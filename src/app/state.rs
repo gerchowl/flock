@@ -500,6 +500,56 @@ impl Palette {
         }
     }
 
+    /// Dalton Dark — colorblind-friendly dark palette (blue-yellow primary axis).
+    ///
+    /// Source: gerchowl/dalton-colorscheme (dalton-dark). Token semantics:
+    /// green = done/idle, yellow = working, red = blocked, peach = interrupted,
+    /// blue/teal = notification accents, mauve = branch labels.
+    pub fn dalton() -> Self {
+        Self {
+            accent: Color::Rgb(122, 162, 247),     // clear blue
+            panel_bg: Color::Rgb(40, 40, 40),      // black — raised panel
+            surface0: Color::Rgb(51, 51, 51),      // selection bg
+            surface1: Color::Rgb(60, 60, 60),      // ash — hover/active
+            surface_dim: Color::Rgb(40, 40, 40),   // separators
+            overlay0: Color::Rgb(154, 154, 154),   // cursor gray — muted text
+            overlay1: Color::Rgb(184, 184, 184),   // pale silver
+            text: Color::Rgb(200, 201, 204),       // dalton foreground
+            subtext0: Color::Rgb(184, 184, 184),   // dim labels
+            mauve: Color::Rgb(192, 112, 240),      // hot violet
+            green: Color::Rgb(136, 185, 125),      // soft lime
+            yellow: Color::Rgb(196, 196, 12),      // vivid gold
+            red: Color::Rgb(216, 80, 80),          // punch red
+            blue: Color::Rgb(122, 162, 247),       // clear blue
+            teal: Color::Rgb(102, 145, 167),       // slate blue
+            peach: Color::Rgb(240, 112, 104),      // hot cherry
+            divider: Some(Color::Rgb(60, 60, 60)), // ash hairline
+        }
+    }
+
+    /// Dalton Light — colorblind-friendly light palette (dalton-bright).
+    pub fn dalton_light() -> Self {
+        Self {
+            accent: Color::Rgb(48, 96, 200),          // deep blue
+            panel_bg: Color::Rgb(244, 241, 235),      // warm paper
+            surface0: Color::Rgb(208, 205, 197),      // selection bg
+            surface1: Color::Rgb(232, 229, 223),      // warm white — hover/active
+            surface_dim: Color::Rgb(232, 229, 223),   // separators
+            overlay0: Color::Rgb(112, 112, 122),      // slate gray — muted text
+            overlay1: Color::Rgb(90, 90, 90),         // cursor gray
+            text: Color::Rgb(46, 48, 56),             // dalton-bright foreground
+            subtext0: Color::Rgb(112, 112, 122),      // dim labels
+            mauve: Color::Rgb(120, 48, 168),          // deep violet
+            green: Color::Rgb(58, 117, 48),           // forest
+            yellow: Color::Rgb(122, 109, 0),          // dark gold
+            red: Color::Rgb(184, 48, 48),             // brick red
+            blue: Color::Rgb(48, 96, 200),            // deep blue
+            teal: Color::Rgb(42, 104, 128),           // dark slate
+            peach: Color::Rgb(200, 56, 56),           // bright brick — interrupted
+            divider: Some(Color::Rgb(208, 205, 197)), // selection-tone hairline
+        }
+    }
+
     /// Resolve a theme by name. Returns None for unknown names.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_lowercase().replace([' ', '_'], "-").as_str() {
@@ -521,6 +571,8 @@ impl Palette {
             "rose-pine" | "rosepine" => Some(Self::rose_pine()),
             "rose-pine-dawn" | "rosepine-dawn" | "dawn" => Some(Self::rose_pine_dawn()),
             "vesper" => Some(Self::vesper()),
+            "dalton" | "dalton-dark" => Some(Self::dalton()),
+            "dalton-light" | "dalton-bright" => Some(Self::dalton_light()),
             _ => None,
         }
     }
@@ -988,6 +1040,8 @@ pub const THEME_NAMES: &[&str] = &[
     "rose-pine",
     "rose-pine-dawn",
     "vesper",
+    "dalton",
+    "dalton-light",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
