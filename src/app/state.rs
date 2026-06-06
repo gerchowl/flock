@@ -650,6 +650,9 @@ pub struct WorkspaceCardArea {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
+    /// When set, the created workspace's root pane resumes a fork of this
+    /// agent session instead of starting a shell (branch-session flow).
+    pub branch_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub source_workspace_id: String,
     pub source_checkout_path: std::path::PathBuf,
     pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -1336,6 +1339,7 @@ pub struct AppState {
     pub request_new_workspace: bool,
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
+    pub request_branch_session: Option<usize>,
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
@@ -1658,6 +1662,7 @@ impl AppState {
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
+            request_branch_session: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,

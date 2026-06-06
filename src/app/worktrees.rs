@@ -109,6 +109,7 @@ impl App {
         self.state.name_input = branch.clone();
         self.state.name_input_replace_on_type = true;
         self.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
             source_workspace_id,
             source_checkout_path,
             source_existing_membership: existing_membership,
@@ -121,6 +122,36 @@ impl App {
             creating: false,
         });
         self.state.mode = Mode::NewLinkedWorktree;
+    }
+
+    /// Branch the focused pane's agent session into a new worktree: same
+    /// dialog as new-worktree, but the created workspace's root pane resumes
+    /// a fork of the session instead of starting a shell.
+    pub(crate) fn open_branch_session_dialog(&mut self, ws_idx: usize) {
+        let Some(plan) = self.focused_branch_plan(ws_idx) else {
+            self.state.config_diagnostic =
+                Some("branch session: focused pane has no resumable agent session".into());
+            return;
+        };
+        self.open_new_linked_worktree_dialog(ws_idx);
+        if let Some(create) = self.state.worktree_create.as_mut() {
+            create.branch_plan = Some(plan);
+        }
+    }
+
+    /// Resolve a fork-aware resume plan for the focused pane of `ws_idx`.
+    /// Prefers the live hook-authority session over the persisted one.
+    fn focused_branch_plan(&self, ws_idx: usize) -> Option<crate::agent_resume::AgentResumePlan> {
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let pane_id = ws.focused_pane_id()?;
+        let pane = ws.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        let info = super::creation::terminal_agent_session_info(terminal)?;
+        let session_ref = crate::agent_resume::AgentSessionRef {
+            kind: info.kind,
+            value: info.value,
+        };
+        crate::agent_resume::branch_plan(&info.source, &info.agent, &session_ref)
     }
 
     pub(crate) fn open_remove_linked_worktree_confirmation(&mut self, ws_idx: usize) {
@@ -587,6 +618,7 @@ impl App {
             Ok(()) => {
                 tracing::info!(checkout_path = %create.checkout_path.display(), "git worktree add completed");
                 let path = create.checkout_path.clone();
+                let branch_plan = create.branch_plan.clone();
                 let source_workspace_id = create.source_workspace_id.clone();
                 let source_checkout_path = create.source_checkout_path.clone();
                 let source_existing_membership = create.source_existing_membership.clone();
@@ -596,7 +628,19 @@ impl App {
                 self.state.worktree_create = None;
                 self.state.name_input.clear();
                 self.state.name_input_replace_on_type = false;
-                match self.create_workspace_with_options(path.clone(), true) {
+                let created = if let Some(plan) = branch_plan {
+                    let (rows, cols) = self.state.estimate_pane_size();
+                    self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
+                        .map(|(ws_idx, _, _)| ws_idx)
+                        .map_err(|err| match err {
+                            super::agents::AgentStartError::SpawnFailed(message) => message,
+                            _ => "agent spawn rejected".to_string(),
+                        })
+                } else {
+                    self.create_workspace_with_options(path.clone(), true)
+                        .map_err(|err| err.to_string())
+                };
+                match created {
                     Ok(ws_idx) => {
                         let source_membership = source_existing_membership.unwrap_or(
                             crate::workspace::WorktreeSpaceMembership {
@@ -946,6 +990,7 @@ mod tests {
         app.state.worktree_directory = std::path::PathBuf::from("/w");
         app.state.name_input = "issue/137".into();
         app.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
             source_workspace_id: "source".into(),
             source_checkout_path: std::path::PathBuf::from("/repo/herdr"),
             source_existing_membership: None,
@@ -979,6 +1024,7 @@ mod tests {
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
             source_workspace_id: "source".into(),
             source_checkout_path: repo.clone(),
             source_existing_membership: None,
@@ -1041,6 +1087,7 @@ mod tests {
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
             source_workspace_id: "source".into(),
             source_checkout_path: source_checkout.clone(),
             source_existing_membership: None,
@@ -1196,5 +1243,72 @@ mod tests {
         assert!(app.state.workspaces.is_empty());
 
         let _ = std::fs::remove_dir_all(repo);
+    }
+    #[test]
+    fn branch_session_dialog_requires_agent_session() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+
+        app.open_branch_session_dialog(0);
+
+        assert!(app.state.worktree_create.is_none());
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some("branch session: focused pane has no resumable agent session")
+        );
+    }
+
+    #[test]
+    fn branch_session_dialog_attaches_fork_plan_from_persisted_session() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("workspace should have a pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state should exist")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/herdr".into());
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-1")
+                .expect("session id should validate"),
+        });
+        app.state.terminals.insert(terminal_id, terminal);
+
+        app.open_branch_session_dialog(0);
+
+        assert_eq!(app.state.mode, Mode::NewLinkedWorktree);
+        let plan = app
+            .state
+            .worktree_create
+            .as_ref()
+            .and_then(|create| create.branch_plan.as_ref())
+            .expect("branch plan should be attached");
+        assert_eq!(
+            plan.argv,
+            vec!["claude", "--resume", "sess-1", "--fork-session"]
+        );
     }
 }

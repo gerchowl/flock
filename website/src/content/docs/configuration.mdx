@@ -180,8 +180,11 @@ next_workspace = "prefix+shift+right"
 last_pane = "prefix+tab"
 open_worktree = "prefix+shift+o"
 remove_worktree = "prefix+alt+d"
+branch_session = "prefix+shift+b"
 next_tab = ["prefix+n", "ctrl+alt+]"]
 ```
+
+`branch_session` branches the focused pane's agent session into a new worktree: it opens the same dialog as `new_worktree`, but the created workspace's root pane resumes a fork of the agent conversation in the new checkout instead of starting a shell (Claude Code uses `--fork-session` so the original session is untouched; other supported agents resume the same session). The focused pane must have a resumable agent session reported through a Herdr integration, and the workspace must be a Git repo parent (same rule as `new_worktree`).
 
 `last_pane` switches back to the last focused pane across workspaces and tabs. It is unset by default because the tmux-style pane binding `prefix+l` is already used for pane-right focus.
 

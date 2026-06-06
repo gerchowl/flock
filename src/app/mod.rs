@@ -412,6 +412,7 @@ impl App {
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
+            request_branch_session: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -763,6 +764,11 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_new_linked_worktree.take() {
                 self.open_new_linked_worktree_dialog(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some(ws_idx) = self.state.request_branch_session.take() {
+                self.open_branch_session_dialog(ws_idx);
                 needs_render = true;
             }
 

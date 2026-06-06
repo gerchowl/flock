@@ -259,7 +259,16 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     ])
     .areas::<8>(inner);
 
-    render_modal_header(frame, rows[0], "new worktree", &app.palette);
+    let header = if app
+        .worktree_create
+        .as_ref()
+        .is_some_and(|create| create.branch_plan.is_some())
+    {
+        "branch session into new worktree"
+    } else {
+        "new worktree"
+    };
+    render_modal_header(frame, rows[0], header, &app.palette);
 
     frame.render_widget(
         Paragraph::new(" branch").style(Style::default().fg(app.palette.overlay0)),

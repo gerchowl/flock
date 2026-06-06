@@ -477,6 +477,7 @@ pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
 pub(crate) enum NavigateAction {
     NewWorkspace,
     NewWorktree,
+    BranchSession,
     OpenWorktree,
     RemoveWorktree,
     RenameWorkspace,
@@ -581,6 +582,7 @@ fn action_for_key(
         (&kb.workspace_picker, NavigateAction::WorkspacePicker),
         (&kb.new_workspace, NavigateAction::NewWorkspace),
         (&kb.new_worktree, NavigateAction::NewWorktree),
+        (&kb.branch_session, NavigateAction::BranchSession),
         (&kb.open_worktree, NavigateAction::OpenWorktree),
         (&kb.remove_worktree, NavigateAction::RemoveWorktree),
         (&kb.rename_workspace, NavigateAction::RenameWorkspace),
@@ -667,6 +669,14 @@ pub(super) fn execute_navigate_action_in_context(
                 .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
             {
                 state.request_new_linked_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::BranchSession => {
+            if let Some(ws_idx) = workspace_action_target(state, context)
+                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
+            {
+                state.request_branch_session = Some(ws_idx);
                 leave_navigate_mode(state);
             }
         }
@@ -1111,6 +1121,24 @@ mod tests {
         );
 
         assert_eq!(state.request_new_linked_worktree, Some(1));
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn custom_branch_session_key_requests_selected_workspace() {
+        let mut state = state_with_workspaces(&["main", "scratch"]);
+        state.workspaces[1].identity_cwd = unique_temp_path("navigate-branch-session-selected");
+        state.mode = Mode::Navigate;
+        state.selected = 1;
+        state.active = Some(0);
+        state.keybinds.branch_session = crate::config::ActionKeybinds::prefix("y");
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.request_branch_session, Some(1));
         assert_eq!(state.mode, Mode::Terminal);
     }
 
