@@ -356,9 +356,14 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     ])
     .areas::<8>(inner);
 
+    let title = if remove.delete_branch {
+        " kill worktree & branch?"
+    } else {
+        " delete worktree checkout?"
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            " delete worktree checkout?",
+            title,
             Style::default()
                 .fg(app.palette.red)
                 .add_modifier(Modifier::BOLD),
@@ -375,11 +380,32 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             .style(Style::default().fg(app.palette.text)),
         rows[2],
     );
-    frame.render_widget(
-        Paragraph::new(" The branch is not deleted. The Herdr workspace will close.")
-            .style(Style::default().fg(app.palette.overlay0)),
-        rows[3],
-    );
+    if remove.delete_branch {
+        let (gate_line, gate_style) = match &remove.merge_gate {
+            None => (
+                " checking merge status…".to_string(),
+                Style::default().fg(app.palette.overlay0),
+            ),
+            Some(crate::worktree::WorktreeMergeGate::Merged { evidence }) => (
+                format!(
+                    " ✓ {evidence} — branch {} will be deleted too.",
+                    remove.branch.as_deref().unwrap_or("?")
+                ),
+                Style::default().fg(app.palette.green),
+            ),
+            Some(crate::worktree::WorktreeMergeGate::NotMerged) => (
+                " ✗ no merge evidence — checkout only; the branch is kept.".to_string(),
+                Style::default().fg(app.palette.peach),
+            ),
+        };
+        frame.render_widget(Paragraph::new(gate_line).style(gate_style), rows[3]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(" The branch is not deleted. The Herdr workspace will close.")
+                .style(Style::default().fg(app.palette.overlay0)),
+            rows[3],
+        );
+    }
     if remove.force_confirmation {
         frame.render_widget(
             Paragraph::new(" Dirty or untracked files will be permanently deleted.")

@@ -16,6 +16,20 @@ pub struct WorktreeAddResult {
 }
 
 #[derive(Debug)]
+pub struct WorktreeKillGateResult {
+    pub workspace_id: String,
+    pub path: std::path::PathBuf,
+    pub branch: Option<String>,
+    pub gate: crate::worktree::WorktreeMergeGate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeBranchDeleteResult {
+    pub branch: String,
+    pub result: Result<(), String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRemoveResult {
     pub workspace_id: String,
     pub path: std::path::PathBuf,
@@ -26,7 +40,9 @@ pub struct WorktreeRemoveResult {
 #[derive(Debug)]
 pub enum AppEvent {
     /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    PaneDied {
+        pane_id: PaneId,
+    },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,
@@ -95,7 +111,9 @@ pub enum AppEvent {
     },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
-    ClipboardWrite { content: Vec<u8> },
+    ClipboardWrite {
+        content: Vec<u8>,
+    },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,
@@ -105,4 +123,6 @@ pub enum AppEvent {
     WorktreeAddFinished(WorktreeAddResult),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(WorktreeRemoveResult),
+    WorktreeKillGateFinished(WorktreeKillGateResult),
+    WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
 }

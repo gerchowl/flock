@@ -2152,6 +2152,8 @@ impl AppState {
             }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
+            AppEvent::WorktreeKillGateFinished(_) => Vec::new(),
+            AppEvent::WorktreeBranchDeleteFinished(_) => Vec::new(),
         }
     }
 

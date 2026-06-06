@@ -413,6 +413,7 @@ impl App {
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_branch_session: None,
+            request_kill_worktree: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -787,6 +788,11 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_remove_linked_worktree.take() {
                 self.open_remove_linked_worktree_confirmation(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some(ws_idx) = self.state.request_kill_worktree.take() {
+                self.open_kill_worktree_confirmation(ws_idx);
                 needs_render = true;
             }
 

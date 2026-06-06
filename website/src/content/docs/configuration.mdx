@@ -181,8 +181,11 @@ last_pane = "prefix+tab"
 open_worktree = "prefix+shift+o"
 remove_worktree = "prefix+alt+d"
 branch_session = "prefix+shift+b"
+kill_worktree = "prefix+alt+k"
 next_tab = ["prefix+n", "ctrl+alt+]"]
 ```
+
+`kill_worktree` deletes a linked worktree checkout **and its local branch** — but the branch only when a merge gate passes: Herdr asks `gh pr view <branch>` for a merged PR, falling back to `git branch --merged <default-branch>`. The confirm dialog shows the evidence ("PR #12 merged" / "merged into master") or, when there is none, downgrades to a checkout-only delete with the branch kept. This is the one deliberate exception to Herdr's "branches are never deleted" rule, and it never fires without positive evidence. Also available as `Kill worktree & branch...` in the workspace context menu.
 
 `branch_session` branches the focused pane's agent session into a new worktree: it opens the same dialog as `new_worktree`, but the created workspace's root pane resumes a fork of the agent conversation in the new checkout instead of starting a shell (Claude Code uses `--fork-session` so the original session is untouched; other supported agents resume the same session). The focused pane must have a resumable agent session reported through a Herdr integration, and the workspace must be a Git repo parent (same rule as `new_worktree`).
 

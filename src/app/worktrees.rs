@@ -177,8 +177,109 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
         self.state.mode = Mode::ConfirmRemoveWorktree;
+    }
+
+    /// Kill flow: like remove, but also deletes the local branch when the
+    /// async merge gate (gh pr view / git branch --merged) passes. Herdr
+    /// never deletes branches otherwise, so this needs positive evidence.
+    pub(crate) fn open_kill_worktree_confirmation(&mut self, ws_idx: usize) {
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return;
+        };
+        if !ws
+            .worktree_space()
+            .is_some_and(|space| space.is_linked_worktree)
+        {
+            self.state.config_diagnostic =
+                Some("This workspace is not a Herdr-managed worktree checkout.".into());
+            return;
+        }
+        let Some(space) = ws.worktree_space().cloned() else {
+            return;
+        };
+        self.state.selected = ws_idx;
+        self.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: ws.id.clone(),
+            repo_root: space.repo_root.clone(),
+            path: space.checkout_path.clone(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            delete_branch: true,
+            branch: None,
+            merge_gate: None,
+        });
+        self.state.mode = Mode::ConfirmRemoveWorktree;
+
+        let workspace_id = ws.id.clone();
+        let repo_root = space.repo_root;
+        let checkout = space.checkout_path;
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let branch = crate::worktree::checkout_branch_name(&checkout);
+            let gate = match branch.as_deref() {
+                Some(branch) => crate::worktree::branch_merge_gate(&repo_root, &checkout, branch),
+                None => crate::worktree::WorktreeMergeGate::NotMerged,
+            };
+            let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
+                crate::events::WorktreeKillGateResult {
+                    workspace_id,
+                    path: checkout,
+                    branch,
+                    gate,
+                },
+            ));
+        });
+    }
+
+    pub(crate) fn handle_worktree_kill_gate_finished(
+        &mut self,
+        result: crate::events::WorktreeKillGateResult,
+    ) {
+        let Some(remove) = &mut self.state.worktree_remove else {
+            return;
+        };
+        if !remove.delete_branch
+            || remove.workspace_id != result.workspace_id
+            || remove.path != result.path
+        {
+            return;
+        }
+        tracing::info!(
+            workspace_id = %result.workspace_id,
+            branch = result.branch.as_deref().unwrap_or("<detached>"),
+            gate = ?result.gate,
+            "worktree kill merge gate resolved"
+        );
+        remove.branch = result.branch;
+        remove.merge_gate = Some(result.gate);
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    pub(crate) fn handle_worktree_branch_delete_finished(
+        &mut self,
+        result: crate::events::WorktreeBranchDeleteResult,
+    ) {
+        match result.result {
+            Ok(()) => {
+                tracing::info!(branch = %result.branch, "deleted local branch after worktree kill");
+            }
+            Err(message) => {
+                tracing::warn!(branch = %result.branch, error = %message, "branch delete failed");
+                self.state.config_diagnostic = Some(format!(
+                    "removed checkout, but failed to delete branch {}: {message}",
+                    result.branch
+                ));
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+            }
+        }
     }
 
     pub(crate) fn open_existing_worktree_dialog(&mut self, ws_idx: usize) {
@@ -585,6 +686,11 @@ impl App {
         if remove.removing {
             return;
         }
+        // Kill flow: wait for the merge gate before allowing confirmation, so
+        // the user always sees what will actually be deleted.
+        if remove.delete_branch && remove.merge_gate.is_none() {
+            return;
+        }
         remove.removing = true;
         remove.error = None;
         let force = remove.force_confirmation;
@@ -700,7 +806,33 @@ impl App {
         match result.result {
             Ok(()) => {
                 tracing::info!(workspace_id = %result.workspace_id, path = %result.path.display(), "git worktree remove completed");
+                let branch_to_delete = self
+                    .state
+                    .worktree_remove
+                    .as_ref()
+                    .filter(|remove| {
+                        remove.delete_branch
+                            && matches!(
+                                remove.merge_gate,
+                                Some(crate::worktree::WorktreeMergeGate::Merged { .. })
+                            )
+                    })
+                    .and_then(|remove| {
+                        remove
+                            .branch
+                            .clone()
+                            .map(|branch| (remove.repo_root.clone(), branch))
+                    });
                 self.state.worktree_remove = None;
+                if let Some((repo_root, branch)) = branch_to_delete {
+                    let event_tx = self.event_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = crate::worktree::delete_local_branch(&repo_root, &branch);
+                        let _ = event_tx.blocking_send(AppEvent::WorktreeBranchDeleteFinished(
+                            crate::events::WorktreeBranchDeleteResult { branch, result },
+                        ));
+                    });
+                }
                 if let Some(ws_idx) = self
                     .state
                     .workspaces
@@ -1132,6 +1264,9 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
 
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
@@ -1160,6 +1295,9 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
 
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
@@ -1310,5 +1448,190 @@ mod tests {
             plan.argv,
             vec!["claude", "--resume", "sess-1", "--fork-session"]
         );
+    }
+    #[test]
+    fn kill_worktree_confirmation_rejects_non_linked_workspace() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+
+        app.open_kill_worktree_confirmation(0);
+
+        assert!(app.state.worktree_remove.is_none());
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some("This workspace is not a Herdr-managed worktree checkout.")
+        );
+    }
+
+    #[test]
+    fn kill_gate_event_updates_pending_dialog() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "ws".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            delete_branch: true,
+            branch: None,
+            merge_gate: None,
+        });
+
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            branch: Some("feature/x".into()),
+            gate: crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "PR #7 merged".into(),
+            },
+        });
+
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(remove.branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            remove.merge_gate,
+            Some(crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "PR #7 merged".into()
+            })
+        );
+    }
+
+    #[test]
+    fn start_worktree_remove_waits_for_pending_merge_gate() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "ws".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            delete_branch: true,
+            branch: Some("feature/x".into()),
+            merge_gate: None,
+        });
+
+        app.start_worktree_remove();
+
+        // Gate unresolved: confirmation is a no-op rather than a blind delete.
+        assert!(!app.state.worktree_remove.as_ref().unwrap().removing);
+
+        app.state.worktree_remove.as_mut().unwrap().merge_gate =
+            Some(crate::worktree::WorktreeMergeGate::NotMerged);
+        app.start_worktree_remove();
+        assert!(app.state.worktree_remove.as_ref().unwrap().removing);
+    }
+
+    #[test]
+    fn remove_finished_deletes_branch_only_with_merged_gate() {
+        // Real repo: merged branch is deleted after the checkout removal.
+        let repo = create_committed_repo("kill-branch-delete-repo");
+        let checkout = unique_temp_path("kill-branch-delete-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/done",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        run_git(&repo, &["merge", "--quiet", "feature/done"]);
+        run_git(
+            &repo,
+            &["worktree", "remove", "--force", checkout.to_str().unwrap()],
+        );
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "ws".into(),
+            repo_root: repo.clone(),
+            path: checkout.clone(),
+            error: None,
+            removing: true,
+            force_confirmation: false,
+            delete_branch: true,
+            branch: Some("feature/done".into()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "merged into master".into(),
+            }),
+        });
+
+        app.handle_worktree_remove_finished(WorktreeRemoveResult {
+            workspace_id: "ws".into(),
+            path: checkout.clone(),
+            result: Ok(()),
+        });
+
+        // Branch deletion runs on a worker thread; poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "branch",
+                    "--list",
+                    "feature/done",
+                ])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch was not deleted within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn remove_finished_keeps_branch_without_merge_evidence() {
+        let repo = create_committed_repo("kill-branch-keep-repo");
+        run_git(&repo, &["branch", "feature/wip"]);
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id: "ws".into(),
+            repo_root: repo.clone(),
+            path: std::path::PathBuf::from("/tmp/x"),
+            error: None,
+            removing: true,
+            force_confirmation: false,
+            delete_branch: true,
+            branch: Some("feature/wip".into()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+        });
+
+        app.handle_worktree_remove_finished(WorktreeRemoveResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/tmp/x"),
+            result: Ok(()),
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "branch",
+                "--list",
+                "feature/wip",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "unmerged branch must be kept"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

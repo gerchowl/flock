@@ -156,6 +156,136 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
     })
 }
 
+/// Evidence-gated decision for deleting a worktree's local branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeMergeGate {
+    /// The branch's work is recorded elsewhere; deleting it is safe.
+    Merged { evidence: String },
+    /// No merge evidence found; only the checkout should be removed.
+    NotMerged,
+}
+
+fn run_command_capture(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("{program} failed with status {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Branch checked out in `checkout`, if any (detached HEAD yields None).
+pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String> {
+    let path = checkout.to_string_lossy().to_string();
+    run_command_capture("git", &["-C", &path, "branch", "--show-current"], None)
+        .ok()
+        .filter(|branch| !branch.is_empty())
+}
+
+/// The repo's default branch: origin/HEAD when set, else main/master if present.
+pub(crate) fn detect_default_branch(repo_root: &std::path::Path) -> Option<String> {
+    let root = repo_root.to_string_lossy().to_string();
+    if let Ok(full) = run_command_capture(
+        "git",
+        &[
+            "-C",
+            &root,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        None,
+    ) {
+        if let Some(branch) = full.strip_prefix("origin/") {
+            return Some(branch.to_string());
+        }
+    }
+    for candidate in ["main", "master"] {
+        let probe = format!("refs/heads/{candidate}");
+        if run_command_capture(
+            "git",
+            &["-C", &root, "show-ref", "--verify", "--quiet", &probe],
+            None,
+        )
+        .is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// PR-merged gate for deleting `branch`. Prefers `gh pr view` (PR merged on
+/// the forge), falls back to `git branch --merged <default>`. Anything
+/// inconclusive is NotMerged — deleting a branch needs positive evidence.
+pub(crate) fn branch_merge_gate(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    branch: &str,
+) -> WorktreeMergeGate {
+    if let Ok(json) = run_command_capture(
+        "gh",
+        &["pr", "view", branch, "--json", "state,number"],
+        Some(checkout),
+    ) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+            if value.get("state").and_then(|v| v.as_str()) == Some("MERGED") {
+                let evidence = match value.get("number").and_then(|v| v.as_u64()) {
+                    Some(number) => format!("PR #{number} merged"),
+                    None => "PR merged".to_string(),
+                };
+                return WorktreeMergeGate::Merged { evidence };
+            }
+        }
+    }
+
+    let root = repo_root.to_string_lossy().to_string();
+    if let Some(default_branch) = detect_default_branch(repo_root) {
+        if let Ok(merged) = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &root,
+                "branch",
+                "--merged",
+                &default_branch,
+                "--format",
+                "%(refname:short)",
+            ],
+            None,
+        ) {
+            if merged.lines().any(|line| line.trim() == branch) {
+                return WorktreeMergeGate::Merged {
+                    evidence: format!("merged into {default_branch}"),
+                };
+            }
+        }
+    }
+
+    WorktreeMergeGate::NotMerged
+}
+
+/// `git branch -D <branch>` in `repo_root`. Only called once the merge gate
+/// produced positive evidence; -D because -d judges merges against the
+/// current HEAD, not the default branch.
+pub(crate) fn delete_local_branch(repo_root: &std::path::Path, branch: &str) -> Result<(), String> {
+    let root = repo_root.to_string_lossy().to_string();
+    run_command_capture("git", &["-C", &root, "branch", "-D", branch], None).map(|_| ())
+}
+
 pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktree> {
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
@@ -485,5 +615,95 @@ prunable stale
         assert!(!checkout.exists());
 
         let _ = std::fs::remove_dir_all(repo);
+    }
+    #[test]
+    fn checkout_branch_name_and_default_branch_detection() {
+        let repo = create_committed_repo("merge-gate-names");
+        let checkout = unique_temp_path("merge-gate-names-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/gate",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            checkout_branch_name(&checkout).as_deref(),
+            Some("feature/gate")
+        );
+        // create_committed_repo commits on the default init branch; detection
+        // falls back to main/master existence when origin/HEAD is unset.
+        let default = detect_default_branch(&repo);
+        assert!(
+            default.as_deref() == Some("master") || default.as_deref() == Some("main"),
+            "unexpected default branch: {default:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_requires_positive_evidence() {
+        let repo = create_committed_repo("merge-gate-evidence");
+        let checkout = unique_temp_path("merge-gate-evidence-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/unmerged",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("new.txt"), "x\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "feature work"]);
+
+        // Unmerged branch: no evidence (gh pr view fails in a remote-less repo).
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "feature/unmerged"),
+            WorktreeMergeGate::NotMerged
+        );
+
+        // Merge it into the default branch: the git fallback now has evidence.
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["merge", "--quiet", "feature/unmerged"]);
+        let gate = branch_merge_gate(&repo, &checkout, "feature/unmerged");
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: format!("merged into {default}")
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn delete_local_branch_removes_merged_branch() {
+        let repo = create_committed_repo("merge-gate-delete");
+        run_git(&repo, &["branch", "feature/done"]);
+        delete_local_branch(&repo, "feature/done").expect("branch delete should succeed");
+        let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "branch",
+                "--list",
+                "feature/done",
+            ])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

@@ -478,6 +478,7 @@ pub(crate) enum NavigateAction {
     NewWorkspace,
     NewWorktree,
     BranchSession,
+    KillWorktree,
     OpenWorktree,
     RemoveWorktree,
     RenameWorkspace,
@@ -585,6 +586,7 @@ fn action_for_key(
         (&kb.branch_session, NavigateAction::BranchSession),
         (&kb.open_worktree, NavigateAction::OpenWorktree),
         (&kb.remove_worktree, NavigateAction::RemoveWorktree),
+        (&kb.kill_worktree, NavigateAction::KillWorktree),
         (&kb.rename_workspace, NavigateAction::RenameWorkspace),
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
@@ -691,6 +693,12 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::RemoveWorktree => {
             if let Some(ws_idx) = workspace_action_target(state, context) {
                 state.request_remove_linked_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::KillWorktree => {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
+                state.request_kill_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
         }

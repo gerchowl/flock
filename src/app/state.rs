@@ -673,6 +673,11 @@ pub struct WorktreeRemoveState {
     pub error: Option<String>,
     pub removing: bool,
     pub force_confirmation: bool,
+    /// Kill flow: delete the local branch too once the merge gate passes.
+    pub delete_branch: bool,
+    pub branch: Option<String>,
+    /// None while the merge check is still running (kill flow only).
+    pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1207,7 +1212,12 @@ impl ContextMenuState {
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
                 ..
-            } => &["Rename", "Close", "Delete worktree checkout..."],
+            } => &[
+                "Rename",
+                "Close",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+            ],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: true,
@@ -1340,6 +1350,7 @@ pub struct AppState {
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
     pub request_branch_session: Option<usize>,
+    pub request_kill_worktree: Option<usize>,
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
@@ -1663,6 +1674,7 @@ impl AppState {
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_branch_session: None,
+            request_kill_worktree: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -1899,7 +1911,12 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            &[
+                "Rename",
+                "Close",
+                "Delete worktree checkout...",
+                "Kill worktree & branch...",
+            ]
         );
     }
 

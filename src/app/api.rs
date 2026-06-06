@@ -64,6 +64,16 @@ impl App {
             return;
         }
 
+        if let AppEvent::WorktreeKillGateFinished(result) = ev {
+            self.handle_worktree_kill_gate_finished(result);
+            return;
+        }
+
+        if let AppEvent::WorktreeBranchDeleteFinished(result) = ev {
+            self.handle_worktree_branch_delete_finished(result);
+            return;
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)

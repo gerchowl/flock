@@ -260,6 +260,10 @@ pub struct KeysConfig {
     pub new_worktree: BindingConfig,
     /// Branch the focused pane's agent session into a new worktree. Unset by default.
     pub branch_session: BindingConfig,
+    /// Delete a linked worktree checkout AND its local branch once the merge
+    /// gate (PR merged / branch merged into the default branch) passes.
+    /// Unset by default.
+    pub kill_worktree: BindingConfig,
     /// Open an existing Git worktree from the selected workspace. Unset by default.
     pub open_worktree: BindingConfig,
     /// Delete the selected managed worktree checkout after confirmation. Unset by default.
@@ -511,6 +515,7 @@ impl Default for KeysConfig {
             new_workspace: BindingConfig::one("prefix+shift+n"),
             new_worktree: BindingConfig::one("prefix+shift+g"),
             branch_session: BindingConfig::empty(),
+            kill_worktree: BindingConfig::empty(),
             open_worktree: BindingConfig::empty(),
             remove_worktree: BindingConfig::empty(),
             rename_workspace: BindingConfig::one("prefix+shift+w"),

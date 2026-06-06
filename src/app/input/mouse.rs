@@ -2332,6 +2332,9 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
@@ -2360,6 +2363,9 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            delete_branch: false,
+            branch: None,
+            merge_gate: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
