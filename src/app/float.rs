@@ -47,7 +47,18 @@ impl AppState {
     /// the session dirty — floats are ephemeral by definition.
     pub(crate) fn register_float(&mut self, workspace_id: String, float: FloatPane) {
         self.remove_alias_shadowed_by_new_pane(float.pane_id);
-        self.floats.insert(workspace_id, float);
+        // The toggle path never spawns over an existing float, but if a
+        // displaced entry ever exists, reap its terminal instead of leaking
+        // the PTY silently.
+        if let Some(displaced) = self.floats.insert(workspace_id, float) {
+            if self.terminals.remove(&displaced.terminal_id).is_some()
+                && !self
+                    .terminal_runtime_shutdowns
+                    .contains(&displaced.terminal_id)
+            {
+                self.terminal_runtime_shutdowns.push(displaced.terminal_id);
+            }
+        }
     }
 
     /// Flip the active workspace's float visibility (hide-not-kill).
