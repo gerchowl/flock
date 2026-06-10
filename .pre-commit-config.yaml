@@ -1,0 +1,65 @@
+# Governance gates, run by `prek` (pre-commit compatible). Tooling comes from
+# the guardrails devShell (flake.nix → lib.mkDevShell), so every `entry` is on
+# PATH. Installed automatically by the devShell shellHook; manually via
+# `just install-hooks`.
+#
+# Rollout status: the three agent-drift gates run **warn-only** (via
+# scripts/guardrails-nudge — report, never block) while existing debug-print /
+# placeholder sites are cleaned up. Promote one by pointing its entry straight
+# at `guardrails-<name>`. Per-line escape hatch anywhere: `guardrails-ok`.
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: local
+    hooks:
+      # --- agent-drift gates (warn-only for now) -------------------------------
+      - id: no-fake-impl
+        name: "no fake/placeholder implementations (nudge)"
+        entry: scripts/guardrails-nudge no-fake-impl
+        language: system
+        pass_filenames: true
+        verbose: true
+      - id: no-debug-leftovers
+        name: "no debug-print leftovers — use the tracing facade (nudge)"
+        entry: scripts/guardrails-nudge no-debug-leftovers
+        language: system
+        pass_filenames: true
+        verbose: true
+      - id: no-commented-code
+        name: "no commented-out code (nudge)"
+        entry: scripts/guardrails-nudge no-commented-code
+        language: system
+        pass_filenames: true
+        verbose: true
+
+      # --- hard gates ----------------------------------------------------------
+      - id: gitleaks
+        name: secrets scan
+        entry: gitleaks protect --staged --redact -v
+        language: system
+        pass_filenames: false
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt --all -- --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: clippy
+        name: "clippy (-D warnings)"
+        entry: cargo clippy --all-targets --locked -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-deny
+        name: "cargo-deny (licenses + advisories)"
+        entry: cargo deny check
+        language: system
+        files: (Cargo\.(toml|lock)|deny\.toml)$
+        pass_filenames: false
+
+      # --- commit message ------------------------------------------------------
+      - id: conventional-commits
+        name: conventional commit message
+        entry: python3 scripts/conventional_commits.py --message-file
+        language: system
+        stages: [commit-msg]
+        pass_filenames: true
