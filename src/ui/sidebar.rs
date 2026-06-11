@@ -3749,6 +3749,66 @@ mod tests {
         assert_eq!(buffer[(rects[0], child.rect.y)].style().fg, Some(p.yellow));
     }
 
+    /// #33 — the primary row IS the section's selectable row (no synthetic
+    /// header) and carries the join of the WHOLE section, including plain
+    /// same-repo members merged in by the restructure; members indent
+    /// under it with their own joins.
+    #[test]
+    fn primary_row_carries_section_join_across_plain_members() {
+        let mut app = space_group_app();
+        let mut plain = Workspace::test_new("scratch");
+        plain.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "grp".into(),
+            checkout_key: "/repo/scratch".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/scratch"),
+            is_linked_worktree: false,
+            project_key: "dir:herdr".into(),
+        });
+        app.workspaces.push(plain);
+        app.ensure_test_terminals();
+        set_pane_state(&mut app, 0, AgentState::Idle, true);
+        set_pane_state(&mut app, 1, AgentState::Working, true);
+        set_pane_state(&mut app, 2, AgentState::Blocked, true);
+
+        let area = Rect::new(0, 0, 30, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let p = &app.palette;
+
+        // Three rows: the primary (main checkout) unindented, the linked
+        // worktree AND the plain same-repo workspace indented under it.
+        let cards = app.view.workspace_card_areas.clone();
+        assert_eq!(cards.len(), 3);
+        assert_eq!((cards[0].ws_idx, cards[0].indented), (0, false));
+        assert_eq!((cards[1].ws_idx, cards[1].indented), (1, true));
+        assert_eq!((cards[2].ws_idx, cards[2].indented), (2, true));
+
+        // The primary row joins ALL members: r·y·g packed rects.
+        let rects = row_glyph_positions(&buffer, cards[0].rect, cards[0].rect.y, "\u{25ae}");
+        assert_eq!(rects.len(), 3, "primary row carries the section join");
+        assert_eq!(buffer[(rects[0], cards[0].rect.y)].style().fg, Some(p.red));
+        assert_eq!(
+            buffer[(rects[1], cards[0].rect.y)].style().fg,
+            Some(p.yellow)
+        );
+        assert_eq!(
+            buffer[(rects[2], cards[0].rect.y)].style().fg,
+            Some(p.green)
+        );
+
+        // The plain member row carries only its own (blocked) join.
+        let rects = row_glyph_positions(&buffer, cards[2].rect, cards[2].rect.y, "\u{25ae}");
+        assert_eq!(rects.len(), 1);
+        assert_eq!(buffer[(rects[0], cards[2].rect.y)].style().fg, Some(p.red));
+
+        // The group affordances live on the primary alone.
+        assert_eq!(
+            workspace_parent_group_state(&app, 0).map(|(key, _)| key),
+            Some("grp".to_string())
+        );
+        assert_eq!(workspace_parent_group_state(&app, 2), None);
+    }
+
     #[test]
     fn workspace_row_with_no_live_agents_renders_a_hollow_rect() {
         let mut app = crate::app::state::AppState::test_new();
