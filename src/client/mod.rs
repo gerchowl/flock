@@ -433,7 +433,16 @@ fn setup_terminal_with_capabilities(
     // terminal (held fds, broken mux) and the panicking init() aborted via a
     // DOUBLE panic (its own hook's eprint also failed) -- #95. A failure here
     // rides the leg loop's normal error rail instead (relaunch + notice).
+    //
+    // Capture the process default hook BEFORE try_init replaces it, so the
+    // protective hook re-asserted below chains into the real default rather
+    // than ratatui's own restore-and-eprintln hook.
+    capture_default_panic_hook();
     ratatui::try_init().map_err(|e| io::Error::other(format!("terminal init failed: {e}")))?;
+    // try_init just installed ratatui's panic hook on top of ours. Re-assert
+    // the protective hook so a panic restores the terminal without ratatui's
+    // eprintln-in-restore double-panicking on a dead stderr (#95 / switch crash).
+    install_protective_panic_hook();
 
     if enable_client_protocols {
         if mouse_capture {
@@ -1025,11 +1034,14 @@ impl HandoffRetry {
             return;
         }
 
+        // Non-panicking writes: this status line is drawn during the
+        // handoff-retry window, when stderr can be broken mid-switch and the
+        // panic from `eprint!`/`eprintln!` would feed the double-panic abort.
         if io::stderr().is_terminal() {
-            eprint!("\r\x1b[K{frame} {text}");
+            let _ = write!(io::stderr(), "\r\x1b[K{frame} {text}");
             let _ = io::stderr().flush();
         } else if !self.status_line_shown {
-            eprintln!("{text}");
+            let _ = writeln!(io::stderr(), "{text}");
         }
         self.status_line_shown = true;
     }
@@ -1043,7 +1055,7 @@ impl HandoffRetry {
             let _ = out.flush();
             self.painted_held = false;
         } else if self.status_line_shown && io::stderr().is_terminal() {
-            eprint!("\r\x1b[K");
+            let _ = write!(io::stderr(), "\r\x1b[K");
             let _ = io::stderr().flush();
         }
         self.status_line_shown = false;
@@ -1134,6 +1146,56 @@ fn run_attach_attempt(
     result.map_err(AttachAttemptError::Session)
 }
 
+/// A boxed panic hook, matching the type `std::panic::take_hook` returns.
+type BoxedPanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>;
+
+/// The process's default panic hook, captured exactly once before any of our
+/// hooks (or ratatui's) replace it. The protective hook below always chains
+/// into THIS, so re-asserting the protective hook per attach attempt never
+/// nests hooks unboundedly.
+static DEFAULT_PANIC_HOOK: std::sync::OnceLock<BoxedPanicHook> = std::sync::OnceLock::new();
+
+/// Capture the process default panic hook once, before `ratatui::try_init` (or
+/// our own hook) replaces it. Side-effect-free after the first call. Call this
+/// before `ratatui::try_init` on entry paths (direct attach) that may not have
+/// run [`install_protective_panic_hook`] yet, so the captured original is the
+/// real default rather than ratatui's restore-and-eprintln hook.
+fn capture_default_panic_hook() {
+    DEFAULT_PANIC_HOOK.get_or_init(std::panic::take_hook);
+}
+
+/// Install herdr's terminal-restoring panic hook, chaining into the captured
+/// process default.
+///
+/// A panic is always a real exit, so this NEVER honors the switch-handoff hold
+/// — it forces a full restore (leave alt-screen, raw off, pop kitty flags) so a
+/// panic mid-held-handoff cannot strand the shell (#69).
+///
+/// MUST be re-asserted after every `ratatui::try_init`: that call installs
+/// ratatui's own hook on top of ours, and ratatui's hook `eprintln!`s while
+/// restoring. On a stderr gone bad mid-handoff that eprintln is a SECOND panic
+/// → `abort()` with the terminal left raw — the federation-switch crash. Ours
+/// emits its diagnostic with a non-panicking `writeln!` and contains the
+/// chained hook in `catch_unwind`, so a dead stderr can never abort us (#95).
+fn install_protective_panic_hook() {
+    capture_default_panic_hook();
+    let in_tmux = std::env::var("TMUX").is_ok();
+    std::panic::set_hook(Box::new(move |info| {
+        if host_terminal_is_held() {
+            force_restore_host_terminal();
+        } else {
+            restore_terminal_state(in_tmux);
+        }
+        // Non-fatal: `writeln!` returns Err on a dead stderr where `eprintln!`
+        // would panic — that panic was the first half of the double-panic
+        // abort. Best-effort diagnostic first so a working stderr still sees it.
+        let _ = writeln!(io::stderr(), "herdr client panic: {info}");
+        if let Some(original) = DEFAULT_PANIC_HOOK.get() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original(info)));
+        }
+    }));
+}
+
 fn run_client_with_mode(
     requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
@@ -1195,25 +1257,12 @@ fn run_client_with_mode(
         input::stdin_reader_loop(stdin_tx, &stdin_quit);
     });
 
-    // Install a panic hook to restore the terminal on panic. A panic is always
-    // a real exit, so it must NEVER honor the switch-handoff hold — force a
-    // full restore (leave alt-screen, raw off, pop kitty flags) so a panic
-    // mid-held-handoff cannot strand the shell (#69).
-    let in_tmux = std::env::var("TMUX").is_ok();
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if host_terminal_is_held() {
-            force_restore_host_terminal();
-        } else {
-            restore_terminal_state(in_tmux);
-        }
-        // Best-effort diagnostic first: if the chained hook dies (ratatui's
-        // hook eprints, and a dead stderr made that a double-panic abort with
-        // NO message -- #95), the user still gets this line when stderr
-        // works, and a hook panic is contained instead of aborting.
-        let _ = writeln!(io::stderr(), "herdr client panic: {info}");
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original_hook(info)));
-    }));
+    // Install herdr's terminal-restoring panic hook. It is re-asserted after
+    // every `ratatui::try_init` (see setup_terminal_with_capabilities) because
+    // that call installs ratatui's own hook on top of ours — and ratatui's hook
+    // `eprintln!`s while restoring, which is a second panic → abort on a dead
+    // stderr mid-handoff (the federation-switch crash; #95).
+    install_protective_panic_hook();
 
     // Create the tokio runtime.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1276,7 +1325,10 @@ fn run_client_with_mode(
                     force_restore_host_terminal();
                 }
                 held_restore.into_handoff();
-                eprintln!("herdr: failed to set up terminal: {setup_err}");
+                let _ = writeln!(
+                    io::stderr(),
+                    "herdr: failed to set up terminal: {setup_err}"
+                );
                 rt.shutdown_timeout(Duration::from_millis(100));
                 crate::logging::shutdown("client");
                 return Err(setup_err);
@@ -1300,7 +1352,12 @@ fn run_client_with_mode(
             held_restore.into_handoff();
         }
 
-        eprintln!("herdr: {err}");
+        // Non-panicking: a clean switch exits through here with err =
+        // "switching" while the terminal is mid-handoff and stderr may be
+        // broken. `eprintln!` would panic on that write, and the active hook
+        // (ratatui's, before this fix) would double-panic → abort — the
+        // federation-switch crash. `writeln!` just drops the diagnostic.
+        let _ = writeln!(io::stderr(), "herdr: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -1789,7 +1846,7 @@ async fn run_client_loop(
                         }
                         // No launcher to chain into (e.g. bare `herdr client`):
                         // stay attached and let the user switch manually.
-                        eprintln!("herdr: server requested switch to {ssh_target}, but no launcher is present (HERDR_SWITCH_FILE unset)");
+                        let _ = writeln!(io::stderr(), "herdr: server requested switch to {ssh_target}, but no launcher is present (HERDR_SWITCH_FILE unset)");
                     }
                     ServerMessage::Notify { kind, message } => {
                         handle_notify(kind, &message, &state.sound_config);
