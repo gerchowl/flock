@@ -1,0 +1,25 @@
+<svg role="img" aria-label="Flock sheep (placeholder logo)" xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#d9dad8"/>
+  <g fill="#303438">
+    <!-- woolly body: overlapping bumps -->
+    <path d="M150 300
+             a52 52 0 0 1 14-96
+             a56 56 0 0 1 96-30
+             a56 56 0 0 1 96 30
+             a52 52 0 0 1 14 96
+             a48 48 0 0 1 -30 78
+             a52 52 0 0 1 -160 0
+             a48 48 0 0 1 -30 -78 z"/>
+    <!-- head -->
+    <ellipse cx="256" cy="232" rx="44" ry="52" fill="#23262a"/>
+    <!-- ears -->
+    <ellipse cx="214" cy="214" rx="16" ry="26" fill="#23262a" transform="rotate(-28 214 214)"/>
+    <ellipse cx="298" cy="214" rx="16" ry="26" fill="#23262a" transform="rotate(28 298 214)"/>
+    <!-- eyes -->
+    <circle cx="240" cy="226" r="7" fill="#d9dad8"/>
+    <circle cx="272" cy="226" r="7" fill="#d9dad8"/>
+    <!-- legs -->
+    <rect x="206" y="380" width="16" height="56" rx="8" fill="#23262a"/>
+    <rect x="290" y="380" width="16" height="56" rx="8" fill="#23262a"/>
+  </g>
+</svg>
