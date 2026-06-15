@@ -1,5 +1,5 @@
 [package]
-name = "flock"
+name = "flock-ai"
 version = "0.6.8"
 edition = "2021"
 build = "build.rs"
@@ -10,6 +10,12 @@ homepage = "https://flock.dev"
 keywords = ["terminal", "tui", "ai", "agents", "multiplexer"]
 categories = ["command-line-utilities"]
 include = ["src/**/*", "assets/sounds/*", "assets/web/**/*", "README.md", "LICENSE", "Cargo.toml"]
+
+# crates.io package is `flock-ai` (the plain `flock` name is taken), but the
+# command users invoke stays `flock`.
+[[bin]]
+name = "flock"
+path = "src/main.rs"
 
 [features]
 # `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
