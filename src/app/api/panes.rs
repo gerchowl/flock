@@ -701,9 +701,9 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("issue")];
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         app
@@ -909,7 +909,7 @@ mod tests {
                 "rid".into(),
                 crate::api::schema::PaneReportPromptParams {
                     pane_id: public_pane_id.clone(),
-                    source: "herdr:claude".into(),
+                    source: "flock:claude".into(),
                     agent: "claude".into(),
                     prompt: prompt.into(),
                     seq: None,
@@ -967,7 +967,7 @@ mod tests {
             "rid".into(),
             crate::api::schema::PaneReportPromptParams {
                 pane_id: public_pane_id.clone(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 prompt: "fix the bug".into(),
                 seq: None,
@@ -977,7 +977,7 @@ mod tests {
             "rid-recap".into(),
             crate::api::schema::PaneReportRecapParams {
                 pane_id: public_pane_id.clone(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 recap: "fixed the parser bug".into(),
                 seq: None,
@@ -1036,7 +1036,7 @@ mod tests {
             "rid-p".into(),
             crate::api::schema::PaneReportPromptParams {
                 pane_id: public_pane_id.clone(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 prompt: "fix the bug".into(),
                 seq: None,
@@ -1046,7 +1046,7 @@ mod tests {
             "rid-r".into(),
             crate::api::schema::PaneReportReplyParams {
                 pane_id: public_pane_id.clone(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 reply: "I'll fix the parser at line 42.".into(),
                 seq: None,
@@ -1057,7 +1057,7 @@ mod tests {
             "rid-rc".into(),
             crate::api::schema::PaneReportRecapParams {
                 pane_id: public_pane_id.clone(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 recap: "\u{203b} recap: parser bug fixed. Next: ship PR.".into(),
                 seq: None,
@@ -1092,7 +1092,7 @@ mod tests {
             "rid".into(),
             crate::api::schema::PaneReportReplyParams {
                 pane_id: "w_99-1".into(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 reply: "nope".into(),
                 seq: None,
@@ -1104,7 +1104,7 @@ mod tests {
             "rid".into(),
             crate::api::schema::PaneReportReplyParams {
                 pane_id: public_pane_id,
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "   ".into(),
                 reply: "nope".into(),
                 seq: None,
@@ -1120,7 +1120,7 @@ mod tests {
             "rid".into(),
             crate::api::schema::PaneReportRecapParams {
                 pane_id: "w_99-1".into(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 recap: "nope".into(),
                 seq: None,
@@ -1132,7 +1132,7 @@ mod tests {
             "rid".into(),
             crate::api::schema::PaneReportRecapParams {
                 pane_id: public_pane_id,
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "   ".into(),
                 recap: "nope".into(),
                 seq: None,
@@ -1154,7 +1154,7 @@ mod tests {
                 "rid".into(),
                 crate::api::schema::PaneReportPromptParams {
                     pane_id: public_pane_id.clone(),
-                    source: "herdr:claude".into(),
+                    source: "flock:claude".into(),
                     agent: "claude".into(),
                     prompt: format!("entry-{i}\n{big_body}"),
                     seq: None,
@@ -1201,7 +1201,7 @@ mod tests {
             "req-1".into(),
             crate::api::schema::PaneReportPromptParams {
                 pane_id: public_pane_id,
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 prompt: "  fix the \u{1b}[31mparser\u{1b}[0m bug  ".into(),
                 seq: Some(1),

@@ -1,19 +1,19 @@
 [package]
-name = "herdr"
+name = "flock"
 version = "0.6.8"
 edition = "2021"
 build = "build.rs"
 description = "terminal workspace manager for AI coding agents"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/ogulcancelik/herdr"
-homepage = "https://herdr.dev"
+repository = "https://github.com/gerchowl/flock"
+homepage = "https://flock.dev"
 keywords = ["terminal", "tui", "ai", "agents", "multiplexer"]
 categories = ["command-line-utilities"]
 include = ["src/**/*", "assets/sounds/*", "assets/web/**/*", "README.md", "LICENSE", "Cargo.toml"]
 
 [features]
-# `herdr web`: xterm.js <-> herdr PTY bridge (gerchowl/herdr#131). Kept behind a
-# feature so axum/futures-util/rust-embed stay out of a default `herdr` build.
+# `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
+# feature so axum/futures-util/rust-embed stay out of a default `flock` build.
 # tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
 web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 

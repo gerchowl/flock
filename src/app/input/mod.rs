@@ -593,7 +593,7 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
 }
 
 #[cfg(test)]

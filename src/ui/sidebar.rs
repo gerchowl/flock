@@ -403,7 +403,7 @@ fn space_join(app: &AppState, key: &str) -> StateJoin {
 }
 
 /// The full state tally across every local workspace — the self server-row
-/// leading counts (#42: `0 2 1 herdr`).
+/// leading counts (#42: `0 2 1 flock`).
 fn local_server_tally(app: &AppState) -> StateTally {
     tally_states(
         app.workspaces
@@ -3176,9 +3176,9 @@ mod tests {
         let mut peer = peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         );
@@ -3314,15 +3314,15 @@ mod tests {
     fn remote_rows_fold_under_matching_local_project() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![
-            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("flock", "github.com/gerchowl/flock"),
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         )];
@@ -3361,8 +3361,8 @@ mod tests {
     fn remote_only_projects_trail_the_list_with_project_leader() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
-            "herdr",
-            "github.com/gerchowl/herdr",
+            "flock",
+            "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
             "sage",
@@ -3444,26 +3444,26 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         let space = |linked: bool| crate::workspace::WorktreeSpaceMembership {
             key: "family-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: if linked {
-                "/repo/herdr-wt".into()
+                "/repo/flock-wt".into()
             } else {
-                "/repo/herdr".into()
+                "/repo/flock".into()
             },
             is_linked_worktree: linked,
         };
-        let mut parent = workspace_with_project_key("herdr", "github.com/gerchowl/herdr");
+        let mut parent = workspace_with_project_key("flock", "github.com/gerchowl/flock");
         parent.worktree_space = Some(space(false));
-        let mut child = workspace_with_project_key("herdr-wt", "github.com/gerchowl/herdr");
+        let mut child = workspace_with_project_key("flock-wt", "github.com/gerchowl/flock");
         child.worktree_space = Some(space(true));
         app.workspaces = vec![parent, child];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         )];
@@ -3497,8 +3497,8 @@ mod tests {
         use crate::app::state::RemotePeerRef;
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
-            "herdr",
-            "github.com/gerchowl/herdr",
+            "flock",
+            "github.com/gerchowl/flock",
         )];
         // The spoke case: zero config peers, a carried snapshot whose peer
         // has a row matching the local project plus a remote-only project.
@@ -3508,9 +3508,9 @@ mod tests {
                 "anvil",
                 vec![
                     remote_summary(
-                        "herdr",
-                        Some("github.com/gerchowl/herdr"),
-                        Some("herdr"),
+                        "flock",
+                        Some("github.com/gerchowl/flock"),
+                        Some("flock"),
                         Some("fix/pty"),
                     ),
                     remote_summary(
@@ -3561,17 +3561,17 @@ mod tests {
         use crate::app::state::RemotePeerRef;
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
-            "herdr",
-            "github.com/gerchowl/herdr",
+            "flock",
+            "github.com/gerchowl/flock",
         )];
         // The spoke standing on sage: the hub (mba22) carries its OWN
         // workspaces as the origin summary (#66) — home-targeted, not ssh.
         let mut origin = peer_with_workspaces(
             "mba22",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("keyboard-shorcuts"),
             )],
         );
@@ -3613,22 +3613,22 @@ mod tests {
     fn config_peer_shadows_matching_snapshot_entry() {
         use crate::app::state::RemotePeerRef;
         let mut app = crate::app::state::AppState::test_new();
-        let herdr_row = || {
+        let flock_row = || {
             remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )
         };
         // Defensive hub-meets-snapshot case: "anvil" is both a live-polled
         // config peer and a carried snapshot entry (same ssh target). The
         // polled entry wins; the snapshot-only "sage" still folds in after.
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![herdr_row()])];
+        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![flock_row()])];
         app.fleet_snapshot = Some(snapshot_with_peers(
             "mba22",
             vec![
-                peer_with_workspaces("anvil", vec![herdr_row()]),
+                peer_with_workspaces("anvil", vec![flock_row()]),
                 peer_with_workspaces(
                     "sage",
                     vec![remote_summary(
@@ -3662,15 +3662,15 @@ mod tests {
     fn server_filter_local_hides_every_remote_row() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
-            "herdr",
-            "github.com/gerchowl/herdr",
+            "flock",
+            "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         )];
@@ -3703,15 +3703,15 @@ mod tests {
         use crate::app::state::RemotePeerRef;
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
-            "herdr",
-            "github.com/gerchowl/herdr",
+            "flock",
+            "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         )];
@@ -3728,9 +3728,9 @@ mod tests {
                         None,
                     ),
                     remote_summary(
-                        "herdr",
-                        Some("github.com/gerchowl/herdr"),
-                        Some("herdr"),
+                        "flock",
+                        Some("github.com/gerchowl/flock"),
+                        Some("flock"),
                         Some("main"),
                     ),
                     remote_summary(
@@ -3781,15 +3781,15 @@ mod tests {
     fn server_filter_clamps_scroll_and_hit_areas_to_filtered_entries() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![
-            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("flock", "github.com/gerchowl/flock"),
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![remote_summary(
-                "herdr",
-                Some("github.com/gerchowl/herdr"),
-                Some("herdr"),
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
                 Some("fix/pty"),
             )],
         )];
@@ -3880,8 +3880,8 @@ mod tests {
 
         let space = |idx: usize, linked: bool| WorktreeSpaceMembership {
             key: "grp".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: format!("/repo/ws-{idx}").into(),
             is_linked_worktree: linked,
         };
@@ -3930,8 +3930,8 @@ mod tests {
         use crate::workspace::WorktreeSpaceMembership;
         let space = |idx: usize, linked: bool| WorktreeSpaceMembership {
             key: "grp".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: format!("/repo/ws-{idx}").into(),
             is_linked_worktree: linked,
         };
@@ -4325,8 +4325,8 @@ mod tests {
             use crate::workspace::WorktreeSpaceMembership;
             app.workspaces[1].worktree_space = Some(WorktreeSpaceMembership {
                 key: "grp".into(),
-                label: "herdr".into(),
-                repo_root: "/repo/herdr".into(),
+                label: "flock".into(),
+                repo_root: "/repo/flock".into(),
                 checkout_path: "/repo/ws-2".into(),
                 is_linked_worktree: true,
             });
@@ -4349,8 +4349,8 @@ mod tests {
     /// `project_key`; the second member shares the repo family so they group.
     fn project_group_app(head_project_key: &str) -> crate::app::state::AppState {
         let mut app = crate::app::state::AppState::test_new();
-        let family = "/repo/herdr/.git";
-        let mut head = workspace_with_project_key("herdr", head_project_key);
+        let family = "/repo/flock/.git";
+        let mut head = workspace_with_project_key("flock", head_project_key);
         // Pin the family key so the worktree below shares the section.
         if let Some(space) = head.cached_git_space.as_mut() {
             space.key = family.into();
@@ -4373,7 +4373,7 @@ mod tests {
     /// grammar.
     #[test]
     fn leader_renders_owner_repo_identity_never_server_branch() {
-        let mut app = project_group_app("github.com/gerchowl/herdr");
+        let mut app = project_group_app("github.com/gerchowl/flock");
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
@@ -4381,7 +4381,7 @@ mod tests {
         assert!(!leader.indented);
         let row = buffer_row_text(&buffer, leader.rect, leader.rect.y);
         assert!(
-            row.contains("gerchowl/herdr"),
+            row.contains("gerchowl/flock"),
             "leader shows owner/repo: {row:?}"
         );
         assert!(
@@ -4437,7 +4437,7 @@ mod tests {
     #[test]
     fn solo_local_row_renders_project_identity_then_server_branch() {
         let mut app = crate::app::state::AppState::test_new();
-        let mut ws = workspace_with_project_key("herdr", "github.com/gerchowl/herdr");
+        let mut ws = workspace_with_project_key("flock", "github.com/gerchowl/flock");
         // Clear the test-only custom name so `local_member_target` falls through
         // to the branch — the issue's example uses a branch tail.
         ws.custom_name = None;
@@ -4456,7 +4456,7 @@ mod tests {
         );
         let row = buffer_row_text(&buffer, card.rect, card.rect.y);
         let server = crate::ui::grammar::local_server_name();
-        let expected_tail = format!("gerchowl/herdr \u{00b7} {server}:keyboard-shorcuts");
+        let expected_tail = format!("gerchowl/flock \u{00b7} {server}:keyboard-shorcuts");
         assert!(
             row.contains(&expected_tail),
             "solo local carries identity + member locator: {row:?}"
@@ -4514,7 +4514,7 @@ mod tests {
     #[test]
     fn collapsed_leader_keeps_rects_for_both_leader_kinds() {
         // Local-main-headed, collapsed: rects present.
-        let mut app = project_group_app("github.com/gerchowl/herdr");
+        let mut app = project_group_app("github.com/gerchowl/flock");
         set_pane_state(&mut app, 0, AgentState::Blocked, true);
         set_pane_state(&mut app, 1, AgentState::Working, true);
         let key = app.project_section_key(0).expect("section key");
@@ -4537,9 +4537,9 @@ mod tests {
             .expect("section key after main close");
         app.collapsed_space_keys.insert(key);
         // Need a second member so it stays a group after main closed.
-        let mut extra = workspace_with_project_key("feature2", "github.com/gerchowl/herdr");
+        let mut extra = workspace_with_project_key("feature2", "github.com/gerchowl/flock");
         if let Some(space) = extra.cached_git_space.as_mut() {
-            space.key = "/repo/herdr/.git".into();
+            space.key = "/repo/flock/.git".into();
             space.is_linked_worktree = true;
         }
         app.workspaces.push(extra);
@@ -4623,10 +4623,10 @@ mod tests {
         plain.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "grp".into(),
             checkout_key: "/repo/scratch".into(),
-            label: "herdr".into(),
+            label: "flock".into(),
             repo_root: std::path::PathBuf::from("/repo/scratch"),
             is_linked_worktree: false,
-            project_key: "dir:herdr".into(),
+            project_key: "dir:flock".into(),
         });
         app.workspaces.push(plain);
         app.ensure_test_terminals();
@@ -4881,7 +4881,7 @@ mod tests {
     #[tokio::test]
     async fn all_workspaces_agent_panel_entries_use_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(
-            "herdr-agent-panel-runtime-cwd-{}-{}",
+            "flock-agent-panel-runtime-cwd-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4890,7 +4890,7 @@ mod tests {
         );
         let root = std::env::temp_dir().join(unique);
         let stale_cwd = root.join("issue-264-nix-support");
-        let live_cwd = root.join("herdr");
+        let live_cwd = root.join("flock");
         std::fs::create_dir_all(stale_cwd.join(".git")).unwrap();
         std::fs::create_dir_all(live_cwd.join(".git")).unwrap();
 
@@ -4942,7 +4942,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(root);
 
-        assert_eq!(primary_label, "herdr");
+        assert_eq!(primary_label, "flock");
     }
 
     #[test]
@@ -5029,8 +5029,8 @@ mod tests {
         if let Some(key) = key {
             ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
                 key: key.into(),
-                label: "herdr".into(),
-                repo_root: std::path::PathBuf::from("/repo/herdr"),
+                label: "flock".into(),
+                repo_root: std::path::PathBuf::from("/repo/flock"),
                 checkout_path: std::path::PathBuf::from(checkout_key),
                 is_linked_worktree: name != "main",
             });
@@ -5043,7 +5043,7 @@ mod tests {
         ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: key.into(),
             checkout_key: format!("/repo/{name}"),
-            label: "herdr".into(),
+            label: "flock".into(),
             repo_root: std::path::PathBuf::from(format!("/repo/{name}")),
             is_linked_worktree: false,
             project_key: format!("dir:{key}"),
@@ -5055,8 +5055,8 @@ mod tests {
     fn parent_workspace_row_stays_clickable_when_grouped() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
 
         let (cards, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 20));
@@ -5120,9 +5120,9 @@ mod tests {
     fn compact_space_group_scroll_offset_can_start_inside_group() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("one", Some("repo-key"), "/repo/herdr-one"),
-            workspace_with_worktree_space("two", Some("repo-key"), "/repo/herdr-two"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("one", Some("repo-key"), "/repo/flock-one"),
+            workspace_with_worktree_space("two", Some("repo-key"), "/repo/flock-two"),
         ];
         let area = Rect::new(0, 0, 30, 20);
         app.workspace_scroll = normalized_workspace_scroll(&app, area, 2);
@@ -5138,8 +5138,8 @@ mod tests {
     fn workspace_scroll_metrics_count_display_entries_not_raw_workspaces() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
             Workspace::test_new("notes"),
         ];
         app.collapsed_space_keys.insert("repo-key".into());
@@ -5158,8 +5158,8 @@ mod tests {
     fn workspace_scroll_offset_applies_to_group_children() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
             Workspace::test_new("notes"),
         ];
         app.collapsed_space_keys.insert("repo-key".into());
@@ -5178,8 +5178,8 @@ mod tests {
     fn workspace_list_entries_group_multiple_workspaces_in_same_git_space() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
 
         assert_eq!(
@@ -5203,8 +5203,8 @@ mod tests {
         // on its members, with the first member promoted to the section head.
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
-            workspace_with_worktree_space("fix", Some("repo-key"), "/repo/herdr-fix"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
+            workspace_with_worktree_space("fix", Some("repo-key"), "/repo/flock-fix"),
         ];
 
         assert_eq!(
@@ -5229,9 +5229,9 @@ mod tests {
     fn workspace_list_entries_group_non_contiguous_explicit_members() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
             workspace_with_git_space("normal", "other-key"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
 
         assert_eq!(
@@ -5257,8 +5257,8 @@ mod tests {
     fn spaces_current_scope_renders_only_focused_group() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
             Workspace::test_new("notes"),
         ];
         app.mode = Mode::Terminal;
@@ -5300,8 +5300,8 @@ mod tests {
     fn spaces_current_scope_stays_orthogonal_to_group_collapse() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
             Workspace::test_new("notes"),
         ];
         app.mode = Mode::Terminal;
@@ -5339,16 +5339,16 @@ mod tests {
     fn spaces_current_scope_keeps_focused_project_remotes_and_hides_remote_only_projects() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("flock", "github.com/gerchowl/flock"),
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "anvil",
             vec![
                 remote_summary(
-                    "herdr",
-                    Some("github.com/gerchowl/herdr"),
-                    Some("herdr"),
+                    "flock",
+                    Some("github.com/gerchowl/flock"),
+                    Some("flock"),
                     Some("fix/pty"),
                 ),
                 remote_summary(
@@ -5385,8 +5385,8 @@ mod tests {
     fn spaces_current_scope_clamps_keyboard_selection_to_visible_entries() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
             Workspace::test_new("notes"),
         ];
         app.mode = Mode::Navigate;
@@ -5465,9 +5465,9 @@ mod tests {
     fn plain_same_repo_workspace_attaches_to_its_project_section() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
             workspace_with_git_space("scratch", "repo-key"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
 
         assert_eq!(
@@ -5497,17 +5497,17 @@ mod tests {
     #[test]
     fn same_origin_checkouts_merge_into_one_section_keyed_by_membership() {
         let mut app = AppState::test_new();
-        let mut main = workspace_with_project_key("herdr", "github.com/gerchowl/herdr");
+        let mut main = workspace_with_project_key("flock", "github.com/gerchowl/flock");
         main.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "family-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
         // A separate clone of the same origin: different common dir, no
         // membership.
-        let clone = workspace_with_project_key("herdr-clone", "github.com/gerchowl/herdr");
+        let clone = workspace_with_project_key("flock-clone", "github.com/gerchowl/flock");
         app.workspaces = vec![main, clone];
 
         assert_eq!(
@@ -5625,7 +5625,7 @@ mod tests {
         notes.git_identity_resolved = true;
         app.workspaces = vec![
             notes,
-            workspace_with_project_key("herdr", "github.com/gerchowl/herdr"),
+            workspace_with_project_key("flock", "github.com/gerchowl/flock"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "sage",
@@ -5684,8 +5684,8 @@ mod tests {
     fn collapsed_group_hides_inactive_children_but_keeps_active_visible() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
         app.active = Some(1);
         app.mode = Mode::Terminal;
@@ -5720,8 +5720,8 @@ mod tests {
     fn collapsed_group_keeps_selected_child_visible_in_navigate_mode() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
-            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
-            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
         app.mode = Mode::Navigate;
         app.selected = 1;

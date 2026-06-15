@@ -1,7 +1,7 @@
 //! Stdin input reading for the thin client.
 //!
 //! Reads stdin bytes and forwards framed input to the main event loop.
-//! Unlike the monolithic herdr, the thin client does NOT parse input into
+//! Unlike the monolithic flock, the thin client does NOT parse input into
 //! key/mouse/paste events. It keeps enough byte-framing state to avoid splitting
 //! terminal control strings, then sends bytes to the server as `ClientMessage::Input`.
 //! The server handles semantic parsing.

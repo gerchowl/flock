@@ -1,5 +1,5 @@
 {
-  description = "herdr — terminal workspace manager for AI coding agents";
+  description = "flock — terminal workspace manager for AI coding agents";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -29,36 +29,36 @@
         system:
         let
           pkgs = pkgsFor system;
-          herdr = pkgs.callPackage ./nix/package.nix {
+          flock = pkgs.callPackage ./nix/package.nix {
             buildChannel = "fork";
             buildId = self.shortRev or self.dirtyShortRev or null;
           };
-          # Same binary plus the `web` feature (the `herdr web` xterm bridge,
-          # gerchowl/herdr#131). Kept out of `default` so a stock build stays
+          # Same binary plus the `web` feature (the `flock web` xterm bridge,
+          # gerchowl/flock#131). Kept out of `default` so a stock build stays
           # lean; hosts that serve the web terminal pin this output.
-          herdr-web = pkgs.callPackage ./nix/package.nix {
+          flock-web = pkgs.callPackage ./nix/package.nix {
             buildChannel = "fork";
             buildId = self.shortRev or self.dirtyShortRev or null;
             withWeb = true;
           };
         in
         {
-          inherit herdr herdr-web;
-          default = herdr;
+          inherit flock flock-web;
+          default = flock;
         }
       );
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/herdr";
-          meta.description = "Run Herdr";
+          program = "${self.packages.${system}.default}/bin/flock";
+          meta.description = "Run Flock";
         };
       });
 
       checks = forAllSystems (system: {
-        herdr = self.packages.${system}.default;
-        default = self.checks.${system}.herdr;
+        flock = self.packages.${system}.default;
+        default = self.checks.${system}.flock;
       });
 
       devShells = forAllSystems (
@@ -68,7 +68,7 @@
         in
         {
           # guardrails brings the governance toolbelt (prek/gitleaks/cargo-deny/
-          # …) and auto-installs the pre-commit hooks; `extra` carries herdr's
+          # …) and auto-installs the pre-commit hooks; `extra` carries flock's
           # own build toolchain. SDKROOT comes from the darwin stdenv for free,
           # so the only env we restore is the libghostty-vt build tuning.
           default = guardrails.lib.${system}.mkDevShell {
@@ -98,7 +98,7 @@
       formatter = forAllSystems (system: (pkgsFor system).nixfmt);
 
       overlays.default = final: _prev: {
-        herdr = final.callPackage ./nix/package.nix {
+        flock = final.callPackage ./nix/package.nix {
           buildChannel = "fork";
           buildId = self.shortRev or self.dirtyShortRev or null;
         };

@@ -1,4 +1,4 @@
-# herdr website
+# flock website
 
 The homepage is `index.html`. The documentation source is in `src/content/docs/` and is rendered by Astro Starlight.
 

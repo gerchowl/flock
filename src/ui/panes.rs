@@ -1196,8 +1196,8 @@ mod tests {
     #[test]
     fn owner_qualified_project_parses_origin_keys() {
         assert_eq!(
-            owner_qualified_project(Some("github.com/gerchowl/herdr"), "herdr"),
-            "gerchowl/herdr"
+            owner_qualified_project(Some("github.com/gerchowl/flock"), "flock"),
+            "gerchowl/flock"
         );
         // gitlab nested groups: top-level org qualifies
         assert_eq!(

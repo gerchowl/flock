@@ -196,7 +196,7 @@ impl App {
                             "-o",
                             "ConnectTimeout=5",
                             &target,
-                            &format!("sh -lc 'herdr workspace focus --workspace {id}'"),
+                            &format!("sh -lc 'flock workspace focus --workspace {id}'"),
                         ])
                         .stdin(std::process::Stdio::null())
                         .output();
@@ -422,8 +422,8 @@ mod tests {
         origin.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
             id: "ws_7".to_string(),
             workspace: "keyboard-shorcuts".to_string(),
-            project_key: Some("github.com/gerchowl/herdr".to_string()),
-            project_label: Some("herdr".to_string()),
+            project_key: Some("github.com/gerchowl/flock".to_string()),
+            project_label: Some("flock".to_string()),
             branch: Some("keyboard-shorcuts".to_string()),
             is_linked_worktree: true,
             agent: Some("cc".to_string()),

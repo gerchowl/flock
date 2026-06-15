@@ -1,0 +1,88 @@
+# pr archive (gerchowl/herdr) — 86 items
+
+- [#1](0001-feat-pane-float-the-last-submitted-prompt-over-agent-panes.md) `MERGED` — feat(pane): float the last submitted prompt over agent panes
+- [#2](0002-fix-worktree-close-two-merge-gate-blind-spots.md) `MERGED` — fix(worktree): close two merge-gate blind spots
+- [#3](0003-fix-worktree-gh-merge-evidence-must-match-the-local-branch-t.md) `MERGED` — fix(worktree): gh merge evidence must match the local branch tip
+- [#4](0004-feat-cli-herdr-worktree-kill-scriptable-merge-gated-cleanup.md) `MERGED` — feat(cli): herdr worktree kill — scriptable merge-gated cleanup
+- [#5](0005-feat-ui-operator-hud-reserved-pane-headers-global-status-lin.md) `MERGED` — feat(ui): operator HUD — reserved pane headers + global status line
+- [#6](0006-docs-agents-codify-the-fork-fleet-pr-flow.md) `MERGED` — docs(agents): codify the fork fleet PR flow
+- [#7](0007-feat-ui-gh-aware-branch-segment-in-the-pane-header.md) `MERGED` — feat(ui): gh-aware branch segment in the pane header
+- [#8](0008-feat-agents-workspace-scoped-attention-cycling.md) `MERGED` — feat(agents): workspace-scoped attention cycling
+- [#9](0009-style-ui-transparent-pane-header-hairline-divider-left-align.md) `MERGED` — style(ui): transparent pane header + hairline divider; left-aligned status line
+- [#10](0010-chore-dist-latest-branch-channel-for-nix-consumers.md) `MERGED` — chore(dist): latest branch channel for Nix consumers
+- [#11](0011-fix-agents-scoped-attention-fallback-cycles-all-workspace-pa.md) `MERGED` — fix(agents): scoped-attention fallback cycles all workspace panes
+- [#12](0012-feat-agents-project-scoped-attention-repo-family-agent-unit.md) `MERGED` — feat(agents): project-scoped attention — repo family, agent unit
+- [#13](0013-feat-api-peer-pid-pane-resolution-hostname-in-status-line.md) `MERGED` — feat(api): peer-PID pane resolution + hostname in status line
+- [#14](0014-perf-api-memoize-ancestry-resolved-pane-ids-into-the-alias-m.md) `MERGED` — perf(api): memoize ancestry-resolved pane ids into the alias map
+- [#15](0015-fix-ids-ancestry-verify-claimed-pane-ids-evict-duplicate-ses.md) `MERGED` — fix(ids): ancestry-verify claimed pane ids; evict duplicate session refs
+- [#17](0017-feat-sidebar-collapse-all-keybind-auto-collapse-traffic-ligh.md) `MERGED` — feat(sidebar): collapse-all keybind + auto-collapse + traffic-light counts
+- [#18](0018-feat-peers-c-symmetric-peer-federation-folded-sidebar-switch.md) `MERGED` — feat(peers): C′ symmetric peer federation — folded sidebar + switch-on-select
+- [#19](0019-feat-peers-servers-section-per-machine-health-free-latency-s.md) `MERGED` — feat(peers): servers section — per-machine health, free latency, switch-on-click
+- [#20](0020-fix-sidebar-stop-status-row-flickering-between-spinner-text.md) `MERGED` — fix(sidebar): stop status row flickering between spinner text and state label
+- [#21](0021-chore-dev-wire-gerchowl-guardrails-governance-into-the-flake.md) `MERGED` — chore(dev): wire gerchowl/guardrails governance into the flake devShell
+- [#22](0022-chore-dev-promote-no-fake-impl-no-commented-code-to-hard-gat.md) `MERGED` — chore(dev): promote no-fake-impl + no-commented-code to hard gates
+- [#23](0023-feat-scroll-shift-pageup-down-home-end-shift-wheel-scroll-he.md) `MERGED` — feat(scroll): Shift+PageUp/Down/Home/End + Shift+wheel scroll herdr scrollback
+- [#24](0024-feat-hud-stable-hostname-header-divider-fix-prompt-expand-ke.md) `MERGED` — feat(hud): stable hostname, header divider fix, prompt-expand keybind + in-place expand
+- [#26](0026-feat-workspace-tab-mode-workspace-new-tab-spawns-a-sibling-w.md) `MERGED` — feat(workspace): tab_mode=workspace — new_tab spawns a sibling workspace (#25)
+- [#27](0027-feat-hud-owner-qualify-the-header-repo-segment-org-person-re.md) `MERGED` — feat(hud): owner-qualify the header repo segment (org|person/repo)
+- [#28](0028-feat-float-ephemeral-floating-pane-25.md) `MERGED` — feat(float): ephemeral floating pane (#25)
+- [#31](0031-feat-nix-bake-fork-build-identity-into-the-version-string.md) `MERGED` — feat(nix): bake fork build identity into the version string
+- [#34](0034-feat-ui-servers-band-v2-self-row-glyph-health-two-line-rows.md) `MERGED` — feat(ui): servers band v2 — self row, glyph health, two-line rows (#32)
+- [#35](0035-chore-dev-adopt-gerchowl-guardrails-flake-input-hard-gates-t.md) `OPEN` — chore(dev): adopt gerchowl/guardrails — flake input, hard gates, tracing facade
+- [#37](0037-feat-integrate-fork-s-consolidated-feature-set-onto-guardrai.md) `OPEN` — feat: integrate fork's consolidated feature set onto guardrails base (sidebar-row-gap → master)
+- [#39](0039-feat-federation-hub-and-spoke-client-carried-fleet-snapshot.md) `MERGED` — feat(federation): hub-and-spoke — client-carried fleet snapshot, home row, switch_home (#36)
+- [#43](0043-feat-ui-pane-header-divider-speaks-the-border-focus-language.md) `MERGED` — feat(ui): pane header divider speaks the border focus language (SSoT)
+- [#44](0044-feat-sidebar-section-divider-parity-all-current-scope-toggle.md) `MERGED` — feat(sidebar): section divider parity + all/current scope toggles (#41)
+- [#48](0048-feat-ui-ring-medallion-helper-multi-color-concentric-status.md) `MERGED` — feat(ui): ring-medallion helper — multi-color concentric status rings in sub-cell blocks (#42)
+- [#49](0049-feat-float-mouse-routing-host-scrollback-live-cwd-title-30.md) `OPEN` — feat(float): mouse routing, host scrollback, live cwd title (#30)
+- [#50](0050-feat-pane-promotable-header-fields-set-field-clear-field-40.md) `MERGED` — feat(pane): promotable header fields — set-field/clear-field (#40)
+- [#51](0051-feat-federation-fold-carried-fleet-into-the-spaces-list-per.md) `MERGED` — feat(federation): fold carried fleet into the spaces list + per-server filter (#46)
+- [#52](0052-feat-client-attach-retry-during-handoff-port-client-terminal.md) `MERGED` — feat(client): attach retry during handoff + port client terminal theme to remote servers (#38, #47)
+- [#53](0053-fix-e2e-taller-switch-snapshot-frames-pinned-menu-band-pushe.md) `MERGED` — fix(e2e): taller switch-snapshot frames — pinned menu band pushed the folded remote row below the 30-row fold
+- [#54](0054-feat-ui-state-language-ssot-join-medallion-rects-circles-acr.md) `MERGED` — feat(ui): state-language SSoT — join + medallion/rects/circles across servers, spaces, workspaces (#42)
+- [#55](0055-feat-ui-medallion-v2-6x6-canvas-nested-rectangular-bands-42.md) `MERGED` — feat(ui): medallion v2 — 6x6 canvas, nested rectangular bands (#42)
+- [#56](0056-feat-sidebar-git-first-restructure-project-sections-primary.md) `MERGED` — feat(sidebar): git-first restructure — project sections, primary rows, member tab-strip (#33)
+- [#58](0058-feat-ui-band-leading-counts-0-2-1-name-global-digit-width-gh.md) `MERGED` — feat(ui): band leading counts — 0 2 1 <name>, global digit width, ghost rows (#42)
+- [#59](0059-fix-ui-no-conn-glyph-is-link-variant-off-not-md-link.md) `MERGED` — fix(ui): no-conn glyph is link_variant_off, not md-link
+- [#60](0060-feat-dev-sccache-in-the-devshell-worktrees-inherit-the-compi.md) `MERGED` — feat(dev): sccache in the devShell — worktrees inherit the compile cache
+- [#61](0061-chore-dev-sccache-via-guardrails-toolbelt-fleet-shared-cache.md) `MERGED` — chore(dev): sccache via guardrails toolbelt (fleet-shared cache)
+- [#64](0064-feat-ui-band-name-first-layout-sidebar-branch-glyph-rect-ded.md) `MERGED` — feat(ui): band name-first layout + sidebar branch glyph + rect dedup
+- [#67](0067-fix-federation-spaces-remote-row-switch-pre-connected-swap-f.md) `MERGED` — fix(federation): spaces remote-row switch + pre-connected swap + failure notice (#63)
+- [#71](0071-fix-input-map-kitty-keypad-functional-codes-numpad-works-aga.md) `MERGED` — fix(input): map kitty keypad functional codes — numpad works again (#70)
+- [#72](0072-fix-client-unconditional-terminal-restore-visible-progress-o.md) `MERGED` — fix(client): unconditional terminal restore + visible progress on the held screen (#69)
+- [#73](0073-feat-federation-origin-summary-rides-the-down-gossip-spokes.md) `MERGED` — feat(federation): origin summary rides the down-gossip — spokes see the hub's spaces (#66)
+- [#74](0074-feat-sidebar-restyle-v3-identity-headers-server-branch-gramm.md) `MERGED` — feat(sidebar): restyle v3 — identity headers, server:branch grammar, agent icons, single-row agents (#62)
+- [#76](0076-feat-client-connection-slots-multi-connection-client-warm-al.md) `MERGED` — feat(client): connection slots — multi-connection client, warm-all, pointer-flip switching (#65)
+- [#81](0081-fix-sidebar-leaders-render-the-project-identity-rects-only-w.md) `MERGED` — fix(sidebar): leaders render the project identity; rects only when collapsed (#78)
+- [#82](0082-fix-terminal-re-assert-pane-geometry-on-attach-switch-scroll.md) `MERGED` — fix(terminal): re-assert pane geometry on attach/switch; scrollback reflow (#77)
+- [#84](0084-refactor-sidebar-kick-the-home-star-ornaments-position-highl.md) `MERGED` — refactor(sidebar): kick the home/star ornaments — position + highlight say it
+- [#86](0086-federation-v2-fork-feature-train-master.md) `MERGED` — Federation v2 + fork feature train → master
+- [#87](0087-feat-panes-single-panes-keep-the-focus-outline-always-framed.md) `MERGED` — feat(panes): single panes keep the focus outline (always framed)
+- [#89](0089-fix-float-restore-lost-49-mouse-routing-scroll-blur-dismiss.md) `MERGED` — fix(float): restore lost #49 (mouse routing/scroll) + blur dismiss (#88)
+- [#90](0090-feat-sidebar-fleet-stable-space-order-85.md) `MERGED` — feat(sidebar): fleet-stable space order (#85)
+- [#91](0091-feat-panes-flush-scrollbar-on-the-border-focus-colored.md) `MERGED` — feat(panes): flush scrollbar on the border, focus-colored
+- [#97](0097-fix-sidebar-solo-local-rows-carry-the-project-identity-92.md) `MERGED` — fix(sidebar): solo local rows carry the project identity (#92)
+- [#98](0098-feat-pane-prompt-history-scrollback-with-recaps-96.md) `MERGED` — feat(pane): prompt history scrollback with recaps (#96)
+- [#99](0099-feat-client-cancellable-switch-popup-over-slot-cold-dials-93.md) `MERGED` — feat(client): cancellable switch popup over slot cold dials (#93)
+- [#101](0101-fix-sidebar-rows-heading-remote-folds-are-leaders-not-solos.md) `MERGED` — fix(sidebar): rows heading remote folds are leaders, not solos
+- [#104](0104-fix-client-slots-cold-dial-carries-the-hub-fleet-snapshot-10.md) `MERGED` — fix(client): slots cold dial carries the hub fleet snapshot (#102)
+- [#107](0107-feat-branch-inject-a-one-shot-pivot-prompt-into-the-forked-a.md) `MERGED` — feat(branch): inject a one-shot pivot prompt into the forked agent (#106)
+- [#110](0110-feat-sidebar-new-blank-workspace-from-home-spaces-header-new.md) `MERGED` — feat(sidebar): new blank workspace from home + spaces-header new + right-click branch (#105)
+- [#111](0111-feat-config-in-app-config-editor-config-local-toml-overlay-1.md) `MERGED` — feat(config): in-app config editor + config.local.toml overlay (#108)
+- [#113](0113-test-federation-slots-enabled-switch-and-render-coverage-103.md) `MERGED` — test(federation): slots-enabled switch-and-render coverage (#103)
+- [#116](0116-fix-remote-federation-switch-fails-with-notice-instead-of-an.md) `MERGED` — fix(remote): federation switch fails-with-notice instead of an install prompt that corrupts the terminal (#115)
+- [#117](0117-fix-terminal-re-assert-pane-geometry-on-in-session-workspace.md) `MERGED` — fix(terminal): re-assert pane geometry on in-session workspace/pane switch (#114)
+- [#118](0118-fix-client-server-switch-no-longer-double-panics-to-sigabrt.md) `MERGED` — fix(client): server switch no longer double-panics to SIGABRT
+- [#119](0119-feat-float-drag-select-and-copy-text-in-float-panes.md) `MERGED` — feat(float): drag-select and copy text in float panes
+- [#120](0120-chore-gitignore-claude.md) `MERGED` — chore: gitignore .claude/
+- [#135](0135-fix-remote-bound-switch-ssh-probes-with-batchmode-connecttim.md) `MERGED` — fix(remote): bound switch SSH probes with BatchMode + ConnectTimeout
+- [#137](0137-perf-remote-collapse-cold-switch-discovery-into-one-ssh-roun.md) `MERGED` — perf(remote): collapse cold-switch discovery into one SSH round-trip
+- [#138](0138-feat-client-bound-cold-switch-dial-with-an-overall-deadline.md) `MERGED` — feat(client): bound cold-switch dial with an overall deadline
+- [#140](0140-feat-integration-publish-the-integration-contract-as-data-in.md) `MERGED` — feat(integration): publish the integration contract as data (`integration manifest`)
+- [#144](0144-feat-float-replies-recaps-as-distinct-kinds-stop-hook-captur.md) `MERGED` — feat(float): replies + recaps as distinct kinds, Stop-hook capture, task-notification filter
+- [#146](0146-feat-client-pre-warm-cold-ssh-peers-so-their-switches-flip-i.md) `MERGED` — feat(client): pre-warm cold ssh peers so their switches flip instantly
+- [#153](0153-feat-web-first-class-herdr-web-bridge-xterm-js-over-tailscal.md) `MERGED` — feat(web): first-class `herdr web` bridge (xterm.js over tailscale) (#131)
+- [#154](0154-feat-web-identity-allow-list-idle-timeout-session-cap-sessio.md) `MERGED` — feat(web): identity allow-list, idle timeout + session cap, --session (#147 #148 #151)
+- [#155](0155-feat-nix-expose-a-web-enabled-herdr-web-package-149.md) `MERGED` — feat(nix): expose a web-enabled herdr-web package (#149)
+- [#156](0156-feat-web-badge-auto-hide-on-screen-key-bar-touch-mouse-128-1.md) `MERGED` — feat(web): badge auto-hide, on-screen key bar, touch→mouse (#128 #129 #130)
+- [#157](0157-ci-latest-branch-trigger-on-master-build-herdr-web.md) `MERGED` — ci(latest-branch): trigger on master + build herdr-web

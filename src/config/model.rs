@@ -46,7 +46,7 @@ impl Default for UpdateConfig {
 pub enum ToastDelivery {
     #[default]
     Off,
-    Herdr,
+    Flock,
     Terminal,
     System,
 }
@@ -161,7 +161,7 @@ pub enum ShellModeConfig {
     NonLogin,
 }
 
-/// What `new_tab` creates (spike gerchowl/herdr#25). In `workspace` mode the
+/// What `new_tab` creates (spike gerchowl/flock#25). In `workspace` mode the
 /// workspace is the unit: "new tab" spawns a SIBLING WORKSPACE in the same
 /// space group (membership cloned, cwd pinned to the checkout) instead of a
 /// tab. The tab model itself is untouched — existing tabs keep working and
@@ -175,7 +175,7 @@ pub enum TabModeConfig {
 }
 
 /// Leading state mark on servers-band rows (#42): `counts` (the default —
-/// fixed r/y/g count columns, `0 2 1 herdr`, zeros muted, band-global digit
+/// fixed r/y/g count columns, `0 2 1 flock`, zeros muted, band-global digit
 /// width) or the rectangular state medallion in `medallion_sextant`
 /// (2x3 sub-blocks via Symbols for Legacy Computing) / `medallion_quadrant`
 /// (2x2 half blocks for fonts without sextant coverage).
@@ -203,7 +203,7 @@ pub struct TerminalConfig {
 #[serde(default)]
 pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
-    /// when restoring a Herdr session. Default: true.
+    /// when restoring a Flock session. Default: true.
     pub resume_agents_on_restore: bool,
 }
 
@@ -389,7 +389,7 @@ pub struct KeysConfig {
     pub edit_scrollback: BindingConfig,
     /// Open the live config (or the user overlay, if the base is a
     /// read-only symlink) in $EDITOR. Unset by default. On close,
-    /// herdr reloads the config and rolls back on a Failed apply.
+    /// flock reloads the config and rolls back on a Failed apply.
     pub edit_config: BindingConfig,
     /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
     pub copy_mode: BindingConfig,
@@ -441,9 +441,9 @@ pub struct IndexedKeysConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct WorktreesConfig {
-    /// Root directory under which Herdr creates <repo>/<branch-slug> checkouts.
+    /// Root directory under which Flock creates <repo>/<branch-slug> checkouts.
     pub directory: String,
-    /// Adopt workspaces that sit in linked git worktrees Herdr didn't create:
+    /// Adopt workspaces that sit in linked git worktrees Flock didn't create:
     /// they group under their open parent repo workspace and get the managed
     /// worktree actions. Default: true.
     pub adopt_external: bool,
@@ -456,7 +456,7 @@ pub struct WorktreesConfig {
     pub branch_pivot_message: String,
 }
 
-/// A federated peer Herdr server. Declared as `[[peers]]` entries. Peers are
+/// A federated peer Flock server. Declared as `[[peers]]` entries. Peers are
 /// polled over SSH for a lightweight workspace/agent summary; their rows fold
 /// into the sidebar's project groups and selecting one switches the client to
 /// that server.
@@ -468,7 +468,7 @@ pub struct PeerConfig {
     /// SSH destination used for polling and attach. Defaults to `name`.
     pub ssh: String,
     /// Command run on the peer to fetch its summary. The default wraps the
-    /// herdr CLI in a login shell so profile-managed PATHs (nix, brew) apply.
+    /// flock CLI in a login shell so profile-managed PATHs (nix, brew) apply.
     pub summary_command: String,
 }
 
@@ -483,7 +483,7 @@ impl Default for PeerConfig {
 }
 
 pub fn default_peer_summary_command() -> &'static str {
-    "sh -lc 'herdr peers summary --json'"
+    "sh -lc 'flock peers summary --json'"
 }
 
 impl PeerConfig {
@@ -505,7 +505,7 @@ pub struct UiConfig {
     pub sidebar_min_width: u16,
     /// Maximum sidebar width (columns) when expanded. Default: 36.
     pub sidebar_max_width: u16,
-    /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
+    /// Terminal width at or below which Flock uses the mobile single-column layout. Default: 64.
     pub mobile_width_threshold: u16,
     /// Blank rows between sidebar list entries (workspaces and agents). Default: 1, max: 3.
     pub sidebar_row_gap: u16,
@@ -523,7 +523,7 @@ pub struct UiConfig {
     /// Show the global machine status line (cpu/mem/disk/battery/net/gpu)
     /// above the tab bar. Default: true.
     pub status_line: bool,
-    /// Capture mouse input for Herdr's mouse UI. Default: true.
+    /// Capture mouse input for Flock's mouse UI. Default: true.
     pub mouse_capture: bool,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
     pub right_click_passthrough_modifier: RightClickPassthroughModifierConfig,
@@ -657,7 +657,7 @@ impl Default for SlotsConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
-    /// Allow launching herdr inside an existing herdr pane. Default: false.
+    /// Allow launching flock inside an existing flock pane. Default: false.
     pub allow_nested: bool,
     /// Experimental local Kitty graphics rendering for attached clients. Default: false.
     pub kitty_graphics: bool,
@@ -771,7 +771,7 @@ fn default_branch_pivot_message() -> &'static str {
 impl Default for WorktreesConfig {
     fn default() -> Self {
         Self {
-            directory: "~/.herdr/worktrees".into(),
+            directory: "~/.flock/worktrees".into(),
             adopt_external: true,
             branch_pivot_message: default_branch_pivot_message().to_string(),
         }
@@ -845,7 +845,7 @@ impl<'de> Deserialize<'de> for ToastConfig {
 
         let raw = RawToastConfig::deserialize(deserializer)?;
         let legacy_delivery = match raw.enabled {
-            Some(true) => ToastDelivery::Herdr,
+            Some(true) => ToastDelivery::Flock,
             Some(false) | None => ToastDelivery::Off,
         };
         let delivery = raw.delivery.unwrap_or(legacy_delivery);
@@ -995,14 +995,14 @@ show_agent_labels_on_pane_borders = true
     #[test]
     fn worktrees_directory_defaults_and_parses() {
         let default_config = Config::default();
-        assert_eq!(default_config.worktrees.directory, "~/.herdr/worktrees");
+        assert_eq!(default_config.worktrees.directory, "~/.flock/worktrees");
 
         let toml = r#"
 [worktrees]
-directory = "~/Projects/herdr-worktrees"
+directory = "~/Projects/flock-worktrees"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.worktrees.directory, "~/Projects/herdr-worktrees");
+        assert_eq!(config.worktrees.directory, "~/Projects/flock-worktrees");
     }
 
     #[test]
@@ -1299,13 +1299,13 @@ delivery = "system"
     }
 
     #[test]
-    fn toast_config_legacy_enabled_true_maps_to_herdr() {
+    fn toast_config_legacy_enabled_true_maps_to_flock() {
         let toml = r#"
 [ui.toast]
 enabled = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.ui.toast.delivery, ToastDelivery::Herdr);
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Flock);
     }
 
     #[test]

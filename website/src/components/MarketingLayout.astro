@@ -7,7 +7,7 @@ interface Props {
 }
 
 const { title, description, canonicalPath, ogType = 'website' } = Astro.props;
-const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
+const canonicalUrl = new URL(canonicalPath, 'https://flock.dev').toString();
 ---
 
 <!doctype html>
@@ -21,27 +21,27 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
     <link rel="canonical" href={canonicalUrl} />
 
     <meta property="og:type" content={ogType} />
-    <meta property="og:site_name" content="Herdr" />
+    <meta property="og:site_name" content="Flock" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonicalUrl} />
-    <meta property="og:image" content="https://herdr.dev/assets/og-card-v6.png" />
+    <meta property="og:image" content="https://flock.dev/assets/og-card-v6.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="Herdr — One terminal. The whole herd." />
+    <meta property="og:image:alt" content="Flock — One terminal. The whole herd." />
 
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
-    <meta name="twitter:image" content="https://herdr.dev/assets/og-card-v6.png" />
-    <meta name="twitter:image:alt" content="Herdr — One terminal. The whole herd." />
+    <meta name="twitter:image" content="https://flock.dev/assets/og-card-v6.png" />
+    <meta name="twitter:image:alt" content="Flock — One terminal. The whole herd." />
 
     <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon.png?v=14" />
     <link rel="apple-touch-icon" href="/assets/logo.png" />
     <link rel="preload" href="/assets/jbm.woff2" as="font" type="font/woff2" crossorigin />
     <script>
       (function () {
-        var saved = localStorage.getItem("herdr-palette");
+        var saved = localStorage.getItem("flock-palette");
         var system = window.matchMedia("(prefers-color-scheme: dark)").matches
           ? "tokyo-night"
           : "tokyo-night-day";
@@ -53,9 +53,9 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
   <body>
     <header class="site-header">
       <nav class="nav" aria-label="Primary navigation">
-        <a class="brand" href="/" aria-label="Herdr home">
+        <a class="brand" href="/" aria-label="Flock home">
           <span class="brand-logo" aria-hidden="true"></span>
-          <span>herdr</span>
+          <span>flock</span>
         </a>
         <details class="nav-menu">
           <summary class="nav-menu-button" aria-label="Open navigation">
@@ -72,7 +72,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
             <a href="/docs/">Docs</a>
             <a href="/docs/socket-api/">API</a>
             <a href="/docs/install/">Install</a>
-            <a href="https://github.com/ogulcancelik/herdr">GitHub</a>
+            <a href="https://github.com/gerchowl/flock">GitHub</a>
           </div>
         </details>
         <div class="nav-links">
@@ -85,12 +85,12 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
           <a href="/docs/socket-api/">API</a>
         </div>
         <div class="nav-tools">
-          <a class="nav-icon-link" href="https://github.com/ogulcancelik/herdr" aria-label="Herdr on GitHub">
+          <a class="nav-icon-link" href="https://github.com/gerchowl/flock" aria-label="Flock on GitHub">
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.64 7.64 0 0 1 8 3.87c.68 0 1.36.09 2 .26 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
             </svg>
           </a>
-          <a class="nav-icon-link" href="https://x.com/herdrdev" aria-label="Herdr on X">
+          <a class="nav-icon-link" href="https://x.com/flockdev" aria-label="Flock on X">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117Z" />
             </svg>
@@ -149,7 +149,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
         if (!overlay || !list) return;
         var options = Array.prototype.slice.call(list.querySelectorAll("[role='option']"));
         var media = window.matchMedia("(prefers-color-scheme: dark)");
-        var saved = localStorage.getItem("herdr-palette") || "";
+        var saved = localStorage.getItem("flock-palette") || "";
         var committed = saved || defaultPalette();
 
         function defaultPalette() {
@@ -172,7 +172,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
         function openOverlay() {
           overlay.hidden = false;
           document.body.style.overflow = "hidden";
-          committed = localStorage.getItem("herdr-palette") || defaultPalette();
+          committed = localStorage.getItem("flock-palette") || defaultPalette();
           updateUI(committed);
           var active = list.querySelector("[aria-selected='true']") || options[0];
           if (active) active.focus();
@@ -197,7 +197,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
 
         function commit(value) {
           setPalette(value);
-          localStorage.setItem("herdr-palette", value);
+          localStorage.setItem("flock-palette", value);
           updateUI(value);
           closeOverlay();
         }
@@ -209,7 +209,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
         }
 
         media.addEventListener("change", function () {
-          if (!localStorage.getItem("herdr-palette")) {
+          if (!localStorage.getItem("flock-palette")) {
             setPalette("");
             updateUI("");
           }
@@ -246,11 +246,11 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
         });
 
         var themeHint = document.getElementById("theme-hint");
-        if (localStorage.getItem("herdr-theme-hint-seen") === "1") {
+        if (localStorage.getItem("flock-theme-hint-seen") === "1") {
           themeHint.classList.add("is-seen");
         }
         themeHint.addEventListener("mouseenter", function () {
-          localStorage.setItem("herdr-theme-hint-seen", "1");
+          localStorage.setItem("flock-theme-hint-seen", "1");
           themeHint.classList.add("is-seen");
         }, { once: true });
         themeHint.addEventListener("click", toggleOverlay);

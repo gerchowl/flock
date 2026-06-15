@@ -367,7 +367,7 @@ mod tests {
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let unique = format!(
-            "herdr-workspace-tests-{}-{}-{}",
+            "flock-workspace-tests-{}-{}-{}",
             name,
             std::process::id(),
             SystemTime::now()
@@ -474,16 +474,16 @@ mod tests {
     #[test]
     fn normalize_git_remote_url_folds_transport_variants() {
         for url in [
-            "git@github.com:gerchowl/herdr.git",
-            "https://github.com/gerchowl/herdr.git",
-            "https://GitHub.com/gerchowl/herdr",
-            "ssh://git@github.com:22/gerchowl/herdr.git",
-            "git://github.com/gerchowl/herdr.git/",
-            "https://user:token@github.com/gerchowl/herdr.git",
+            "git@github.com:gerchowl/flock.git",
+            "https://github.com/gerchowl/flock.git",
+            "https://GitHub.com/gerchowl/flock",
+            "ssh://git@github.com:22/gerchowl/flock.git",
+            "git://github.com/gerchowl/flock.git/",
+            "https://user:token@github.com/gerchowl/flock.git",
         ] {
             assert_eq!(
                 normalize_git_remote_url(url),
-                "github.com/gerchowl/herdr",
+                "github.com/gerchowl/flock",
                 "url: {url}"
             );
         }
@@ -496,12 +496,12 @@ mod tests {
             "gitlab.psi.ch/Group/MyRepo"
         );
         assert_eq!(
-            normalize_git_remote_url("/srv/git/herdr.git/"),
-            "/srv/git/herdr"
+            normalize_git_remote_url("/srv/git/flock.git/"),
+            "/srv/git/flock"
         );
         assert_eq!(
-            normalize_git_remote_url("C:\\repos\\herdr"),
-            "C:\\repos\\herdr"
+            normalize_git_remote_url("C:\\repos\\flock"),
+            "C:\\repos\\flock"
         );
     }
 
@@ -512,13 +512,13 @@ mod tests {
         std::fs::create_dir_all(&git_dir).unwrap();
         std::fs::write(
             git_dir.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = git@github.com:gerchowl/herdr.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = git@github.com:gerchowl/flock.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         )
         .unwrap();
 
         assert_eq!(
-            project_key_for_common_dir(&git_dir, "herdr"),
-            "github.com/gerchowl/herdr"
+            project_key_for_common_dir(&git_dir, "flock"),
+            "github.com/gerchowl/flock"
         );
 
         std::fs::remove_dir_all(root).unwrap();
@@ -545,13 +545,13 @@ mod tests {
         let config = root.join("config");
         std::fs::write(
             &config,
-            "[remote \"upstream\"]\n\turl = git@github.com:ogulcancelik/herdr.git\n[Remote \"origin\"]\n\turl = git@github.com:gerchowl/herdr.git # fork\n",
+            "[remote \"upstream\"]\n\turl = git@github.com:gerchowl/flock.git\n[Remote \"origin\"]\n\turl = git@github.com:gerchowl/flock.git # fork\n",
         )
         .unwrap();
 
         assert_eq!(
             read_git_config_subsection_value(&config, "remote", "origin", "url").as_deref(),
-            Some("git@github.com:gerchowl/herdr.git")
+            Some("git@github.com:gerchowl/flock.git")
         );
         assert_eq!(
             read_git_config_subsection_value(&config, "remote", "missing", "url"),
@@ -574,8 +574,8 @@ mod tests {
             return;
         }
 
-        run_git(&root, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&root, &["config", "user.name", "Herdr Test"]);
+        run_git(&root, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&root, &["config", "user.name", "Flock Test"]);
         run_git(&root, &["commit", "--allow-empty", "-m", "initial"]);
 
         let head_oid = git_rev_parse_verify(&root, "HEAD").unwrap();

@@ -1179,7 +1179,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("unix time")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("herdr-ui-test-{unique}"));
+        let root = std::env::temp_dir().join(format!("flock-ui-test-{unique}"));
         std::fs::create_dir_all(root.join(".git")).expect("create .git dir");
         std::fs::write(
             root.join(".git/HEAD"),

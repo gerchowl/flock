@@ -1114,7 +1114,7 @@ mod tests {
         let original_home = std::env::var_os("HOME");
         // Pin HOME for the assertion and restore it. Established pattern in
         // this crate (mirrors expand_tilde_path tests in worktree.rs).
-        std::env::set_var("HOME", "/tmp/herdr-fake-home");
+        std::env::set_var("HOME", "/tmp/flock-fake-home");
         for tab_mode in [
             crate::config::TabModeConfig::Tabs,
             crate::config::TabModeConfig::Workspace,
@@ -1146,7 +1146,7 @@ mod tests {
             ));
             assert_eq!(
                 app.state.request_new_workspace_cwd,
-                Some(std::path::PathBuf::from("/tmp/herdr-fake-home")),
+                Some(std::path::PathBuf::from("/tmp/flock-fake-home")),
                 "header `new` stages $HOME for both event loops in {tab_mode:?}",
             );
             // The scope toggle is not collaterally fired by the new-button click.
@@ -1449,12 +1449,12 @@ mod tests {
     fn clicking_worktree_parent_row_focuses_workspace_without_toggling() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
-        for (idx, checkout_path) in ["/repo/herdr", "/repo/herdr-issue"].into_iter().enumerate() {
+        for (idx, checkout_path) in ["/repo/flock", "/repo/flock-issue"].into_iter().enumerate() {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx > 0,
                 });
@@ -1483,12 +1483,12 @@ mod tests {
     fn clicking_worktree_parent_chevron_toggles_group_only() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
-        for (idx, checkout_path) in ["/repo/herdr", "/repo/herdr-issue"].into_iter().enumerate() {
+        for (idx, checkout_path) in ["/repo/flock", "/repo/flock-issue"].into_iter().enumerate() {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx > 0,
                 });
@@ -1525,12 +1525,12 @@ mod tests {
             Workspace::test_new("normal"),
             Workspace::test_new("issue"),
         ];
-        for (idx, checkout_path) in [(0, "/repo/herdr"), (2, "/repo/herdr-issue")] {
+        for (idx, checkout_path) in [(0, "/repo/flock"), (2, "/repo/flock-issue")] {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx != 0,
                 });
@@ -1751,8 +1751,8 @@ mod tests {
         let mut ws = Workspace::test_new(name);
         ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: key.into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: format!("/repo/{name}").into(),
             is_linked_worktree: name != "main",
         });

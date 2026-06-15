@@ -2658,7 +2658,7 @@ fn is_trailing_token_wrapper(ch: char) -> bool {
 
 impl AppState {
     /// Infer worktree membership for workspaces sitting in linked git
-    /// worktrees that Herdr didn't create (agent-made, manual, other tools):
+    /// worktrees that Flock didn't create (agent-made, manual, other tools):
     /// they get the managed worktree actions and group under their parent
     /// repo workspace when it is open. Pure inference from cached git
     /// metadata — no directory registry.
@@ -2785,7 +2785,7 @@ impl AppState {
                 self.update_dismissed = true;
                 if matches!(
                     self.toast_config.delivery,
-                    crate::config::ToastDelivery::Herdr
+                    crate::config::ToastDelivery::Flock
                 ) {
                     self.toast = Some(ToastNotification {
                         kind: ToastKind::UpdateInstalled,
@@ -3104,7 +3104,7 @@ impl AppState {
 
         if matches!(
             self.toast_config.delivery,
-            crate::config::ToastDelivery::Herdr
+            crate::config::ToastDelivery::Flock
         ) {
             if let (Some(agent_label), Some(kind)) = (
                 change.agent_label.as_deref(),
@@ -3223,8 +3223,8 @@ mod tests {
     fn mark_linked_worktree(state: &mut AppState, ws_idx: usize) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: true,
         });
@@ -3233,9 +3233,9 @@ mod tests {
     fn mark_parent_worktree(state: &mut AppState, ws_idx: usize) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
     }
@@ -3246,8 +3246,8 @@ mod tests {
         let root = state.workspaces[0].tabs[0].root_pane;
 
         assert_eq!(
-            notification_context(&state.workspaces[0], "__herdr_projects__", 0, root),
-            "__herdr_projects__ · 1"
+            notification_context(&state.workspaces[0], "__flock_projects__", 0, root),
+            "__flock_projects__ · 1"
         );
     }
 
@@ -3334,9 +3334,9 @@ mod tests {
                 "./src/app/actions.rs:795",
             ),
             (
-                "open ../herdr-worktrees/issue-1",
-                "herdr",
-                "../herdr-worktrees/issue-1",
+                "open ../flock-worktrees/issue-1",
+                "flock",
+                "../flock-worktrees/issue-1",
             ),
             (
                 "edit src/app/actions.rs,then",
@@ -3367,7 +3367,7 @@ mod tests {
             ),
             ("refs #123 and @owner/name", "#123", "#123"),
             ("refs #123 and @owner/name", "owner", "@owner/name"),
-            ("cargo test --package=herdr", "--package", "--package=herdr"),
+            ("cargo test --package=flock", "--package", "--package=flock"),
             (
                 "cargo test app::actions::tests",
                 "app::",
@@ -3380,7 +3380,7 @@ mod tests {
             ),
             ("ERROR [worker-1] request_id=abc-123", "worker", "worker-1"),
             (
-                "tmux|newhoo|fixhoo|newmoo|notification|window_bell|herdr",
+                "tmux|newhoo|fixhoo|newmoo|notification|window_bell|flock",
                 "newhoo",
                 "newhoo",
             ),
@@ -3412,7 +3412,7 @@ mod tests {
     fn double_click_word_bounds_ignore_delimiters() {
         for (row, click) in [
             (
-                "tmux|newhoo|fixhoo|newmoo|notification|window_bell|herdr",
+                "tmux|newhoo|fixhoo|newmoo|notification|window_bell|flock",
                 "|",
             ),
             ("alpha,beta;gamma", ","),
@@ -3840,7 +3840,7 @@ mod tests {
     #[test]
     fn navigator_search_only_matches_visible_row_text() {
         let mut state = app_with_workspaces(&["one"]);
-        state.workspaces[0].identity_cwd = "/tmp/herdr-worktrees/issue-work".into();
+        state.workspaces[0].identity_cwd = "/tmp/flock-worktrees/issue-work".into();
 
         state.open_navigator();
         state.navigator.query = "work".into();
@@ -4038,11 +4038,11 @@ mod tests {
     #[test]
     fn update_ready_sets_explicit_upgrade_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
 
         let updates = state.handle_app_event(crate::events::AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "herdr update".into(),
+            install_command: "flock update".into(),
         });
 
         assert!(updates.is_empty());
@@ -4052,7 +4052,7 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `herdr update`, then follow its restart guidance"
+            "detach, run `flock update`, then follow its restart guidance"
         );
     }
 
@@ -4489,16 +4489,16 @@ mod tests {
         let mut state = app_with_workspaces(&["main", "issue", "notes"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
         state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         state.selected = 0;
@@ -4520,16 +4520,16 @@ mod tests {
         let mut state = app_with_workspaces(&["main", "issue", "notes"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
         state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         state.selected = 0;
@@ -4550,9 +4550,9 @@ mod tests {
             state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
-                    checkout_path: format!("/repo/herdr-{idx}").into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
+                    checkout_path: format!("/repo/flock-{idx}").into(),
                     is_linked_worktree: true,
                 });
         }
@@ -4837,7 +4837,7 @@ mod tests {
 
         let report = |pane_id| AppEvent::AgentSessionReported {
             pane_id,
-            source: "herdr:claude".into(),
+            source: "flock:claude".into(),
             agent_label: "claude".into(),
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("session-123"),
@@ -4878,7 +4878,7 @@ mod tests {
     fn background_waiting_sets_attention_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -4903,7 +4903,7 @@ mod tests {
     fn hook_reported_unknown_agent_sets_toast_title_from_label() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::HookStateReported {
@@ -4927,7 +4927,7 @@ mod tests {
     fn visible_blocker_overrides_hook_working_and_notifies() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
         let bg_terminal_id = state.workspaces[1]
             .panes
@@ -4949,7 +4949,7 @@ mod tests {
         });
         state.handle_app_event(AppEvent::HookStateReported {
             pane_id: bg_pane_id,
-            source: "herdr:codex".into(),
+            source: "flock:codex".into(),
             agent_label: "codex".into(),
             state: AgentState::Working,
             message: None,
@@ -4980,7 +4980,7 @@ mod tests {
     fn reserved_native_state_report_does_not_override_screen_state() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         let terminal_id = state.workspaces[0]
             .panes
@@ -5002,7 +5002,7 @@ mod tests {
         });
         state.handle_app_event(AppEvent::HookStateReported {
             pane_id,
-            source: "herdr:claude".into(),
+            source: "flock:claude".into(),
             agent_label: "claude".into(),
             state: AgentState::Blocked,
             message: None,
@@ -5056,7 +5056,7 @@ mod tests {
         });
         state.handle_app_event(AppEvent::HookAgentReleased {
             pane_id,
-            source: "herdr:claude".into(),
+            source: "flock:claude".into(),
             agent_label: "claude".into(),
             known_agent: Some(Agent::Claude),
             seq: Some(1),
@@ -5074,7 +5074,7 @@ mod tests {
 
         let first_updates = state.handle_app_event(AppEvent::HookStateReported {
             pane_id,
-            source: "herdr:pi".into(),
+            source: "flock:pi".into(),
             agent_label: "pi".into(),
             state: AgentState::Working,
             message: None,
@@ -5087,7 +5087,7 @@ mod tests {
 
         let second_updates = state.handle_app_event(AppEvent::HookStateReported {
             pane_id,
-            source: "herdr:pi".into(),
+            source: "flock:pi".into(),
             agent_label: "pi".into(),
             state: AgentState::Working,
             message: None,
@@ -5104,7 +5104,7 @@ mod tests {
     fn background_idle_sets_finished_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
         let bg_terminal_id = state.workspaces[1]
             .panes
@@ -5139,7 +5139,7 @@ mod tests {
     fn background_toast_includes_tab_name_when_workspace_has_multiple_tabs() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         state.workspaces[1].tabs[0].set_custom_name("main".into());
         let second_tab = state.workspaces[1].test_add_tab(Some("logs"));
         state.ensure_test_terminals();
@@ -5167,7 +5167,7 @@ mod tests {
     fn background_tab_in_active_workspace_still_sets_toast() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         state.workspaces[0].tabs[0].set_custom_name("main".into());
         let second_tab = state.workspaces[0].test_add_tab(Some("logs"));
         state.ensure_test_terminals();
@@ -5195,7 +5195,7 @@ mod tests {
     fn active_workspace_active_tab_does_not_set_toast() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -5214,11 +5214,11 @@ mod tests {
     }
 
     #[test]
-    fn active_workspace_active_tab_keeps_herdr_toast_suppressed_when_outer_terminal_is_unfocused() {
+    fn active_workspace_active_tab_keeps_flock_toast_suppressed_when_outer_terminal_is_unfocused() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
         state.outer_terminal_focus = Some(false);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -5247,11 +5247,11 @@ mod tests {
     #[test]
     fn update_ready_sets_manual_update_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
 
         let updates = state.handle_app_event(AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "herdr update".into(),
+            install_command: "flock update".into(),
         });
 
         assert!(updates.is_empty());
@@ -5263,28 +5263,28 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `herdr update`, then follow its restart guidance"
+            "detach, run `flock update`, then follow its restart guidance"
         );
     }
 
     #[test]
     fn update_ready_uses_event_install_command_in_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
 
         state.handle_app_event(AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "brew update && brew upgrade herdr".into(),
+            install_command: "brew update && brew upgrade flock".into(),
         });
 
         assert_eq!(
             state.update_install_command,
-            "brew update && brew upgrade herdr"
+            "brew update && brew upgrade flock"
         );
         let toast = state.toast.as_ref().expect("update toast");
         assert_eq!(
             toast.context,
-            "detach, run `brew update && brew upgrade herdr`, then restart this Herdr session when ready"
+            "detach, run `brew update && brew upgrade flock`, then restart this Flock session when ready"
         );
     }
 
@@ -5587,8 +5587,8 @@ mod tests {
             state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: key.into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
                     checkout_path: format!("/repo/ws-{idx}").into(),
                     is_linked_worktree: linked,
                 });

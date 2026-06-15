@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_herdr_pid,
-    send_input, unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_socket,
+    cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_flock_pid,
+    send_input, unregister_spawned_flock_pid, wait_for_disconnect, wait_for_socket,
 };
 
-struct SpawnedHerdr {
+struct SpawnedFlock {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -26,11 +26,11 @@ struct RequestError {
     message: String,
 }
 
-impl Drop for SpawnedHerdr {
+impl Drop for SpawnedFlock {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
-        unregister_spawned_herdr_pid(pid);
+        unregister_spawned_flock_pid(pid);
     }
 }
 
@@ -47,7 +47,7 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
 }
 
-fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
+fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedFlock {
     spawn_server_with_env(config_home, runtime_dir, api_socket, &[])
 }
 
@@ -56,11 +56,11 @@ fn spawn_server_with_env(
     runtime_dir: &Path,
     api_socket: &Path,
     extra_env: &[(&str, &str)],
-) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+) -> SpawnedFlock {
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -73,14 +73,14 @@ fn spawn_server_with_env(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket);
+    cmd.env("FLOCK_SOCKET_PATH", api_socket);
     cmd.env(
-        "HERDR_CLIENT_SOCKET_PATH",
-        runtime_dir.join("herdr-client.sock"),
+        "FLOCK_CLIENT_SOCKET_PATH",
+        runtime_dir.join("flock-client.sock"),
     );
     cmd.env("SHELL", "/bin/sh");
     for (key, value) in extra_env {
@@ -88,8 +88,8 @@ fn spawn_server_with_env(
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
+    register_spawned_flock_pid(child.process_id());
+    SpawnedFlock {
         _master: pair.master,
         child,
     }
@@ -99,11 +99,11 @@ fn spawn_named_session_server(
     config_home: &Path,
     runtime_dir: &Path,
     session_name: &str,
-) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr-dev")).unwrap();
+) -> SpawnedFlock {
+    fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
-        config_home.join("herdr-dev/config.toml"),
+        config_home.join("flock-dev/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -116,28 +116,28 @@ fn spawn_named_session_server(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SESSION", session_name);
-    cmd.env_remove("HERDR_SOCKET_PATH");
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SESSION", session_name);
+    cmd.env_remove("FLOCK_SOCKET_PATH");
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
+    register_spawned_flock_pid(child.process_id());
+    SpawnedFlock {
         _master: pair.master,
         child,
     }
 }
 
-fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr-dev")).unwrap();
+fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedFlock {
+    fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
-        config_home.join("herdr-dev/config.toml"),
+        config_home.join("flock-dev/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -150,18 +150,18 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env_remove("HERDR_SESSION");
-    cmd.env_remove("HERDR_SOCKET_PATH");
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env_remove("FLOCK_SESSION");
+    cmd.env_remove("FLOCK_SOCKET_PATH");
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
+    register_spawned_flock_pid(child.process_id());
+    SpawnedFlock {
         _master: pair.master,
         child,
     }
@@ -346,7 +346,7 @@ fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Du
     let deadline = Instant::now() + timeout;
     let mut last_pids = Vec::new();
     while Instant::now() < deadline {
-        last_pids = support::herdr_server_pids_for_runtime_dir(runtime_dir).unwrap_or_default();
+        last_pids = support::flock_server_pids_for_runtime_dir(runtime_dir).unwrap_or_default();
         if let Some(pid) = last_pids.iter().copied().find(|pid| *pid != old_pid) {
             return pid;
         }
@@ -361,7 +361,7 @@ fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Du
 
 #[cfg(target_os = "macos")]
 fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
-    let handoff_socket_pattern = format!("herdr-handoff-{old_pid}.sock");
+    let handoff_socket_pattern = format!("flock-handoff-{old_pid}.sock");
     let deadline = Instant::now() + timeout;
     let mut last_stdout = String::new();
     while Instant::now() < deadline {
@@ -427,7 +427,7 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -508,9 +508,9 @@ fn live_handoff_preserves_named_session_socket_paths() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let session_dir = config_home.join("herdr-dev/sessions/work");
-    let api_socket = session_dir.join("herdr.sock");
-    let client_socket = session_dir.join("herdr-client.sock");
+    let session_dir = config_home.join("flock-dev/sessions/work");
+    let api_socket = session_dir.join("flock.sock");
+    let client_socket = session_dir.join("flock-client.sock");
 
     let spawned = spawn_named_session_server(&config_home, &runtime_dir, "work");
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -524,7 +524,7 @@ fn live_handoff_preserves_named_session_socket_paths() {
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
     assert!(
-        !config_home.join("herdr-dev/herdr.sock").exists(),
+        !config_home.join("flock-dev/flock.sock").exists(),
         "named handoff unexpectedly bound the default session API socket"
     );
 
@@ -541,8 +541,8 @@ fn live_handoff_preserves_pane_process_io() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
     let marker = base.join("child.pid");
     let second_marker = base.join("second-child.pid");
     let hup_marker = base.join("hup");
@@ -714,8 +714,8 @@ fn live_handoff_preserves_keyboard_protocol_for_client_input() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
     let script = base.join("read-raw.py");
     let ready_marker = base.join("keyboard-ready");
     let received_marker = base.join("keyboard-received");
@@ -805,8 +805,8 @@ fn live_handoff_preserves_modify_other_keys_for_client_input() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
     let script = base.join("read-raw.py");
     let ready_marker = base.join("modify-ready");
     let received_marker = base.join("modify-received");
@@ -900,7 +900,7 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
     let pane_id_marker = base.join("old-pane-id");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
@@ -924,7 +924,7 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
         serde_json::json!({
             "id": "test:pane:print-id",
             "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": format!("printf '%s' \"$HERDR_PANE_ID\" > {}", pane_id_marker.display()), "keys": ["Enter"]}
+            "params": {"pane_id": pane_id, "text": format!("printf '%s' \"$FLOCK_PANE_ID\" > {}", pane_id_marker.display()), "keys": ["Enter"]}
         }),
     ));
     let old_pane_id = wait_for_file_contains(&pane_id_marker, "p_", Duration::from_secs(5));
@@ -983,7 +983,7 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
     let started_marker = base.join("agent-started");
     let exited_marker = base.join("agent-exited");
     let shell_marker = base.join("shell-after-agent");
@@ -1049,7 +1049,7 @@ fn live_handoff_keeps_shell_pane_after_foreground_process_exits() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
     let started_marker = base.join("foreground-started");
     let exited_marker = base.join("foreground-exited");
     let shell_marker = base.join("shell-after-foreground");
@@ -1116,8 +1116,8 @@ fn live_handoff_preserves_python_http_server() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
     let web_root = base.join("web");
     fs::create_dir_all(&web_root).unwrap();
     fs::write(
@@ -1189,10 +1189,10 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let sessions = [
-        (None, config_home.join("herdr-dev/herdr.sock")),
+        (None, config_home.join("flock-dev/flock.sock")),
         (
             Some("work"),
-            config_home.join("herdr-dev/sessions/work/herdr.sock"),
+            config_home.join("flock-dev/sessions/work/flock.sock"),
         ),
     ];
     let mut spawned = Vec::new();
@@ -1281,7 +1281,7 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
 
@@ -1361,8 +1361,8 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
 
@@ -1370,7 +1370,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         &config_home,
         &runtime_dir,
         &api_socket,
-        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", failure_point)],
+        &[("FLOCK_TEST_HANDOFF_IMPORT_FAIL", failure_point)],
     );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);

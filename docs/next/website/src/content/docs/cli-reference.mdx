@@ -1,55 +1,55 @@
 ---
 title: CLI reference
-description: Herdr commands for sessions, workspaces, tabs, panes, agents, waits, integrations, and status.
+description: Flock commands for sessions, workspaces, tabs, panes, agents, waits, integrations, and status.
 ---
 
-Herdr’s CLI talks to the running server over the same local socket API used by integrations and agents.
+Flock’s CLI talks to the running server over the same local socket API used by integrations and agents.
 
 Most commands print JSON responses. Use them from scripts when you want deterministic automation.
 
 ## Launch and status
 
 ```bash
-herdr                         # launch or attach to the default session
-herdr --session work          # launch or attach to a named session
-herdr --remote workbox        # attach through SSH, using local keybindings
-herdr --remote workbox --remote-keybindings server
-herdr --remote workbox --handoff
-herdr --no-session            # single-process escape hatch
-herdr --default-config        # print default config
-herdr update                  # download and install from the configured channel
-herdr update --handoff        # opt into live handoff for supported running servers
-herdr channel show            # print stable or preview
-herdr channel set preview     # opt into preview builds
-herdr channel set stable      # return to stable releases
-herdr --version               # print version
+flock                         # launch or attach to the default session
+flock --session work          # launch or attach to a named session
+flock --remote workbox        # attach through SSH, using local keybindings
+flock --remote workbox --remote-keybindings server
+flock --remote workbox --handoff
+flock --no-session            # single-process escape hatch
+flock --default-config        # print default config
+flock update                  # download and install from the configured channel
+flock update --handoff        # opt into live handoff for supported running servers
+flock channel show            # print stable or preview
+flock channel set preview     # opt into preview builds
+flock channel set stable      # return to stable releases
+flock --version               # print version
 ```
 
 Status commands:
 
 ```bash
-herdr status
-herdr status server
-herdr status client
+flock status
+flock status server
+flock status client
 ```
 
 ## Server
 
 ```bash
-herdr server
-herdr server stop
-herdr server reload-config
+flock server
+flock server stop
+flock server reload-config
 ```
 
-`herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
+`flock server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
 ## Sessions
 
 ```bash
-herdr session list [--json]
-herdr session attach <name>
-herdr session stop <name> [--json]
-herdr session delete <name> [--json]
+flock session list [--json]
+flock session attach <name>
+flock session stop <name> [--json]
+flock session delete <name> [--json]
 ```
 
 Use `default` as the session name when you need to stop the default session explicitly.
@@ -57,68 +57,68 @@ Use `default` as the session name when you need to stop the default session expl
 ## Workspaces
 
 ```bash
-herdr workspace list
-herdr workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
-herdr workspace get <workspace_id>
-herdr workspace focus <workspace_id>
-herdr workspace rename <workspace_id> <label>
-herdr workspace close <workspace_id>
+flock workspace list
+flock workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flock workspace get <workspace_id>
+flock workspace focus <workspace_id>
+flock workspace rename <workspace_id> <label>
+flock workspace close <workspace_id>
 ```
 
 Create a workspace without stealing focus:
 
 ```bash
-herdr workspace create --cwd ~/project --label api --no-focus
+flock workspace create --cwd ~/project --label api --no-focus
 ```
 
 ## Worktrees
 
 ```bash
-herdr worktree list [--workspace ID | --cwd PATH] [--json]
-herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
-herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
-herdr worktree remove --workspace ID [--force] [--json]
+flock worktree list [--workspace ID | --cwd PATH] [--json]
+flock worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
+flock worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
+flock worktree remove --workspace ID [--force] [--json]
 ```
 
-Worktrees are normal Herdr workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Herdr creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
+Worktrees are normal Flock workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Flock creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
 
-`workspace close` closes Herdr state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
+`workspace close` closes Flock state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
 
 ## Tabs
 
 ```bash
-herdr tab list [--workspace <workspace_id>]
-herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
-herdr tab get <tab_id>
-herdr tab focus <tab_id>
-herdr tab rename <tab_id> <label>
-herdr tab close <tab_id>
+flock tab list [--workspace <workspace_id>]
+flock tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flock tab get <tab_id>
+flock tab focus <tab_id>
+flock tab rename <tab_id> <label>
+flock tab close <tab_id>
 ```
 
 ## Panes
 
 ```bash
-herdr pane list [--workspace <workspace_id>]
-herdr pane get <pane_id>
-herdr pane rename <pane_id> <label>|--clear
-herdr pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]
-herdr pane close <pane_id>
+flock pane list [--workspace <workspace_id>]
+flock pane get <pane_id>
+flock pane rename <pane_id> <label>|--clear
+flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]
+flock pane close <pane_id>
 ```
 
 Read output:
 
 ```bash
-herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N]
-herdr pane read <pane_id> --source visible --ansi
-herdr pane read <pane_id> --source recent-unwrapped --lines 120
+flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N]
+flock pane read <pane_id> --source visible --ansi
+flock pane read <pane_id> --source recent-unwrapped --lines 120
 ```
 
 Send input:
 
 ```bash
-herdr pane send-text <pane_id> <text>
-herdr pane send-keys <pane_id> <key> [key ...]
-herdr pane run <pane_id> <command>
+flock pane send-text <pane_id> <text>
+flock pane send-keys <pane_id> <key> [key ...]
+flock pane run <pane_id> <command>
 ```
 
 `pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
@@ -126,7 +126,7 @@ herdr pane run <pane_id> <command>
 Report agent state from custom hooks:
 
 ```bash
-herdr pane report-agent <pane_id> \
+flock pane report-agent <pane_id> \
   --source ID \
   --agent LABEL \
   --state idle|working|blocked|unknown \
@@ -139,12 +139,12 @@ herdr pane report-agent <pane_id> \
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
-Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The existing `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.
+Those commands include `foreground_cwd` when Flock can resolve the cwd of the foreground process controlling the pane. The existing `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.
 
 Report display-only pane metadata without taking over semantic state:
 
 ```bash
-herdr pane report-metadata <pane_id> \
+flock pane report-metadata <pane_id> \
   --source ID \
   [--agent LABEL] \
   [--applies-to-source ID] \
@@ -162,15 +162,15 @@ herdr pane report-metadata <pane_id> \
 ## Agents
 
 ```bash
-herdr agent list
-herdr agent get <target>
-herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
-herdr agent send <target> <text>
-herdr agent rename <target> <name>|--clear
-herdr agent focus <target>
-herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
-herdr agent attach <target> [--takeover]
-herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+flock agent list
+flock agent get <target>
+flock agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
+flock agent send <target> <text>
+flock agent rename <target> <name>|--clear
+flock agent focus <target>
+flock agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
+flock agent attach <target> [--takeover]
+flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
 ```
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
@@ -182,7 +182,7 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 ## Direct terminal attach
 
 ```bash
-herdr terminal attach <terminal_id> [--takeover]
+flock terminal attach <terminal_id> [--takeover]
 ```
 
 Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
@@ -192,13 +192,13 @@ Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ct
 Wait for output in a pane:
 
 ```bash
-herdr wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]
+flock wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]
 ```
 
 Wait for pane agent state:
 
 ```bash
-herdr wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]
+flock wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]
 ```
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
@@ -206,25 +206,25 @@ Use `wait output` for normal commands and servers. Use `wait agent-status` for c
 ## Integrations
 
 ```bash
-herdr integration install pi
-herdr integration install omp
-herdr integration install claude
-herdr integration install codex
-herdr integration install copilot
-herdr integration install kimi
-herdr integration install opencode
-herdr integration install hermes
-herdr integration install qodercli
-herdr integration uninstall pi
-herdr integration uninstall omp
-herdr integration uninstall claude
-herdr integration uninstall codex
-herdr integration uninstall copilot
-herdr integration uninstall kimi
-herdr integration uninstall opencode
-herdr integration uninstall hermes
-herdr integration uninstall qodercli
-herdr integration status [--outdated-only]
+flock integration install pi
+flock integration install omp
+flock integration install claude
+flock integration install codex
+flock integration install copilot
+flock integration install kimi
+flock integration install opencode
+flock integration install hermes
+flock integration install qodercli
+flock integration uninstall pi
+flock integration uninstall omp
+flock integration uninstall claude
+flock integration uninstall codex
+flock integration uninstall copilot
+flock integration uninstall kimi
+flock integration uninstall opencode
+flock integration uninstall hermes
+flock integration uninstall qodercli
+flock integration status [--outdated-only]
 ```
 
 ## Read sources
@@ -239,8 +239,8 @@ herdr integration status [--outdated-only]
 
 | Variable | Purpose |
 | --- | --- |
-| `HERDR_CONFIG_PATH` | Override the config file path. |
-| `HERDR_SESSION` | Select a named session for CLI commands. |
-| `HERDR_SOCKET_PATH` | Low-level socket path override. |
-| `HERDR_LOG` | Set log filter, for example `HERDR_LOG=herdr=debug`. |
-| `HERDR_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |
+| `FLOCK_CONFIG_PATH` | Override the config file path. |
+| `FLOCK_SESSION` | Select a named session for CLI commands. |
+| `FLOCK_SOCKET_PATH` | Low-level socket path override. |
+| `FLOCK_LOG` | Set log filter, for example `FLOCK_LOG=flock=debug`. |
+| `FLOCK_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |

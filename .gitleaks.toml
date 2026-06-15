@@ -1,7 +1,7 @@
-# herdr gitleaks config — keep the full default ruleset, but don't scan
+# flock gitleaks config — keep the full default ruleset, but don't scan
 # vendored third-party assets. Minified bundles (e.g. xterm.js) contain
 # high-entropy identifiers that trip the generic-api-key heuristic; they are
-# upstream artifacts, not herdr secrets.
+# upstream artifacts, not flock secrets.
 [extend]
 useDefault = true
 

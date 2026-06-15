@@ -65,7 +65,7 @@ impl App {
                 })
             })
             .ok_or_else(|| {
-                "Herdr worktree actions require a workspace inside a Git work tree.".to_string()
+                "Flock worktree actions require a workspace inside a Git work tree.".to_string()
             })?;
         let source_checkout_path = existing_membership
             .as_ref()
@@ -166,7 +166,7 @@ impl App {
             .is_some_and(|space| space.is_linked_worktree)
         {
             self.state.config_diagnostic =
-                Some("This workspace is not a Herdr-managed worktree checkout.".into());
+                Some("This workspace is not a Flock-managed worktree checkout.".into());
             return;
         }
         let Some(space) = ws.worktree_space().cloned() else {
@@ -189,13 +189,13 @@ impl App {
     }
 
     /// Kill flow: like remove, but also deletes the local branch when the
-    /// async merge gate (gh pr view / git branch --merged) passes. Herdr
+    /// async merge gate (gh pr view / git branch --merged) passes. Flock
     /// never deletes branches otherwise, so this needs positive evidence.
     pub(crate) fn open_kill_worktree_confirmation(&mut self, ws_idx: usize) {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return;
         };
-        // Herdr-managed membership is just bookkeeping; any linked git
+        // Flock-managed membership is just bookkeeping; any linked git
         // worktree (created by an agent, by hand, by another tool) gets the
         // same merge-gated kill. Only non-worktree checkouts are refused —
         // the main checkout is never killable.
@@ -924,7 +924,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
@@ -946,8 +946,8 @@ mod tests {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Flock Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
@@ -987,12 +987,12 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: app.state.workspaces[0].id.clone(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/flock".into(),
+            source_repo_root: "/repo/flock".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             entries: vec![WorktreeOpenEntry {
-                path: "/repo/herdr-issue".into(),
+                path: "/repo/flock-issue".into(),
                 branch: Some("worktree/issue".into()),
                 is_linked_worktree: true,
                 already_open_ws_idx: Some(1),
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(target_membership.key, "repo-key");
         assert_eq!(
             target_membership.checkout_path,
-            std::path::PathBuf::from("/repo/herdr-issue")
+            std::path::PathBuf::from("/repo/flock-issue")
         );
         assert!(target_membership.is_linked_worktree);
     }
@@ -1024,13 +1024,13 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: "source".into(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/flock".into(),
+            source_repo_root: "/repo/flock".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             entries: vec![
                 WorktreeOpenEntry {
-                    path: "/repo/herdr".into(),
+                    path: "/repo/flock".into(),
                     branch: Some("main".into()),
                     is_linked_worktree: false,
                     already_open_ws_idx: Some(0),
@@ -1131,9 +1131,9 @@ mod tests {
         app.state.mode = Mode::Navigate;
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
 
@@ -1164,11 +1164,11 @@ mod tests {
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
             source_workspace_id: "source".into(),
-            source_checkout_path: std::path::PathBuf::from("/repo/herdr"),
+            source_checkout_path: std::path::PathBuf::from("/repo/flock"),
             source_existing_membership: None,
-            source_repo_root: std::path::PathBuf::from("/repo/herdr"),
+            source_repo_root: std::path::PathBuf::from("/repo/flock"),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             branch: "old".into(),
             checkout_path: std::path::PathBuf::from("/old"),
             error: Some("old error".into()),
@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(create.branch, "issue/137");
         assert_eq!(
             create.checkout_path,
-            std::path::PathBuf::from("/w/herdr/issue-137")
+            std::path::PathBuf::from("/w/flock/issue-137")
         );
         assert_eq!(create.error, None);
     }
@@ -1191,7 +1191,7 @@ mod tests {
         let repo = create_committed_repo("app-worktree-add-repo");
         let worktree_root = unique_temp_path("app-worktree-add-root");
         let branch = "worktree/app-worker";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
@@ -1202,7 +1202,7 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -1254,7 +1254,7 @@ mod tests {
 
         let worktree_root = unique_temp_path("app-worktree-add-from-source-root");
         let branch = "worktree/from-source";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
@@ -1265,7 +1265,7 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -1295,12 +1295,12 @@ mod tests {
 
     #[test]
     fn dirty_worktree_remove_failure_requests_force_confirmation() {
-        let path = std::path::PathBuf::from("/w/herdr/dirty");
+        let path = std::path::PathBuf::from("/w/flock/dirty");
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(WorktreeRemoveState {
             managed: true,
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
             path: path.clone(),
             error: None,
             removing: true,
@@ -1314,7 +1314,7 @@ mod tests {
             workspace_id: "ws".into(),
             path,
             result: Err(
-                "fatal: '/w/herdr/dirty' contains modified or untracked files, use --force to delete it"
+                "fatal: '/w/flock/dirty' contains modified or untracked files, use --force to delete it"
                     .into(),
             ),
         });
@@ -1327,12 +1327,12 @@ mod tests {
 
     #[test]
     fn non_dirty_worktree_remove_failure_keeps_error_message() {
-        let path = std::path::PathBuf::from("/w/herdr/missing");
+        let path = std::path::PathBuf::from("/w/flock/missing");
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(WorktreeRemoveState {
             managed: true,
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
             path: path.clone(),
             error: None,
             removing: true,
@@ -1345,7 +1345,7 @@ mod tests {
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
             workspace_id: "ws".into(),
             path,
-            result: Err("fatal: '/w/herdr/missing' is not a working tree".into()),
+            result: Err("fatal: '/w/flock/missing' is not a working tree".into()),
         });
 
         let remove = app.state.worktree_remove.unwrap();
@@ -1353,7 +1353,7 @@ mod tests {
         assert!(!remove.force_confirmation);
         assert_eq!(
             remove.error,
-            Some("fatal: '/w/herdr/missing' is not a working tree".into())
+            Some("fatal: '/w/flock/missing' is not a working tree".into())
         );
     }
 
@@ -1380,7 +1380,7 @@ mod tests {
         let workspace_id = app.state.workspaces[0].id.clone();
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
+            label: "flock".into(),
             repo_root: repo.clone(),
             checkout_path: checkout.clone(),
             is_linked_worktree: true,
@@ -1432,10 +1432,10 @@ mod tests {
         app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "repo-key".into(),
             checkout_key: "checkout-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             is_linked_worktree: false,
-            project_key: "dir:herdr".into(),
+            project_key: "dir:flock".into(),
         });
 
         app.open_branch_session_dialog(0);
@@ -1456,10 +1456,10 @@ mod tests {
         app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "repo-key".into(),
             checkout_key: "checkout-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             is_linked_worktree: false,
-            project_key: "dir:herdr".into(),
+            project_key: "dir:flock".into(),
         });
 
         let ws = &app.state.workspaces[0];
@@ -1470,9 +1470,9 @@ mod tests {
             .attached_terminal_id
             .clone();
         let mut terminal =
-            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/herdr".into());
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
         terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:claude".into(),
+            source: "flock:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("sess-1")
                 .expect("session id should validate"),
@@ -1572,8 +1572,8 @@ mod tests {
         app.state.worktree_remove = Some(WorktreeRemoveState {
             managed: true,
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
-            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
             force_confirmation: false,
@@ -1584,7 +1584,7 @@ mod tests {
 
         app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
             workspace_id: "ws".into(),
-            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::Merged {
                 evidence: "PR #7 merged".into(),
@@ -1607,8 +1607,8 @@ mod tests {
         app.state.worktree_remove = Some(WorktreeRemoveState {
             managed: true,
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
-            path: std::path::PathBuf::from("/repo/herdr-issue"),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
             force_confirmation: false,

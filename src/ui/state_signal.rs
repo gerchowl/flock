@@ -128,7 +128,7 @@ impl StateJoin {
 }
 
 /// Full per-class tally of a server's agent states — the data behind the
-/// band's count columns (`herdr 0 2 1`, #42): fixed r/y/g columns =
+/// band's count columns (`flock 0 2 1`, #42): fixed r/y/g columns =
 /// blocked / working / calm (idle + done-unseen fold into the calm column;
 /// the teal distinction stays on workspace rows). Unlike the capped
 /// [`StateJoin`], the tally keeps exact counts.

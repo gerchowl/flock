@@ -6,9 +6,9 @@ use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 pub fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
-        "herdr-dev"
+        "flock-dev"
     } else {
-        "herdr"
+        "flock"
     }
 }
 
@@ -92,9 +92,9 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Path to the optional user overlay (config.local.toml). Mirrors
-/// `config_path()`'s precedence (HERDR_CONFIG_PATH wins) but only the
+/// `config_path()`'s precedence (FLOCK_CONFIG_PATH wins) but only the
 /// file name changes -- the overlay always sits next to the base config.
-/// When HERDR_CONFIG_PATH is set, the overlay sits in the same directory
+/// When FLOCK_CONFIG_PATH is set, the overlay sits in the same directory
 /// as that override; otherwise it lives in `config_dir()`.
 pub fn config_overlay_path() -> PathBuf {
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
@@ -617,10 +617,10 @@ mod tests {
     #[test]
     fn remove_section_key_removes_matching_key_from_section() {
         let content =
-            "[ui.toast]\nenabled = true\ndelivery = \"herdr\"\n[ui.sound]\nenabled = true\n";
+            "[ui.toast]\nenabled = true\ndelivery = \"flock\"\n[ui.sound]\nenabled = true\n";
         let updated = remove_section_key(content, "ui.toast", "enabled");
         assert!(!updated.contains("[ui.toast]\nenabled = true"));
-        assert!(updated.contains("delivery = \"herdr\""));
+        assert!(updated.contains("delivery = \"flock\""));
         assert!(updated.contains("[ui.sound]\nenabled = true"));
     }
 
@@ -750,7 +750,7 @@ mouse_capture = false
     #[test]
     fn overlay_introduces_new_section_when_base_omits_it() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let dir = unique_test_dir("herdr-overlay-new");
+        let dir = unique_test_dir("flock-overlay-new");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
         std::fs::write(&base, "onboarding = false\n").unwrap();
@@ -774,7 +774,7 @@ mouse_capture = false
     #[test]
     fn malformed_overlay_keeps_base_and_surfaces_diagnostic() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let dir = unique_test_dir("herdr-overlay");
+        let dir = unique_test_dir("flock-overlay");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
         std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();

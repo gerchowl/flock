@@ -28,7 +28,7 @@ pub struct PeerSummaryState {
     pub ssh_target: String,
     /// Hostname the peer reported about itself (display fallback: peer name).
     pub host: Option<String>,
-    /// herdr version the peer reported (spot un-deployed peers).
+    /// flock version the peer reported (spot un-deployed peers).
     pub version: Option<String>,
     /// Machine health snapshot from the last successful poll.
     pub system: Option<crate::api::schema::PeerSystemSummary>,
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn origin_summary_survives_wire_roundtrip_and_passthrough() {
         let mut origin = summary_state("mba22", crate::protocol::HOME_SWITCH_TARGET, Some(0));
-        origin.workspaces[0].workspace = "herdr".to_string();
+        origin.workspaces[0].workspace = "flock".to_string();
         let snapshot = FleetSnapshotState {
             origin: "mba22".to_string(),
             peers: vec![summary_state("anvil", "lars@anvil", Some(3))],
@@ -438,7 +438,7 @@ mod tests {
             .clone()
             .expect("origin summary survives");
         assert_eq!(carried.ssh_target, crate::protocol::HOME_SWITCH_TARGET);
-        assert_eq!(carried.workspaces[0].workspace, "herdr");
+        assert_eq!(carried.workspaces[0].workspace, "flock");
         // A nested leap (pass-through) keeps the hub's own summary too.
         let nested = FleetSnapshotState::from_wire(back.to_wire("lars@anvil"));
         assert!(nested.origin_summary.is_some());
@@ -448,7 +448,7 @@ mod tests {
     fn parse_summary_response_reads_envelope() {
         let stdout = r#"
 Last login: whatever banner
-{"id":"cli:peers:summary","result":{"host":"anvil","version":"0.6.8","system":{"cpu_percent":71,"mem_used":48000000000,"mem_total":64000000000,"disk_free":200000000000},"workspaces":[{"workspace":"herdr","project_key":"github.com/gerchowl/herdr","project_label":"herdr","branch":"fix/pty","is_linked_worktree":true,"agent":"cc","status":"blocked","status_age_secs":840}]}}
+{"id":"cli:peers:summary","result":{"host":"anvil","version":"0.6.8","system":{"cpu_percent":71,"mem_used":48000000000,"mem_total":64000000000,"disk_free":200000000000},"workspaces":[{"workspace":"flock","project_key":"github.com/gerchowl/flock","project_label":"flock","branch":"fix/pty","is_linked_worktree":true,"agent":"cc","status":"blocked","status_age_secs":840}]}}
 "#;
         let payload = parse_summary_response(stdout, 34).unwrap();
         assert_eq!(payload.host, "anvil");
@@ -458,7 +458,7 @@ Last login: whatever banner
         assert_eq!(system.cpu_percent, Some(71));
         assert_eq!(system.mem_total, Some(64000000000));
         assert_eq!(payload.workspaces.len(), 1);
-        assert_eq!(payload.workspaces[0].workspace, "herdr");
+        assert_eq!(payload.workspaces[0].workspace, "flock");
         assert_eq!(payload.workspaces[0].status, AgentStatus::Blocked);
         assert_eq!(payload.workspaces[0].status_age_secs, Some(840));
         assert!(payload.workspaces[0].is_linked_worktree);

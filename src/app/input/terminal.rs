@@ -241,7 +241,7 @@ impl App {
             return None;
         }
 
-        // Shift+PageUp/Down/Home/End scroll herdr's own scrollback in the
+        // Shift+PageUp/Down/Home/End scroll flock's own scrollback in the
         // focused pane, regardless of the app's mouse mode — a deterministic
         // keyboard path that never gets "stuck" forwarding to the app. Bare
         // Page/Home/End still go to the app.
@@ -480,7 +480,7 @@ mod tests {
     async fn bare_page_up_forwards_to_mouse_app_while_shift_scrolls() {
         // Mouse-reporting pane (DECSET 1000): bare PageUp forwards to the app
         // (this is the "stuck" case the user hit in agent chats); Shift+PageUp
-        // must still scroll herdr scrollback.
+        // must still scroll flock scrollback.
         let mut bytes = numbered_lines_bytes(200);
         bytes.extend_from_slice(b"\x1b[?1000h");
         let (mut app, info) = app_with_scrollback(&bytes);
@@ -495,7 +495,7 @@ mod tests {
         app.handle_terminal_key_headless(shift_key(KeyCode::PageUp));
         assert!(
             offset_from_bottom(&app, info.id) > 0,
-            "Shift+PageUp must scroll herdr scrollback even in a mouse-reporting pane"
+            "Shift+PageUp must scroll flock scrollback even in a mouse-reporting pane"
         );
     }
 
@@ -524,7 +524,7 @@ mod tests {
         ));
         assert!(
             offset_from_bottom(&app, info.id) > 0,
-            "Shift+wheel must scroll herdr scrollback even under mouse capture"
+            "Shift+wheel must scroll flock scrollback even under mouse capture"
         );
     }
 

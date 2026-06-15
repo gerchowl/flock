@@ -11,24 +11,24 @@
   git,
   apple-sdk ? null,
   cctools ? null,
-  # Build identity baked into `herdr status` / federation summaries:
+  # Build identity baked into `flock status` / federation summaries:
   # version renders as "<base>-<channel>.<id>" (src/build_info.rs). The
   # flake passes the fork channel + short rev so every deployed build
   # self-identifies — two fork builds are otherwise indistinguishable
   # ("0.6.8" / proto N). null keeps the plain upstream version string.
   buildChannel ? null,
   buildId ? null,
-  # Build the `web` cargo feature (the `herdr web` xterm bridge, gerchowl/herdr#131).
+  # Build the `web` cargo feature (the `flock web` xterm bridge, gerchowl/flock#131).
   # Off by default so the standard build stays lean (no axum/rust-embed); the
-  # flake exposes a `herdr-web` package with this on. The binary is still
-  # `bin/herdr` — the feature only adds the `web` subcommand.
+  # flake exposes a `flock-web` package with this on. The binary is still
+  # `bin/flock` — the feature only adds the `web` subcommand.
   withWeb ? false,
 }:
 
 let
   manifest = lib.importTOML ../Cargo.toml;
   zigDeps = callPackage ../vendor/libghostty-vt/build.zig.zon.nix {
-    name = "herdr-libghostty-vt-zig-cache";
+    name = "flock-libghostty-vt-zig-cache";
     inherit zstd;
     linkFarm =
       name: entries:
@@ -60,7 +60,7 @@ let
   '';
 in
 rustPlatform.buildRustPackage {
-  pname = "herdr" + lib.optionalString withWeb "-web";
+  pname = "flock" + lib.optionalString withWeb "-web";
   version = manifest.package.version;
 
   buildFeatures = lib.optionals withWeb [ "web" ];
@@ -101,10 +101,10 @@ rustPlatform.buildRustPackage {
     ZIG = lib.getExe zig_0_15;
   }
   // lib.optionalAttrs (buildChannel != null) {
-    HERDR_BUILD_CHANNEL = buildChannel;
+    FLOCK_BUILD_CHANNEL = buildChannel;
   }
   // lib.optionalAttrs (buildId != null) {
-    HERDR_BUILD_ID = buildId;
+    FLOCK_BUILD_ID = buildId;
   }
   // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
     SDKROOT = darwinSdkRoot;
@@ -122,9 +122,9 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Terminal workspace manager for AI coding agents";
-    homepage = "https://herdr.dev";
+    homepage = "https://flock.dev";
     license = lib.licenses.agpl3Plus;
-    mainProgram = "herdr";
+    mainProgram = "flock";
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }

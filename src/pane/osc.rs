@@ -360,7 +360,7 @@ impl Osc52Forwarder {
 }
 
 /// Accepts `52;c;<base64>` and `52;;<base64>`.
-/// Queries (`?`) are rejected because herdr has no reply path.
+/// Queries (`?`) are rejected because flock has no reply path.
 /// The payload must decode as base64 before it is forwarded.
 fn parse_osc52_clipboard_write(body: &[u8]) -> Option<Vec<u8>> {
     use base64::Engine;
@@ -434,7 +434,7 @@ pub(super) fn maybe_filter_primary_screen_scrollback_clear<'a>(
     foreground_job: Option<&crate::platform::ForegroundJob>,
 ) -> Cow<'a, [u8]> {
     // Droid redraws its primary-screen TUI with CSI 3 J, which erases pane
-    // scrollback inside herdr. Keep the hack scoped to Droid on the primary
+    // scrollback inside flock. Keep the hack scoped to Droid on the primary
     // screen so normal terminal clear-history behavior still works elsewhere.
     if alternate_screen
         || !contains_scrollback_clear_sequence(bytes)

@@ -438,14 +438,14 @@ mod tests {
         }
 
         let path =
-            std::env::temp_dir().join(format!("herdr-notify-send-args-{}", std::process::id()));
-        let script = "printf '%s\\n' \"$@\" > \"$HERDR_NOTIFY_ARGS\"";
+            std::env::temp_dir().join(format!("flock-notify-send-args-{}", std::process::id()));
+        let script = "printf '%s\\n' \"$@\" > \"$FLOCK_NOTIFY_ARGS\"";
         let shown = show_desktop_notification_with_command("-danger", Some("body"), |_| {
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
                 .arg(script)
                 .arg("notify-send")
-                .env("HERDR_NOTIFY_ARGS", &path);
+                .env("FLOCK_NOTIFY_ARGS", &path);
             cmd
         })
         .expect("notification command should run");

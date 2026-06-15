@@ -42,22 +42,22 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-x86_64
+            name: flock-linux-x86_64
             libghostty_vt_optimize: ReleaseFast
             libghostty_vt_simd: 'true'
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-aarch64
+            name: flock-linux-aarch64
             libghostty_vt_optimize: ReleaseFast
             libghostty_vt_simd: 'true'
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: herdr-macos-x86_64
+            name: flock-macos-x86_64
             libghostty_vt_optimize: ReleaseFast
             libghostty_vt_simd: 'true'
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: herdr-macos-aarch64
+            name: flock-macos-aarch64
             libghostty_vt_optimize: ReleaseFast
             libghostty_vt_simd: 'true'
 
@@ -123,7 +123,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+        run: cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -165,10 +165,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            herdr-linux-x86_64/herdr-linux-x86_64
-            herdr-linux-aarch64/herdr-linux-aarch64
-            herdr-macos-x86_64/herdr-macos-x86_64
-            herdr-macos-aarch64/herdr-macos-aarch64
+            flock-linux-x86_64/flock-linux-x86_64
+            flock-linux-aarch64/flock-linux-aarch64
+            flock-macos-x86_64/flock-macos-x86_64
+            flock-macos-aarch64/flock-macos-aarch64
           body_path: RELEASE_NOTES.md
 
   close-released-issues:
@@ -218,7 +218,7 @@ jobs:
           fi
 
           RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"
-          RELEASE_COMMENT_MARKER="<!-- herdr:released:v${VERSION} -->"
+          RELEASE_COMMENT_MARKER="<!-- flock:released:v${VERSION} -->"
           RELEASE_COMMENT="${RELEASE_COMMENT_MARKER}"$'\n'"Released in [v${VERSION}](${RELEASE_URL})."
 
           issue_has_comment_marker() {

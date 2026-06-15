@@ -1,4 +1,4 @@
-//! Wire protocol for herdr server/client communication.
+//! Wire protocol for flock server/client communication.
 //!
 //! Defines the message types, framing, version negotiation, and safety
 //! constraints for the binary protocol over Unix domain sockets.
@@ -136,7 +136,7 @@ pub struct FleetPeer {
     pub ssh_target: String,
     /// Hostname the peer reported about itself.
     pub host: Option<String>,
-    /// herdr version the peer reported.
+    /// flock version the peer reported.
     pub version: Option<String>,
     /// Machine health from the hub's last successful poll.
     pub system: Option<FleetSystem>,
@@ -586,12 +586,12 @@ pub enum ServerMessage {
 
     /// Whether the client should currently capture host mouse input.
     MouseCapture {
-        /// True when Herdr mouse UI is enabled or the focused pane app requests mouse reporting.
+        /// True when Flock mouse UI is enabled or the focused pane app requests mouse reporting.
         enabled: bool,
     },
 
     /// A federated peer row was selected: the client should detach and
-    /// reattach to this SSH target (`herdr --remote <ssh_target>`). The
+    /// reattach to this SSH target (`flock --remote <ssh_target>`). The
     /// client records the target for its launcher and exits like a detach.
     SwitchServer {
         /// SSH destination of the peer server, or [`HOME_SWITCH_TARGET`]
@@ -852,11 +852,11 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your herdr client"
+            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your flock client"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the herdr server"
+            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the flock server"
         ))
     }
 }
@@ -1042,9 +1042,9 @@ mod tests {
                 latency_ms: None,
                 workspaces: vec![FleetWorkspace {
                     id: "ws_1".to_owned(),
-                    workspace: "herdr".to_owned(),
-                    project_key: Some("git:github.com/gerchowl/herdr".to_owned()),
-                    project_label: Some("herdr".to_owned()),
+                    workspace: "flock".to_owned(),
+                    project_key: Some("git:github.com/gerchowl/flock".to_owned()),
+                    project_label: Some("flock".to_owned()),
                     branch: Some("keyboard-shorcuts".to_owned()),
                     is_linked_worktree: true,
                     agent: Some("cc".to_owned()),

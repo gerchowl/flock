@@ -14,7 +14,7 @@ ASSET_TARGETS = (
     "macos-x86_64",
     "macos-aarch64",
 )
-EXPECTED_ASSET_NAMES = {target: f"herdr-{target}" for target in ASSET_TARGETS}
+EXPECTED_ASSET_NAMES = {target: f"flock-{target}" for target in ASSET_TARGETS}
 HIDDEN_SUBJECTS = (
     "release:",
     "docs: update website manifest",
@@ -264,13 +264,13 @@ def main() -> int:
     notes.add_argument("--commit", required=True)
     notes.add_argument("--build-id", required=True)
     notes.add_argument("--base-version", required=True)
-    notes.add_argument("--repo", default="ogulcancelik/herdr")
+    notes.add_argument("--repo", default="gerchowl/flock")
     notes.add_argument("--output", required=True)
     notes.set_defaults(func=cmd_notes)
 
     manifest = sub.add_parser("manifest")
     manifest.add_argument("--output", default="website/preview.json")
-    manifest.add_argument("--repo", default="ogulcancelik/herdr")
+    manifest.add_argument("--repo", default="gerchowl/flock")
     manifest.add_argument("--tag", required=True)
     manifest.add_argument("--build-id", required=True)
     manifest.add_argument("--commit", required=True)

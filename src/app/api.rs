@@ -272,7 +272,7 @@ impl App {
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
-            self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
+            self.refresh_new_flock_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
         }
         self.sync_agent_metadata_deadline();
@@ -367,14 +367,14 @@ impl App {
         self.shutdown_detached_terminal_runtimes();
     }
 
-    pub(crate) fn refresh_new_herdr_toast_context_for_update(
+    pub(crate) fn refresh_new_flock_toast_context_for_update(
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
         previous_toast: &Option<crate::app::state::ToastNotification>,
     ) {
         if !matches!(
             self.state.toast_config.delivery,
-            crate::config::ToastDelivery::Herdr
+            crate::config::ToastDelivery::Flock
         ) || self.state.toast == *previous_toast
         {
             return;
@@ -849,9 +849,9 @@ mod tests {
                     latency_ms: 34,
                     workspaces: vec![crate::api::schema::PeerWorkspaceSummary {
                         id: "ws_1".into(),
-                        workspace: "herdr".into(),
-                        project_key: Some("github.com/gerchowl/herdr".into()),
-                        project_label: Some("herdr".into()),
+                        workspace: "flock".into(),
+                        project_key: Some("github.com/gerchowl/flock".into()),
+                        project_label: Some("flock".into()),
                         branch: Some("fix/pty".into()),
                         is_linked_worktree: true,
                         agent: Some("cc".into()),
@@ -907,15 +907,15 @@ mod tests {
             crate::api::EventHub::default(),
         );
 
-        let mut workspace = crate::workspace::Workspace::test_new("herdr");
+        let mut workspace = crate::workspace::Workspace::test_new("flock");
         workspace.cached_git_branch = Some("feat/peer-federation".into());
         workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "/repo/herdr/.git".into(),
-            checkout_key: "/repo/herdr".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            key: "/repo/flock/.git".into(),
+            checkout_key: "/repo/flock".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             is_linked_worktree: false,
-            project_key: "github.com/gerchowl/herdr".into(),
+            project_key: "github.com/gerchowl/flock".into(),
         });
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -934,9 +934,9 @@ mod tests {
         let result = &value["result"];
         assert!(result["host"].as_str().is_some_and(|h| !h.is_empty()));
         let summary = &result["workspaces"][0];
-        assert_eq!(summary["workspace"], "herdr");
-        assert_eq!(summary["project_key"], "github.com/gerchowl/herdr");
-        assert_eq!(summary["project_label"], "herdr");
+        assert_eq!(summary["workspace"], "flock");
+        assert_eq!(summary["project_key"], "github.com/gerchowl/flock");
+        assert_eq!(summary["project_label"], "flock");
         assert_eq!(summary["branch"], "feat/peer-federation");
         assert_eq!(summary["status"], "blocked");
         assert_eq!(summary["agent"], "cc");
@@ -944,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn herdr_toast_context_uses_live_root_runtime_cwd_label() {
+    async fn flock_toast_context_uses_live_root_runtime_cwd_label() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -959,15 +959,15 @@ mod tests {
         let root = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(root).cloned().unwrap();
         let temp_root = std::env::temp_dir().join(format!(
-            "herdr-toast-context-{}-{}",
+            "flock-toast-context-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let stale_cwd = temp_root.join("__herdr_original__");
-        let live_cwd = temp_root.join("__herdr_projects__");
+        let stale_cwd = temp_root.join("__flock_original__");
+        let live_cwd = temp_root.join("__flock_projects__");
         std::fs::create_dir_all(&stale_cwd).unwrap();
         std::fs::create_dir_all(&live_cwd).unwrap();
         init_repo(&stale_cwd);
@@ -980,7 +980,7 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
 
         let (events, _) = tokio::sync::mpsc::channel(4);
         let runtime = crate::terminal::TerminalRuntime::spawn(
@@ -1027,7 +1027,7 @@ mod tests {
 
         assert_eq!(
             app.state.toast.as_ref().map(|toast| toast.context.as_str()),
-            Some("__herdr_projects__ · 1")
+            Some("__flock_projects__ · 1")
         );
 
         for (_, runtime) in app.terminal_runtimes.drain() {
@@ -1059,7 +1059,7 @@ mod tests {
         terminal.respawn_shell_on_exit = true;
         terminal.set_agent_name("codex".into());
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:codex".into(),
+            source: "flock:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session")
                 .expect("test session id should be valid"),
@@ -1099,13 +1099,13 @@ mod tests {
 
         let mut workspace = crate::workspace::Workspace::test_new("stale");
         workspace.custom_name = None;
-        workspace.identity_cwd = "/__herdr_original__".into();
+        workspace.identity_cwd = "/__flock_original__".into();
         let root = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(root).cloned().unwrap();
         let workspace_id = workspace.id.clone();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
-        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = "/__herdr_projects__".into();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = "/__flock_projects__".into();
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -1125,7 +1125,7 @@ mod tests {
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: ToastKind::Finished,
             title: "codex finished".into(),
-            context: "__herdr_original__ · 1".into(),
+            context: "__flock_original__ · 1".into(),
             target: Some(crate::app::state::ToastTarget {
                 workspace_id,
                 pane_id: root,
@@ -1146,7 +1146,7 @@ mod tests {
 
         assert_eq!(
             app.state.toast.as_ref().map(|toast| toast.context.as_str()),
-            Some("__herdr_original__ · 1")
+            Some("__flock_original__ · 1")
         );
     }
     #[tokio::test]
@@ -1187,7 +1187,7 @@ mod tests {
         use crate::workspace::{Workspace, WorktreeSpaceMembership};
         let membership = |idx: usize, linked: bool, root: &str| WorktreeSpaceMembership {
             key: root.into(),
-            label: "herdr".into(),
+            label: "flock".into(),
             repo_root: root.into(),
             checkout_path: format!("{root}/ws-{idx}").into(),
             is_linked_worktree: linked,
@@ -1196,11 +1196,11 @@ mod tests {
         let mut state = crate::app::state::AppState::test_new();
         // Linked worktree member.
         let mut linked = Workspace::test_new("linked");
-        linked.worktree_space = Some(membership(1, true, "/repo/herdr"));
+        linked.worktree_space = Some(membership(1, true, "/repo/flock"));
         linked.cached_git_branch = Some("feat/a".into());
         // Primary (non-linked) checkout of the same space.
         let mut primary = Workspace::test_new("primary");
-        primary.worktree_space = Some(membership(0, false, "/repo/herdr"));
+        primary.worktree_space = Some(membership(0, false, "/repo/flock"));
         primary.cached_git_branch = Some("master".into());
         // Standalone repo: no worktree space, only live git metadata.
         let mut standalone = Workspace::test_new("solo");
@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(targets[0].branch, "feat/a");
         assert_eq!(
             targets[0].checkout,
-            std::path::PathBuf::from("/repo/herdr/ws-1")
+            std::path::PathBuf::from("/repo/flock/ws-1")
         );
         assert_eq!(targets[1].workspace_ids, vec![ids[1].clone()]);
         assert_eq!(targets[1].branch, "master");

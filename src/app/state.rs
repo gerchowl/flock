@@ -753,7 +753,7 @@ pub struct WorktreeCreateState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRemoveState {
-    /// False when the checkout was adopted ad hoc (not a herdr-managed
+    /// False when the checkout was adopted ad hoc (not a flock-managed
     /// membership): the workspace is closed by id after removal.
     pub managed: bool,
     pub workspace_id: String,
@@ -1634,7 +1634,7 @@ pub struct AppState {
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
     pub copy_feedback: Option<CopyFeedback>,
-    /// Last reported focus state for the outer terminal hosting herdr.
+    /// Last reported focus state for the outer terminal hosting flock.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
     // Config
@@ -1676,7 +1676,7 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_scope: AgentPanelScope,
-    /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
+    /// Capture mouse input for Flock's own mouse UI. When false, Flock only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
     pub right_click_passthrough_modifiers: Option<KeyModifiers>,
@@ -2105,7 +2105,7 @@ impl AppState {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
-            worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
+            worktree_directory: std::path::PathBuf::from("/tmp/flock-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
@@ -2147,7 +2147,7 @@ impl AppState {
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,
-            update_install_command: "herdr update".into(),
+            update_install_command: "flock update".into(),
             latest_release_notes_available: false,
             update_dismissed: false,
             config_diagnostic: None,
@@ -2434,7 +2434,7 @@ mod tests {
         // request consumers already drain it via `create_workspace_with_options`.
         // No new field, no new event-loop branch.
         let original_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", "/tmp/herdr-blank-home");
+        std::env::set_var("HOME", "/tmp/flock-blank-home");
 
         let mut state = AppState::test_new();
         assert!(state.request_new_workspace_cwd.is_none());
@@ -2443,7 +2443,7 @@ mod tests {
 
         assert_eq!(
             state.request_new_workspace_cwd,
-            Some(std::path::PathBuf::from("/tmp/herdr-blank-home")),
+            Some(std::path::PathBuf::from("/tmp/flock-blank-home")),
         );
 
         match original_home {
@@ -2478,7 +2478,7 @@ mod tests {
             .clone();
         let terminal = state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:claude".into(),
+            source: "flock:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("sess-1")
                 .expect("session id should validate"),

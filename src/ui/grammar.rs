@@ -143,7 +143,7 @@ pub(crate) fn remote_member_target(summary: &crate::api::schema::PeerWorkspaceSu
 }
 
 /// The agents-panel single-row location string (#62), matching the spaces
-/// grammar: `<server> <proj> <target>` (e.g. `mba22 herdr keyboard-shorcuts`).
+/// grammar: `<server> <proj> <target>` (e.g. `mba22 flock keyboard-shorcuts`).
 /// Under width pressure the location truncates right-to-left: the branch/target
 /// shrinks first (middle-truncated), then the project, while the server
 /// qualifier stays whole so "where" is always answered. Returns the rendered
@@ -221,11 +221,11 @@ mod tests {
     #[test]
     fn project_identity_strips_host_to_owner_repo() {
         assert_eq!(
-            project_identity_label("github.com/gerchowl/herdr"),
-            "gerchowl/herdr"
+            project_identity_label("github.com/gerchowl/flock"),
+            "gerchowl/flock"
         );
         // Host + single path segment -> that segment.
-        assert_eq!(project_identity_label("example.com/herdr"), "herdr");
+        assert_eq!(project_identity_label("example.com/flock"), "flock");
     }
 
     #[test]
@@ -235,14 +235,14 @@ mod tests {
 
     #[test]
     fn project_identity_keeps_bare_key() {
-        assert_eq!(project_identity_label("herdr"), "herdr");
+        assert_eq!(project_identity_label("flock"), "flock");
     }
 
     #[test]
     fn agent_location_joins_server_proj_target_when_it_fits() {
         assert_eq!(
-            agent_location_label("mba22", Some("herdr"), "keyboard-shorcuts", 80),
-            "mba22 herdr keyboard-shorcuts"
+            agent_location_label("mba22", Some("flock"), "keyboard-shorcuts", 80),
+            "mba22 flock keyboard-shorcuts"
         );
     }
 
@@ -254,8 +254,8 @@ mod tests {
     #[test]
     fn agent_location_truncates_target_before_project() {
         // Server + project stay whole; the target shrinks (middle-truncated).
-        let out = agent_location_label("mba22", Some("herdr"), "keyboard-shorcuts", 20);
-        assert!(out.starts_with("mba22 herdr "), "got {out:?}");
+        let out = agent_location_label("mba22", Some("flock"), "keyboard-shorcuts", 20);
+        assert!(out.starts_with("mba22 flock "), "got {out:?}");
         assert!(out.chars().count() <= 20, "got {out:?}");
         assert!(out.contains('…'), "got {out:?}");
     }
@@ -265,16 +265,16 @@ mod tests {
         // Mirrors the shape `remote_entry_label` already produces for solo
         // remotes (#81): `<owner/repo> · <server>:<branch>`.
         let mut app = crate::app::AppState::test_new();
-        let mut ws = crate::workspace::Workspace::test_new("herdr");
+        let mut ws = crate::workspace::Workspace::test_new("flock");
         ws.custom_name = None;
         ws.cached_git_branch = Some("keyboard-shorcuts".into());
         ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "/repo/herdr/.git".into(),
-            checkout_key: "/repo/herdr".into(),
-            label: "herdr".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            key: "/repo/flock/.git".into(),
+            checkout_key: "/repo/flock".into(),
+            label: "flock".into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
             is_linked_worktree: false,
-            project_key: "github.com/gerchowl/herdr".into(),
+            project_key: "github.com/gerchowl/flock".into(),
         });
         app.workspaces = vec![ws];
         let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
@@ -282,7 +282,7 @@ mod tests {
         let server = local_server_name();
         assert_eq!(
             label,
-            format!("gerchowl/herdr \u{00b7} {server}:keyboard-shorcuts")
+            format!("gerchowl/flock \u{00b7} {server}:keyboard-shorcuts")
         );
     }
 
@@ -303,9 +303,9 @@ mod tests {
     #[test]
     fn agent_location_drops_project_under_hard_pressure() {
         // Too tight for any project segment: drop it, keep server + target.
-        let out = agent_location_label("mba22", Some("herdr"), "main", 9);
+        let out = agent_location_label("mba22", Some("flock"), "main", 9);
         assert!(out.starts_with("mba22 "), "got {out:?}");
-        assert!(!out.contains("herdr"), "got {out:?}");
+        assert!(!out.contains("flock"), "got {out:?}");
         assert!(out.chars().count() <= 9, "got {out:?}");
     }
 }

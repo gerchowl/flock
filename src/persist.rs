@@ -1,6 +1,6 @@
 //! Session persistence — save/restore workspaces, layouts, and working directories.
 //!
-//! Stored at `~/.config/herdr/session.json`.
+//! Stored at `~/.config/flock/session.json`.
 //! Optional pane screen history is stored separately at `session-history.json`.
 
 mod io;

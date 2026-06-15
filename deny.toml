@@ -1,6 +1,6 @@
 # cargo-deny — dependency licenses + RUSTSEC advisories, run by the cargo-deny
 # pre-commit hook (and `cargo deny check`). Baseline config: permissive license
-# allow-list covering herdr's tree, multiple-versions tolerated (large async
+# allow-list covering flock's tree, multiple-versions tolerated (large async
 # graph), advisories deny by default with an explicit, auditable `ignore` list.
 
 [advisories]
@@ -16,7 +16,7 @@ ignore = [
 version = 2
 confidence-threshold = 0.8
 allow = [
-  # herdr itself is AGPL-3.0-or-later; copyleft deps are license-compatible.
+  # flock itself is AGPL-3.0-or-later; copyleft deps are license-compatible.
   "AGPL-3.0-or-later",
   "MIT",
   "Apache-2.0",
@@ -34,7 +34,7 @@ allow = [
 ]
 
 [bans]
-# herdr pulls a broad async/TUI graph; duplicate transitive versions are noise,
+# flock pulls a broad async/TUI graph; duplicate transitive versions are noise,
 # not a defect class worth gating. Revisit if binary size becomes a concern.
 multiple-versions = "allow"
 wildcards = "allow"

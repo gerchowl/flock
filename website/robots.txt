@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://herdr.dev/sitemap-index.xml
+Sitemap: https://flock.dev/sitemap-index.xml

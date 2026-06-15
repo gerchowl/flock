@@ -33,7 +33,7 @@ pub struct AgentDetection {
     /// scrollback and may override a non-blocked integration state.
     pub visible_blocker: bool,
     /// True when the current screen visibly shows the agent's idle input UI.
-    /// This lets Herdr recover from integrations that miss an interrupt/stop
+    /// This lets Flock recover from integrations that miss an interrupt/stop
     /// event without treating an empty or ambiguous screen as idle authority.
     pub visible_idle: bool,
     /// True when the current screen visibly shows live working chrome. This is
@@ -570,7 +570,7 @@ mod tests {
 
     fn temp_detection_path(name: &str) -> std::path::PathBuf {
         let unique = format!(
-            "herdr-detect-tests-{}-{}-{}",
+            "flock-detect-tests-{}-{}-{}",
             name,
             std::process::id(),
             std::time::SystemTime::now()
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn claude_bash_permission_modal_is_visible_blocker() {
-        let screen = "● Bash(mkdir -p /tmp/herdr-claude-detector-test && for i in 1 2 3; do dd if=/dev/urandom)\n  ⎿  Waiting…\n\n────────────────────────\n Bash command\n\n   mkdir -p /tmp/herdr-claude-detector-test && ls -la /tmp/herdr-claude-detector-test\n   Create random files in temporary detector directory\n\n Contains expansion\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend · ctrl+e to explain";
+        let screen = "● Bash(mkdir -p /tmp/flock-claude-detector-test && for i in 1 2 3; do dd if=/dev/urandom)\n  ⎿  Waiting…\n\n────────────────────────\n Bash command\n\n   mkdir -p /tmp/flock-claude-detector-test && ls -la /tmp/flock-claude-detector-test\n   Create random files in temporary detector directory\n\n Contains expansion\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend · ctrl+e to explain";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Blocked);
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn claude_cropped_bash_permission_modal_is_visible_blocker() {
-        let screen = "● Bash(mkdir -p /tmp/herdr-claude-detector-test && ls -la /tmp/herdr-claude-detector-test)\n  ⎿  Waiting…\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        let screen = "● Bash(mkdir -p /tmp/flock-claude-detector-test && ls -la /tmp/flock-claude-detector-test)\n  ⎿  Waiting…\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Blocked);
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn claude_interrupted_permission_prompt_box_is_visible_idle() {
-        let screen = "❯ this is a test, create some dummy files on /tmp and -rm rf them i wanna test\n    permissions\n\n  Thought for 7s (ctrl+o to expand)\n\n● Bash(tmpdir=$(mktemp -d /tmp/claude-perm-test.XXXXXX) && touch \"$tmpdir/file1.txt\"\n      \"$tmpdir/file2.log\" && mkdir \"$tmpdir/subdir\" && touch\n      \"$tmpdir/subdir/nested.txt\"…)\n  ⎿  Interrupted · What should Claude do instead?\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "❯ this is a test, create some dummy files on /tmp and -rm rf them i wanna test\n    permissions\n\n  Thought for 7s (ctrl+o to expand)\n\n● Bash(tmpdir=$(mktemp -d /tmp/claude-perm-test.XXXXXX) && touch \"$tmpdir/file1.txt\"\n      \"$tmpdir/file2.log\" && mkdir \"$tmpdir/subdir\" && touch\n      \"$tmpdir/subdir/nested.txt\"…)\n  ⎿  Interrupted · What should Claude do instead?\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1195,7 +1195,7 @@ mod tests {
 
     #[test]
     fn claude_old_permission_prompt_with_live_prompt_box_is_idle() {
-        let screen = "● Bash(rm -rf /tmp/test)\n  ⎿  Waiting…\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "● Bash(rm -rf /tmp/test)\n  ⎿  Waiting…\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel · Tab to amend · ctrl+e to explain\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1206,7 +1206,7 @@ mod tests {
 
     #[test]
     fn claude_spinner_after_interrupted_permission_is_visible_working() {
-        let screen = "❯ this is a test, create some dummy files on /tmp and -rm rf them i wanna test\n    permissions\n\n  Thought for 7s (ctrl+o to expand)\n\n● Bash(tmpdir=$(mktemp -d /tmp/claude-perm-test.XXXXXX) && touch \"$tmpdir/file1.txt\"\n      \"$tmpdir/file2.log\" && mkdir \"$tmpdir/subdir\" && touch\n      \"$tmpdir/subdir/nested.txt\"…)\n  ⎿  Interrupted · What should Claude do instead?\n\n❯ test\n\n✢ Garnishing… (1s · thinking with high effort)\n  ⎿  Tip: Run claude --continue or claude --resume to resume a conversation\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "❯ this is a test, create some dummy files on /tmp and -rm rf them i wanna test\n    permissions\n\n  Thought for 7s (ctrl+o to expand)\n\n● Bash(tmpdir=$(mktemp -d /tmp/claude-perm-test.XXXXXX) && touch \"$tmpdir/file1.txt\"\n      \"$tmpdir/file2.log\" && mkdir \"$tmpdir/subdir\" && touch\n      \"$tmpdir/subdir/nested.txt\"…)\n  ⎿  Interrupted · What should Claude do instead?\n\n❯ test\n\n✢ Garnishing… (1s · thinking with high effort)\n  ⎿  Tip: Run claude --continue or claude --resume to resume a conversation\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn claude_waiting_for_multiple_background_agents_is_working() {
-        let screen = "● Done. I’ve delegated two investigations.\n\n✻ Waiting for 2 background agents to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "● Done. I’ve delegated two investigations.\n\n✻ Waiting for 2 background agents to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn claude_completed_background_agent_wait_in_scrollback_is_idle() {
-        let screen = "❯ please create a background agent that sleeps 15 sec then say hi\n\n  Thought for 8s (ctrl+o to expand)\n\n● claude(Sleep then say hi)\n  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\n● Done. I launched a background agent that will wait 15 seconds and then reply with hi.\n\n✻ Waiting for 1 background agent to finish\n\n● Agent \"Sleep then say hi\" completed · 17s\n\n● hi\n\n✻ Brewed for 28s\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "❯ please create a background agent that sleeps 15 sec then say hi\n\n  Thought for 8s (ctrl+o to expand)\n\n● claude(Sleep then say hi)\n  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\n● Done. I launched a background agent that will wait 15 seconds and then reply with hi.\n\n✻ Waiting for 1 background agent to finish\n\n● Agent \"Sleep then say hi\" completed · 17s\n\n● hi\n\n✻ Brewed for 28s\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn claude_completed_background_agent_with_prompt_box_is_idle() {
-        let screen = "● Done. I’ve started a background agent.\n\n✻ Waiting for 1 background agent to finish\n\n⏺ Agent \"Sleep then say hi\" completed · 31s\n\n⏺ hi\n\n✻ Baked for 42s\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%\n\n  ● main      ↑/↓ to select · Enter to view\n  ◯ general-purpose  Sleep then say hi  31s";
+        let screen = "● Done. I’ve started a background agent.\n\n✻ Waiting for 1 background agent to finish\n\n⏺ Agent \"Sleep then say hi\" completed · 31s\n\n⏺ hi\n\n✻ Baked for 42s\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%\n\n  ● main      ↑/↓ to select · Enter to view\n  ◯ general-purpose  Sleep then say hi  31s";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[test]
     fn claude_zero_background_agent_wait_with_prompt_box_is_idle() {
-        let screen = "✻ Waiting for 0 background agents to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "✻ Waiting for 0 background agents to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn claude_background_agent_wait_phrase_in_prose_is_idle() {
-        let screen = "Claude mentioned: Waiting for 1 background agent to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/herdr ⎇ master ▱▱▱▱▱ 0%";
+        let screen = "Claude mentioned: Waiting for 1 background agent to finish\n\n─────────────────────────────────────────────────────────────────────────────────────────\n❯ \n─────────────────────────────────────────────────────────────────────────────────────────\n  ~/P/flock ⎇ master ▱▱▱▱▱ 0%";
         let detection = detect_agent(Some(Agent::Claude), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn codex_replayed_transcript_weak_blocked_text_above_prompt_is_idle() {
-        let screen = "Codex\nBlocked signals in src/detect/agents/codex.rs:6: confirm footer, submit answer/all, allow command, [y/n], yes (y), or generic confirmation.\n\nLikely false positives: [y/n] and generic confirmation prose still mark Blocked.\n\n• Agent thread 019e7670-ba31-7641-b6e0-545c101de8c3 is closed. Replaying saved transcript.\n\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master · gpt-5.5 default · Context 37% used";
+        let screen = "Codex\nBlocked signals in src/detect/agents/codex.rs:6: confirm footer, submit answer/all, allow command, [y/n], yes (y), or generic confirmation.\n\nLikely false positives: [y/n] and generic confirmation prose still mark Blocked.\n\n• Agent thread 019e7670-ba31-7641-b6e0-545c101de8c3 is closed. Replaying saved transcript.\n\n\n› Summarize recent commits\n\n  ~/Projects/flock · master · gpt-5.5 default · Context 37% used";
         let detection = detect_agent(Some(Agent::Codex), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1401,7 +1401,7 @@ mod tests {
 
     #[test]
     fn codex_interrupted_prompt_is_visible_idle() {
-        let screen = "■ Conversation interrupted - tell the model what to do differently. Something went\nwrong? Hit `/feedback` to report the issue.\n\n\n› Run /review on my current changes\n\n  gpt-5.5 high · ~/Projects/herdr-worktrees/issue-249-state-arbitration";
+        let screen = "■ Conversation interrupted - tell the model what to do differently. Something went\nwrong? Hit `/feedback` to report the issue.\n\n\n› Run /review on my current changes\n\n  gpt-5.5 high · ~/Projects/flock-worktrees/issue-249-state-arbitration";
         let detection = detect_agent(Some(Agent::Codex), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1437,7 +1437,7 @@ mod tests {
     fn codex_live_working_status_above_current_prompt_stays_working() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "• Ran git diff --name-status v0.6.3..HEAD\n  └ A    website/src/pages/releases/index.astro\n\n• Working (28s • esc to interrupt)\n\n\n› Run /review on my current changes\n\n  ~/Projects/herdr · master · gpt-5.5 high · Context 7% used · 5h 96% left",
+            "• Ran git diff --name-status v0.6.3..HEAD\n  └ A    website/src/pages/releases/index.astro\n\n• Working (28s • esc to interrupt)\n\n\n› Run /review on my current changes\n\n  ~/Projects/flock · master · gpt-5.5 high · Context 7% used · 5h 96% left",
         );
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1461,7 +1461,7 @@ mod tests {
     fn codex_reviewing_approval_request_is_visible_working() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "• Reviewing approval request (22s • esc to interrupt)\n  └ /bin/zsh -lc 'rm -rf /tmp/codex-rm-test'\n\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
+            "• Reviewing approval request (22s • esc to interrupt)\n  └ /bin/zsh -lc 'rm -rf /tmp/codex-rm-test'\n\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
         );
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1485,7 +1485,7 @@ mod tests {
     fn codex_reviewing_multiple_approval_requests_is_visible_working() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "• Reviewing 2 approval requests (0s • esc to interrupt)\n\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
+            "• Reviewing 2 approval requests (0s • esc to interrupt)\n\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
         );
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1497,7 +1497,7 @@ mod tests {
     fn codex_booting_mcp_server_is_visible_working() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "• Booting MCP server: codex_apps (7s • esc to interrupt)\n\n\n› ok spawn one again please\n\n  ~/Projects/herdr · master",
+            "• Booting MCP server: codex_apps (7s • esc to interrupt)\n\n\n› ok spawn one again please\n\n  ~/Projects/flock · master",
         );
 
         assert_eq!(detection.state, AgentState::Working);
@@ -1509,7 +1509,7 @@ mod tests {
     fn codex_stale_working_status_above_current_idle_prompt_is_idle() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "■ Conversation interrupted - tell the model what to do differently. Something went wrong?\nHit `/feedback` to report the issue.\n\n\n› `/feedback` to report the issue.\n\n\n  › Working\n\n\n  • Working (2s • esc to interrupt)\n\n\n  › Run /review on my current changes\n\n    ~/Projects/herdr · master · gpt-5.5 high · Context 7% used\n\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong?\nHit `/feedback` to report the issue.\n\n\n› Run /review on my current changes\n\n  ~/Projects/herdr · master · gpt-5.5 high · Context 7% used · 5h 95% left",
+            "■ Conversation interrupted - tell the model what to do differently. Something went wrong?\nHit `/feedback` to report the issue.\n\n\n› `/feedback` to report the issue.\n\n\n  › Working\n\n\n  • Working (2s • esc to interrupt)\n\n\n  › Run /review on my current changes\n\n    ~/Projects/flock · master · gpt-5.5 high · Context 7% used\n\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong?\nHit `/feedback` to report the issue.\n\n\n› Run /review on my current changes\n\n  ~/Projects/flock · master · gpt-5.5 high · Context 7% used · 5h 95% left",
         );
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1521,7 +1521,7 @@ mod tests {
     fn codex_pasted_transcript_in_current_prompt_does_not_trigger_working() {
         let detection = detect_agent(
             Some(Agent::Codex),
-            "› so there is a problem\n\n\n\n\n  • Working (2s • esc to interrupt)\n\n\n  › Run /review on my current changes\n\n    ~/Projects/herdr · master · gpt-5.5 high · Context 0% used · 5h 94% left · weekly\n  36% …\n\n  wdyt\n\n\n\n  ~/Projects/herdr · master · gpt-5.5 high · Context 0% used · 5h 94% left · weekly 36% …",
+            "› so there is a problem\n\n\n\n\n  • Working (2s • esc to interrupt)\n\n\n  › Run /review on my current changes\n\n    ~/Projects/flock · master · gpt-5.5 high · Context 0% used · 5h 94% left · weekly\n  36% …\n\n  wdyt\n\n\n\n  ~/Projects/flock · master · gpt-5.5 high · Context 0% used · 5h 94% left · weekly 36% …",
         );
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -1579,10 +1579,10 @@ mod tests {
     #[test]
     fn codex_queued_follow_up_keeps_active_working_status() {
         let cases = [
-            "• Working (9m 24s • esc to interrupt)\n\n  • Queued follow-up inputs\n    ↳ also a new bug we can talk about later\n    alt + ↑ edit last queued message\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
-            "• Working (9m 24s • esc to interrupt)\n\n• Queued follow-up inputs\n  ↳ also a new bug we can talk about later\n  alt + ↑ edit last queued message\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
-            "• Working (4s • esc to interrupt)\n\n  • Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n    ↳ you mean that\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
-            "• Working (4s • esc to interrupt)\n\n• Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n  ↳ you mean that\n\n› Summarize recent commits\n\n  ~/Projects/herdr · master",
+            "• Working (9m 24s • esc to interrupt)\n\n  • Queued follow-up inputs\n    ↳ also a new bug we can talk about later\n    alt + ↑ edit last queued message\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
+            "• Working (9m 24s • esc to interrupt)\n\n• Queued follow-up inputs\n  ↳ also a new bug we can talk about later\n  alt + ↑ edit last queued message\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
+            "• Working (4s • esc to interrupt)\n\n  • Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n    ↳ you mean that\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
+            "• Working (4s • esc to interrupt)\n\n• Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n  ↳ you mean that\n\n› Summarize recent commits\n\n  ~/Projects/flock · master",
         ];
 
         for screen in cases {
@@ -2227,13 +2227,13 @@ mod tests {
 
     #[test]
     fn kimi_idle() {
-        let screen = "Welcome to Kimi Code CLI!\n── input ─\n────────────────\nagent (Kimi-k2.6 ●)  ~/Projects/herdr";
+        let screen = "Welcome to Kimi Code CLI!\n── input ─\n────────────────\nagent (Kimi-k2.6 ●)  ~/Projects/flock";
         assert_eq!(detect_kimi(screen), AgentState::Idle);
     }
 
     #[test]
     fn kimi_current_editor_box_is_visible_idle() {
-        let screen = "╭──────────────────────────────────────────────────╮\n│  >                                               │\n╰──────────────────────────────────────────────────╯\nk2  ~/Projects/herdr                    /help: show commands\n                                      context: 0.0%";
+        let screen = "╭──────────────────────────────────────────────────╮\n│  >                                               │\n╰──────────────────────────────────────────────────╯\nk2  ~/Projects/flock                    /help: show commands\n                                      context: 0.0%";
         let detection = detect_agent(Some(Agent::Kimi), screen);
 
         assert_eq!(detection.state, AgentState::Idle);
@@ -2396,7 +2396,7 @@ mod tests {
 
     #[test]
     fn amp_idle() {
-        let screen = "  Response complete.\n\n╭─100% of 272k · $1.20─────────────────────────╮\n│                                               │\n╰───────────────────────~/Projects/herdr (master)╯";
+        let screen = "  Response complete.\n\n╭─100% of 272k · $1.20─────────────────────────╮\n│                                               │\n╰───────────────────────~/Projects/flock (master)╯";
         assert_eq!(detect_state(Some(Agent::Amp), screen), AgentState::Idle);
     }
 
@@ -2411,7 +2411,7 @@ mod tests {
     #[test]
     fn grok_blocked_on_permission_prompt() {
         let screen = "Show recent commit history for analysis\n\
-                      git -C /home/can/Projects/herdr log --oneline --decorate -n 12\n\
+                      git -C /home/can/Projects/flock log --oneline --decorate -n 12\n\
                       Use ← → to choose permission whitelist scope\n\n\
                       1 (○) Always allow: git -C\n\
                       2 (●) Yes, proceed\n\
@@ -2434,7 +2434,7 @@ mod tests {
 
     #[test]
     fn grok_working_on_tool_spinner() {
-        let screen = "⠼ Run git -C /home/can/Projects/herdr log --oneline 1.0s";
+        let screen = "⠼ Run git -C /home/can/Projects/flock log --oneline 1.0s";
         assert_eq!(detect_state(Some(Agent::Grok), screen), AgentState::Working);
     }
 
@@ -2469,7 +2469,7 @@ mod tests {
 
     #[test]
     fn hermes_blocked_on_dangerous_command_prompt() {
-        let screen = "╭────────────────────────────────────────────────────────────╮\n│ ⚠️  Dangerous Command                                      │\n│ mkdir -p /tmp/herdr-hermes-block-test/subdir && touch      │\n│ ❯ 1. Allow once                                            │\n│   2. Allow for this session                                │\n│   3. Add to permanent allowlist                            │\n│   4. Deny                                                  │\n│   5. Show full command                                     │\n╰────────────────────────────────────────────────────────────╯\n  ↑/↓ to select, Enter to confirm\n⚠ ❯";
+        let screen = "╭────────────────────────────────────────────────────────────╮\n│ ⚠️  Dangerous Command                                      │\n│ mkdir -p /tmp/flock-hermes-block-test/subdir && touch      │\n│ ❯ 1. Allow once                                            │\n│   2. Allow for this session                                │\n│   3. Add to permanent allowlist                            │\n│   4. Deny                                                  │\n│   5. Show full command                                     │\n╰────────────────────────────────────────────────────────────╯\n  ↑/↓ to select, Enter to confirm\n⚠ ❯";
         assert_eq!(
             detect_state(Some(Agent::Hermes), screen),
             AgentState::Blocked

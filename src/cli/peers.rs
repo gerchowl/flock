@@ -41,5 +41,5 @@ fn peers_summary(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_peers_help() {
-    eprintln!("usage: herdr peers summary [--json]");
+    eprintln!("usage: flock peers summary [--json]");
 }

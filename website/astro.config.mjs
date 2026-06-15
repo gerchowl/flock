@@ -1,9 +1,9 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-const repoBlob = 'https://github.com/ogulcancelik/herdr/blob/master/';
+const repoBlob = 'https://github.com/gerchowl/flock/blob/master/';
 
-function rewriteHerdrLinks() {
+function rewriteFlockLinks() {
   const docsLinks = new Map([
     ['README.md', '/docs/'],
     ['./README.md', '/docs/'],
@@ -48,17 +48,17 @@ function walk(node, visitor) {
 }
 
 export default defineConfig({
-  site: 'https://herdr.dev',
+  site: 'https://flock.dev',
   integrations: [
     starlight({
-      title: 'herdr',
+      title: 'flock',
       description: 'Terminal-native agent runtime and multiplexer.',
       favicon: '/assets/favicon.png?v=14',
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/ogulcancelik/herdr',
+          href: 'https://github.com/gerchowl/flock',
         },
       ],
       components: {
@@ -70,7 +70,7 @@ export default defineConfig({
       head: [
         {
           tag: 'meta',
-          attrs: { property: 'og:image', content: 'https://herdr.dev/assets/og-card-v6.png' },
+          attrs: { property: 'og:image', content: 'https://flock.dev/assets/og-card-v6.png' },
         },
         { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
         { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
@@ -78,23 +78,23 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Herdr documentation — One terminal. The whole herd.',
+            content: 'Flock documentation — One terminal. The whole herd.',
           },
         },
         {
           tag: 'meta',
-          attrs: { name: 'twitter:image', content: 'https://herdr.dev/assets/og-card-v6.png' },
+          attrs: { name: 'twitter:image', content: 'https://flock.dev/assets/og-card-v6.png' },
         },
         {
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Herdr documentation — One terminal. The whole herd.',
+            content: 'Flock documentation — One terminal. The whole herd.',
           },
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/ogulcancelik/herdr/edit/master/',
+        baseUrl: 'https://github.com/gerchowl/flock/edit/master/',
       },
       lastUpdated: true,
       disable404Route: true,
@@ -105,7 +105,7 @@ export default defineConfig({
             { label: 'Overview', slug: 'docs' },
             { label: 'Install', slug: 'docs/install' },
             { label: 'Quick start', slug: 'docs/quick-start' },
-            { label: 'How to work with Herdr', slug: 'docs/how-to-work' },
+            { label: 'How to work with Flock', slug: 'docs/how-to-work' },
             { label: 'Concepts', slug: 'docs/concepts' },
           ],
         },
@@ -139,6 +139,6 @@ export default defineConfig({
     }),
   ],
   markdown: {
-    remarkPlugins: [rewriteHerdrLinks],
+    remarkPlugins: [rewriteFlockLinks],
   },
 });

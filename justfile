@@ -1,4 +1,4 @@
-# herdr task runner
+# flock task runner
 
 # Run tests
 test:
@@ -95,7 +95,7 @@ release-prepare version:
     python3 scripts/changelog.py prepare --version {{version}}
     cp CHANGELOG.md docs/next/CHANGELOG.md
     sed -i.bak 's/^version = ".*"/version = "{{version}}"/' Cargo.toml && rm -f Cargo.toml.bak
-    cargo update -p herdr --offline
+    cargo update -p flock --offline
     just check
     git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
@@ -127,8 +127,8 @@ release-publish version:
         exit 1; \
     fi
     just release-docs-check
-    python3 scripts/changelog.py extract --version {{version}} --output /tmp/herdr-release-notes-check.md
-    rm -f /tmp/herdr-release-notes-check.md
+    python3 scripts/changelog.py extract --version {{version}} --output /tmp/flock-release-notes-check.md
+    rm -f /tmp/flock-release-notes-check.md
     @local_head="$(git rev-parse HEAD)"; \
     remote_head="$(git rev-parse origin/master)"; \
     if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \

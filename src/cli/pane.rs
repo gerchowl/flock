@@ -67,11 +67,11 @@ fn pane_list(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane get <pane_id>");
+        eprintln!("usage: flock pane get <pane_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: herdr pane get <pane_id>");
+        eprintln!("usage: flock pane get <pane_id>");
         return Ok(2);
     }
 
@@ -85,11 +85,11 @@ fn pane_get(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flock pane rename <pane_id> <label>|--clear");
         return Ok(2);
     };
     if args.len() < 2 {
-        eprintln!("usage: herdr pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flock pane rename <pane_id> <label>|--clear");
         return Ok(2);
     }
     let label = if args.len() == 2 && args[1] == "--clear" {
@@ -109,7 +109,7 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
@@ -187,7 +187,7 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
 fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!(
-            "usage: herdr pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+            "usage: flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
         );
         return Ok(2);
     };
@@ -250,11 +250,11 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane close <pane_id>");
+        eprintln!("usage: flock pane close <pane_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: herdr pane close <pane_id>");
+        eprintln!("usage: flock pane close <pane_id>");
         return Ok(2);
     }
 
@@ -268,7 +268,7 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: herdr pane send-text <pane_id> <text>");
+        eprintln!("usage: flock pane send-text <pane_id> <text>");
         return Ok(2);
     }
 
@@ -279,7 +279,7 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: herdr pane send-keys <pane_id> <key> [key ...]");
+        eprintln!("usage: flock pane send-keys <pane_id> <key> [key ...]");
         return Ok(2);
     }
 
@@ -290,7 +290,7 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: herdr pane run <pane_id> <command>");
+        eprintln!("usage: flock pane run <pane_id> <command>");
         return Ok(2);
     }
 
@@ -305,7 +305,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+        eprintln!("usage: flock pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
         return Ok(2);
     };
 
@@ -424,7 +424,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
+        eprintln!("usage: flock pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
         return Ok(2);
     };
 
@@ -607,14 +607,14 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
 }
 
 const SET_FIELD_USAGE: &str =
-    "usage: herdr pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]";
-const CLEAR_FIELD_USAGE: &str = "usage: herdr pane clear-field <key> [--pane <pane_id>]";
+    "usage: flock pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]";
+const CLEAR_FIELD_USAGE: &str = "usage: flock pane clear-field <key> [--pane <pane_id>]";
 const REPORT_RECAP_USAGE: &str =
-    "usage: herdr pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]";
+    "usage: flock pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]";
 const REPORT_REPLY_USAGE: &str =
-    "usage: herdr pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]";
+    "usage: flock pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]";
 
-/// `herdr pane report-recap`: append a recap entry to the calling pane's
+/// `flock pane report-recap`: append a recap entry to the calling pane's
 /// prompt-history scrollback (#96). The pane defaults to the calling pane,
 /// like the other report-* verbs.
 fn pane_report_recap(args: &[String]) -> std::io::Result<i32> {
@@ -707,9 +707,9 @@ fn pane_report_recap(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
-/// `herdr pane report-reply`: append an assistant-reply entry to the calling
+/// `flock pane report-reply`: append an assistant-reply entry to the calling
 /// pane's prompt-history scrollback. Wired from the same Stop hook that fires
-/// `report-recap` — see `assets/claude/herdr-agent-state.sh`.
+/// `report-recap` — see `assets/claude/flock-agent-state.sh`.
 fn pane_report_reply(args: &[String]) -> std::io::Result<i32> {
     let mut source = None;
     let mut agent = None;
@@ -801,10 +801,10 @@ fn pane_report_reply(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// The calling pane's id, like the integration hooks resolve it: the
-/// env-baked HERDR_PANE_ID when present, otherwise an empty claim that the
+/// env-baked FLOCK_PANE_ID when present, otherwise an empty claim that the
 /// server heals by socket-peer process ancestry.
 fn calling_pane_id() -> String {
-    std::env::var("HERDR_PANE_ID").unwrap_or_default()
+    std::env::var("FLOCK_PANE_ID").unwrap_or_default()
 }
 
 /// Parse the trailing `[--ttl <secs>] [--pane <pane_id>]` options shared by
@@ -852,7 +852,7 @@ fn parse_field_options(
     Ok((ttl_secs, pane_id.unwrap_or_else(calling_pane_id)))
 }
 
-/// `herdr pane set-field <key> <value> [--ttl <secs>]`: promote a
+/// `flock pane set-field <key> <value> [--ttl <secs>]`: promote a
 /// session-specific field (container, progress, custom KV) into the calling
 /// pane's header. Capped at 6 fields per pane, key <= 16 chars, value <= 48.
 fn pane_set_field(args: &[String]) -> std::io::Result<i32> {
@@ -873,7 +873,7 @@ fn pane_set_field(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
-/// `herdr pane clear-field <key>`: remove a promoted header field from the
+/// `flock pane clear-field <key>`: remove a promoted header field from the
 /// calling pane. Idempotent.
 fn pane_clear_field(args: &[String]) -> std::io::Result<i32> {
     let Some(key) = args.first() else {
@@ -894,34 +894,34 @@ fn pane_clear_field(args: &[String]) -> std::io::Result<i32> {
 fn pane_help_text() -> String {
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(out, "herdr pane commands:");
-    let _ = writeln!(out, "  herdr pane list [--workspace <workspace_id>]");
-    let _ = writeln!(out, "  herdr pane get <pane_id>");
-    let _ = writeln!(out, "  herdr pane rename <pane_id> <label>|--clear");
-    let _ = writeln!(out, "  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    let _ = writeln!(out, "flock pane commands:");
+    let _ = writeln!(out, "  flock pane list [--workspace <workspace_id>]");
+    let _ = writeln!(out, "  flock pane get <pane_id>");
+    let _ = writeln!(out, "  flock pane rename <pane_id> <label>|--clear");
+    let _ = writeln!(out, "  flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
-        "  herdr pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+        "  flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
     );
-    let _ = writeln!(out, "  herdr pane close <pane_id>");
-    let _ = writeln!(out, "  herdr pane send-text <pane_id> <text>");
-    let _ = writeln!(out, "  herdr pane send-keys <pane_id> <key> [key ...]");
-    let _ = writeln!(out, "  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-    let _ = writeln!(out, "  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
+    let _ = writeln!(out, "  flock pane close <pane_id>");
+    let _ = writeln!(out, "  flock pane send-text <pane_id> <text>");
+    let _ = writeln!(out, "  flock pane send-keys <pane_id> <key> [key ...]");
+    let _ = writeln!(out, "  flock pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+    let _ = writeln!(out, "  flock pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
     let _ = writeln!(
         out,
-        "  herdr pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]"
-    );
-    let _ = writeln!(
-        out,
-        "  herdr pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]"
+        "  flock pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]"
     );
     let _ = writeln!(
         out,
-        "  herdr pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
+        "  flock pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]"
     );
-    let _ = writeln!(out, "  herdr pane clear-field <key> [--pane <pane_id>]");
-    let _ = writeln!(out, "  herdr pane run <pane_id> <command>");
+    let _ = writeln!(
+        out,
+        "  flock pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
+    );
+    let _ = writeln!(out, "  flock pane clear-field <key> [--pane <pane_id>]");
+    let _ = writeln!(out, "  flock pane run <pane_id> <command>");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -933,7 +933,7 @@ fn pane_help_text() -> String {
     );
     let _ = writeln!(
         out,
-        "The pane defaults to the calling pane ($HERDR_PANE_ID, healed by process"
+        "The pane defaults to the calling pane ($FLOCK_PANE_ID, healed by process"
     );
     let _ = writeln!(
         out,
@@ -975,11 +975,11 @@ mod tests {
     fn pane_help_lists_report_recap_and_history_explanation() {
         let help = pane_help_text();
         assert!(
-            help.contains("herdr pane report-recap --source ID --agent LABEL --recap TEXT"),
+            help.contains("flock pane report-recap --source ID --agent LABEL --recap TEXT"),
             "help should advertise the report-recap subcommand"
         );
         assert!(
-            help.contains("herdr pane report-reply --source ID --agent LABEL --reply TEXT"),
+            help.contains("flock pane report-reply --source ID --agent LABEL --reply TEXT"),
             "help should advertise the report-reply subcommand"
         );
         assert!(

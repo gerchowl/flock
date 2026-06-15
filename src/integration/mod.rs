@@ -9,19 +9,19 @@ use serde_json::{json, Map, Value};
 
 use crate::layout::PaneId;
 
-pub(crate) const HERDR_PANE_ID_ENV_VAR: &str = "HERDR_PANE_ID";
-const PI_EXTENSION_INSTALL_NAME: &str = "herdr-agent-state.ts";
-const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/herdr-agent-state.ts");
+pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
+const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
+const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
 const PI_INTEGRATION_VERSION: u32 = 2;
-const OMP_EXTENSION_INSTALL_NAME: &str = "herdr-omp-agent-state.ts";
-const OMP_EXTENSION_ASSET: &str = include_str!("assets/omp/herdr-agent-state.ts");
+const OMP_EXTENSION_INSTALL_NAME: &str = "flock-omp-agent-state.ts";
+const OMP_EXTENSION_ASSET: &str = include_str!("assets/omp/flock-agent-state.ts");
 const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
-const CLAUDE_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
-const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh");
+const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
+const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
 const CLAUDE_INTEGRATION_VERSION: u32 = 7;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
-// Canonical settings.json hook entries herdr installs for Claude Code, as
+// Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
 // `install_claude` (which writes them) and `claude_hooks_fragment` (which the
 // `integration manifest` command emits) so the two cannot drift — see ADR
@@ -35,16 +35,16 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
     ("Stop", "stop", None),
 ];
 const CLAUDE_HOOK_TIMEOUT: u64 = 10;
-const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
-const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
+const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
+const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
 const CODEX_INTEGRATION_VERSION: u32 = 5;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
-const KIMI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
-const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/herdr-agent-state.sh");
+const KIMI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
+const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/flock-agent-state.sh");
 const KIMI_INTEGRATION_VERSION: u32 = 1;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
-const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> herdr kimi integration";
-const KIMI_CONFIG_BLOCK_END: &str = "# <<< herdr kimi integration";
+const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> flock kimi integration";
+const KIMI_CONFIG_BLOCK_END: &str = "# <<< flock kimi integration";
 const KIMI_MIN_VERSION: &str = "0.8.0";
 const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
     ("SessionStart", "idle"),
@@ -58,24 +58,24 @@ const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
     ("StopFailure", "idle"),
     ("SessionEnd", "release"),
 ];
-const COPILOT_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
-const COPILOT_HOOK_ASSET: &str = include_str!("assets/copilot/herdr-agent-state.sh");
+const COPILOT_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
+const COPILOT_HOOK_ASSET: &str = include_str!("assets/copilot/flock-agent-state.sh");
 const COPILOT_INTEGRATION_VERSION: u32 = 1;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
-const OPENCODE_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
-const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/herdr-agent-state.js");
+const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
+const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
 const OPENCODE_INTEGRATION_VERSION: u32 = 4;
-const HERMES_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state";
+const HERMES_PLUGIN_INSTALL_NAME: &str = "flock-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
 const HERMES_PLUGIN_MANIFEST_ASSET: &str = include_str!("assets/hermes/plugin.yaml");
 const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py");
 const HERMES_INTEGRATION_VERSION: u32 = 2;
-const QODERCLI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
-const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/herdr-agent-state.sh");
+const QODERCLI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
+const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/flock-agent-state.sh");
 const QODERCLI_INTEGRATION_VERSION: u32 = 1;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
-const INTEGRATION_VERSION_MARKER: &str = "HERDR_INTEGRATION_VERSION=";
+const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
 #[derive(Debug)]
 pub(crate) struct ClaudeInstallPaths {
@@ -236,7 +236,7 @@ pub(crate) struct HermesUninstallResult {
 
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
-    cmd.env(HERDR_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
+    cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
 }
 
 pub(crate) fn install_target(
@@ -403,12 +403,12 @@ pub(crate) fn uninstall_target(
             }
             if result.updated_settings {
                 messages.push(format!(
-                    "removed herdr claude hook entries from {}",
+                    "removed flock claude hook entries from {}",
                     result.settings_path.display()
                 ));
             } else {
                 messages.push(format!(
-                    "no herdr claude hook entries found in {}",
+                    "no flock claude hook entries found in {}",
                     result.settings_path.display()
                 ));
             }
@@ -430,12 +430,12 @@ pub(crate) fn uninstall_target(
             }
             if result.updated_hooks {
                 messages.push(format!(
-                    "removed herdr codex hook entries from {}",
+                    "removed flock codex hook entries from {}",
                     result.hooks_path.display()
                 ));
             } else {
                 messages.push(format!(
-                    "no herdr codex hook entries found in {}",
+                    "no flock codex hook entries found in {}",
                     result.hooks_path.display()
                 ));
             }
@@ -461,12 +461,12 @@ pub(crate) fn uninstall_target(
             }
             if result.updated_settings {
                 messages.push(format!(
-                    "removed herdr copilot hook entries from {}",
+                    "removed flock copilot hook entries from {}",
                     result.settings_path.display()
                 ));
             } else {
                 messages.push(format!(
-                    "no herdr copilot hook entries found in {}",
+                    "no flock copilot hook entries found in {}",
                     result.settings_path.display()
                 ));
             }
@@ -488,12 +488,12 @@ pub(crate) fn uninstall_target(
             }
             if result.updated_config {
                 messages.push(format!(
-                    "removed herdr kimi hook entries from {}",
+                    "removed flock kimi hook entries from {}",
                     result.config_path.display()
                 ));
             } else {
                 messages.push(format!(
-                    "no herdr kimi hook entries found in {}",
+                    "no flock kimi hook entries found in {}",
                     result.config_path.display()
                 ));
             }
@@ -556,12 +556,12 @@ pub(crate) fn uninstall_target(
             }
             if result.updated_settings {
                 messages.push(format!(
-                    "removed herdr qodercli hook entries from {}",
+                    "removed flock qodercli hook entries from {}",
                     result.settings_path.display()
                 ));
             } else {
                 messages.push(format!(
-                    "no herdr qodercli hook entries found in {}",
+                    "no flock qodercli hook entries found in {}",
                     result.settings_path.display()
                 ));
             }
@@ -730,7 +730,7 @@ pub(crate) fn integration_update_instructions(
         .iter()
         .map(|target| {
             format!(
-                "`herdr integration install {}`",
+                "`flock integration install {}`",
                 integration_target_label(*target)
             )
         })
@@ -754,7 +754,7 @@ pub(crate) fn print_outdated_update_notice() -> bool {
         .map(|integration| integration.target)
         .collect::<Vec<_>>();
     eprintln!(
-        "installed herdr integrations need updating; {}.",
+        "installed flock integrations need updating; {}.",
         integration_update_instructions(&targets).replace('`', "")
     );
     true
@@ -847,7 +847,7 @@ fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
     }
 
     let content = fs::read_to_string(&legacy_path)?;
-    if content.contains("HERDR_INTEGRATION_ID=pi") {
+    if content.contains("FLOCK_INTEGRATION_ID=pi") {
         fs::remove_file(legacy_path)?;
         return Ok(true);
     }
@@ -956,11 +956,11 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     })
 }
 
-/// The settings.json `hooks` fragment herdr installs for Claude Code, built
+/// The settings.json `hooks` fragment flock installs for Claude Code, built
 /// from [`CLAUDE_HOOK_ENTRIES`] so it is byte-for-byte what `install_claude`
 /// writes via [`ensure_command_hook`]. This is the canonical thing a consumer
 /// merges into its own (possibly read-only / externally-managed) settings.json
-/// instead of relying on herdr to patch the file — the manifest "seam".
+/// instead of relying on flock to patch the file — the manifest "seam".
 fn claude_hooks_fragment(hook_path: &Path) -> Value {
     let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
     let mut hooks = Map::new();
@@ -990,7 +990,7 @@ fn claude_hooks_fragment(hook_path: &Path) -> Value {
 /// Emit the integration contract for `target` as data: the version, the hook
 /// script path, the settings path, and the exact `hooks` fragment to declare.
 /// Consumers (Nix/Home-Manager, Ansible, a human, a postinstall) read this and
-/// own the merge themselves — herdr never has to write a read-only or
+/// own the merge themselves — flock never has to write a read-only or
 /// externally-co-owned settings.json. See ADR on #136.
 pub(crate) fn integration_manifest(
     target: crate::api::schema::IntegrationTarget,
@@ -1009,7 +1009,7 @@ pub(crate) fn integration_manifest(
             }))
         }
         other => Err(io::Error::other(format!(
-            "manifest is not available for {} yet; use `herdr integration install {}`",
+            "manifest is not available for {} yet; use `flock integration install {}`",
             integration_target_label(other),
             integration_target_command(other)
         ))),
@@ -1575,7 +1575,7 @@ pub(crate) fn install_qodercli() -> io::Result<QodercliInstallPaths> {
     let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
 
     // SubagentStop is intentionally *not* mapped to working: the hook script
-    // returns early on it (mirroring assets/claude/herdr-agent-state.sh) so
+    // returns early on it (mirroring assets/claude/flock-agent-state.sh) so
     // that recap/away-summary frames cannot revive an idle pane.
     ensure_command_hook(
         hooks,
@@ -1945,7 +1945,7 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
         if !result.is_empty() {
             result.push('\n');
         }
-        result.push_str("plugins:\n  enabled:\n    - herdr-agent-state\n");
+        result.push_str("plugins:\n  enabled:\n    - flock-agent-state\n");
         return result;
     };
 
@@ -1958,10 +1958,10 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
 
     if let Some(enabled_index) = enabled_index {
         let line = lines[enabled_index].trim();
-        if line == "enabled: []" || line == "enabled: [] # herdr" {
+        if line == "enabled: []" || line == "enabled: [] # flock" {
             if enabled {
                 lines[enabled_index] = "  enabled:".to_string();
-                lines.insert(enabled_index + 1, "    - herdr-agent-state".to_string());
+                lines.insert(enabled_index + 1, "    - flock-agent-state".to_string());
             }
             return join_yaml_lines(lines, trailing_newline);
         }
@@ -1981,7 +1981,7 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
 
         match (enabled, existing_item_index) {
             (true, Some(_)) | (false, None) => return content.to_string(),
-            (true, None) => lines.insert(list_start, "    - herdr-agent-state".to_string()),
+            (true, None) => lines.insert(list_start, "    - flock-agent-state".to_string()),
             (false, Some(index)) => {
                 lines.remove(index);
             }
@@ -1991,7 +1991,7 @@ fn update_hermes_enabled_plugin(content: &str, enabled: bool) -> String {
 
     if enabled {
         lines.insert(plugins_index + 1, "  enabled:".to_string());
-        lines.insert(plugins_index + 2, "    - herdr-agent-state".to_string());
+        lines.insert(plugins_index + 2, "    - flock-agent-state".to_string());
         return join_yaml_lines(lines, trailing_newline);
     }
 
@@ -2385,7 +2385,7 @@ mod tests {
     fn unique_base() -> PathBuf {
         clear_integration_path_env();
         std::env::temp_dir().join(format!(
-            "herdr-integration-install-test-{}-{}",
+            "flock-integration-install-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2429,7 +2429,7 @@ mod tests {
             label: "claude",
             command: "claude",
             available: false,
-            path: PathBuf::from("/tmp/herdr-agent-state.sh"),
+            path: PathBuf::from("/tmp/flock-agent-state.sh"),
             state: IntegrationStatusKind::NotInstalled,
         };
         assert!(!recommendation.needs_install());
@@ -2549,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn install_omp_preserves_non_herdr_file_with_pi_install_name() {
+    fn install_omp_preserves_non_flock_file_with_pi_install_name() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -2670,7 +2670,7 @@ mod tests {
         let ext_dir = home.join(".pi/agent/extensions");
         fs::create_dir_all(&ext_dir).unwrap();
         let extension_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
-        fs::write(&extension_path, "// installed by herdr\n").unwrap();
+        fs::write(&extension_path, "// installed by flock\n").unwrap();
         std::env::set_var("HOME", &home);
 
         let outdated = outdated_installed_integrations();
@@ -2791,7 +2791,7 @@ mod tests {
         // out-of-sync constant before the install test reports the wrong
         // version.
         assert!(
-            asset.contains("HERDR_INTEGRATION_VERSION=7"),
+            asset.contains("FLOCK_INTEGRATION_VERSION=7"),
             "asset version pin missing"
         );
         // Stop action wired through the case statement.
@@ -2872,8 +2872,8 @@ mod tests {
         let base = unique_base();
         let claude_dir = base.join("custom-claude");
         fs::create_dir_all(&claude_dir).unwrap();
-        // A user-defined SessionStart hook unrelated to herdr must survive
-        // install AND must not bleed into the manifest (manifest = herdr's
+        // A user-defined SessionStart hook unrelated to flock must survive
+        // install AND must not bleed into the manifest (manifest = flock's
         // entries only). This exercises ensure_command_hook's "append to an
         // existing array" branch, which the empty-settings test does not.
         fs::write(
@@ -2893,7 +2893,7 @@ mod tests {
         assert!(session_start
             .iter()
             .any(|entry| entry["hooks"][0]["command"] == "echo user"));
-        // ...and herdr's manifest entry is exactly one, present verbatim in the
+        // ...and flock's manifest entry is exactly one, present verbatim in the
         // post-install settings (the subset / no-drift property).
         let manifest_session = manifest["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(manifest_session.len(), 1);
@@ -3052,7 +3052,7 @@ mod tests {
         let hook_path = claude_hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
         fs::write(
             &hook_path,
-            "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=1\n",
+            "#!/bin/sh\n# FLOCK_INTEGRATION_ID=claude\n# FLOCK_INTEGRATION_VERSION=1\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3082,7 +3082,7 @@ mod tests {
         let hook_path = claude_hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
         fs::write(
             &hook_path,
-            "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=2\n",
+            "#!/bin/sh\n# FLOCK_INTEGRATION_ID=claude\n# FLOCK_INTEGRATION_VERSION=2\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3103,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_claude_removes_herdr_hooks_and_preserves_others() {
+    fn uninstall_claude_removes_flock_hooks_and_preserves_others() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3186,7 +3186,7 @@ mod tests {
         let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
         fs::write(
             &hook_path,
-            "#!/bin/sh\n# HERDR_INTEGRATION_ID=codex\n# HERDR_INTEGRATION_VERSION=2\n",
+            "#!/bin/sh\n# FLOCK_INTEGRATION_ID=codex\n# FLOCK_INTEGRATION_VERSION=2\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3323,7 +3323,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
+    fn uninstall_codex_removes_flock_hooks_and_leaves_config_alone() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3597,7 +3597,7 @@ mod tests {
         let hook_path = copilot_hooks_dir.join(COPILOT_HOOK_INSTALL_NAME);
         fs::write(
             &hook_path,
-            "#!/bin/sh\n# HERDR_INTEGRATION_ID=copilot\n# HERDR_INTEGRATION_VERSION=1\n",
+            "#!/bin/sh\n# FLOCK_INTEGRATION_ID=copilot\n# FLOCK_INTEGRATION_VERSION=1\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3662,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_copilot_removes_herdr_hooks_and_preserves_others() {
+    fn uninstall_copilot_removes_flock_hooks_and_preserves_others() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3810,7 +3810,7 @@ mod tests {
         );
         assert_eq!(manifest, HERMES_PLUGIN_MANIFEST_ASSET);
         assert_eq!(init, HERMES_PLUGIN_INIT_ASSET);
-        assert!(config.contains("plugins:\n  enabled:\n    - herdr-agent-state"));
+        assert!(config.contains("plugins:\n  enabled:\n    - flock-agent-state"));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -3825,7 +3825,7 @@ mod tests {
         fs::create_dir_all(&hermes_dir).unwrap();
         fs::write(
             hermes_dir.join("config.yaml"),
-            "plugins:\n  enabled:\n    - herdr-agent-state\n",
+            "plugins:\n  enabled:\n    - flock-agent-state\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3834,7 +3834,7 @@ mod tests {
         install_hermes().unwrap();
 
         let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
-        assert_eq!(config.matches("herdr-agent-state").count(), 1);
+        assert_eq!(config.matches("flock-agent-state").count(), 1);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -3855,7 +3855,7 @@ mod tests {
         .unwrap();
         fs::write(
             hermes_dir.join("config.yaml"),
-            "plugins:\n  enabled:\n    - other-plugin\n    - herdr-agent-state\n",
+            "plugins:\n  enabled:\n    - other-plugin\n    - flock-agent-state\n",
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -3867,7 +3867,7 @@ mod tests {
         assert!(result.updated_config);
         assert!(!plugin_dir.exists());
         assert!(config.contains("    - other-plugin"));
-        assert!(!config.contains("herdr-agent-state"));
+        assert!(!config.contains("flock-agent-state"));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -3898,12 +3898,12 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("\"state\": action"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(CODEX_HOOK_ASSET.contains("HERDR_HOOK_INPUT_FILE"));
+        assert!(CODEX_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
         assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
         assert!(CODEX_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
         assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(KIMI_HOOK_ASSET.contains("source = \"herdr:kimi\""));
+        assert!(KIMI_HOOK_ASSET.contains("source = \"flock:kimi\""));
         assert!(KIMI_HOOK_ASSET.contains("pane.report_agent"));
         assert!(KIMI_HOOK_ASSET.contains("pane.release_agent"));
         assert!(!KIMI_HOOK_ASSET.contains("agent_session_id"));
@@ -3923,7 +3923,7 @@ mod tests {
         // Qoder hook reads the event from the stdin JSON payload (per
         // https://docs.qoder.com/zh/cli/hooks). Make sure the bundled script
         // never reaches for a QODER_HOOK_EVENT environment variable.
-        assert!(QODERCLI_HOOK_ASSET.contains("HERDR_HOOK_INPUT_FILE"));
+        assert!(QODERCLI_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
         assert!(QODERCLI_HOOK_ASSET.contains("hook_event_name"));
         assert!(QODERCLI_HOOK_ASSET.contains("agent_session_id"));
         assert!(!QODERCLI_HOOK_ASSET.contains("QODER_HOOK_EVENT"));
@@ -4013,7 +4013,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_qodercli_removes_herdr_hooks_and_preserves_others() {
+    fn uninstall_qodercli_removes_flock_hooks_and_preserves_others() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let qoder_dir = base.join(".qoder");

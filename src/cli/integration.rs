@@ -27,7 +27,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
         [] => false,
         [flag] if flag == "--outdated-only" => true,
         _ => {
-            eprintln!("usage: herdr integration status [--outdated-only]");
+            eprintln!("usage: flock integration status [--outdated-only]");
             return Ok(2);
         }
     };
@@ -161,13 +161,13 @@ fn parse_integration_target(
 ) -> std::io::Result<Option<IntegrationTarget>> {
     let Some(target) = args.first().map(|arg| arg.as_str()) else {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli>"
+            "usage: flock integration {action} <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli>"
         );
         return Ok(None);
     };
     if args.len() != 1 {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli>"
+            "usage: flock integration {action} <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli>"
         );
         return Ok(None);
     }
@@ -195,25 +195,25 @@ fn parse_integration_target(
 }
 
 fn print_integration_help() {
-    eprintln!("herdr integration commands:");
-    eprintln!("  herdr integration install pi");
-    eprintln!("  herdr integration install omp");
-    eprintln!("  herdr integration install claude");
-    eprintln!("  herdr integration install codex");
-    eprintln!("  herdr integration install copilot");
-    eprintln!("  herdr integration install kimi");
-    eprintln!("  herdr integration install opencode");
-    eprintln!("  herdr integration install hermes");
-    eprintln!("  herdr integration install qodercli");
-    eprintln!("  herdr integration uninstall pi");
-    eprintln!("  herdr integration uninstall omp");
-    eprintln!("  herdr integration uninstall claude");
-    eprintln!("  herdr integration uninstall codex");
-    eprintln!("  herdr integration uninstall copilot");
-    eprintln!("  herdr integration uninstall kimi");
-    eprintln!("  herdr integration uninstall opencode");
-    eprintln!("  herdr integration uninstall hermes");
-    eprintln!("  herdr integration uninstall qodercli");
-    eprintln!("  herdr integration status [--outdated-only]");
-    eprintln!("  herdr integration manifest <target> [--json]");
+    eprintln!("flock integration commands:");
+    eprintln!("  flock integration install pi");
+    eprintln!("  flock integration install omp");
+    eprintln!("  flock integration install claude");
+    eprintln!("  flock integration install codex");
+    eprintln!("  flock integration install copilot");
+    eprintln!("  flock integration install kimi");
+    eprintln!("  flock integration install opencode");
+    eprintln!("  flock integration install hermes");
+    eprintln!("  flock integration install qodercli");
+    eprintln!("  flock integration uninstall pi");
+    eprintln!("  flock integration uninstall omp");
+    eprintln!("  flock integration uninstall claude");
+    eprintln!("  flock integration uninstall codex");
+    eprintln!("  flock integration uninstall copilot");
+    eprintln!("  flock integration uninstall kimi");
+    eprintln!("  flock integration uninstall opencode");
+    eprintln!("  flock integration uninstall hermes");
+    eprintln!("  flock integration uninstall qodercli");
+    eprintln!("  flock integration status [--outdated-only]");
+    eprintln!("  flock integration manifest <target> [--json]");
 }

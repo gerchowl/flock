@@ -1,0 +1,74 @@
+# issue archive (gerchowl/herdr) — 72 items
+
+- [#16](0016-spike-replace-bincode-2-0-1-wire-encoder-rustsec-2025-0141.md) `OPEN` — Spike: replace bincode 2.0.1 wire encoder (RUSTSEC-2025-0141)
+- [#25](0025-spike-workspace-as-unit-creation-floating-throwaway-pane-de.md) `CLOSED` — spike: workspace-as-unit creation + floating throwaway pane; de-emphasize tabs
+- [#29](0029-workspace-mode-group-local-tab-switching-keys-prefix-1-9-nex.md) `CLOSED` — workspace mode: group-local tab-switching keys (prefix+1..9 / next_tab)
+- [#30](0030-float-pane-ux-round-2-mouse-host-scrollback-live-cwd-title.md) `CLOSED` — float pane UX round 2: mouse, host scrollback, live cwd title
+- [#32](0032-servers-band-v2-self-row-glyph-health-two-line-rows-first-re.md) `CLOSED` — servers band v2: self row, glyph health, two-line rows (first real two-server dogfood)
+- [#33](0033-git-first-sidebar-projects-as-sections-main-checkout-as-prim.md) `CLOSED` — git-first sidebar: projects as sections, main checkout as primary row, members as tab-like entries; misc for non-git
+- [#36](0036-hub-and-spoke-client-carried-origin-home-row-switch-home-dro.md) `CLOSED` — hub-and-spoke: client-carried origin + home row + switch_home (drop the full mesh)
+- [#38](0038-client-auto-retry-attach-during-live-handoff-window-instead.md) `CLOSED` — client: auto-retry attach during live-handoff window instead of bailing to shell
+- [#40](0040-pane-header-promotable-session-specific-fields-containers-pr.md) `CLOSED` — pane header: promotable session-specific fields (containers, progress, custom KV)
+- [#41](0041-sidebar-sections-servers-spaces-divider-parity-all-current-s.md) `CLOSED` — sidebar sections: servers↔spaces divider parity + all/current scope toggles (servers, spaces) like agents
+- [#42](0042-sidebar-state-language-ssot-agent-icons-on-workspace-rows-tr.md) `CLOSED` — sidebar state-language SSoT: agent icons on workspace rows, traffic light on primary rows, PR/gh status everywhere
+- [#45](0045-session-comms-patterns-from-dompt-full-state-lww-late-join-s.md) `OPEN` — session-comms patterns from dompt: full-state LWW + late-join seed, absolute commands, holder token, wire-shape contract tests
+- [#46](0046-spoke-renders-the-full-fleet-in-the-spaces-list-fold-snapsho.md) `CLOSED` — spoke renders the full fleet in the spaces list (fold snapshot workspaces) + right-click server filter
+- [#47](0047-remote-attach-must-port-the-client-s-terminal-theme-panes-re.md) `CLOSED` — remote attach must port the client's terminal theme (panes render pitch-black on spokes)
+- [#57](0057-follow-ups-from-56-review-member-strip-overflow-test-per-fra.md) `OPEN` — follow-ups from #56 review: member-strip overflow test + per-frame section-key memoization
+- [#62](0062-spaces-label-grammar-space-row-shared-origin-identity-every.md) `CLOSED` — spaces label grammar: space row = shared origin identity; every member = <server>:<branch>
+- [#63](0063-spaces-remote-row-switch-broken-band-works-pre-connected-swa.md) `CLOSED` — spaces remote-row switch broken (band works); pre-connected swap + top-right failure toast
+- [#65](0065-connection-slots-multi-connection-client-pre-load-switch-pau.md) `CLOSED` — connection slots: multi-connection client — pre-load/switch/pause instead of exit-and-relaunch legs
+- [#66](0066-down-gossip-the-hub-s-own-workspaces-origin-summary-spokes-c.md) `CLOSED` — down-gossip the hub's OWN workspaces (origin summary) — spokes can't see mba22's spaces
+- [#68](0068-tracking-federation-v2-spoke-parity-restyle-v3-connection-sl.md) `CLOSED` — tracking: federation v2 — spoke parity, restyle v3, connection slots
+- [#69](0069-reconnect-after-handoff-idle-hang-behind-frozen-frame-shell.md) `CLOSED` — reconnect after handoff: idle hang behind frozen frame + shell left unusable (proto-16 hold path)
+- [#70](0070-numpad-emits-nothing-inside-herdr-kitty-enhancement-kp-codes.md) `CLOSED` — numpad emits nothing inside herdr (kitty enhancement: KP_* codes dropped)
+- [#75](0075-slots-stage-2-live-status-over-paused-slots-retire-the-ssh-s.md) `OPEN` — slots stage 2 — live status over paused slots, retire the ssh summary poller + snapshot staleness
+- [#77](0077-stale-pane-geometry-after-restart-switch-scrollback-doesn-t.md) `CLOSED` — stale pane geometry after restart/switch + scrollback doesn't reflow (we ship libghostty-vt — use its reflow)
+- [#78](0078-section-leaders-must-render-the-project-identity-not-mba22-m.md) `CLOSED` — section leaders must render the project identity, not mba22:main; rects only on collapsed leaders
+- [#79](0079-viewer-profile-rides-the-client-portable-per-client-sidebar.md) `OPEN` — viewer profile rides the client: portable + per-client sidebar state (width/collapse/scopes/filter)
+- [#80](0080-fleet-wide-attention-cycle-server-visibility-as-a-selection.md) `OPEN` — fleet-wide attention cycle + server visibility as a selection set (SSoT with sidebar + switcher)
+- [#83](0083-pane-keystrokes-stall-while-the-pane-is-under-load-ui-stays.md) `OPEN` — pane keystrokes stall while the pane is under load (UI stays responsive — input→PTY leg starves)
+- [#85](0085-space-order-changes-when-switching-servers-sections-need-a-f.md) `CLOSED` — space order changes when switching servers — sections need a fleet-stable order
+- [#88](0088-float-pane-hide-on-blur-click-outside-scrollback-doesn-t-ren.md) `CLOSED` — float pane: hide on blur (click outside); scrollback doesn't render inside the float
+- [#92](0092-solo-local-workspaces-render-member-grammar-with-no-project.md) `CLOSED` — solo local workspaces render member grammar with no project identity
+- [#93](0093-spike-server-switch-popup-with-cancel-and-return-stall-proof.md) `CLOSED` — spike: server-switch popup with cancel-and-return (stall-proof switching)
+- [#94](0094-server-management-ui-add-remove-from-ssh-hosts-aliases-clien.md) `OPEN` — server management UI: add/remove from ssh hosts, aliases, client-side overlay over nix peers
+- [#95](0095-switch-crash-next-leg-s-ratatui-init-unwrap-aborts-via-doubl.md) `CLOSED` — switch crash: next leg's ratatui::init() unwrap aborts via double panic (try_init + unfailable hook)
+- [#96](0096-pane-header-prompt-history-scrollback-with-recaps-bounded-ex.md) `CLOSED` — pane header: prompt history scrollback with recaps (bounded expandable panel)
+- [#100](0100-release-pipeline-sage-built-gh-release-binaries-harmonia-cac.md) `OPEN` — release pipeline: sage-built GH release binaries + harmonia cache (transport v2)
+- [#102](0102-slots-switch-drops-the-hub-fleet-snapshot-spokes-lose-the-se.md) `CLOSED` — slots switch drops the hub fleet snapshot -- spokes lose the servers band/home row
+- [#103](0103-test-gap-federation-switch-and-render-needs-slots-enabled-e2.md) `CLOSED` — test gap: federation switch-and-render needs slots-enabled e2e + a live smoke harness
+- [#105](0105-workspace-creation-ux-new-blank-from-home-new-on-spaces-head.md) `CLOSED` — workspace creation UX: new-blank-from-home + 'new' on spaces header + right-click->branch on any row
+- [#106](0106-branch-session-injects-a-you-have-been-branched-pivot-prompt.md) `CLOSED` — branch_session injects a 'you have been branched, pivot' prompt into the forked agent
+- [#108](0108-natural-config-editor-edit-the-serde-config-in-app-without-p.md) `CLOSED` — natural config editor: edit the serde config in-app without per-field wiring
+- [#109](0109-web-terminal-xterm-js-endpoint-over-tailscale-to-attach-the.md) `OPEN` — web terminal: xterm.js endpoint over tailscale to attach the phone to the fleet
+- [#112](0112-config-overlay-deep-merge-so-config-local-toml-can-override.md) `OPEN` — config overlay: deep-merge so config.local.toml can OVERRIDE base-set scalars
+- [#114](0114-pane-geometry-not-re-asserted-on-in-session-workspace-pane-s.md) `CLOSED` — pane geometry not re-asserted on in-session workspace/pane switch (cramped narrow render until resize)
+- [#115](0115-remote-install-prompt-during-a-side-pane-switch-corrupts-the.md) `CLOSED` — remote-install prompt during a side-pane switch corrupts the terminal (must fail-with-notice, never prompt)
+- [#121](0121-navigator-overlay-group-by-project-match-the-fleet-stable-si.md) `OPEN` — navigator overlay: group by project (match the fleet-stable sidebar)
+- [#122](0122-sidebar-always-render-a-project-header-even-for-a-solo-proje.md) `OPEN` — sidebar: always render a project header, even for a solo project
+- [#123](0123-worktree-create-pick-the-base-ref-main-dev-defined-branch-no.md) `OPEN` — worktree create: pick the base ref (main / dev / defined branch), not just HEAD
+- [#124](0124-worktree-create-from-an-existing-worktree-inherit-its-branch.md) `OPEN` — worktree create from an existing worktree (inherit its branch/state)
+- [#125](0125-cross-machine-checkout-pull-a-peer-s-branch-into-a-local-wor.md) `OPEN` — cross-machine checkout: pull a peer's branch into a local worktree (no git/gh dance)
+- [#126](0126-project-header-summary-panel-lazygit-style-agent-fleet-info.md) `OPEN` — project header summary panel: lazygit-style + agent/fleet info on click
+- [#127](0127-epic-project-centric-fleet-organization-cross-machine-worktr.md) `OPEN` — [Epic] Project-centric fleet organization + cross-machine worktree DX
+- [#128](0128-herdr-web-connected-status-badge-overlaps-the-top-right-tui.md) `CLOSED` — herdr-web: 'connected' status badge overlaps the top-right TUI (server/repo picker)
+- [#129](0129-herdr-web-cli-friendly-on-screen-key-bar-esc-tab-ctrl-arrows.md) `CLOSED` — herdr-web: CLI-friendly on-screen key bar (Esc/Tab/Ctrl/arrows/pipe/prefix)
+- [#130](0130-herdr-web-forward-wheel-touch-as-mouse-events-scroll-convers.md) `CLOSED` — herdr-web: forward wheel/touch as mouse events (scroll conversation + right-click parity)
+- [#131](0131-port-herdr-web-bridge-into-herdr-as-a-first-class-option-g-f.md) `CLOSED` — port herdr-web bridge into herdr as a first-class option (g-fleet keeps only the tailscale-serve exposure)
+- [#132](0132-server-switch-probe-ssh-commands-have-no-timeout-batchmode-s.md) `CLOSED` — Server switch: probe SSH commands have no timeout/BatchMode → switch can hang forever
+- [#133](0133-server-switch-cold-dial-does-3-4-sequential-ssh-round-trips.md) `CLOSED` — Server switch: cold dial does 3–4 sequential SSH round-trips → slow switches
+- [#134](0134-server-switch-config-snapshot-peers-can-t-pre-warm-legacy-pa.md) `CLOSED` — Server switch: config/snapshot peers can't pre-warm + legacy path has no timeout-bounded fallback
+- [#136](0136-agent-integration-should-travel-with-herdr-self-detect-nudge.md) `OPEN` — Agent integration should travel with herdr: self-detect/nudge + declarative install instead of per-host re-wiring
+- [#139](0139-server-switch-stage-2-pre-warm-config-snapshot-ssh-peers-so.md) `CLOSED` — Server switch (stage-2): pre-warm config/snapshot SSH peers so their switches are instant
+- [#141](0141-self-detect-missing-outdated-agent-integration-and-nudge-in.md) `OPEN` — Self-detect missing/outdated agent integration and nudge in-band
+- [#142](0142-ship-the-status-line-built-in-config-toml-defaults-from-herd.md) `OPEN` — Ship the status line + built-in config.toml defaults from herdr
+- [#143](0143-integration-status-must-be-manifest-aware-script-vs-settings.md) `OPEN` — integration status must be manifest-aware (script-vs-settings half-state)
+- [#145](0145-keys-and-clipboard-not-reaching-inner-pane-when-claude-code.md) `OPEN` — Keys and clipboard not reaching inner pane when Claude Code runs inside a herdr pane
+- [#147](0147-herdr-web-map-tailscale-identity-to-a-herdr-user-allow-list.md) `CLOSED` — herdr web: map tailscale identity to a herdr user / allow-list (auth beyond loopback)
+- [#148](0148-herdr-web-idle-ws-timeout-concurrent-session-cap.md) `CLOSED` — herdr web: idle WS timeout + concurrent-session cap
+- [#149](0149-g-fleet-retire-herdr-web-mvp-run-an-always-on-herdr-server-d.md) `OPEN` — g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on sage
+- [#150](0150-herdr-web-native-socket-bridge-drop-the-per-connection-pty-u.md) `OPEN` — herdr web: native socket bridge (drop the per-connection PTY) — unblocks #128/#129/#130
+- [#151](0151-herdr-web-first-class-session-name-flag.md) `CLOSED` — herdr web: first-class `--session <name>` flag
+- [#152](0152-server-switch-stage-3-idle-evict-unused-warm-ssh-bridges-lar.md) `OPEN` — Server switch (stage-3): idle-evict unused warm ssh bridges (large-fleet only)
+- [#158](0158-mobile-friendly-web-bridge-reconnect-heartbeat-scroll-lock-s.md) `OPEN` — Mobile-friendly web bridge: reconnect+heartbeat, scroll-lock+scrollback, loud TLS guidance

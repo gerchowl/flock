@@ -222,7 +222,7 @@ mod tests {
 
     /// Eyeball demo — renders the medallion variants as raw true-color ANSI.
     /// Run in a real terminal (this is the design-review artifact for #42):
-    ///   cargo test --bin herdr medallion_demo -- --ignored --nocapture
+    ///   cargo test --bin flock medallion_demo -- --ignored --nocapture
     #[test]
     #[ignore = "visual demo, run with --ignored --nocapture in a real terminal"]
     fn medallion_demo() {
@@ -300,7 +300,7 @@ mod tests {
         let rect = |c: Color| format!("{}\u{25AE}\x1b[0m", sgr(c, 38));
         writeln!(
             out,
-            "  {}{}{}  {}{}{}  {}\u{25AF}\x1b[0m(no conn)   {}0\x1b[0m {}2\x1b[0m {}1\x1b[0m herdr",
+            "  {}{}{}  {}{}{}  {}\u{25AF}\x1b[0m(no conn)   {}0\x1b[0m {}2\x1b[0m {}1\x1b[0m flock",
             rect(RED),
             rect(YELLOW),
             rect(GREEN),

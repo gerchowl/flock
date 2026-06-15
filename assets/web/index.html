@@ -3,29 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>herdr</title>
+<title>flock</title>
 <!--
-  herdr web — gerchowl/herdr#131 (in-tree port of the #109 MVP).
+  flock web — gerchowl/flock#131 (in-tree port of the #109 MVP).
 
-  The bridge sends raw ANSI from herdr (HERDR_RENDER_ENCODING=terminal-ansi)
-  as binary WS frames; xterm.js writes them straight to the buffer. The herdr
+  The bridge sends raw ANSI from flock (FLOCK_RENDER_ENCODING=terminal-ansi)
+  as binary WS frames; xterm.js writes them straight to the buffer. The flock
   client enables mouse reporting (DECSET 1000/1006) over that same stream, so
   xterm forwards mouse/wheel back through term.onData automatically; this page
   adds touch→mouse mapping for phones (#130), an on-screen CLI key bar (#129),
   and an auto-hiding status badge (#128).
 
-  Vendored offline (no CDN): xterm assets in ./vendor/, embedded in the herdr
+  Vendored offline (no CDN): xterm assets in ./vendor/, embedded in the flock
   binary, so the phone needs only the tailnet.
 -->
 <script>
   // Path-mount aware (#109): tailscale serve fronts us at / (port mode) or a
-  // stripped path mount (/herdr). Resolve assets + the websocket under that
+  // stripped path mount (/flock). Resolve assets + the websocket under that
   // mount so a single build works at both.
   (function () {
     var b = location.pathname.replace(/index\.html$/, "");
     if (!b.endsWith("/")) b += "/";
     document.write('<base href="' + b + '">');
-    window.__HERDR_BASE = b;
+    window.__FLOCK_BASE = b;
   })();
 </script>
 <link rel="stylesheet" href="vendor/xterm.min.css">
@@ -37,7 +37,7 @@
   #term { position: absolute; top: 0; left: 0; right: 0; bottom: var(--keybar-h); }
 
   /* #128 — status badge. Top-right, but auto-hides a couple seconds after
-     'connected' so it stops covering herdr's server/repo header; it returns
+     'connected' so it stops covering flock's server/repo header; it returns
      for connecting/disconnected/error. */
   #status {
     position: fixed; top: 8px; right: 12px; font-size: 11px;
@@ -50,7 +50,7 @@
   #status.hidden { opacity: 0; }
 
   /* #129 — on-screen CLI key bar. The iOS soft keyboard has no Esc/Tab/Ctrl/
-     arrows/pipe and no way to send the herdr prefix; this bar emits the right
+     arrows/pipe and no way to send the flock prefix; this bar emits the right
      bytes over the existing WS. */
   #keybar {
     position: fixed; left: 0; right: 0; bottom: 0; height: var(--keybar-h);
@@ -121,7 +121,7 @@
   fit.fit();
 
   const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
-  const base = window.__HERDR_BASE || "/";
+  const base = window.__FLOCK_BASE || "/";
   const ws = new WebSocket(`${wsProto}//${location.host}${base}ws`);
   ws.binaryType = "arraybuffer";
 
@@ -140,7 +140,7 @@
   ws.onclose = () => setStatus("disconnected", "bad");
   ws.onerror = () => setStatus("error", "bad");
 
-  // PTY -> term: binary ANSI from herdr (terminal-ansi).
+  // PTY -> term: binary ANSI from flock (terminal-ansi).
   ws.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
       term.write(new Uint8Array(ev.data));
@@ -164,7 +164,7 @@
     return ch;
   }
 
-  // term -> PTY: keystrokes (and xterm's own mouse reports when herdr has
+  // term -> PTY: keystrokes (and xterm's own mouse reports when flock has
   // mouse reporting on) as text frames. Sticky Ctrl rewrites the next char.
   term.onData((data) => {
     if (ctrlSticky && data.length === 1) {
@@ -188,7 +188,7 @@
     { label: "-", bytes: "-" },
     { label: "~", bytes: "~" },
     { label: "`", bytes: "`" },
-    // herdr prefix chord (ctrl+space → NUL). Unlocks prefix-driven features
+    // flock prefix chord (ctrl+space → NUL). Unlocks prefix-driven features
     // (new worktree, navigate, kill) from a phone.
     { label: "prefix", bytes: "\x00" },
   ];
@@ -210,9 +210,9 @@
   }
 
   // ── #130: touch → mouse (phones have no pointer) ─────────────────────
-  // Only synthesize when herdr actually has mouse reporting on, so we never
+  // Only synthesize when flock actually has mouse reporting on, so we never
   // inject stray escape sequences as keystrokes. Vertical drag → wheel
-  // (scrolls herdr's pane); long-press → right-click (sidebar menu).
+  // (scrolls flock's pane); long-press → right-click (sidebar menu).
   function mouseReportingOn() {
     try { return term.modes && term.modes.mouseTrackingMode &&
                  term.modes.mouseTrackingMode !== "none"; }

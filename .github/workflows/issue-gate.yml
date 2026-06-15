@@ -31,7 +31,7 @@ jobs:
               '### Environment',
             ];
             const requiredEnvironmentFields = [
-              /^\s*(?:-\s*)?Herdr version:[^\S\r\n]*\S.*$/m,
+              /^\s*(?:-\s*)?Flock version:[^\S\r\n]*\S.*$/m,
               /^\s*(?:-\s*)?Operating system:[^\S\r\n]*\S.*$/m,
               /^\s*(?:-\s*)?Terminal:[^\S\r\n]*\S.*$/m,
             ];
@@ -116,7 +116,7 @@ jobs:
               const message = [
                 `hi @${author}, thanks for opening this.`,
                 '',
-                'this bug report is missing required environment details. please edit the issue and fill in herdr version, operating system, and terminal.',
+                'this bug report is missing required environment details. please edit the issue and fill in flock version, operating system, and terminal.',
                 '',
                 'shell and relevant config are optional, but they help when they affect the bug.',
               ].join('\n');
@@ -135,9 +135,9 @@ jobs:
             const message = [
               `hi @${author}, thanks for opening this.`,
               '',
-              'this issue does not appear to use the full bug report template. herdr issues are only for reproducible bugs and maintainer-created or maintainer-converted work items.',
+              'this issue does not appear to use the full bug report template. flock issues are only for reproducible bugs and maintainer-created or maintainer-converted work items.',
               '',
-              'bug reports must include the reproducible-bug confirmation, current behavior, expected behavior, reproduction, impact, and environment fields with herdr version, operating system, and terminal.',
+              'bug reports must include the reproducible-bug confirmation, current behavior, expected behavior, reproduction, impact, and environment fields with flock version, operating system, and terminal.',
               '',
               'feature requests, ideas, questions, contribution proposals, and direction checks belong in discussions:',
               `https://github.com/${context.repo.owner}/${context.repo.repo}/discussions`,

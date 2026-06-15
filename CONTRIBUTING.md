@@ -1,20 +1,20 @@
-# Contributing to herdr
+# Contributing to flock
 
 Thanks for wanting to contribute.
 
-Herdr came from my own need for a fast, simple, effective workspace manager for coding agents. I care a lot about how it looks, feels, and works, so many design and technical decisions here are deliberate.
+Flock came from my own need for a fast, simple, effective workspace manager for coding agents. I care a lot about how it looks, feels, and works, so many design and technical decisions here are deliberate.
 
-This guide exists so I can keep herdr manageable as a solo project and keep it from drifting from what it is supposed to be.
+This guide exists so I can keep flock manageable as a solo project and keep it from drifting from what it is supposed to be.
 
 ## The One Rule
 
-**You must understand your code.** If you cannot explain what your changes do, how they behave at the edges, and how they fit herdr's existing design, your PR will be closed.
+**You must understand your code.** If you cannot explain what your changes do, how they behave at the edges, and how they fit flock's existing design, your PR will be closed.
 
 Using AI to write code is fine. Submitting code you do not understand is not.
 
-## Herdr is opinionated
+## Flock is opinionated
 
-Herdr has a specific direction for how it should look, feel, and work.
+Flock has a specific direction for how it should look, feel, and work.
 
 That includes interaction patterns, layout behavior, mouse ergonomics, terminology, and how features fit the product as a whole.
 
@@ -46,7 +46,7 @@ Keep it short. Write in your own voice. A discussion, upvote, branch, or propose
 
 This exists because AI makes it trivial to generate plausible-looking contributions that do not fit the app.
 
-Agent note: if you are an AI agent preparing an issue or PR for this repository, check whether the human's GitHub username is listed in `.github/APPROVED_CONTRIBUTORS`. If they are not listed, warn them that opening a PR will be closed automatically. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve herdr's product direction, run the documented checks, and make sure the human can explain the change.
+Agent note: if you are an AI agent preparing an issue or PR for this repository, check whether the human's GitHub username is listed in `.github/APPROVED_CONTRIBUTORS`. If they are not listed, warn them that opening a PR will be closed automatically. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve flock's product direction, run the documented checks, and make sure the human can explain the change.
 
 ## What to put in a bug report
 
@@ -56,7 +56,7 @@ Bug reports should answer these questions clearly:
 - what is the expected behavior
 - what is the shortest reproduction
 - how does this affect you
-- what Herdr version, OS, and terminal are affected
+- what Flock version, OS, and terminal are affected
 - what shell and config are relevant, if any
 
 If there is no reproduction yet, start a discussion instead.
@@ -65,7 +65,7 @@ If your proposal changes the visual language, interaction model, workflow, persi
 
 ## Documentation for unreleased changes
 
-The root `README.md`, root `CHANGELOG.md`, and website docs describe the latest released version of herdr. Do not update root `README.md`, root `CHANGELOG.md`, or `website/src/content/docs/` for normal PRs.
+The root `README.md`, root `CHANGELOG.md`, and website docs describe the latest released version of flock. Do not update root `README.md`, root `CHANGELOG.md`, or `website/src/content/docs/` for normal PRs.
 
 If your PR changes user-facing behavior, mention the needed public-doc update in the PR. Update `docs/next/README.md` only when the root README needs to change for the next release. Update the full website-doc mirror under `docs/next/website/src/content/docs/` when website docs need to change for the next release.
 
@@ -105,7 +105,7 @@ fix: handle pane focus
 refs #128
 ```
 
-Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Herdr closes released issues after a release is published, not when unreleased commits land on `master`.
+Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Flock closes released issues after a release is published, not when unreleased commits land on `master`.
 
 ## PR scope
 
@@ -113,7 +113,7 @@ Small bug fixes for accepted issues that clearly match the existing design are g
 
 Bigger changes to UI, behavior, interaction patterns, persistence, or architecture need discussion and maintainer approval first.
 
-If a PR introduces a feature without prior alignment, or changes herdr's feel without discussion, it will likely be closed.
+If a PR introduces a feature without prior alignment, or changes flock's feel without discussion, it will likely be closed.
 
 ## Questions?
 

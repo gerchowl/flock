@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
+    unregister_spawned_flock_pid,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -22,12 +22,12 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hapi-{}-{nanos}", std::process::id()))
 }
 
-struct SpawnedHerdr {
+struct SpawnedFlock {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
 
-impl Drop for SpawnedHerdr {
+impl Drop for SpawnedFlock {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
@@ -44,12 +44,12 @@ impl Drop for SpawnedHerdr {
                 thread::sleep(Duration::from_millis(20));
             }
 
-            unregister_spawned_herdr_pid(Some(pid));
+            unregister_spawned_flock_pid(Some(pid));
         }
     }
 }
 
-fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
+fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
 }
@@ -84,17 +84,17 @@ fn wait_for_path(path: &Path, timeout: Duration) {
     panic!("path did not appear at {}", path.display());
 }
 
-fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedHerdr {
-    spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, "/bin/sh")
+fn spawn_flock(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedFlock {
+    spawn_flock_with_options(config_home, runtime_dir, socket_path, None, "/bin/sh")
 }
 
-fn spawn_herdr_with_path(
+fn spawn_flock_with_path(
     config_home: &Path,
     runtime_dir: &Path,
     socket_path: &Path,
     path_override: Option<&Path>,
-) -> SpawnedHerdr {
-    spawn_herdr_with_options(
+) -> SpawnedFlock {
+    spawn_flock_with_options(
         config_home,
         runtime_dir,
         socket_path,
@@ -104,27 +104,27 @@ fn spawn_herdr_with_path(
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_herdr_with_shell(
+fn spawn_flock_with_shell(
     config_home: &Path,
     runtime_dir: &Path,
     socket_path: &Path,
     shell: &str,
-) -> SpawnedHerdr {
-    spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, shell)
+) -> SpawnedFlock {
+    spawn_flock_with_options(config_home, runtime_dir, socket_path, None, shell)
 }
 
-fn spawn_herdr_with_options(
+fn spawn_flock_with_options(
     config_home: &Path,
     runtime_dir: &Path,
     socket_path: &Path,
     path_override: Option<&Path>,
     shell: &str,
-) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+) -> SpawnedFlock {
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -138,22 +138,22 @@ fn spawn_herdr_with_options(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", socket_path);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
 
-    SpawnedHerdr {
+    SpawnedFlock {
         _master: pair.master,
         child,
     }
@@ -259,9 +259,9 @@ fn ping_over_socket_returns_version() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let value = send_request(
@@ -275,7 +275,7 @@ fn ping_over_socket_returns_version() {
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 18);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -285,9 +285,9 @@ fn workspace_list_and_create_round_trip() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let empty = send_request(
@@ -473,7 +473,7 @@ fn workspace_list_and_create_round_trip() {
     );
     assert_eq!(timeout["error"]["code"], "timeout");
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -483,9 +483,9 @@ fn tab_methods_round_trip_over_socket() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -592,7 +592,7 @@ fn tab_methods_round_trip_over_socket() {
     );
     assert_eq!(closed["result"]["type"], "ok");
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(target_os = "linux")]
@@ -606,9 +606,9 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     fs::create_dir_all(&foreground).unwrap();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/bash");
+    let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/bash");
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -706,7 +706,7 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         foreground.display().to_string()
     );
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -716,9 +716,9 @@ fn agent_start_creates_named_terminal_over_socket() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
@@ -762,7 +762,7 @@ fn agent_start_creates_named_terminal_over_socket() {
         .unwrap()
         .contains(&terminal_id));
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[test]
@@ -771,9 +771,9 @@ fn agent_methods_round_trip_over_socket() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -926,7 +926,7 @@ fn agent_methods_round_trip_over_socket() {
     assert_eq!(focused["result"]["agent"]["tab_id"], second_tab_id);
     assert_eq!(focused["result"]["agent"]["focused"], true);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[test]
@@ -935,9 +935,9 @@ fn tab_create_with_no_focus_preserves_active_tab() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -984,7 +984,7 @@ fn tab_create_with_no_focus_preserves_active_tab() {
     assert_eq!(tabs[1]["tab_id"], second_tab_id);
     assert_eq!(tabs[1]["focused"], false);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -994,7 +994,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1014,7 +1014,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -1118,7 +1118,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
     assert_eq!(renamed_event["data"]["tab_id"], second_tab_id);
     assert_eq!(renamed_event["data"]["label"], "logs");
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1128,9 +1128,9 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -1192,7 +1192,7 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     );
     assert_eq!(pane_closed["data"]["pane_id"], split_pane_id);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1202,9 +1202,9 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -1278,7 +1278,7 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     let workspace_closed = wait_for_event(&mut reader, "workspace_closed", Duration::from_secs(2));
     assert_eq!(workspace_closed["data"]["workspace_id"], workspace_id);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1289,7 +1289,7 @@ fn pane_report_agent_updates_effective_state() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1305,7 +1305,7 @@ fn pane_report_agent_updates_effective_state() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -1365,7 +1365,7 @@ fn pane_report_agent_updates_effective_state() {
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_hook_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","message":"thinking","agent_session_path":"{}"}}}}"#,
+            r#"{{"id":"req_hook_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"flock:pi","agent":"pi","state":"working","message":"thinking","agent_session_path":"{}"}}}}"#,
             pane_id,
             session_path.display()
         ),
@@ -1383,7 +1383,7 @@ fn pane_report_agent_updates_effective_state() {
     assert_eq!(pane["result"]["pane"]["agent_status"], "working");
     assert_eq!(
         pane["result"]["pane"]["agent_session"]["source"],
-        "herdr:pi"
+        "flock:pi"
     );
     assert_eq!(pane["result"]["pane"]["agent_session"]["agent"], "pi");
     assert_eq!(pane["result"]["pane"]["agent_session"]["kind"], "path");
@@ -1395,7 +1395,7 @@ fn pane_report_agent_updates_effective_state() {
     let metadata = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_hook_metadata","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"herdr:pi","title":"Refactor auth","display_agent":"Pi auth","custom_status":"middleware","state_labels":{{"working":"deep in the mines"}}}}}}"#,
+            r#"{{"id":"req_hook_metadata","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"flock:pi","title":"Refactor auth","display_agent":"Pi auth","custom_status":"middleware","state_labels":{{"working":"deep in the mines"}}}}}}"#,
             pane_id
         ),
     );
@@ -1425,7 +1425,7 @@ fn pane_report_agent_updates_effective_state() {
     assert_eq!(agent["result"]["agent"]["agent"], "pi");
     assert_eq!(
         agent["result"]["agent"]["agent_session"]["source"],
-        "herdr:pi"
+        "flock:pi"
     );
     assert_eq!(agent["result"]["agent"]["agent_session"]["agent"], "pi");
     assert_eq!(agent["result"]["agent"]["agent_session"]["kind"], "path");
@@ -1489,7 +1489,7 @@ fn pane_report_agent_updates_effective_state() {
         "invalid_metadata_request"
     );
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1499,8 +1499,8 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let socket_path = runtime_dir.join("flock.sock");
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -1534,7 +1534,7 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     assert_eq!(pane["result"]["pane"]["agent"], "hermes");
     assert_eq!(pane["result"]["pane"]["agent_status"], "working");
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1544,7 +1544,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1568,7 +1568,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -1627,7 +1627,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_release_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working"}}}}"#,
+            r#"{{"id":"req_release_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"flock:pi","agent":"pi","state":"working"}}}}"#,
             pane_id
         ),
     );
@@ -1636,7 +1636,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     let released = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_release_5","method":"pane.release_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi"}}}}"#,
+            r#"{{"id":"req_release_5","method":"pane.release_agent","params":{{"pane_id":"{}","source":"flock:pi","agent":"pi"}}}}"#,
             pane_id
         ),
     );
@@ -1682,7 +1682,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1692,7 +1692,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1708,7 +1708,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -1779,7 +1779,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle"}}}}"#,
+            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"flock:pi","agent":"pi","state":"idle"}}}}"#,
             pane_id
         ),
     );
@@ -1788,7 +1788,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let cleared = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"herdr:pi"}}}}"#,
+            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"flock:pi"}}}}"#,
             pane_id
         ),
     );
@@ -1804,7 +1804,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     assert_eq!(pane["result"]["pane"]["agent"], "pi");
     assert_eq!(pane["result"]["pane"]["agent_status"], fallback_status);
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[test]
@@ -1813,7 +1813,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1833,7 +1833,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -1923,7 +1923,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
     assert_eq!(agent_idle["data"]["agent_status"], "idle");
     assert_eq!(agent_idle["data"]["agent"], "pi");
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[test]
@@ -1932,7 +1932,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
@@ -1956,7 +1956,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
-    let child = spawn_herdr_with_path(
+    let child = spawn_flock_with_path(
         &config_home,
         &runtime_dir,
         &socket_path,
@@ -2070,7 +2070,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
 
     fs::write(&stop_file, "stop").unwrap();
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }
 
 #[test]
@@ -2079,9 +2079,9 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket_path = runtime_dir.join("herdr.sock");
+    let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -2099,7 +2099,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let report_agent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_2","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working"}}}}"#,
+            r#"{{"id":"req_meta_sub_2","method":"pane.report_agent","params":{{"pane_id":"{}","source":"flock:pi","agent":"pi","state":"working"}}}}"#,
             pane_id
         ),
     );
@@ -2119,7 +2119,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let metadata = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_3","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"herdr:pi","custom_status":"filtered out"}}}}"#,
+            r#"{{"id":"req_meta_sub_3","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"flock:pi","custom_status":"filtered out"}}}}"#,
             pane_id
         ),
     );
@@ -2145,7 +2145,7 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let metadata = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_meta_sub_4","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"herdr:pi","custom_status":"short lived","ttl_ms":100}}}}"#,
+            r#"{{"id":"req_meta_sub_4","method":"pane.report_metadata","params":{{"pane_id":"{}","source":"user:pi-display","agent":"pi","applies_to_source":"flock:pi","custom_status":"short lived","ttl_ms":100}}}}"#,
             pane_id
         ),
     );
@@ -2165,5 +2165,5 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert_eq!(expiry_event["data"]["agent"], "pi");
     assert!(expiry_event["data"]["custom_status"].is_null());
 
-    cleanup_spawned_herdr(child, base);
+    cleanup_spawned_flock(child, base);
 }

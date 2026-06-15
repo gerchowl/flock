@@ -154,7 +154,7 @@ pub enum AppEvent {
         install_command: String,
     },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
-    /// re-emits it through herdr's own clipboard writer.
+    /// re-emits it through flock's own clipboard writer.
     ClipboardWrite {
         content: Vec<u8>,
     },

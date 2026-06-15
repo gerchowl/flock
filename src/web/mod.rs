@@ -1,15 +1,15 @@
-//! `herdr web` — xterm.js <-> herdr PTY bridge (feature = "web").
+//! `flock web` — xterm.js <-> flock PTY bridge (feature = "web").
 //!
-//! gerchowl/herdr#131 — first-class, in-tree port of the #109 MVP. Architecture
+//! gerchowl/flock#131 — first-class, in-tree port of the #109 MVP. Architecture
 //! (per the spike verdict, parent #109):
 //!
-//!   browser (xterm.js) <--WS--> herdr web <--PTY--> herdr client (terminal-ansi)
+//!   browser (xterm.js) <--WS--> flock web <--PTY--> flock client (terminal-ansi)
 //!
-//! Each WebSocket spawns a herdr **client** in a PTY with
-//! `HERDR_RENDER_ENCODING=terminal-ansi`; herdr's server pre-diffs to ANSI and
+//! Each WebSocket spawns a flock **client** in a PTY with
+//! `FLOCK_RENDER_ENCODING=terminal-ansi`; flock's server pre-diffs to ANSI and
 //! the client is a stdout passthrough, so xterm.js writes the byte stream
 //! straight to its buffer — no JS painting, no rerender. On an always-on host
-//! (e.g. sage) the client attaches to the persistent `herdr server` daemon, so
+//! (e.g. sage) the client attaches to the persistent `flock server` daemon, so
 //! the phone shares that node's live session AND its fleet gossip view.
 //!
 //! Security boundary (v1): this binds loopback only and is fronted by
@@ -52,13 +52,13 @@ struct WebAssets;
 /// personal fleet. `0` disables the cap.
 const DEFAULT_MAX_SESSIONS: usize = 16;
 
-/// Parsed `herdr web` configuration.
+/// Parsed `flock web` configuration.
 struct WebConfig {
     bind: SocketAddr,
-    herdr_bin: PathBuf,
+    flock_bin: PathBuf,
     /// Session name forwarded to the spawned client as `--session <name>`.
     session: Option<String>,
-    herdr_args: Vec<String>,
+    flock_args: Vec<String>,
     allow_non_loopback: bool,
     allow_funnel: bool,
     allowed_origins: Vec<String>,
@@ -74,8 +74,8 @@ struct WebConfig {
 
 #[derive(Clone)]
 struct AppState {
-    herdr_bin: Arc<PathBuf>,
-    herdr_args: Arc<Vec<String>>,
+    flock_bin: Arc<PathBuf>,
+    flock_args: Arc<Vec<String>>,
     allowed_origins: Arc<Vec<String>>,
     allow_any_origin: bool,
     allowed_users: Arc<Vec<String>>,
@@ -110,7 +110,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
     // routable interface exposes it without the tailscale-serve auth boundary.
     if !cfg.bind.ip().is_loopback() && !cfg.allow_non_loopback {
         eprintln!(
-            "herdr web: refusing to bind non-loopback address {}",
+            "flock web: refusing to bind non-loopback address {}",
             cfg.bind
         );
         eprintln!("  the web bridge is a full shell; front it with `tailscale serve` on loopback.");
@@ -126,7 +126,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
         match tailscale_funnel_status() {
             FunnelCheck::Active => {
                 eprintln!(
-                    "herdr web: refusing to start — `tailscale funnel` is active on this node."
+                    "flock web: refusing to start — `tailscale funnel` is active on this node."
                 );
                 eprintln!(
                     "  funnel publishes to the PUBLIC internet; this bridge is a full shell."
@@ -139,7 +139,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
             FunnelCheck::Inactive => {}
             FunnelCheck::Unknown => {
                 eprintln!(
-                    "herdr web: could not verify tailscale funnel state; ensure you front this \
+                    "flock web: could not verify tailscale funnel state; ensure you front this \
                      with `tailscale serve` (tailnet-only), NOT `tailscale funnel`."
                 );
             }
@@ -160,17 +160,17 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
 
 async fn serve(cfg: WebConfig) -> std::io::Result<i32> {
     let bind = cfg.bind;
-    // `--session <name>` is a global herdr flag, so it must precede any
+    // `--session <name>` is a global flock flag, so it must precede any
     // passthrough args and the (absent) subcommand for the default attach.
     let mut spawn_args = Vec::new();
     if let Some(session) = &cfg.session {
         spawn_args.push("--session".to_string());
         spawn_args.push(session.clone());
     }
-    spawn_args.extend(cfg.herdr_args);
+    spawn_args.extend(cfg.flock_args);
     let state = AppState {
-        herdr_bin: Arc::new(cfg.herdr_bin),
-        herdr_args: Arc::new(spawn_args),
+        flock_bin: Arc::new(cfg.flock_bin),
+        flock_args: Arc::new(spawn_args),
         allowed_origins: Arc::new(cfg.allowed_origins),
         allow_any_origin: cfg.allow_any_origin,
         allowed_users: Arc::new(cfg.allowed_users),
@@ -186,8 +186,8 @@ async fn serve(cfg: WebConfig) -> std::io::Result<i32> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("herdr web listening on http://{}/", bind);
-    eprintln!("herdr web: listening on http://{}/", bind);
+    info!("flock web listening on http://{}/", bind);
+    eprintln!("flock web: listening on http://{}/", bind);
     axum::serve(listener, app).await?;
     Ok(0)
 }
@@ -228,7 +228,7 @@ fn content_type_for(path: &str) -> &'static str {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    /// First message: terminal size. The bridge defers spawning herdr until
+    /// First message: terminal size. The bridge defers spawning flock until
     /// this lands so the PTY is sized correctly from the start.
     Init { cols: u16, rows: u16 },
     /// xterm resized; pty.resize() on the master.
@@ -276,7 +276,7 @@ async fn ws_handler(
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "herdr web: session limit reached",
+                "flock web: session limit reached",
             )
                 .into_response();
         }
@@ -338,9 +338,9 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
         }
     };
 
-    info!(cols, rows, "ws init — spawning herdr in PTY");
+    info!(cols, rows, "ws init — spawning flock in PTY");
 
-    // 2. Spawn herdr in a PTY.
+    // 2. Spawn flock in a PTY.
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -351,38 +351,38 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
         })
         .context("openpty")?;
 
-    let mut cmd = CommandBuilder::new(state.herdr_bin.as_os_str());
-    for a in state.herdr_args.iter() {
+    let mut cmd = CommandBuilder::new(state.flock_bin.as_os_str());
+    for a in state.flock_args.iter() {
         cmd.arg(a);
     }
-    // Start the spawned client from a clean herdr environment. CommandBuilder
-    // seeds env from the current process; if `herdr web` is run from inside a
-    // herdr pane, the inherited `HERDR_*` vars break the child: `HERDR_ENV=1`
+    // Start the spawned client from a clean flock environment. CommandBuilder
+    // seeds env from the current process; if `flock web` is run from inside a
+    // flock pane, the inherited `FLOCK_*` vars break the child: `FLOCK_ENV=1`
     // trips the nested-launch guard (`exit_if_nested_disabled`) so every
     // connection flash-exits, and the leg/handoff/switch/socket/pane vars make
     // it resume stale state or point at the launcher's socket instead of doing
     // a clean default-launch attach to the persistent server. Strip every
-    // inherited `HERDR_*` (the set grows over time, so blanket-strip rather
+    // inherited `FLOCK_*` (the set grows over time, so blanket-strip rather
     // than enumerate) except the user's config pointer, then set only what the
     // bridge needs below.
-    const KEEP_HERDR_ENV: &[&str] = &[crate::config::CONFIG_PATH_ENV_VAR];
+    const KEEP_FLOCK_ENV: &[&str] = &[crate::config::CONFIG_PATH_ENV_VAR];
     for (key, _) in std::env::vars() {
-        if key.starts_with("HERDR_") && !KEEP_HERDR_ENV.contains(&key.as_str()) {
+        if key.starts_with("FLOCK_") && !KEEP_FLOCK_ENV.contains(&key.as_str()) {
             cmd.env_remove(&key);
         }
     }
     // Server-side ANSI diff encoding — the whole reason this bridge exists.
-    cmd.env("HERDR_RENDER_ENCODING", "terminal-ansi");
+    cmd.env("FLOCK_RENDER_ENCODING", "terminal-ansi");
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLUMNS", cols.to_string());
     cmd.env("LINES", rows.to_string());
     // Kitty graphics is the known v1 cut — disable image cell reporting.
-    cmd.env("HERDR_CELL_WIDTH_PX", "0");
+    cmd.env("FLOCK_CELL_WIDTH_PX", "0");
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
 
-    let mut child = pair.slave.spawn_command(cmd).context("spawning herdr")?;
+    let mut child = pair.slave.spawn_command(cmd).context("spawning flock")?;
     drop(pair.slave);
 
     let master = pair.master;
@@ -493,7 +493,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
     tokio::select! {
         _ = pty_forwarder => { debug!("pty->ws drained"); }
         _ = ws_to_pty => { debug!("ws->pty task ended"); }
-        _ = child_done_rx.recv() => { info!("herdr child exited"); }
+        _ = child_done_rx.recv() => { info!("flock child exited"); }
     }
 
     // Drop the master and stop the side tasks. The cloned reader fd (held by
@@ -634,35 +634,35 @@ enum ParseResult {
     Err(i32),
 }
 
-fn default_herdr_bin() -> PathBuf {
-    if let Ok(v) = std::env::var("HERDR_WEB_HERDR_BIN") {
+fn default_flock_bin() -> PathBuf {
+    if let Ok(v) = std::env::var("FLOCK_WEB_FLOCK_BIN") {
         if !v.is_empty() {
             return PathBuf::from(v);
         }
     }
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("herdr"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flock"))
 }
 
 fn parse_args(args: &[String]) -> ParseResult {
-    let mut bind_raw = std::env::var("HERDR_WEB_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let mut bind_raw = std::env::var("FLOCK_WEB_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     if bind_raw.is_empty() {
         bind_raw = DEFAULT_BIND.to_string();
     }
-    let mut herdr_bin = default_herdr_bin();
-    let mut herdr_args: Vec<String> = Vec::new();
-    let mut session: Option<String> = std::env::var("HERDR_WEB_SESSION")
+    let mut flock_bin = default_flock_bin();
+    let mut flock_args: Vec<String> = Vec::new();
+    let mut session: Option<String> = std::env::var("FLOCK_WEB_SESSION")
         .ok()
         .filter(|s| !s.is_empty());
     let mut allow_non_loopback = false;
     let mut allow_funnel = false;
     let mut allow_any_origin = false;
-    let mut allowed_origins = csv_env("HERDR_WEB_ALLOWED_ORIGINS");
-    let mut allowed_users = csv_env("HERDR_WEB_ALLOWED_USERS");
-    let mut max_sessions: usize = std::env::var("HERDR_WEB_MAX_SESSIONS")
+    let mut allowed_origins = csv_env("FLOCK_WEB_ALLOWED_ORIGINS");
+    let mut allowed_users = csv_env("FLOCK_WEB_ALLOWED_USERS");
+    let mut max_sessions: usize = std::env::var("FLOCK_WEB_MAX_SESSIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_SESSIONS);
-    let mut idle_secs: u64 = std::env::var("HERDR_WEB_IDLE_TIMEOUT_SECS")
+    let mut idle_secs: u64 = std::env::var("FLOCK_WEB_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -673,23 +673,23 @@ fn parse_args(args: &[String]) -> ParseResult {
             "help" | "--help" | "-h" => return ParseResult::Help,
             "--bind" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --bind");
+                    eprintln!("flock web: missing value for --bind");
                     return ParseResult::Err(2);
                 };
                 bind_raw = v.clone();
                 i += 2;
             }
-            "--herdr-bin" => {
+            "--flock-bin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --herdr-bin");
+                    eprintln!("flock web: missing value for --flock-bin");
                     return ParseResult::Err(2);
                 };
-                herdr_bin = PathBuf::from(v);
+                flock_bin = PathBuf::from(v);
                 i += 2;
             }
             "--session" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --session");
+                    eprintln!("flock web: missing value for --session");
                     return ParseResult::Err(2);
                 };
                 session = Some(v.clone());
@@ -697,7 +697,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--allowed-origin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --allowed-origin");
+                    eprintln!("flock web: missing value for --allowed-origin");
                     return ParseResult::Err(2);
                 };
                 allowed_origins.push(v.clone());
@@ -705,7 +705,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--allowed-user" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --allowed-user");
+                    eprintln!("flock web: missing value for --allowed-user");
                     return ParseResult::Err(2);
                 };
                 allowed_users.push(v.clone());
@@ -713,13 +713,13 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--max-sessions" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --max-sessions");
+                    eprintln!("flock web: missing value for --max-sessions");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => max_sessions = n,
                     Err(_) => {
-                        eprintln!("herdr web: invalid --max-sessions: {v}");
+                        eprintln!("flock web: invalid --max-sessions: {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -727,13 +727,13 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--idle-timeout" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("herdr web: missing value for --idle-timeout");
+                    eprintln!("flock web: missing value for --idle-timeout");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => idle_secs = n,
                     Err(_) => {
-                        eprintln!("herdr web: invalid --idle-timeout (seconds): {v}");
+                        eprintln!("flock web: invalid --idle-timeout (seconds): {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -752,11 +752,11 @@ fn parse_args(args: &[String]) -> ParseResult {
                 i += 1;
             }
             "--" => {
-                herdr_args.extend(args[i + 1..].iter().cloned());
+                flock_args.extend(args[i + 1..].iter().cloned());
                 break;
             }
             other => {
-                eprintln!("herdr web: unknown option: {other}");
+                eprintln!("flock web: unknown option: {other}");
                 return ParseResult::Err(2);
             }
         }
@@ -765,16 +765,16 @@ fn parse_args(args: &[String]) -> ParseResult {
     let bind = match bind_raw.parse::<SocketAddr>() {
         Ok(addr) => addr,
         Err(_) => {
-            eprintln!("herdr web: invalid bind address: {bind_raw}");
+            eprintln!("flock web: invalid bind address: {bind_raw}");
             return ParseResult::Err(2);
         }
     };
 
     ParseResult::Ok(WebConfig {
         bind,
-        herdr_bin,
+        flock_bin,
         session,
-        herdr_args,
+        flock_args,
         allow_non_loopback,
         allow_funnel,
         allowed_origins,
@@ -799,33 +799,33 @@ fn csv_env(name: &str) -> Vec<String> {
 }
 
 fn print_web_help() {
-    println!("herdr web — serve a phone-friendly xterm.js terminal over a WebSocket");
+    println!("flock web — serve a phone-friendly xterm.js terminal over a WebSocket");
     println!();
-    println!("Usage: herdr web [options] [-- <herdr args>]");
+    println!("Usage: flock web [options] [-- <flock args>]");
     println!();
     println!("Front this with `tailscale serve` (tailnet-only). It is a full shell.");
     println!();
     println!("Options:");
     println!("  --bind <addr>            loopback addr to listen on (default {DEFAULT_BIND})");
-    println!("                           env: HERDR_WEB_BIND");
-    println!("  --herdr-bin <path>       herdr binary to spawn per connection");
-    println!("                           (default: this binary; env HERDR_WEB_HERDR_BIN)");
-    println!("  --session <name>         herdr session the bridge attaches to");
-    println!("                           env: HERDR_WEB_SESSION");
+    println!("                           env: FLOCK_WEB_BIND");
+    println!("  --flock-bin <path>       flock binary to spawn per connection");
+    println!("                           (default: this binary; env FLOCK_WEB_FLOCK_BIN)");
+    println!("  --session <name>         flock session the bridge attaches to");
+    println!("                           env: FLOCK_WEB_SESSION");
     println!("  --allowed-origin <o>     extra allowed WS Origin (repeatable)");
-    println!("                           env: HERDR_WEB_ALLOWED_ORIGINS (comma-separated)");
+    println!("                           env: FLOCK_WEB_ALLOWED_ORIGINS (comma-separated)");
     println!("  --allowed-user <login>   tailscale identity allowed to connect (repeatable);");
-    println!("                           empty = not enforced. env: HERDR_WEB_ALLOWED_USERS");
+    println!("                           empty = not enforced. env: FLOCK_WEB_ALLOWED_USERS");
     println!("  --max-sessions <n>       concurrent WS cap (0 = unlimited;");
     println!(
-        "                           default {DEFAULT_MAX_SESSIONS}). env: HERDR_WEB_MAX_SESSIONS"
+        "                           default {DEFAULT_MAX_SESSIONS}). env: FLOCK_WEB_MAX_SESSIONS"
     );
     println!("  --idle-timeout <secs>    close a WS idle this long (0 = off;");
-    println!("                           default 0). env: HERDR_WEB_IDLE_TIMEOUT_SECS");
+    println!("                           default 0). env: FLOCK_WEB_IDLE_TIMEOUT_SECS");
     println!("  --allow-non-loopback     permit a routable --bind (you provide auth)");
     println!("  --allow-funnel           start even if `tailscale funnel` is active");
     println!("  --allow-any-origin       disable the same-origin WS check (unsafe)");
-    println!("  -- <herdr args>          extra args passed to the spawned herdr");
+    println!("  -- <flock args>          extra args passed to the spawned flock");
 }
 
 #[cfg(test)]

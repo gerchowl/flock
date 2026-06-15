@@ -609,8 +609,8 @@ mod tests {
     fn member(state: &mut crate::app::state::AppState, ws_idx: usize, linked: bool) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "grp".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
             checkout_path: format!("/repo/ws-{ws_idx}").into(),
             is_linked_worktree: linked,
         });

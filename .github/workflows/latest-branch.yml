@@ -1,7 +1,7 @@
 # Fork-only: maintain the `latest` distribution channel for Nix users.
 #
 # Every push to the integration branch builds the flake packages — exactly
-# what `github:gerchowl/herdr/latest` consumers will get — and fast-forwards
+# what `github:gerchowl/flock/latest` consumers will get — and fast-forwards
 # `latest` only on success. Pin `latest` for newest-green, a tag/rev for
 # immutable, or the integration branch for bleeding edge.
 #
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build-and-advance:
-    if: github.repository == 'gerchowl/herdr'
+    if: github.repository == 'gerchowl/flock'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +34,6 @@ jobs:
             experimental-features = nix-command flakes
             always-allow-substitutes = true
       - name: Build the flake packages consumers receive
-        run: nix build .#default .#herdr-web --print-build-logs
+        run: nix build .#default .#flock-web --print-build-logs
       - name: Fast-forward latest
         run: git push --force origin "$GITHUB_SHA:refs/heads/latest"

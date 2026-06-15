@@ -47,10 +47,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-x86_64
+            name: flock-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-aarch64
+            name: flock-linux-aarch64
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
@@ -93,7 +93,7 @@ jobs:
 
       - name: Package artifact
         run: |
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
           file ${{ matrix.name }} > BUILD_INFO.txt
           ldd ${{ matrix.name }} 2>&1 | tee -a BUILD_INFO.txt
           grep -q "statically linked" BUILD_INFO.txt
@@ -127,10 +127,10 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: herdr-macos-x86_64
+            name: flock-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: herdr-macos-aarch64
+            name: flock-macos-aarch64
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
@@ -161,7 +161,7 @@ jobs:
 
       - name: Package artifact
         run: |
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
           file ${{ matrix.name }} > BUILD_INFO.txt
           {
             echo "commit=$GITHUB_SHA"

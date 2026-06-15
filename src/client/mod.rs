@@ -1,7 +1,7 @@
 //! Thin client mode — connects to the server's client socket.
 //!
 //! The client:
-//! - Connects to `herdr-client.sock`, sends Hello with terminal size and protocol version
+//! - Connects to `flock-client.sock`, sends Hello with terminal size and protocol version
 //! - Sets up the real terminal (raw mode, mouse capture, keyboard enhancements)
 //! - Receives Frame messages and blits them to the terminal (diff against last frame)
 //! - Reads stdin events (keystrokes, mouse, paste) and sends them as ClientMessage::Input
@@ -199,17 +199,17 @@ impl ClientState {
 // Error types
 // ---------------------------------------------------------------------------
 
-/// Path of the launcher's switch file. Set by the outermost herdr process;
+/// Path of the launcher's switch file. Set by the outermost flock process;
 /// a client that receives SwitchServer writes the SSH target here and exits,
-/// and the launcher chains into `herdr --remote <target>`.
-pub const SWITCH_FILE_ENV_VAR: &str = "HERDR_SWITCH_FILE";
+/// and the launcher chains into `flock --remote <target>`.
+pub const SWITCH_FILE_ENV_VAR: &str = "FLOCK_SWITCH_FILE";
 
 /// Env var the launcher sets on the leg it re-attaches after a FAILED server
 /// switch (#63). The client lifts it into the Hello `notice` so the server
 /// renders `switch to <name> failed: <reason>` top-right — the user lands
 /// back on the previous server, told why, never stranded at a shell. Cleared
 /// (unset) once consumed so it shows on the first attach only.
-pub const SWITCH_NOTICE_ENV_VAR: &str = "HERDR_SWITCH_NOTICE";
+pub const SWITCH_NOTICE_ENV_VAR: &str = "FLOCK_SWITCH_NOTICE";
 
 /// Env var the launcher sets on a leg it chains into AFTER a seamless switch
 /// held the host terminal (#63/#69). The previous leg's process exited holding
@@ -220,7 +220,7 @@ pub const SWITCH_NOTICE_ENV_VAR: &str = "HERDR_SWITCH_NOTICE";
 /// leg to arm its held-terminal restore guard, so if it dies in the #52 retry
 /// window — ctrl-c, signal, error, panic — before it repaints, it reclaims the
 /// host terminal instead of leaving the user stranded behind the frozen frame.
-pub const HELD_TERMINAL_ENV_VAR: &str = "HERDR_TERMINAL_HELD";
+pub const HELD_TERMINAL_ENV_VAR: &str = "FLOCK_TERMINAL_HELD";
 
 /// Take the launcher's one-shot attach notice, if set, clearing it so a later
 /// in-leg handshake retry (#38 live-handoff) does not repeat it.
@@ -342,7 +342,7 @@ impl std::fmt::Display for ClientError {
                 let path = client_socket_path();
                 write!(
                     f,
-                    "\nIs herdr server running? Start it with `herdr server`."
+                    "\nIs flock server running? Start it with `flock server`."
                 )?;
                 write!(f, "\nSocket path: {}", path.display())
             }
@@ -615,7 +615,7 @@ impl Drop for TerminalGuard {
 // ---------------------------------------------------------------------------
 
 fn requested_render_encoding() -> RenderEncoding {
-    match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
+    match std::env::var("FLOCK_RENDER_ENCODING").ok().as_deref() {
         Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
         _ => RenderEncoding::SemanticFrame,
     }
@@ -1004,7 +1004,7 @@ impl HandoffRetry {
     /// counter so the wait reads as progress rather than a frozen hang (#69).
     fn status_text(&self) -> String {
         let secs = self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        format!("herdr: handoff in progress, reconnecting… ({secs}s)")
+        format!("flock: handoff in progress, reconnecting… ({secs}s)")
     }
 
     /// Paint the reconnect status while waiting. When a previous leg left the
@@ -1164,7 +1164,7 @@ fn capture_default_panic_hook() {
     DEFAULT_PANIC_HOOK.get_or_init(std::panic::take_hook);
 }
 
-/// Install herdr's terminal-restoring panic hook, chaining into the captured
+/// Install flock's terminal-restoring panic hook, chaining into the captured
 /// process default.
 ///
 /// A panic is always a real exit, so this NEVER honors the switch-handoff hold
@@ -1189,7 +1189,7 @@ fn install_protective_panic_hook() {
         // Non-fatal: `writeln!` returns Err on a dead stderr where `eprintln!`
         // would panic — that panic was the first half of the double-panic
         // abort. Best-effort diagnostic first so a working stderr still sees it.
-        let _ = writeln!(io::stderr(), "herdr client panic: {info}");
+        let _ = writeln!(io::stderr(), "flock client panic: {info}");
         if let Some(original) = DEFAULT_PANIC_HOOK.get() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original(info)));
         }
@@ -1257,7 +1257,7 @@ fn run_client_with_mode(
         input::stdin_reader_loop(stdin_tx, &stdin_quit);
     });
 
-    // Install herdr's terminal-restoring panic hook. It is re-asserted after
+    // Install flock's terminal-restoring panic hook. It is re-asserted after
     // every `ratatui::try_init` (see setup_terminal_with_capabilities) because
     // that call installs ratatui's own hook on top of ours — and ratatui's hook
     // `eprintln!`s while restoring, which is a second panic → abort on a dead
@@ -1327,7 +1327,7 @@ fn run_client_with_mode(
                 held_restore.into_handoff();
                 let _ = writeln!(
                     io::stderr(),
-                    "herdr: failed to set up terminal: {setup_err}"
+                    "flock: failed to set up terminal: {setup_err}"
                 );
                 rt.shutdown_timeout(Duration::from_millis(100));
                 crate::logging::shutdown("client");
@@ -1357,7 +1357,7 @@ fn run_client_with_mode(
         // broken. `eprintln!` would panic on that write, and the active hook
         // (ratatui's, before this fix) would double-panic → abort — the
         // federation-switch crash. `writeln!` just drops the diagnostic.
-        let _ = writeln!(io::stderr(), "herdr: {err}");
+        let _ = writeln!(io::stderr(), "flock: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -1833,7 +1833,7 @@ async fn run_client_loop(
                             }
                         }
                         // Record the target for the launcher's attach loop, then
-                        // exit exactly like a detach. The outermost herdr process
+                        // exit exactly like a detach. The outermost flock process
                         // reads the file and starts the next leg.
                         if record_switch_target(
                             &ssh_target,
@@ -1847,9 +1847,9 @@ async fn run_client_loop(
                                 reason: Some("switching".to_string()),
                             });
                         }
-                        // No launcher to chain into (e.g. bare `herdr client`):
+                        // No launcher to chain into (e.g. bare `flock client`):
                         // stay attached and let the user switch manually.
-                        let _ = writeln!(io::stderr(), "herdr: server requested switch to {ssh_target}, but no launcher is present (HERDR_SWITCH_FILE unset)");
+                        let _ = writeln!(io::stderr(), "flock: server requested switch to {ssh_target}, but no launcher is present (FLOCK_SWITCH_FILE unset)");
                     }
                     ServerMessage::Notify { kind, message } => {
                         handle_notify(kind, &message, &state.sound_config);
@@ -2795,7 +2795,7 @@ fn connect_with_brief_retry(path: &std::path::Path) -> io::Result<UnixStream> {
 ///
 /// - Home: the local client socket — always reachable.
 /// - The ACTIVE ssh leg: its ssh-stdio bridge socket, created by the LAUNCHER
-///   (`run_remote`) and handed down explicitly via `HERDR_ACTIVE_BRIDGE_SOCKET`.
+///   (`run_remote`) and handed down explicitly via `FLOCK_ACTIVE_BRIDGE_SOCKET`.
 ///   The client is a separate child, so it CANNOT recompute that path from
 ///   `local_forward_socket_path` (which keys on `std::process::id()` — the
 ///   launcher's pid, never the client's). Recomputing it was the bug: every ssh
@@ -3166,7 +3166,7 @@ fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()>
 }
 
 fn init_logging() {
-    crate::logging::init_file_logging("herdr-client.log");
+    crate::logging::init_file_logging("flock-client.log");
 }
 
 // ---------------------------------------------------------------------------
@@ -3295,7 +3295,7 @@ mod tests {
         let fresh = HandoffRetry::default();
         assert_eq!(
             fresh.status_text(),
-            "herdr: handoff in progress, reconnecting… (0s)"
+            "flock: handoff in progress, reconnecting… (0s)"
         );
 
         // Once the window opens, the counter ticks up.
@@ -3305,7 +3305,7 @@ mod tests {
         };
         assert_eq!(
             retry.status_text(),
-            "herdr: handoff in progress, reconnecting… (3s)"
+            "flock: handoff in progress, reconnecting… (3s)"
         );
     }
 
@@ -3404,7 +3404,7 @@ mod tests {
 
     #[test]
     fn recorded_switch_roundtrips_with_and_without_fleet() {
-        let dir = std::env::temp_dir().join(format!("herdr-switch-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flock-switch-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("switch");
 
@@ -3552,14 +3552,14 @@ mod tests {
         crate::session::clear_explicit_session_for_test();
 
         // Bind a fake "spoke" listener; slot_socket_path(Home) reads
-        // HERDR_CLIENT_SOCKET_PATH (legacy fallback when HERDR_SOCKET_PATH is
+        // FLOCK_CLIENT_SOCKET_PATH (legacy fallback when FLOCK_SOCKET_PATH is
         // absent), so we point Home at our fake socket.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let socket_path = PathBuf::from(format!(
-            "/tmp/herdr-slots-fed-{}-{nanos}.sock",
+            "/tmp/flock-slots-fed-{}-{nanos}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&socket_path);
@@ -3749,7 +3749,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
+    fn kitty_graphics_image_id_parser_tracks_flock_ids_only() {
         let ids = kitty_graphics_image_ids(
             b"text\x1b_Ga=t,t=d,f=32,s=1,v=1,i=10023,q=2;AAAA\x1b\\\x1b_Ga=p,i=10023,p=7;\x1b\\",
         );
@@ -3916,7 +3916,7 @@ mod tests {
             "should mention connection failure: {msg}"
         );
         assert!(
-            msg.contains("herdr server"),
+            msg.contains("flock server"),
             "should suggest starting server: {msg}"
         );
     }
@@ -3970,7 +3970,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr` to reattach"),
+            msg.contains("Run `flock` to reattach"),
             "should suggest default reattach command: {msg}"
         );
     }
@@ -3985,7 +3985,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr session attach work` to reattach"),
+            msg.contains("Run `flock session attach work` to reattach"),
             "should suggest named session reattach command: {msg}"
         );
     }
@@ -3995,7 +3995,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "herdr --remote host --session work",
+            "flock --remote host --session work",
         );
         let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
         let err = ClientError::ServerShutdown {
@@ -4003,7 +4003,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr --remote host --session work` to reattach"),
+            msg.contains("Run `flock --remote host --session work` to reattach"),
             "should prefer remote reattach command: {msg}"
         );
     }
@@ -4044,7 +4044,7 @@ mod tests {
     fn reload_local_client_config_refreshes_redraw_on_focus_gained() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let path = std::env::temp_dir().join(format!(
-            "herdr-client-config-reload-{}-{}.toml",
+            "flock-client-config-reload-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

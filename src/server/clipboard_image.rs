@@ -77,7 +77,7 @@ fn sanitize_extension(extension: &str) -> &'static str {
 
 fn staging_dir() -> PathBuf {
     let user_id = unsafe { libc::geteuid() };
-    std::env::temp_dir().join(format!("herdr-clipboard-images-{user_id}"))
+    std::env::temp_dir().join(format!("flock-clipboard-images-{user_id}"))
 }
 
 fn ensure_staging_dir() -> io::Result<PathBuf> {

@@ -15,8 +15,8 @@ use serde::Deserialize;
 use support::{
     cleanup_test_base, client_handshake, encode_live_handoff_refusal, encode_varint_u16,
     encode_varint_u32, frame_message, read_server_message, register_runtime_dir,
-    register_spawned_herdr_pid, send_input, send_set_frame_subscription,
-    unregister_spawned_herdr_pid, wait_for_file, wait_for_message_variant, wait_for_socket,
+    register_spawned_flock_pid, send_input, send_set_frame_subscription,
+    unregister_spawned_flock_pid, wait_for_file, wait_for_message_variant, wait_for_socket,
     wait_until,
 };
 
@@ -26,23 +26,23 @@ fn unique_test_dir() -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     PathBuf::from(format!(
-        "/tmp/herdr-client-test-{}-{nanos}",
+        "/tmp/flock-client-test-{}-{nanos}",
         std::process::id()
     ))
 }
 
-struct SpawnedHerdr {
+struct SpawnedFlock {
     _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
-impl SpawnedHerdr {
+impl SpawnedFlock {
     fn close_master(&mut self) {
         drop(self._master.take());
     }
 }
 
-impl Drop for SpawnedHerdr {
+impl Drop for SpawnedFlock {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
@@ -60,12 +60,12 @@ impl Drop for SpawnedHerdr {
                 thread::sleep(Duration::from_millis(20));
             }
 
-            unregister_spawned_herdr_pid(Some(pid));
+            unregister_spawned_flock_pid(Some(pid));
         }
     }
 }
 
-fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
+fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
 }
@@ -81,7 +81,7 @@ fn spawn_client_process(
     config_home: &PathBuf,
     runtime_dir: &PathBuf,
     api_socket_path: &PathBuf,
-) -> SpawnedHerdr {
+) -> SpawnedFlock {
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -92,21 +92,21 @@ fn spawn_client_process(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("client");
-    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("FLOCK_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
-    SpawnedHerdr {
+    SpawnedFlock {
         _master: Some(pair.master),
         child,
     }
@@ -117,12 +117,12 @@ fn spawn_server(
     runtime_dir: &PathBuf,
     api_socket_path: &PathBuf,
     _client_socket_path: &PathBuf,
-) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+) -> SpawnedFlock {
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -136,20 +136,20 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
-    SpawnedHerdr {
+    SpawnedFlock {
         _master: Some(pair.master),
         child,
     }
@@ -265,8 +265,8 @@ fn client_connects_and_receives_frame() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -286,7 +286,7 @@ fn client_connects_and_receives_frame() {
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
         .expect("should receive a frame from server");
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -298,8 +298,8 @@ fn pause_subscription_stops_frames_and_resume_redraws() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -337,7 +337,7 @@ fn pause_subscription_stops_frames_and_resume_redraws() {
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
         .expect("resumed slot should receive a full-redraw frame");
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 /// ClientMessage::Resize is positional variant 3. Re-asserting geometry to a
@@ -364,8 +364,8 @@ fn resume_reasserts_geometry_so_panes_render_at_new_width() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -411,7 +411,7 @@ fn resume_reasserts_geometry_so_panes_render_at_new_width() {
         "after resume + geometry re-assert the server must render panes at width B (120)"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -420,13 +420,13 @@ fn client_sees_headless_startup_config_diagnostic() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "flock-dev"
     } else {
-        "herdr"
+        "flock"
     };
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(
@@ -446,20 +446,20 @@ fn client_sees_headless_startup_config_diagnostic() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", &api_socket);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", &api_socket);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
-    let spawned = SpawnedHerdr {
+    let spawned = SpawnedFlock {
         _master: Some(pair.master),
         child,
     };
@@ -496,7 +496,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         "attached client should see startup config parse diagnostic"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -507,8 +507,8 @@ fn client_input_forwarded_to_pane() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -551,7 +551,7 @@ fn client_input_forwarded_to_pane() {
         "server should still respond to ping after input: {response}"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -561,8 +561,8 @@ fn client_resize_sends_message() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -610,7 +610,7 @@ fn client_resize_sends_message() {
         "server should respond after resize: {response}"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -620,8 +620,8 @@ fn server_shutdown_sends_message_to_client() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -685,25 +685,25 @@ fn server_unreachable_shows_clear_error() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
+    let api_socket = runtime_dir.join("flock.sock");
 
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flock"))
         .arg("client")
-        .env("HERDR_DISABLE_SOUND", "1")
+        .env("FLOCK_DISABLE_SOUND", "1")
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("HERDR_SOCKET_PATH", &api_socket)
-        .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env_remove("HERDR_ENV")
+        .env("FLOCK_SOCKET_PATH", &api_socket)
+        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_ENV")
         .output()
         .expect("client command should run");
 
@@ -717,7 +717,7 @@ fn server_unreachable_shows_clear_error() {
         "stderr should mention connection failure: {stderr}"
     );
     assert!(
-        stderr.contains("Is herdr server running?"),
+        stderr.contains("Is flock server running?"),
         "stderr should include actionable guidance: {stderr}"
     );
     assert!(
@@ -736,8 +736,8 @@ fn server_crash_after_attach_causes_lost_connection_error() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -859,8 +859,8 @@ fn client_receives_frame_after_pane_output() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -894,7 +894,7 @@ fn client_receives_frame_after_pane_output() {
         .expect("wait for post-output frame");
     assert!(received_frame, "should receive a Frame after pane output");
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -906,8 +906,8 @@ fn navigate_mode_keybind_dispatch_in_server() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -971,7 +971,7 @@ fn navigate_mode_keybind_dispatch_in_server() {
         "server should still respond after navigate mode input: {response}"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -983,8 +983,8 @@ fn pane_spawn_cwd_fallback_in_server() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -1013,7 +1013,7 @@ fn pane_spawn_cwd_fallback_in_server() {
         "workspace creation should succeed: {response}"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 #[test]
@@ -1024,8 +1024,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -1086,13 +1086,13 @@ fn client_receives_notify_on_agent_state_change() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
     // Enable toast and sound in config so the server produces notifications.
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();
@@ -1110,20 +1110,20 @@ fn client_receives_notify_on_agent_state_change() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", &api_socket);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", &api_socket);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
-    let spawned = SpawnedHerdr {
+    let spawned = SpawnedFlock {
         _master: Some(pair.master),
         child,
     };
@@ -1301,7 +1301,7 @@ fn client_receives_notify_on_agent_state_change() {
         "client should receive a Sound Notify with 'agent done' when background pane transitions Working→Idle"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,7 +1309,7 @@ fn client_receives_notify_on_agent_state_change() {
 // ---------------------------------------------------------------------------
 
 /// A stand-in server that refuses every connecting client with the
-/// live-handoff notice, keeping the real `herdr client` spinning in its #52
+/// live-handoff notice, keeping the real `flock client` spinning in its #52
 /// retry window. Returns a flag the caller can flip to stop the accept loop.
 fn spawn_refusing_server(client_socket: PathBuf) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     use std::os::unix::net::UnixListener;
@@ -1391,14 +1391,14 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
 
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("flock/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -1413,25 +1413,25 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("client");
-    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("FLOCK_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", &api_socket);
-    cmd.env("HERDR_CLIENT_SOCKET_PATH", &client_socket);
+    cmd.env("FLOCK_SOCKET_PATH", &api_socket);
+    cmd.env("FLOCK_CLIENT_SOCKET_PATH", &client_socket);
     // Pretend a previous leg handed us a held terminal (the switch-handoff case).
-    cmd.env("HERDR_TERMINAL_HELD", "1");
+    cmd.env("FLOCK_TERMINAL_HELD", "1");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("FLOCK_ENV");
     cmd.env_remove("TMUX");
 
     let reader = pair.master.try_clone_reader().unwrap();
     let child = pair.slave.spawn_command(cmd).unwrap();
     let pid = child.process_id();
-    register_spawned_herdr_pid(pid);
+    register_spawned_flock_pid(pid);
     drop(pair.slave);
-    let mut spawned = SpawnedHerdr {
+    let mut spawned = SpawnedFlock {
         _master: Some(pair.master),
         child,
     };
@@ -1497,5 +1497,5 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
     server_stop.store(true, std::sync::atomic::Ordering::Release);
     spawned.close_master();
     let _ = spawned.child.wait();
-    cleanup_spawned_herdr(spawned, base);
+    cleanup_spawned_flock(spawned, base);
 }

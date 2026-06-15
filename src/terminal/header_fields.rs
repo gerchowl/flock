@@ -1,6 +1,6 @@
 //! Session-promoted pane header fields ("chips").
 //!
-//! Sessions know things herdr cannot derive: dev containers they started,
+//! Sessions know things flock cannot derive: dev containers they started,
 //! long-task progress, ports, model names. `pane.set_header_field` lets the
 //! session register small `key value` chips onto its own pane's header (and
 //! the navigation surfaces that ride `PaneDetail`). Fields are ephemeral by

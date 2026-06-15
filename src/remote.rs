@@ -20,33 +20,33 @@ const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
-const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
-pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const REMOTE_BINARY_ENV_VAR: &str = "FLOCK_REMOTE_BINARY";
+pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "FLOCK_REATTACH_COMMAND";
 
-pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "FLOCK_REMOTE_KEYBINDINGS";
 
 /// JSON-encoded `protocol::FleetSnapshot` the launcher hands to the spawned
 /// client process; the client forwards it in its `Hello` (hub-and-spoke
 /// down-gossip). Set per-child, never exported to the launcher's own env.
-pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "HERDR_FLEET_SNAPSHOT";
+pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "FLOCK_FLEET_SNAPSHOT";
 
 /// The ssh target of the server a remote client leg is attaching to, handed to
 /// the spawned client process so its connection-slots manager (#65) knows which
 /// slot is active (the others, incl. home, are warm-dialed). Unset for a local
 /// attach — then home is the active slot.
-pub(crate) const ACTIVE_SSH_TARGET_ENV_VAR: &str = "HERDR_ACTIVE_SSH_TARGET";
+pub(crate) const ACTIVE_SSH_TARGET_ENV_VAR: &str = "FLOCK_ACTIVE_SSH_TARGET";
 
 /// The actual local-forward socket path of the active leg's ssh-stdio bridge,
 /// handed from the LAUNCHER (`run_remote`, which created the bridge socket
 /// keyed on its own pid) to the spawned client child. The client and launcher
 /// are separate processes, so the client cannot recompute this path from
-/// `std::process::id()` — it must be passed explicitly (the `HERDR_FLEET_SNAPSHOT`
+/// `std::process::id()` — it must be passed explicitly (the `FLOCK_FLEET_SNAPSHOT`
 /// precedent). The connection-slots manager (#65) uses it to warm-dial the
 /// active ssh slot's already-live bridge instead of a path that never exists.
 /// Unset for a local attach (home needs no bridge).
-pub(crate) const ACTIVE_BRIDGE_SOCKET_ENV_VAR: &str = "HERDR_ACTIVE_BRIDGE_SOCKET";
+pub(crate) const ACTIVE_BRIDGE_SOCKET_ENV_VAR: &str = "FLOCK_ACTIVE_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {
@@ -75,7 +75,7 @@ impl RemoteKeybindings {
 /// PROMPT the user (`--remote` from a shell) or must surface mismatches as
 /// errors that ride the switch-failure notice rail (#67).
 ///
-/// An explicit `herdr --remote <target>` call has a real interactive TTY and
+/// An explicit `flock --remote <target>` call has a real interactive TTY and
 /// the user is making a one-shot decision to launch a remote leg — install /
 /// upgrade prompts are appropriate. A federation SWITCH leg is queued by the
 /// leg loop while a previous leg may still hold the alternate screen + raw
@@ -84,7 +84,7 @@ impl RemoteKeybindings {
 /// the terminal tab (the live bug on #115).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchContext {
-    /// The user typed `herdr --remote <target>` at a shell. Prompt freely.
+    /// The user typed `flock --remote <target>` at a shell. Prompt freely.
     Cli,
     /// The leg loop is chaining into this remote leg after a SwitchServer
     /// from a previous leg. Any install / upgrade prompt must be replaced
@@ -225,7 +225,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
     let program = std::env::args()
         .next()
-        .unwrap_or_else(|| "herdr".to_string());
+        .unwrap_or_else(|| "flock".to_string());
     let reattach_command = reattach_command(
         &program,
         &remote.target,
@@ -234,10 +234,10 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
     );
     let prepared_remote =
-        prepare_remote_herdr(&remote.target, remote.live_handoff, remote.context)?;
+        prepare_remote_flock(&remote.target, remote.live_handoff, remote.context)?;
     ensure_remote_server_ready(
         &remote.target,
-        &prepared_remote.remote_herdr,
+        &prepared_remote.remote_flock,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
@@ -250,7 +250,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .manage_ssh_config;
     let _bridge = SshStdioBridge::start(
         remote.target,
-        prepared_remote.remote_herdr,
+        prepared_remote.remote_flock,
         local_socket.clone(),
         session_name,
         manage_ssh_config,
@@ -290,7 +290,7 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
         io::Error::new(
             err.kind(),
             format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
+                "failed to connect to remote Flock client socket {}: {err}",
                 socket_path.display()
             ),
         )
@@ -321,7 +321,7 @@ fn ensure_remote_server_running() -> io::Result<()> {
             return Ok(());
         }
         return Err(io::Error::other(
-            "remote herdr server must restart before this bridge can attach; rerun `herdr --remote` from an interactive terminal to approve stopping it",
+            "remote flock server must restart before this bridge can attach; rerun `flock --remote` from an interactive terminal to approve stopping it",
         ));
     }
 
@@ -376,15 +376,15 @@ impl RemotePlatform {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteHerdr {
+struct RemoteFlock {
     install_suffix: String,
     shell_path: String,
     platform: RemotePlatform,
 }
 
-impl RemoteHerdr {
+impl RemoteFlock {
     fn for_platform(platform: RemotePlatform) -> Self {
-        let install_suffix = ".local/bin/herdr".to_string();
+        let install_suffix = ".local/bin/flock".to_string();
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
             install_suffix,
@@ -517,8 +517,8 @@ struct RemoteReleaseAsset {
     sha256: Option<String>,
 }
 
-struct PreparedRemoteHerdr {
-    remote_herdr: RemoteHerdr,
+struct PreparedRemoteFlock {
+    remote_flock: RemoteFlock,
     installed_or_replaced: bool,
     stop_after_install_approved: bool,
 }
@@ -545,30 +545,30 @@ impl InstallSource {
     }
 }
 
-fn prepare_remote_herdr(
+fn prepare_remote_flock(
     target: &str,
     live_handoff_enabled: bool,
     context: LaunchContext,
-) -> io::Result<PreparedRemoteHerdr> {
+) -> io::Result<PreparedRemoteFlock> {
     let platform = detect_remote_platform(target)?;
-    let remote_herdr = RemoteHerdr::for_platform(platform);
+    let remote_flock = RemoteFlock::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
-    let path_remote_herdr = remote_binary_on_path_any(target, &remote_herdr)?;
+    let path_remote_flock = remote_binary_on_path_any(target, &remote_flock)?;
 
     if override_binary.is_none() {
-        if let Some(path_remote_herdr) = path_remote_herdr
+        if let Some(path_remote_flock) = path_remote_flock
             .as_ref()
             .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
         {
-            return Ok(PreparedRemoteHerdr {
-                remote_herdr: path_remote_herdr.clone(),
+            return Ok(PreparedRemoteFlock {
+                remote_flock: path_remote_flock.clone(),
                 installed_or_replaced: false,
                 stop_after_install_approved: false,
             });
         }
-        if remote_binary_matches(target, &remote_herdr)? {
-            return Ok(PreparedRemoteHerdr {
-                remote_herdr,
+        if remote_binary_matches(target, &remote_flock)? {
+            return Ok(PreparedRemoteFlock {
+                remote_flock,
                 installed_or_replaced: false,
                 stop_after_install_approved: false,
             });
@@ -576,40 +576,40 @@ fn prepare_remote_herdr(
     }
 
     let mut stop_after_install_approved = false;
-    if let Some(status_probe_herdr) = path_remote_herdr.as_ref().or_else(|| {
-        remote_binary_exists(target, &remote_herdr)
+    if let Some(status_probe_flock) = path_remote_flock.as_ref().or_else(|| {
+        remote_binary_exists(target, &remote_flock)
             .ok()
-            .and_then(|exists| exists.then_some(&remote_herdr))
+            .and_then(|exists| exists.then_some(&remote_flock))
     }) {
         stop_after_install_approved = confirm_remote_install_with_running_server(
             target,
-            status_probe_herdr,
+            status_probe_flock,
             live_handoff_enabled,
             context,
         )?;
     }
     confirm_remote_install(
         target,
-        &remote_herdr,
-        &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
+        &remote_flock,
+        &install_source_description(&remote_flock.platform, override_binary.as_deref()),
         context,
     )?;
-    let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
-    let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
+    let source = resolve_install_source(&remote_flock.platform, override_binary)?;
+    let install_result = install_remote_flock(target, &remote_flock, &source.path);
     source.cleanup();
     install_result?;
 
-    if !remote_binary_matches(target, &remote_herdr)? {
+    if !remote_binary_matches(target, &remote_flock)? {
         return Err(io::Error::other(format!(
-            "installed remote herdr at {}, but it did not report version {}",
-            remote_herdr.shell_path,
+            "installed remote flock at {}, but it did not report version {}",
+            remote_flock.shell_path,
             current_version()
         )));
     }
     warn_if_remote_bin_not_on_path(target)?;
 
-    Ok(PreparedRemoteHerdr {
-        remote_herdr,
+    Ok(PreparedRemoteFlock {
+        remote_flock,
         installed_or_replaced: true,
         stop_after_install_approved,
     })
@@ -636,33 +636,33 @@ fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
 
 fn remote_binary_on_path_any(
     target: &str,
-    remote_herdr: &RemoteHerdr,
-) -> io::Result<Option<RemoteHerdr>> {
-    let output = ssh_user_shell_output(target, "command -v herdr")?;
+    remote_flock: &RemoteFlock,
+) -> io::Result<Option<RemoteFlock>> {
+    let output = ssh_user_shell_output(target, "command -v flock")?;
     if !output.status.success() {
         return Ok(None);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(remote_herdr_from_path_discovery(remote_herdr, &stdout))
+    Ok(remote_flock_from_path_discovery(remote_flock, &stdout))
 }
 
-fn remote_herdr_from_path_discovery(
-    remote_herdr: &RemoteHerdr,
+fn remote_flock_from_path_discovery(
+    remote_flock: &RemoteFlock,
     stdout: &str,
-) -> Option<RemoteHerdr> {
+) -> Option<RemoteFlock> {
     let mut lines = stdout.lines();
     let path = lines.next()?;
     if !path.starts_with('/') {
         return None;
     }
-    Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
+    Some(remote_flock.clone().with_shell_path(shell_quote(path)))
 }
 
-fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
+fn remote_binary_matches(target: &str, remote_flock: &RemoteFlock) -> io::Result<bool> {
     let command = format!(
         "test -x {0} && {0} --version && {0} status client --json",
-        remote_herdr.shell_path
+        remote_flock.shell_path
     );
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
@@ -673,14 +673,14 @@ fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result
     let mut lines = stdout.lines();
     let version = lines.next().unwrap_or_default().trim();
     let status = lines.next().unwrap_or_default();
-    Ok(version == format!("herdr {}", current_version())
+    Ok(version == format!("flock {}", current_version())
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false))
 }
 
-fn remote_binary_exists(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
-    let command = format!("test -x {}", remote_herdr.shell_path);
+fn remote_binary_exists(target: &str, remote_flock: &RemoteFlock) -> io::Result<bool> {
+    let command = format!("test -x {}", remote_flock.shell_path);
     Ok(ssh_sh_output(target, &command)?.status.success())
 }
 
@@ -736,7 +736,7 @@ fn install_source_description_for(
     }
 
     if local_binary_can_seed_remote {
-        "the current local herdr binary".to_string()
+        "the current local flock binary".to_string()
     } else {
         format!(
             "the {} {} asset for {}",
@@ -794,13 +794,13 @@ enum RemoteServerRestartReason {
 
 fn ensure_remote_server_ready(
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
     context: LaunchContext,
 ) -> io::Result<()> {
-    let status = remote_server_status(target, remote_herdr)?;
+    let status = remote_server_status(target, remote_flock)?;
     let RemoteServerStatus::Running {
         version,
         protocol,
@@ -817,7 +817,7 @@ fn ensure_remote_server_ready(
     };
 
     if live_handoff_enabled && live_handoff {
-        match live_handoff_remote_server(target, remote_herdr) {
+        match live_handoff_remote_server(target, remote_flock) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!("remote live handoff failed: {err}");
@@ -827,12 +827,12 @@ fn ensure_remote_server_ready(
     }
 
     if stop_after_install_approved {
-        stop_remote_server(target, remote_herdr)?;
+        stop_remote_server(target, remote_flock)?;
         return Ok(());
     }
 
     if confirm_remote_server_stop(target, version.as_deref(), protocol, reason, context)? {
-        stop_remote_server(target, remote_herdr)?;
+        stop_remote_server(target, remote_flock)?;
     }
     Ok(())
 }
@@ -856,7 +856,7 @@ fn remote_server_restart_reason(
 
 fn confirm_remote_install_with_running_server(
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
     live_handoff_enabled: bool,
     context: LaunchContext,
 ) -> io::Result<bool> {
@@ -865,18 +865,18 @@ fn confirm_remote_install_with_running_server(
     // non-interactive launcher: surface mismatches as errors so the switch
     // fails-with-notice (#67) instead of corrupting the terminal.
     let may_prompt = context.allows_install_prompt() && io::stdin().is_terminal();
-    let status = match remote_server_status(target, remote_herdr) {
+    let status = match remote_server_status(target, remote_flock) {
         Ok(status) => status,
         Err(err) => {
             if !may_prompt {
                 return Err(io::Error::other(format!(
-                    "could not inspect the running remote herdr server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
+                    "could not inspect the running remote flock server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
                 )));
             }
             eprintln!(
-                "could not inspect the running remote herdr server on {target} before installing: {err}"
+                "could not inspect the running remote flock server on {target} before installing: {err}"
             );
-            eprint!("continue installing the remote herdr binary? [y/N] ");
+            eprint!("continue installing the remote flock binary? [y/N] ");
             io::stderr().flush()?;
 
             let mut answer = String::new();
@@ -885,7 +885,7 @@ fn confirm_remote_install_with_running_server(
             if answer != "y" && answer != "yes" {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "remote herdr install cancelled",
+                    "remote flock install cancelled",
                 ));
             }
             return Ok(false);
@@ -904,25 +904,25 @@ fn confirm_remote_install_with_running_server(
             return Ok(false);
         }
         return Err(io::Error::other(format!(
-            "remote herdr server on {target} is running v{}; run from an interactive terminal to approve stopping it for the update",
+            "remote flock server on {target} is running v{}; run from an interactive terminal to approve stopping it for the update",
             version_label(version.as_deref())
         )));
     }
 
     if live_handoff_enabled && live_handoff {
-        eprintln!("remote herdr server on {target} is currently running:");
+        eprintln!("remote flock server on {target} is currently running:");
         eprintln!("  server: v{}", version_label(version.as_deref()));
         eprintln!(
-            "Herdr will install {} and hand off live pane processes to the prepared server.",
+            "Flock will install {} and hand off live pane processes to the prepared server.",
             current_version()
         );
         return Ok(false);
     }
 
-    eprintln!("remote herdr server on {target} is currently running:");
+    eprintln!("remote flock server on {target} is currently running:");
     eprintln!("  server: v{}", version_label(version.as_deref()));
     eprintln!(
-        "To complete the remote update, Herdr must stop the running remote server after installing."
+        "To complete the remote update, Flock must stop the running remote server after installing."
     );
     eprintln!("This stops active remote pane processes, including shells, dev servers, and tests.");
     eprintln!();
@@ -938,7 +938,7 @@ fn confirm_remote_install_with_running_server(
     if answer != "y" && answer != "yes" {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "remote herdr install cancelled",
+            "remote flock install cancelled",
         ));
     }
 
@@ -947,9 +947,9 @@ fn confirm_remote_install_with_running_server(
 
 fn remote_server_status(
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
 ) -> io::Result<RemoteServerStatus> {
-    let command = format!("{} status server --json", remote_herdr.shell_path);
+    let command = format!("{} status server --json", remote_flock.shell_path);
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
@@ -1010,30 +1010,30 @@ fn confirm_remote_server_stop(
     // A federation switch leg must never prompt OR scribble on the held
     // alt-screen (#115). Any restart reason on a switch leg is a hard error
     // that rides the failure-notice rail (#67) — the switch should
-    // fail-with-notice ("anvil-dev: herdr version mismatch"), not silently
+    // fail-with-notice ("anvil-dev: flock version mismatch"), not silently
     // keep running an incompatible remote server.
     if !context.allows_install_prompt() {
         return Err(io::Error::other(format!(
-            "remote herdr server on {target} is running v{}; refusing to prompt for a stop during a federation switch — relaunching previous leg",
+            "remote flock server on {target} is running v{}; refusing to prompt for a stop during a federation switch — relaunching previous leg",
             version_label(version)
         )));
     }
     if !io::stdin().is_terminal() {
         if reason == RemoteServerRestartReason::ProtocolMismatch {
             return Err(io::Error::other(format!(
-                "remote herdr server on {target} must stop before this client can attach; run from an interactive terminal to approve stopping it"
+                "remote flock server on {target} must stop before this client can attach; run from an interactive terminal to approve stopping it"
             )));
         }
 
         eprintln!(
-            "remote herdr server on {target} is still running v{}; it will use {} after it restarts.",
+            "remote flock server on {target} is still running v{}; it will use {} after it restarts.",
             version_label(version),
             current_version()
         );
         return Ok(false);
     }
 
-    eprintln!("remote herdr server on {target} is currently running:");
+    eprintln!("remote flock server on {target} is currently running:");
     eprintln!("  server: v{}", version_label(version));
     eprintln!("  prepared binary: {}", current_version());
     eprintln!();
@@ -1044,12 +1044,12 @@ fn confirm_remote_server_stop(
         }
         RemoteServerRestartReason::BinaryUpdated => {
             eprintln!(
-                "the remote herdr binary was installed or replaced. restart the remote server so it uses the prepared binary."
+                "the remote flock binary was installed or replaced. restart the remote server so it uses the prepared binary."
             );
         }
         RemoteServerRestartReason::VersionMismatch => {
             eprintln!(
-                "the remote server is still running a different herdr version. restart it so it uses the prepared binary."
+                "the remote server is still running a different flock version. restart it so it uses the prepared binary."
             );
         }
     }
@@ -1074,18 +1074,18 @@ fn confirm_remote_server_stop(
     if reason == RemoteServerRestartReason::ProtocolMismatch {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "remote herdr server stop cancelled",
+            "remote flock server stop cancelled",
         ));
     }
 
     Ok(false)
 }
 
-fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
     let command = format!(
         "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
-        remote_herdr.shell_path,
-        remote_herdr.shell_path,
+        remote_flock.shell_path,
+        remote_flock.shell_path,
         CURRENT_PROTOCOL,
         current_version()
     );
@@ -1095,34 +1095,34 @@ fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::R
     }
 
     eprintln!(
-        "handed off the remote herdr server on {target}; reconnecting to the prepared server."
+        "handed off the remote flock server on {target}; reconnecting to the prepared server."
     );
     Ok(())
 }
 
-fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
-    let command = format!("{} server stop", remote_herdr.shell_path);
+fn stop_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
+    let command = format!("{} server stop", remote_flock.shell_path);
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
 
-    wait_for_remote_server_shutdown(target, remote_herdr)?;
-    eprintln!("stopped the remote herdr server on {target}; it will restart when the remote client bridge attaches.");
+    wait_for_remote_server_shutdown(target, remote_flock)?;
+    eprintln!("stopped the remote flock server on {target}; it will restart when the remote client bridge attaches.");
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn wait_for_remote_server_shutdown(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(target, remote_herdr)? == RemoteServerStatus::NotRunning {
+        if remote_server_status(target, remote_flock)? == RemoteServerStatus::NotRunning {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "shutdown was requested, but the old remote herdr server on {target} is still responding after {} seconds",
+                    "shutdown was requested, but the old remote flock server on {target} is still responding after {} seconds",
                     REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT.as_secs()
                 ),
             ));
@@ -1136,7 +1136,7 @@ fn version_label(version: Option<&str>) -> &str {
 }
 
 fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
-    let output = ssh_user_shell_output(target, "command -v herdr")?;
+    let output = ssh_user_shell_output(target, "command -v flock")?;
     if output.status.success()
         && remote_shell_resolves_managed_install(&String::from_utf8_lossy(&output.stdout))
     {
@@ -1144,7 +1144,7 @@ fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
     }
 
     eprintln!(
-        "herdr: installed remote binary to ~/.local/bin/herdr, but the remote shell does not resolve `herdr` to that path"
+        "flock: installed remote binary to ~/.local/bin/flock, but the remote shell does not resolve `flock` to that path"
     );
     Ok(())
 }
@@ -1154,7 +1154,7 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
         .lines()
         .next()
         .map(str::trim)
-        .is_some_and(|path| path.ends_with("/.local/bin/herdr"))
+        .is_some_and(|path| path.ends_with("/.local/bin/flock"))
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
@@ -1162,7 +1162,7 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
     let asset = remote_release_asset(&asset_key)?;
 
     let dir = private_download_dir(&asset_key)?;
-    let path = dir.join("herdr.tmp");
+    let path = dir.join("flock.tmp");
     let status = Command::new("curl")
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&path)
@@ -1222,7 +1222,7 @@ fn preview_assets_for_build<'a>(
     }
     let build = manifest.builds.get(build_id).ok_or_else(|| {
         io::Error::other(format!(
-            "preview manifest no longer includes build {build_id}; run `herdr update` locally or set {REMOTE_BINARY_ENV_VAR}=target/release/herdr"
+            "preview manifest no longer includes build {build_id}; run `flock update` locally or set {REMOTE_BINARY_ENV_VAR}=target/release/flock"
         ))
     })?;
     Ok((build.protocol, &build.assets))
@@ -1231,7 +1231,7 @@ fn preview_assets_for_build<'a>(
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     if crate::build_info::is_preview() {
         let build_id = crate::build_info::build_id().ok_or_else(|| {
-            io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
+            io::Error::other("preview client has no build id; set FLOCK_REMOTE_BINARY or install Flock on the remote manually")
         })?;
         let manifest_bytes = fetch_remote_manifest(PREVIEW_UPDATE_MANIFEST_URL)?;
         let manifest: RemotePreviewManifest =
@@ -1241,7 +1241,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
         let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
         if protocol != CURRENT_PROTOCOL {
             return Err(io::Error::other(format!(
-                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
+                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flock or install a matching Flock on the remote host manually"
             )));
         }
         return assets.get(asset_key).map(remote_asset_info).ok_or_else(|| {
@@ -1257,14 +1257,14 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
     let release = manifest.release_for_version(&current_version).ok_or_else(|| {
         io::Error::other(format!(
-            "release manifest does not include herdr {current_version}; build herdr for {} or install it there manually",
+            "release manifest does not include flock {current_version}; build flock for {} or install it there manually",
             asset_key
         ))
     })?;
     if let Some(protocol) = release.protocol {
         if protocol != CURRENT_PROTOCOL {
             return Err(io::Error::other(format!(
-                "release manifest has herdr {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching herdr on the remote host manually"
+                "release manifest has flock {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flock or install a matching flock on the remote host manually"
             )));
         }
     }
@@ -1274,7 +1274,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
         .map(remote_asset_info)
         .ok_or_else(|| {
             io::Error::other(format!(
-                "no {asset_key} binary in the release manifest for herdr {current_version}"
+                "no {asset_key} binary in the release manifest for flock {current_version}"
             ))
         })
 }
@@ -1283,7 +1283,7 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
     let base = std::env::temp_dir();
     for attempt in 0..100 {
         let dir = base.join(format!(
-            "herdr-remote-{}-{}-{attempt}",
+            "flock-remote-{}-{}-{attempt}",
             std::process::id(),
             asset_key
         ));
@@ -1296,13 +1296,13 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
 
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "failed to create private herdr remote download directory",
+        "failed to create private flock remote download directory",
     ))
 }
 
 fn confirm_remote_install(
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
     source_description: &str,
     context: LaunchContext,
 ) -> io::Result<()> {
@@ -1312,20 +1312,20 @@ fn confirm_remote_install(
     // terminal with a stdin read while the alt-screen is held.
     if !context.allows_install_prompt() || !io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
-            "matching remote herdr {} is not installed at {}; run from an interactive terminal to approve installation",
+            "matching remote flock {} is not installed at {}; run from an interactive terminal to approve installation",
             current_version(),
-            remote_herdr.shell_path
+            remote_flock.shell_path
         )));
     }
 
     eprintln!(
-        "matching herdr {} is not installed on {target} for {}.",
+        "matching flock {} is not installed on {target} for {}.",
         current_version(),
-        remote_herdr.platform.asset_key()
+        remote_flock.platform.asset_key()
     );
     eprint!(
         "Install {} to {}? [Y/n] ",
-        source_description, remote_herdr.shell_path
+        source_description, remote_flock.shell_path
     );
     io::stderr().flush()?;
 
@@ -1335,16 +1335,16 @@ fn confirm_remote_install(
     if answer == "n" || answer == "no" {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "remote herdr installation cancelled",
+            "remote flock installation cancelled",
         ));
     }
 
     Ok(())
 }
 
-fn install_remote_herdr(
+fn install_remote_flock(
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
     source_path: &Path,
 ) -> io::Result<()> {
     let script = format!(
@@ -1356,7 +1356,7 @@ cat > "$tmp"
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
 "#,
-        install_suffix = remote_herdr.install_suffix
+        install_suffix = remote_flock.install_suffix
     );
 
     let mut child = Command::new("ssh")
@@ -1394,7 +1394,7 @@ mv "$tmp" "$dest"
 /// (discovery probes + the bridge tunnel). Without these a dead, firewalled,
 /// or unknown host blocks a server switch indefinitely on a TCP black-hole or
 /// an interactive password / host-key prompt — the "switch just hangs / breaks
-/// herdr" failure mode. `BatchMode` refuses to prompt, `ConnectTimeout` bounds
+/// flock" failure mode. `BatchMode` refuses to prompt, `ConnectTimeout` bounds
 /// the TCP connect, and `accept-new` trusts first-seen host keys without asking.
 const SSH_NONINTERACTIVE_OPTS: &[&str] = &[
     "-o",
@@ -1440,8 +1440,8 @@ fn ssh_user_shell_output(target: &str, command: &str) -> io::Result<Output> {
         .output()
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
-    let mut command = format!("exec {}", remote_herdr.shell_path);
+fn remote_bridge_command(remote_flock: &RemoteFlock, session_name: &str) -> String {
+    let mut command = format!("exec {}", remote_flock.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
@@ -1457,7 +1457,7 @@ fn reattach_command(
     keybindings: RemoteKeybindings,
     live_handoff: bool,
 ) -> String {
-    let program = if program.is_empty() { "herdr" } else { program };
+    let program = if program.is_empty() { "flock" } else { program };
     let mut command = format!("{} --remote {}", shell_quote(program), shell_quote(target));
     if keybindings != RemoteKeybindings::Local {
         command.push_str(" --remote-keybindings ");
@@ -1509,7 +1509,7 @@ pub(crate) struct SshStdioBridge {
 impl SshStdioBridge {
     fn start(
         target: String,
-        remote_herdr: RemoteHerdr,
+        remote_flock: RemoteFlock,
         local_socket: PathBuf,
         session_name: String,
         manage_ssh_config: bool,
@@ -1538,25 +1538,25 @@ impl SshStdioBridge {
                     Ok((stream, _addr)) => {
                         if let Err(err) = stream.set_nonblocking(false) {
                             eprintln!(
-                                "herdr: remote bridge failed to prepare client socket: {err}"
+                                "flock: remote bridge failed to prepare client socket: {err}"
                             );
                             continue;
                         }
                         if let Err(err) = bridge_connection(
                             stream,
                             &target,
-                            &remote_herdr,
+                            &remote_flock,
                             &session_name,
                             thread_ssh_config.as_deref(),
                         ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
+                            eprintln!("flock: remote bridge failed: {err}");
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
-                        eprintln!("herdr: remote bridge listener failed: {err}");
+                        eprintln!("flock: remote bridge listener failed: {err}");
                         break;
                     }
                 }
@@ -1588,30 +1588,30 @@ impl Drop for SshStdioBridge {
     }
 }
 
-/// Single-round-trip remote-herdr discovery for the cold-switch path.
+/// Single-round-trip remote-flock discovery for the cold-switch path.
 ///
-/// The legacy chain ran `uname`, `command -v herdr`, and one or two
+/// The legacy chain ran `uname`, `command -v flock`, and one or two
 /// `--version`/`status` probes as *separate* ssh invocations — 3-4 sequential
 /// SSH handshakes before the bridge could even start, which on a slow link is
 /// the bulk of a cold switch's latency. This collapses all of it into one
 /// `/bin/sh -s` script whose tab-delimited output we parse locally, so a cold
 /// switch costs exactly one probe SSH command. The selection order (PATH binary,
-/// then the default `$HOME/.local/bin/herdr`) matches the interactive
-/// `prepare_remote_herdr` path.
-fn probe_switch_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
+/// then the default `$HOME/.local/bin/flock`) matches the interactive
+/// `prepare_remote_flock` path.
+fn probe_switch_remote_flock(target: &str) -> io::Result<RemoteFlock> {
     // `KEY\tVALUE` lines keep parsing robust against missing sections (an absent
     // candidate simply omits its lines) and empty values (an unresolved
     // `command -v`). `printf` interprets the `\t`/`\n` escapes; the captured
     // values are passed as `%s` args so `%` in JSON can't corrupt the format.
     const PROBE_SCRIPT: &str = r#"printf 'OS\t%s\n' "$(uname -s)"
 printf 'ARCH\t%s\n' "$(uname -m)"
-P=$(command -v herdr 2>/dev/null || true)
+P=$(command -v flock 2>/dev/null || true)
 printf 'PATH\t%s\n' "$P"
 if [ -n "$P" ] && [ -x "$P" ]; then
   printf 'PATHVER\t%s\n' "$("$P" --version 2>/dev/null | head -n1)"
   printf 'PATHSTATUS\t%s\n' "$("$P" status client --json 2>/dev/null | head -n1)"
 fi
-D="$HOME/.local/bin/herdr"
+D="$HOME/.local/bin/flock"
 if [ -x "$D" ]; then
   printf 'DEFVER\t%s\n' "$("$D" --version 2>/dev/null | head -n1)"
   printf 'DEFSTATUS\t%s\n' "$("$D" status client --json 2>/dev/null | head -n1)"
@@ -1633,7 +1633,7 @@ fi
             field("ARCH").trim()
         ))
     })?;
-    let default_remote = RemoteHerdr::for_platform(platform);
+    let default_remote = RemoteFlock::for_platform(platform);
 
     if let Some(path) = fields.get("PATH").filter(|path| path.starts_with('/')) {
         if switch_probe_matches(fields.get("PATHVER"), fields.get("PATHSTATUS")) {
@@ -1645,7 +1645,7 @@ fi
     }
 
     Err(io::Error::other(format!(
-        "no compatible herdr {} on {target}; install via `herdr --remote {target}` from an interactive terminal first",
+        "no compatible flock {} on {target}; install via `flock --remote {target}` from an interactive terminal first",
         current_version()
     )))
 }
@@ -1660,14 +1660,14 @@ fn parse_switch_probe(stdout: &str) -> std::collections::HashMap<String, String>
         .collect()
 }
 
-/// A probed binary is usable iff it reports the current `herdr <version>` AND a
+/// A probed binary is usable iff it reports the current `flock <version>` AND a
 /// client status whose protocol matches ours — same gate as the legacy
 /// `remote_binary_matches`, just evaluated on already-captured output.
 fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bool {
     let (Some(version), Some(status)) = (version, status) else {
         return false;
     };
-    version.trim() == format!("herdr {}", current_version())
+    version.trim() == format!("flock {}", current_version())
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false)
@@ -1676,11 +1676,11 @@ fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bo
 /// Build a client-side ssh-stdio bridge to `target` for a cold switch dial,
 /// NON-INTERACTIVELY. Used by the slots cold-switch path (#93): the user is
 /// already mid-switch under raw mode, so install prompts are impossible —
-/// the call must succeed using the PATH `herdr` (or an explicit override) or
+/// the call must succeed using the PATH `flock` (or an explicit override) or
 /// fail. The returned bridge owns its listener thread and its local-forward
 /// socket file; dropping it tears the transport down (the existing `Drop`
 /// impl above). The launcher-driven `run_remote` keeps using
-/// `prepare_remote_herdr` for the interactive install/upgrade path.
+/// `prepare_remote_flock` for the interactive install/upgrade path.
 ///
 /// Returns `(bridge, local_socket_path)` so the caller can immediately dial
 /// the framed client socket through the bridge.
@@ -1691,13 +1691,13 @@ pub(crate) fn start_switch_bridge_noninteractive(
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(target, &session_name);
 
-    // Non-interactive remote-herdr discovery in a SINGLE ssh round-trip: prefer
-    // the PATH binary; fall back to the default `~/.local/bin/herdr` install
+    // Non-interactive remote-flock discovery in a SINGLE ssh round-trip: prefer
+    // the PATH binary; fall back to the default `~/.local/bin/flock` install
     // location. We deliberately do NOT call into the interactive install/upgrade
     // path — a cold switch under raw mode cannot prompt the user, and a
     // missing/incompatible remote binary must surface as a dial failure that the
     // popup shows in plain text.
-    let remote_herdr = probe_switch_remote_herdr(target)?;
+    let remote_flock = probe_switch_remote_flock(target)?;
 
     let manage_ssh_config = crate::config::Config::load()
         .config
@@ -1706,7 +1706,7 @@ pub(crate) fn start_switch_bridge_noninteractive(
 
     let bridge = SshStdioBridge::start(
         target.to_string(),
-        remote_herdr,
+        remote_flock,
         local_socket.clone(),
         session_name,
         manage_ssh_config,
@@ -1719,14 +1719,14 @@ pub(crate) fn start_switch_bridge_noninteractive(
 ///
 /// Using a private directory created with fail-if-exists semantics — rather
 /// than a predictable file in the world-writable temp dir — stops a local user
-/// from pre-planting a symlink or world-writable file that herdr would write
+/// from pre-planting a symlink or world-writable file that flock would write
 /// and `ssh -F` would then read.
 fn private_ssh_config_dir() -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
 
     let base = std::env::temp_dir();
     for attempt in 0..100 {
-        let dir = base.join(format!("herdr-ssh-{}-{attempt}", std::process::id()));
+        let dir = base.join(format!("flock-ssh-{}-{attempt}", std::process::id()));
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1736,14 +1736,14 @@ fn private_ssh_config_dir() -> io::Result<PathBuf> {
 
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "failed to create private herdr ssh config directory",
+        "failed to create private flock ssh config directory",
     ))
 }
 
 /// Quotes a path for an ssh_config `Include` so a path containing spaces (or
 /// glob metacharacters) is treated as one literal token instead of being split
 /// or expanded by ssh — otherwise the user's config might not be Included and
-/// herdr's fallback would wrongly take effect.
+/// flock's fallback would wrongly take effect.
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -1753,7 +1753,7 @@ fn ssh_config_quote(path: &str) -> String {
 ///
 /// The file `Include`s the user's real ssh config first, so ssh's
 /// first-value-wins rule keeps any `ServerAlive*` the user set there (including
-/// an explicit `0` to disable it); herdr's values apply only when the user has
+/// an explicit `0` to disable it); flock's values apply only when the user has
 /// none.
 fn write_keepalive_ssh_config() -> io::Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1789,7 +1789,7 @@ fn write_keepalive_ssh_config() -> io::Result<PathBuf> {
 fn bridge_connection(
     stream: UnixStream,
     target: &str,
-    remote_herdr: &RemoteHerdr,
+    remote_flock: &RemoteFlock,
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
 ) -> io::Result<()> {
@@ -1802,7 +1802,7 @@ fn bridge_connection(
         .arg("-T")
         .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name));
+        .arg(remote_bridge_command(remote_flock, session_name));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1878,7 +1878,7 @@ fn run_client_process(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
             local_socket,
         )
-        .env("HERDR_RENDER_ENCODING", "terminal-ansi")
+        .env("FLOCK_RENDER_ENCODING", "terminal-ansi")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env(FLEET_SNAPSHOT_ENV_VAR, fleet_json)
@@ -1907,7 +1907,7 @@ pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> Pat
 
     let tmpdir = std::env::temp_dir();
     let readable = tmpdir.join(format!(
-        "herdr-remote-{pid}-{target_clean}-{session_clean}.sock"
+        "flock-remote-{pid}-{target_clean}-{session_clean}.sock"
     ));
     if fits_unix_socket_path(&readable) {
         return readable;
@@ -1921,7 +1921,7 @@ pub(crate) fn local_forward_socket_path(target: &str, session_name: &str) -> Pat
     // the prefix is kept only for debuggability.
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash(target, session_name);
-    let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
+    let short_name = format!("flock-r-{pid}-{target_prefix}-{hash}.sock");
     let short_in_tmp = tmpdir.join(&short_name);
     if fits_unix_socket_path(&short_in_tmp) {
         return short_in_tmp;
@@ -1971,16 +1971,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let socket = std::env::temp_dir().join(format!(
-            "herdr-bridge-permissions-test-{}.sock",
+            "flock-bridge-permissions-test-{}.sock",
             std::process::id()
         ));
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
         let bridge = SshStdioBridge::start(
             "example".to_string(),
-            remote_herdr,
+            remote_flock,
             socket.clone(),
             "default".to_string(),
             false,
@@ -2001,7 +2001,7 @@ mod tests {
         let path = write_keepalive_ssh_config().expect("write keepalive config");
         let contents = std::fs::read_to_string(&path).expect("read keepalive config");
 
-        // herdr's fallback keepalive is present...
+        // flock's fallback keepalive is present...
         assert!(
             contents.contains("Host *"),
             "config should add a Host * fallback block: {contents}"
@@ -2027,7 +2027,7 @@ mod tests {
                 let fallback_at = contents.find("Host *").expect("fallback present");
                 assert!(
                     include_at < fallback_at,
-                    "user config must be Included before herdr's fallback: {contents}"
+                    "user config must be Included before flock's fallback: {contents}"
                 );
             }
         }
@@ -2056,13 +2056,13 @@ mod tests {
     #[test]
     fn extract_remote_args_removes_space_form() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "--remote".into(),
             "dev".into(),
             "--help".into(),
         ];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
-        assert_eq!(cleaned, vec!["herdr", "--help"]);
+        assert_eq!(cleaned, vec!["flock", "--help"]);
         let remote = remote.unwrap();
         assert_eq!(remote.target, "dev");
         assert_eq!(remote.keybindings, RemoteKeybindings::Local);
@@ -2070,9 +2070,9 @@ mod tests {
 
     #[test]
     fn extract_remote_args_removes_equals_form() {
-        let args = vec!["herdr".into(), "--remote=user@host".into()];
+        let args = vec!["flock".into(), "--remote=user@host".into()];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
-        assert_eq!(cleaned, vec!["herdr"]);
+        assert_eq!(cleaned, vec!["flock"]);
         let remote = remote.unwrap();
         assert_eq!(remote.target, "user@host");
         assert_eq!(remote.keybindings, RemoteKeybindings::Local);
@@ -2081,13 +2081,13 @@ mod tests {
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_server() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "--remote".into(),
             "dev".into(),
             "--remote-keybindings=server".into(),
         ];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
-        assert_eq!(cleaned, vec!["herdr"]);
+        assert_eq!(cleaned, vec!["flock"]);
         let remote = remote.unwrap();
         assert_eq!(remote.target, "dev");
         assert_eq!(remote.keybindings, RemoteKeybindings::Server);
@@ -2096,23 +2096,23 @@ mod tests {
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_space_form() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings".into(),
             "server".into(),
         ];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
-        assert_eq!(cleaned, vec!["herdr"]);
+        assert_eq!(cleaned, vec!["flock"]);
         assert_eq!(remote.unwrap().keybindings, RemoteKeybindings::Server);
     }
 
     #[test]
     fn extract_remote_args_accepts_explicit_handoff() {
-        let args = vec!["herdr".into(), "--remote=dev".into(), "--handoff".into()];
+        let args = vec!["flock".into(), "--remote=dev".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
-        assert_eq!(cleaned, vec!["herdr"]);
+        assert_eq!(cleaned, vec!["flock"]);
         let remote = remote.unwrap();
         assert_eq!(remote.target, "dev");
         assert!(remote.live_handoff);
@@ -2121,7 +2121,7 @@ mod tests {
     #[test]
     fn extract_remote_args_preserves_child_remote_options_after_separator() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "agent".into(),
             "start".into(),
             "repro".into(),
@@ -2141,7 +2141,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_preserves_handoff_without_remote() {
-        let args = vec!["herdr".into(), "update".into(), "--handoff".into()];
+        let args = vec!["flock".into(), "update".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
@@ -2151,7 +2151,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_remote_keybindings_without_remote() {
-        let args = vec!["herdr".into(), "--remote-keybindings=server".into()];
+        let args = vec!["flock".into(), "--remote-keybindings=server".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote-keybindings requires --remote");
     }
@@ -2159,7 +2159,7 @@ mod tests {
     #[test]
     fn extract_remote_args_rejects_duplicate_remote_keybindings() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings=local".into(),
             "--remote-keybindings=server".into(),
@@ -2170,14 +2170,14 @@ mod tests {
 
     #[test]
     fn extract_remote_args_requires_value() {
-        let args = vec!["herdr".into(), "--remote".into()];
+        let args = vec!["flock".into(), "--remote".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_empty_value() {
-        let args = vec!["herdr".into(), "--remote=".into()];
+        let args = vec!["flock".into(), "--remote=".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
@@ -2185,7 +2185,7 @@ mod tests {
     #[test]
     fn extract_remote_args_rejects_duplicate_values() {
         let args = vec![
-            "herdr".into(),
+            "flock".into(),
             "--remote=dev".into(),
             "--remote=prod".into(),
         ];
@@ -2195,7 +2195,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_option_like_target() {
-        let args = vec!["herdr".into(), "--remote".into(), "-oProxyCommand=x".into()];
+        let args = vec!["flock".into(), "--remote".into(), "-oProxyCommand=x".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote target must not start with '-'");
     }
@@ -2226,171 +2226,171 @@ mod tests {
     fn reattach_command_includes_remote_and_session() {
         assert_eq!(
             reattach_command(
-                "target/release/herdr",
+                "target/release/flock",
                 "user@host",
                 "work",
                 RemoteKeybindings::Local,
                 false,
             ),
-            "target/release/herdr --remote user@host --session work"
+            "target/release/flock --remote user@host --session work"
         );
         assert_eq!(
             reattach_command(
-                "herdr",
+                "flock",
                 "host name",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Local,
                 false,
             ),
-            "herdr --remote 'host name'"
+            "flock --remote 'host name'"
         );
         assert_eq!(
             reattach_command(
-                "herdr",
+                "flock",
                 "host",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Server,
                 false,
             ),
-            "herdr --remote host --remote-keybindings server"
+            "flock --remote host --remote-keybindings server"
         );
         assert_eq!(
             reattach_command(
-                "herdr",
+                "flock",
                 "host",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Local,
                 true,
             ),
-            "herdr --remote host --handoff"
+            "flock --remote host --handoff"
         );
     }
 
     #[test]
     fn remote_bridge_command_uses_installed_binary() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+            remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
+            "exec \"$HOME/.local/bin/flock\" remote-client-bridge"
         );
     }
 
     #[test]
     fn remote_path_discovery_uses_path_binary() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "/usr/bin/herdr\n")
+        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "/usr/bin/flock\n")
             .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec /usr/bin/herdr remote-client-bridge"
+            remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
+            "exec /usr/bin/flock remote-client-bridge"
         );
     }
 
     #[test]
     fn remote_path_discovery_quotes_discovered_binary() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_herdr =
-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/herdr bin/herdr\n")
+        let remote_flock =
+            remote_flock_from_path_discovery(&remote_flock, "/opt/flock bin/flock\n")
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec '/opt/herdr bin/herdr' remote-client-bridge"
+            remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
+            "exec '/opt/flock bin/flock' remote-client-bridge"
         );
     }
 
     #[test]
     fn remote_path_discovery_uses_macos_path_binary() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "macos",
             arch: "aarch64",
         });
-        let remote_herdr =
-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/homebrew/bin/herdr\n")
+        let remote_flock =
+            remote_flock_from_path_discovery(&remote_flock, "/opt/homebrew/bin/flock\n")
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec /opt/homebrew/bin/herdr remote-client-bridge"
+            remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
+            "exec /opt/homebrew/bin/flock remote-client-bridge"
         );
-        assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
+        assert_eq!(remote_flock.platform.asset_key(), "macos-aarch64");
     }
 
     #[test]
     fn remote_path_discovery_quotes_single_quotes_in_discovered_binary() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_herdr =
-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/herdr's/bin/herdr\n")
+        let remote_flock =
+            remote_flock_from_path_discovery(&remote_flock, "/opt/flock's/bin/flock\n")
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-            "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
+            remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
+            "exec '/opt/flock'\\''s/bin/flock' remote-client-bridge"
         );
     }
 
     #[test]
     fn remote_path_discovery_ignores_relative_paths() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "bin/herdr\n");
+        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "bin/flock\n");
 
-        assert!(remote_herdr.is_none());
+        assert!(remote_flock.is_none());
     }
 
     #[test]
     fn remote_path_discovery_ignores_empty_output() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "\n");
+        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "\n");
 
-        assert!(remote_herdr.is_none());
+        assert!(remote_flock.is_none());
     }
 
     #[test]
     fn remote_shell_path_warning_accepts_managed_install() {
         assert!(remote_shell_resolves_managed_install(
-            "/home/can/.local/bin/herdr\n"
+            "/home/can/.local/bin/flock\n"
         ));
         assert!(remote_shell_resolves_managed_install(
-            "/Users/can/.local/bin/herdr\n"
+            "/Users/can/.local/bin/flock\n"
         ));
         assert!(!remote_shell_resolves_managed_install(
-            "/usr/local/bin/herdr\n"
+            "/usr/local/bin/flock\n"
         ));
         assert!(!remote_shell_resolves_managed_install(""));
     }
 
     #[test]
     fn parse_switch_probe_reads_tab_delimited_fields() {
-        let stdout = "OS\tDarwin\nARCH\tarm64\nPATH\t/Users/can/.local/bin/herdr\nPATHVER\therdr 0.6.0\nPATHSTATUS\t{\"protocol\":8}\n";
+        let stdout = "OS\tDarwin\nARCH\tarm64\nPATH\t/Users/can/.local/bin/flock\nPATHVER\tflock 0.6.0\nPATHSTATUS\t{\"protocol\":8}\n";
         let fields = parse_switch_probe(stdout);
         assert_eq!(fields.get("OS").map(String::as_str), Some("Darwin"));
         assert_eq!(fields.get("ARCH").map(String::as_str), Some("arm64"));
         assert_eq!(
             fields.get("PATH").map(String::as_str),
-            Some("/Users/can/.local/bin/herdr")
+            Some("/Users/can/.local/bin/flock")
         );
         assert_eq!(
             fields.get("PATHVER").map(String::as_str),
-            Some("herdr 0.6.0")
+            Some("flock 0.6.0")
         );
         // A missing section simply yields no entry — never a panic.
         assert!(!fields.contains_key("DEFVER"));
@@ -2398,7 +2398,7 @@ mod tests {
 
     #[test]
     fn switch_probe_matches_requires_version_and_protocol() {
-        let good_version = format!("herdr {}", current_version());
+        let good_version = format!("flock {}", current_version());
         let good_status = format!(r#"{{"protocol":{CURRENT_PROTOCOL}}}"#);
         assert!(switch_probe_matches(
             Some(&good_version),
@@ -2407,7 +2407,7 @@ mod tests {
 
         // Wrong version, stale protocol, and missing fields all reject.
         assert!(!switch_probe_matches(
-            Some(&"herdr 0.0.1".to_string()),
+            Some(&"flock 0.0.1".to_string()),
             Some(&good_status)
         ));
         let stale_status = format!(r#"{{"protocol":{}}}"#, CURRENT_PROTOCOL + 1);
@@ -2422,7 +2422,7 @@ mod tests {
     #[test]
     fn parse_client_status_json_reads_protocol() {
         assert_eq!(
-            parse_client_status_json(r#"{"version":"x","protocol":8,"binary":"/bin/herdr"}"#)
+            parse_client_status_json(r#"{"version":"x","protocol":8,"binary":"/bin/flock"}"#)
                 .map(|status| status.protocol),
             Some(8)
         );
@@ -2664,8 +2664,8 @@ mod tests {
             arch: "aarch64",
         };
         assert_eq!(
-            install_source_description_for(&platform, Some(Path::new("/tmp/herdr-aarch64")), false),
-            "HERDR_REMOTE_BINARY (/tmp/herdr-aarch64)"
+            install_source_description_for(&platform, Some(Path::new("/tmp/flock-aarch64")), false),
+            "FLOCK_REMOTE_BINARY (/tmp/flock-aarch64)"
         );
     }
 
@@ -2675,7 +2675,7 @@ mod tests {
 
         assert_eq!(
             install_source_description_for(&platform, None, true),
-            "the current local herdr binary"
+            "the current local flock binary"
         );
     }
 
@@ -2700,9 +2700,9 @@ mod tests {
             os: "linux",
             arch: "aarch64",
         };
-        let source = resolve_install_source(&platform, Some(PathBuf::from("/tmp/herdr-aarch64")))
+        let source = resolve_install_source(&platform, Some(PathBuf::from("/tmp/flock-aarch64")))
             .expect("override source");
-        assert_eq!(source.path, PathBuf::from("/tmp/herdr-aarch64"));
+        assert_eq!(source.path, PathBuf::from("/tmp/flock-aarch64"));
         assert!(source.temporary_dir.is_none());
     }
 
@@ -2728,7 +2728,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            filename.starts_with("herdr-remote-"),
+            filename.starts_with("flock-remote-"),
             "expected readable name, got {filename}"
         );
         assert!(filename.contains("-dev-default."), "got {filename}");
@@ -2785,7 +2785,7 @@ mod tests {
         assert!(fits, "fallback path still overflows: {}", path.display());
         assert_eq!(parent.as_deref(), Some(Path::new("/tmp")));
         assert!(
-            filename.starts_with("herdr-r-"),
+            filename.starts_with("flock-r-"),
             "expected hashed fallback, got {filename}"
         );
     }
@@ -2793,12 +2793,12 @@ mod tests {
     #[test]
     fn install_source_cleanup_removes_temporary_directory() {
         let dir = std::env::temp_dir().join(format!(
-            "herdr-install-source-cleanup-test-{}",
+            "flock-install-source-cleanup-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).expect("create temp dir");
-        let path = dir.join("herdr.tmp");
+        let path = dir.join("flock.tmp");
         fs::write(&path, b"test").expect("write temp file");
 
         InstallSource::temporary(path, dir.clone()).cleanup();
@@ -2810,7 +2810,7 @@ mod tests {
 
     #[test]
     fn launch_context_cli_allows_install_prompt() {
-        // The explicit `herdr --remote <target>` path keeps its prompts:
+        // The explicit `flock --remote <target>` path keeps its prompts:
         // the user typed the command at a real shell and is making a
         // one-shot install/upgrade decision.
         assert!(LaunchContext::Cli.allows_install_prompt());
@@ -2832,10 +2832,10 @@ mod tests {
         // blocking on stdin.
         let platform = RemotePlatform::from_uname("Linux", "x86_64")
             .expect("Linux x86_64 must be a known remote platform");
-        let remote_herdr = RemoteHerdr::for_platform(platform);
+        let remote_flock = RemoteFlock::for_platform(platform);
         let err = confirm_remote_install(
             "alice@anvil-dev",
-            &remote_herdr,
+            &remote_flock,
             "the 0.6.8 stable asset for linux-x86_64",
             LaunchContext::FederationSwitch,
         )

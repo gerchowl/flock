@@ -32,8 +32,8 @@ pub fn resolve_write_target() -> std::io::Result<PathBuf> {
     if !overlay.exists() {
         std::fs::write(
             &overlay,
-            "# herdr overlay -- read after config.toml, adds scalar keys\n\
-             # the base config does not declare. See `herdr config edit`.\n",
+            "# flock overlay -- read after config.toml, adds scalar keys\n\
+             # the base config does not declare. See `flock config edit`.\n",
         )?;
     }
     Ok(overlay)
@@ -155,7 +155,7 @@ impl App {
     pub(super) fn save_toast_delivery(&mut self, delivery: crate::config::ToastDelivery) {
         let value = match delivery {
             crate::config::ToastDelivery::Off => "\"off\"",
-            crate::config::ToastDelivery::Herdr => "\"herdr\"",
+            crate::config::ToastDelivery::Flock => "\"flock\"",
             crate::config::ToastDelivery::Terminal => "\"terminal\"",
             crate::config::ToastDelivery::System => "\"system\"",
         };
@@ -275,7 +275,7 @@ fn unique_config_edit_path(label: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "herdr-config-edit-{label}-{}-{nanos}.toml",
+        "flock-config-edit-{label}-{}-{nanos}.toml",
         std::process::id()
     ))
 }
@@ -313,7 +313,7 @@ mod edit_config_tests {
     #[tokio::test]
     async fn launch_config_editor_registers_post_exit_hook_and_temp_files() {
         let _lock = lock_env();
-        let dir = unique_dir("herdr-edit-launch");
+        let dir = unique_dir("flock-edit-launch");
         let base = dir.join("config.toml");
         std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
 
@@ -379,7 +379,7 @@ mod edit_config_tests {
     #[tokio::test]
     async fn config_edit_rolls_back_when_edit_produces_invalid_toml() {
         let _lock = lock_env();
-        let dir = unique_dir("herdr-edit-rollback");
+        let dir = unique_dir("flock-edit-rollback");
         let base = dir.join("config.toml");
         let backup = dir.join("backup.toml");
         let good = "[ui]\nsidebar_row_gap = 1\n";
@@ -457,7 +457,7 @@ mod write_target_tests {
     #[test]
     fn write_target_uses_overlay_when_base_is_symlink() {
         let _lock = lock_env();
-        let dir = unique_dir("herdr-write-target");
+        let dir = unique_dir("flock-write-target");
 
         // Pretend the base config is a read-only symlink to a nix-store-ish
         // path that already has content. The exact target doesn't matter --
@@ -492,13 +492,13 @@ mod write_target_tests {
         // The overlay file was materialised with a header comment so the
         // editor opens onto something explanatory.
         let content = std::fs::read_to_string(&target).unwrap();
-        assert!(content.starts_with("# herdr overlay"));
+        assert!(content.starts_with("# flock overlay"));
     }
 
     #[test]
     fn write_target_uses_base_when_base_is_real_file() {
         let _lock = lock_env();
-        let dir = unique_dir("herdr-write-target-base");
+        let dir = unique_dir("flock-write-target-base");
         let base = dir.join("config.toml");
         std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
 

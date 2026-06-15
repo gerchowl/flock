@@ -1,0 +1,30 @@
+Flock
+=====
+
+Flock is a fork of Herdr, rebranded but functionally derived from it.
+
+Upstream project:  Herdr
+Upstream source:   https://github.com/ogulcancelik/herdr
+Upstream license:  GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
+Copyright:         (c) the Herdr authors
+
+Substantial portions of Flock are copied from or derived from Herdr. Those
+portions remain under AGPL-3.0-or-later, and the original copyright is retained
+as required by sections 4 and 5 of the AGPL. Flock as a whole is distributed
+under AGPL-3.0-or-later.
+
+Changes from upstream are recorded in the project's git history and CHANGELOG.
+
+--------------------------------------------------------------------------------
+
+Bundled third-party components
+------------------------------
+
+vendor/libghostty-vt
+  Ghostty terminal VT engine, vendored unmodified (see vendor/*.vendor.json for
+  the pinned upstream commit).
+  Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
+  License: MIT (see vendor/libghostty-vt/LICENSE)
+
+  This component is NOT covered by Flock's AGPL license; it retains its own MIT
+  license and copyright.

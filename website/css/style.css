@@ -50,7 +50,7 @@
     --logo-opacity: 0.72;
 }
 
-[data-palette="herdr"] {
+[data-palette="flock"] {
   --bg: #0c0c0b; --bg-elevated: #131312; --ink: #f0ece0; --ink-soft: #dedad0;
   --muted: #8a8a80; --muted-2: #5c5c55; --line: #252522; --line-strong: #2e2e2b;
   --terminal: #0c0c0b; --terminal-2: #131312; --accent: #4a9eff;
@@ -271,7 +271,7 @@
   --term-dim: #7e7e7e; --term-blue: #ffc799; --term-green-bright: #99ffe4;
 }
 
-[data-palette="herdr"],
+[data-palette="flock"],
 [data-palette="taat"],
 [data-palette="catppuccin"],
 [data-palette="terminal"],
@@ -387,8 +387,8 @@ samp {
     position: absolute;
     inset: 2px;
     background: var(--ink);
-    -webkit-mask: url("/assets/agent-icons/herdr-mask.svg") center / contain no-repeat;
-    mask: url("/assets/agent-icons/herdr-mask.svg") center / contain no-repeat;
+    -webkit-mask: url("/assets/agent-icons/flock-mask.svg") center / contain no-repeat;
+    mask: url("/assets/agent-icons/flock-mask.svg") center / contain no-repeat;
 }
 
 .logo-menu {
@@ -1152,7 +1152,7 @@ samp {
     font-family: var(--mono);
 }
 
-.herdr-ui-mock {
+.flock-ui-mock {
     display: grid;
     grid-template-columns: minmax(120px, 17%) minmax(0, 1fr);
     overflow: hidden;
@@ -1232,7 +1232,7 @@ samp {
     min-height: 4rem;
 }
 
-.herdr-ui-mock .mock-sidebar-spacer {
+.flock-ui-mock .mock-sidebar-spacer {
     flex: 0 0 5.2rem;
     min-height: 0;
 }
@@ -1354,35 +1354,35 @@ samp {
     color: var(--accent);
 }
 
-.herdr-ui-mock .cmd {
+.flock-ui-mock .cmd {
     color: var(--term-cmd);
 }
 
-.herdr-ui-mock .str {
+.flock-ui-mock .str {
     color: var(--term-str);
 }
 
-.herdr-ui-mock pre {
+.flock-ui-mock pre {
     margin: 0.55rem 0 0.75rem;
     color: var(--term-text);
     white-space: pre;
 }
 
-.herdr-ui-mock .dim,
-.herdr-ui-mock .time {
+.flock-ui-mock .dim,
+.flock-ui-mock .time {
     color: var(--term-dim);
 }
 
-.herdr-ui-mock .blue,
-.herdr-ui-mock .url-line span {
+.flock-ui-mock .blue,
+.flock-ui-mock .url-line span {
     color: var(--term-blue);
 }
 
-.herdr-ui-mock .green {
+.flock-ui-mock .green {
     color: var(--term-green-bright);
 }
 
-.herdr-ui-mock .badge {
+.flock-ui-mock .badge {
     display: inline-block;
     padding: 0.1rem 0.45rem;
     background: var(--term-green-bright);
@@ -2694,12 +2694,12 @@ td:last-child {
         font-weight: 600;
     }
 
-    .compare-cards .herdr {
+    .compare-cards .flock {
         background: var(--accent-soft);
         color: var(--accent);
     }
 
-    .compare-cards .herdr b {
+    .compare-cards .flock b {
         color: var(--accent);
     }
 
@@ -2773,7 +2773,7 @@ td:last-child {
         font-size: 0.68rem;
     }
 
-    .herdr-ui-mock {
+    .flock-ui-mock {
         grid-template-columns: 96px minmax(0, 1fr);
         aspect-ratio: 16 / 10;
         font-size: 0.38rem;
@@ -2796,7 +2796,7 @@ td:last-child {
         padding: 0.24rem 0.45rem;
     }
 
-    .herdr-ui-mock .mock-sidebar-spacer {
+    .flock-ui-mock .mock-sidebar-spacer {
         flex: 0 0 0.35rem;
     }
 

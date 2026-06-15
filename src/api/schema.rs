@@ -725,7 +725,7 @@ pub enum ResponseResult {
     PeersSummary {
         /// Short hostname of the answering server.
         host: String,
-        /// herdr version string of the answering server (spot un-deployed peers).
+        /// flock version string of the answering server (spot un-deployed peers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
         /// Machine health snapshot, piggybacked from the peer's existing
@@ -1196,7 +1196,7 @@ mod tests {
             id: "req_hook".into(),
             method: Method::PaneReportAgent(PaneReportAgentParams {
                 pane_id: "1-1".into(),
-                source: "herdr:pi".into(),
+                source: "flock:pi".into(),
                 agent: "pi".into(),
                 state: PaneAgentState::Working,
                 message: Some("thinking".into()),
@@ -1218,7 +1218,7 @@ mod tests {
             id: "req_session".into(),
             method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
                 pane_id: "1-1".into(),
-                source: "herdr:claude".into(),
+                source: "flock:claude".into(),
                 agent: "claude".into(),
                 seq: Some(42),
                 agent_session_id: Some("claude-session".into()),
@@ -1239,7 +1239,7 @@ mod tests {
                 pane_id: "1-1".into(),
                 source: "user:claude-title".into(),
                 agent: Some("claude".into()),
-                applies_to_source: Some("herdr:claude".into()),
+                applies_to_source: Some("flock:claude".into()),
                 title: Some("Refactor auth".into()),
                 display_agent: Some("Claude auth".into()),
                 custom_status: Some("refactor auth".into()),
@@ -1264,7 +1264,7 @@ mod tests {
             id: "req_clear".into(),
             method: Method::PaneClearAgentAuthority(PaneClearAgentAuthorityParams {
                 pane_id: "1-1".into(),
-                source: Some("herdr:pi".into()),
+                source: Some("flock:pi".into()),
                 seq: Some(42),
             }),
         };
@@ -1280,7 +1280,7 @@ mod tests {
             id: "req_release".into(),
             method: Method::PaneReleaseAgent(PaneReleaseAgentParams {
                 pane_id: "1-1".into(),
-                source: "herdr:pi".into(),
+                source: "flock:pi".into(),
                 agent: "pi".into(),
                 seq: Some(42),
             }),
@@ -1541,17 +1541,17 @@ mod tests {
                 workspace: WorkspaceInfo {
                     workspace_id: "w_1".into(),
                     number: 2,
-                    label: "herdr".into(),
+                    label: "flock".into(),
                     focused: true,
                     pane_count: 1,
                     tab_count: 1,
                     active_tab_id: "w_1:1".into(),
                     agent_status: AgentStatus::Unknown,
                     worktree: Some(WorkspaceWorktreeInfo {
-                        repo_key: "/repo/herdr/.git".into(),
-                        repo_name: "herdr".into(),
-                        repo_root: "/repo/herdr".into(),
-                        checkout_path: "/worktrees/herdr/worktree-api".into(),
+                        repo_key: "/repo/flock/.git".into(),
+                        repo_name: "flock".into(),
+                        repo_root: "/repo/flock".into(),
+                        checkout_path: "/worktrees/flock/worktree-api".into(),
                         is_linked_worktree: true,
                     }),
                 },
@@ -1559,7 +1559,7 @@ mod tests {
                     tab_id: "w_1:1".into(),
                     workspace_id: "w_1".into(),
                     number: 1,
-                    label: "herdr".into(),
+                    label: "flock".into(),
                     focused: true,
                     pane_count: 1,
                     agent_status: AgentStatus::Unknown,
@@ -1570,7 +1570,7 @@ mod tests {
                     workspace_id: "w_1".into(),
                     tab_id: "w_1:1".into(),
                     focused: true,
-                    cwd: Some("/worktrees/herdr/worktree-api".into()),
+                    cwd: Some("/worktrees/flock/worktree-api".into()),
                     foreground_cwd: None,
                     label: None,
                     agent: None,
@@ -1583,14 +1583,14 @@ mod tests {
                     revision: 0,
                 },
                 worktree: WorktreeInfo {
-                    path: "/worktrees/herdr/worktree-api".into(),
+                    path: "/worktrees/flock/worktree-api".into(),
                     branch: Some("worktree/api".into()),
                     is_bare: false,
                     is_detached: false,
                     is_prunable: false,
                     is_linked_worktree: true,
                     open_workspace_id: Some("w_1".into()),
-                    label: "herdr".into(),
+                    label: "flock".into(),
                 },
             },
         };

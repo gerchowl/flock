@@ -1824,7 +1824,7 @@ impl AppState {
     ) {
         let lines_per_notch = self.mouse_scroll_lines;
 
-        // Shift+wheel is a deterministic escape hatch: always scroll herdr's
+        // Shift+wheel is a deterministic escape hatch: always scroll flock's
         // own scrollback, even in alt-screen / mouse-reporting panes where a
         // bare wheel is forwarded to the app.
         let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
@@ -2215,9 +2215,9 @@ mod tests {
     fn remote_row(project_key: &str, branch: &str) -> crate::api::schema::PeerWorkspaceSummary {
         crate::api::schema::PeerWorkspaceSummary {
             id: "ws_1".into(),
-            workspace: "herdr".into(),
+            workspace: "flock".into(),
             project_key: Some(project_key.into()),
-            project_label: Some("herdr".into()),
+            project_label: Some("flock".into()),
             branch: Some(branch.into()),
             is_linked_worktree: true,
             agent: Some("cc".into()),
@@ -2245,7 +2245,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_remote_row_click_requests_switch_with_carried_address() {
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![workspace_with_project("herdr", "github.com/gerchowl/herdr")];
+        app.state.workspaces = vec![workspace_with_project("flock", "github.com/gerchowl/flock")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -2254,7 +2254,7 @@ mod tests {
             peers: vec![federated_peer(
                 "anvil",
                 "lars@anvil",
-                vec![remote_row("github.com/gerchowl/herdr", "fix/pty")],
+                vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
             )],
             origin_summary: None,
             received_at: std::time::Instant::now(),
@@ -2287,11 +2287,11 @@ mod tests {
     /// Issue #63 (the live bug): a CONFIG-peer remote row folded under a
     /// local project block (indented, sharing the project key) must emit
     /// the same switch the servers band does — clicking `sage:main` under a
-    /// local `herdr` checkout requests ConfigPeer carrying the target ws.
+    /// local `flock` checkout requests ConfigPeer carrying the target ws.
     #[tokio::test]
     async fn folded_config_peer_row_click_requests_switch() {
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![workspace_with_project("herdr", "github.com/gerchowl/herdr")];
+        app.state.workspaces = vec![workspace_with_project("flock", "github.com/gerchowl/flock")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -2300,7 +2300,7 @@ mod tests {
         app.state.peer_summaries = vec![federated_peer(
             "sage",
             "lars@sage",
-            vec![remote_row("github.com/gerchowl/herdr", "main")],
+            vec![remote_row("github.com/gerchowl/flock", "main")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 40));
 
@@ -2338,14 +2338,14 @@ mod tests {
     async fn right_click_server_row_filters_spaces_and_same_menu_clears() {
         use crate::app::state::ServerFilter;
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![workspace_with_project("herdr", "github.com/gerchowl/herdr")];
+        app.state.workspaces = vec![workspace_with_project("flock", "github.com/gerchowl/flock")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.peer_summaries = vec![federated_peer(
             "anvil",
             "lars@anvil",
-            vec![remote_row("github.com/gerchowl/herdr", "fix/pty")],
+            vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
 
@@ -2393,14 +2393,14 @@ mod tests {
     async fn right_click_self_row_filters_local_and_scope_toggle_clears() {
         use crate::app::state::{PanelScope, ServerFilter};
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![workspace_with_project("herdr", "github.com/gerchowl/herdr")];
+        app.state.workspaces = vec![workspace_with_project("flock", "github.com/gerchowl/flock")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.peer_summaries = vec![federated_peer(
             "anvil",
             "lars@anvil",
-            vec![remote_row("github.com/gerchowl/herdr", "fix/pty")],
+            vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
 
@@ -2675,7 +2675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mouse_dispatcher_does_not_forward_motion_behind_herdr_modes() {
+    async fn mouse_dispatcher_does_not_forward_motion_behind_flock_modes() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -2706,7 +2706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unset_right_click_passthrough_keeps_modified_right_click_as_herdr_menu() {
+    async fn unset_right_click_passthrough_keeps_modified_right_click_as_flock_menu() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -2840,19 +2840,19 @@ mod tests {
         crate::app::state::WorktreeOpenState {
             source_workspace_id: "source".into(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/flock".into(),
+            source_repo_root: "/repo/flock".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "flock".into(),
             entries: vec![
                 crate::app::state::WorktreeOpenEntry {
-                    path: "/repo/herdr".into(),
+                    path: "/repo/flock".into(),
                     branch: Some("main".into()),
                     is_linked_worktree: false,
                     already_open_ws_idx: Some(0),
                 },
                 crate::app::state::WorktreeOpenEntry {
-                    path: "/repo/herdr-issue".into(),
+                    path: "/repo/flock-issue".into(),
                     branch: Some("worktree/issue".into()),
                     is_linked_worktree: true,
                     already_open_ws_idx: None,
@@ -2898,7 +2898,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
         let target_terminal_id = app.state.workspaces[1]
             .panes
             .get(&target_pane)
@@ -3080,8 +3080,8 @@ mod tests {
         app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
             managed: true,
             workspace_id: "issue".into(),
-            repo_root: "/repo/herdr".into(),
-            path: "/repo/herdr-issue".into(),
+            repo_root: "/repo/flock".into(),
+            path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
             force_confirmation: false,
@@ -3112,8 +3112,8 @@ mod tests {
         app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
             managed: true,
             workspace_id: "issue".into(),
-            repo_root: "/repo/herdr".into(),
-            path: "/repo/herdr-issue".into(),
+            repo_root: "/repo/flock".into(),
+            path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
             force_confirmation: false,

@@ -3,42 +3,42 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Compare Herdr — terminal-native agent multiplexer</title>
+        <title>Compare Flock — terminal-native agent multiplexer</title>
         <meta
             name="description"
-            content="Compare Herdr with tmux, Zellij, cmux, Warp, Solo, Conductor, Emdash, and Superset. See where terminal multiplexers, agent terminals, process dashboards, and worktree orchestrators differ."
+            content="Compare Flock with tmux, Zellij, cmux, Warp, Solo, Conductor, Emdash, and Superset. See where terminal multiplexers, agent terminals, process dashboards, and worktree orchestrators differ."
         />
         <meta name="theme-color" content="#f0eee9" />
-        <link rel="canonical" href="https://herdr.dev/compare/" />
+        <link rel="canonical" href="https://flock.dev/compare/" />
 
         <meta property="og:type" content="website" />
-        <meta property="og:site_name" content="Herdr" />
-        <meta property="og:title" content="Compare Herdr — terminal-native agent multiplexer" />
+        <meta property="og:site_name" content="Flock" />
+        <meta property="og:title" content="Compare Flock — terminal-native agent multiplexer" />
         <meta
             property="og:description"
-            content="Herdr combines tmux-style persistence, real terminal panes, agent state, direct attach, SSH workflows, and an API agents can drive."
+            content="Flock combines tmux-style persistence, real terminal panes, agent state, direct attach, SSH workflows, and an API agents can drive."
         />
-        <meta property="og:url" content="https://herdr.dev/compare/" />
-        <meta property="og:image" content="https://herdr.dev/assets/og-card-v6.png" />
+        <meta property="og:url" content="https://flock.dev/compare/" />
+        <meta property="og:image" content="https://flock.dev/assets/og-card-v6.png" />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
-        <meta property="og:image:alt" content="Herdr — One terminal. The whole herd." />
+        <meta property="og:image:alt" content="Flock — One terminal. The whole herd." />
 
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="Compare Herdr — terminal-native agent multiplexer" />
+        <meta name="twitter:title" content="Compare Flock — terminal-native agent multiplexer" />
         <meta
             name="twitter:description"
-            content="Compare Herdr with tmux, Zellij, cmux, Warp, Solo, Conductor, Emdash, and Superset."
+            content="Compare Flock with tmux, Zellij, cmux, Warp, Solo, Conductor, Emdash, and Superset."
         />
-        <meta name="twitter:image" content="https://herdr.dev/assets/og-card-v6.png" />
-        <meta name="twitter:image:alt" content="Herdr — One terminal. The whole herd." />
+        <meta name="twitter:image" content="https://flock.dev/assets/og-card-v6.png" />
+        <meta name="twitter:image:alt" content="Flock — One terminal. The whole herd." />
 
         <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon.png?v=14" />
         <link rel="apple-touch-icon" href="/assets/logo.png" />
         <link rel="preload" href="/assets/jbm.woff2" as="font" type="font/woff2" crossorigin />
         <script>
             (function () {
-                var saved = localStorage.getItem("herdr-palette");
+                var saved = localStorage.getItem("flock-palette");
                 var system = window.matchMedia("(prefers-color-scheme: dark)").matches
                     ? "tokyo-night"
                     : "tokyo-night-day";
@@ -50,9 +50,9 @@
     <body>
         <header class="site-header">
             <nav class="nav" aria-label="Primary navigation">
-                <a class="brand" href="/" aria-label="Herdr home">
+                <a class="brand" href="/" aria-label="Flock home">
                     <span class="brand-logo" aria-hidden="true"></span>
-                    <span>herdr</span>
+                    <span>flock</span>
                 </a>
                 <details class="nav-menu">
                     <summary class="nav-menu-button" aria-label="Open navigation">
@@ -69,7 +69,7 @@
                         <a href="/docs/">Docs</a>
                         <a href="/docs/socket-api/">API</a>
                         <a href="/docs/install/">Install</a>
-                        <a href="https://github.com/ogulcancelik/herdr">GitHub</a>
+                        <a href="https://github.com/gerchowl/flock">GitHub</a>
                     </div>
                 </details>
                 <div class="nav-links">
@@ -82,12 +82,12 @@
                     <a href="/docs/socket-api/">API</a>
                 </div>
                 <div class="nav-tools">
-                    <a class="nav-icon-link" href="https://github.com/ogulcancelik/herdr" aria-label="Herdr on GitHub">
+                    <a class="nav-icon-link" href="https://github.com/gerchowl/flock" aria-label="Flock on GitHub">
                         <svg viewBox="0 0 16 16" aria-hidden="true">
                             <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.64 7.64 0 0 1 8 3.87c.68 0 1.36.09 2 .26 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
                         </svg>
                     </a>
-                    <a class="nav-icon-link" href="https://x.com/herdrdev" aria-label="Herdr on X">
+                    <a class="nav-icon-link" href="https://x.com/flockdev" aria-label="Flock on X">
                         <svg viewBox="0 0 24 24" aria-hidden="true">
                             <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117Z" />
                         </svg>
@@ -100,10 +100,10 @@
         <main>
             <section class="hero compare-hero">
                 <div class="hero-copy">
-                    <p class="eyebrow"><span class="status-dot dot-done"></span>Compare Herdr</p>
+                    <p class="eyebrow"><span class="status-dot dot-done"></span>Compare Flock</p>
                     <h1>The agent multiplexer that lives in your terminal.</h1>
                     <p class="hero-lede">
-                        Herdr gives coding agents the thing tmux gave terminal users:
+                        Flock gives coding agents the thing tmux gave terminal users:
                         persistent real panes, detach and reattach, remote access, and a
                         control surface. Then it adds agent state and an API the agents can use.
                     </p>
@@ -112,8 +112,8 @@
                         <a class="button button-secondary" href="#matrix">See the matrix</a>
                     </div>
                 </div>
-                <div class="compare-claim-card" aria-label="Herdr positioning summary">
-                    <p class="section-kicker">Herdr combines</p>
+                <div class="compare-claim-card" aria-label="Flock positioning summary">
+                    <p class="section-kicker">Flock combines</p>
                     <h2>tmux persistence, agent awareness, no terminal replacement.</h2>
                     <ul class="compare-checks">
                         <li>Runs inside your existing terminal</li>
@@ -143,7 +143,7 @@
                         <thead>
                             <tr>
                                 <th>Capability</th>
-                                <th>Herdr</th>
+                                <th>Flock</th>
                                 <th>tmux / Zellij</th>
                                 <th>cmux / Warp</th>
                                 <th>Solo</th>
@@ -214,20 +214,20 @@
 
             <section class="section compare-categories-section">
                 <div class="section-heading">
-                    <p class="section-kicker">How Herdr differs</p>
+                    <p class="section-kicker">How Flock differs</p>
                     <h2>The intersection other tools miss.</h2>
                 </div>
                 <div class="differ-grid">
                     <article class="intersection-card">
-                        <span class="card-index">Herdr</span>
+                        <span class="card-index">Flock</span>
                         <h3>Persistent terminal runtime, built for agents.</h3>
                         <p>
-                            Herdr keeps real terminal panes alive like a multiplexer, but treats agents
+                            Flock keeps real terminal panes alive like a multiplexer, but treats agents
                             as first-class runtime objects. You can scan state, jump to blocked work,
                             attach directly to one agent, and let agents read, send, split, and wait
                             through the CLI/socket API.
                         </p>
-                        <div class="intersection-pills" aria-label="Herdr strengths">
+                        <div class="intersection-pills" aria-label="Flock strengths">
                             <span>existing terminal</span>
                             <span>persistent PTYs</span>
                             <span>SSH attach</span>
@@ -245,17 +245,17 @@
                         <article>
                             <span>cmux / Warp</span>
                             <h3>Terminal apps replace the terminal.</h3>
-                            <p>They can add polished desktop UX, but the workflow moves into their app. Herdr stays inside the terminal you already use.</p>
+                            <p>They can add polished desktop UX, but the workflow moves into their app. Flock stays inside the terminal you already use.</p>
                         </article>
                         <article>
                             <span>Solo</span>
                             <h3>Dashboards supervise processes.</h3>
-                            <p>Process health and auto-restart are useful, but Herdr is about persistent interactive agent panes, not dev-stack supervision.</p>
+                            <p>Process health and auto-restart are useful, but Flock is about persistent interactive agent panes, not dev-stack supervision.</p>
                         </article>
                         <article>
                             <span>Conductor / Emdash / Superset</span>
                             <h3>Worktree tools own review flow.</h3>
-                            <p>They are for branch isolation, diffs, and PRs. Herdr is the live terminal layer those agents can run inside or alongside.</p>
+                            <p>They are for branch isolation, diffs, and PRs. Flock is the live terminal layer those agents can run inside or alongside.</p>
                         </article>
                     </div>
                 </div>
@@ -267,48 +267,48 @@
                     <h2>Use this when deciding.</h2>
                 </div>
                 <div class="one-liner-list">
-                    <article><strong>Herdr vs tmux</strong><span>tmux persists terminals; Herdr persists agent workspaces and understands agent state.</span></article>
-                    <article><strong>Herdr vs Zellij</strong><span>Zellij is a modern terminal workspace; Herdr is an agent multiplexer with state, waits, and orchestration.</span></article>
-                    <article><strong>Herdr vs cmux</strong><span>cmux is a Mac terminal app for agents; Herdr is a terminal-native multiplexer that runs anywhere your terminal and SSH do.</span></article>
-                    <article><strong>Herdr vs Warp</strong><span>Warp is an agentic development platform; Herdr is the local terminal control layer for your existing agents.</span></article>
-                    <article><strong>Herdr vs Solo</strong><span>Solo manages your dev stack; Herdr manages persistent interactive agent panes.</span></article>
-                    <article><strong>Herdr vs Conductor, Emdash, Superset</strong><span>They orchestrate isolated worktrees and review diffs; Herdr orchestrates live terminals and agent state.</span></article>
+                    <article><strong>Flock vs tmux</strong><span>tmux persists terminals; Flock persists agent workspaces and understands agent state.</span></article>
+                    <article><strong>Flock vs Zellij</strong><span>Zellij is a modern terminal workspace; Flock is an agent multiplexer with state, waits, and orchestration.</span></article>
+                    <article><strong>Flock vs cmux</strong><span>cmux is a Mac terminal app for agents; Flock is a terminal-native multiplexer that runs anywhere your terminal and SSH do.</span></article>
+                    <article><strong>Flock vs Warp</strong><span>Warp is an agentic development platform; Flock is the local terminal control layer for your existing agents.</span></article>
+                    <article><strong>Flock vs Solo</strong><span>Solo manages your dev stack; Flock manages persistent interactive agent panes.</span></article>
+                    <article><strong>Flock vs Conductor, Emdash, Superset</strong><span>They orchestrate isolated worktrees and review diffs; Flock orchestrates live terminals and agent state.</span></article>
                 </div>
             </section>
 
             <section class="final-cta compare-final-cta">
                 <p class="section-kicker">Start with the multiplexer</p>
-                <h2>If your agents live in terminals, put the terminals in Herdr.</h2>
+                <h2>If your agents live in terminals, put the terminals in Flock.</h2>
                 <p>
-                    Install Herdr, run two agents, split a pane, then detach once. The difference is obvious when the agents keep running.
+                    Install Flock, run two agents, split a pane, then detach once. The difference is obvious when the agents keep running.
                 </p>
                 <div class="hero-actions center">
-                    <a class="button button-primary" href="/docs/install/">Install Herdr</a>
+                    <a class="button button-primary" href="/docs/install/">Install Flock</a>
                     <a class="button button-secondary" href="/docs/quick-start/">Quick start</a>
                 </div>
             </section>
         </main>
 
         <footer class="footer">
-            <a class="brand" href="/" aria-label="Herdr home">
+            <a class="brand" href="/" aria-label="Flock home">
                 <span class="brand-logo" aria-hidden="true"></span>
-                <span>herdr</span>
+                <span>flock</span>
             </a>
             <div>
                 <a href="/compare/">Compare</a>
                 <a href="/docs/">Docs</a>
                 <a href="/docs/configuration/">Configuration</a>
                 <a href="/docs/socket-api/">API</a>
-                <a href="https://github.com/ogulcancelik/herdr/releases">Releases</a>
-                <a href="mailto:hey@herdr.dev">hey@herdr.dev</a>
+                <a href="https://github.com/gerchowl/flock/releases">Releases</a>
+                <a href="mailto:hey@flock.dev">hey@flock.dev</a>
             </div>
             <nav class="footer-social" aria-label="Social links">
-                <a href="https://github.com/ogulcancelik/herdr" aria-label="Herdr on GitHub">
+                <a href="https://github.com/gerchowl/flock" aria-label="Flock on GitHub">
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                         <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.64 7.64 0 0 1 8 3.87c.68 0 1.36.09 2 .26 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
                     </svg>
                 </a>
-                <a href="https://x.com/herdrdev" aria-label="Herdr on X">
+                <a href="https://x.com/flockdev" aria-label="Flock on X">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                         <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117Z" />
                     </svg>
@@ -363,7 +363,7 @@
                 if (!overlay || !list) return;
                 var options = Array.prototype.slice.call(list.querySelectorAll("[role='option']"));
                 var media = window.matchMedia("(prefers-color-scheme: dark)");
-                var saved = localStorage.getItem("herdr-palette") || "";
+                var saved = localStorage.getItem("flock-palette") || "";
                 var committed = saved || defaultPalette();
 
                 function defaultPalette() {
@@ -386,7 +386,7 @@
                 function openOverlay() {
                     overlay.hidden = false;
                     document.body.style.overflow = "hidden";
-                    committed = localStorage.getItem("herdr-palette") || defaultPalette();
+                    committed = localStorage.getItem("flock-palette") || defaultPalette();
                     updateUI(committed);
                     var active = list.querySelector("[aria-selected='true']") || options[0];
                     if (active) active.focus();
@@ -411,7 +411,7 @@
 
                 function commit(value) {
                     setPalette(value);
-                    localStorage.setItem("herdr-palette", value);
+                    localStorage.setItem("flock-palette", value);
                     updateUI(value);
                     closeOverlay();
                 }
@@ -423,7 +423,7 @@
                 }
 
                 media.addEventListener("change", function () {
-                    if (!localStorage.getItem("herdr-palette")) {
+                    if (!localStorage.getItem("flock-palette")) {
                         setPalette("");
                         updateUI("");
                     }
@@ -460,11 +460,11 @@
                 });
 
                 var themeHint = document.getElementById("theme-hint");
-                if (localStorage.getItem("herdr-theme-hint-seen") === "1") {
+                if (localStorage.getItem("flock-theme-hint-seen") === "1") {
                     themeHint.classList.add("is-seen");
                 }
                 themeHint.addEventListener("mouseenter", function () {
-                    localStorage.setItem("herdr-theme-hint-seen", "1");
+                    localStorage.setItem("flock-theme-hint-seen", "1");
                     themeHint.classList.add("is-seen");
                 }, { once: true });
                 themeHint.addEventListener("click", toggleOverlay);

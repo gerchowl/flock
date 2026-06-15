@@ -185,9 +185,9 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("issue")];
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         app

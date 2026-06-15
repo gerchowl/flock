@@ -105,7 +105,7 @@ jobs:
               '',
               'New contributors need maintainer approval before opening PRs. This keeps review time focused on accepted work and avoids wasted effort.',
               '',
-              'Herdr is opinionated about how it should look, feel, and work. Feature requests, ideas, questions, contribution proposals, and product-direction checks belong in Discussions, not issues.',
+              'Flock is opinionated about how it should look, feel, and work. Feature requests, ideas, questions, contribution proposals, and product-direction checks belong in Discussions, not issues.',
               '',
               '**Next steps:**',
               '1. If this is a feature or behavior change, open a Discussion describing what you want to change and why',

@@ -544,7 +544,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -566,8 +566,8 @@ mod tests {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Flock Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
@@ -644,8 +644,8 @@ prunable stale
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", "/home/me");
         assert_eq!(
-            expand_tilde_path("~/.herdr/worktrees"),
-            PathBuf::from("/home/me/.herdr/worktrees")
+            expand_tilde_path("~/.flock/worktrees"),
+            PathBuf::from("/home/me/.flock/worktrees")
         );
         assert_eq!(
             expand_tilde_path("/tmp/worktrees"),
@@ -662,19 +662,19 @@ prunable stale
     fn default_checkout_path_appends_repo_and_branch_slug() {
         assert_eq!(
             default_checkout_path(
-                Path::new("/home/me/.herdr/worktrees"),
-                "herdr",
+                Path::new("/home/me/.flock/worktrees"),
+                "flock",
                 "worktree/brave-river",
             ),
-            PathBuf::from("/home/me/.herdr/worktrees/herdr/worktree-brave-river")
+            PathBuf::from("/home/me/.flock/worktrees/flock/worktree-brave-river")
         );
     }
 
     #[test]
     fn worktree_remove_command_preserves_branch_by_not_deleting_it() {
         let command = build_worktree_remove_command(
-            Path::new("/repo/herdr"),
-            Path::new("/w/herdr/issue-137"),
+            Path::new("/repo/flock"),
+            Path::new("/w/flock/issue-137"),
             false,
         );
         assert_eq!(command.program, "git");
@@ -682,10 +682,10 @@ prunable stale
             command.args,
             vec![
                 "-C",
-                "/repo/herdr",
+                "/repo/flock",
                 "worktree",
                 "remove",
-                "/w/herdr/issue-137"
+                "/w/flock/issue-137"
             ]
         );
     }
@@ -693,19 +693,19 @@ prunable stale
     #[test]
     fn forced_worktree_remove_command_uses_git_force_flag() {
         let command = build_worktree_remove_command(
-            Path::new("/repo/herdr"),
-            Path::new("/w/herdr/issue-137"),
+            Path::new("/repo/flock"),
+            Path::new("/w/flock/issue-137"),
             true,
         );
         assert_eq!(
             command.args,
             vec![
                 "-C",
-                "/repo/herdr",
+                "/repo/flock",
                 "worktree",
                 "remove",
                 "--force",
-                "/w/herdr/issue-137"
+                "/w/flock/issue-137"
             ]
         );
     }
@@ -713,21 +713,21 @@ prunable stale
     #[test]
     fn dirty_remove_error_detection_matches_git_force_hint() {
         assert!(is_dirty_worktree_remove_error(
-            "fatal: '/w/herdr' contains modified or untracked files, use --force to delete it"
+            "fatal: '/w/flock' contains modified or untracked files, use --force to delete it"
         ));
         assert!(!is_dirty_worktree_remove_error(
-            "fatal: '/w/herdr' is a missing but already registered worktree"
+            "fatal: '/w/flock' is a missing but already registered worktree"
         ));
         assert!(!is_dirty_worktree_remove_error(
-            "fatal: '/w/herdr' contains a locked worktree, use --force only if you know why"
+            "fatal: '/w/flock' contains a locked worktree, use --force only if you know why"
         ));
     }
 
     #[test]
     fn worktree_add_command_creates_new_branch_from_base() {
         let command = build_worktree_add_new_branch_command(
-            Path::new("/repo/herdr"),
-            Path::new("/w/herdr/worktree-brave-river"),
+            Path::new("/repo/flock"),
+            Path::new("/w/flock/worktree-brave-river"),
             "worktree/brave-river",
             "HEAD",
         );
@@ -736,12 +736,12 @@ prunable stale
             command.args,
             vec![
                 "-C",
-                "/repo/herdr",
+                "/repo/flock",
                 "worktree",
                 "add",
                 "-b",
                 "worktree/brave-river",
-                "/w/herdr/worktree-brave-river",
+                "/w/flock/worktree-brave-river",
                 "HEAD"
             ]
         );
@@ -868,12 +868,12 @@ prunable stale
     #[test]
     fn github_repo_parses_ssh_and_https_remote_urls() {
         assert_eq!(
-            github_repo_from_remote_url("git@github.com:gerchowl/herdr.git").as_deref(),
-            Some("gerchowl/herdr")
+            github_repo_from_remote_url("git@github.com:gerchowl/flock.git").as_deref(),
+            Some("gerchowl/flock")
         );
         assert_eq!(
-            github_repo_from_remote_url("https://github.com/ogulcancelik/herdr").as_deref(),
-            Some("ogulcancelik/herdr")
+            github_repo_from_remote_url("https://github.com/gerchowl/flock").as_deref(),
+            Some("gerchowl/flock")
         );
         assert_eq!(github_repo_from_remote_url("https://example.com/x/y"), None);
         assert_eq!(github_repo_from_remote_url("git@github.com:broken"), None);
@@ -940,8 +940,8 @@ prunable stale
     #[test]
     fn main_root_from_common_dir_strips_dot_git() {
         assert_eq!(
-            main_root_from_common_dir(std::path::Path::new("/repo/herdr/.git")),
-            std::path::PathBuf::from("/repo/herdr")
+            main_root_from_common_dir(std::path::Path::new("/repo/flock/.git")),
+            std::path::PathBuf::from("/repo/flock")
         );
         assert_eq!(
             main_root_from_common_dir(std::path::Path::new("/repo/bare.git")),

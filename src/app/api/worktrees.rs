@@ -281,7 +281,7 @@ impl App {
             return encode_error(
                 id,
                 "not_linked_worktree",
-                "workspace is not a Herdr-managed worktree checkout",
+                "workspace is not a Flock-managed worktree checkout",
             );
         };
         if !space.is_linked_worktree {
@@ -362,7 +362,7 @@ impl App {
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
-                    "Herdr worktree actions require a path inside a Git work tree",
+                    "Flock worktree actions require a path inside a Git work tree",
                 )
             })?;
             if space.is_linked_worktree {
@@ -422,7 +422,7 @@ impl App {
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
-                    "Herdr worktree actions require a path inside a Git work tree",
+                    "Flock worktree actions require a path inside a Git work tree",
                 )
             })?;
             let workspace_idx = self.list_source_workspace_idx_for_space(&space);
@@ -474,7 +474,7 @@ impl App {
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
-                "Herdr worktree actions require a workspace inside a Git work tree",
+                "Flock worktree actions require a workspace inside a Git work tree",
             ));
         };
         if space.is_linked_worktree {
@@ -530,7 +530,7 @@ impl App {
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
-                "Herdr worktree actions require a workspace inside a Git work tree",
+                "Flock worktree actions require a workspace inside a Git work tree",
             ));
         };
         let workspace_idx = if space.is_linked_worktree {
@@ -859,7 +859,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -881,8 +881,8 @@ mod tests {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Flock Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);

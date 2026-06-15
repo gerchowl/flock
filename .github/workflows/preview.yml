@@ -119,23 +119,23 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-x86_64
+            name: flock-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-aarch64
+            name: flock-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: herdr-macos-x86_64
+            name: flock-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: herdr-macos-aarch64
+            name: flock-macos-aarch64
     runs-on: ${{ matrix.os }}
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
       LIBGHOSTTY_VT_SIMD: 'true'
-      HERDR_BUILD_CHANNEL: preview
-      HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
-      HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
+      FLOCK_BUILD_CHANNEL: preview
+      FLOCK_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+      FLOCK_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -187,7 +187,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
           if [ "${{ runner.os }}" = "Linux" ]; then
             file ${{ matrix.name }} > BUILD_INFO.txt
             ldd ${{ matrix.name }} > LDD_INFO.txt 2>&1 || true
@@ -251,9 +251,9 @@ jobs:
           python3 - <<'PY'
           import json, pathlib
           result = {}
-          for path in pathlib.Path('artifacts').glob('herdr-*/*.sha256'):
+          for path in pathlib.Path('artifacts').glob('flock-*/*.sha256'):
               digest, name = path.read_text().split()[:2]
-              target = name.removeprefix('herdr-')
+              target = name.removeprefix('flock-')
               result[target] = digest
           pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
           PY
@@ -269,10 +269,10 @@ jobs:
           overwrite_files: true
           target_commitish: ${{ needs.preflight.outputs.commit }}
           files: |
-            artifacts/herdr-linux-x86_64/herdr-linux-x86_64
-            artifacts/herdr-linux-aarch64/herdr-linux-aarch64
-            artifacts/herdr-macos-x86_64/herdr-macos-x86_64
-            artifacts/herdr-macos-aarch64/herdr-macos-aarch64
+            artifacts/flock-linux-x86_64/flock-linux-x86_64
+            artifacts/flock-linux-aarch64/flock-linux-aarch64
+            artifacts/flock-macos-x86_64/flock-macos-x86_64
+            artifacts/flock-macos-aarch64/flock-macos-aarch64
 
       - name: Update preview manifest
         run: |

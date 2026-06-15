@@ -1,10 +1,10 @@
-Herdr is dual-licensed:
+Flock is licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later). See the full text below.
 
-1. Open source: GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
-   See the full text below.
-
-2. Commercial: commercial licenses are available for organizations that cannot comply
-   with AGPL. Contact hey@herdr.dev for details.
+Flock is a fork of Herdr (https://github.com/ogulcancelik/herdr), Copyright (c)
+its authors, also distributed under AGPL-3.0-or-later. Substantial portions of
+this software are derived from Herdr; that copyright and license are retained as
+required by the AGPL. See NOTICE for attribution details.
 
 --------------------------------------------------------------------------------
 

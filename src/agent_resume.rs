@@ -72,7 +72,7 @@ pub fn session_ref_from_report(
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude") | ("herdr:codex", "codex") | ("herdr:opencode", "opencode")
+        ("flock:claude", "claude") | ("flock:codex", "codex") | ("flock:opencode", "opencode")
     )
 }
 
@@ -103,30 +103,30 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     }
 
     let argv = match (source, agent, session_ref.kind) {
-        ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
+        ("flock:claude", "claude", AgentSessionRefKind::Id) => {
             vec![
                 "claude".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
+        ("flock:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
         }
-        ("herdr:copilot", "copilot", AgentSessionRefKind::Id) => {
+        ("flock:copilot", "copilot", AgentSessionRefKind::Id) => {
             vec!["copilot".into(), format!("--resume={}", session_ref.value)]
         }
-        ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+        ("flock:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:hermes", "hermes", AgentSessionRefKind::Id) => {
+        ("flock:hermes", "hermes", AgentSessionRefKind::Id) => {
             vec![
                 "hermes".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:opencode", "opencode", AgentSessionRefKind::Id) => {
+        ("flock:opencode", "opencode", AgentSessionRefKind::Id) => {
             vec![
                 "opencode".into(),
                 "--session".into(),
@@ -153,7 +153,7 @@ pub fn branch_plan(
     session_ref: &AgentSessionRef,
 ) -> Option<AgentResumePlan> {
     let mut plan = plan(source, agent, session_ref)?;
-    if source == "herdr:claude" {
+    if source == "flock:claude" {
         plan.argv.push("--fork-session".into());
     }
     Some(plan)
@@ -186,12 +186,12 @@ pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> S
 fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude")
-            | ("herdr:codex", "codex")
-            | ("herdr:copilot", "copilot")
-            | ("herdr:pi", "pi")
-            | ("herdr:hermes", "hermes")
-            | ("herdr:opencode", "opencode")
+        ("flock:claude", "claude")
+            | ("flock:codex", "codex")
+            | ("flock:copilot", "copilot")
+            | ("flock:pi", "pi")
+            | ("flock:hermes", "hermes")
+            | ("flock:opencode", "opencode")
     )
 }
 
@@ -214,7 +214,7 @@ mod tests {
     fn planner_allows_supported_agents() {
         assert_eq!(
             plan(
-                "herdr:claude",
+                "flock:claude",
                 "claude",
                 &AgentSessionRef::id("claude-session").unwrap()
             )
@@ -224,7 +224,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:codex",
+                "flock:codex",
                 "codex",
                 &AgentSessionRef::id("codex-session").unwrap()
             )
@@ -234,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:copilot",
+                "flock:copilot",
                 "copilot",
                 &AgentSessionRef::id("copilot-session").unwrap()
             )
@@ -244,7 +244,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:pi",
+                "flock:pi",
                 "pi",
                 &AgentSessionRef::path("/tmp/pi-session.jsonl").unwrap()
             )
@@ -254,7 +254,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:hermes",
+                "flock:hermes",
                 "hermes",
                 &AgentSessionRef::id("hermes-session").unwrap()
             )
@@ -264,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:opencode",
+                "flock:opencode",
                 "opencode",
                 &AgentSessionRef::id("opencode-session").unwrap()
             )
@@ -283,7 +283,7 @@ mod tests {
         )
         .is_none());
         assert!(plan(
-            "herdr:claude",
+            "flock:claude",
             "claude",
             &AgentSessionRef::path("/tmp/claude-session").unwrap()
         )
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn report_ref_prefers_pi_path_and_validates_values() {
         let session_ref = session_ref_from_report(
-            "herdr:pi",
+            "flock:pi",
             "pi",
             Some("pi-id".into()),
             Some("/tmp/pi-session.jsonl".into()),
@@ -302,14 +302,14 @@ mod tests {
         assert_eq!(session_ref.kind, AgentSessionRefKind::Path);
         assert_eq!(session_ref.value, "/tmp/pi-session.jsonl");
 
-        assert!(session_ref_from_report("herdr:pi", "pi", Some("bad\nid".into()), None).is_none());
+        assert!(session_ref_from_report("flock:pi", "pi", Some("bad\nid".into()), None).is_none());
         assert!(
-            session_ref_from_report("herdr:pi", "pi", None, Some("relative.jsonl".into()))
+            session_ref_from_report("flock:pi", "pi", None, Some("relative.jsonl".into()))
                 .is_none()
         );
         assert!(session_ref_from_report("custom:pi", "pi", Some("pi-id".into()), None).is_none());
         assert!(session_ref_from_report(
-            "herdr:claude",
+            "flock:claude",
             "claude",
             None,
             Some("/tmp/claude-session".into())
@@ -317,12 +317,12 @@ mod tests {
         .is_none());
 
         let session_ref =
-            session_ref_from_report("herdr:copilot", "copilot", Some("copilot-id".into()), None)
+            session_ref_from_report("flock:copilot", "copilot", Some("copilot-id".into()), None)
                 .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "copilot-id");
         assert!(session_ref_from_report(
-            "herdr:copilot",
+            "flock:copilot",
             "copilot",
             None,
             Some("/tmp/copilot-session".into())
@@ -333,11 +333,11 @@ mod tests {
     #[test]
     fn ids_are_data_not_shell_text() {
         let id = "abc; rm -rf /";
-        let codex_plan = plan("herdr:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
+        let codex_plan = plan("flock:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
         assert_eq!(codex_plan.argv, vec!["codex", "resume", id]);
 
         let copilot_plan = plan(
-            "herdr:copilot",
+            "flock:copilot",
             "copilot",
             &AgentSessionRef::id(id).unwrap(),
         )
@@ -348,39 +348,39 @@ mod tests {
     #[test]
     fn planner_rejects_path_refs_for_id_only_agents() {
         assert!(plan(
-            "herdr:hermes",
+            "flock:hermes",
             "hermes",
             &AgentSessionRef::path("/tmp/hermes-session").unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:opencode",
+            "flock:opencode",
             "opencode",
             &AgentSessionRef::path("/tmp/opencode-session").unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:copilot",
+            "flock:copilot",
             "copilot",
             &AgentSessionRef::path("/tmp/copilot-session").unwrap()
         )
         .is_none());
         assert!(session_ref_from_snapshot(
-            "herdr:hermes",
+            "flock:hermes",
             "hermes",
             AgentSessionRefKind::Id,
             "hermes-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:opencode",
+            "flock:opencode",
             "opencode",
             AgentSessionRefKind::Id,
             "opencode-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:copilot",
+            "flock:copilot",
             "copilot",
             AgentSessionRefKind::Id,
             "copilot-session"
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn branch_plan_claude_appends_fork_session_flag() {
         let session = AgentSessionRef::id("claude-session").unwrap();
-        let plan = branch_plan("herdr:claude", "claude", &session).unwrap();
+        let plan = branch_plan("flock:claude", "claude", &session).unwrap();
         assert_eq!(
             plan.argv,
             vec!["claude", "--resume", "claude-session", "--fork-session"]
@@ -400,17 +400,17 @@ mod tests {
     #[test]
     fn append_pivot_message_pushes_only_for_claude_forks() {
         let session = AgentSessionRef::id("sid").unwrap();
-        let mut claude = branch_plan("herdr:claude", "claude", &session).unwrap();
+        let mut claude = branch_plan("flock:claude", "claude", &session).unwrap();
         append_pivot_message(&mut claude, "PIVOT now");
         assert_eq!(claude.argv.last().unwrap(), "PIVOT now");
 
         // Empty message: no-op.
-        let mut claude2 = branch_plan("herdr:claude", "claude", &session).unwrap();
+        let mut claude2 = branch_plan("flock:claude", "claude", &session).unwrap();
         append_pivot_message(&mut claude2, "");
         assert_eq!(claude2.argv.last().unwrap(), "--fork-session");
 
         // Non-claude (codex): no positional prompt appended even if asked.
-        let mut codex = branch_plan("herdr:codex", "codex", &session).unwrap();
+        let mut codex = branch_plan("flock:codex", "codex", &session).unwrap();
         let before = codex.argv.clone();
         append_pivot_message(&mut codex, "PIVOT now");
         assert_eq!(codex.argv, before);
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn branch_plan_non_claude_agents_fall_back_to_plain_resume() {
         let session = AgentSessionRef::id("codex-session").unwrap();
-        let plan = branch_plan("herdr:codex", "codex", &session).unwrap();
+        let plan = branch_plan("flock:codex", "codex", &session).unwrap();
         assert_eq!(plan.argv, vec!["codex", "resume", "codex-session"]);
     }
 

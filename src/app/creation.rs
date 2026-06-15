@@ -449,9 +449,9 @@ mod tests {
         let mut ws = Workspace::test_new("parent");
         ws.worktree_space = Some(WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-worktrees/feature".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-worktrees/feature".into(),
             is_linked_worktree: true,
         });
         ws
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(membership.key, "repo-key");
         assert_eq!(
             pinned.as_deref(),
-            Some(std::path::Path::new("/repo/herdr-worktrees/feature")),
+            Some(std::path::Path::new("/repo/flock-worktrees/feature")),
             "cwd pins to the checkout path, not the live root-pane cwd"
         );
     }

@@ -401,7 +401,7 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         frame.render_widget(Paragraph::new(gate_line).style(gate_style), rows[3]);
     } else {
         frame.render_widget(
-            Paragraph::new(" The branch is not deleted. The Herdr workspace will close.")
+            Paragraph::new(" The branch is not deleted. The Flock workspace will close.")
                 .style(Style::default().fg(app.palette.overlay0)),
             rows[3],
         );
@@ -806,17 +806,17 @@ mod tests {
         let mut parent = Workspace::test_new("main");
         parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
         let mut child = Workspace::test_new("issue");
         child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         app.workspaces = vec![parent, child];
@@ -838,17 +838,17 @@ mod tests {
         let mut parent = Workspace::test_new("main");
         parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
         let mut child = Workspace::test_new("issue");
         child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock-issue".into(),
             is_linked_worktree: true,
         });
         app.workspaces = vec![parent, child];

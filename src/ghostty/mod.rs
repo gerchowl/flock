@@ -1529,7 +1529,7 @@ fn kitty_placeholder_color_to_id(color: CellColor) -> u32 {
 
 fn kitty_placeholder_diacritic_index(codepoint: u32) -> Option<u32> {
     let map = KITTY_PLACEHOLDER_DIACRITICS.get_or_init(|| {
-        // Reuse Ghostty's vendored table so Herdr decodes the same placeholder
+        // Reuse Ghostty's vendored table so Flock decodes the same placeholder
         // row/column diacritics that libghostty accepts.
         let source =
             include_str!("../../vendor/libghostty-vt/src/terminal/kitty/graphics_unicode.zig");

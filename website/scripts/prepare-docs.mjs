@@ -83,7 +83,7 @@ function insertPreviewNotice(content, relativePath) {
   ].join('\n');
   const indexPrefix =
     relativePath === 'index.mdx'
-      ? content.replace('title: Herdr documentation', 'title: Herdr preview documentation')
+      ? content.replace('title: Flock documentation', 'title: Flock preview documentation')
       : content;
   const frontmatter = indexPrefix.match(/^---\n[\s\S]*?\n---\n/);
   if (!frontmatter) {

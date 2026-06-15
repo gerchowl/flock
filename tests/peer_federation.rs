@@ -16,8 +16,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 use support::{
     cleanup_test_base, client_handshake, client_handshake_with_fleet, decode_varint_u32,
-    read_server_message, register_runtime_dir, register_spawned_herdr_pid, send_input,
-    unregister_spawned_herdr_pid, wait_for_file, wait_for_socket,
+    read_server_message, register_runtime_dir, register_spawned_flock_pid, send_input,
+    unregister_spawned_flock_pid, wait_for_file, wait_for_socket,
 };
 
 /// ServerMessage bincode variant indices (declaration order in wire.rs).
@@ -30,17 +30,17 @@ fn unique_test_dir() -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     PathBuf::from(format!(
-        "/tmp/herdr-peer-federation-test-{}-{nanos}",
+        "/tmp/flock-peer-federation-test-{}-{nanos}",
         std::process::id()
     ))
 }
 
-struct SpawnedHerdr {
+struct SpawnedFlock {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
 
-impl Drop for SpawnedHerdr {
+impl Drop for SpawnedFlock {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
@@ -55,7 +55,7 @@ impl Drop for SpawnedHerdr {
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            unregister_spawned_herdr_pid(Some(pid));
+            unregister_spawned_flock_pid(Some(pid));
         }
     }
 }
@@ -98,8 +98,8 @@ fn create_workspace(api_socket: &Path, cwd: &Path) {
 }
 
 fn write_config(config_home: &Path, contents: &str) {
-    // Debug builds read the herdr-dev app dir; release builds read herdr.
-    for app_dir in ["herdr", "herdr-dev"] {
+    // Debug builds read the flock-dev app dir; release builds read flock.
+    for app_dir in ["flock", "flock-dev"] {
         let dir = config_home.join(app_dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), contents).unwrap();
@@ -113,7 +113,7 @@ fn spawn_server(
     api_socket_path: &Path,
     cwd: &Path,
     extra_path: Option<&Path>,
-) -> SpawnedHerdr {
+) -> SpawnedFlock {
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
 
@@ -126,26 +126,26 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
     cmd.arg("server");
     cmd.cwd(cwd);
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
-    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env_remove("FLOCK_ENV");
+    cmd.env("FLOCK_DISABLE_SOUND", "1");
     if let Some(extra) = extra_path {
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{}", extra.display(), path));
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
-    SpawnedHerdr {
+    SpawnedFlock {
         _master: pair.master,
         child,
     }
@@ -349,7 +349,7 @@ fn strip_focus_suffix(tail: &[u8]) -> &[u8] {
 #[test]
 fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_herdr"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -360,7 +360,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     init_repo_with_origin(&repo_b, "git@github.com:peer-fed-test/proj.git");
     let config_home_b = base.join("config-b");
     let runtime_b = base.join("runtime-b");
-    let socket_b = base.join("herdr-b.sock");
+    let socket_b = base.join("flock-b.sock");
     write_config(&config_home_b, "onboarding = false\n");
     let server_b = spawn_server(&config_home_b, &runtime_b, &socket_b, &repo_b, None);
     wait_for_socket(&socket_b, Duration::from_secs(10));
@@ -373,7 +373,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nfor last; do :; done\nHERDR_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
+            "#!/bin/sh\nfor last; do :; done\nFLOCK_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
             socket_b.display(),
             config_home_b.display(),
             bin_dir.display(),
@@ -387,7 +387,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     init_repo_with_origin(&repo_a, "git@github.com:peer-fed-test/alpha.git");
     let config_home_a = base.join("config-a");
     let runtime_a = base.join("runtime-a");
-    let socket_a = base.join("herdr-a.sock");
+    let socket_a = base.join("flock-a.sock");
     write_config(
         &config_home_a,
         "onboarding = false\n\n[[peers]]\nname = \"peerb\"\n",
@@ -401,8 +401,8 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     );
     wait_for_socket(&socket_a, Duration::from_secs(10));
     create_workspace(&socket_a, &repo_a);
-    // Derived from HERDR_SOCKET_PATH: `-client` inserted before `.sock`.
-    let client_socket_a = base.join("herdr-a-client.sock");
+    // Derived from FLOCK_SOCKET_PATH: `-client` inserted before `.sock`.
+    let client_socket_a = base.join("flock-a-client.sock");
     wait_for_file(&client_socket_a, Duration::from_secs(10));
 
     // --- Attach a protocol client to A and wait for the folded remote row.
@@ -447,7 +447,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
 #[test]
 fn folded_remote_member_row_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_herdr"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -461,7 +461,7 @@ fn folded_remote_member_row_click_switches_server() {
     init_repo_with_origin(&repo_b, shared_origin);
     let config_home_b = base.join("config-b");
     let runtime_b = base.join("runtime-b");
-    let socket_b = base.join("herdr-b.sock");
+    let socket_b = base.join("flock-b.sock");
     write_config(&config_home_b, "onboarding = false\n");
     let server_b = spawn_server(&config_home_b, &runtime_b, &socket_b, &repo_b, None);
     wait_for_socket(&socket_b, Duration::from_secs(10));
@@ -474,7 +474,7 @@ fn folded_remote_member_row_click_switches_server() {
     fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nfor last; do :; done\nHERDR_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
+            "#!/bin/sh\nfor last; do :; done\nFLOCK_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
             socket_b.display(),
             config_home_b.display(),
             bin_dir.display(),
@@ -488,7 +488,7 @@ fn folded_remote_member_row_click_switches_server() {
     init_repo_with_origin(&repo_a, shared_origin);
     let config_home_a = base.join("config-a");
     let runtime_a = base.join("runtime-a");
-    let socket_a = base.join("herdr-a.sock");
+    let socket_a = base.join("flock-a.sock");
     write_config(
         &config_home_a,
         "onboarding = false\n\n[[peers]]\nname = \"peerb\"\n",
@@ -502,7 +502,7 @@ fn folded_remote_member_row_click_switches_server() {
     );
     wait_for_socket(&socket_a, Duration::from_secs(10));
     create_workspace(&socket_a, &repo_a);
-    let client_socket_a = base.join("herdr-a-client.sock");
+    let client_socket_a = base.join("flock-a-client.sock");
     wait_for_file(&client_socket_a, Duration::from_secs(10));
 
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
@@ -547,7 +547,7 @@ fn folded_remote_member_row_click_switches_server() {
 #[test]
 fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_herdr"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -557,7 +557,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     init_repo_with_origin(&repo_b, "git@github.com:peer-fed-home/proj.git");
     let config_home_b = base.join("config-b");
     let runtime_b = base.join("runtime-b");
-    let socket_b = base.join("herdr-b.sock");
+    let socket_b = base.join("flock-b.sock");
     write_config(&config_home_b, "onboarding = false\n");
     let server_b = spawn_server(&config_home_b, &runtime_b, &socket_b, &repo_b, None);
     wait_for_socket(&socket_b, Duration::from_secs(10));
@@ -570,7 +570,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nprev=\"\"; target=\"\"\nfor a; do target=\"$prev\"; prev=\"$a\"; done\nif [ \"$target\" = \"ghost\" ]; then exit 255; fi\nHERDR_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$prev\"\n",
+            "#!/bin/sh\nprev=\"\"; target=\"\"\nfor a; do target=\"$prev\"; prev=\"$a\"; done\nif [ \"$target\" = \"ghost\" ]; then exit 255; fi\nFLOCK_SOCKET_PATH='{}' XDG_CONFIG_HOME='{}' PATH='{}':\"$PATH\" exec sh -c \"$prev\"\n",
             socket_b.display(),
             config_home_b.display(),
             bin_dir.display(),
@@ -585,7 +585,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     init_repo_with_origin(&repo_a, "git@github.com:peer-fed-home/alpha.git");
     let config_home_a = base.join("config-a");
     let runtime_a = base.join("runtime-a");
-    let socket_a = base.join("herdr-a.sock");
+    let socket_a = base.join("flock-a.sock");
     write_config(
         &config_home_a,
         "onboarding = false\n\n[[peers]]\nname = \"peerb\"\n\n[[peers]]\nname = \"ghost\"\n",
@@ -599,7 +599,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     );
     wait_for_socket(&socket_a, Duration::from_secs(10));
     create_workspace(&socket_a, &repo_a);
-    let client_socket_a = base.join("herdr-a-client.sock");
+    let client_socket_a = base.join("flock-a-client.sock");
     wait_for_file(&client_socket_a, Duration::from_secs(10));
 
     // --- Leap off the hub: click peerb's folded remote row. 45 rows: with
@@ -643,7 +643,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
 
     // --- Re-attach to the spoke carrying the snapshot bytes verbatim —
     // exactly what the launcher's next leg does.
-    let client_socket_b = base.join("herdr-b-client.sock");
+    let client_socket_b = base.join("flock-b-client.sock");
     wait_for_file(&client_socket_b, Duration::from_secs(10));
     let mut stream_b =
         UnixStream::connect(&client_socket_b).expect("spoke client socket should connect");

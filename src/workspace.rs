@@ -102,7 +102,7 @@ pub struct Workspace {
     /// has, a workspace without git metadata is "pending", not non-git —
     /// the sidebar must not flash it into the `misc` section (#33).
     pub(crate) git_identity_resolved: bool,
-    /// Explicit Herdr-managed worktree grouping provenance.
+    /// Explicit Flock-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
     /// Stable-ish public pane numbers within this workspace.
     /// New panes append at the end; closing a pane compacts higher numbers down.
@@ -879,14 +879,14 @@ mod tests {
         let mut terminals = HashMap::new();
         terminals.insert(
             terminal_id.clone(),
-            TerminalState::new(terminal_id, PathBuf::from("/herdr-test/pion")),
+            TerminalState::new(terminal_id, PathBuf::from("/flock-test/pion")),
         );
         let terminal_runtimes = TerminalRuntimeRegistry::new();
 
         assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "pion");
         assert_eq!(
             ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
-            Some(PathBuf::from("/herdr-test/pion"))
+            Some(PathBuf::from("/flock-test/pion"))
         );
     }
 

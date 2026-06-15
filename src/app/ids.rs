@@ -69,7 +69,7 @@ impl App {
     }
 
     /// Like parse_pane_id, but with the API caller's process ancestry as the
-    /// authority when a peer pid is available. An env-baked HERDR_PANE_ID can
+    /// authority when a peer pid is available. An env-baked FLOCK_PANE_ID can
     /// be stale in two ways: dangling (no such pane — heal by ancestry) or,
     /// worse, colliding with a *different* live pane after pane renumbering —
     /// in which case trusting it silently delivers reports to the wrong pane.

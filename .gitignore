@@ -12,6 +12,10 @@ __pycache__/
 !/docs/next/**
 !/docs/adr/
 !/docs/adr/**
+!/docs/issues/
+!/docs/issues/**
+!/docs/PRs/
+!/docs/PRs/**
 /.local/
 
 /.pi/todos
