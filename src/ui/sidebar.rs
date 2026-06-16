@@ -12,7 +12,7 @@ use super::state_signal::{
     join_states, leading_count_spans, medallion_rings, packed_rects, tally_states, StateClass,
     StateJoin, StateTally,
 };
-use super::status::{agent_icon, remote_agent_icon, state_label_color};
+use super::status::{agent_icon, remote_agent_icon};
 use crate::app::state::{AgentPanelScope, Palette, PanelScope};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -2481,7 +2481,8 @@ fn render_workspace_list(
                 line1.push(Span::styled(" ", Style::default()));
                 line1.push(Span::styled(
                     count.to_string(),
-                    Style::default().fg(state_label_color(state, seen, p)),
+                    Style::default()
+                        .fg(crate::ui::state_signal::StateClass::of(state, seen).count_color(p)),
                 ));
             }
         }
@@ -2588,7 +2589,8 @@ fn render_workspace_list(
                 spans.push(Span::styled(" ", Style::default()));
                 spans.push(Span::styled(
                     count.to_string(),
-                    Style::default().fg(state_label_color(state, seen, p)),
+                    Style::default()
+                        .fg(crate::ui::state_signal::StateClass::of(state, seen).count_color(p)),
                 ));
             }
         }
@@ -4160,7 +4162,7 @@ mod tests {
         app.ensure_test_terminals();
         app.active = Some(0);
         app.mode = crate::app::Mode::Terminal;
-        // Local tally: one blocked + one working pane -> `1 1 0`.
+        // Local tally: one blocked + one working pane -> `1 0 1 0`.
         let panes: Vec<_> = app.workspaces[0].tabs[0].panes.keys().copied().collect();
         for (pane, state) in panes
             .into_iter()
@@ -4169,7 +4171,7 @@ mod tests {
             let tid = app.workspaces[0].terminal_id(pane).unwrap().clone();
             app.terminals.get_mut(&tid).unwrap().state = state;
         }
-        // Peer tally: blocked + working workspace statuses -> `1 1 0`.
+        // Peer tally: blocked + working workspace statuses -> `1 0 1 0`.
         let mut blocked = remote_summary("a", None, None, None);
         blocked.status = AgentStatus::Blocked;
         let mut working = remote_summary("b", None, None, None);
@@ -4187,8 +4189,8 @@ mod tests {
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
         let peer_rect = server_slot_rect(rows_area, 1).expect("peer slot");
 
-        // Default mark = name first, then the counts `<name> 1 1 0`: fixed
-        // r/y/g columns, zeros muted, single-digit width band-wide. The
+        // Default mark = name first, then the counts `<name> 1 0 1 0`: fixed
+        // blocked/done/working/idle columns, zeros muted, single-digit width. The
         // name field pads to the band-wide max display width, so the count
         // columns sit at the same x on every row.
         let host = crate::app::short_host_name();
@@ -4196,13 +4198,16 @@ mod tests {
         let counts_x = |rect: Rect| rect.x + name_width as u16 + 1;
         for rect in [self_rect, peer_rect] {
             let x = counts_x(rect);
+            // Four columns blocked / done / working / idle = `1 0 1 0`.
             assert_eq!(buffer[(x, rect.y)].symbol(), "1");
             assert_eq!(buffer[(x, rect.y)].style().fg, Some(p.red));
-            assert_eq!(buffer[(x + 2, rect.y)].symbol(), "1");
-            assert_eq!(buffer[(x + 2, rect.y)].style().fg, Some(p.yellow));
-            assert_eq!(buffer[(x + 4, rect.y)].symbol(), "0");
+            assert_eq!(buffer[(x + 2, rect.y)].symbol(), "0", "done column");
+            assert_eq!(buffer[(x + 2, rect.y)].style().fg, Some(p.overlay0));
+            assert_eq!(buffer[(x + 4, rect.y)].symbol(), "1", "working column");
+            assert_eq!(buffer[(x + 4, rect.y)].style().fg, Some(p.yellow));
+            assert_eq!(buffer[(x + 6, rect.y)].symbol(), "0", "idle column");
             assert_eq!(
-                buffer[(x + 4, rect.y)].style().fg,
+                buffer[(x + 6, rect.y)].style().fg,
                 Some(p.overlay0),
                 "zero column is muted"
             );
@@ -4307,19 +4312,20 @@ mod tests {
             .chars()
             .skip(name_width + 1)
             .collect();
-        assert!(peer_title.starts_with(" 0 10  0 "), "{peer_title:?}");
+        // Four columns blocked/done/working/idle, working hits two digits.
+        assert!(peer_title.starts_with(" 0  0 10  0 "), "{peer_title:?}");
         assert_eq!(
-            buffer[(peer_rect.x + name_width as u16 + 1 + 3, peer_rect.y)]
+            buffer[(peer_rect.x + name_width as u16 + 1 + 6, peer_rect.y)]
                 .style()
                 .fg,
             Some(p.yellow)
         );
-        // Self (no agents): every column widens to match — `<host> 0  0  0`.
+        // Self (no agents): every column widens to match — `<host> 0  0  0  0`.
         let self_title: String = buffer_row_text(&buffer, self_rect, self_rect.y)
             .chars()
             .skip(name_width + 1)
             .collect();
-        assert!(self_title.starts_with(" 0  0  0"), "{self_title:?}");
+        assert!(self_title.starts_with(" 0  0  0  0"), "{self_title:?}");
     }
     #[test]
     fn medallion_mark_config_switches_the_band_to_the_medallion() {
@@ -4930,7 +4936,7 @@ mod tests {
             assert_eq!(agent_icon(state, seen, 0, &p).1.fg, expected, "{class:?}");
             assert_eq!(state_dot(state, seen, &p).1.fg, expected, "{class:?}");
             assert_eq!(
-                Some(state_label_color(state, seen, &p)),
+                Some(crate::ui::status::state_label_color(state, seen, &p)),
                 expected,
                 "{class:?}"
             );

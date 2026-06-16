@@ -79,6 +79,18 @@ impl StateClass {
             Self::None => p.overlay0,
         }
     }
+
+    /// Color for the per-state COUNT badges (sidebar group headers + servers
+    /// band), where the number's color is the ONLY differentiator — the dot /
+    /// checkmark icons elsewhere carry shape, so they keep `color` (idle green).
+    /// In a bare count, idle's green blurs into done's teal, so idle reads as a
+    /// muted grey here; blocked/done/working keep their signal colors.
+    pub(crate) fn count_color(self, p: &Palette) -> Color {
+        match self {
+            Self::Idle => p.overlay1,
+            other => other.color(p),
+        }
+    }
 }
 
 /// The join: a scope's live agent states as a severity-sorted multiset,
@@ -128,15 +140,16 @@ impl StateJoin {
 }
 
 /// Full per-class tally of a server's agent states — the data behind the
-/// band's count columns (`flock 0 2 1`, #42): fixed r/y/g columns =
-/// blocked / working / calm (idle + done-unseen fold into the calm column;
-/// the teal distinction stays on workspace rows). Unlike the capped
-/// [`StateJoin`], the tally keeps exact counts.
+/// band's count columns (`flock 0 1 2 1`, #42): four columns =
+/// blocked / done / working / idle, each kept distinct (done stays teal, idle
+/// reads muted-grey in a bare count). Unlike the capped [`StateJoin`], the
+/// tally keeps exact counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StateTally {
     pub(crate) blocked: usize,
+    pub(crate) done: usize,
     pub(crate) working: usize,
-    pub(crate) calm: usize,
+    pub(crate) idle: usize,
 }
 
 pub(crate) fn tally_states(states: impl IntoIterator<Item = StateClass>) -> StateTally {
@@ -144,8 +157,9 @@ pub(crate) fn tally_states(states: impl IntoIterator<Item = StateClass>) -> Stat
     for class in states {
         match class {
             StateClass::Blocked => tally.blocked += 1,
+            StateClass::Done => tally.done += 1,
             StateClass::Working => tally.working += 1,
-            StateClass::Done | StateClass::Idle => tally.calm += 1,
+            StateClass::Idle => tally.idle += 1,
             StateClass::None => {}
         }
     }
@@ -156,7 +170,7 @@ impl StateTally {
     /// Width in digits of the widest column — feeds the band-global digit
     /// alignment (one server hitting 10 widens every row to two digits).
     pub(crate) fn digit_width(&self) -> usize {
-        [self.blocked, self.working, self.calm]
+        [self.blocked, self.done, self.working, self.idle]
             .into_iter()
             .map(|n| n.max(1).ilog10() as usize + 1)
             .max()
@@ -164,19 +178,21 @@ impl StateTally {
     }
 
     /// The capped severity join equivalent to this tally (medallion mode).
+    /// Done and idle both reduce to the calm `Idle` class for the join.
     pub(crate) fn join(&self) -> StateJoin {
         join_states(
             std::iter::repeat_n(StateClass::Blocked, self.blocked)
                 .chain(std::iter::repeat_n(StateClass::Working, self.working))
-                .chain(std::iter::repeat_n(StateClass::Idle, self.calm)),
+                .chain(std::iter::repeat_n(StateClass::Idle, self.done + self.idle)),
         )
     }
 }
 
 /// The count columns for one band row (rendered after the padded name
-/// field): three right-aligned counts in the severity colors
-/// (red/yellow/green), zeros muted, every column padded to the band-global
-/// `digit_width`, each with a trailing separator space.
+/// field): four right-aligned counts — blocked / done / working / idle in
+/// red / teal / yellow / muted-grey (idle reads grey in a bare count so it
+/// never blurs into done's teal). Zeros muted, every column padded to the
+/// band-global `digit_width`, each with a trailing separator space.
 pub(crate) fn leading_count_spans(
     tally: &StateTally,
     digit_width: usize,
@@ -198,9 +214,10 @@ pub(crate) fn leading_count_spans(
         Span::styled(format!("{count:>digit_width$} "), style)
     };
     vec![
-        column(tally.blocked, p.red),
-        column(tally.working, p.yellow),
-        column(tally.calm, p.green),
+        column(tally.blocked, StateClass::Blocked.count_color(p)),
+        column(tally.done, StateClass::Done.count_color(p)),
+        column(tally.working, StateClass::Working.count_color(p)),
+        column(tally.idle, StateClass::Idle.count_color(p)),
     ]
 }
 
