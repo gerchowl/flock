@@ -449,10 +449,10 @@ pub struct WorktreesConfig {
     pub adopt_external: bool,
     /// One-shot prompt injected as the forked agent's first turn when you
     /// branch_session a Claude pane (#106) -- so the fork knows it was
-    /// branched and should pivot rather than duplicate the parent. The
-    /// `<branch>` placeholder is replaced with the new branch name. Empty
-    /// string disables injection. Claude only (the only agent whose resume
-    /// takes a positional first prompt).
+    /// branched and waits for new input rather than starting work on its
+    /// own. The `<branch>` placeholder is replaced with the new branch name.
+    /// Empty string disables injection. Claude only (the only agent whose
+    /// resume takes a positional first prompt).
     pub branch_pivot_message: String,
 }
 
@@ -765,7 +765,7 @@ impl Default for KeysConfig {
 
 /// Default branch pivot prompt (#106). `<branch>` is substituted at fork time.
 fn default_branch_pivot_message() -> &'static str {
-    "You have been branched from a parent agent session into a new worktree (<branch>). The parent continues the original direction. You should PIVOT: pick up a different thread, an alternative approach, or the next sub-task -- do not duplicate the parent's work. Re-orient before continuing."
+    "You have been branched from a parent agent session into a new worktree (<branch>). Do not pick up a different task, pivot, or start any work on your own. Simply acknowledge that you were branched and wait for new input before doing anything."
 }
 
 impl Default for WorktreesConfig {
