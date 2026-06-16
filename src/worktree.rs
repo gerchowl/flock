@@ -208,6 +208,98 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
         .filter(|branch| !branch.is_empty())
 }
 
+/// What the spoke found (and did) when preparing a branch for a cross-machine
+/// checkout (#125). The spoke runs this on ITS OWN repo; the hub then fetches
+/// the branch from origin — each node touches only its own git (hub-spoke).
+// Wired into the peers.checkout_prepare RPC handler in #125 phase 2.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerCheckoutReport {
+    /// The peer's working tree had uncommitted changes. Only committed refs
+    /// transfer — the hub gets the last commit, not live edits.
+    pub was_dirty: bool,
+    /// The branch had no upstream, or local commits origin lacked, before this
+    /// ran (i.e. a push was needed to make it fetchable).
+    pub was_unpushed: bool,
+    /// A push to origin was performed by this call.
+    pub pushed: bool,
+}
+
+/// Prepare a branch on the spoke for the hub to check out (#125, "defer to the
+/// client"): probe the working-tree/upstream state, then — when `push` —
+/// `git push -u origin <branch>` so a plain `git fetch origin <branch>` on the
+/// hub brings it across. `push == false` is a read-only probe for the hub's
+/// pre-action confirmations. The spoke owns its own git; the hub never reaches
+/// into it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn prepare_peer_checkout(
+    repo: &std::path::Path,
+    branch: &str,
+    push: bool,
+) -> Result<PeerCheckoutReport, String> {
+    let repo = repo.to_string_lossy().to_string();
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            &repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        None,
+    )
+    .map_err(|_| format!("branch '{branch}' not found on peer"))?;
+
+    let status = run_command_capture("git", &["-C", &repo, "status", "--porcelain"], None)?;
+    let was_dirty = !status.trim().is_empty();
+
+    let upstream = run_command_capture(
+        "git",
+        &[
+            "-C",
+            &repo,
+            "rev-parse",
+            "--abbrev-ref",
+            &format!("{branch}@{{upstream}}"),
+        ],
+        None,
+    )
+    .ok()
+    .filter(|up| !up.is_empty());
+    let was_unpushed = match &upstream {
+        None => true,
+        Some(up) => run_command_capture(
+            "git",
+            &[
+                "-C",
+                &repo,
+                "rev-list",
+                "--count",
+                &format!("{up}..{branch}"),
+            ],
+            None,
+        )
+        .map(|ahead| ahead.trim() != "0")
+        .unwrap_or(true),
+    };
+
+    let pushed = if push {
+        run_command_capture("git", &["-C", &repo, "push", "-u", "origin", branch], None)
+            .map_err(|err| format!("push to origin failed: {err}"))?;
+        true
+    } else {
+        false
+    };
+
+    Ok(PeerCheckoutReport {
+        was_dirty,
+        was_unpushed,
+        pushed,
+    })
+}
+
 /// The repo's default branch: origin/HEAD when set, else main/master if present.
 pub(crate) fn detect_default_branch(repo_root: &std::path::Path) -> Option<String> {
     let root = repo_root.to_string_lossy().to_string();
@@ -572,6 +664,86 @@ mod tests {
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
         repo
+    }
+
+    /// A committed repo wired to a fresh bare `origin` remote (no upstream
+    /// tracking set yet) — the shape `prepare_peer_checkout` operates on.
+    fn create_repo_with_bare_origin(name: &str) -> (PathBuf, PathBuf) {
+        let repo = create_committed_repo(name);
+        let origin = unique_temp_path(&format!("{name}-origin"));
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--quiet", "--bare"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        (repo, origin)
+    }
+
+    fn origin_has_branch(origin: &Path, branch: &str) -> bool {
+        run_command_capture(
+            "git",
+            &[
+                "-C",
+                &origin.display().to_string(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+            None,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn prepare_peer_checkout_probe_reports_unpushed_without_mutating() {
+        let (repo, origin) = create_repo_with_bare_origin("peer-probe");
+        run_git(&repo, &["checkout", "--quiet", "-b", "feature-x"]);
+
+        let report = prepare_peer_checkout(&repo, "feature-x", false).unwrap();
+        assert_eq!(
+            report,
+            PeerCheckoutReport {
+                was_dirty: false,
+                was_unpushed: true,
+                pushed: false,
+            }
+        );
+        // A read-only probe must not push.
+        assert!(!origin_has_branch(&origin, "feature-x"));
+    }
+
+    #[test]
+    fn prepare_peer_checkout_pushes_branch_to_origin() {
+        let (repo, origin) = create_repo_with_bare_origin("peer-push");
+        run_git(&repo, &["checkout", "--quiet", "-b", "feature-x"]);
+
+        let report = prepare_peer_checkout(&repo, "feature-x", true).unwrap();
+        assert!(report.pushed);
+        assert!(report.was_unpushed, "no upstream before the push");
+        assert!(origin_has_branch(&origin, "feature-x"));
+
+        // A second prepare now sees it as already pushed (in sync).
+        let again = prepare_peer_checkout(&repo, "feature-x", false).unwrap();
+        assert!(!again.was_unpushed);
+    }
+
+    #[test]
+    fn prepare_peer_checkout_flags_a_dirty_working_tree() {
+        let (repo, _origin) = create_repo_with_bare_origin("peer-dirty");
+        run_git(&repo, &["checkout", "--quiet", "-b", "feature-x"]);
+        std::fs::write(repo.join("README.md"), "uncommitted\n").unwrap();
+
+        let report = prepare_peer_checkout(&repo, "feature-x", false).unwrap();
+        assert!(report.was_dirty);
+    }
+
+    #[test]
+    fn prepare_peer_checkout_errors_on_missing_branch() {
+        let (repo, _origin) = create_repo_with_bare_origin("peer-missing");
+        let err = prepare_peer_checkout(&repo, "nope", false).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     #[test]
