@@ -507,6 +507,15 @@ pub(super) fn grouped_child_display_label(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
+    /// A synthetic, non-selectable project-group header (#122): the `owner/repo`
+    /// project identity rendered as its own row above the group's members. It
+    /// owns no `ws_idx` — navigation and hit-testing skip it; it is a
+    /// collapse/expand affordance and a right-click target ("new worktree from
+    /// default branch") only. Every real checkout, including the main one, is a
+    /// `Workspace` member beneath it.
+    Header {
+        key: String,
+    },
     Workspace {
         ws_idx: usize,
         indented: bool,
@@ -629,33 +638,19 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
         let Some(members) = members_by_key.get(key) else {
             continue;
         };
-        // Section head = the local main checkout (non-linked) when present, so
-        // the space row keeps its identity and muscle memory. When main has
-        // been closed (#62) the space must NOT disband: fall back to the first
-        // remaining member of the project section. Nothing dereferences main as
-        // the group's anchor.
-        let Some(parent_idx) = members
-            .iter()
-            .copied()
-            .find(|idx| !app.workspaces[*idx].is_linked_checkout())
-            .or_else(|| members.first().copied())
-        else {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
-            });
-            continue;
-        };
-        let collapsed = app.collapsed_space_keys.contains(key);
-        entries.push(WorkspaceListEntry::Workspace {
-            ws_idx: parent_idx,
-            indented: false,
+        // #122: the project group is a synthetic header row; every checkout —
+        // the main one included — renders as an equal member beneath it. The
+        // header is non-selectable, so closing the main checkout (#62) never
+        // disbands the space: the header survives on its remaining members.
+        entries.push(WorkspaceListEntry::Header {
+            key: key.to_string(),
         });
-
+        let collapsed = app.collapsed_space_keys.contains(key);
         if collapsed {
-            if let Some(active_idx) = visible_group_idx
-                .filter(|idx| *idx != parent_idx)
-                .filter(|_| active_group.as_deref() == Some(key))
+            // Collapsed: keep just the header, but surface the active member
+            // when this group is the focused one so selection stays visible.
+            if let Some(active_idx) =
+                visible_group_idx.filter(|_| active_group.as_deref() == Some(key))
             {
                 entries.push(WorkspaceListEntry::Workspace {
                     ws_idx: active_idx,
@@ -664,9 +659,6 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         } else {
             for member_idx in members {
-                if *member_idx == parent_idx {
-                    continue;
-                }
                 entries.push(WorkspaceListEntry::Workspace {
                     ws_idx: *member_idx,
                     indented: true,
@@ -784,6 +776,8 @@ fn retain_focused_space_group(
                 .is_some_and(|section| section.as_deref() == Some(key)),
             None => *ws_idx == focused_idx,
         },
+        // Keep the focused group's header; drop other groups' headers.
+        WorkspaceListEntry::Header { key } => focused_key == Some(key.as_str()),
         // Remote rows are folded in after this filter runs.
         WorkspaceListEntry::Remote { .. } => false,
     });
@@ -1112,6 +1106,14 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
     let entries = workspace_list_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
         let needed = match entry {
+            WorkspaceListEntry::Header { .. } => {
+                let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
+                1u16.saturating_add(gap)
+            }
             WorkspaceListEntry::Workspace { ws_idx, indented } => {
                 let Some(ws) = app.workspaces.get(*ws_idx) else {
                     continue;
@@ -1239,6 +1241,7 @@ pub(crate) fn compute_workspace_list_areas(
 ) -> (
     Vec<crate::app::state::WorkspaceCardArea>,
     Vec<crate::app::state::RemoteCardArea>,
+    Vec<crate::app::state::SpaceHeaderArea>,
 ) {
     let ws_area = workspace_list_rect(
         area,
@@ -1247,7 +1250,7 @@ pub(crate) fn compute_workspace_list_areas(
         servers_section_height(app),
     );
     if ws_area == Rect::default() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     let metrics = workspace_list_scroll_metrics(app, ws_area);
@@ -1257,7 +1260,7 @@ pub(crate) fn compute_workspace_list_areas(
         app.sidebar_new_entry_visible(),
     );
     if body.width == 0 || body.height == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     let scroll = app.workspace_scroll;
@@ -1265,10 +1268,29 @@ pub(crate) fn compute_workspace_list_areas(
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
     let mut remote_cards = Vec::new();
+    let mut headers = Vec::new();
 
     let entries = workspace_list_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
         match entry {
+            WorkspaceListEntry::Header { key } => {
+                // Header hugs its members (gap 0); the inter-group gap comes
+                // from the previous group's last member. A collapsed header
+                // with no members showing gets the full row gap.
+                let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
+                    0
+                } else {
+                    app.sidebar_row_gap
+                };
+                if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
+                    break;
+                }
+                headers.push(crate::app::state::SpaceHeaderArea {
+                    key: key.clone(),
+                    rect: Rect::new(body.x, row_y, body.width, 1),
+                });
+                row_y = row_y.saturating_add(1 + gap);
+            }
             WorkspaceListEntry::Workspace { ws_idx, indented } => {
                 let Some(ws) = app.workspaces.get(*ws_idx) else {
                     continue;
@@ -1317,7 +1339,7 @@ pub(crate) fn compute_workspace_list_areas(
         }
     }
 
-    (cards, remote_cards)
+    (cards, remote_cards, headers)
 }
 
 pub(crate) fn compute_workspace_card_areas(
@@ -2281,16 +2303,33 @@ fn render_workspace_list(
     // section (unindented head row) shows its 1-based index, exactly like the
     // collapsed sidebar numbers workspaces — but only when `switch_space` is
     // bound, so the unbound default stays uncluttered. ws_idx -> 1-based index.
-    let section_indices: std::collections::HashMap<usize, usize> =
-        if app.keybinds.switch_space.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            app.space_section_heads()
-                .into_iter()
-                .enumerate()
-                .map(|(pos, ws_idx)| (ws_idx, pos + 1))
-                .collect()
-        };
+    // Section numbers (#62) are shared across the rendered top-level rows in
+    // render order: a project group's number lands on its Header row, a
+    // standalone's on its card. Both maps come from one walk so the numbering
+    // matches `space_section_heads` exactly.
+    let mut header_section_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut standalone_section_index: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    if !app.keybinds.switch_space.is_empty() {
+        let mut n = 0usize;
+        for entry in workspace_list_entries(app) {
+            match entry {
+                WorkspaceListEntry::Header { key } => {
+                    n += 1;
+                    header_section_index.insert(key, n);
+                }
+                WorkspaceListEntry::Workspace {
+                    indented: false,
+                    ws_idx,
+                } => {
+                    n += 1;
+                    standalone_section_index.insert(ws_idx, n);
+                }
+                _ => {}
+            }
+        }
+    }
 
     for card in cards {
         let i = card.ws_idx;
@@ -2337,8 +2376,8 @@ fn render_workspace_list(
         let mut show_workspace_icon = true;
         let mut collapsed_group_key: Option<String> = None;
         let mut group_key: Option<String> = None;
-        // Section index prefix (#62) on the section-head row, when bound.
-        if let Some(index) = section_indices.get(&i).filter(|_| !card.indented) {
+        // Section index prefix (#62) on a standalone row, when bound.
+        if let Some(index) = standalone_section_index.get(&i).filter(|_| !card.indented) {
             let idx_style = if highlighted {
                 Style::default().fg(p.overlay1)
             } else {
@@ -2492,6 +2531,70 @@ fn render_workspace_list(
         frame.render_widget(
             Paragraph::new(line),
             Rect::new(card.rect.x, card.rect.y, card.rect.width, 1),
+        );
+    }
+
+    // Synthetic project-group headers (#122): non-selectable rows carrying the
+    // project identity, the collapse triangle, the group's aggregate agent
+    // icon, and the section number. The active workspace's section gets the
+    // same always-on `surface_dim` currency fill as the active row.
+    let active_section_key = app.active.and_then(|i| app.project_section_key(i));
+    for header in &app.view.space_header_areas {
+        let row_y = header.rect.y;
+        if row_y >= list_bottom {
+            continue;
+        }
+        let key = &header.key;
+        let collapsed = app.collapsed_space_keys.contains(key);
+        let is_active_section = active_section_key.as_deref() == Some(key.as_str());
+        if is_active_section {
+            let buf = frame.buffer_mut();
+            for x in header.rect.x..header.rect.x + header.rect.width {
+                buf[(x, row_y)].set_style(Style::default().bg(p.surface_dim));
+            }
+        }
+        let mut spans = Vec::new();
+        if let Some(index) = header_section_index.get(key) {
+            let idx_style = if is_active_section {
+                Style::default().fg(p.overlay1)
+            } else {
+                Style::default().fg(p.overlay0)
+            };
+            spans.push(Span::styled(format!("{index} "), idx_style));
+        }
+        let triangle = if collapsed { "▸" } else { "▾" };
+        spans.push(Span::styled(triangle, Style::default().fg(p.accent)));
+        spans.push(Span::styled(" ", Style::default()));
+        let (state, seen) = space_aggregate_state(app, key);
+        let (group_icon, group_style) = agent_icon(state, seen, app.spinner_tick, p);
+        spans.push(Span::styled(group_icon, group_style));
+        spans.push(Span::styled(" ", Style::default()));
+        let label = space_head_idx(app, key)
+            .and_then(|idx| app.workspaces.get(idx))
+            .map(|ws| super::grammar::leader_label(app, ws, terminal_runtimes))
+            .unwrap_or_else(|| super::grammar::project_identity_label(key));
+        let label_style = if is_active_section {
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(label, label_style));
+        // Collapsed groups summarize their hidden members on the header with
+        // exact per-state counts as plain colored digits — no packed-rect bars,
+        // the number alone is enough. Expanded groups drop the summary: the
+        // member rows below carry it.
+        if collapsed {
+            for (state, seen, count) in space_state_counts(app, key) {
+                spans.push(Span::styled(" ", Style::default()));
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(state_label_color(state, seen, p)),
+                ));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(clamp_line(Line::from(spans), header.rect.width)),
+            header.rect,
         );
     }
 
@@ -3645,7 +3748,7 @@ mod tests {
             .into_iter()
             .filter_map(|entry| match entry {
                 WorkspaceListEntry::Remote { peer, .. } => Some(peer),
-                WorkspaceListEntry::Workspace { .. } => None,
+                WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::Header { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -3802,14 +3905,14 @@ mod tests {
         });
         assert_eq!(workspace_list_entries(&app).len(), 1);
         assert_eq!(normalized_workspace_scroll(&app, area, 99), 0);
-        let (cards, remote_cards) = compute_workspace_list_areas(&app, area);
+        let (cards, remote_cards, _headers) = compute_workspace_list_areas(&app, area);
         assert!(cards.is_empty());
         assert_eq!(remote_cards.len(), 1);
 
         // Local filter: both local cards, no remote ones.
         app.server_filter = Some(crate::app::state::ServerFilter::Local);
         assert_eq!(normalized_workspace_scroll(&app, area, 99), 1);
-        let (cards, remote_cards) = compute_workspace_list_areas(&app, area);
+        let (cards, remote_cards, _headers) = compute_workspace_list_areas(&app, area);
         assert_eq!(cards.len(), 2);
         assert!(remote_cards.is_empty());
     }
@@ -3973,9 +4076,10 @@ mod tests {
         app: &mut crate::app::state::AppState,
         area: Rect,
     ) -> ratatui::buffer::Buffer {
-        let (cards, remotes) = compute_workspace_list_areas(app, area);
+        let (cards, remotes, headers) = compute_workspace_list_areas(app, area);
         app.view.workspace_card_areas = cards;
         app.view.remote_card_areas = remotes;
+        app.view.space_header_areas = headers;
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
         let runtimes = TerminalRuntimeRegistry::new();
@@ -4244,7 +4348,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_group_renders_packed_rects_and_plain_digit_counts() {
+    fn collapsed_group_header_renders_plain_digit_counts_no_bars() {
         let mut app = space_group_app();
         set_pane_state(&mut app, 0, AgentState::Blocked, true);
         set_pane_state(&mut app, 1, AgentState::Working, true);
@@ -4254,18 +4358,23 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
         let p = &app.palette;
 
-        let card = app.view.workspace_card_areas[0];
-        let row = buffer_row_text(&buffer, card.rect, card.rect.y);
-        // Group join r·y as packed rects, then exact counts as PLAIN digits
-        // in the terminal font — `▮▮ 1 1`, not `❶❶`.
-        assert!(row.contains("\u{25ae}\u{25ae} 1 1"), "{row:?}");
-        let rects = row_glyph_positions(&buffer, card.rect, card.rect.y, "\u{25ae}");
-        assert_eq!(buffer[(rects[0], card.rect.y)].style().fg, Some(p.red));
-        assert_eq!(buffer[(rects[1], card.rect.y)].style().fg, Some(p.yellow));
-        let digits = row_glyph_positions(&buffer, card.rect, card.rect.y, "1");
+        // The collapsed group's aggregate renders on the synthetic HEADER row
+        // (#122) — exact per-state counts as PLAIN digits, with NO packed-rect
+        // bars (the number alone is enough).
+        let header = app.view.space_header_areas[0].clone();
+        let row = buffer_row_text(&buffer, header.rect, header.rect.y);
+        assert!(
+            row_glyph_positions(&buffer, header.rect, header.rect.y, "\u{25ae}").is_empty(),
+            "collapsed header carries no rect bars: {row:?}"
+        );
+        assert!(row.contains("1 1"), "{row:?}");
+        let digits = row_glyph_positions(&buffer, header.rect, header.rect.y, "1");
         assert_eq!(digits.len(), 2, "{row:?}");
-        assert_eq!(buffer[(digits[0], card.rect.y)].style().fg, Some(p.red));
-        assert_eq!(buffer[(digits[1], card.rect.y)].style().fg, Some(p.yellow));
+        assert_eq!(buffer[(digits[0], header.rect.y)].style().fg, Some(p.red));
+        assert_eq!(
+            buffer[(digits[1], header.rect.y)].style().fg,
+            Some(p.yellow)
+        );
         assert_no_circled_digit_dingbats(&buffer);
     }
 
@@ -4311,14 +4420,14 @@ mod tests {
         let mut app = space_group_app();
         let area = Rect::new(0, 0, 30, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let parent = app.view.workspace_card_areas[0];
+        let header = app.view.space_header_areas[0].clone();
         assert!(
-            row_glyph_positions(&buffer, parent.rect, parent.rect.y, "\u{25af}").is_empty(),
-            "expanded leader with an empty join shows no hollow rect"
+            row_glyph_positions(&buffer, header.rect, header.rect.y, "\u{25af}").is_empty(),
+            "expanded header with an empty join shows no hollow rect"
         );
 
         // Close main (idx 0): the worktree (idx 1) becomes the section head and
-        // still leads the group; an expanded worktree-headed leader drops rects too.
+        // still leads the group; an expanded worktree-headed group drops rects too.
         app.workspaces.remove(0);
         app.workspaces.push(Workspace::test_new("sibling"));
         {
@@ -4336,12 +4445,11 @@ mod tests {
         set_pane_state(&mut app, 0, AgentState::Idle, true);
         set_pane_state(&mut app, 1, AgentState::Working, true);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let head = app.view.workspace_card_areas[0];
-        assert!(!head.indented, "worktree head is the unindented leader");
+        let head = app.view.space_header_areas[0].clone();
         assert!(
             row_glyph_positions(&buffer, head.rect, head.rect.y, "\u{25ae}").is_empty()
                 && row_glyph_positions(&buffer, head.rect, head.rect.y, "\u{25af}").is_empty(),
-            "expanded worktree-headed leader drops its rects"
+            "expanded worktree-headed group header drops its rects"
         );
     }
 
@@ -4377,19 +4485,21 @@ mod tests {
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
-        let leader = app.view.workspace_card_areas[0];
-        assert!(!leader.indented);
-        let row = buffer_row_text(&buffer, leader.rect, leader.rect.y);
+        // The project identity now lives on the synthetic header row, per #122.
+        // Every checkout below — main included — is an equal member written in
+        // the server-colon-target grammar.
+        let header = app.view.space_header_areas[0].clone();
+        let row = buffer_row_text(&buffer, header.rect, header.rect.y);
         assert!(
             row.contains("gerchowl/flock"),
-            "leader shows owner/repo: {row:?}"
+            "header shows owner/repo: {row:?}"
         );
         assert!(
             !row.contains(&format!("{}:", crate::ui::grammar::local_server_name())),
-            "leader NEVER renders server:branch: {row:?}"
+            "header NEVER renders server:branch: {row:?}"
         );
 
-        // The member row beneath keeps the `<server>:<target>` grammar.
+        // The member rows keep the `<server>:<target>` grammar.
         let member = app.view.workspace_card_areas[1];
         assert!(member.indented);
         let member_row = buffer_row_text(&buffer, member.rect, member.rect.y);
@@ -4500,20 +4610,20 @@ mod tests {
         let mut app = space_group_app();
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let leader = app.view.workspace_card_areas[0];
-        let row = buffer_row_text(&buffer, leader.rect, leader.rect.y);
+        let header = app.view.space_header_areas[0].clone();
+        let row = buffer_row_text(&buffer, header.rect, header.rect.y);
         assert!(
             !row.contains(&format!("{}:", crate::ui::grammar::local_server_name())),
-            "unresolved leader still avoids server:branch: {row:?}"
+            "unresolved header still avoids server:branch: {row:?}"
         );
     }
 
-    /// #78: a COLLAPSED leader KEEPS its packed rects (members hidden → the
-    /// aggregate is the only signal) — both for a local-main-headed group and
-    /// after main closes and a worktree heads it.
+    /// #122: a COLLAPSED group HEADER summarizes its hidden members with plain
+    /// per-state count digits (no bars) — both for a local-main-headed group
+    /// and after main closes and a worktree heads it.
     #[test]
-    fn collapsed_leader_keeps_rects_for_both_leader_kinds() {
-        // Local-main-headed, collapsed: rects present.
+    fn collapsed_header_summarizes_members_for_both_head_kinds() {
+        // Local-main-headed, collapsed: count digits present, no bars.
         let mut app = project_group_app("github.com/gerchowl/flock");
         set_pane_state(&mut app, 0, AgentState::Blocked, true);
         set_pane_state(&mut app, 1, AgentState::Working, true);
@@ -4521,13 +4631,17 @@ mod tests {
         app.collapsed_space_keys.insert(key.clone());
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let leader = app.view.workspace_card_areas[0];
+        let header = app.view.space_header_areas[0].clone();
         assert!(
-            !row_glyph_positions(&buffer, leader.rect, leader.rect.y, "\u{25ae}").is_empty(),
-            "collapsed main-headed leader keeps its rects"
+            row_glyph_positions(&buffer, header.rect, header.rect.y, "\u{25ae}").is_empty(),
+            "collapsed header carries no bars"
+        );
+        assert!(
+            !row_glyph_positions(&buffer, header.rect, header.rect.y, "1").is_empty(),
+            "collapsed main-headed header shows member counts"
         );
 
-        // Worktree-headed (main closed), collapsed: rects still present.
+        // Worktree-headed (main closed), collapsed: still summarized.
         app.workspaces.remove(0);
         app.ensure_test_terminals();
         app.active = Some(0);
@@ -4549,11 +4663,11 @@ mod tests {
         let key = app.project_section_key(0).expect("section key");
         app.collapsed_space_keys.insert(key);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let head = app.view.workspace_card_areas[0];
-        assert!(!head.indented, "worktree head leads the collapsed group");
+        let head = app.view.space_header_areas[0].clone();
         assert!(
-            !row_glyph_positions(&buffer, head.rect, head.rect.y, "\u{25ae}").is_empty(),
-            "collapsed worktree-headed leader keeps its rects"
+            row_glyph_positions(&buffer, head.rect, head.rect.y, "\u{25ae}").is_empty()
+                && !row_glyph_positions(&buffer, head.rect, head.rect.y, "1").is_empty(),
+            "collapsed worktree-headed header summarizes with counts, no bars"
         );
     }
 
@@ -4562,7 +4676,7 @@ mod tests {
     /// row (the always-on session-currency marker) carry surface_dim; bold
     /// text stays on the active row alone.
     #[test]
-    fn two_level_highlight_marks_active_member_and_its_primary() {
+    fn two_level_highlight_marks_active_member_and_its_section_header() {
         let mut app = space_group_app();
         app.active = Some(1);
 
@@ -4570,36 +4684,46 @@ mod tests {
         let surface_dim = app.palette.surface_dim;
         let buffer = render_sidebar_to_buffer(&mut app, area);
         let cards = app.view.workspace_card_areas.clone();
+        let header = app.view.space_header_areas[0].clone();
         assert_eq!((cards[0].ws_idx, cards[1].ws_idx), (0, 1));
 
-        // Both levels carry the currency fill…
+        // The section HEADER carries the always-on currency fill (the section
+        // the active workspace belongs to)…
         assert_eq!(
-            buffer[(cards[0].rect.x, cards[0].rect.y)].style().bg,
+            buffer[(header.rect.x, header.rect.y)].style().bg,
             Some(surface_dim),
-            "primary row marks session currency"
+            "active section header marks session currency"
         );
+        // …and the active member row carries the standard active fill.
         assert_eq!(
             buffer[(cards[1].rect.x, cards[1].rect.y)].style().bg,
             Some(surface_dim),
             "active member row carries the standard fill"
         );
+        // A non-active member is not filled.
+        assert_ne!(
+            buffer[(cards[0].rect.x, cards[0].rect.y)].style().bg,
+            Some(surface_dim),
+            "inactive member carries no fill"
+        );
 
-        // …but the focus emphasis (bold name) stays on the active row.
+        // The focus emphasis (bold name) stays on the active member row.
         let member_name_cell = &buffer[(cards[1].rect.x + 5, cards[1].rect.y)];
         assert!(member_name_cell
             .style()
             .add_modifier
             .contains(Modifier::BOLD));
-        let primary_name_cell = &buffer[(cards[0].rect.x + 4, cards[0].rect.y)];
-        assert!(!primary_name_cell
-            .style()
-            .add_modifier
-            .contains(Modifier::BOLD));
 
-        // With the primary itself active there is exactly one marked row.
+        // Switching the active member moves the member fill; the section header
+        // stays lit.
         app.active = Some(0);
         let buffer = render_sidebar_to_buffer(&mut app, area);
         let cards = app.view.workspace_card_areas.clone();
+        let header = app.view.space_header_areas[0].clone();
+        assert_eq!(
+            buffer[(header.rect.x, header.rect.y)].style().bg,
+            Some(surface_dim)
+        );
         assert_eq!(
             buffer[(cards[0].rect.x, cards[0].rect.y)].style().bg,
             Some(surface_dim)
@@ -4636,19 +4760,20 @@ mod tests {
 
         let area = Rect::new(0, 0, 30, 40);
 
-        // Three rows: the primary (main checkout) unindented, the linked
-        // worktree AND the plain same-repo workspace indented under it.
+        // Header + three equal indented members (main checkout included).
         let buffer = render_sidebar_to_buffer(&mut app, area);
         let cards = app.view.workspace_card_areas.clone();
         assert_eq!(cards.len(), 3);
-        assert_eq!((cards[0].ws_idx, cards[0].indented), (0, false));
+        assert_eq!((cards[0].ws_idx, cards[0].indented), (0, true));
         assert_eq!((cards[1].ws_idx, cards[1].indented), (1, true));
         assert_eq!((cards[2].ws_idx, cards[2].indented), (2, true));
 
-        // Expanded: the leader drops the rects (the visible members carry them).
+        // Expanded: the header drops the summary (the visible members carry it).
+        let header = app.view.space_header_areas[0].clone();
         assert!(
-            row_glyph_positions(&buffer, cards[0].rect, cards[0].rect.y, "\u{25ae}").is_empty(),
-            "expanded leader drops the section-join rects (#78)"
+            row_glyph_positions(&buffer, header.rect, header.rect.y, "\u{25ae}").is_empty()
+                && row_glyph_positions(&buffer, header.rect, header.rect.y, "1").is_empty(),
+            "expanded header drops the section-join summary"
         );
         // The plain member row's own join is a single class (blocked) — it
         // dedups into the leading icon, so no rect renders.
@@ -4658,19 +4783,23 @@ mod tests {
             "single-class member row renders no rect"
         );
 
-        // Collapse the section: now the leader DOES carry the whole-section
-        // join (r·y·g) since its members are hidden.
+        // Collapse the section: now the header carries the whole-section join as
+        // per-state count digits (no bars) since its members are hidden.
         app.collapsed_space_keys.insert("grp".into());
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let leader = app.view.workspace_card_areas[0];
-        let p = &app.palette;
-        let rects = row_glyph_positions(&buffer, leader.rect, leader.rect.y, "\u{25ae}");
-        assert_eq!(rects.len(), 3, "collapsed leader carries the section join");
-        assert_eq!(buffer[(rects[0], leader.rect.y)].style().fg, Some(p.red));
-        assert_eq!(buffer[(rects[1], leader.rect.y)].style().fg, Some(p.yellow));
-        assert_eq!(buffer[(rects[2], leader.rect.y)].style().fg, Some(p.green));
+        let header = app.view.space_header_areas[0].clone();
+        assert!(
+            row_glyph_positions(&buffer, header.rect, header.rect.y, "\u{25ae}").is_empty(),
+            "collapsed header carries no bars"
+        );
+        let digits = row_glyph_positions(&buffer, header.rect, header.rect.y, "1");
+        assert_eq!(
+            digits.len(),
+            3,
+            "collapsed header summarizes the three members' states as counts"
+        );
 
-        // The group affordances live on the primary alone.
+        // The group affordances live on the section's head member.
         assert_eq!(
             workspace_parent_group_state(&app, 0).map(|(key, _)| key),
             Some("grp".to_string())
@@ -5052,21 +5181,27 @@ mod tests {
     }
 
     #[test]
-    fn parent_workspace_row_stays_clickable_when_grouped() {
+    fn grouped_members_render_as_equals_under_a_header() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
             workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
             workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
         ];
 
-        let (cards, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 20));
+        let (cards, _remote, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 20));
 
-        assert!(headers.is_empty());
+        // #122: the group is a synthetic header; the main checkout is no longer
+        // a privileged unindented head — it is an equal indented member.
+        assert_eq!(headers.len(), 1, "the two-member group gets one header row");
+        assert_eq!(Some(headers[0].key.clone()), app.project_section_key(0));
+        assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].ws_idx, 0);
-        assert!(!cards[0].indented);
+        assert!(cards[0].indented, "main is an equal member now");
         assert_eq!(cards[1].ws_idx, 1);
         assert!(cards[1].indented);
-        assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
+        // The header sits directly above its members.
+        assert!(headers[0].rect.y < cards[0].rect.y);
+        assert_eq!(cards[0].rect.y, headers[0].rect.y + 1);
     }
 
     #[test]
@@ -5100,7 +5235,7 @@ mod tests {
         ];
         let area = Rect::new(0, 0, 30, 20);
 
-        let (cards, _) = compute_workspace_list_areas(&app, area);
+        let (cards, _, _) = compute_workspace_list_areas(&app, area);
         assert_eq!(
             cards[1].rect.y,
             cards[0].rect.y + cards[0].rect.height + 1,
@@ -5108,7 +5243,7 @@ mod tests {
         );
 
         app.sidebar_row_gap = 0;
-        let (cards, _) = compute_workspace_list_areas(&app, area);
+        let (cards, _, _) = compute_workspace_list_areas(&app, area);
         assert_eq!(
             cards[1].rect.y,
             cards[0].rect.y + cards[0].rect.height,
@@ -5127,11 +5262,14 @@ mod tests {
         let area = Rect::new(0, 0, 30, 20);
         app.workspace_scroll = normalized_workspace_scroll(&app, area, 2);
 
-        let (cards, headers) = compute_workspace_list_areas(&app, area);
+        let (cards, _remote, headers) = compute_workspace_list_areas(&app, area);
 
-        assert!(headers.is_empty());
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].ws_idx, 2);
+        // entries: [Header, m0, m1, m2]; scrolling to offset 2 starts inside
+        // the group at its second member.
+        assert!(headers.is_empty(), "header scrolled out of view");
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].ws_idx, 1);
+        assert_eq!(cards[1].ws_idx, 2);
     }
 
     #[test]
@@ -5167,11 +5305,14 @@ mod tests {
         app.mode = Mode::Terminal;
         app.workspace_scroll = 1;
 
-        let (cards, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 14));
+        let (cards, _remote, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 14));
 
-        assert!(headers.is_empty());
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].ws_idx, 0);
+        // The display list is a leading pending row then the collapsed group
+        // header. Scrolling past the leading row reveals that header, with its
+        // members staying folded away.
+        assert!(cards.is_empty());
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].key, app.project_section_key(0).unwrap());
     }
 
     #[test]
@@ -5185,9 +5326,12 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5210,9 +5354,12 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5220,7 +5367,8 @@ mod tests {
                 },
             ]
         );
-        // The head row carries the group triangle even though it's a worktree.
+        // The head member still resolves (drives the header identity), even
+        // though it's a worktree.
         assert!(workspace_parent_group_state(&app, 0).is_some());
         assert!(workspace_parent_group_state(&app, 1).is_none());
     }
@@ -5241,9 +5389,12 @@ mod tests {
                     ws_idx: 1,
                     indented: false,
                 },
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 2,
@@ -5265,14 +5416,17 @@ mod tests {
         app.active = Some(1);
         app.spaces_panel_scope = PanelScope::Current;
 
-        // Focused grouped workspace: the whole group block renders — parent
+        // Focused grouped workspace: the whole group block renders — header
         // plus members — and nothing else.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5291,9 +5445,9 @@ mod tests {
             }]
         );
 
-        // Scope all: the full list, unchanged.
+        // Scope all: the full list (header + two members + the standalone).
         app.spaces_panel_scope = PanelScope::All;
-        assert_eq!(workspace_list_entries(&app).len(), 3);
+        assert_eq!(workspace_list_entries(&app).len(), 4);
     }
 
     #[test]
@@ -5309,14 +5463,13 @@ mod tests {
         app.spaces_panel_scope = PanelScope::Current;
         app.collapsed_space_keys.insert("repo-key".into());
 
-        // Collapse still folds members within the rendered group: parent +
+        // Collapse still folds members within the rendered group: header +
         // the focused child only.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5328,10 +5481,15 @@ mod tests {
         app.active = Some(0);
         assert_eq!(
             workspace_list_entries(&app),
-            vec![WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false,
-            }]
+            vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true,
+                },
+            ]
         );
     }
 
@@ -5447,9 +5605,12 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5473,9 +5634,12 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5513,9 +5677,12 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: "family-key".into(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5533,9 +5700,8 @@ mod tests {
         app.mode = Mode::Terminal;
         assert_eq!(
             workspace_list_entries(&app),
-            vec![WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false,
+            vec![WorkspaceListEntry::Header {
+                key: "family-key".into(),
             }]
         );
     }
@@ -5694,9 +5860,8 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
@@ -5709,9 +5874,8 @@ mod tests {
         app.mode = Mode::Terminal;
         assert_eq!(
             workspace_list_entries(&app),
-            vec![WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false,
+            vec![WorkspaceListEntry::Header {
+                key: app.project_section_key(0).unwrap(),
             }]
         );
     }
@@ -5731,9 +5895,8 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
+                WorkspaceListEntry::Header {
+                    key: app.project_section_key(0).unwrap(),
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,

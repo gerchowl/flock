@@ -648,6 +648,15 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// On-screen rect of a synthetic project-group header row (#122). Non-selectable
+/// for navigation, but a right-click target ("new worktree from default
+/// branch") and a collapse/expand affordance, keyed by project-section key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceHeaderArea {
+    pub key: String,
+    pub rect: Rect,
+}
+
 /// Where a requested server switch points. Set by sidebar clicks and the
 /// switch_home keybind; consumed by both the monolithic and headless loops.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -900,6 +909,7 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    pub space_header_areas: Vec<SpaceHeaderArea>,
     pub remote_card_areas: Vec<RemoteCardArea>,
     /// Hit areas for peer rows in the `servers` section.
     pub server_card_areas: Vec<ServerCardArea>,
@@ -2124,6 +2134,7 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                space_header_areas: Vec::new(),
                 remote_card_areas: Vec::new(),
                 server_card_areas: Vec::new(),
                 servers_header_rect: Rect::default(),

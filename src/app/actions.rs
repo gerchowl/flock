@@ -1345,9 +1345,10 @@ impl AppState {
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
-                // Remote rows are mouse targets only; keyboard navigation
-                // cycles local workspaces.
-                crate::ui::WorkspaceListEntry::Remote { .. } => None,
+                // Headers are non-selectable; remote rows are mouse targets
+                // only. Keyboard navigation cycles local workspaces.
+                crate::ui::WorkspaceListEntry::Header { .. }
+                | crate::ui::WorkspaceListEntry::Remote { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
@@ -1364,16 +1365,31 @@ impl AppState {
     /// The unindented section heads of the spaces list, in render order (#62):
     /// one per project group (its primary/anchor row) plus each ungrouped
     /// standalone workspace. This is the index space `switch_space` jumps over.
+    /// One representative workspace per rendered top-level section, in render
+    /// order: a project group resolves to its head member (the [`Header`] row
+    /// itself is non-selectable), a standalone checkout resolves to itself.
+    /// Drives `switch_space` numbering (#62) and the header section-index
+    /// prefix.
+    ///
+    /// [`Header`]: crate::ui::WorkspaceListEntry::Header
     pub(crate) fn space_section_heads(&self) -> Vec<usize> {
+        let section_keys = self.project_section_keys();
         crate::ui::workspace_list_entries(self)
             .into_iter()
             .filter_map(|entry| match entry {
+                // A project group: its head member (main when present, else the
+                // first remaining member) represents the section.
+                crate::ui::WorkspaceListEntry::Header { key } => {
+                    (0..self.workspaces.len()).find(|idx| {
+                        section_keys.get(*idx).and_then(|k| k.as_deref()) == Some(key.as_str())
+                    })
+                }
+                // A standalone (ungrouped) checkout is its own section.
                 crate::ui::WorkspaceListEntry::Workspace {
                     ws_idx,
                     indented: false,
                 } => Some(ws_idx),
-                // Skip indented members and remote rows — keyboard
-                // space-switching cycles local project sections only
+                // Indented members and remote rows are not section anchors.
                 _ => None,
             })
             .collect()
@@ -1389,37 +1405,24 @@ impl AppState {
         let heads = self.space_section_heads();
         let head_idx = heads.get(position).copied()?;
 
-        // The project key this section groups on (None for an ungrouped
-        // standalone, which is its own single-member section).
-        let Some(section_key) = self
-            .workspaces
-            .get(head_idx)
-            .and_then(|ws| ws.worktree_space())
-            .map(|space| space.key.clone())
-        else {
+        // Group on the same identity the sidebar sections on
+        // (`project_section_keys`), so switching matches what is drawn.
+        let section_keys = self.project_section_keys();
+        let Some(section_key) = section_keys.get(head_idx).cloned().flatten() else {
+            // An ungrouped standalone is its own single-member section.
             return Some(head_idx);
         };
 
-        // Members of this section, in workspace order.
-        let members: Vec<usize> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, ws)| {
-                ws.worktree_space()
-                    .is_some_and(|space| space.key == section_key)
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-
         // Preserve muscle memory: if the active workspace already belongs to
         // this section, keep it focused (re-pressing the section index is a
-        // no-op rather than yanking focus to main).
-        if let Some(active) = self.active.filter(|idx| members.contains(idx)) {
+        // no-op rather than yanking focus to the head).
+        if let Some(active) = self.active.filter(|idx| {
+            section_keys.get(*idx).and_then(|k| k.as_deref()) == Some(section_key.as_str())
+        }) {
             return Some(active);
         }
         // Otherwise the section head — main when present, else its first
-        // member — exactly the row the sidebar draws as the section.
+        // member.
         Some(head_idx)
     }
 

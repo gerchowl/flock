@@ -541,6 +541,7 @@ impl App {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                space_header_areas: Vec::new(),
                 remote_card_areas: Vec::new(),
                 server_card_areas: Vec::new(),
                 servers_header_rect: Rect::default(),

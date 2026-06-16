@@ -236,8 +236,8 @@ fn compute_view_internal(
         app.agent_panel_scroll = 0;
     }
 
-    let (workspace_card_areas, remote_card_areas) = if app.sidebar_collapsed {
-        (Vec::new(), Vec::new())
+    let (workspace_card_areas, remote_card_areas, space_header_areas) = if app.sidebar_collapsed {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         crate::ui::sidebar::compute_workspace_list_areas(app, sidebar_area)
     };
@@ -306,6 +306,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
+        space_header_areas,
         remote_card_areas,
         server_card_areas,
         servers_header_rect,
@@ -380,6 +381,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        space_header_areas: Vec::new(),
         remote_card_areas: Vec::new(),
         server_card_areas: Vec::new(),
         servers_header_rect: Rect::default(),
