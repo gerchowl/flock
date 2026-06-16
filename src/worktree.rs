@@ -211,8 +211,7 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
 /// What the spoke found (and did) when preparing a branch for a cross-machine
 /// checkout (#125). The spoke runs this on ITS OWN repo; the hub then fetches
 /// the branch from origin — each node touches only its own git (hub-spoke).
-// Wired into the peers.checkout_prepare RPC handler in #125 phase 2.
-#[cfg_attr(not(test), allow(dead_code))]
+// Driven by the peers.checkout_prepare RPC handler (#125).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerCheckoutReport {
     /// The peer's working tree had uncommitted changes. Only committed refs
@@ -231,7 +230,6 @@ pub struct PeerCheckoutReport {
 /// hub brings it across. `push == false` is a read-only probe for the hub's
 /// pre-action confirmations. The spoke owns its own git; the hub never reaches
 /// into it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prepare_peer_checkout(
     repo: &std::path::Path,
     branch: &str,

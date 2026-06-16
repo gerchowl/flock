@@ -713,6 +713,9 @@ impl App {
                 }
             }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
+            Method::PeersCheckoutPrepare(params) => {
+                return self.handle_peers_checkout_prepare(request.id, params)
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
