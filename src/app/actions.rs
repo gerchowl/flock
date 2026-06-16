@@ -2858,9 +2858,9 @@ impl AppState {
             | AppEvent::PeerSummaryFetched(_)
             // Cross-machine checkout (#125) legs are handled at the App layer
             // (it owns the git side-effects); they never reach state-level.
-            | AppEvent::PeerCheckoutProbed(_)
-            | AppEvent::PeerCheckoutPushed(_)
-            | AppEvent::PeerCheckoutWorktreeReady(_) => Vec::new(),
+            | AppEvent::PeerCheckoutProbed { .. }
+            | AppEvent::PeerCheckoutPushed { .. }
+            | AppEvent::PeerCheckoutWorktreeReady { .. } => Vec::new(),
             AppEvent::HookPromptReported { pane_id, prompt } => self
                 .update_terminal_state(pane_id, |terminal| {
                     // Updates `last_prompt` (legacy collapsed-header field)

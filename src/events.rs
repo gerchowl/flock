@@ -68,14 +68,24 @@ pub enum AppEvent {
     PeerSummaryFetched(crate::peers::PeerSummaryFetch),
     /// Cross-machine checkout (#125), read-only probe (`push=false`): the peer
     /// reported its branch's working-tree / push state, feeding the confirm
-    /// dialog before any mutation.
-    PeerCheckoutProbed(Result<crate::peers::PeerCheckoutOutcome, String>),
+    /// dialog before any mutation. `generation` discards a stale leg whose
+    /// checkout was cancelled (or superseded) while it was in flight.
+    PeerCheckoutProbed {
+        generation: u64,
+        result: Result<crate::peers::PeerCheckoutOutcome, String>,
+    },
     /// Cross-machine checkout (#125), push leg (`push=true`): the peer pushed
     /// the branch to origin so the hub can fetch it.
-    PeerCheckoutPushed(Result<crate::peers::PeerCheckoutOutcome, String>),
+    PeerCheckoutPushed {
+        generation: u64,
+        result: Result<crate::peers::PeerCheckoutOutcome, String>,
+    },
     /// Cross-machine checkout (#125), local leg: the hub fetched the branch
     /// from origin and added a worktree at this path (or failed).
-    PeerCheckoutWorktreeReady(Result<std::path::PathBuf, String>),
+    PeerCheckoutWorktreeReady {
+        generation: u64,
+        result: Result<std::path::PathBuf, String>,
+    },
     /// A user prompt submitted to an agent pane (integration hook report).
     HookPromptReported {
         pane_id: PaneId,

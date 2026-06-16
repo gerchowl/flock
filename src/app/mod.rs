@@ -498,6 +498,7 @@ impl App {
             request_peer_switch: None,
             request_peer_checkout: None,
             peer_checkout: None,
+            peer_checkout_seq: 0,
             servers_panel_scope: panel_scope_from_config(config.ui.servers_panel_scope),
             spaces_panel_scope: panel_scope_from_config(config.ui.spaces_panel_scope),
             server_filter: None,

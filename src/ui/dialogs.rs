@@ -942,6 +942,7 @@ mod tests {
     fn cross_checkout_lines_carry_host_branch_and_warnings() {
         let mut app = AppState::test_new();
         app.peer_checkout = Some(crate::app::state::PeerCheckoutState {
+            generation: 1,
             peer: crate::config::PeerConfig {
                 name: "anvil".into(),
                 ..Default::default()

@@ -61,7 +61,9 @@ impl crate::app::App {
             return;
         };
 
+        self.state.peer_checkout_seq += 1;
         self.state.peer_checkout = Some(PeerCheckoutState {
+            generation: self.state.peer_checkout_seq,
             peer,
             host,
             remote_workspace_id,
@@ -75,7 +77,10 @@ impl crate::app::App {
             busy: true,
             error: None,
         });
-        self.spawn_peer_checkout_leg(false, AppEvent::PeerCheckoutProbed);
+        self.spawn_peer_checkout_leg(false, |generation, result| AppEvent::PeerCheckoutProbed {
+            generation,
+            result,
+        });
     }
 
     /// A local workspace's repo identity matching `project_key`, preferring the
@@ -123,31 +128,44 @@ impl crate::app::App {
     }
 
     /// Spawn one prepare leg over SSH (probe or push), reporting back via
-    /// `wrap` (`PeerCheckoutProbed` / `PeerCheckoutPushed`).
+    /// `wrap` (`PeerCheckoutProbed` / `PeerCheckoutPushed`) stamped with the
+    /// checkout's generation so a stale return is discarded.
     fn spawn_peer_checkout_leg(
         &self,
         push: bool,
-        wrap: fn(Result<crate::peers::PeerCheckoutOutcome, String>) -> AppEvent,
+        wrap: fn(u64, Result<crate::peers::PeerCheckoutOutcome, String>) -> AppEvent,
     ) {
         let Some(checkout) = self.state.peer_checkout.as_ref() else {
             return;
         };
+        let generation = checkout.generation;
         let peer = checkout.peer.clone();
         let workspace_id = checkout.remote_workspace_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = crate::peers::run_checkout_prepare_command(&peer, &workspace_id, push);
-            let _ = event_tx.blocking_send(wrap(result));
+            let _ = event_tx.blocking_send(wrap(generation, result));
         });
     }
 
+    /// The current checkout iff it matches `generation` — used by each leg's
+    /// handler to drop a stale return (cancelled or superseded mid-flight).
+    fn peer_checkout_for(&mut self, generation: u64) -> Option<&mut PeerCheckoutState> {
+        self.state
+            .peer_checkout
+            .as_mut()
+            .filter(|checkout| checkout.generation == generation)
+    }
+
     /// Probe (`push=false`) returned: open the confirm dialog with the peer's
-    /// dirty / unpushed warnings, or surface the failure and abort.
+    /// dirty / unpushed warnings, or surface the failure and abort. A stale
+    /// generation (cancelled / superseded mid-flight) is dropped.
     pub(crate) fn handle_peer_checkout_probed(
         &mut self,
+        generation: u64,
         result: Result<crate::peers::PeerCheckoutOutcome, String>,
     ) {
-        let Some(checkout) = self.state.peer_checkout.as_mut() else {
+        let Some(checkout) = self.peer_checkout_for(generation) else {
             return;
         };
         match result {
@@ -178,7 +196,10 @@ impl crate::app::App {
         }
         checkout.busy = true;
         checkout.error = None;
-        self.spawn_peer_checkout_leg(true, AppEvent::PeerCheckoutPushed);
+        self.spawn_peer_checkout_leg(true, |generation, result| AppEvent::PeerCheckoutPushed {
+            generation,
+            result,
+        });
         self.render_dirty.store(true, Ordering::Release);
         self.render_notify.notify_one();
     }
@@ -201,9 +222,10 @@ impl crate::app::App {
     /// the error so the user can retry or cancel.
     pub(crate) fn handle_peer_checkout_pushed(
         &mut self,
+        generation: u64,
         result: Result<crate::peers::PeerCheckoutOutcome, String>,
     ) {
-        let Some(checkout) = self.state.peer_checkout.as_mut() else {
+        let Some(checkout) = self.peer_checkout_for(generation) else {
             return;
         };
         match result {
@@ -223,7 +245,8 @@ impl crate::app::App {
                         &repo_name,
                         &branch,
                     );
-                    let _ = event_tx.blocking_send(AppEvent::PeerCheckoutWorktreeReady(result));
+                    let _ = event_tx
+                        .blocking_send(AppEvent::PeerCheckoutWorktreeReady { generation, result });
                 });
             }
             Err(err) => {
@@ -240,9 +263,15 @@ impl crate::app::App {
     /// failure keep the dialog open with the error.
     pub(crate) fn handle_peer_checkout_worktree_ready(
         &mut self,
+        generation: u64,
         result: Result<std::path::PathBuf, String>,
     ) {
-        let Some(checkout) = self.state.peer_checkout.as_ref() else {
+        let Some(checkout) = self
+            .state
+            .peer_checkout
+            .as_ref()
+            .filter(|checkout| checkout.generation == generation)
+        else {
             return;
         };
         match result {
@@ -284,7 +313,7 @@ impl crate::app::App {
                         self.state.mark_session_dirty();
                     }
                     Err(err) => {
-                        if let Some(checkout) = self.state.peer_checkout.as_mut() {
+                        if let Some(checkout) = self.peer_checkout_for(generation) {
                             checkout.busy = false;
                             checkout.error =
                                 Some(format!("added worktree but failed to open: {err}"));
@@ -293,7 +322,7 @@ impl crate::app::App {
                 }
             }
             Err(err) => {
-                if let Some(checkout) = self.state.peer_checkout.as_mut() {
+                if let Some(checkout) = self.peer_checkout_for(generation) {
                     checkout.busy = false;
                     checkout.error = Some(err);
                 }
@@ -358,6 +387,7 @@ mod tests {
 
     fn sample_state() -> PeerCheckoutState {
         PeerCheckoutState {
+            generation: 1,
             peer: crate::config::PeerConfig {
                 name: "anvil".into(),
                 ..Default::default()
@@ -423,12 +453,15 @@ mod tests {
         let mut app = test_app();
         app.state.peer_checkout = Some(sample_state());
 
-        app.handle_peer_checkout_probed(Ok(PeerCheckoutOutcome {
-            branch: "feature-x".into(),
-            was_dirty: true,
-            was_unpushed: true,
-            pushed: false,
-        }));
+        app.handle_peer_checkout_probed(
+            1,
+            Ok(PeerCheckoutOutcome {
+                branch: "feature-x".into(),
+                was_dirty: true,
+                was_unpushed: true,
+                pushed: false,
+            }),
+        );
 
         assert_eq!(app.state.mode, Mode::ConfirmCrossCheckout);
         let checkout = app.state.peer_checkout.as_ref().unwrap();
@@ -437,11 +470,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_probe_is_dropped_and_does_not_corrupt_a_new_checkout() {
+        let mut app = test_app();
+        // A NEW checkout (generation 2) is in flight...
+        let mut current = sample_state();
+        current.generation = 2;
+        current.branch = "current-branch".into();
+        app.state.peer_checkout = Some(current);
+
+        // ...when a STALE leg from a cancelled checkout (generation 1) returns.
+        app.handle_peer_checkout_probed(
+            1,
+            Ok(PeerCheckoutOutcome {
+                branch: "stale-branch".into(),
+                was_dirty: true,
+                was_unpushed: true,
+                pushed: false,
+            }),
+        );
+
+        // The stale leg is discarded: the new checkout is untouched, no dialog.
+        assert_ne!(app.state.mode, Mode::ConfirmCrossCheckout);
+        let checkout = app.state.peer_checkout.as_ref().unwrap();
+        assert_eq!(checkout.branch, "current-branch");
+        assert!(checkout.report.is_none());
+    }
+
+    #[tokio::test]
     async fn probe_error_aborts_with_notice() {
         let mut app = test_app();
         app.state.peer_checkout = Some(sample_state());
 
-        app.handle_peer_checkout_probed(Err("ssh down".into()));
+        app.handle_peer_checkout_probed(1, Err("ssh down".into()));
 
         assert!(app.state.peer_checkout.is_none());
         assert_ne!(app.state.mode, Mode::ConfirmCrossCheckout);

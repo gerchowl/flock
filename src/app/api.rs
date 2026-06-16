@@ -198,18 +198,18 @@ impl App {
             return;
         }
 
-        if let AppEvent::PeerCheckoutProbed(result) = ev {
-            self.handle_peer_checkout_probed(result);
+        if let AppEvent::PeerCheckoutProbed { generation, result } = ev {
+            self.handle_peer_checkout_probed(generation, result);
             return;
         }
 
-        if let AppEvent::PeerCheckoutPushed(result) = ev {
-            self.handle_peer_checkout_pushed(result);
+        if let AppEvent::PeerCheckoutPushed { generation, result } = ev {
+            self.handle_peer_checkout_pushed(generation, result);
             return;
         }
 
-        if let AppEvent::PeerCheckoutWorktreeReady(result) = ev {
-            self.handle_peer_checkout_worktree_ready(result);
+        if let AppEvent::PeerCheckoutWorktreeReady { generation, result } = ev {
+            self.handle_peer_checkout_worktree_ready(generation, result);
             return;
         }
 

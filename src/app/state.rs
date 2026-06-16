@@ -749,6 +749,10 @@ pub struct RemoteCardArea {
 /// fail fast when the hub has no checkout of the project to add a worktree to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PeerCheckoutState {
+    /// Monotonic id stamped at `begin_peer_checkout`. Each spawned leg carries
+    /// it; a returning leg whose generation no longer matches the current
+    /// checkout (cancelled or superseded mid-flight) is discarded.
+    pub generation: u64,
     /// The peer to invoke over SSH (probe + push).
     pub peer: crate::config::PeerConfig,
     /// Display host (peer's reported host, falling back to the peer name).
@@ -1671,6 +1675,9 @@ pub struct AppState {
     /// In-flight cross-machine checkout (#125): probe → confirm → push → local
     /// fetch + worktree add + open. None when idle.
     pub peer_checkout: Option<PeerCheckoutState>,
+    /// Monotonic generation source for [`PeerCheckoutState`] — bumped per
+    /// checkout so stale in-flight legs are discarded.
+    pub peer_checkout_seq: u64,
     /// Scope of the `servers` sidebar section: all server rows, or only the
     /// current machine (plus the home row when attached remotely).
     pub servers_panel_scope: PanelScope,
@@ -2186,6 +2193,7 @@ impl AppState {
             request_peer_switch: None,
             request_peer_checkout: None,
             peer_checkout: None,
+            peer_checkout_seq: 0,
             servers_panel_scope: PanelScope::All,
             spaces_panel_scope: PanelScope::All,
             server_filter: None,
