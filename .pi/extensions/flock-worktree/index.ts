@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SOURCE_CHECKOUT = "/home/can/Projects/flock";
-const DEFAULT_BASE = "master";
+const DEFAULT_BASE = "main";
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const EXTENSION_NAME = "flock-worktree";
 
@@ -34,12 +34,12 @@ export default function (pi: ExtensionAPI) {
     name: "flock_start_worktree",
     label: "Start Flock Worktree",
     description:
-      "Create a Flock-linked git worktree from the Flock master checkout, continue the active pi session in it, " +
+      "Create a Flock-linked git worktree from the Flock main checkout, continue the active pi session in it, " +
       "start pi in the new Flock pane, then shut down and clean up the old pane.",
     promptSnippet: "Create a Flock worktree workspace and continue the active pi session in it",
     promptGuidelines: [
       "Use flock_start_worktree when work in the Flock repo should continue in a fresh git worktree.",
-      "flock_start_worktree creates the checkout from /home/can/Projects/flock on master by default.",
+      "flock_start_worktree creates the checkout from /home/can/Projects/flock on main by default.",
       "Prefer passing a clear branch name such as issue/123-short-slug when the work relates to an issue.",
       "After flock_start_worktree succeeds, the current pi process will shut down and the old Flock pane will close.",
     ],
@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
       ),
       base: Type.Optional(
         Type.String({
-          description: "Base ref for the new worktree. Defaults to master.",
+          description: "Base ref for the new worktree. Defaults to main.",
         }),
       ),
       label: Type.Optional(
@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("flock-worktree-start", {
     description:
-      "Create a Flock worktree from master, continue this pi session in it, and clean up the old pane",
+      "Create a Flock worktree from main, continue this pi session in it, and clean up the old pane",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
       try {

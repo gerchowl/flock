@@ -4,7 +4,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Before you start:** Read [CONTRIBUTING.md](https://github.com/gerchowl/flock/blob/master/CONTRIBUTING.md).
+        **Before you start:** Read [CONTRIBUTING.md](https://github.com/gerchowl/flock/blob/main/CONTRIBUTING.md).
 
         Issues are only for reproducible bugs and maintainer-created or maintainer-converted work items. Feature requests, ideas, questions, contribution proposals, and direction checks belong in [Discussions](https://github.com/gerchowl/flock/discussions).
 

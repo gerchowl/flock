@@ -1,7 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-const repoBlob = 'https://github.com/gerchowl/flock/blob/master/';
+const repoBlob = 'https://github.com/gerchowl/flock/blob/main/';
 
 function rewriteFlockLinks() {
   const docsLinks = new Map([
@@ -94,7 +94,7 @@ export default defineConfig({
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/gerchowl/flock/edit/master/',
+        baseUrl: 'https://github.com/gerchowl/flock/edit/main/',
       },
       lastUpdated: true,
       disable404Route: true,

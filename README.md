@@ -94,7 +94,7 @@ flock update
 
 `flock update` is for installs managed by Flock's own installer. Homebrew, mise, and Nix installs update through `brew upgrade flock`, `mise upgrade flock`, or your Nix workflow, then use the same stop-and-run-again flow if a session is still running the old server. Direct installs can opt into development preview builds with `flock channel set preview` and return to stable with `flock channel set stable`. See [install docs](https://flock.dev/docs/install/) and [session state docs](https://flock.dev/docs/session-state/) for the full update, restart, restore, and handoff matrix.
 
-Flock uses the stable update channel by default. To test preview builds from `master` before the next stable release:
+Flock uses the stable update channel by default. To test preview builds from `main` before the next stable release:
 
 ```bash
 flock channel set preview
