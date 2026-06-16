@@ -343,6 +343,20 @@ impl AppState {
         })
     }
 
+    /// The project-section key of the synthetic group header at `row`, if any
+    /// (#122). Headers are non-selectable, so they have no `ws_idx` — they are
+    /// a collapse/expand and right-click target keyed by section.
+    pub(super) fn space_header_at_row(&self, row: u16) -> Option<String> {
+        if self.workspace_list_rect() == Rect::default() {
+            return None;
+        }
+        self.view
+            .space_header_areas
+            .iter()
+            .find(|header| row >= header.rect.y && row < header.rect.y + header.rect.height)
+            .map(|header| header.key.clone())
+    }
+
     pub(super) fn collapsed_workspace_at_row(&self, row: u16) -> Option<usize> {
         if !self.sidebar_collapsed {
             return None;

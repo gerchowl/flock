@@ -742,7 +742,8 @@ pub(super) fn execute_navigate_action_in_context(
             if let Some(ws_idx) = workspace_action_target(state, context)
                 .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
             {
-                state.request_new_linked_worktree = Some(ws_idx);
+                state.request_new_linked_worktree =
+                    Some(crate::app::state::NewLinkedWorktreeRequest { ws_idx, base: None });
                 leave_navigate_mode(state);
             }
         }
@@ -1244,7 +1245,13 @@ mod tests {
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
         );
 
-        assert_eq!(state.request_new_linked_worktree, Some(1));
+        assert_eq!(
+            state.request_new_linked_worktree,
+            Some(crate::app::state::NewLinkedWorktreeRequest {
+                ws_idx: 1,
+                base: None
+            })
+        );
         assert_eq!(state.mode, Mode::Terminal);
     }
 
@@ -1351,7 +1358,13 @@ mod tests {
             ActionContext::Direct,
         );
 
-        assert_eq!(state.request_new_linked_worktree, Some(0));
+        assert_eq!(
+            state.request_new_linked_worktree,
+            Some(crate::app::state::NewLinkedWorktreeRequest {
+                ws_idx: 0,
+                base: None
+            })
+        );
     }
 
     #[test]

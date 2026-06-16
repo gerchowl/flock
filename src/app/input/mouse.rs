@@ -1193,6 +1193,19 @@ impl AppState {
                     }
                     return None;
                 }
+                // A project-group header row (#122): the menu acts on the whole
+                // section (new worktree from default branch, collapse, close).
+                if let Some(key) = self.space_header_at_row(mouse.row) {
+                    let collapsed = self.collapsed_space_keys.contains(&key);
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::SpaceHeader { key, collapsed },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                    return None;
+                }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
                     let branchable = self.workspace_branchable(idx);

@@ -25,24 +25,26 @@ impl App {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return Err("Workspace not found.".into());
         };
+        // #124: a flock-managed linked worktree IS a valid source — the new
+        // branch forks from that worktree's HEAD (branch-from-here). Its
+        // membership carries the shared repo_root + its own checkout_path, so
+        // `git worktree add` runs from the linked checkout. (An ad-hoc, non
+        // -membership linked checkout below stays refused — its repo_root is
+        // ambiguous.)
         let existing_membership = ws.worktree_space().cloned();
-        if existing_membership
-            .as_ref()
-            .is_some_and(|membership| membership.is_linked_worktree)
-        {
-            return Err(
-                "New and open worktree actions start from the repo parent workspace.".into(),
-            );
-        }
 
         let git_space = ws.git_space().cloned().or_else(|| {
             ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
-        if git_space
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_linked_worktree)
+        // An ad-hoc linked checkout (no flock-managed membership) stays refused
+        // — its repo_root is ambiguous. A membership-backed linked worktree is
+        // the #124 branch-from-here case, resolved from the membership below.
+        if existing_membership.is_none()
+            && git_space
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_linked_worktree)
         {
             return Err(
                 "New and open worktree actions start from the repo parent workspace.".into(),
@@ -80,7 +82,7 @@ impl App {
         ))
     }
 
-    pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize) {
+    pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize, base: Option<String>) {
         let (existing_membership, space, source_checkout_path, source_workspace_id) =
             match self.worktree_source_metadata(ws_idx) {
                 Ok(metadata) => metadata,
@@ -121,6 +123,7 @@ impl App {
             repo_key: space.key,
             repo_name,
             branch,
+            base: base.unwrap_or_else(|| "HEAD".into()),
             checkout_path,
             error: None,
             creating: false,
@@ -136,7 +139,7 @@ impl App {
             self.show_action_notice("branch session: focused pane has no resumable agent session");
             return;
         };
-        self.open_new_linked_worktree_dialog(ws_idx);
+        self.open_new_linked_worktree_dialog(ws_idx, None);
         if let Some(create) = self.state.worktree_create.as_mut() {
             create.branch_plan = Some(plan);
         }
@@ -651,7 +654,7 @@ impl App {
             &create.source_checkout_path,
             &create.checkout_path,
             &create.branch,
-            "HEAD",
+            &create.base,
         );
         let parent_dir = create
             .checkout_path
@@ -1125,7 +1128,10 @@ mod tests {
     }
 
     #[test]
-    fn worktree_create_and_open_dialogs_reject_linked_child_source() {
+    fn worktree_create_from_linked_worktree_is_allowed() {
+        // #124: branch-from-here on a flock-managed linked worktree opens the
+        // new-worktree dialog with that worktree's checkout as the source (it
+        // forks from the linked worktree's own HEAD).
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
         app.state.mode = Mode::Navigate;
@@ -1137,23 +1143,37 @@ mod tests {
             is_linked_worktree: true,
         });
 
-        app.open_new_linked_worktree_dialog(0);
+        app.open_new_linked_worktree_dialog(0, None);
 
-        assert_eq!(app.state.mode, Mode::Navigate);
-        assert!(app.state.worktree_create.is_none());
+        assert_eq!(app.state.mode, Mode::NewLinkedWorktree);
+        let create = app.state.worktree_create.as_ref().expect("dialog opened");
         assert_eq!(
-            app.state.action_notice.as_deref(),
-            Some("New and open worktree actions start from the repo parent workspace.")
+            create.source_checkout_path,
+            std::path::PathBuf::from("/repo/flock-issue")
         );
+        assert_eq!(create.base, "HEAD");
+        assert!(app.state.action_notice.is_none());
+    }
 
-        app.state.action_notice = None;
-        app.open_existing_worktree_dialog(0);
+    #[test]
+    fn new_worktree_dialog_honors_explicit_base_ref() {
+        // #123: the project header passes the project's default branch as the
+        // base ref, instead of the source checkout's HEAD.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
+            is_linked_worktree: false,
+        });
 
-        assert!(app.state.worktree_open.is_none());
-        assert_eq!(
-            app.state.action_notice.as_deref(),
-            Some("New and open worktree actions start from the repo parent workspace.")
-        );
+        app.open_new_linked_worktree_dialog(0, Some("main".into()));
+
+        let create = app.state.worktree_create.as_ref().expect("dialog opened");
+        assert_eq!(create.base, "main");
     }
 
     #[test]
@@ -1170,6 +1190,7 @@ mod tests {
             repo_key: "repo-key".into(),
             repo_name: "flock".into(),
             branch: "old".into(),
+            base: "HEAD".into(),
             checkout_path: std::path::PathBuf::from("/old"),
             error: Some("old error".into()),
             creating: false,
@@ -1204,6 +1225,7 @@ mod tests {
             repo_key: "repo-key".into(),
             repo_name: "flock".into(),
             branch: branch.into(),
+            base: "HEAD".into(),
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
@@ -1267,6 +1289,7 @@ mod tests {
             repo_key: "repo-key".into(),
             repo_name: "flock".into(),
             branch: branch.into(),
+            base: "HEAD".into(),
             checkout_path: checkout.clone(),
             error: None,
             creating: false,

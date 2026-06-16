@@ -870,8 +870,8 @@ impl App {
                 needs_render = true;
             }
 
-            if let Some(ws_idx) = self.state.request_new_linked_worktree.take() {
-                self.open_new_linked_worktree_dialog(ws_idx);
+            if let Some(req) = self.state.request_new_linked_worktree.take() {
+                self.open_new_linked_worktree_dialog(req.ws_idx, req.base);
                 needs_render = true;
             }
 

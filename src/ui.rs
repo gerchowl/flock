@@ -76,10 +76,10 @@ pub(crate) use self::{
         agent_panel_scrollbar_rect, collapsed_sidebar_sections, collapsed_sidebar_toggle_rect,
         compute_workspace_card_areas, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
         normalized_workspace_scroll, server_band_slot_at, servers_section_height,
-        sidebar_menu_row_rect, sidebar_section_divider_rect, workspace_drop_indicator_row,
-        workspace_list_body_rect, workspace_list_entries, workspace_list_rect,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        WorkspaceListEntry, SIDEBAR_MENU_BAND_ROWS,
+        sidebar_menu_row_rect, sidebar_section_divider_rect, space_head_idx,
+        workspace_drop_indicator_row, workspace_list_body_rect, workspace_list_entries,
+        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
+        workspace_parent_group_state, WorkspaceListEntry, SIDEBAR_MENU_BAND_ROWS,
     },
 };
 // The scope-label rects are used by hit-area code in app::input::sidebar to

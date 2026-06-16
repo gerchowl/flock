@@ -755,9 +755,24 @@ pub struct WorktreeCreateState {
     pub repo_key: String,
     pub repo_name: String,
     pub branch: String,
+    /// The git ref the new branch is based on. `"HEAD"` (the source checkout's
+    /// current head — branch-from-here) is the default; the project header's
+    /// "new worktree from default branch" passes the resolved default branch
+    /// instead (#123).
+    pub base: String,
     pub checkout_path: std::path::PathBuf,
     pub error: Option<String>,
     pub creating: bool,
+}
+
+/// A deferred new-linked-worktree request from input → app loop, carrying the
+/// source workspace and the base ref the new branch should fork from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLinkedWorktreeRequest {
+    pub ws_idx: usize,
+    /// `None` = the source checkout's HEAD (branch-from-here). `Some(ref)` =
+    /// an explicit base, e.g. the project's default branch from a header.
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1339,6 +1354,14 @@ pub enum ContextMenuKind {
         /// adds the clear entry alongside the narrowing.
         any_filter: bool,
     },
+    /// A synthetic project-group header row (#122): the group is a pure UI
+    /// grouping, so its menu acts on the whole section — new worktree from the
+    /// project's default branch (#123), expand/collapse, close group.
+    SpaceHeader {
+        /// The project-section key this header groups on.
+        key: String,
+        collapsed: bool,
+    },
 }
 
 /// Right-click context menu state.
@@ -1384,6 +1407,7 @@ impl ContextMenuState {
                 "Rename",
                 "Close",
                 "Close group",
+                "New worktree",
                 "Delete worktree checkout...",
                 "Kill worktree & branch...",
                 "Expand",
@@ -1397,6 +1421,7 @@ impl ContextMenuState {
                 "Rename",
                 "Close",
                 "Close group",
+                "New worktree",
                 "Delete worktree checkout...",
                 "Kill worktree & branch...",
                 "Collapse",
@@ -1407,6 +1432,7 @@ impl ContextMenuState {
             } => vec![
                 "Rename",
                 "Close",
+                "New worktree",
                 "Delete worktree checkout...",
                 "Kill worktree & branch...",
             ],
@@ -1463,6 +1489,16 @@ impl ContextMenuState {
                 any_filter: true, ..
             } => vec!["Show only this server", "Show all servers"],
             ContextMenuKind::Server { .. } => vec!["Show only this server"],
+            ContextMenuKind::SpaceHeader {
+                collapsed: true, ..
+            } => vec!["New worktree from default branch", "Expand", "Close group"],
+            ContextMenuKind::SpaceHeader {
+                collapsed: false, ..
+            } => vec![
+                "New worktree from default branch",
+                "Collapse",
+                "Close group",
+            ],
         };
         if branchable_workspace {
             items.push("Branch session");
@@ -1555,7 +1591,7 @@ pub struct AppState {
     pub detach_requested: bool,
     pub request_new_workspace: bool,
     pub request_new_tab: bool,
-    pub request_new_linked_worktree: Option<usize>,
+    pub request_new_linked_worktree: Option<NewLinkedWorktreeRequest>,
     pub request_branch_session: Option<usize>,
     pub request_kill_worktree: Option<usize>,
     /// One-shot guard so the attention all-clear chime fires once per
@@ -2350,14 +2386,52 @@ mod tests {
             list: MenuListState::new(0),
         };
 
+        // #124: a linked worktree can now branch-from-here, so it offers
+        // "New worktree" alongside the safe-close / explicit-remove actions.
         assert_eq!(
             menu.items(),
             vec![
                 "Rename",
                 "Close",
+                "New worktree",
                 "Delete worktree checkout...",
                 "Kill worktree & branch...",
             ]
+        );
+    }
+
+    #[test]
+    fn space_header_context_menu_offers_default_branch_worktree_and_collapse() {
+        let expanded = ContextMenuState {
+            kind: ContextMenuKind::SpaceHeader {
+                key: "repo-key".into(),
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            expanded.items(),
+            vec![
+                "New worktree from default branch",
+                "Collapse",
+                "Close group"
+            ]
+        );
+
+        let collapsed = ContextMenuState {
+            kind: ContextMenuKind::SpaceHeader {
+                key: "repo-key".into(),
+                collapsed: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            collapsed.items(),
+            vec!["New worktree from default branch", "Expand", "Close group"]
         );
     }
 

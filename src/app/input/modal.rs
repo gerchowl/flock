@@ -642,8 +642,54 @@ pub(super) fn apply_context_menu_action(
     let item = menu.items().get(idx).copied();
     match (menu.kind, item) {
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
-            state.request_new_linked_worktree = Some(ws_idx);
+            state.request_new_linked_worktree =
+                Some(crate::app::state::NewLinkedWorktreeRequest { ws_idx, base: None });
             leave_modal(state);
+        }
+        // #122/#123: the project header creates a worktree from the project's
+        // DEFAULT branch (vs a workspace row, which forks from its own HEAD).
+        // The section head member is the source checkout; its repo resolves the
+        // default branch.
+        (ContextMenuKind::SpaceHeader { key, .. }, Some("New worktree from default branch")) => {
+            if let Some(head_idx) = crate::ui::space_head_idx(state, &key) {
+                let base = state
+                    .workspaces
+                    .get(head_idx)
+                    .and_then(|ws| {
+                        ws.worktree_space()
+                            .map(|m| m.repo_root.clone())
+                            .or_else(|| ws.git_space().map(|g| g.repo_root.clone()))
+                    })
+                    .and_then(|root| crate::worktree::detect_default_branch(&root));
+                state.request_new_linked_worktree =
+                    Some(crate::app::state::NewLinkedWorktreeRequest {
+                        ws_idx: head_idx,
+                        base,
+                    });
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::SpaceHeader { key, collapsed }, Some("Collapse" | "Expand")) => {
+            if collapsed {
+                state.collapsed_space_keys.remove(&key);
+            } else {
+                state.collapsed_space_keys.insert(key);
+            }
+            state.mark_session_dirty();
+            leave_modal(state);
+        }
+        (ContextMenuKind::SpaceHeader { key, .. }, Some("Close group")) => {
+            if let Some(head_idx) = crate::ui::space_head_idx(state, &key) {
+                state.selected = head_idx;
+                if state.confirm_close {
+                    open_confirm_close_space(state);
+                } else {
+                    state.close_selected_space();
+                    state.mode = Mode::Navigate;
+                }
+            } else {
+                leave_modal(state);
+            }
         }
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Delete worktree checkout...")) => {
             state.request_remove_linked_worktree = Some(ws_idx);

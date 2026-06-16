@@ -436,8 +436,9 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.deferred_new_tab");
             }
 
-            if let Some(ws_idx) = self.app.state.request_new_linked_worktree.take() {
-                self.app.open_new_linked_worktree_dialog(ws_idx);
+            if let Some(req) = self.app.state.request_new_linked_worktree.take() {
+                self.app
+                    .open_new_linked_worktree_dialog(req.ws_idx, req.base);
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
