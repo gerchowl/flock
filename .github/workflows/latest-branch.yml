@@ -5,13 +5,13 @@
 # `latest` only on success. Pin `latest` for newest-green, a tag/rev for
 # immutable, or the integration branch for bleeding edge.
 #
-# The integration branch is `master` (graduated from feat/sidebar-row-gap,
+# The integration branch is `main` (graduated from feat/sidebar-row-gap,
 # PR #86).
 name: latest-branch
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

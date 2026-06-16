@@ -25,8 +25,9 @@ mod tabs;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
-    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
+    render_confirm_close_overlay, render_cross_checkout_overlay,
+    render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
+    render_remove_worktree_overlay, render_rename_overlay,
 };
 pub(crate) use self::float::{float_overlay_inner_rect, float_overlay_rect};
 use self::float::{render_float_overlay, resize_float_runtime};
@@ -477,6 +478,7 @@ pub fn render_with_runtime_registry(
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
+        Mode::ConfirmCrossCheckout => render_cross_checkout_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, frame),

@@ -1,7 +1,7 @@
 use crate::api::schema::{PeerSystemSummary, PeerWorkspaceSummary, ResponseResult};
 use crate::app::App;
 
-use super::responses::encode_success;
+use super::responses::{encode_error, encode_success};
 
 impl App {
     /// Serve this server's federated summary: one entry per workspace with
@@ -17,6 +17,62 @@ impl App {
                 workspaces: self.self_workspace_summaries(),
             },
         )
+    }
+
+    /// Prepare one of THIS server's workspaces for a cross-machine checkout
+    /// (#125, "defer to the client"): resolve the repo + branch from the named
+    /// workspace, then probe (and optionally push) on our OWN git. The hub
+    /// drives this over SSH and fetches the branch from origin afterwards — it
+    /// never reaches into our `.git`, keeping the model hub-spoke.
+    pub(super) fn handle_peers_checkout_prepare(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PeersCheckoutPrepareParams,
+    ) -> String {
+        let Some(ws) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == params.workspace_id)
+        else {
+            return encode_error(
+                id,
+                "workspace_not_found",
+                format!("workspace '{}' not found", params.workspace_id),
+            );
+        };
+        let Some(branch) = ws.branch() else {
+            return encode_error(
+                id,
+                "no_branch",
+                format!(
+                    "workspace '{}' has no git branch to prepare",
+                    params.workspace_id
+                ),
+            );
+        };
+        let Some(checkout) = ws.resolved_identity_cwd() else {
+            return encode_error(
+                id,
+                "no_checkout",
+                format!(
+                    "workspace '{}' has no resolved checkout path",
+                    params.workspace_id
+                ),
+            );
+        };
+        match crate::worktree::prepare_peer_checkout(&checkout, &branch, params.push) {
+            Ok(report) => encode_success(
+                id,
+                ResponseResult::PeersCheckoutPrepared {
+                    branch,
+                    was_dirty: report.was_dirty,
+                    was_unpushed: report.was_unpushed,
+                    pushed: report.pushed,
+                },
+            ),
+            Err(err) => encode_error(id, "checkout_prepare_failed", err),
+        }
     }
 
     /// This server's own workspaces in the federated summary shape — the same
@@ -348,6 +404,20 @@ mod tests {
             origin_summary: None,
             received_at: std::time::Instant::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn checkout_prepare_unknown_workspace_is_rejected() {
+        let mut app = test_app();
+        let response = app.handle_peers_checkout_prepare(
+            "req".into(),
+            crate::api::schema::PeersCheckoutPrepareParams {
+                workspace_id: "ws_nope".into(),
+                push: false,
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "workspace_not_found");
     }
 
     #[tokio::test]

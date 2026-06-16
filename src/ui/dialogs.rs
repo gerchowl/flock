@@ -775,6 +775,144 @@ pub(crate) fn confirm_close_popup_rect(area: Rect) -> Option<Rect> {
     centered_popup_rect(area, 64, 6)
 }
 
+/// The body lines for the cross-machine checkout confirm dialog (#125):
+/// (title, summary, warnings, status). Pure function of the state so it can be
+/// unit-tested without a frame.
+pub(super) fn cross_checkout_overlay_lines(
+    app: &AppState,
+) -> (String, String, Vec<String>, Option<String>) {
+    let Some(checkout) = app.peer_checkout.as_ref() else {
+        return (String::new(), String::new(), Vec::new(), None);
+    };
+    let title = format!("Check out {}", checkout.branch);
+    let summary = format!(
+        "Push '{}' from {} to origin and check it out here?",
+        checkout.branch, checkout.host
+    );
+    let mut warnings = Vec::new();
+    if let Some(report) = checkout.report.as_ref() {
+        if report.was_dirty {
+            warnings.push("⚠ peer has uncommitted changes (not transferred)".to_string());
+        }
+        if report.was_unpushed {
+            warnings.push("⚠ branch has unpushed commits (will push to origin)".to_string());
+        }
+    }
+    let status = if let Some(error) = checkout.error.as_ref() {
+        Some(format!("✗ {error}"))
+    } else if checkout.busy {
+        Some("working…".to_string())
+    } else {
+        None
+    };
+    (title, summary, warnings, status)
+}
+
+pub(crate) fn cross_checkout_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 68, 9)
+}
+
+pub(super) fn render_cross_checkout_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let (title, summary, warnings, status) = cross_checkout_overlay_lines(app);
+    if title.is_empty() {
+        return;
+    }
+    let busy = app.peer_checkout.as_ref().is_some_and(|c| c.busy);
+
+    super::dim_background(frame, area);
+    let Some(popup) = cross_checkout_popup_rect(area) else {
+        return;
+    };
+
+    let accent = app.palette.blue;
+    let Some(inner) = render_panel_shell(frame, popup, accent, app.palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 5 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // title
+        Constraint::Length(1), // summary
+        Constraint::Length(1), // warning 1 / status
+        Constraint::Length(1), // warning 2
+        Constraint::Length(1), // buttons
+    ])
+    .areas::<5>(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {summary}"),
+            Style::default().fg(app.palette.text),
+        ))),
+        rows[1],
+    );
+
+    let warn_style = Style::default().fg(app.palette.yellow);
+    if let Some(line) = warnings.first() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {line}"), warn_style))),
+            rows[2],
+        );
+    }
+    if let Some(line) = warnings.get(1) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {line}"), warn_style))),
+            rows[3],
+        );
+    }
+
+    if let Some(status) = status {
+        // Errors render red, the busy spinner dim; both sit on the status row.
+        let is_error = status.starts_with('✗');
+        let style = if is_error {
+            Style::default()
+                .fg(app.palette.red)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {status}"), style))),
+            rows[4],
+        );
+    }
+
+    // While a leg is running there is nothing to confirm — hide the buttons so
+    // the user can't double-fire; esc still cancels via the key handler.
+    if !busy {
+        let (confirm_rect, cancel_rect) = confirm_close_button_rects(inner);
+        render_action_button(
+            frame,
+            confirm_rect,
+            Some("↵"),
+            "check out",
+            Style::default()
+                .fg(panel_contrast_fg(&app.palette))
+                .bg(accent)
+                .add_modifier(Modifier::BOLD),
+        );
+        render_action_button(
+            frame,
+            cancel_rect,
+            Some("esc"),
+            "cancel",
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
 pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
     let rects = action_button_row_rects(
         inner,
@@ -799,6 +937,57 @@ mod tests {
     use crate::{app::AppState, workspace::Workspace};
 
     use super::confirm_close_overlay_text;
+
+    #[test]
+    fn cross_checkout_lines_carry_host_branch_and_warnings() {
+        let mut app = AppState::test_new();
+        app.peer_checkout = Some(crate::app::state::PeerCheckoutState {
+            generation: 1,
+            peer: crate::config::PeerConfig {
+                name: "anvil".into(),
+                ..Default::default()
+            },
+            host: "anvil".into(),
+            remote_workspace_id: "ws_3".into(),
+            branch: "feature-x".into(),
+            source_repo_root: "/repo".into(),
+            source_checkout_path: "/repo".into(),
+            source_workspace_id: "w".into(),
+            repo_key: "/repo/.git".into(),
+            repo_name: "proj".into(),
+            report: Some(crate::peers::PeerCheckoutOutcome {
+                branch: "feature-x".into(),
+                was_dirty: true,
+                was_unpushed: true,
+                pushed: false,
+            }),
+            busy: false,
+            error: None,
+        });
+
+        let (title, summary, warnings, status) = super::cross_checkout_overlay_lines(&app);
+        assert!(title.contains("feature-x"));
+        assert!(summary.contains("anvil") && summary.contains("feature-x"));
+        assert_eq!(warnings.len(), 2, "dirty + unpushed both warn");
+        assert!(
+            status.is_none(),
+            "idle dialog shows buttons, no status line"
+        );
+
+        // Busy hides warnings-vs-status independence: a running leg shows status.
+        if let Some(checkout) = app.peer_checkout.as_mut() {
+            checkout.busy = true;
+        }
+        let (_, _, _, status) = super::cross_checkout_overlay_lines(&app);
+        assert_eq!(status.as_deref(), Some("working…"));
+
+        // An error takes precedence over the busy spinner.
+        if let Some(checkout) = app.peer_checkout.as_mut() {
+            checkout.error = Some("fetch failed".into());
+        }
+        let (_, _, _, status) = super::cross_checkout_overlay_lines(&app);
+        assert!(status.as_deref().unwrap().contains("fetch failed"));
+    }
 
     #[test]
     fn confirm_close_text_reports_parent_group_scope() {

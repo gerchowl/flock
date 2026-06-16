@@ -198,6 +198,21 @@ impl App {
             return;
         }
 
+        if let AppEvent::PeerCheckoutProbed { generation, result } = ev {
+            self.handle_peer_checkout_probed(generation, result);
+            return;
+        }
+
+        if let AppEvent::PeerCheckoutPushed { generation, result } = ev {
+            self.handle_peer_checkout_pushed(generation, result);
+            return;
+        }
+
+        if let AppEvent::PeerCheckoutWorktreeReady { generation, result } = ev {
+            self.handle_peer_checkout_worktree_ready(generation, result);
+            return;
+        }
+
         if let AppEvent::WorktreeKillGateFinished(result) = ev {
             self.handle_worktree_kill_gate_finished(result);
             return;
@@ -713,6 +728,9 @@ impl App {
                 }
             }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
+            Method::PeersCheckoutPrepare(params) => {
+                return self.handle_peers_checkout_prepare(request.id, params)
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {

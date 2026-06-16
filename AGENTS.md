@@ -28,7 +28,7 @@ Do all code edits, tests, and validation inside the task worktree.
 
 Commit on the task branch in that worktree.
 
-When the change is ready, fast-forward the shared checkout at `../flock` to the task branch commit, then push `origin/master` from `../flock`. Do not treat the task branch as the final landing branch.
+When the change is ready, fast-forward the shared checkout at `../flock` to the task branch commit, then push `origin/main` from `../flock`. Do not treat the task branch as the final landing branch.
 
 ### Fork fleet flow (gerchowl/flock, feat/sidebar-row-gap)
 
@@ -106,18 +106,18 @@ fix: handle pane focus
 refs #82
 ```
 
-Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `master` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
+Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `main` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
 
 ## Code Conventions
 
 - Rust: no `unwrap()` in production code. Use `tracing` for logging. Use `#[allow]` only with a comment explaining why.
 - Don't add dependencies without a reason. Check whether existing dependencies cover the need first.
-- Integration asset versions (`FLOCK_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `master`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
+- Integration asset versions (`FLOCK_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `main`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
 - When changing the server/client wire protocol, compare `src/protocol/wire.rs::PROTOCOL_VERSION` against the latest released tag. Bump it only if the current source protocol is not already greater than the latest released protocol. Update hardcoded protocol expectations and manual protocol fixtures in tests.
 
 ## Release Channels
 
-Flock has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
+Flock has one main branch and two update channels. Stable and preview both build from `main`; there is no long-lived preview branch.
 
 Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.
 

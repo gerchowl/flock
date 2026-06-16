@@ -74,6 +74,13 @@ impl App {
                     Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                     Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                     Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
+                    // Cross-machine checkout confirm (#125): ↵ pushes + fetches,
+                    // esc aborts. Ignore keys while a leg is in flight.
+                    Mode::ConfirmCrossCheckout => match key_event.code {
+                        KeyCode::Enter => self.confirm_peer_checkout(),
+                        KeyCode::Esc => self.cancel_peer_checkout(),
+                        _ => {}
+                    },
                     Mode::Resize => handle_resize_key(&mut self.state, key),
                     Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
                     Mode::ContextMenu => {

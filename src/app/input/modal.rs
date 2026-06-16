@@ -842,6 +842,12 @@ pub(super) fn apply_context_menu_action(
             state.workspace_scroll = 0;
             leave_modal(state);
         }
+        // Cross-machine checkout (#125): defer to the App loop, which resolves
+        // the local target and drives the probe → confirm → push → fetch flow.
+        (ContextMenuKind::PeerWorkspace { peer_idx, ws_idx }, Some("Check out here")) => {
+            state.request_peer_checkout = Some((peer_idx, ws_idx));
+            leave_modal(state);
+        }
         _ => leave_modal(state),
     }
 }

@@ -210,7 +210,92 @@ pub fn fetch_peer_summary(peer: &PeerConfig) -> PeerSummaryFetch {
     }
 }
 
+/// What a peer reported (and did) for a cross-machine checkout-prepare (#125):
+/// the resolved branch plus the working-tree / push state, parsed from the
+/// `peers.checkout_prepare` response envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCheckoutOutcome {
+    pub branch: String,
+    pub was_dirty: bool,
+    pub was_unpushed: bool,
+    pub pushed: bool,
+}
+
+/// Ask a peer to prepare one of its OWN workspaces' branches for a cross-machine
+/// checkout (#125, "defer to the client"): the spoke resolves the repo + branch
+/// from the workspace id and acts on its own git; with `push` it pushes to
+/// origin so the hub can `git fetch origin <branch>` afterwards. `push == false`
+/// is a read-only probe feeding the hub's pre-action confirmation. Runs over the
+/// SAME SSH-invoked verb surface as `run_summary_command` — the hub never
+/// touches the peer's `.git`, keeping the model hub-spoke. Blocking; run off the
+/// UI thread.
+pub fn run_checkout_prepare_command(
+    peer: &PeerConfig,
+    workspace_id: &str,
+    push: bool,
+) -> Result<PeerCheckoutOutcome, String> {
+    // Workspace ids are server-assigned ("ws_3"); refuse anything that could
+    // escape the remote shell command (mirrors prepare_peer_switch's guard).
+    if workspace_id.is_empty()
+        || !workspace_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!("invalid workspace id: {workspace_id:?}"));
+    }
+    let push_flag = if push { " --push" } else { "" };
+    // The flock invocation is wrapped in a login shell so profile-managed PATHs
+    // (nix, brew) apply — same shape as the default summary_command and the
+    // prepare_peer_switch pre-focus call.
+    let remote = format!(
+        "sh -lc 'flock peers checkout-prepare --workspace {workspace_id}{push_flag} --json'"
+    );
+    let stdout = run_peer_ssh(peer, &remote)?;
+    parse_checkout_prepare_response(&stdout)
+}
+
+/// Parse the `peers.checkout_prepare` response envelope:
+/// `{"id":..,"result":{"branch":..,"was_dirty":..,"was_unpushed":..,"pushed":..}}`.
+fn parse_checkout_prepare_response(stdout: &str) -> Result<PeerCheckoutOutcome, String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('{'))
+        .ok_or_else(|| "no JSON in checkout-prepare output".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|err| format!("checkout-prepare parse error: {err}"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("peer error: {message}"));
+    }
+    let result = value
+        .get("result")
+        .ok_or_else(|| "checkout-prepare response has no result".to_string())?;
+    let branch = result
+        .get("branch")
+        .and_then(|b| b.as_str())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| "checkout-prepare response has no branch".to_string())?
+        .to_string();
+    let flag = |key: &str| result.get(key).and_then(serde_json::Value::as_bool);
+    Ok(PeerCheckoutOutcome {
+        branch,
+        was_dirty: flag("was_dirty").unwrap_or(false),
+        was_unpushed: flag("was_unpushed").unwrap_or(false),
+        pushed: flag("pushed").unwrap_or(false),
+    })
+}
+
 fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
+    run_peer_ssh(peer, &peer.summary_command)
+}
+
+/// Run one command on a peer over SSH (batch mode, short timeouts), returning
+/// stdout. Shared by the summary poll and the checkout-prepare invocation.
+fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
     let output = std::process::Command::new("ssh")
         .args([
             "-o",
@@ -222,7 +307,7 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
             "-o",
             "ServerAliveCountMax=2",
             peer.ssh_target(),
-            &peer.summary_command,
+            remote_command,
         ])
         .stdin(std::process::Stdio::null())
         .output()
@@ -238,7 +323,7 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
         };
         return Err(detail);
     }
-    String::from_utf8(output.stdout).map_err(|_| "non-utf8 summary output".to_string())
+    String::from_utf8(output.stdout).map_err(|_| "non-utf8 ssh output".to_string())
 }
 
 /// Parse the CLI's response envelope:
@@ -479,6 +564,54 @@ Last login: whatever banner
         let err = parse_summary_response(r#"{"id":"x","error":{"code":"nope"}}"#, 1).unwrap_err();
         assert!(err.contains("peer error"));
         assert!(parse_summary_response("no json here", 1).is_err());
+    }
+
+    #[test]
+    fn parse_checkout_prepare_reads_report_and_surfaces_errors() {
+        let stdout = r#"
+Last login: banner noise
+{"id":"cli:peers:checkout_prepare","result":{"type":"peers_checkout_prepared","branch":"feature-x","was_dirty":true,"was_unpushed":true,"pushed":true}}
+"#;
+        let outcome = parse_checkout_prepare_response(stdout).unwrap();
+        assert_eq!(
+            outcome,
+            PeerCheckoutOutcome {
+                branch: "feature-x".into(),
+                was_dirty: true,
+                was_unpushed: true,
+                pushed: true,
+            }
+        );
+
+        // A pure probe (push=false) carries pushed=false.
+        let probe = parse_checkout_prepare_response(
+            r#"{"id":"x","result":{"branch":"main","was_dirty":false,"was_unpushed":false,"pushed":false}}"#,
+        )
+        .unwrap();
+        assert!(!probe.pushed);
+        assert!(!probe.was_dirty);
+
+        // Peer-side errors and malformed output surface as Err.
+        let err = parse_checkout_prepare_response(
+            r#"{"id":"x","error":{"code":"no_branch","message":"workspace has no git branch"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("peer error"));
+        assert!(err.contains("no git branch"));
+        assert!(parse_checkout_prepare_response("no json here").is_err());
+        // A result with no branch is rejected (the hub needs it to fetch).
+        assert!(parse_checkout_prepare_response(r#"{"id":"x","result":{"pushed":true}}"#).is_err());
+    }
+
+    #[test]
+    fn checkout_prepare_command_rejects_unsafe_workspace_ids() {
+        let peer = PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        };
+        // Never spawns ssh: the guard rejects shell-unsafe ids before dialing.
+        assert!(run_checkout_prepare_command(&peer, "ws_3; rm -rf /", false).is_err());
+        assert!(run_checkout_prepare_command(&peer, "", false).is_err());
     }
 
     #[test]

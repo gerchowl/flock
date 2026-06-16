@@ -54,6 +54,8 @@ pub enum Method {
     TabClose(TabTarget),
     #[serde(rename = "peers.summary")]
     PeersSummary(EmptyParams),
+    #[serde(rename = "peers.checkout_prepare")]
+    PeersCheckoutPrepare(PeersCheckoutPrepareParams),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
     #[serde(rename = "agent.get")]
@@ -123,6 +125,20 @@ pub struct EmptyParams {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PingParams {}
+
+/// Ask this server to prepare one of its OWN workspaces' branches for a
+/// cross-machine checkout (#125). The hub sends the peer's workspace id (from
+/// `peers.summary`); the spoke resolves the repo + branch from its own state
+/// and acts only on its own git — hub-spoke, the hub never touches peer `.git`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersCheckoutPrepareParams {
+    /// Workspace id on this (the answering) server, e.g. "ws_3".
+    pub workspace_id: String,
+    /// `true` performs `git push -u origin <branch>`; `false` is a read-only
+    /// probe for the hub's pre-action confirmation (dirty / unpushed warnings).
+    #[serde(default)]
+    pub push: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTarget {
@@ -734,6 +750,17 @@ pub enum ResponseResult {
         system: Option<PeerSystemSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
     },
+    PeersCheckoutPrepared {
+        /// The branch the spoke prepared (resolved from the workspace), so the
+        /// hub fetches exactly what was pushed.
+        branch: String,
+        /// The peer's working tree had uncommitted changes (not transferred).
+        was_dirty: bool,
+        /// The branch had unpushed commits / no upstream before this ran.
+        was_unpushed: bool,
+        /// A push to origin was performed by this call (`push: true`).
+        pushed: bool,
+    },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
     },
@@ -1289,6 +1316,45 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let restored: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, request);
+    }
+
+    #[test]
+    fn peers_checkout_prepare_request_and_response_round_trip() {
+        let request = Request {
+            id: "cli:peers:checkout_prepare".into(),
+            method: Method::PeersCheckoutPrepare(PeersCheckoutPrepareParams {
+                workspace_id: "ws_3".into(),
+                push: true,
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "peers.checkout_prepare");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+
+        // `push` defaults to false (probe) when omitted.
+        let probe: Request = serde_json::from_str(
+            r#"{"id":"x","method":"peers.checkout_prepare","params":{"workspace_id":"ws_3"}}"#,
+        )
+        .unwrap();
+        let Method::PeersCheckoutPrepare(params) = probe.method else {
+            panic!("wrong method parsed");
+        };
+        assert!(!params.push);
+
+        let response = SuccessResponse {
+            id: "x".into(),
+            result: ResponseResult::PeersCheckoutPrepared {
+                branch: "feature-x".into(),
+                was_dirty: true,
+                was_unpushed: true,
+                pushed: true,
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"peers_checkout_prepared\""));
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
     }
 
     #[test]

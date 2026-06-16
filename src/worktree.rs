@@ -211,8 +211,7 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
 /// What the spoke found (and did) when preparing a branch for a cross-machine
 /// checkout (#125). The spoke runs this on ITS OWN repo; the hub then fetches
 /// the branch from origin — each node touches only its own git (hub-spoke).
-// Wired into the peers.checkout_prepare RPC handler in #125 phase 2.
-#[cfg_attr(not(test), allow(dead_code))]
+// Driven by the peers.checkout_prepare RPC handler (#125).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerCheckoutReport {
     /// The peer's working tree had uncommitted changes. Only committed refs
@@ -231,7 +230,6 @@ pub struct PeerCheckoutReport {
 /// hub brings it across. `push == false` is a read-only probe for the hub's
 /// pre-action confirmations. The spoke owns its own git; the hub never reaches
 /// into it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prepare_peer_checkout(
     repo: &std::path::Path,
     branch: &str,
@@ -298,6 +296,76 @@ pub(crate) fn prepare_peer_checkout(
         was_unpushed,
         pushed,
     })
+}
+
+/// Bring a peer's branch across to this machine (#125, the hub's local leg):
+/// `git fetch origin <branch>` into a local checkout of the project, then add a
+/// linked worktree on it — reusing an existing local branch when present, else
+/// creating one tracking `origin/<branch>`. Returns the new checkout path. The
+/// spoke already pushed the branch (peers.checkout_prepare with push); this
+/// only ever touches the hub's own git, so the model stays hub-spoke.
+pub(crate) fn fetch_and_add_peer_worktree(
+    repo_dir: &Path,
+    worktree_directory: &Path,
+    repo_name: &str,
+    branch: &str,
+) -> Result<PathBuf, String> {
+    let dir = repo_dir.to_string_lossy().to_string();
+    run_command_capture("git", &["-C", &dir, "fetch", "origin", branch], None)
+        .map_err(|err| format!("git fetch origin {branch} failed: {err}"))?;
+
+    let checkout_path = default_checkout_path(worktree_directory, repo_name, branch);
+    if let Some(parent) = checkout_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let path = checkout_path.display().to_string();
+
+    // A local branch of this name may already exist (the hub worked on it
+    // before): check it out directly. Otherwise create one tracking the freshly
+    // fetched origin branch.
+    let local_exists = run_command_capture(
+        "git",
+        &[
+            "-C",
+            &dir,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        None,
+    )
+    .is_ok();
+    let command = if local_exists {
+        WorktreeCommand {
+            program: "git".to_string(),
+            args: vec![
+                "-C".to_string(),
+                dir,
+                "worktree".to_string(),
+                "add".to_string(),
+                path,
+                branch.to_string(),
+            ],
+        }
+    } else {
+        WorktreeCommand {
+            program: "git".to_string(),
+            args: vec![
+                "-C".to_string(),
+                dir,
+                "worktree".to_string(),
+                "add".to_string(),
+                "--track".to_string(),
+                "-b".to_string(),
+                branch.to_string(),
+                path,
+                format!("origin/{branch}"),
+            ],
+        }
+    };
+    run_worktree_command(&command)?;
+    Ok(checkout_path)
 }
 
 /// The repo's default branch: origin/HEAD when set, else main/master if present.
@@ -744,6 +812,44 @@ mod tests {
         let (repo, _origin) = create_repo_with_bare_origin("peer-missing");
         let err = prepare_peer_checkout(&repo, "nope", false).unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn fetch_and_add_peer_worktree_brings_branch_across_from_origin() {
+        // A peer pushes feature-x to origin (the spoke's checkout-prepare leg).
+        let (peer, origin) = create_repo_with_bare_origin("xchk-peer");
+        run_git(&peer, &["checkout", "--quiet", "-b", "feature-x"]);
+        std::fs::write(peer.join("feature.txt"), "from peer\n").unwrap();
+        run_git(&peer, &["add", "feature.txt"]);
+        run_git(&peer, &["commit", "--quiet", "-m", "feature work"]);
+        run_git(&peer, &["push", "--quiet", "-u", "origin", "feature-x"]);
+
+        // The hub has its OWN clone of the same origin, with no feature-x yet.
+        let hub = unique_temp_path("xchk-hub");
+        let clone_ok = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                &origin.display().to_string(),
+                &hub.display().to_string(),
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(clone_ok, "git clone of origin failed");
+        run_git(&hub, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&hub, &["config", "user.name", "Flock Test"]);
+
+        let worktree_dir = unique_temp_path("xchk-worktrees");
+        let path = fetch_and_add_peer_worktree(&hub, &worktree_dir, "hub", "feature-x").unwrap();
+
+        // The hub now has a worktree on the peer's branch, with its commit.
+        assert!(path.is_dir(), "worktree checkout exists");
+        assert_eq!(checkout_branch_name(&path).as_deref(), Some("feature-x"));
+        assert!(
+            path.join("feature.txt").is_file(),
+            "peer's commit is present"
+        );
     }
 
     #[test]
