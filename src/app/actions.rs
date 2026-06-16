@@ -294,12 +294,33 @@ impl AppState {
     /// the least (header > agent panel > nav list).
     pub(crate) const NAVIGATOR_HEADER_FIELD_VALUE_COLS: usize = 16;
 
+    /// Workspace indices in the same fleet-stable, project-grouped order the
+    /// sidebar uses (#121): sections sort by their machine-independent project
+    /// key (#85), members stay contiguous in storage order, identity-less rows
+    /// sort by name. Unlike the sidebar this never folds on collapse — the
+    /// navigator always lists every workspace.
+    pub(crate) fn project_grouped_workspace_order(&self) -> Vec<usize> {
+        let section_keys = self.project_section_keys();
+        let sort_ids = self.project_section_sort_ids();
+        let mut order: Vec<usize> = (0..self.workspaces.len()).collect();
+        order.sort_by_cached_key(|&i| {
+            let section = sort_ids[i]
+                .clone()
+                .unwrap_or_else(|| self.workspaces[i].display_name().to_ascii_lowercase());
+            (section, section_keys[i].clone().unwrap_or_default(), i)
+        });
+        order
+    }
+
     pub(crate) fn navigator_rows(&self) -> Vec<NavigatorRow> {
         let query = self.navigator.query.trim().to_lowercase();
         let query_kind = navigator_query_kind(&query, self.navigator.state_filter);
         let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let mut rows = Vec::new();
-        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+        // #121: group by project + fleet-stable order, matching the sidebar,
+        // instead of raw storage order.
+        for ws_idx in self.project_grouped_workspace_order() {
+            let ws = &self.workspaces[ws_idx];
             let workspace_label = ws.display_name_from(&self.terminals, &terminal_runtimes);
             let activity = workspace_activity_summary(ws, &self.terminals);
             let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
@@ -3665,6 +3686,32 @@ mod tests {
             None
         );
         assert_eq!(selected_url("open file:///tmp/report", "file"), None);
+    }
+
+    #[test]
+    fn navigator_groups_workspaces_by_project_fleet_stable_order() {
+        // #121: storage order interleaves two checkouts of one project (0, 2)
+        // with a standalone (1); the navigator order must group 0 and 2
+        // contiguously, matching the sidebar instead of raw storage order.
+        let mut state = app_with_workspaces(&["a-one", "z-solo", "a-two"]);
+        for i in [0usize, 2] {
+            state.workspaces[i].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+                key: "repo-key".into(),
+                checkout_key: format!("/repo/{i}"),
+                label: "repo".into(),
+                repo_root: std::path::PathBuf::from(format!("/repo/{i}")),
+                is_linked_worktree: i == 2,
+                project_key: "dir:repo-key".into(),
+            });
+        }
+
+        let order = state.project_grouped_workspace_order();
+        let pos = |idx: usize| order.iter().position(|&x| x == idx).unwrap();
+        assert_eq!(
+            (pos(0) as isize - pos(2) as isize).abs(),
+            1,
+            "the two checkouts of one project are contiguous: {order:?}"
+        );
     }
 
     #[test]
