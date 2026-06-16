@@ -15,6 +15,7 @@ mod creation;
 pub(crate) mod float;
 mod ids;
 mod input;
+mod peer_checkout;
 mod runtime;
 mod session;
 pub mod state;
@@ -495,6 +496,8 @@ impl App {
                 .collect(),
             fleet_snapshot: None,
             request_peer_switch: None,
+            request_peer_checkout: None,
+            peer_checkout: None,
             servers_panel_scope: panel_scope_from_config(config.ui.servers_panel_scope),
             spaces_panel_scope: panel_scope_from_config(config.ui.spaces_panel_scope),
             server_filter: None,
@@ -910,6 +913,11 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_kill_worktree.take() {
                 self.open_kill_worktree_confirmation(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some((peer_idx, ws_idx)) = self.state.request_peer_checkout.take() {
+                self.begin_peer_checkout(peer_idx, ws_idx);
                 needs_render = true;
             }
 
@@ -1546,6 +1554,11 @@ impl App {
             Mode::ConfirmRemoveWorktree => {
                 self.handle_worktree_remove_key(key_event);
             }
+            Mode::ConfirmCrossCheckout => match key_event.code {
+                crossterm::event::KeyCode::Enter => self.confirm_peer_checkout(),
+                crossterm::event::KeyCode::Esc => self.cancel_peer_checkout(),
+                _ => {}
+            },
             Mode::Resize => {
                 input::handle_resize_key(&mut self.state, key);
             }

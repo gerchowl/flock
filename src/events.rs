@@ -66,6 +66,16 @@ pub enum AppEvent {
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).
     PeerSummaryFetched(crate::peers::PeerSummaryFetch),
+    /// Cross-machine checkout (#125), read-only probe (`push=false`): the peer
+    /// reported its branch's working-tree / push state, feeding the confirm
+    /// dialog before any mutation.
+    PeerCheckoutProbed(Result<crate::peers::PeerCheckoutOutcome, String>),
+    /// Cross-machine checkout (#125), push leg (`push=true`): the peer pushed
+    /// the branch to origin so the hub can fetch it.
+    PeerCheckoutPushed(Result<crate::peers::PeerCheckoutOutcome, String>),
+    /// Cross-machine checkout (#125), local leg: the hub fetched the branch
+    /// from origin and added a worktree at this path (or failed).
+    PeerCheckoutWorktreeReady(Result<std::path::PathBuf, String>),
     /// A user prompt submitted to an agent pane (integration hook report).
     HookPromptReported {
         pane_id: PaneId,

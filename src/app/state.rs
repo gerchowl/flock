@@ -743,6 +743,36 @@ pub struct RemoteCardArea {
     pub indented: bool,
 }
 
+/// In-flight cross-machine checkout (#125): the hub drives a peer's workspace
+/// branch through probe → confirm → push (on the spoke, over SSH) then fetch +
+/// worktree add + open (locally). The local target is resolved up front so we
+/// fail fast when the hub has no checkout of the project to add a worktree to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerCheckoutState {
+    /// The peer to invoke over SSH (probe + push).
+    pub peer: crate::config::PeerConfig,
+    /// Display host (peer's reported host, falling back to the peer name).
+    pub host: String,
+    /// Workspace id on the peer — the prepare target.
+    pub remote_workspace_id: String,
+    /// Branch to check out (from the summary row; refreshed from the report).
+    pub branch: String,
+    /// Local source checkout of the same project: the repo the worktree is
+    /// added to, and the source-row membership anchor.
+    pub source_repo_root: std::path::PathBuf,
+    pub source_checkout_path: std::path::PathBuf,
+    pub source_workspace_id: String,
+    pub repo_key: String,
+    pub repo_name: String,
+    /// The probe report, once it returns — drives the confirm dialog text.
+    pub report: Option<crate::peers::PeerCheckoutOutcome>,
+    /// A leg (probe / push / local) is running: the dialog shows progress and
+    /// repeat confirms are ignored.
+    pub busy: bool,
+    /// Last error to surface in the dialog.
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     /// When set, the created workspace's root pane resumes a fork of this
@@ -959,6 +989,10 @@ pub enum Mode {
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
+    /// Confirm a cross-machine checkout (#125) after the read-only probe, so the
+    /// user sees the host, branch, and any dirty / unpushed warnings before the
+    /// branch is pushed to origin and fetched locally.
+    ConfirmCrossCheckout,
     Resize,
     ConfirmClose,
     ContextMenu,
@@ -1362,6 +1396,15 @@ pub enum ContextMenuKind {
         key: String,
         collapsed: bool,
     },
+    /// A federated peer's workspace row (#125): offers a cross-machine checkout
+    /// of that workspace's branch into a local checkout of the same project.
+    /// Only config-owned peers (live-polled, SSH-reachable) carry this menu.
+    PeerWorkspace {
+        /// Index into `state.peer_summaries` (== `state.peers`).
+        peer_idx: usize,
+        /// Index into that peer's `workspaces` summary vec.
+        ws_idx: usize,
+    },
 }
 
 /// Right-click context menu state.
@@ -1499,6 +1542,7 @@ impl ContextMenuState {
                 "Collapse",
                 "Close group",
             ],
+            ContextMenuKind::PeerWorkspace { .. } => vec!["Check out here"],
         };
         if branchable_workspace {
             items.push("Branch session");
@@ -1620,6 +1664,13 @@ pub struct AppState {
     /// A server row was selected (or switch_home pressed): switch the
     /// client to this target. Consumed by both loops.
     pub request_peer_switch: Option<PeerSwitchRequest>,
+    /// A peer workspace row's "Check out here" was chosen (#125): (peer_idx,
+    /// ws_idx) into peer_summaries. Consumed by the App loop, which resolves
+    /// the local target and kicks off the read-only probe.
+    pub request_peer_checkout: Option<(usize, usize)>,
+    /// In-flight cross-machine checkout (#125): probe → confirm → push → local
+    /// fetch + worktree add + open. None when idle.
+    pub peer_checkout: Option<PeerCheckoutState>,
     /// Scope of the `servers` sidebar section: all server rows, or only the
     /// current machine (plus the home row when attached remotely).
     pub servers_panel_scope: PanelScope,
@@ -2133,6 +2184,8 @@ impl AppState {
             peer_summaries: Vec::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
+            request_peer_checkout: None,
+            peer_checkout: None,
             servers_panel_scope: PanelScope::All,
             spaces_panel_scope: PanelScope::All,
             server_filter: None,

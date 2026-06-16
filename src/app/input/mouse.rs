@@ -344,6 +344,12 @@ impl AppState {
             }
         }
 
+        // The cross-machine checkout confirm (#125) is driven by enter and esc
+        // only; swallow mouse events so clicks don't leak to the UI beneath it.
+        if self.mode == Mode::ConfirmCrossCheckout {
+            return None;
+        }
+
         if matches!(
             self.mode,
             Mode::NewLinkedWorktree | Mode::OpenExistingWorktree | Mode::ConfirmRemoveWorktree
@@ -1252,6 +1258,31 @@ impl AppState {
                         list: MenuListState::new(0),
                     });
                     self.mode = Mode::ContextMenu;
+                }
+                // A federated peer's workspace row (#125): offer a cross-machine
+                // checkout. Only config-owned peers are SSH-reachable; snapshot
+                // and origin rows (render-only) get no menu, like the home row.
+                if self.context_menu.is_none() {
+                    if let Some((peer_idx, ws_idx)) = self
+                        .view
+                        .remote_card_areas
+                        .iter()
+                        .find(|card| mouse.row == card.rect.y)
+                        .and_then(|card| match card.peer {
+                            crate::app::state::RemotePeerRef::Config { peer_idx } => {
+                                Some((peer_idx, card.ws_idx))
+                            }
+                            _ => None,
+                        })
+                    {
+                        self.context_menu = Some(ContextMenuState {
+                            kind: ContextMenuKind::PeerWorkspace { peer_idx, ws_idx },
+                            x: mouse.column,
+                            y: mouse.row,
+                            list: MenuListState::new(0),
+                        });
+                        self.mode = Mode::ContextMenu;
+                    }
                 }
             }
 

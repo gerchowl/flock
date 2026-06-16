@@ -198,6 +198,21 @@ impl App {
             return;
         }
 
+        if let AppEvent::PeerCheckoutProbed(result) = ev {
+            self.handle_peer_checkout_probed(result);
+            return;
+        }
+
+        if let AppEvent::PeerCheckoutPushed(result) = ev {
+            self.handle_peer_checkout_pushed(result);
+            return;
+        }
+
+        if let AppEvent::PeerCheckoutWorktreeReady(result) = ev {
+            self.handle_peer_checkout_worktree_ready(result);
+            return;
+        }
+
         if let AppEvent::WorktreeKillGateFinished(result) = ev {
             self.handle_worktree_kill_gate_finished(result);
             return;
