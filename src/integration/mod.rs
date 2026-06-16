@@ -81,6 +81,9 @@ const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 pub(crate) struct ClaudeInstallPaths {
     pub hook_path: PathBuf,
     pub settings_path: PathBuf,
+    /// A stale `herdr`-era hook file or settings.json registration was removed
+    /// during this install (rebrand cleanup).
+    pub removed_legacy_hook: bool,
 }
 
 #[derive(Debug)]
@@ -267,16 +270,22 @@ pub(crate) fn install_target(
         }
         crate::api::schema::IntegrationTarget::Claude => {
             let installed = install_claude()?;
-            vec![
-                format!(
-                    "installed claude integration hook to {}",
-                    installed.hook_path.display()
-                ),
-                format!(
-                    "ensured claude settings at {}",
-                    installed.settings_path.display()
-                ),
-            ]
+            let mut messages = Vec::new();
+            if installed.removed_legacy_hook {
+                messages.push(
+                    "removed stale herdr-era claude hook (file and/or settings registration)"
+                        .to_string(),
+                );
+            }
+            messages.push(format!(
+                "installed claude integration hook to {}",
+                installed.hook_path.display()
+            ));
+            messages.push(format!(
+                "ensured claude settings at {}",
+                installed.settings_path.display()
+            ));
+            messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
             let installed = install_codex()?;
@@ -870,6 +879,9 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     let hook_path = hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
     fs::write(&hook_path, CLAUDE_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    // Rebrand cleanup: drop the dead `herdr-agent-state.sh` shim left by a
+    // pre-flock install (its `HERDR_ENV` gate is never set now).
+    let removed_legacy_hook_file = remove_legacy_herdr_file(&hook_path)?;
 
     let settings_path = dir.join("settings.json");
     let mut settings = if settings_path.is_file() {
@@ -889,6 +901,13 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         "claude settings",
         "claude settings hooks",
     )?;
+    // Rebrand cleanup: strip any settings.json registration still pointing at
+    // the pre-flock `herdr-agent-state.sh` shim, across every event.
+    let legacy_hook_path =
+        hook_path.with_file_name(CLAUDE_HOOK_INSTALL_NAME.replace("flock", "herdr"));
+    let removed_legacy_registrations =
+        remove_legacy_herdr_hook_registrations(hooks, &legacy_hook_path);
+
     let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
     remove_command_hook(
         hooks,
@@ -953,6 +972,7 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     Ok(ClaudeInstallPaths {
         hook_path,
         settings_path,
+        removed_legacy_hook: removed_legacy_hook_file || removed_legacy_registrations,
     })
 }
 
@@ -1880,6 +1900,75 @@ fn remove_command_hook(
     Ok(removed)
 }
 
+/// Delete a stale `herdr`-era integration file left next to its `flock`-named
+/// replacement. The rebrand renamed the binary's exported env vars
+/// (`HERDR_* -> FLOCK_*`) and the installed shim (`herdr-agent-state.* ->
+/// flock-agent-state.*`); the old file no longer matches (its `HERDR_ENV`
+/// gate is never set), so it is a dead no-op. Returns whether a file was
+/// removed. The legacy name is the flock name with `flock` swapped back to
+/// `herdr` (covers `flock-agent-state.sh`, `flock-omp-agent-state.ts`, etc.).
+fn remove_legacy_herdr_file(flock_path: &Path) -> io::Result<bool> {
+    let Some(name) = flock_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(false);
+    };
+    if !name.contains("flock") {
+        return Ok(false);
+    }
+    let legacy_path = flock_path.with_file_name(name.replace("flock", "herdr"));
+    if !legacy_path.is_file() {
+        return Ok(false);
+    }
+    fs::remove_file(&legacy_path)?;
+    Ok(true)
+}
+
+/// Strip any settings.json command hook (across every event) that still invokes
+/// the stale `herdr`-era shim path. The old install registered
+/// `bash '<.../herdr-agent-state.sh>' <arg>`; flock only de-dupes its own path,
+/// so without this the dead registration lingers and fires a no-op subprocess
+/// per hook event. Empties left behind are pruned like [`remove_command_hook`].
+/// Returns whether anything was removed.
+fn remove_legacy_herdr_hook_registrations(
+    hooks: &mut Map<String, Value>,
+    legacy_hook_path: &Path,
+) -> bool {
+    let needle = legacy_hook_path.display().to_string();
+    let mut removed = false;
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain_mut(|entry| {
+            let Some(hook_entries) = entry
+                .as_object_mut()
+                .and_then(|obj| obj.get_mut("hooks"))
+                .and_then(Value::as_array_mut)
+            else {
+                return true;
+            };
+            let before = hook_entries.len();
+            hook_entries.retain(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|command| !command.contains(&needle))
+            });
+            if hook_entries.len() != before {
+                removed = true;
+            }
+            !hook_entries.is_empty()
+        });
+        if hooks
+            .get(&event)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.is_empty())
+        {
+            hooks.remove(&event);
+        }
+    }
+    removed
+}
+
 fn remove_direct_command_hook(
     hooks: &mut Map<String, Value>,
     event: &str,
@@ -2718,6 +2807,72 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_claude_removes_stale_herdr_hook() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        let hooks_dir = claude_dir.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        // A pre-flock (herdr) install left a herdr-named shim plus a
+        // settings.json registration pointing at it.
+        let legacy_hook = hooks_dir.join("herdr-agent-state.sh");
+        fs::write(&legacy_hook, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        let legacy_cmd = format!("bash '{}' working", legacy_hook.display());
+        let settings = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [ { "type": "command", "command": legacy_cmd } ] }
+                ]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_claude().unwrap();
+
+        assert!(installed.removed_legacy_hook);
+        assert!(
+            !legacy_hook.exists(),
+            "stale herdr shim file should be deleted"
+        );
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
+        // No registration referencing the dead herdr shim survives anywhere.
+        let blob = settings.to_string();
+        assert!(
+            !blob.contains("herdr-agent-state.sh"),
+            "stale herdr registration should be stripped: {blob}"
+        );
+        // The flock hook is installed in its place.
+        assert!(installed.hook_path.is_file());
+        assert!(installed
+            .hook_path
+            .to_string_lossy()
+            .ends_with("flock-agent-state.sh"));
+    }
+
+    #[test]
+    fn install_claude_reports_no_legacy_removal_on_clean_dir() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_claude().unwrap();
+        assert!(
+            !installed.removed_legacy_hook,
+            "clean install should not report a legacy removal"
+        );
     }
 
     #[test]
