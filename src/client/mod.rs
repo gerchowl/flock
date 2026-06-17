@@ -575,6 +575,10 @@ fn setup_terminal_with_capabilities(
     // the protective hook so a panic restores the terminal without ratatui's
     // eprintln-in-restore double-panicking on a dead stderr (#95 / switch crash).
     install_protective_panic_hook();
+    // Raw mode + alt-screen are on the moment try_init succeeds, so arm the
+    // crash restore HERE — not after the rest of setup — to cover a crash in
+    // the input-reporting `execute!`s below (the abort window the PR closes).
+    mark_terminal_owned(true);
 
     if enable_client_protocols {
         if mouse_capture {
@@ -607,9 +611,6 @@ fn setup_terminal_with_capabilities(
         io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
     }
-
-    // Now in raw mode with input reporting on: a crash from here must reset it.
-    mark_terminal_owned(true);
 
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
@@ -1348,6 +1349,9 @@ fn run_client_with_mode(
     // in-process leg may have left set (#63) so a clean exit of THIS leg
     // restores the host terminal fully.
     SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
+    // Defensive: a non-aborting panic in a prior in-process leg could leave the
+    // flag set; clear it so a fresh leg's loop is not killed by stale state.
+    CLIENT_PANICKED.store(false, Ordering::Release);
 
     // If the launcher chained this leg in after a seamless switch, the host
     // terminal is INHERITED-held (frozen frame, raw mode) until this leg
