@@ -1,10 +1,10 @@
-//! Idle "flock" gimmick: when the UI sits idle, grass grows organically along
-//! the sidebar's separator bars; sheep peek in from the edges, wait until a tuft
-//! is ripe, then race for it — closest wins, so a nearer sheep steals a claim a
-//! farther one hasn't reached yet. They crop it, move to the next, and retire
-//! off-screen after a few patches while fresh sheep wander in. Growth ramps up
-//! over the idle spell so the scene fills out. Any interaction and the whole
-//! flock bolts off the bars.
+//! Idle "flock" gimmick: when the UI sits idle, grass grows slowly along the
+//! sidebar's separator bars; sheep wander in from above or below, drop onto the
+//! line, wait for a tuft to ripen, then race for it — closest wins, so a nearer
+//! sheep steals a claim a farther one hasn't reached yet. They crop it, move on,
+//! and after a few patches step back off the line (above/below) and leave while
+//! fresh sheep arrive. Growth ramps up a little over the idle spell. Any
+//! interaction and the whole flock bolts off the bars.
 //!
 //! A small time-stepped, agent-based sim. State lives in [`SheepSim`] (held in
 //! `AppState`) and advances by wall-clock `dt` each render — frame-rate
@@ -38,12 +38,21 @@ const CROPPED: f32 = 0.3; // grass is "eaten" below this
 const WALK: f32 = 3.0; // cells/sec — deliberately unhurried
 const EAT: f32 = 0.9; // grass-height/sec while grazing
 const FLEE: f32 = 42.0; // cells/sec bolting off
+const ENTER_SECS: f32 = 0.5; // time hovering above/below before landing
+const LEAVE_SECS: f32 = 0.5; // time stepping off the line before vanishing
 const EATEN_BEFORE_RETIRE: u32 = 4;
-const MAX_PER_LANE: usize = 2;
+const SHEEP_CELLS: f32 = 2.0; // a sprite is wool + head
+const MAX_OCCUPANCY: f32 = 0.30; // sheep cover at most ~30% of a bar's width
+const LANE_CAP_HARD: usize = 8; // sanity ceiling on very wide bars
 const SPAWN_COOLDOWN: f32 = 2.0; // sec between a lane's arrivals
-const RAMP_FULL_SECS: f32 = 18.0; // idle time to reach max growth speed
-const RAMP_MAX: f32 = 3.0;
+const RAMP_FULL_SECS: f32 = 30.0; // idle time to reach max growth speed
+const RAMP_MAX: f32 = 2.0;
 const MAX_STEP: f32 = 0.25; // clamp a single step after a long pause
+
+/// Max sheep on a bar: ~30% of its width occupied (each sprite is 2 cells).
+fn lane_cap(width: u16) -> usize {
+    ((width as f32 * MAX_OCCUPANCY / SHEEP_CELLS).floor() as usize).clamp(1, LANE_CAP_HARD)
+}
 
 /// What the flock is doing this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,14 +127,16 @@ fn consider_run(best: &mut Option<(u16, u16)>, s: u16, e: u16) {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
-    /// Peeking at the entry edge, waiting for a tuft to ripen.
+    /// Hovering one row above/below, about to land on the line.
+    Entering,
+    /// On the line, waiting for a tuft to ripen.
     Peek,
     /// Heading for a claimed ripe tuft (its column).
     Walk(u16),
     /// Grazing the tuft at this column down.
     Eat(u16),
-    /// Done; walking off the nearest edge.
-    Retire,
+    /// Sated; stepped off the line and leaving.
+    Leaving,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +144,10 @@ struct Sheep {
     x: f32,
     /// +1 facing/heading right, -1 left. The wool body trails the head.
     facing: i8,
+    /// Row offset from the line: -1 above, 0 on it, +1 below (enter/leave).
+    y_off: i8,
+    /// Countdown for the current enter/leave hop.
+    timer: f32,
     state: State,
     eaten: u32,
 }
@@ -152,7 +167,6 @@ struct Lane {
     tufts: Vec<Tuft>,
     sheep: Vec<Sheep>,
     spawn_cd: f32,
-    entry_left: bool,
 }
 
 /// Persistent idle-flock simulation, held in `AppState` and stepped each render.
@@ -234,26 +248,28 @@ impl SheepSim {
         let ramp = (1.0 + self.age / RAMP_FULL_SECS * (RAMP_MAX - 1.0)).min(RAMP_MAX);
 
         for li in 0..self.lanes.len() {
-            // Trickle a new sheep in (alternating edges) once there's foreseeable
-            // food and the lane isn't crowded.
+            let cap = lane_cap(self.lanes[li].x1 - self.lanes[li].x0 + 1);
             let spawn = {
                 let lane = &self.lanes[li];
                 !fleeing
-                    && lane.sheep.len() < MAX_PER_LANE
+                    && lane.sheep.len() < cap
                     && lane.spawn_cd <= 0.0
                     && lane.tufts.iter().any(|t| t.height > 0.15)
             };
             if spawn {
+                // Drop in from above or below at a random spot on the bar.
+                let rx = self.rand();
+                let above = self.rand() < 0.5;
                 let jitter = self.rand();
                 let lane = &mut self.lanes[li];
-                let left = lane.entry_left;
                 lane.sheep.push(Sheep {
-                    x: if left { lane.x0 as f32 } else { lane.x1 as f32 },
-                    facing: if left { 1 } else { -1 },
-                    state: State::Peek,
+                    x: lane.x0 as f32 + rx * (lane.x1 - lane.x0) as f32,
+                    facing: if rx < 0.5 { 1 } else { -1 },
+                    y_off: if above { -1 } else { 1 },
+                    timer: ENTER_SECS,
+                    state: State::Entering,
                     eaten: 0,
                 });
-                lane.entry_left = !left;
                 lane.spawn_cd = SPAWN_COOLDOWN + jitter;
             }
             self.lanes[li].spawn_cd -= dt;
@@ -263,14 +279,14 @@ impl SheepSim {
 
     fn seed_lane(&mut self, y: u16, x0: u16, x1: u16) -> Lane {
         // Tufts at organically-spaced columns, each with its own start height
-        // and pace, so the bar greens up unevenly.
+        // and (slow) pace, so the bar greens up unevenly.
         let mut tufts = Vec::new();
         let mut col = x0 + 1;
         while col < x1 {
             tufts.push(Tuft {
                 x: col,
                 height: self.rand() * 0.6,
-                grow: 0.05 + self.rand() * 0.28,
+                grow: 0.02 + self.rand() * 0.10,
             });
             col += 2 + (self.rand() * 4.0) as u16;
         }
@@ -281,13 +297,14 @@ impl SheepSim {
             tufts,
             sheep: Vec::new(),
             spawn_cd: self.rand() * SPAWN_COOLDOWN,
-            entry_left: self.rand() < 0.5,
         }
     }
 
     fn draw(&self, buf: &mut Buffer, palette: &Palette) {
         let grass_style = Style::default().fg(palette.green);
         let sheep_style = Style::default().add_modifier(Modifier::BOLD);
+        let max_y = buf.area().bottom();
+        let min_y = buf.area().top();
         for lane in &self.lanes {
             for t in &lane.tufts {
                 if let Some(glyph) = grass_glyph(t.height) {
@@ -299,14 +316,19 @@ impl SheepSim {
                 if col < lane.x0 as f32 || col > lane.x1 as f32 {
                     continue;
                 }
+                let row = lane.y as i32 + s.y_off as i32;
+                if row < min_y as i32 || row >= max_y as i32 {
+                    continue;
+                }
+                let row = row as u16;
                 let head = col as u16;
-                // Wool trails opposite the heading; off-bar (e.g. a peeking sheep
-                // at the very edge) just shows the head poking in.
+                // Wool trails opposite the heading; off-bar (e.g. landing at the
+                // very edge) just shows the head.
                 let wool_x = head as i32 - s.facing as i32;
                 if wool_x >= lane.x0 as i32 && wool_x <= lane.x1 as i32 {
-                    buf.set_string(wool_x as u16, lane.y, WOOL, sheep_style);
+                    buf.set_string(wool_x as u16, row, WOOL, sheep_style);
                 }
-                buf.set_string(head, lane.y, HEAD, sheep_style);
+                buf.set_string(head, row, HEAD, sheep_style);
             }
         }
     }
@@ -326,14 +348,14 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool, ramp: f32) {
         for s in &mut lane.sheep {
             let dir = if s.x - lo < hi - s.x { -1.0 } else { 1.0 };
             s.facing = dir as i8;
+            s.y_off = 0;
             s.x += dir * FLEE * dt;
         }
         return;
     }
 
-    // Closest-wins claiming: a tuft goes to the nearest free (Peek/Walk) sheep,
-    // so a newcomer can steal a claim a farther sheep hasn't reached yet. Sheep
-    // already Eating keep their tuft.
+    // Closest-wins claiming over ripe, non-eaten tufts. Only sheep already on
+    // the line and free (Peek/Walk) compete; a grazing sheep keeps its tuft.
     let eating: Vec<u16> = lane
         .sheep
         .iter()
@@ -351,10 +373,9 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool, ramp: f32) {
     let mut free: Vec<usize> = (0..lane.sheep.len())
         .filter(|&i| matches!(lane.sheep[i].state, State::Peek | State::Walk(_)))
         .collect();
-    // Greedy nearest pairing.
     let mut claims: Vec<(usize, u16)> = Vec::new();
     while !ripe.is_empty() && !free.is_empty() {
-        let mut best: Option<(usize, usize, f32)> = None; // (free_i, ripe_i, dist)
+        let mut best: Option<(usize, usize, f32)> = None;
         for (fi, &si) in free.iter().enumerate() {
             for (ri, &tx) in ripe.iter().enumerate() {
                 let d = (lane.sheep[si].x - tx as f32).abs();
@@ -368,11 +389,21 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool, ramp: f32) {
         free.swap_remove(fi);
         ripe.swap_remove(ri);
     }
-
     let claim_of = |si: usize| claims.iter().find(|(s, _)| *s == si).map(|(_, tx)| *tx);
 
     for si in 0..lane.sheep.len() {
         match lane.sheep[si].state {
+            State::Entering => {
+                let s = &mut lane.sheep[si];
+                s.timer -= dt;
+                if s.timer <= 0.0 {
+                    s.y_off = 0; // landed on the line
+                    s.state = State::Peek;
+                }
+            }
+            State::Leaving => {
+                lane.sheep[si].timer -= dt; // reaped below when it elapses
+            }
             State::Eat(tx) => {
                 lane.sheep[si].x = tx as f32;
                 let done = if let Some(t) = lane.tufts.iter_mut().find(|t| t.x == tx) {
@@ -383,11 +414,14 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool, ramp: f32) {
                 };
                 if done {
                     lane.sheep[si].eaten += 1;
-                    lane.sheep[si].state = if lane.sheep[si].eaten >= EATEN_BEFORE_RETIRE {
-                        State::Retire
+                    if lane.sheep[si].eaten >= EATEN_BEFORE_RETIRE {
+                        // Step off the line (above or below) and leave.
+                        lane.sheep[si].state = State::Leaving;
+                        lane.sheep[si].y_off = if tx % 2 == 0 { -1 } else { 1 };
+                        lane.sheep[si].timer = LEAVE_SECS;
                     } else {
-                        State::Peek
-                    };
+                        lane.sheep[si].state = State::Peek;
+                    }
                 }
             }
             State::Peek | State::Walk(_) => {
@@ -403,22 +437,14 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool, ramp: f32) {
                         s.state = State::Eat(tx);
                     }
                 } else {
-                    // Nothing ripe to chase: wait, peeking at the entry edge.
-                    lane.sheep[si].state = State::Peek;
+                    lane.sheep[si].state = State::Peek; // wait on the line
                 }
-            }
-            State::Retire => {
-                let s = &mut lane.sheep[si];
-                let dir = if s.x - lo < hi - s.x { -1.0 } else { 1.0 };
-                s.facing = dir as i8;
-                s.x += dir * WALK * dt;
             }
         }
     }
 
-    // Reap sheep that have retired off the bar.
     lane.sheep
-        .retain(|s| !(matches!(s.state, State::Retire) && (s.x < lo - 1.0 || s.x > hi + 1.0)));
+        .retain(|s| !(matches!(s.state, State::Leaving) && s.timer <= 0.0));
 }
 
 #[cfg(test)]
@@ -426,9 +452,19 @@ mod tests {
     use super::*;
 
     fn run(sim: &mut SheepSim, lanes: &[(u16, u16, u16)], secs: f32, fleeing: bool) {
-        let steps = (secs / 0.1) as usize;
-        for _ in 0..steps {
+        for _ in 0..(secs / 0.1) as usize {
             sim.advance(0.1, lanes, fleeing);
+        }
+    }
+
+    fn sheep(x: f32, state: State, eaten: u32) -> Sheep {
+        Sheep {
+            x,
+            facing: 1,
+            y_off: 0,
+            timer: 0.0,
+            state,
+            eaten,
         }
     }
 
@@ -446,42 +482,48 @@ mod tests {
     }
 
     #[test]
+    fn lane_cap_scales_with_width() {
+        assert_eq!(lane_cap(8), 1); // 8*0.3/2 = 1.2 -> 1
+        assert_eq!(lane_cap(20), 3); // 20*0.3/2 = 3.0
+        assert_eq!(lane_cap(40), 6);
+        assert_eq!(lane_cap(200), LANE_CAP_HARD); // ceiling
+    }
+
+    #[test]
+    fn sheep_enter_from_off_line_then_land() {
+        let mut sim = SheepSim::default();
+        let lanes = vec![(5u16, 0u16, 39u16)];
+        sim.advance(0.1, &lanes, false);
+        // First arrival hovers off the line (y_off != 0) while Entering.
+        run(&mut sim, &lanes, 0.2, false);
+        let entering = sim.lanes[0]
+            .sheep
+            .iter()
+            .find(|s| s.state == State::Entering);
+        if let Some(s) = entering {
+            assert!(s.y_off != 0, "enters from above/below the line");
+        }
+        // After the hop they are on the line (y_off == 0).
+        run(&mut sim, &lanes, 1.0, false);
+        assert!(sim.lanes[0]
+            .sheep
+            .iter()
+            .all(|s| s.state == State::Entering || s.y_off == 0));
+    }
+
+    #[test]
     fn grass_ripens_and_sheep_arrive_and_eat() {
         let mut sim = SheepSim::default();
         let lanes = vec![(1u16, 0u16, 39u16)];
-        run(&mut sim, &lanes, 40.0, false);
+        run(&mut sim, &lanes, 70.0, false);
         let lane = &sim.lanes[0];
         assert!(!lane.sheep.is_empty(), "sheep wandered in");
-        // Something got grazed: at least one sheep is eating or has eaten.
         assert!(
             lane.sheep
                 .iter()
                 .any(|s| matches!(s.state, State::Eat(_)) || s.eaten > 0),
             "a sheep reached and grazed grass"
         );
-    }
-
-    #[test]
-    fn sheep_wait_at_edge_until_grass_is_ripe() {
-        let mut sim = SheepSim::default();
-        let lanes = vec![(1u16, 0u16, 39u16)];
-        // Force a sheep in immediately, but keep all grass below ripe.
-        sim.advance(0.1, &lanes, false);
-        for t in &mut sim.lanes[0].tufts {
-            t.height = RIPE - 0.3;
-            t.grow = 0.0;
-        }
-        sim.lanes[0].sheep.push(Sheep {
-            x: 0.0,
-            facing: 1,
-            state: State::Peek,
-            eaten: 0,
-        });
-        run(&mut sim, &lanes, 3.0, false);
-        // No ripe grass → the sheep never leaves Peek and stays put at the edge.
-        let s = &sim.lanes[0].sheep[sim.lanes[0].sheep.len() - 1];
-        assert_eq!(s.state, State::Peek);
-        assert!(s.x <= 1.0, "still peeking at the edge: x={}", s.x);
     }
 
     #[test]
@@ -495,25 +537,10 @@ mod tests {
                 height: MAX_GRASS,
                 grow: 0.0,
             }],
-            sheep: vec![
-                Sheep {
-                    x: 18.0,
-                    facing: 1,
-                    state: State::Peek,
-                    eaten: 0,
-                }, // near
-                Sheep {
-                    x: 2.0,
-                    facing: 1,
-                    state: State::Peek,
-                    eaten: 0,
-                }, // far
-            ],
+            sheep: vec![sheep(18.0, State::Peek, 0), sheep(2.0, State::Peek, 0)],
             spawn_cd: 999.0,
-            entry_left: true,
         };
         tick_lane(&mut lane, 0.1, false, 1.0);
-        // The near sheep heads for / reaches the tuft; the far one keeps peeking.
         assert!(matches!(
             lane.sheep[0].state,
             State::Walk(20) | State::Eat(20)
@@ -522,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn sheep_retire_after_enough_patches() {
+    fn sated_sheep_leaves_off_the_line() {
         let mut lane = Lane {
             y: 1,
             x0: 0,
@@ -532,22 +559,24 @@ mod tests {
                 height: MAX_GRASS,
                 grow: 0.0,
             }],
-            sheep: vec![Sheep {
-                x: 5.0,
-                facing: 1,
-                state: State::Eat(5),
-                eaten: EATEN_BEFORE_RETIRE - 1,
-            }],
+            sheep: vec![sheep(5.0, State::Eat(5), EATEN_BEFORE_RETIRE - 1)],
             spawn_cd: 999.0,
-            entry_left: true,
         };
-        // Graze the (non-regrowing) tuft to nothing → counts the last patch.
+        // Graze the last patch -> Leaving (off the line), then reaped.
+        let mut left_off_line = false;
         for _ in 0..40 {
             tick_lane(&mut lane, 0.1, false, 1.0);
+            if lane
+                .sheep
+                .iter()
+                .any(|s| s.state == State::Leaving && s.y_off != 0)
+            {
+                left_off_line = true;
+            }
         }
         assert!(
-            lane.sheep.is_empty() || matches!(lane.sheep[0].state, State::Retire),
-            "sated sheep retires"
+            left_off_line || lane.sheep.is_empty(),
+            "sated sheep steps off and leaves"
         );
     }
 
@@ -555,7 +584,7 @@ mod tests {
     fn fleeing_clears_the_bar() {
         let mut sim = SheepSim::default();
         let lanes = vec![(1u16, 0u16, 39u16)];
-        run(&mut sim, &lanes, 40.0, false);
+        run(&mut sim, &lanes, 70.0, false);
         run(&mut sim, &lanes, 2.0, true);
         let lane = &sim.lanes[0];
         assert!(
