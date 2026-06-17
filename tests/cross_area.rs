@@ -551,11 +551,11 @@ fn decode_frame_payload(payload: &[u8]) -> io::Result<FrameWire> {
         })
 }
 
-fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
+/// Flatten a decoded frame's cells into row-joined text.
+fn frame_text(frame: &FrameWire) -> String {
     if frame.cells.is_empty() {
-        return false;
+        return String::new();
     }
-
     let width = frame.width.max(1) as usize;
     let mut text = String::new();
     for row in frame.cells.chunks(width) {
@@ -569,8 +569,28 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     if let Some(cursor) = frame.cursor.as_ref() {
         let _ = (cursor.x, cursor.y, cursor.visible, cursor.shape);
     }
+    text
+}
 
-    text.contains(needle)
+fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
+    frame_text(frame).contains(needle)
+}
+
+/// The agent panel renders an agent's STATE as a glyph next to its label, not
+/// as a word (see `ui::agent_icon` / `ui::SPINNERS`): Working is a braille
+/// spinner, Idle a `●` (unseen) or `✓` (seen). So a reattached frame proves it
+/// surfaced the persisted status by showing `<state glyph> <agent>`, never the
+/// literal "working" / "idle".
+const WORKING_SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const IDLE_GLYPHS: &[&str] = &["●", "✓"];
+
+/// Whether the frame's agents panel surfaces `agent` with one of `glyphs`
+/// immediately preceding its label.
+fn frame_shows_agent_state(frame: &FrameWire, agent: &str, glyphs: &[&str]) -> bool {
+    let text = frame_text(frame);
+    glyphs
+        .iter()
+        .any(|glyph| text.contains(&format!("{glyph} {agent}")))
 }
 
 fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result<u32> {
@@ -839,12 +859,12 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     client_handshake(&mut client_b, 18, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_text(frame, "working")
+            frame_shows_agent_state(frame, "pi", WORKING_SPINNERS)
         })
         .expect("frame decoding should succeed");
     assert!(
         saw_working_on_client,
-        "reattached client frame should expose persisted agent working status"
+        "reattached client frame should surface the persisted working agent (spinner + pi)"
     );
 
     // Transition to idle and verify API + client surfaces both observe it.
@@ -856,12 +876,12 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     let saw_idle_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_text(frame, "idle")
+            frame_shows_agent_state(frame, "pi", IDLE_GLYPHS)
         })
         .expect("frame decoding should succeed");
     assert!(
         saw_idle_on_client,
-        "reattached client frame should show idle status after transition"
+        "reattached client frame should surface the persisted agent as idle (● / ✓ + pi) after transition"
     );
 
     cleanup_spawned_flock(server, base);
