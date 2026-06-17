@@ -279,6 +279,134 @@ fn host_terminal_is_held() -> bool {
         || INHERITED_TERMINAL_HOLD.load(Ordering::Acquire)
 }
 
+// ---------------------------------------------------------------------------
+// Crash-time terminal restore (defense-in-depth)
+//
+// The protective panic hook restores the terminal on an *unwinding* panic, and
+// the held-restore guards cover the `std::process::exit` paths. Two gaps remain
+// that strand the host terminal in raw mode with mouse / focus / kitty input
+// reporting still enabled — the "random escape-sequence spill" that makes the
+// shell unusable after an SSH disconnect crash:
+//   1. `abort()`: a double-panic (a panic *while the hook itself runs*) aborts
+//      the process — no hook completes, no destructor runs.
+//   2. A *background* thread (stdin / resize) panicking: the global hook
+//      restores the terminal on that thread while the main loop keeps painting
+//      frames into the now-cooked terminal.
+// (1) is closed by a SIGABRT handler that re-emits the disable sequences with
+// async-signal-safe primitives; (2) by `CLIENT_PANICKED`, which stops the loop.
+// ---------------------------------------------------------------------------
+
+/// Set by every panic hook firing, on any thread. The client loop polls it so a
+/// *background* thread's panic — which already restored the terminal out from
+/// under us — stops the loop instead of spilling more frames into the cooked
+/// terminal.
+static CLIENT_PANICKED: AtomicBool = AtomicBool::new(false);
+
+/// True while this process owns the host terminal in raw mode (set at terminal
+/// setup, cleared on the real-exit restore). Read by the async-signal-safe
+/// SIGABRT handler to decide whether a crash must reset the terminal.
+static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// The host terminal's pre-raw-mode termios, captured once so the crash handler
+/// can restore cooked mode on an abort. Heap pointer behind an atomic (not
+/// `static mut`) so the handler's load + deref stays async-signal-safe.
+static ORIG_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Every input-reporting mode the client enables, disabled in one write — pop
+/// kitty keyboard flags, disable focus / bracketed-paste / mouse (all
+/// encodings), leave the alternate screen, show the cursor, reset cursor shape
+/// and xterm modifyOtherKeys. One byte string so the SIGABRT handler emits it
+/// with a single async-signal-safe `write(2)`.
+const CRASH_TERMINAL_RESET: &[u8] =
+    b"\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1003l\x1b[?1002l\x1b[?1006l\x1b[?1015l\x1b[?1000l\x1b[?1049l\x1b[?25h\x1b[0 q\x1b[>4;0m";
+
+fn note_client_panicked() {
+    CLIENT_PANICKED.store(true, Ordering::Release);
+}
+
+fn client_should_stop_for_panic() -> bool {
+    CLIENT_PANICKED.load(Ordering::Acquire)
+}
+
+fn mark_terminal_owned(owned: bool) {
+    TERMINAL_OWNED.store(owned, Ordering::Release);
+}
+
+/// Whether a crash must reset the terminal: we own it AND it is not in a
+/// deliberate seamless-switch hold (where the next leg repaints it).
+fn crash_restore_armed() -> bool {
+    TERMINAL_OWNED.load(Ordering::Acquire) && !host_terminal_is_held()
+}
+
+/// Capture the cooked termios once, before any raw mode, so the crash handler
+/// can restore it. Best-effort: a failure just means the handler emits the
+/// escape resets without the `tcsetattr`.
+fn capture_terminal_for_crash_restore() {
+    if !ORIG_TERMIOS.load(Ordering::Acquire).is_null() {
+        return; // already captured (first leg, cooked)
+    }
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr fills `termios` for stdin; we read it only on success.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) } == 0 {
+        let ptr = Box::into_raw(Box::new(unsafe { termios.assume_init() }));
+        // Publish for the handler. If another leg raced us, drop our copy.
+        if ORIG_TERMIOS
+            .compare_exchange(
+                std::ptr::null_mut(),
+                ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: ptr came from Box::into_raw and was not published.
+            drop(unsafe { Box::from_raw(ptr) });
+        }
+    }
+}
+
+extern "C" fn crash_terminal_restore_handler(sig: libc::c_int) {
+    if crash_restore_armed() {
+        // SAFETY: write / tcsetattr are async-signal-safe; ORIG_TERMIOS is a
+        // valid pointer once non-null (published with AcqRel above).
+        unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                CRASH_TERMINAL_RESET.as_ptr() as *const libc::c_void,
+                CRASH_TERMINAL_RESET.len(),
+            );
+            let termios = ORIG_TERMIOS.load(Ordering::Acquire);
+            if !termios.is_null() {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
+            }
+        }
+    }
+    // Re-raise with the default disposition so the crash still aborts and any
+    // core dump is produced — we only borrowed the signal to clean up.
+    // SAFETY: signal / raise are async-signal-safe.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Install the SIGABRT crash handler once, closing the `abort()` / double-panic
+/// gap the unwinding panic hook cannot reach. Deliberately scoped to SIGABRT:
+/// SIGSEGV/SIGBUS stay with Rust's stack-overflow handler, and
+/// SIGINT/SIGTERM/SIGHUP stay with `ctrlc`.
+fn install_crash_terminal_restore() {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: registering an async-signal-safe handler for SIGABRT.
+    let handler = crash_terminal_restore_handler as extern "C" fn(libc::c_int);
+    unsafe {
+        libc::signal(libc::SIGABRT, handler as *const () as libc::sighandler_t);
+    }
+}
+
 /// Record a server-switch target for the launcher. Returns false when no
 /// launcher registered a switch file (nothing to chain into).
 fn record_switch_target(
@@ -438,6 +566,10 @@ fn setup_terminal_with_capabilities(
     // protective hook re-asserted below chains into the real default rather
     // than ratatui's own restore-and-eprintln hook.
     capture_default_panic_hook();
+    // Before raw mode: snapshot the cooked termios (once) and arm the SIGABRT
+    // crash handler so an abort can never strand the terminal (defense-in-depth).
+    capture_terminal_for_crash_restore();
+    install_crash_terminal_restore();
     ratatui::try_init().map_err(|e| io::Error::other(format!("terminal init failed: {e}")))?;
     // try_init just installed ratatui's panic hook on top of ours. Re-assert
     // the protective hook so a panic restores the terminal without ratatui's
@@ -475,6 +607,9 @@ fn setup_terminal_with_capabilities(
         io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
     }
+
+    // Now in raw mode with input reporting on: a crash from here must reset it.
+    mark_terminal_owned(true);
 
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
@@ -532,6 +667,7 @@ fn restore_terminal_state(reset_modify_other_keys: bool) {
     // inherited hold from a previous leg (#69) is superseded and must not
     // trigger a second force-restore on the way out.
     INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+    mark_terminal_owned(false);
     ratatui::restore();
     let _ = write_terminal_restore_postlude(&mut io::stdout());
 }
@@ -588,6 +724,7 @@ impl Drop for HeldRestoreGuard {
 pub fn force_restore_host_terminal() {
     SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
     INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+    mark_terminal_owned(false);
     let _ = crossterm::terminal::disable_raw_mode();
     // Reset xterm modifyOtherKeys unconditionally: a held leg may have enabled
     // it (tmux/host-specific) and exited without resetting. Harmless on hosts
@@ -1181,6 +1318,9 @@ fn install_protective_panic_hook() {
     capture_default_panic_hook();
     let in_tmux = std::env::var("TMUX").is_ok();
     std::panic::set_hook(Box::new(move |info| {
+        // Stop the client loop: a background thread's panic restored the
+        // terminal here, so the main loop must not paint another frame into it.
+        note_client_panicked();
         if host_terminal_is_held() {
             force_restore_host_terminal();
         } else {
@@ -1532,6 +1672,15 @@ async fn run_client_loop(
             },
             _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
         };
+
+        // A background thread (stdin / resize) panicked: its hook already
+        // restored the host terminal, so stop now rather than paint this event's
+        // frame into the cooked terminal (the visible escape-sequence spill).
+        if client_should_stop_for_panic() {
+            return Err(ClientError::ConnectionLost(io::Error::other(
+                "client thread panicked",
+            )));
+        }
 
         match event {
             ClientLoopEvent::StdinInput(data) => {
@@ -3334,6 +3483,74 @@ mod tests {
         INHERITED_TERMINAL_HOLD.store(true, Ordering::Release);
         assert!(host_terminal_is_held(), "inherited hold counts");
         INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn crash_restore_arms_only_when_owned_and_not_held() {
+        let _guard = hold_test_lock();
+        SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
+        INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+
+        mark_terminal_owned(false);
+        assert!(
+            !crash_restore_armed(),
+            "no restore when we don't own the term"
+        );
+
+        mark_terminal_owned(true);
+        assert!(crash_restore_armed(), "owned + not held → restore on crash");
+
+        // A deliberate seamless-switch hold must NOT be reset by a crash: the
+        // next leg repaints the frozen frame.
+        SWITCH_HANDOFF_PENDING.store(true, Ordering::Release);
+        assert!(
+            !crash_restore_armed(),
+            "held handoff is left for the next leg"
+        );
+        SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
+
+        mark_terminal_owned(false);
+        assert!(!crash_restore_armed());
+    }
+
+    #[test]
+    fn panic_flag_stops_the_client_loop() {
+        let _guard = hold_test_lock();
+        CLIENT_PANICKED.store(false, Ordering::Release);
+        assert!(!client_should_stop_for_panic());
+        note_client_panicked();
+        assert!(
+            client_should_stop_for_panic(),
+            "a panic hook firing stops the loop"
+        );
+        CLIENT_PANICKED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn crash_reset_sequence_disables_every_input_reporting_mode() {
+        // The bytes the SIGABRT handler emits must turn OFF everything setup
+        // turns on, or the shell keeps spilling escape sequences.
+        let seq = CRASH_TERMINAL_RESET;
+        assert!(
+            seq.starts_with(b"\x1b[<u"),
+            "pops kitty keyboard flags first"
+        );
+        for disable in [
+            b"\x1b[?1000l".as_slice(), // mouse (normal)
+            b"\x1b[?1002l".as_slice(), // mouse (button-event)
+            b"\x1b[?1006l".as_slice(), // mouse (SGR)
+            b"\x1b[?1004l".as_slice(), // focus reporting
+            b"\x1b[?2004l".as_slice(), // bracketed paste
+            b"\x1b[?1049l".as_slice(), // leave alt-screen
+            b"\x1b[?25h".as_slice(),   // show cursor
+            b"\x1b[>4;0m".as_slice(),  // reset modifyOtherKeys
+        ] {
+            assert!(
+                seq.windows(disable.len()).any(|w| w == disable),
+                "crash reset must include {:?}",
+                String::from_utf8_lossy(disable)
+            );
+        }
     }
 
     #[test]
