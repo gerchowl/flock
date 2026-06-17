@@ -275,6 +275,15 @@ pub(crate) fn short_host_name() -> String {
 }
 
 fn compute_short_host_name() -> String {
+    // Explicit override (also pins a short, deterministic host for the test
+    // suite, whose layout assertions otherwise break on CI runners with long
+    // generated hostnames like `fv-az…`).
+    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
     #[cfg(target_os = "macos")]
     if let Some(name) = macos_local_host_name() {
         return name;
