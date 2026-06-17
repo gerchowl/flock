@@ -15,6 +15,13 @@
 # retries to absorb residual timing flakiness. Unit tests (lib/bin) stay fully
 # parallel and are not retried, so genuine logic failures still fail fast.
 
+# Pin a short, deterministic hostname for the whole test run. Several sidebar
+# layout tests derive column offsets from `short_host_name()`; on CI runners
+# with long generated hostnames (`fv-az…`) the name field truncates and the
+# math breaks. The binary and the integration-test helpers both honor this.
+[env]
+FLOCK_HOST_NAME = "host"
+
 [test-groups]
 # At most one of these heavy, multi-process tests runs at a time across the
 # whole nextest run.

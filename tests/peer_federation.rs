@@ -29,6 +29,12 @@ const VARIANT_SWITCH_SERVER: u32 = 9;
 /// `hostname` base). Keeps the home-row assertion portable across dev machines
 /// and CI runners — it was previously hardcoded to one laptop's `mba22`.
 fn local_short_host() -> String {
+    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if let Ok(out) = std::process::Command::new("/usr/sbin/scutil")
