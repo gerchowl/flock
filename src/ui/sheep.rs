@@ -19,9 +19,12 @@ pub const IDLE_THRESHOLD: Duration = Duration::from_secs(20);
 /// How long the rush-off animation runs after interaction resumes.
 pub const FLEE_DURATION: Duration = Duration::from_millis(800);
 
-const SHEEP: &str = "🐑";
-/// Grass sprouts, then is cropped shorter as it's grazed.
-const GRASS: [&str; 3] = ["🌱", "🌿", "ᵕ"];
+// Nerd Font Material Design glyphs (the same icon class as the status bar's
+// cpu/mem/disk), not emoji — 1-wide and theme-consistent.
+const SHEEP: &str = "\u{f0cc6}"; // nf-md-sheep
+/// Grass grows (sprout → grass) ahead of a grazing sheep, then is eaten (the
+/// later cycle stages draw nothing).
+const GRASS: [&str; 2] = ["\u{f0e9c}", "\u{f1510}"]; // nf-md-sprout, nf-md-grass
 
 /// What the flock is doing this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
