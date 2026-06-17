@@ -24,7 +24,11 @@ pub const FLEE_DURATION: Duration = Duration::from_millis(800);
 
 // Nerd Font Material Design glyphs (the same icon class as the status bar's
 // cpu/mem/disk), not emoji — 1-wide and theme-consistent.
-const SHEEP: &str = "\u{f0cc6}"; // nf-md-sheep
+//
+// `nf-md-sheep` renders as a front-view head only, so a sheep is a 2-cell
+// sprite: a fluffy wool "body" (nf-md-cloud) with the head grazing in front.
+const SHEEP_HEAD: &str = "\u{f0cc6}"; // nf-md-sheep (head)
+const SHEEP_WOOL: &str = "\u{f0590}"; // nf-md-cloud (woolly body, trails the head)
 const GRASS_TIERS: [&str; 2] = ["\u{f0e9c}", "\u{f1510}"]; // nf-md-sprout, nf-md-grass
 
 const MAX_GRASS: f32 = 2.0;
@@ -307,9 +311,15 @@ impl SheepSim {
             }
             for s in &lane.sheep {
                 let col = s.x.round();
-                if col >= lane.x0 as f32 && col <= lane.x1 as f32 {
-                    buf.set_string(col as u16, lane.y, SHEEP, sheep_style);
+                if col < lane.x0 as f32 || col > lane.x1 as f32 {
+                    continue;
                 }
+                let head = col as u16;
+                // Woolly body trails one cell behind the grazing head.
+                if head > lane.x0 {
+                    buf.set_string(head - 1, lane.y, SHEEP_WOOL, sheep_style);
+                }
+                buf.set_string(head, lane.y, SHEEP_HEAD, sheep_style);
             }
         }
     }
