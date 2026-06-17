@@ -38,7 +38,7 @@ const SPROUT_AT: f32 = 0.5; // height at which bare ground shows a sprout
 const RIPE: f32 = 1.4; // a sheep only commits to grass at least this tall
 const CROPPED: f32 = 0.3; // grass is "eaten" below this
 const WALK: f32 = 3.0; // horizontal cells/sec — deliberately unhurried
-const CLIMB: f32 = 2.5; // vertical rows/sec when stepping around
+const CLIMB: f32 = 1.6; // vertical rows/sec when arcing around — eased, not snappy
 const BAND: f32 = 2.0; // sheep may stray this many rows above/below their bar
 const EAT: f32 = 0.9; // grass-height/sec while grazing
 const FLEE: f32 = 42.0; // cells/sec bolting off the side
@@ -48,7 +48,7 @@ const EATEN_BEFORE_RETIRE: u32 = 4;
 const SHEEP_CELLS: f32 = 2.0; // a sprite is wool + head
 const MAX_OCCUPANCY: f32 = 0.30; // sheep cover at most ~30% of a bar's width
 const LANE_CAP_HARD: usize = 8; // per-bar sanity ceiling
-const SPAWN_COOLDOWN: f32 = 1.5; // sec between a bar's arrivals
+const SPAWN_COOLDOWN: f32 = 4.0; // sec between a bar's arrivals — flock fills in slowly
 const RAMP_FULL_SECS: f32 = 30.0; // idle time to reach max growth speed
 const RAMP_MAX: f32 = 2.0;
 const MAX_STEP: f32 = 0.25; // clamp a single step after a long pause
@@ -146,6 +146,9 @@ struct Sheep {
     y: f32,
     /// +1 heading right, -1 left. The wool body trails the head.
     facing: i8,
+    /// Row offset (±`BAND`) the sheep is currently committed to while arcing
+    /// around another; 0 once it's clear and re-joining its bar.
+    detour: f32,
     state: State,
     eaten: u32,
 }
@@ -268,6 +271,7 @@ impl SheepSim {
                     x: edge as f32,
                     y: lane.y as f32,
                     facing: if left { 1 } else { -1 },
+                    detour: 0.0,
                     state: State::Walk(edge),
                     eaten: 0,
                 });
@@ -285,7 +289,7 @@ impl SheepSim {
             tufts.push(Tuft {
                 x: col,
                 height: self.rand() * 0.6,
-                grow: 0.02 + self.rand() * 0.10,
+                grow: 0.01 + self.rand() * 0.05,
             });
             col += 2 + (self.rand() * 4.0) as u16;
         }
@@ -433,23 +437,31 @@ fn tick_lane(lane: &mut Lane, dt: f32, fleeing: bool) {
                 }
                 let facing = if target > x { 1.0 } else { -1.0 };
                 let sx = (target - x).clamp(-WALK * dt, WALK * dt);
-                let to_line = (line - y).clamp(-CLIMB * dt, CLIMB * dt);
-                let up = (y - CLIMB * dt).max(line - BAND);
-                let down = (y + CLIMB * dt).min(line + BAND);
-                // Prefer advancing while drifting back to the line; if blocked,
-                // veer a row up/down (within the band) to step around.
-                let options = [
-                    (x + sx, y + to_line),
-                    (x + sx, up),
-                    (x + sx, down),
-                    (x, up),
-                    (x, down),
-                ];
+                // Commit to a wide arc rather than jittering a row at a time: if
+                // the next step along the bar is blocked, swing the full BAND to
+                // the clearer side and hold it until the path ahead is clear, then
+                // ease back to the line for a straight final approach.
+                let mut detour = lane.sheep[si].detour;
+                if occupied(si, x + sx, line) {
+                    if detour.abs() < 0.5 {
+                        let up_room = !occupied(si, x + sx, line - BAND);
+                        detour = if up_room { -BAND } else { BAND };
+                    }
+                } else if (x - target).abs() > ARRIVE {
+                    detour = 0.0;
+                }
+                let aim_y = (line + detour).clamp(line - BAND, line + BAND);
+                let dy = (aim_y - y).clamp(-CLIMB * dt, CLIMB * dt);
+                let (nx, ny) = (x + sx, y + dy);
                 let s = &mut lane.sheep[si];
                 s.facing = facing as i8;
+                s.detour = detour;
                 s.state = State::Walk(tx);
-                if let Some(&(nx, ny)) = options.iter().find(|&&(nx, ny)| !occupied(si, nx, ny)) {
+                if !occupied(si, nx, ny) {
                     s.x = nx;
+                    s.y = ny;
+                } else if !occupied(si, x, ny) {
+                    // Can't gain ground yet — settle into the arc and wait.
                     s.y = ny;
                 }
             }
@@ -481,6 +493,7 @@ mod tests {
             x,
             y,
             facing: 1,
+            detour: 0.0,
             state,
             eaten: 0,
         }

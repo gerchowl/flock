@@ -12,8 +12,8 @@ import sys, time, random
 HEAD, WOOL, SPROUT, WEED = (chr(c) for c in (0xF0CC6, 0xF0590, 0xF0E9C, 0xF1510))
 W = 50
 MAX, SPROUT_AT, RIPE, CROP = 2.0, 0.5, 1.4, 0.3
-WALK, CLIMB, BAND, EAT, FLEE, RECEDE, ARRIVE = 3.0, 2.5, 2, 0.9, 42.0, 5.0, 0.6
-RETIRE_AT, COOLDOWN = 4, 1.5
+WALK, CLIMB, BAND, EAT, FLEE, RECEDE, ARRIVE = 3.0, 1.6, 2, 0.9, 42.0, 5.0, 0.6
+RETIRE_AT, COOLDOWN = 4, 4.0
 BAR_Y = [4, 11]
 CAP = max(1, min(8, int(W * 0.30 / 2)))
 random.seed(5)
@@ -21,7 +21,7 @@ random.seed(5)
 def new_lane(y):
     tufts, x = [], 1
     while x < W - 1:
-        tufts.append({"x": x, "h": random.random()*0.6, "g": 0.02 + random.random()*0.10})
+        tufts.append({"x": x, "h": random.random()*0.6, "g": 0.01 + random.random()*0.05})
         x += 2 + random.randint(0, 4)
     return {"y": y, "tufts": tufts, "sheep": [], "cd": random.random()*COOLDOWN, "left": random.random() < .5}
 
@@ -77,10 +77,16 @@ def tick(dt, flee):
                 x,y=s["x"],s["y"]
                 if abs(x-tx)<=ARRIVE and abs(y-line)<=ARRIVE: s["x"]=float(tx); s["y"]=float(line); s["st"]="eat"; s["tx"]=tx; continue
                 fc = 1 if tx>x else -1; sx=max(-WALK*dt,min(WALK*dt,tx-x)); s["f"]=fc
-                toline = max(-CLIMB*dt,min(CLIMB*dt,line-y))
-                up=max(y-CLIMB*dt, line-BAND); dn=min(y+CLIMB*dt, line+BAND)
-                for nx,ny in [(x+sx,y+toline),(x+sx,up),(x+sx,dn),(x,up),(x,dn)]:
-                    if not occ(i,nx,ny): s["x"]=nx; s["y"]=ny; break
+                det = s.get("det", 0.0)  # committed arc: full BAND, held until clear
+                if occ(i, x+sx, line):
+                    if abs(det) < 0.5: det = -BAND if not occ(i, x+sx, line-BAND) else BAND
+                elif abs(x-tx) > ARRIVE:
+                    det = 0.0
+                aim = max(line-BAND, min(line+BAND, line+det))
+                dy = max(-CLIMB*dt, min(CLIMB*dt, aim-y))
+                nx, ny = x+sx, y+dy; s["det"] = det
+                if not occ(i,nx,ny): s["x"]=nx; s["y"]=ny
+                elif not occ(i,x,ny): s["y"]=ny
         L["sheep"] = [s for s in L["sheep"] if not (s["st"]=="leave" and (s["x"]<-1 or s["x"]>W))]
 
 def render():
