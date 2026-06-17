@@ -131,6 +131,10 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
+    /// Someone is watching this server's frames — true in monolithic mode, and
+    /// set from foreground-client presence by the headless loop. Gates the idle
+    /// "flock" gimmick so a detached daemon never animates with nobody looking.
+    pub(crate) has_foreground_viewer: bool,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
@@ -629,6 +633,8 @@ impl App {
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             spinner_tick: 0,
+            last_interaction: std::time::Instant::now(),
+            sheep_flee_until: None,
             palette: resolve_palette(config),
             theme_name: config
                 .theme
@@ -693,6 +699,9 @@ impl App {
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
+            // Monolithic mode always has the local terminal watching; the
+            // headless loop overrides this from foreground-client presence.
+            has_foreground_viewer: true,
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,

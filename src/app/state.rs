@@ -1822,6 +1822,12 @@ pub struct AppState {
     pub keybinds: Keybinds,
     /// Frame counter for spinner animations (wraps around).
     pub spinner_tick: u32,
+    /// When the user last interacted (key/mouse). Drives the idle "flock"
+    /// gimmick: after a quiet spell sheep graze on the sidebar bars.
+    pub last_interaction: std::time::Instant,
+    /// Set when interaction resumes after an idle spell so the flock bolts off
+    /// before vanishing; cleared once the window elapses.
+    pub sheep_flee_until: Option<std::time::Instant>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1846,6 +1852,26 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Stamp user activity for the idle "flock" gimmick. If the flock had
+    /// wandered in (we were idle past the threshold), open a brief flee window
+    /// so the sheep bolt off-screen before vanishing.
+    pub(crate) fn note_interaction(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_interaction) >= crate::ui::sheep::IDLE_THRESHOLD {
+            self.sheep_flee_until = Some(now + crate::ui::sheep::FLEE_DURATION);
+        }
+        self.last_interaction = now;
+    }
+
+    /// The current idle-flock phase (None when the user is active).
+    pub(crate) fn flock_phase(&self) -> Option<crate::ui::sheep::FlockPhase> {
+        crate::ui::sheep::flock_phase(
+            self.last_interaction,
+            self.sheep_flee_until,
+            std::time::Instant::now(),
+        )
     }
 
     /// Whether the sidebar reserves its `new` footer entry. Hidden in
@@ -2314,6 +2340,8 @@ impl AppState {
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             spinner_tick: 0,
+            last_interaction: std::time::Instant::now(),
+            sheep_flee_until: None,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {

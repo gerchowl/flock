@@ -56,6 +56,7 @@ use super::App;
 
 impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
+        self.state.note_interaction();
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
@@ -182,6 +183,7 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.state.note_interaction();
         if self.handle_overlay_mouse(mouse) {
             return;
         }
