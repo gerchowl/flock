@@ -247,8 +247,9 @@ fn load_with_overlay_diagnostic(
 }
 
 fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
-    let value = content
-        .parse::<toml::Value>()
+    // toml 1.x: `str::parse::<Value>` (FromStr) parses a single value, not a
+    // document — use the serde document parser for the whole config file.
+    let value = toml::from_str::<toml::Value>(content)
         .map_err(|err| vec![format!("config parse error: {err}; keeping current config")])?;
     let table = value.as_table().ok_or_else(|| {
         vec![

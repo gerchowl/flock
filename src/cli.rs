@@ -111,7 +111,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     } else {
         String::new()
     };
-    if let Err(err) = content.parse::<toml::Value>() {
+    if let Err(err) = toml::from_str::<toml::Value>(&content) {
         eprintln!(
             "config file at {} is invalid TOML: {err}. Fix it before changing the update channel.",
             path.display()
@@ -125,7 +125,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         "channel",
         &format!("\"{channel}\""),
     );
-    if let Err(err) = updated.parse::<toml::Value>() {
+    if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
             "changing the update channel would make {} invalid TOML: {err}; leaving config unchanged",
             path.display()
@@ -269,7 +269,7 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
     }
 
     let content = std::fs::read_to_string(&path)?;
-    let parsed = match content.parse::<toml::Value>() {
+    let parsed = match toml::from_str::<toml::Value>(&content) {
         Ok(value) => value,
         Err(err) => {
             eprintln!(
@@ -303,7 +303,7 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
         );
         return Ok(1);
     }
-    if let Err(err) = updated.parse::<toml::Value>() {
+    if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
             "removing keybinding config would make {} invalid TOML: {err}; leaving config unchanged",
             path.display()
