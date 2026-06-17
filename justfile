@@ -1,5 +1,11 @@
 # flock task runner
 
+# Pin a short, deterministic hostname for every test run. Several sidebar layout
+# tests derive column offsets from `short_host_name()`; on CI runners with long
+# generated hostnames (`fv-az…`) the name field truncates and the math breaks.
+# The binary and the integration-test helpers both honor FLOCK_HOST_NAME.
+export FLOCK_HOST_NAME := "host"
+
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
