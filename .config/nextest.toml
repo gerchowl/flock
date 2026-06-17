@@ -1,0 +1,34 @@
+# nextest configuration.
+#
+# Why this exists: the integration suites in `tests/` each spawn several real
+# `flock` processes over PTYs (servers, clients, ssh shims) and then wait on
+# rendered frames with 30–60s deadlines. On a dev box (many cores) they have
+# headroom and pass. On GitHub's small hosted runners (ubuntu ~4 vCPU, macOS
+# ~3 cores) nextest's default parallelism (one test per core) runs a handful of
+# these multi-process tests at once, oversubscribes the CPU, and their frame
+# waits time out — flaky failures that shuffle between tests/platforms per run
+# and pass in isolation. This is CPU contention, not a real regression and not
+# a runner-minutes problem.
+#
+# Fix: serialize the worst multi-process offenders so they never compete with
+# each other, and give every PTY-spawning integration binary a couple of
+# retries to absorb residual timing flakiness. Unit tests (lib/bin) stay fully
+# parallel and are not retried, so genuine logic failures still fail fast.
+
+[test-groups]
+# At most one of these heavy, multi-process tests runs at a time across the
+# whole nextest run.
+serial-pty = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# The federation hub/spoke and detach/reattach suites stand up multiple servers
+# + clients per test and race hardest under contention — serialize them.
+filter = 'binary(peer_federation) | binary(cross_area)'
+test-group = 'serial-pty'
+retries = 2
+
+[[profile.default.overrides]]
+# The remaining integration binaries also spawn the real `flock` process; let
+# them run in parallel but retry to ride out timing hiccups under CI load.
+filter = 'kind(test)'
+retries = 2
