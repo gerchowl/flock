@@ -427,6 +427,10 @@ impl FrameData {
         Self::from_ratatui_buffer_with_hyperlinks(buffer, cursor, &[])
     }
 
+    // ratatui 0.30.1 deprecated the `Cell::skip` bool in favour of
+    // `CellDiffOption`. The wire format still carries a bool; preserve it
+    // verbatim across this dep bump rather than risk a render-behaviour change.
+    #[allow(deprecated)]
     pub fn from_ratatui_buffer_with_hyperlinks(
         buffer: &ratatui::buffer::Buffer,
         cursor: Option<CursorState>,
@@ -483,6 +487,7 @@ impl FrameData {
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
     #[cfg(test)]
+    #[allow(deprecated)] // ratatui 0.30.1 Cell::skip — see encoder above.
     pub fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
         let expected = (self.width as usize) * (self.height as usize);
         if self.cells.len() != expected {

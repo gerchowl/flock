@@ -427,7 +427,8 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
             let Some(msg) = msg else { break };
             match msg {
                 Ok(Message::Binary(b)) => {
-                    if stdin_tx.send(b).is_err() {
+                    // axum 0.8: ws binary payloads are `Bytes`, not `Vec<u8>`.
+                    if stdin_tx.send(b.to_vec()).is_err() {
                         break;
                     }
                 }
@@ -441,7 +442,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
                             }
                             ClientMsg::Init { .. } => { /* ignore re-init */ }
                         }
-                    } else if stdin_tx.send(t.into_bytes()).is_err() {
+                    } else if stdin_tx.send(t.as_bytes().to_vec()).is_err() {
                         break;
                     }
                 }
@@ -484,7 +485,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
     // PTY -> WS forwarder.
     let pty_forwarder = async {
         while let Some(chunk) = pty_rx.recv().await {
-            if ws_sink.send(Message::Binary(chunk)).await.is_err() {
+            if ws_sink.send(Message::Binary(chunk.into())).await.is_err() {
                 break;
             }
         }
