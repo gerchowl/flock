@@ -18,6 +18,7 @@ mod panes;
 mod release_notes;
 mod scrollbar;
 mod settings;
+pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
 mod status;
@@ -446,6 +447,23 @@ pub fn render_with_runtime_registry(
         render_status_line(app, frame, app.view.status_line_rect);
     }
     render_panes(app, terminal_runtimes, frame, terminal_area);
+
+    // Idle gimmick: a flock grazes the sidebar's separator bars after a quiet
+    // spell, and bolts off when interaction resumes. Resting views only.
+    if !app.sidebar_collapsed
+        && app.view.layout != ViewLayout::Mobile
+        && matches!(app.mode, Mode::Navigate | Mode::Terminal)
+    {
+        if let Some(phase) = app.flock_phase() {
+            let fleeing = matches!(phase, sheep::FlockPhase::Fleeing(_));
+            app.sheep_sim.borrow_mut().step(
+                frame.buffer_mut(),
+                sidebar_area,
+                fleeing,
+                &app.palette,
+            );
+        }
+    }
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);

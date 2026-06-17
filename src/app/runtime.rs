@@ -300,8 +300,18 @@ impl App {
     }
 
     fn sync_animation_timer_with_interval(&mut self, now: Instant, interval: Duration) {
-        if self.agent_panel_has_animation() {
+        // The idle "flock" only animates while someone is watching.
+        let flock_on_screen = self.has_foreground_viewer && self.state.flock_phase().is_some();
+        if self.agent_panel_has_animation() || flock_on_screen {
             self.next_animation_tick.get_or_insert(now + interval);
+        } else if self.has_foreground_viewer {
+            // Nothing animating yet, but the flock wanders in at the idle
+            // threshold — wake the loop then so it can start grazing.
+            self.next_animation_tick = self
+                .state
+                .last_interaction
+                .checked_add(crate::ui::sheep::IDLE_THRESHOLD)
+                .filter(|due| *due > now);
         } else {
             self.next_animation_tick = None;
         }

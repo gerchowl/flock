@@ -553,6 +553,8 @@ impl HeadlessServer {
             self.drain_client_config_reload_request();
             self.stream_host_mouse_capture_mode();
 
+            // Idle flock animates only while a client is watching this server.
+            self.app.has_foreground_viewer = self.foreground_client_id.is_some();
             self.app.sync_headless_animation_timer(now);
 
             // 7. Render virtually and stream frames.
@@ -2045,6 +2047,10 @@ impl HeadlessServer {
                 }
                 self.update_client_outer_focus_from_events(client_id, &events);
                 let interaction = events_include_interaction(&events);
+                if interaction {
+                    // Idle-flock gimmick: real input bolts the sheep off.
+                    self.app.state.note_interaction();
+                }
                 let foreground_changed = if interaction {
                     self.promote_client_to_foreground(client_id)
                 } else {
