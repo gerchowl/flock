@@ -6,6 +6,16 @@
 # The binary and the integration-test helpers both honor FLOCK_HOST_NAME.
 export FLOCK_HOST_NAME := "host"
 
+# Force git's default branch for every `git init` in the suite. The peer
+# federation test waits for an indented `:main` workspace row; CI runners
+# default new repos to `master` (dev machines default to `main`), so the row
+# never matched and the test timed out — deterministic, not flaky. These
+# GIT_CONFIG_* env keys make all git invocations (and the spawned binary's)
+# default to `main` regardless of the host's git config.
+export GIT_CONFIG_COUNT := "1"
+export GIT_CONFIG_KEY_0 := "init.defaultBranch"
+export GIT_CONFIG_VALUE_0 := "main"
+
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
