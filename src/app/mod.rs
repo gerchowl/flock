@@ -635,6 +635,7 @@ impl App {
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
             sheep_flee_until: None,
+            sheep_sim: std::cell::RefCell::new(crate::ui::sheep::SheepSim::default()),
             palette: resolve_palette(config),
             theme_name: config
                 .theme

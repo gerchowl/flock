@@ -455,11 +455,11 @@ pub fn render_with_runtime_registry(
         && matches!(app.mode, Mode::Navigate | Mode::Terminal)
     {
         if let Some(phase) = app.flock_phase() {
-            sheep::render_flock(
+            let fleeing = matches!(phase, sheep::FlockPhase::Fleeing(_));
+            app.sheep_sim.borrow_mut().step(
                 frame.buffer_mut(),
                 sidebar_area,
-                app.spinner_tick,
-                phase,
+                fleeing,
                 &app.palette,
             );
         }

@@ -1828,6 +1828,9 @@ pub struct AppState {
     /// Set when interaction resumes after an idle spell so the flock bolts off
     /// before vanishing; cleared once the window elapses.
     pub sheep_flee_until: Option<std::time::Instant>,
+    /// Persistent state for the idle-flock simulation (grass heights + sheep).
+    /// `RefCell` so the render pass (which holds `&AppState`) can step it.
+    pub(crate) sheep_sim: std::cell::RefCell<crate::ui::sheep::SheepSim>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -2342,6 +2345,7 @@ impl AppState {
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
             sheep_flee_until: None,
+            sheep_sim: std::cell::RefCell::new(crate::ui::sheep::SheepSim::default()),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
