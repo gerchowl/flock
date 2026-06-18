@@ -300,8 +300,10 @@ impl App {
     }
 
     fn sync_animation_timer_with_interval(&mut self, now: Instant, interval: Duration) {
-        // The idle "flock" only animates while someone is watching.
-        let flock_on_screen = self.has_foreground_viewer && self.state.flock_phase().is_some();
+        // The idle "flock" (stage-1 bars + stage-2 screensaver) only animates
+        // while someone is watching.
+        let flock_on_screen = self.has_foreground_viewer
+            && (self.state.flock_phase().is_some() || self.state.screensaver_phase().is_some());
         if self.agent_panel_has_animation() || flock_on_screen {
             self.next_animation_tick.get_or_insert(now + interval);
         } else if self.has_foreground_viewer {

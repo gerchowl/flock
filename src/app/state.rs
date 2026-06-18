@@ -1831,6 +1831,11 @@ pub struct AppState {
     /// Persistent state for the idle-flock simulation (grass heights + sheep).
     /// `RefCell` so the render pass (which holds `&AppState`) can step it.
     pub(crate) sheep_sim: std::cell::RefCell<crate::ui::sheep::SheepSim>,
+    /// Set when interaction resumes after a long idle so the full-screen
+    /// screensaver wipes (sheep bolt, grass recedes) before vanishing.
+    pub sheep_wipe_until: Option<std::time::Instant>,
+    /// Persistent state for the stage-2 full-screen screensaver simulation.
+    pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1862,8 +1867,12 @@ impl AppState {
     /// so the sheep bolt off-screen before vanishing.
     pub(crate) fn note_interaction(&mut self) {
         let now = std::time::Instant::now();
-        if now.duration_since(self.last_interaction) >= crate::ui::sheep::IDLE_THRESHOLD {
+        let idle = now.duration_since(self.last_interaction);
+        if idle >= crate::ui::sheep::IDLE_THRESHOLD {
             self.sheep_flee_until = Some(now + crate::ui::sheep::FLEE_DURATION);
+        }
+        if idle >= crate::ui::screensaver::SCREENSAVER_THRESHOLD {
+            self.sheep_wipe_until = Some(now + crate::ui::screensaver::WIPE_DURATION);
         }
         self.last_interaction = now;
     }
@@ -1873,6 +1882,16 @@ impl AppState {
         crate::ui::sheep::flock_phase(
             self.last_interaction,
             self.sheep_flee_until,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// The current full-screen screensaver phase (stage 2; None until the longer
+    /// idle threshold, or once the wipe completes).
+    pub(crate) fn screensaver_phase(&self) -> Option<crate::ui::screensaver::ScreensaverPhase> {
+        crate::ui::screensaver::phase(
+            self.last_interaction,
+            self.sheep_wipe_until,
             std::time::Instant::now(),
         )
     }
@@ -2346,6 +2365,10 @@ impl AppState {
             last_interaction: std::time::Instant::now(),
             sheep_flee_until: None,
             sheep_sim: std::cell::RefCell::new(crate::ui::sheep::SheepSim::default()),
+            sheep_wipe_until: None,
+            screensaver_sim: std::cell::RefCell::new(
+                crate::ui::screensaver::ScreensaverSim::default(),
+            ),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
