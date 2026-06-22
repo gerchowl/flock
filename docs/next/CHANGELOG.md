@@ -4,6 +4,7 @@
 
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
+- Headless servers now avoid repeated scrollback rendering work for inactive panes, reducing CPU in large sessions. Wheel-routing lookups go through a narrow mouse-mode probe instead of building a full input-state snapshot, and per-client frame preparation moves the frame through prepare/commit instead of cloning it on every send. Ported from herdr #512. (#17)
 
 ## [0.6.8] - 2026-06-04
 

@@ -41,25 +41,24 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn prepare_frame(&mut self, frame: &FrameData) -> Option<PreparedRender> {
+    pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
             Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(frame) {
+                if last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
                 crate::render_prof::event("prepare_frame.semantic.changed");
-                Some(PreparedRender {
-                    message: ServerMessage::Frame(frame.clone()),
-                    encoded: None,
+                Some(PreparedRender::Semantic {
+                    message: ServerMessage::Frame(frame),
                 })
             }
             Self::TerminalAnsi { blit_encoder, seq } => {
-                if blit_encoder.is_current(frame) {
+                if blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
-                let mut encoded = blit_encoder.encode(frame, false);
+                let mut encoded = blit_encoder.encode(&frame, false);
                 crate::render_prof::event("prepare_frame.ansi.changed");
                 crate::render_prof::counter("prepare_frame.ansi.bytes", encoded.bytes.len() as u64);
                 if encoded.full {
@@ -72,7 +71,7 @@ impl ClientRenderState {
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
                 );
-                Some(PreparedRender {
+                Some(PreparedRender::TerminalAnsi {
                     message: ServerMessage::Terminal(TerminalFrame {
                         seq: *seq + 1,
                         width: frame.width,
@@ -80,6 +79,7 @@ impl ClientRenderState {
                         full: encoded.full,
                         bytes: encoded.bytes.clone(),
                     }),
+                    frame,
                     encoded: Some(encoded),
                 })
             }
@@ -93,10 +93,22 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn commit_sent_frame(&mut self, frame: FrameData, prepared: PreparedRender) {
-        match (self, prepared.encoded) {
-            (Self::Semantic { last_frame }, None) => *last_frame = Some(frame),
-            (Self::TerminalAnsi { blit_encoder, seq }, Some(encoded)) => {
+    pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
+        match (self, prepared) {
+            (
+                Self::Semantic { last_frame },
+                PreparedRender::Semantic {
+                    message: ServerMessage::Frame(frame),
+                },
+            ) => *last_frame = Some(frame),
+            (
+                Self::TerminalAnsi { blit_encoder, seq },
+                PreparedRender::TerminalAnsi {
+                    frame,
+                    encoded: Some(encoded),
+                    ..
+                },
+            ) => {
                 blit_encoder.commit(frame, encoded);
                 *seq += 1;
             }
@@ -138,14 +150,32 @@ fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// A prepared client render message plus any baseline state needed after send.
-pub(crate) struct PreparedRender {
-    message: ServerMessage,
-    encoded: Option<EncodedBlit>,
+pub(crate) enum PreparedRender {
+    Semantic {
+        message: ServerMessage,
+    },
+    TerminalAnsi {
+        message: ServerMessage,
+        frame: FrameData,
+        encoded: Option<EncodedBlit>,
+    },
 }
 
 impl PreparedRender {
     pub(crate) fn message(&self) -> &ServerMessage {
-        &self.message
+        match self {
+            Self::Semantic { message } | Self::TerminalAnsi { message, .. } => message,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> Option<FrameData> {
+        match self {
+            Self::Semantic {
+                message: ServerMessage::Frame(frame),
+            } => Some(frame),
+            Self::TerminalAnsi { frame, .. } => Some(frame),
+            _ => None,
+        }
     }
 }
 
@@ -401,5 +431,124 @@ pub(crate) fn focused_terminal_cursor(
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the per-client render baseline.
+    //!
+    //! Covers the inactive-pane render-work-skip behavior ported from
+    //! herdr #512: an unchanged pane (which is what an inactive pane looks
+    //! like from the render stream's perspective — no new frame deltas) must
+    //! short-circuit `prepare_frame` so the headless server skips encode +
+    //! send work, while a first-render or a changed frame still produces a
+    //! correctly serialized message.
+    use super::*;
+    use crate::protocol::{CellData, FrameData, RenderEncoding};
+
+    fn cell(symbol: &str) -> CellData {
+        CellData {
+            symbol: symbol.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        }
+    }
+
+    fn frame_with(symbol: &str) -> FrameData {
+        FrameData {
+            cells: vec![cell(symbol); 4],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn semantic_inactive_pane_skips_repeated_render_work() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let frame = frame_with("x");
+
+        // First render: client has no baseline, so the frame must be prepared
+        // and committed (covers an attaching client / focused pane).
+        let prepared = state
+            .prepare_frame(frame.clone())
+            .expect("first render must produce a frame");
+        assert!(matches!(
+            prepared.message(),
+            ServerMessage::Frame(produced) if produced == &frame
+        ));
+        state.commit_sent_frame(prepared);
+        assert_eq!(state.last_frame(), Some(&frame));
+
+        // Inactive pane: nothing changed between ticks. prepare_frame must
+        // return None so the caller skips serialize + send.
+        assert!(state.prepare_frame(frame.clone()).is_none());
+
+        // A change still re-renders correctly (active pane unaffected).
+        let changed = frame_with("y");
+        let prepared = state
+            .prepare_frame(changed.clone())
+            .expect("changed frame must re-render");
+        match prepared.message() {
+            ServerMessage::Frame(produced) => assert_eq!(produced, &changed),
+            other => panic!("unexpected message variant: {other:?}"),
+        }
+        state.commit_sent_frame(prepared);
+        assert_eq!(state.last_frame(), Some(&changed));
+    }
+
+    #[test]
+    fn terminal_ansi_inactive_pane_skips_repeated_render_work() {
+        let mut state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+        let frame = frame_with("x");
+
+        // First render bumps the seq.
+        let prepared = state
+            .prepare_frame(frame.clone())
+            .expect("first render must produce a frame");
+        assert!(matches!(prepared.message(), ServerMessage::Terminal(_)));
+        state.commit_sent_frame(prepared);
+        assert_eq!(state.terminal_seq(), Some(1));
+
+        // No change: no work, no seq bump.
+        assert!(state.prepare_frame(frame.clone()).is_none());
+        assert_eq!(state.terminal_seq(), Some(1));
+
+        // Change re-renders and bumps the seq.
+        let changed = frame_with("y");
+        let prepared = state
+            .prepare_frame(changed)
+            .expect("changed frame must re-render");
+        assert!(matches!(prepared.message(), ServerMessage::Terminal(_)));
+        state.commit_sent_frame(prepared);
+        assert_eq!(state.terminal_seq(), Some(2));
+    }
+
+    #[test]
+    fn prepared_render_recovers_owned_frame_for_fallback() {
+        // Recovering the owned frame from `PreparedRender::into_frame` is what
+        // lets the headless full-render path drop graphics from an oversized
+        // frame without re-cloning the entire FrameData per send.
+        let mut state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+        let mut frame = frame_with("x");
+        frame.graphics = vec![1, 2, 3];
+
+        let prepared = state.prepare_frame(frame.clone()).expect("prepare frame");
+        let recovered = prepared.into_frame().expect("frame recoverable");
+        assert_eq!(recovered, frame);
+
+        // Semantic variant carries the frame inside the message.
+        let mut sem_state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let prepared = sem_state
+            .prepare_frame(frame.clone())
+            .expect("semantic prepare");
+        let recovered = prepared.into_frame().expect("frame recoverable");
+        assert_eq!(recovered, frame);
     }
 }

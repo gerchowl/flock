@@ -2683,7 +2683,7 @@ impl HeadlessServer {
             return false;
         };
         let prepare_started = crate::render_prof::timer();
-        let Some(prepared) = client.render_state.prepare_frame(&frame) else {
+        let Some(prepared) = client.render_state.prepare_frame(frame) else {
             client.render_pending = false;
             crate::render_prof::event("retained_send.skip_identical");
             crate::render_prof::duration_since("retained_send.prepare_frame", prepare_started);
@@ -2719,7 +2719,7 @@ impl HeadlessServer {
         match writer.render.try_send(serialized) {
             Ok(()) => {
                 client.render_pending = false;
-                client.render_state.commit_sent_frame(frame, prepared);
+                client.render_state.commit_sent_frame(prepared);
                 crate::render_prof::event("retained_send.sent");
                 crate::render_prof::duration_since("retained_send.try_send", send_started);
                 true
@@ -2895,21 +2895,21 @@ impl HeadlessServer {
                 commit_graphics_cache = false;
             }
 
+            let max_frame_size = if frame.graphics.is_empty() {
+                MAX_FRAME_SIZE
+            } else {
+                MAX_GRAPHICS_FRAME_SIZE
+            };
+            let has_graphics = !frame.graphics.is_empty();
             let prepare_started = crate::render_prof::timer();
-            let Some(mut prepared) = client.render_state.prepare_frame(&frame) else {
+            let Some(mut prepared) = client.render_state.prepare_frame(frame) else {
                 client.render_pending = false;
                 crate::render_prof::event("full_render.skip_identical");
                 crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
                 continue;
             };
             crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
-            let mut frame_to_commit = frame.clone();
 
-            let max_frame_size = if frame.graphics.is_empty() {
-                MAX_FRAME_SIZE
-            } else {
-                MAX_GRAPHICS_FRAME_SIZE
-            };
             let serialize_started = crate::render_prof::timer();
             let serialized = match Self::frame_server_message_with_max(
                 prepared.message(),
@@ -2919,17 +2919,22 @@ impl HeadlessServer {
                     crate::render_prof::duration_since("full_render.serialize", serialize_started);
                     framed
                 }
-                Err(protocol::FramingError::Oversized { claimed, max })
-                    if !frame.graphics.is_empty() =>
-                {
+                Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
                         client_id,
                         claimed, max, "dropping graphics from oversized frame for client"
                     );
-                    let mut text_only_frame = frame.clone();
+                    let Some(mut text_only_frame) = prepared.into_frame() else {
+                        crate::render_prof::event("full_render.serialize_error");
+                        crate::render_prof::duration_since(
+                            "full_render.serialize",
+                            serialize_started,
+                        );
+                        continue;
+                    };
                     text_only_frame.graphics.clear();
                     let Some(text_only_prepared) =
-                        client.render_state.prepare_frame(&text_only_frame)
+                        client.render_state.prepare_frame(text_only_frame)
                     else {
                         client.render_pending = false;
                         crate::render_prof::event("full_render.skip_identical_text_only");
@@ -2953,7 +2958,6 @@ impl HeadlessServer {
                         }
                     };
                     prepared = text_only_prepared;
-                    frame_to_commit = text_only_frame;
                     commit_graphics_cache = false;
                     crate::render_prof::duration_since("full_render.serialize", serialize_started);
                     framed
@@ -2985,9 +2989,7 @@ impl HeadlessServer {
                         client.graphics_cache = next_graphics_cache;
                         client.graphics_surface_reset_pending = false;
                     }
-                    client
-                        .render_state
-                        .commit_sent_frame(frame_to_commit, prepared);
+                    client.render_state.commit_sent_frame(prepared);
                     crate::render_prof::event("full_render.sent");
                     crate::render_prof::duration_since("full_render.try_send", send_started);
                 }
@@ -6691,9 +6693,9 @@ next_tab = ""
         frame.cells[hyperlink_idx].hyperlink = Some(0);
         let prepared = client
             .render_state
-            .prepare_frame(&frame)
+            .prepare_frame(frame)
             .expect("hyperlink frame differs");
-        client.render_state.commit_sent_frame(frame, prepared);
+        client.render_state.commit_sent_frame(prepared);
 
         let runtime = server
             .app
