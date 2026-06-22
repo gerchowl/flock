@@ -330,7 +330,7 @@ fn workspace_list_and_create_round_trip() {
     assert_eq!(created["result"]["workspace"]["tab_count"], 1);
     assert_eq!(created["result"]["tab"]["tab_id"], active_tab_id);
     assert_eq!(created["result"]["root_pane"]["tab_id"], active_tab_id);
-    assert_eq!(active_tab_id, format!("{workspace_id}:1"));
+    assert_eq!(active_tab_id, format!("{workspace_id}:t1"));
 
     let listed = send_request(
         &socket_path,
@@ -503,7 +503,7 @@ fn tab_methods_round_trip_over_socket() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(first_tab_id, format!("{workspace_id}:1"));
+    assert_eq!(first_tab_id, format!("{workspace_id}:t1"));
 
     let tab_created = send_request(
         &socket_path,
@@ -527,7 +527,7 @@ fn tab_methods_round_trip_over_socket() {
         .to_string();
     assert!(second_root_terminal_id.starts_with("term_"));
     assert_ne!(second_root_terminal_id, second_root_pane_id);
-    assert_eq!(second_tab_id, format!("{workspace_id}:2"));
+    assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
     assert_eq!(tab_created["result"]["tab"]["focused"], true);
     assert_eq!(tab_created["result"]["root_pane"]["tab_id"], second_tab_id);
 
@@ -968,7 +968,7 @@ fn tab_create_with_no_focus_preserves_active_tab() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(second_tab_id, format!("{workspace_id}:2"));
+    assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
     assert_eq!(tab_created["result"]["tab"]["focused"], false);
 
     let tab_list = send_request(
@@ -1053,7 +1053,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
         wait_for_event(&mut reader, "workspace_focused", Duration::from_secs(2));
     assert_eq!(workspace_focused["data"]["workspace_id"], workspace_id);
 
-    let first_tab_id = format!("{workspace_id}:1");
+    let first_tab_id = format!("{workspace_id}:t1");
     let tab_created = wait_for_event(&mut reader, "tab_created", Duration::from_secs(2));
     assert_eq!(tab_created["data"]["tab"]["tab_id"], first_tab_id);
     let tab_focused = wait_for_event(&mut reader, "tab_focused", Duration::from_secs(2));
@@ -1099,7 +1099,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(second_tab_id, format!("{workspace_id}:2"));
+    assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
 
     let created_tab_event = wait_for_event(&mut reader, "tab_created", Duration::from_secs(2));
     assert_eq!(created_tab_event["data"]["tab"]["tab_id"], second_tab_id);
@@ -1975,7 +1975,10 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
         .as_str()
         .unwrap()
         .to_string();
-    let background_pane_id = format!("{}-1", workspace_id);
+    let background_pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let tab_created = send_request(
         &socket_path,
@@ -2091,10 +2094,10 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
             base.display()
         ),
     );
-    let pane_id = created["result"]["workspace"]["workspace_id"]
+    let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
-        .map(|workspace_id| format!("{}-1", workspace_id))
-        .unwrap();
+        .unwrap()
+        .to_string();
 
     let report_agent = send_request(
         &socket_path,

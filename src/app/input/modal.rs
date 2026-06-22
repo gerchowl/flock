@@ -328,7 +328,7 @@ fn next_new_tab_default_name(state: &AppState) -> String {
     state
         .active
         .and_then(|i| state.workspaces.get(i))
-        .map(|ws| (ws.tabs.len() + 1).to_string())
+        .map(|ws| ws.next_public_tab_number.to_string())
         .unwrap_or_else(|| "1".to_string())
 }
 
@@ -426,12 +426,20 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                         if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                             let workspace_id = ws.id.clone();
                             let active_tab = ws.active_tab;
+                            let tab_public_number = ws.public_tab_number(active_tab);
                             if let Some(tab) = ws.active_tab_mut() {
                                 let keep_auto_name =
                                     tab.is_auto_named() && new_name == tab.number.to_string();
                                 if !new_name.is_empty() && !keep_auto_name {
                                     tab.set_custom_name(new_name);
-                                    let tab_id = format!("{}:{}", workspace_id, active_tab + 1);
+                                    let tab_id = tab_public_number
+                                        .map(|number| {
+                                            crate::workspace::public_tab_id_for_number(
+                                                &workspace_id,
+                                                number,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| workspace_id.clone());
                                     crate::logging::tab_renamed(&workspace_id, &tab_id);
                                     state.mark_session_dirty();
                                 }
@@ -1243,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_first_auto_tab_resets_remaining_auto_tab_and_next_prompt() {
+    fn closing_first_auto_tab_keeps_remaining_auto_tab_number_and_next_prompt() {
         let mut state = state_with_workspaces(&["test"]);
         open_new_tab_dialog(&mut state);
         handle_rename_key(
@@ -1258,11 +1266,13 @@ mod tests {
         state.workspaces[0].close_tab(0);
         state.workspaces[0].switch_tab(0);
 
-        assert_eq!(state.workspaces[0].tabs[0].display_name(), "1");
+        // Stable tab numbers: closing tab 1 leaves tab 2 as-is, and the next
+        // auto-named tab will be 3.
+        assert_eq!(state.workspaces[0].tabs[0].display_name(), "2");
         assert!(state.workspaces[0].tabs[0].custom_name.is_none());
 
         open_new_tab_dialog(&mut state);
-        assert_eq!(state.name_input, "2");
+        assert_eq!(state.name_input, "3");
     }
 
     #[test]

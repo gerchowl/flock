@@ -1739,13 +1739,18 @@ mod tests {
             .iter()
             .map(|tab| tab.display_name())
             .collect();
-        assert_eq!(labels, vec!["foo", "2", "3"]);
+        // Stable tab numbers (#25): a reorder keeps each tab's number, so the
+        // auto-named tab that was originally #1 stays "1" even after moving.
+        assert_eq!(labels, vec!["foo", "3", "1"]);
         assert_eq!(
             app.state.workspaces[0].tabs[0].custom_name.as_deref(),
             Some("foo")
         );
         assert!(app.state.workspaces[0].tabs[1].custom_name.is_none());
         assert!(app.state.workspaces[0].tabs[2].custom_name.is_none());
+        assert_eq!(app.state.workspaces[0].tabs[0].number, 2);
+        assert_eq!(app.state.workspaces[0].tabs[1].number, 3);
+        assert_eq!(app.state.workspaces[0].tabs[2].number, 1);
         assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
         assert_eq!(app.state.workspaces[0].active_tab, 2);
     }
