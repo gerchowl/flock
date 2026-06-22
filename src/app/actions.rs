@@ -2946,9 +2946,16 @@ impl AppState {
                 agent_label,
                 seq,
                 session_ref,
+                session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
+                    terminal.set_agent_session_ref_for_session_start(
+                        source,
+                        agent_label,
+                        session_ref,
+                        seq,
+                        session_start_source,
+                    )
                 })
                 .into_iter()
                 .collect(),
@@ -4896,6 +4903,7 @@ mod tests {
             agent_label: "claude".into(),
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("session-123"),
+            session_start_source: None,
         };
 
         // Mis-delivered first (stale env id), then the ancestry-verified

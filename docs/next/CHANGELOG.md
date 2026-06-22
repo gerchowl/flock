@@ -4,6 +4,7 @@
 
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
+- Claude Code session restore now accepts real `/clear`, `/resume`, and compacted session identity changes while still ignoring nested `claude -p` startup sessions that inherit the pane environment. (#19)
 
 ## [0.6.8] - 2026-06-04
 

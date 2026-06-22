@@ -69,6 +69,17 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+/// Normalize the optional `session_start_source` field reported by the Claude
+/// Code hook on `SessionStart`. Claude reports `startup`, `resume`, `clear`,
+/// or `compact` — anything else is treated as absent so we don't trust an
+/// unrecognized value.
+pub fn normalize_claude_session_start_source(value: Option<String>) -> Option<String> {
+    match value.as_deref().map(str::trim) {
+        Some(source @ ("startup" | "resume" | "clear" | "compact")) => Some(source.to_string()),
+        _ => None,
+    }
+}
+
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
@@ -427,5 +438,36 @@ mod tests {
     fn branch_plan_rejects_unofficial_sources() {
         let session = AgentSessionRef::id("claude-session").unwrap();
         assert!(branch_plan("tmux:claude", "claude", &session).is_none());
+    }
+
+    #[test]
+    fn normalize_claude_session_start_source_keeps_known_values() {
+        for source in ["startup", "resume", "clear", "compact"] {
+            assert_eq!(
+                normalize_claude_session_start_source(Some(source.into())),
+                Some(source.into())
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_claude_session_start_source_trims_whitespace() {
+        assert_eq!(
+            normalize_claude_session_start_source(Some(" resume ".into())),
+            Some("resume".into())
+        );
+    }
+
+    #[test]
+    fn normalize_claude_session_start_source_rejects_unknown_or_missing() {
+        assert_eq!(
+            normalize_claude_session_start_source(Some("bogus".into())),
+            None
+        );
+        assert_eq!(
+            normalize_claude_session_start_source(Some(String::new())),
+            None
+        );
+        assert_eq!(normalize_claude_session_start_source(None), None);
     }
 }
