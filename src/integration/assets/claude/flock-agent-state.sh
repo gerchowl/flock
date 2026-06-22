@@ -3,7 +3,7 @@
 # managed by flock; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=claude
-# FLOCK_INTEGRATION_VERSION=7
+# FLOCK_INTEGRATION_VERSION=8
 
 set -eu
 
@@ -132,17 +132,31 @@ if action == "session":
     agent_session_id = session_id if isinstance(session_id, str) and session_id else None
     if not agent_session_id:
         raise SystemExit(0)
+    # Claude Code reports `source` on SessionStart hooks as one of
+    # `startup`, `resume`, `clear`, `compact`. The server uses this to tell a
+    # legitimate identity change (clear/resume/compact) from a nested
+    # `claude -p` startup that inherits the pane env. Only forward the value
+    # when it actually comes from a SessionStart hook so other lifecycle
+    # actions can't spoof it.
+    session_start_source = None
+    if hook_event_name == "SessionStart":
+        candidate = hook_input.get("source")
+        if isinstance(candidate, str) and candidate:
+            session_start_source = candidate
     request_id, report_seq = now_ids()
+    params = {
+        "pane_id": pane_id,
+        "source": source,
+        "agent": "claude",
+        "seq": report_seq,
+        "agent_session_id": agent_session_id,
+    }
+    if session_start_source:
+        params["session_start_source"] = session_start_source
     send({
         "id": request_id,
         "method": "pane.report_agent_session",
-        "params": {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": "claude",
-            "seq": report_seq,
-            "agent_session_id": agent_session_id,
-        },
+        "params": params,
     })
     raise SystemExit(0)
 

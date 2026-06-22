@@ -136,6 +136,11 @@ pub enum AppEvent {
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// Normalized Claude Code `SessionStart` source field
+        /// (`startup`/`resume`/`clear`/`compact`). `startup` reports are
+        /// treated as nested session noise and never replace an existing
+        /// restored session id; the other values are real identity changes.
+        session_start_source: Option<String>,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {

@@ -532,12 +532,75 @@ impl TerminalState {
         self.persisted_agent_session = Some(session);
     }
 
+    /// Returns true when the current persisted identity is an id for the same
+    /// source+agent but with a *different* value than the incoming report, and
+    /// the `session_start_source` does not authorize replacement. This is the
+    /// guard that keeps a nested `claude -p` (which inherits the pane env and
+    /// reports its own session id at startup) from clobbering the restored id
+    /// belonging to the original pane occupant.
+    fn has_conflicting_current_session_ref(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        session_start_source: Option<&str>,
+    ) -> bool {
+        let Some((current_source, current_agent, current_kind, current_value)) =
+            self.current_session_identity_for_persistence()
+        else {
+            return false;
+        };
+        if current_source != source || current_agent != agent_label {
+            return false;
+        }
+        if current_kind != crate::agent_resume::AgentSessionRefKind::Id
+            || session_ref.kind != crate::agent_resume::AgentSessionRefKind::Id
+        {
+            return false;
+        }
+        if current_value == session_ref.value {
+            return false;
+        }
+        !Self::session_start_source_allows_session_replacement(
+            source,
+            agent_label,
+            session_start_source,
+        )
+    }
+
+    fn session_start_source_allows_session_replacement(
+        source: &str,
+        agent_label: &str,
+        session_start_source: Option<&str>,
+    ) -> bool {
+        source == "flock:claude"
+            && agent_label == "claude"
+            && matches!(session_start_source, Some("clear" | "resume" | "compact"))
+    }
+
     pub fn set_agent_session_ref(
         &mut self,
         source: String,
         agent_label: String,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
+    ) -> Option<TerminalStateMutation> {
+        self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
+    }
+
+    /// Same as [`set_agent_session_ref`] but also honours the Claude Code
+    /// `SessionStart` `source` field. A startup-style report (no source, or
+    /// `startup`) that would replace an existing restored Claude id is
+    /// rejected — it's almost certainly a nested `claude -p` inheriting the
+    /// pane environment. `clear`, `resume`, and `compact` are real identity
+    /// changes the user just triggered, and we accept them.
+    pub fn set_agent_session_ref_for_session_start(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
         self.header_reserved = true;
         let session_ref = session_ref?;
@@ -547,10 +610,12 @@ impl TerminalState {
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
         }
-        if self
-            .conflicting_current_session_ref(&source, &agent_label, &session_ref)
-            .is_some()
-        {
+        if self.has_conflicting_current_session_ref(
+            &source,
+            &agent_label,
+            &session_ref,
+            session_start_source.as_deref(),
+        ) {
             return None;
         }
 
@@ -2440,6 +2505,120 @@ mod tests {
         assert_eq!(
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
+        );
+    }
+
+    /// A nested `claude -p` invocation inherits the parent pane's
+    /// `FLOCK_PANE_ID` and fires its own SessionStart hook with a fresh
+    /// session id. We must not let it hijack the restored id for the pane.
+    #[test]
+    fn claude_nested_startup_session_does_not_replace_restored_session_ref() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "flock:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+                Some("startup".into()),
+            )
+            .expect("initial session should be accepted");
+
+        // Same `source` + `agent`, fresh id, `startup` source — this is the
+        // nested `claude -p` shape. It must be ignored.
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "flock:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("nested-startup-session"),
+            Some(21),
+            Some("startup".into()),
+        );
+        assert!(
+            mutation.is_none(),
+            "nested startup session must not produce a mutation"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("claude-session"),
+            "nested startup must not overwrite the restored id"
+        );
+    }
+
+    /// Real lifecycle changes (/clear, /resume, compaction) genuinely rotate
+    /// the session id and must be persisted so resume works after a restart.
+    #[test]
+    fn claude_lifecycle_session_start_replaces_existing_session_ref() {
+        for session_start_source in ["clear", "resume", "compact"] {
+            let mut terminal = test_terminal();
+            terminal
+                .set_agent_session_ref_for_session_start(
+                    "flock:claude".into(),
+                    "claude".into(),
+                    crate::agent_resume::AgentSessionRef::id("claude-session"),
+                    Some(20),
+                    Some("startup".into()),
+                )
+                .expect("initial session should be accepted");
+
+            let next_session = format!("{session_start_source}-session");
+            let mutation = terminal
+                .set_agent_session_ref_for_session_start(
+                    "flock:claude".into(),
+                    "claude".into(),
+                    crate::agent_resume::AgentSessionRef::id(&next_session),
+                    Some(21),
+                    Some(session_start_source.into()),
+                )
+                .unwrap_or_else(|| panic!("`{session_start_source}` must replace the session id"));
+            assert!(
+                mutation.session_ref_changed,
+                "{session_start_source} should mark the session changed"
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.session_ref.value.as_str()),
+                Some(next_session.as_str()),
+                "{session_start_source} should store the replacement session id"
+            );
+        }
+    }
+
+    /// Repeating the same id (idle SessionStart with no rotation) is fine —
+    /// no conflict, no mutation noise.
+    #[test]
+    fn claude_repeated_same_session_ref_is_accepted_without_change() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "flock:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+                Some("startup".into()),
+            )
+            .expect("initial session should be accepted");
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start(
+                "flock:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(21),
+                Some("startup".into()),
+            )
+            .expect("same id should still flow through");
+        assert!(!mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("claude-session"),
         );
     }
 }

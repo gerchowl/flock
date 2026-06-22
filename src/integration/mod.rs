@@ -19,7 +19,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 7;
+const CLAUDE_INTEGRATION_VERSION: u32 = 8;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -2940,14 +2940,21 @@ mod tests {
     /// or the decision:block nudge) without needing to spawn python3 at
     /// test time. Pairs with the runtime path that the install test covers.
     #[test]
-    fn claude_hook_asset_has_v7_shape() {
+    fn claude_hook_asset_has_v8_shape() {
         let asset = CLAUDE_HOOK_ASSET;
         // Version pin so a future change makes the test catch the
         // out-of-sync constant before the install test reports the wrong
         // version.
         assert!(
-            asset.contains("FLOCK_INTEGRATION_VERSION=7"),
+            asset.contains("FLOCK_INTEGRATION_VERSION=8"),
             "asset version pin missing"
+        );
+        // Session-start source forwarding so the server can distinguish a
+        // real `/clear`/`/resume`/compaction from a nested `claude -p`
+        // startup that inherits the pane environment.
+        assert!(
+            asset.contains("session_start_source"),
+            "session_start_source forwarding missing"
         );
         // Stop action wired through the case statement.
         assert!(
@@ -3220,7 +3227,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 7);
+        assert_eq!(claude.expected_version, 8);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -3250,7 +3257,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 7);
+        assert_eq!(claude.expected_version, 8);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
