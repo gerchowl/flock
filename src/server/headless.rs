@@ -495,6 +495,7 @@ impl HeadlessServer {
                     self.send_to_foreground_client(ServerMessage::Notify {
                         kind: protocol::NotifyKind::Sound,
                         message: "attention clear".to_owned(),
+                        body: None,
                     });
                 }
             }
@@ -1450,6 +1451,7 @@ impl HeadlessServer {
                         self.send_to_foreground_client(ServerMessage::Notify {
                             kind: protocol::NotifyKind::Sound,
                             message: msg.to_owned(),
+                            body: None,
                         });
                     }
                 }
@@ -1481,6 +1483,7 @@ impl HeadlessServer {
                         kind: toast_notify_kind(self.app.state.toast_config.delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         message: msg,
+                        body: None,
                     });
                 }
 
@@ -1536,6 +1539,7 @@ impl HeadlessServer {
                         self.send_to_foreground_client(ServerMessage::Notify {
                             kind: protocol::NotifyKind::Sound,
                             message: msg.to_owned(),
+                            body: None,
                         });
                     }
                 }
@@ -1567,6 +1571,7 @@ impl HeadlessServer {
                         kind: toast_notify_kind(self.app.state.toast_config.delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         message: msg,
+                        body: None,
                     });
                 }
 
@@ -1605,6 +1610,7 @@ impl HeadlessServer {
                         kind: toast_notify_kind(self.app.state.toast_config.delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         message: msg,
+                        body: None,
                     });
                 }
 
@@ -2375,6 +2381,7 @@ impl HeadlessServer {
                         kind: toast_notify_kind(self.app.state.toast_config.delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         message: msg_text,
+                        body: None,
                     });
                     true
                 } else {
@@ -2467,6 +2474,7 @@ impl HeadlessServer {
                             kind: toast_notify_kind(self.app.state.toast_config.delivery)
                                 .expect("toast forwarding requires a client notification kind"),
                             message: msg_text,
+                            body: None,
                         });
                     }
                 }
@@ -2489,6 +2497,7 @@ impl HeadlessServer {
                     self.send_to_foreground_client(ServerMessage::Notify {
                         kind: protocol::NotifyKind::Sound,
                         message: msg_text.to_owned(),
+                        body: None,
                     });
                 }
             }
@@ -6501,6 +6510,7 @@ next_tab = ""
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_owned(),
             context: "background · 2".to_owned(),
+            position: None,
             target: None,
         });
         server.render_and_stream();
@@ -7006,6 +7016,7 @@ next_tab = ""
         assert!(server.send_to_foreground_client(ServerMessage::Notify {
             kind: protocol::NotifyKind::Toast,
             message: "pi finished: workspace 1".to_string(),
+            body: None,
         }));
 
         match read_server_message(
@@ -7013,9 +7024,14 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("foreground toast message"),
         ) {
-            ServerMessage::Notify { kind, message } => {
+            ServerMessage::Notify {
+                kind,
+                message,
+                body,
+            } => {
                 assert_eq!(kind, protocol::NotifyKind::Toast);
                 assert_eq!(message, "pi finished: workspace 1");
+                assert!(body.is_none());
             }
             other => panic!("expected toast notify, got {other:?}"),
         }
@@ -7093,7 +7109,11 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("system toast message"),
         ) {
-            ServerMessage::Notify { kind, message } => {
+            ServerMessage::Notify {
+                kind,
+                message,
+                body: _,
+            } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(
                     message,

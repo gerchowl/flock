@@ -168,6 +168,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "custom command failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -249,6 +250,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "edit scrollback failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -291,6 +293,7 @@ impl App {
                 kind: crate::app::state::ToastKind::Finished,
                 title: "opened scrollback".to_string(),
                 context: format!("focused pane {public_pane_id}"),
+                position: None,
                 target: None,
             });
         }
@@ -1568,6 +1571,7 @@ mod tests {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".into(),
             context: "two".into(),
+            position: None,
             target: Some(crate::app::state::ToastTarget {
                 workspace_id: target_workspace_id,
                 pane_id: target_pane,

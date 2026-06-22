@@ -3002,6 +3002,7 @@ mod tests {
             kind: crate::app::state::ToastKind::Finished,
             title: "pi finished".into(),
             context: "background · 2".into(),
+            position: None,
             target: Some(crate::app::state::ToastTarget {
                 workspace_id,
                 pane_id: target_pane,

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added the `notification.show` socket API method and `flock notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]` CLI subcommand for raising notifications through the configured toast delivery. Added `[ui.toast.flock] position`, `[ui.toast.clipboard] enabled`/`position`, and `[ui.toast] delay_seconds` config so in-app toast and clipboard feedback placement and timing are configurable. Bumped the wire protocol from 18 to 19 so clients can carry an optional notification body alongside the title. Ported from herdr #486. (#26)
+
 ### Changed
 - Renamed the project from herdr to Flock. This is a full fork that now diverges from herdr upstream and develops independently; herdr changes are no longer tracked. The crate is published as `flock-ai`, the binary remains `flock`, and the version line continues uninterrupted (the number tracks code maturity, not the rename). Stale herdr-era integration artifacts, such as the installed Claude hook, are removed on install.
 - Config startup and reload now warn about unknown top-level table sections, including a `[toast]` hint that points to `[ui.toast]`, instead of silently ignoring them. (#21)

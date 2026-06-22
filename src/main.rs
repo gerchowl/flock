@@ -250,10 +250,18 @@ const DEFAULT_CONFIG: &str = r##"# flock configuration
 # Background notification popup delivery
 [ui.toast]
 # off = disable pop-up notifications
-# flock = show top-right in-app toasts
+# flock = show in-app toasts
 # terminal = ask the outer terminal to show a desktop notification
 # system = ask the OS notification service directly
 # delivery = "off"
+# delay_seconds = 1
+
+[ui.toast.flock]
+# position = "bottom-right"
+
+[ui.toast.clipboard]
+# enabled = true
+# position = "bottom-center"
 
 # Play sounds when agents change state in background workspaces
 [ui.sound]
@@ -686,6 +694,7 @@ fn main() -> io::Result<()> {
         println!("       flock workspace <subcommand> ...");
         println!("       flock worktree <subcommand> ...");
         println!("       flock tab <subcommand> ...");
+        println!("       flock notification <subcommand> ...");
         println!("       flock agent <subcommand> ...");
         println!("       flock pane <subcommand> ...");
         println!("       flock wait <subcommand> ...");
@@ -730,6 +739,10 @@ fn main() -> io::Result<()> {
                 "Git worktree helpers over the socket API",
             ),
             ("flock tab <subcommand>", "Tab helpers over the socket API"),
+            (
+                "flock notification <subcommand>",
+                "Notification helpers over the socket API",
+            ),
             (
                 "flock agent <subcommand>",
                 "Agent/terminal helpers over the socket API",

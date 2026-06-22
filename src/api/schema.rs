@@ -20,6 +20,8 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "notification.show")]
+    NotificationShow(NotificationShowParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -125,6 +127,50 @@ pub struct EmptyParams {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PingParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationShowParams {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<crate::config::ToastFlockPosition>,
+    #[serde(default, skip_serializing_if = "NotificationShowSound::is_none")]
+    pub sound: NotificationShowSound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationShowSound {
+    #[default]
+    None,
+    Done,
+    Request,
+}
+
+impl NotificationShowSound {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn to_sound(self) -> Option<crate::sound::Sound> {
+        match self {
+            Self::None => None,
+            Self::Done => Some(crate::sound::Sound::Done),
+            Self::Request => Some(crate::sound::Sound::Request),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationShowReason {
+    Shown,
+    Disabled,
+    RateLimited,
+    NoForegroundClient,
+    Busy,
+}
 
 /// Ask this server to prepare one of its OWN workspaces' branches for a
 /// cross-machine checkout (#125). The hub sends the peer's workspace id (from
@@ -739,6 +785,10 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+    },
+    NotificationShow {
+        shown: bool,
+        reason: NotificationShowReason,
     },
     PeersSummary {
         /// Short hostname of the answering server.
@@ -1399,6 +1449,34 @@ mod tests {
         assert_eq!(json["method"], "server.reload_config");
         let restored: Request = serde_json::from_value(json).unwrap();
         assert_eq!(restored, request);
+    }
+
+    #[test]
+    fn notification_show_request_parses() {
+        let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
+        let request: Request = serde_json::from_str(json).unwrap();
+        let Method::NotificationShow(params) = request.method else {
+            panic!("wrong method parsed");
+        };
+        assert_eq!(params.title, "build failed");
+        assert_eq!(params.body.as_deref(), Some("api workspace"));
+        assert_eq!(
+            params.position,
+            Some(crate::config::ToastFlockPosition::TopLeft)
+        );
+        assert_eq!(params.sound, NotificationShowSound::Request);
+    }
+
+    #[test]
+    fn notification_show_sound_defaults_to_none() {
+        let json =
+            r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed"}}"#;
+        let request: Request = serde_json::from_str(json).unwrap();
+        let Method::NotificationShow(params) = request.method else {
+            panic!("wrong method parsed");
+        };
+
+        assert_eq!(params.sound, NotificationShowSound::None);
     }
 
     #[test]

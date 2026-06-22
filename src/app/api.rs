@@ -426,6 +426,11 @@ impl App {
     }
 
     pub(crate) fn show_clipboard_feedback(&mut self) {
+        if !self.state.toast_config.clipboard.enabled {
+            self.state.copy_feedback = None;
+            self.copy_feedback_deadline = None;
+            return;
+        }
         self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
             message: "copied to clipboard".to_string(),
         });
@@ -489,6 +494,7 @@ impl App {
                 title: "config rolled back".to_string(),
                 context: crate::config::config_diagnostic_summary(&report.diagnostics)
                     .unwrap_or_else(|| "edit produced an invalid config".to_string()),
+                position: None,
                 target: None,
             });
         }
@@ -604,7 +610,7 @@ impl App {
         }
     }
 
-    pub(super) fn sync_toast_deadline(
+    pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
     ) {
@@ -727,6 +733,9 @@ impl App {
                     },
                 }
             }
+            Method::NotificationShow(params) => {
+                return self.handle_notification_show(request.id, params);
+            }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
             Method::PeersCheckoutPrepare(params) => {
                 return self.handle_peers_checkout_prepare(request.id, params)
@@ -824,6 +833,137 @@ impl App {
 
         serde_json::to_string(&response).unwrap()
     }
+
+    fn handle_notification_show(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationShowParams,
+    ) -> String {
+        use crate::api::schema::{NotificationShowReason, ResponseResult};
+
+        let requested_sound = params.sound;
+        let Some(title) = sanitized_notification_text(&params.title, 80) else {
+            return responses::encode_error(id, "invalid_params", "notification title is empty");
+        };
+        let body = params
+            .body
+            .as_deref()
+            .and_then(|body| sanitized_notification_text(body, 240));
+
+        let reason = match self.state.toast_config.delivery {
+            crate::config::ToastDelivery::Off => NotificationShowReason::Disabled,
+            crate::config::ToastDelivery::Flock => {
+                if self.state.toast.is_some() {
+                    NotificationShowReason::Busy
+                } else if self.api_notification_rate_limited(Instant::now()) {
+                    NotificationShowReason::RateLimited
+                } else {
+                    let previous_toast = self.state.toast.clone();
+                    self.mark_api_notification_shown(Instant::now());
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: ToastKind::UpdateInstalled,
+                        title,
+                        context: body.unwrap_or_default(),
+                        position: params.position,
+                        target: None,
+                    });
+                    self.sync_toast_deadline(previous_toast);
+                    self.emit_api_notification_sound(requested_sound);
+                    NotificationShowReason::Shown
+                }
+            }
+            crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System => {
+                // In headless mode, terminal/system delivery must be forwarded
+                // to the foreground attached client — `local_terminal_notifications`
+                // gates whether this process can emit notifications itself. When
+                // unset, report NoForegroundClient so the caller can fall back
+                // to a different delivery channel.
+                if !self.local_terminal_notifications {
+                    NotificationShowReason::NoForegroundClient
+                } else if self.api_notification_rate_limited(Instant::now()) {
+                    NotificationShowReason::RateLimited
+                } else {
+                    let notify = match self.state.toast_config.delivery {
+                        crate::config::ToastDelivery::Terminal => {
+                            crate::terminal_notify::show_notification
+                        }
+                        crate::config::ToastDelivery::System => {
+                            crate::platform::show_desktop_notification
+                        }
+                        _ => unreachable!("notification delivery was checked above"), // guardrails-ok: outer match arm restricts delivery to Terminal | System
+                    };
+                    match notify(&title, body.as_deref()) {
+                        Ok(true) => {
+                            self.mark_api_notification_shown(Instant::now());
+                            self.emit_api_notification_sound(requested_sound);
+                            NotificationShowReason::Shown
+                        }
+                        Ok(false) | Err(_) => NotificationShowReason::NoForegroundClient,
+                    }
+                }
+            }
+        };
+
+        responses::encode_success(
+            id,
+            ResponseResult::NotificationShow {
+                shown: matches!(reason, NotificationShowReason::Shown),
+                reason,
+            },
+        )
+    }
+
+    fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
+        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
+            return;
+        }
+        if let Some(sound) = sound.to_sound() {
+            crate::sound::play(sound, &self.state.sound);
+        }
+    }
+
+    pub(crate) fn api_notification_rate_limited(&self, now: Instant) -> bool {
+        self.last_api_notification_at
+            .is_some_and(|last| now.duration_since(last) < API_NOTIFICATION_RATE_LIMIT)
+    }
+
+    pub(crate) fn mark_api_notification_shown(&mut self, now: Instant) {
+        self.last_api_notification_at = Some(now);
+    }
+}
+
+const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
+
+fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
+    let mut sanitized = String::new();
+    let mut previous_space = false;
+    for ch in value.chars() {
+        let replacement = if ch == '\n' || ch == '\r' || ch == '\t' {
+            Some(' ')
+        } else if ch.is_control() {
+            None
+        } else {
+            Some(ch)
+        };
+        let Some(ch) = replacement else {
+            continue;
+        };
+        if ch.is_whitespace() {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+            sanitized.push(' ');
+        } else {
+            previous_space = false;
+            sanitized.push(ch);
+        }
+        if sanitized.chars().count() >= max_chars {
+            break;
+        }
+    }
+    let sanitized = sanitized.trim().to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 #[cfg(test)]
@@ -1144,6 +1284,7 @@ mod tests {
             kind: ToastKind::Finished,
             title: "codex finished".into(),
             context: "__flock_original__ · 1".into(),
+            position: None,
             target: Some(crate::app::state::ToastTarget {
                 workspace_id,
                 pane_id: root,

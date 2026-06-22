@@ -61,8 +61,8 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
-    render_config_diagnostic, render_copy_feedback, render_status_line, render_toast_notification,
-    toast_notification_rect,
+    copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_status_line,
+    render_toast_notification, toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -302,7 +302,14 @@ fn compute_view_internal(
     let toast_hit_area = app
         .toast
         .as_ref()
-        .map(|toast| toast_notification_rect(terminal_area, toast, app.config_diagnostic.is_some()))
+        .map(|toast| {
+            toast_notification_rect(
+                area,
+                toast,
+                app.config_diagnostic.is_some(),
+                toast.position.unwrap_or(app.toast_config.flock.position),
+            )
+        })
         .unwrap_or_default();
 
     app.view = crate::app::ViewState {
@@ -532,6 +539,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         );
         copy_feedback_offset += 1;
     }
+    let mut toast_rect = None;
     if let Some(toast) = &app.toast {
         if app.view.layout == ViewLayout::Mobile {
             render_mobile_toast_banner(
@@ -542,20 +550,25 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 &app.palette,
             );
         } else {
+            let position = toast.position.unwrap_or(app.toast_config.flock.position);
             render_toast_notification(
                 frame,
-                terminal_area,
+                frame.area(),
                 toast,
                 has_config_diagnostic,
+                position,
                 &app.palette,
             );
+            toast_rect = Some(toast_notification_rect(
+                frame.area(),
+                toast,
+                has_config_diagnostic,
+                position,
+            ));
         }
-        copy_feedback_offset =
-            copy_feedback_offset.saturating_add(if app.view.layout == ViewLayout::Mobile {
-                1
-            } else {
-                toast_notification_rect(terminal_area, toast, has_config_diagnostic).height
-            });
+        if app.view.layout == ViewLayout::Mobile {
+            copy_feedback_offset = copy_feedback_offset.saturating_add(1);
+        }
     }
     if let Some(feedback) = &app.copy_feedback {
         let area = if app.view.layout == ViewLayout::Mobile {
@@ -563,8 +576,47 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         } else {
             terminal_area
         };
-        render_copy_feedback(frame, area, feedback, copy_feedback_offset, &app.palette);
+        let position = app.toast_config.clipboard.position;
+        if let Some(toast_rect) = toast_rect {
+            copy_feedback_offset = copy_feedback_offset_for_toast(
+                area,
+                feedback,
+                copy_feedback_offset,
+                position,
+                toast_rect,
+            );
+        }
+        render_copy_feedback(
+            frame,
+            area,
+            feedback,
+            copy_feedback_offset,
+            position,
+            &app.palette,
+        );
     }
+}
+
+fn copy_feedback_offset_for_toast(
+    area: Rect,
+    feedback: &crate::app::state::CopyFeedback,
+    base_offset: u16,
+    position: crate::config::ToastClipboardPosition,
+    toast_rect: Rect,
+) -> u16 {
+    let feedback_rect = copy_feedback_rect(area, feedback, base_offset, position);
+    if rects_overlap(feedback_rect, toast_rect) {
+        base_offset.saturating_add(toast_rect.height)
+    } else {
+        base_offset
+    }
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x.saturating_add(b.width)
+        && b.x < a.x.saturating_add(a.width)
+        && a.y < b.y.saturating_add(b.height)
+        && b.y < a.y.saturating_add(a.height)
 }
 
 fn dim_background(frame: &mut Frame, area: Rect) {
