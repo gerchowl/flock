@@ -457,21 +457,23 @@ pub fn render_with_runtime_registry(
     render_panes(app, terminal_runtimes, frame, terminal_area);
 
     // Idle gimmick. Stage 1: a flock grazes the sidebar's separator bars after a
-    // quiet spell. Stage 2: after a much longer idle the screensaver takes over
-    // the whole frame (a guarded pasture). Either bolts off when interaction
-    // resumes. Resting views only.
-    if app.view.layout != ViewLayout::Mobile && matches!(app.mode, Mode::Navigate | Mode::Terminal)
+    // quiet spell. Stage 2: after a much longer idle a guarded-pasture screensaver
+    // takes over the sidebar column (never the whole frame). Either bolts off when
+    // interaction resumes. Resting views only, and only while the sidebar is open —
+    // a collapsed sidebar is too narrow for the sim, which no-ops on it.
+    if app.view.layout != ViewLayout::Mobile
+        && !app.sidebar_collapsed
+        && matches!(app.mode, Mode::Navigate | Mode::Terminal)
     {
         if let Some(phase) = app.screensaver_phase() {
             let wiping = matches!(phase, screensaver::ScreensaverPhase::Wiping(_));
-            let full_area = frame.area();
             app.screensaver_sim.borrow_mut().step(
                 frame.buffer_mut(),
-                full_area,
+                sidebar_area,
                 wiping,
                 &app.palette,
             );
-        } else if !app.sidebar_collapsed {
+        } else {
             if let Some(phase) = app.flock_phase() {
                 let fleeing = matches!(phase, sheep::FlockPhase::Fleeing(_));
                 app.sheep_sim.borrow_mut().step(

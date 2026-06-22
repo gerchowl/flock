@@ -1832,10 +1832,10 @@ pub struct AppState {
     /// Persistent state for the idle-flock simulation (grass heights + sheep).
     /// `RefCell` so the render pass (which holds `&AppState`) can step it.
     pub(crate) sheep_sim: std::cell::RefCell<crate::ui::sheep::SheepSim>,
-    /// Set when interaction resumes after a long idle so the full-screen
+    /// Set when interaction resumes after a long idle so the sidebar
     /// screensaver wipes (sheep bolt, grass recedes) before vanishing.
     pub sheep_wipe_until: Option<std::time::Instant>,
-    /// Persistent state for the stage-2 full-screen screensaver simulation.
+    /// Persistent state for the stage-2 sidebar screensaver simulation.
     pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
@@ -1887,7 +1887,7 @@ impl AppState {
         )
     }
 
-    /// The current full-screen screensaver phase (stage 2; None until the longer
+    /// The current sidebar screensaver phase (stage 2; None until the longer
     /// idle threshold, or once the wipe completes).
     pub(crate) fn screensaver_phase(&self) -> Option<crate::ui::screensaver::ScreensaverPhase> {
         crate::ui::screensaver::phase(

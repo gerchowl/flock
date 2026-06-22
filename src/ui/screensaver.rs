@@ -1,6 +1,6 @@
 //! Idle screensaver — **stage 2** of the flock gimmick. Stage 1 ([`super::sheep`])
 //! is the subtle grazing on the sidebar's separator bars after a short idle.
-//! After a *longer* idle this scene takes over the whole frame: sheep graze
+//! After a *longer* idle this scene takes over the sidebar column: sheep graze
 //! along several fence lines, wander off as strays, and now and then a few bolt
 //! for the screen edge. A sheepdog guards the field — it commits to the worst
 //! offender, swings to the **outside** (the far side from the field centre) and
@@ -21,9 +21,10 @@ use ratatui::style::{Modifier, Style};
 
 use crate::app::state::Palette;
 
-/// Idle time before the full-screen screensaver takes over — deliberately much
-/// longer than the sidebar-bar grazing ([`super::sheep::IDLE_THRESHOLD`]).
-pub const SCREENSAVER_THRESHOLD: Duration = Duration::from_secs(75);
+/// Idle time before the stage-2 screensaver takes over the sidebar — deliberately
+/// much longer than the sidebar-bar grazing ([`super::sheep::IDLE_THRESHOLD`]), so
+/// it only appears after a genuinely long idle rather than a brief quiet spell.
+pub const SCREENSAVER_THRESHOLD: Duration = Duration::from_secs(20 * 60);
 /// How long the wipe (sheep bolt off, grass recedes) runs after interaction.
 pub const WIPE_DURATION: Duration = Duration::from_millis(900);
 
@@ -146,7 +147,7 @@ struct Tuft {
     grow: f32,
 }
 
-/// Persistent full-screen screensaver simulation, held in `AppState`.
+/// Persistent screensaver simulation (drawn into the sidebar column), held in `AppState`.
 #[derive(Debug)]
 pub struct ScreensaverSim {
     area: Rect,
