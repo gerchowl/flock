@@ -207,22 +207,54 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
         ("image/bmp", "bmp"),
     ] {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            if let Some(bytes) = read_clipboard_image_with_command("wl-paste", &["--type", mime]) {
-                return Some(ClipboardImage { bytes, extension });
+            if let Some(image) =
+                read_validated_clipboard_image("wl-paste", &["--type", mime], extension)
+            {
+                return Some(image);
             }
         }
 
         if std::env::var_os("DISPLAY").is_some() {
-            if let Some(bytes) = read_clipboard_image_with_command(
+            if let Some(image) = read_validated_clipboard_image(
                 "xclip",
                 &["-selection", "clipboard", "-t", mime, "-o"],
+                extension,
             ) {
-                return Some(ClipboardImage { bytes, extension });
+                return Some(image);
             }
         }
     }
 
     None
+}
+
+fn read_validated_clipboard_image(
+    program: &str,
+    args: &[&str],
+    extension: &'static str,
+) -> Option<ClipboardImage> {
+    let bytes = read_clipboard_image_with_command(program, args)?;
+    if !bytes_match_image_signature(extension, &bytes) {
+        return None;
+    }
+    Some(ClipboardImage { bytes, extension })
+}
+
+fn bytes_match_image_signature(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP",
+        "bmp" => {
+            if bytes.len() < 26 || !bytes.starts_with(b"BM") {
+                return false;
+            }
+            let offset = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+            (26..=bytes.len()).contains(&offset)
+        }
+        _ => false,
+    }
 }
 
 /// Show a native desktop notification through libnotify's command-line helper.
@@ -427,6 +459,83 @@ mod tests {
             read_clipboard_image_with_spawned_command_max(command, 4),
             None
         );
+    }
+
+    #[test]
+    fn read_validated_clipboard_image_accepts_real_png_payload() {
+        assert_eq!(
+            read_validated_clipboard_image(
+                "sh",
+                &["-c", "printf '\\211PNG\\r\\n\\032\\nrest-of-image'"],
+                "png"
+            ),
+            Some(ClipboardImage {
+                bytes: b"\x89PNG\r\n\x1a\nrest-of-image".to_vec(),
+                extension: "png",
+            })
+        );
+    }
+
+    #[test]
+    fn read_validated_clipboard_image_rejects_garbage_payload_for_png() {
+        assert_eq!(
+            read_validated_clipboard_image("sh", &["-c", "printf '# Tasks'"], "png"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_validated_clipboard_image_rejects_truncated_png_payload() {
+        // PNG magic is 8 bytes; supply only the first 4.
+        assert_eq!(
+            read_validated_clipboard_image("sh", &["-c", "printf '\\211PNG'"], "png"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_clipboard_image_with_spawned_command_rejects_oversized_png_payload() {
+        // Oversized payloads are dropped by the size cap before validation.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '\\211PNG\\r\\n\\032\\noversized-content'");
+
+        assert_eq!(
+            read_clipboard_image_with_spawned_command_max(command, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn image_signatures_match_only_their_format() {
+        assert!(bytes_match_image_signature("png", b"\x89PNG\r\n\x1a\n..."));
+        assert!(bytes_match_image_signature(
+            "jpg",
+            &[0xFF, 0xD8, 0xFF, 0xE0]
+        ));
+        assert!(bytes_match_image_signature("gif", b"GIF87a..."));
+        assert!(bytes_match_image_signature("gif", b"GIF89a..."));
+        assert!(bytes_match_image_signature(
+            "webp",
+            b"RIFF\x10\x00\x00\x00WEBPVP8 "
+        ));
+
+        let mut bmp = vec![0u8; 26];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[10] = 26;
+        assert!(bytes_match_image_signature("bmp", &bmp));
+
+        assert!(!bytes_match_image_signature("png", b"# Tasks"));
+        assert!(!bytes_match_image_signature("jpg", b"plain clipboard text"));
+        assert!(!bytes_match_image_signature("gif", b""));
+        assert!(!bytes_match_image_signature("webp", b"RIFF but not webp"));
+        assert!(!bytes_match_image_signature("bmp", b"\x89PNG\r\n\x1a\n"));
+        assert!(!bytes_match_image_signature(
+            "bmp",
+            b"BM text is not a bitmap"
+        ));
+        assert!(!bytes_match_image_signature("svg", b"<svg></svg>"));
     }
 
     #[test]

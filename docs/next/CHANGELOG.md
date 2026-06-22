@@ -7,6 +7,7 @@
 
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
+- Linux clipboard image reads now validate image payloads before accepting them, preventing malformed clipboard data from reaching pane image paste flows. (#18)
 
 ## [0.6.8] - 2026-06-04
 
