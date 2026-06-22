@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- Renamed the project from herdr to Flock. This is a full fork that now diverges from herdr upstream and develops independently; herdr changes are no longer tracked. The crate is published as `flock-ai`, the binary remains `flock`, and the version line continues uninterrupted (the number tracks code maturity, not the rename). Stale herdr-era integration artifacts, such as the installed Claude hook, are removed on install.
+
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
 
