@@ -2004,8 +2004,12 @@ async fn run_client_loop(
                         // stay attached and let the user switch manually.
                         let _ = writeln!(io::stderr(), "flock: server requested switch to {ssh_target}, but no launcher is present (FLOCK_SWITCH_FILE unset)");
                     }
-                    ServerMessage::Notify { kind, message } => {
-                        handle_notify(kind, &message, &state.sound_config);
+                    ServerMessage::Notify {
+                        kind,
+                        message,
+                        body,
+                    } => {
+                        handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                     }
                     ServerMessage::Clipboard { data } => {
                         forward_clipboard(&data);
@@ -3060,10 +3064,16 @@ fn reload_local_client_config(
     }
 }
 
-fn handle_notify(kind: NotifyKind, message: &str, sound_config: &crate::config::SoundConfig) {
+fn handle_notify(
+    kind: NotifyKind,
+    message: &str,
+    body: Option<&str>,
+    sound_config: &crate::config::SoundConfig,
+) {
     handle_notify_with_notifiers(
         kind,
         message,
+        body,
         sound_config,
         crate::terminal_notify::show_notification,
         crate::platform::show_desktop_notification,
@@ -3073,6 +3083,7 @@ fn handle_notify(kind: NotifyKind, message: &str, sound_config: &crate::config::
 fn handle_notify_with_notifiers(
     kind: NotifyKind,
     message: &str,
+    body: Option<&str>,
     sound_config: &crate::config::SoundConfig,
     mut show_terminal_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
     mut show_system_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
@@ -3095,7 +3106,13 @@ fn handle_notify_with_notifiers(
                 message = message,
                 "received terminal toast notification from server"
             );
-            let (title, body) = crate::terminal_notify::split_message(message);
+            // If a body is provided, treat `message` as the title verbatim.
+            // Otherwise, fall back to splitting on the legacy `title: body`
+            // wire format for backward compatibility.
+            let (title, body) = match body {
+                Some(body) => (message, Some(body)),
+                None => crate::terminal_notify::split_message(message),
+            };
             if let Err(err) = show_terminal_notification(title, body) {
                 warn!(err = %err, "failed to emit terminal notification");
             }
@@ -3105,7 +3122,10 @@ fn handle_notify_with_notifiers(
                 message = message,
                 "received system toast notification from server"
             );
-            let (title, body) = crate::terminal_notify::split_message(message);
+            let (title, body) = match body {
+                Some(body) => (message, Some(body)),
+                None => crate::terminal_notify::split_message(message),
+            };
             if let Err(err) = show_system_notification(title, body) {
                 warn!(err = %err, "failed to emit system notification");
             }
@@ -4291,7 +4311,8 @@ mod tests {
 
         handle_notify_with_notifiers(
             NotifyKind::Toast,
-            "pi finished: workspace 1",
+            "pi finished",
+            Some("workspace 1"),
             &sound_config,
             |title, body| {
                 emitted = Some((title.to_string(), body.map(str::to_string)));
@@ -4313,7 +4334,8 @@ mod tests {
 
         handle_notify_with_notifiers(
             NotifyKind::SystemToast,
-            "pi finished: workspace 1",
+            "pi finished",
+            Some("workspace 1"),
             &sound_config,
             |_, _| Ok(false),
             |title, body| {
@@ -4325,6 +4347,32 @@ mod tests {
         assert_eq!(
             emitted,
             Some(("pi finished".to_string(), Some("workspace 1".to_string())))
+        );
+    }
+
+    #[test]
+    fn system_toast_notify_preserves_colon_in_title() {
+        let sound_config = crate::config::SoundConfig::default();
+        let mut emitted = None;
+
+        handle_notify_with_notifiers(
+            NotifyKind::SystemToast,
+            "build: failed",
+            Some("api workspace"),
+            &sound_config,
+            |_, _| Ok(false),
+            |title, body| {
+                emitted = Some((title.to_string(), body.map(str::to_string)));
+                Ok(true)
+            },
+        );
+
+        assert_eq!(
+            emitted,
+            Some((
+                "build: failed".to_string(),
+                Some("api workspace".to_string())
+            ))
         );
     }
 

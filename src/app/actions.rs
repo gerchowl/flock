@@ -2815,6 +2815,7 @@ impl AppState {
                         kind: ToastKind::UpdateInstalled,
                         title: format!("v{version} available"),
                         context: crate::update::update_install_instruction(&install_command),
+                        position: None,
                         target: None,
                     });
                 }
@@ -3166,6 +3167,7 @@ impl AppState {
                     kind,
                     title: format!("{} {}", toast_agent_label(agent_label), event_text),
                     context,
+                    position: None,
                     target: Some(ToastTarget {
                         workspace_id: self.workspaces[ws_idx].id.clone(),
                         pane_id,

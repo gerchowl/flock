@@ -51,6 +51,30 @@ pub enum ToastDelivery {
     System,
 }
 
+pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastFlockPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastClipboardPosition {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomCenter,
+    BottomRight,
+}
+
 /// Scope of a sidebar panel (agents, servers, spaces): everything, or only
 /// what belongs to the current workspace/machine/space group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -126,6 +150,22 @@ fn parse_right_click_passthrough_modifier(value: &str) -> Option<Option<KeyModif
 #[derive(Debug, Clone)]
 pub struct ToastConfig {
     pub delivery: ToastDelivery,
+    pub delay_seconds: u64,
+    pub flock: FlockToastConfig,
+    pub clipboard: ClipboardToastConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FlockToastConfig {
+    pub position: ToastFlockPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClipboardToastConfig {
+    pub enabled: bool,
+    pub position: ToastClipboardPosition,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -827,6 +867,26 @@ impl Default for ToastConfig {
     fn default() -> Self {
         Self {
             delivery: ToastDelivery::Off,
+            delay_seconds: 1,
+            flock: FlockToastConfig::default(),
+            clipboard: ClipboardToastConfig::default(),
+        }
+    }
+}
+
+impl Default for FlockToastConfig {
+    fn default() -> Self {
+        Self {
+            position: ToastFlockPosition::BottomRight,
+        }
+    }
+}
+
+impl Default for ClipboardToastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: ToastClipboardPosition::BottomCenter,
         }
     }
 }
@@ -841,6 +901,9 @@ impl<'de> Deserialize<'de> for ToastConfig {
         struct RawToastConfig {
             delivery: Option<ToastDelivery>,
             enabled: Option<bool>,
+            delay_seconds: Option<u64>,
+            flock: FlockToastConfig,
+            clipboard: ClipboardToastConfig,
         }
 
         let raw = RawToastConfig::deserialize(deserializer)?;
@@ -849,7 +912,19 @@ impl<'de> Deserialize<'de> for ToastConfig {
             Some(false) | None => ToastDelivery::Off,
         };
         let delivery = raw.delivery.unwrap_or(legacy_delivery);
-        Ok(Self { delivery })
+        let default = Self::default();
+        let delay_seconds = raw.delay_seconds.unwrap_or(default.delay_seconds);
+        if delay_seconds > MAX_TOAST_DELAY_SECONDS {
+            return Err(de::Error::custom(format!(
+                "ui.toast.delay_seconds must be between 0 and {MAX_TOAST_DELAY_SECONDS}"
+            )));
+        }
+        Ok(Self {
+            delivery,
+            delay_seconds,
+            flock: raw.flock,
+            clipboard: raw.clipboard,
+        })
     }
 }
 
@@ -1283,9 +1358,55 @@ mouse_scroll_lines = 0
         let toml = r#"
 [ui.toast]
 delivery = "terminal"
+delay_seconds = 2
+
+[ui.toast.flock]
+position = "top-left"
+
+[ui.toast.clipboard]
+enabled = false
+position = "top-center"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.toast.delivery, ToastDelivery::Terminal);
+        assert_eq!(config.ui.toast.delay_seconds, 2);
+        assert_eq!(config.ui.toast.flock.position, ToastFlockPosition::TopLeft);
+        assert!(!config.ui.toast.clipboard.enabled);
+        assert_eq!(
+            config.ui.toast.clipboard.position,
+            ToastClipboardPosition::TopCenter
+        );
+    }
+
+    #[test]
+    fn toast_config_defaults_preserve_existing_behavior_with_delay() {
+        let config = Config::default();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Off);
+        assert_eq!(config.ui.toast.delay_seconds, 1);
+        assert_eq!(
+            config.ui.toast.flock.position,
+            ToastFlockPosition::BottomRight
+        );
+        assert!(config.ui.toast.clipboard.enabled);
+        assert_eq!(
+            config.ui.toast.clipboard.position,
+            ToastClipboardPosition::BottomCenter
+        );
+    }
+
+    #[test]
+    fn toast_config_rejects_unbounded_delay() {
+        let toml = format!(
+            r#"
+[ui.toast]
+delay_seconds = {}
+"#,
+            MAX_TOAST_DELAY_SECONDS + 1
+        );
+
+        let error = toml::from_str::<Config>(&toml).unwrap_err().to_string();
+
+        assert!(error.contains("ui.toast.delay_seconds must be between 0 and 3600"));
     }
 
     #[test]

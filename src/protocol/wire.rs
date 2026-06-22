@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// `ClientMessage` (existing variant indices unchanged on the positional wire),
 /// but the new message is a wire-format change — deliberate bump. Single-owner
 /// fleet, lockstep deploys.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -576,8 +576,10 @@ pub enum ServerMessage {
     Notify {
         /// What kind of notification.
         kind: NotifyKind,
-        /// Human-readable message.
+        /// Human-readable title or sound label.
         message: String,
+        /// Optional human-readable notification body.
+        body: Option<String>,
     },
 
     /// OSC 52 clipboard data forwarded from a PTY through the server.
@@ -1257,6 +1259,7 @@ mod tests {
             let msg = ServerMessage::Notify {
                 kind,
                 message: "agent done".to_owned(),
+                body: None,
             };
             let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
             let (decoded, _): (ServerMessage, _) =

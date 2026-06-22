@@ -53,6 +53,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "edit config failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
