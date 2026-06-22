@@ -162,6 +162,11 @@ impl TileLayout {
 
     /// Adjust the nearest split in the given direction for the focused pane.
     /// `delta` is positive to grow, negative to shrink.
+    ///
+    /// When the focused pane has no split on the requested edge (e.g. it sits
+    /// against the outer edge of the workspace), fall back to the split on the
+    /// opposite edge so the keybinding can still shrink/grow the focused pane
+    /// against an ancestor border instead of becoming a no-op.
     pub fn resize_focused(&mut self, nav: NavDirection, delta: f32, area: Rect) {
         let panes = self.panes(area);
         let Some(focused) = panes.iter().find(|p| p.is_focused) else {
@@ -170,52 +175,15 @@ impl TileLayout {
         let focused_rect = focused.rect;
         let splits = self.splits(area);
 
-        // Find the split whose border is adjacent to the focused pane in the given direction
         let target_dir = match nav {
             NavDirection::Left | NavDirection::Right => Direction::Horizontal,
             NavDirection::Up | NavDirection::Down => Direction::Vertical,
         };
         let grows = matches!(nav, NavDirection::Right | NavDirection::Down);
 
-        // Find the closest matching split border
-        let best = splits
-            .iter()
-            .filter(|s| s.direction == target_dir)
-            .filter(|s| match target_dir {
-                Direction::Horizontal => {
-                    // Border must be near the focused pane's left or right edge
-                    let near_right = (s.pos as i32 - (focused_rect.x + focused_rect.width) as i32)
-                        .unsigned_abs()
-                        <= 1;
-                    let near_left = (s.pos as i32 - focused_rect.x as i32).unsigned_abs() <= 1;
-                    near_right || near_left
-                }
-                Direction::Vertical => {
-                    let near_bottom = (s.pos as i32
-                        - (focused_rect.y + focused_rect.height) as i32)
-                        .unsigned_abs()
-                        <= 1;
-                    let near_top = (s.pos as i32 - focused_rect.y as i32).unsigned_abs() <= 1;
-                    near_bottom || near_top
-                }
-            })
-            .min_by_key(|s| {
-                // Prefer the border in the direction we're resizing toward
-                match (target_dir, grows) {
-                    (Direction::Horizontal, true) => {
-                        ((focused_rect.x + focused_rect.width) as i32 - s.pos as i32).unsigned_abs()
-                    }
-                    (Direction::Horizontal, false) => {
-                        (focused_rect.x as i32 - s.pos as i32).unsigned_abs()
-                    }
-                    (Direction::Vertical, true) => ((focused_rect.y + focused_rect.height) as i32
-                        - s.pos as i32)
-                        .unsigned_abs(),
-                    (Direction::Vertical, false) => {
-                        (focused_rect.y as i32 - s.pos as i32).unsigned_abs()
-                    }
-                }
-            });
+        let best = nearest_resize_split(&splits, target_dir, focused_rect, nav).or_else(|| {
+            nearest_resize_split(&splits, target_dir, focused_rect, opposite_direction(nav))
+        });
 
         if let Some(split) = best {
             let path = split.path.clone();
@@ -464,5 +432,211 @@ fn split_rect(area: Rect, direction: Direction, ratio: f32) -> (Rect, Rect) {
                 Rect::new(area.x, area.y + first_h, area.width, second_h),
             )
         }
+    }
+}
+
+// --- Resize helpers ---
+
+fn split_edge_distance(split: &SplitBorder, focused: Rect, nav: NavDirection) -> u32 {
+    match nav {
+        NavDirection::Left => (split.pos as i32 - focused.x as i32).unsigned_abs(),
+        NavDirection::Right => {
+            (split.pos as i32 - (focused.x + focused.width) as i32).unsigned_abs()
+        }
+        NavDirection::Up => (split.pos as i32 - focused.y as i32).unsigned_abs(),
+        NavDirection::Down => {
+            (split.pos as i32 - (focused.y + focused.height) as i32).unsigned_abs()
+        }
+    }
+}
+
+fn split_on_requested_edge(split: &SplitBorder, focused: Rect, nav: NavDirection) -> bool {
+    split_edge_distance(split, focused, nav) <= 1
+}
+
+fn split_area_overlaps_focused_pane(split: &SplitBorder, focused: Rect, nav: NavDirection) -> bool {
+    match nav {
+        NavDirection::Left | NavDirection::Right => {
+            ranges_overlap(split.area.y, split.area.height, focused.y, focused.height)
+        }
+        NavDirection::Up | NavDirection::Down => {
+            ranges_overlap(split.area.x, split.area.width, focused.x, focused.width)
+        }
+    }
+}
+
+fn nearest_resize_split(
+    splits: &[SplitBorder],
+    target_dir: Direction,
+    focused: Rect,
+    nav: NavDirection,
+) -> Option<&SplitBorder> {
+    splits
+        .iter()
+        .filter(|s| s.direction == target_dir)
+        .filter(|s| split_area_overlaps_focused_pane(s, focused, nav))
+        .filter(|s| split_on_requested_edge(s, focused, nav))
+        .min_by_key(|s| split_edge_distance(s, focused, nav))
+}
+
+fn opposite_direction(nav: NavDirection) -> NavDirection {
+    match nav {
+        NavDirection::Left => NavDirection::Right,
+        NavDirection::Right => NavDirection::Left,
+        NavDirection::Up => NavDirection::Down,
+        NavDirection::Down => NavDirection::Up,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(raw: u32) -> PaneId {
+        PaneId::from_raw(raw)
+    }
+
+    fn split_ratios(node: &Node) -> Vec<(Direction, f32)> {
+        fn collect(node: &Node, out: &mut Vec<(Direction, f32)>) {
+            if let Node::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } = node
+            {
+                out.push((*direction, *ratio));
+                collect(first, out);
+                collect(second, out);
+            }
+        }
+        let mut out = Vec::new();
+        collect(node, &mut out);
+        out
+    }
+
+    fn pane_rect(layout: &TileLayout, area: Rect, pane_id: PaneId) -> Rect {
+        layout
+            .panes(area)
+            .into_iter()
+            .find(|p| p.id == pane_id)
+            .map(|p| p.rect)
+            .expect("pane should exist")
+    }
+
+    /// Regression for flock#23 / herdr#562: resize keybindings used to be a
+    /// no-op when the focused pane sat against an outer edge (no split on the
+    /// requested edge). Falling back to the opposite edge lets the user shrink
+    /// the focused pane instead of only being able to grow it.
+    #[test]
+    fn resize_outer_edges_shrink_focused_pane() {
+        // 2-pane horizontal split: focus the LEFT pane, ask to resize Left
+        // (toward the outer edge). The only border is on the right edge of
+        // the focused pane, so the fallback should pick it and decrease the
+        // ratio, shrinking the focused pane.
+        let (mut horizontal, left) = TileLayout::new();
+        horizontal.split_focused(Direction::Horizontal);
+        horizontal.focus_pane(left);
+        horizontal.resize_focused(NavDirection::Left, 0.05, Rect::new(0, 0, 100, 40));
+        let ratios = split_ratios(horizontal.root());
+        assert_eq!(ratios[0].0, Direction::Horizontal);
+        assert!((ratios[0].1 - 0.45).abs() < f32::EPSILON);
+
+        // Focus the RIGHT pane, ask to resize Right (outer edge). Border is on
+        // the focused pane's left edge; growing it (delta > 0 means grow)
+        // should bump the split ratio up, shrinking the focused right pane's
+        // neighbor — i.e. growing the focused pane.
+        let (mut horizontal, _left) = TileLayout::new();
+        let right = horizontal.split_focused(Direction::Horizontal);
+        horizontal.focus_pane(right);
+        horizontal.resize_focused(NavDirection::Right, 0.05, Rect::new(0, 0, 100, 40));
+        let ratios = split_ratios(horizontal.root());
+        assert_eq!(ratios[0].0, Direction::Horizontal);
+        assert!((ratios[0].1 - 0.55).abs() < f32::EPSILON);
+
+        let (mut vertical, top) = TileLayout::new();
+        vertical.split_focused(Direction::Vertical);
+        vertical.focus_pane(top);
+        vertical.resize_focused(NavDirection::Up, 0.05, Rect::new(0, 0, 100, 40));
+        let ratios = split_ratios(vertical.root());
+        assert_eq!(ratios[0].0, Direction::Vertical);
+        assert!((ratios[0].1 - 0.45).abs() < f32::EPSILON);
+
+        let (mut vertical, _top) = TileLayout::new();
+        let bottom = vertical.split_focused(Direction::Vertical);
+        vertical.focus_pane(bottom);
+        vertical.resize_focused(NavDirection::Down, 0.05, Rect::new(0, 0, 100, 40));
+        let ratios = split_ratios(vertical.root());
+        assert_eq!(ratios[0].0, Direction::Vertical);
+        assert!((ratios[0].1 - 0.55).abs() < f32::EPSILON);
+    }
+
+    /// When focused pane is nested under a horizontal ancestor split and has
+    /// no horizontal split on its requested edge, the fallback should walk to
+    /// the ancestor's split (on the opposite edge) and adjust *that* ratio.
+    #[test]
+    fn resize_outer_edge_falls_back_to_horizontal_ancestor_split() {
+        let area = Rect::new(0, 0, 100, 40);
+        let mut layout = TileLayout::from_saved(
+            Node::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.6,
+                first: Box::new(Node::Split {
+                    direction: Direction::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(Node::Pane(pane(1))),
+                    second: Box::new(Node::Pane(pane(2))),
+                }),
+                second: Box::new(Node::Pane(pane(3))),
+            },
+            pane(1),
+        );
+        let before = pane_rect(&layout, area, pane(1));
+
+        layout.resize_focused(NavDirection::Left, 0.05, area);
+
+        let after = pane_rect(&layout, area, pane(1));
+        assert_eq!(after.height, before.height);
+        assert!(
+            after.width < before.width,
+            "left-resize should shrink width"
+        );
+        let ratios = split_ratios(layout.root());
+        assert_eq!(ratios[0].0, Direction::Horizontal);
+        assert!((ratios[0].1 - 0.55).abs() < f32::EPSILON);
+        assert_eq!(ratios[1], (Direction::Vertical, 0.5));
+    }
+
+    #[test]
+    fn resize_outer_edge_falls_back_to_vertical_ancestor_split() {
+        let area = Rect::new(0, 0, 100, 40);
+        let mut layout = TileLayout::from_saved(
+            Node::Split {
+                direction: Direction::Vertical,
+                ratio: 0.6,
+                first: Box::new(Node::Split {
+                    direction: Direction::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(Node::Pane(pane(1))),
+                    second: Box::new(Node::Pane(pane(2))),
+                }),
+                second: Box::new(Node::Pane(pane(3))),
+            },
+            pane(1),
+        );
+        let before = pane_rect(&layout, area, pane(1));
+
+        layout.resize_focused(NavDirection::Up, 0.05, area);
+
+        let after = pane_rect(&layout, area, pane(1));
+        assert_eq!(after.width, before.width);
+        assert!(
+            after.height < before.height,
+            "up-resize should shrink height"
+        );
+        let ratios = split_ratios(layout.root());
+        assert_eq!(ratios[0].0, Direction::Vertical);
+        assert!((ratios[0].1 - 0.55).abs() < f32::EPSILON);
+        assert_eq!(ratios[1], (Direction::Horizontal, 0.5));
     }
 }

@@ -4,6 +4,7 @@
 
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
+- Pane resize keybindings now shrink panes again instead of only being able to grow them; when the focused pane has no split on the requested edge, the resize falls back to the opposite-edge split so an ancestor border still moves. (#23)
 
 ## [0.6.8] - 2026-06-04
 
