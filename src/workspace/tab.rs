@@ -7,11 +7,21 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
-use crate::layout::{PaneId, TileLayout};
+use crate::layout::{Node, PaneId, TileLayout};
 use crate::pane::PaneState;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 pub(crate) type DetachedPane = (PaneId, TerminalId);
+
+/// A pane removed from its tab for relocation. Carries the live `PaneState`
+/// (including its `attached_terminal_id`) so the PTY/runtime registered under
+/// that terminal id keeps running across the move. The pane is reinserted into
+/// the destination tab by id reference — the terminal runtime itself stays put
+/// in the `App::terminal_runtimes` registry and remains attached.
+pub(crate) struct MovedPane {
+    pub pane_id: PaneId,
+    pub pane_state: PaneState,
+}
 
 pub struct NewPane {
     pub pane_id: PaneId,
@@ -336,6 +346,91 @@ impl Tab {
             terminal,
             runtime,
         })
+    }
+
+    /// Construct a tab around an already-existing pane, without spawning a new
+    /// PTY or allocating a new pane id. The pane's existing runtime continues
+    /// running attached to the same terminal id.
+    pub(crate) fn from_existing_pane(
+        number: usize,
+        custom_name: Option<String>,
+        moved: MovedPane,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        let mut panes = HashMap::new();
+        let pane_id = moved.pane_id;
+        panes.insert(pane_id, moved.pane_state);
+        Self {
+            custom_name,
+            number,
+            root_pane: pane_id,
+            layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),
+            panes,
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        }
+    }
+
+    /// Remove a pane for relocation while keeping its PTY alive. Returns the
+    /// pane state (with its terminal id) so a caller can insert it into another
+    /// tab/workspace. If this is the last pane in the tab the caller is
+    /// expected to drop the tab itself; we still return the pane_state so the
+    /// pane survives the tab removal.
+    pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<MovedPane> {
+        if !self.panes.contains_key(&pane_id) {
+            return None;
+        }
+
+        if self.layout.pane_count() > 1 {
+            let next_root = self.promoted_root_if_needed(pane_id);
+            if self.layout.focused() == pane_id {
+                self.layout.close_focused();
+            } else {
+                let prev_focus = self.layout.focused();
+                self.layout.focus_pane(pane_id);
+                self.layout.close_focused();
+                self.layout.focus_pane(prev_focus);
+            }
+            if let Some(next_root) = next_root {
+                self.root_pane = next_root;
+            }
+        }
+
+        let pane_state = self.panes.remove(&pane_id)?;
+        self.zoomed = false;
+        Some(MovedPane {
+            pane_id,
+            pane_state,
+        })
+    }
+
+    /// Splice a moved pane into this tab next to `target_pane_id`. On failure
+    /// (target absent / pane id collision) the `MovedPane` is returned so the
+    /// caller can recover it. No new PTY is spawned: the moved pane reuses its
+    /// existing terminal runtime under the same terminal id.
+    pub(crate) fn insert_existing_pane(
+        &mut self,
+        target_pane_id: PaneId,
+        moved: MovedPane,
+        direction: Direction,
+        ratio: f32,
+    ) -> Result<PaneId, MovedPane> {
+        if !self
+            .layout
+            .insert_pane_near(target_pane_id, moved.pane_id, direction, ratio)
+        {
+            return Err(moved);
+        }
+        let pane_id = moved.pane_id;
+        self.panes.insert(pane_id, moved.pane_state);
+        self.zoomed = false;
+        Ok(pane_id)
     }
 
     pub fn close_focused(&mut self) -> Option<DetachedPane> {

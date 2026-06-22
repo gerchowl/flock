@@ -156,6 +156,10 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::PaneFocused,
                 last_sequence: 0,
             })),
+            Subscription::PaneMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::PaneMoved,
+                last_sequence: 0,
+            })),
             Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneExited,
                 last_sequence: 0,
