@@ -2248,8 +2248,8 @@ last_pane = "prefix+tab"
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], app.state.workspaces[0].id);
-        assert_eq!(lines[1], format!("{}:1", app.state.workspaces[0].id));
-        assert_eq!(lines[2], format!("{}-1", app.state.workspaces[0].id));
+        assert_eq!(lines[1], format!("{}:t1", app.state.workspaces[0].id));
+        assert_eq!(lines[2], format!("{}:p1", app.state.workspaces[0].id));
         assert_eq!(app.state.mode, Mode::Terminal);
 
         let _ = std::fs::remove_file(output_path);

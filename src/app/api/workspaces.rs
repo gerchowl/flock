@@ -146,14 +146,16 @@ impl App {
         if self.state.workspaces.get(index).is_none() {
             return workspace_not_found(id, &target.workspace_id);
         }
+        // Resolve to the canonical workspace id BEFORE close — the request
+        // may have used a positional `1` form, but the event should always
+        // carry the public id.
+        let workspace_id = self.public_workspace_id(index);
         self.state.selected = index;
         self.state.close_selected_workspace();
         self.shutdown_detached_terminal_runtimes();
         self.emit_event(EventEnvelope {
             event: EventKind::WorkspaceClosed,
-            data: EventData::WorkspaceClosed {
-                workspace_id: target.workspace_id,
-            },
+            data: EventData::WorkspaceClosed { workspace_id },
         });
 
         encode_success(id, ResponseResult::Ok {})

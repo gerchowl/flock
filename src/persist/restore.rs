@@ -57,8 +57,44 @@ type RestoredTab = (
     crate::workspace::Tab,
     Vec<TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
+    HashMap<PaneId, u32>,
 );
 type RestoreFailures<T> = (T, usize);
+
+/// Walk a snapshot layout subtree and collect every old raw pane id mentioned
+/// in it. Used to precompute stable public pane numbers for legacy snapshots
+/// that did not persist them.
+fn collect_layout_snapshot_pane_ids(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
+    match node {
+        LayoutSnapshot::Pane(id) => ids.push(*id),
+        LayoutSnapshot::Split { first, second, .. } => {
+            collect_layout_snapshot_pane_ids(first, ids);
+            collect_layout_snapshot_pane_ids(second, ids);
+        }
+    }
+}
+
+/// Old snapshots have no `public_pane_numbers`; assign stable numbers in
+/// layout order so a restored workspace gets the same `<ws>:p<n>` it had
+/// before, and the next snapshot of it captures the canonical mapping.
+fn migrated_public_pane_numbers_by_old_raw(
+    snap: &WorkspaceSnapshot,
+    next_public_pane_number: &mut usize,
+) -> HashMap<u32, usize> {
+    let mut public_numbers = snap.public_pane_numbers.clone();
+    for tab in &snap.tabs {
+        let mut pane_ids = Vec::new();
+        collect_layout_snapshot_pane_ids(&tab.layout, &mut pane_ids);
+        for old_raw in pane_ids {
+            public_numbers.entry(old_raw).or_insert_with(|| {
+                let number = *next_public_pane_number;
+                *next_public_pane_number += 1;
+                number
+            });
+        }
+    }
+    public_numbers
+}
 
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
 pub fn restore(
@@ -285,6 +321,9 @@ fn restore_with_imports_and_failures(
             workspaces.push(workspace);
         }
     }
+    // Bump the workspace id counter past every restored id so newly created
+    // workspaces won't collide with what's on disk (#25).
+    crate::workspace::reserve_workspace_ids(&workspaces);
     ((workspaces, terminals, terminal_runtimes), failed_imports)
 }
 
@@ -300,9 +339,31 @@ fn restore_workspace(
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
-    let mut public_pane_numbers = HashMap::new();
-    let mut next_public_pane_number = 1;
     let mut failed_imports = 0;
+
+    // Public number stability across restore (#25): preserve numbers captured
+    // in the snapshot, and for legacy snapshots that didn't persist any,
+    // pre-assign stable numbers in layout order so they round-trip the same
+    // pane/tab handles after the next save.
+    let mut next_public_pane_number = snap
+        .public_pane_numbers
+        .values()
+        .copied()
+        .max()
+        .and_then(|max| max.checked_add(1))
+        .unwrap_or(1)
+        .max(snap.next_public_pane_number);
+    let public_pane_numbers_by_old_raw =
+        migrated_public_pane_numbers_by_old_raw(snap, &mut next_public_pane_number);
+    let mut public_pane_numbers = HashMap::new();
+    let mut next_public_tab_number = snap
+        .public_tab_numbers
+        .iter()
+        .copied()
+        .max()
+        .and_then(|max| max.checked_add(1))
+        .unwrap_or(1)
+        .max(snap.next_public_tab_number);
 
     for (idx, tab_snap) in snap.tabs.iter().enumerate() {
         let (restored_tab, tab_failed_imports) = restore_tab(
@@ -316,12 +377,30 @@ fn restore_workspace(
             imported_panes,
         );
         failed_imports += tab_failed_imports;
-        let Some((tab, restored_terminals, restored_runtimes)) = restored_tab else {
+        let Some((mut tab, restored_terminals, restored_runtimes, reverse_id_map)) = restored_tab
+        else {
             continue;
         };
+        if let Some(public_tab_number) = snap.public_tab_numbers.get(idx).copied() {
+            tab.number = public_tab_number;
+        }
+        next_public_tab_number = next_public_tab_number.max(tab.number + 1);
         for pane_id in tab.layout.pane_ids() {
-            public_pane_numbers.insert(pane_id, next_public_pane_number);
-            next_public_pane_number += 1;
+            let public_number = public_pane_numbers_by_old_raw
+                .get(
+                    &reverse_id_map
+                        .get(&pane_id)
+                        .copied()
+                        .unwrap_or(pane_id.raw()),
+                )
+                .copied()
+                .unwrap_or_else(|| {
+                    let number = next_public_pane_number;
+                    next_public_pane_number += 1;
+                    number
+                });
+            public_pane_numbers.insert(pane_id, public_number);
+            next_public_pane_number = next_public_pane_number.max(public_number + 1);
         }
         terminals.extend(restored_terminals);
         terminal_runtimes.extend(restored_runtimes);
@@ -353,6 +432,7 @@ fn restore_workspace(
             worktree_space,
             public_pane_numbers,
             next_public_pane_number,
+            next_public_tab_number,
             active_tab: snap.active_tab.min(tabs.len().saturating_sub(1)),
             tabs,
             #[cfg(test)]
@@ -612,6 +692,7 @@ fn restore_tab(
             },
             terminals,
             terminal_runtimes,
+            reverse_id_map,
         )),
         failed_imports,
     )
@@ -1035,6 +1116,10 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
@@ -1115,6 +1200,10 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
@@ -1323,6 +1412,10 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd,
                 worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),

@@ -18,8 +18,10 @@ impl App {
 
     pub(super) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
         let ws = self.state.workspaces.get(ws_idx)?;
-        ws.tabs.get(tab_idx)?;
-        Some(format!("{}:{}", ws.id, tab_idx + 1))
+        let tab_number = ws.public_tab_number(tab_idx)?;
+        Some(crate::workspace::public_tab_id_for_number(
+            &ws.id, tab_number,
+        ))
     }
 
     pub(super) fn public_pane_id(
@@ -29,7 +31,10 @@ impl App {
     ) -> Option<String> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_number = ws.public_pane_number(pane_id)?;
-        Some(format!("{}-{pane_number}", ws.id))
+        Some(crate::workspace::public_pane_id_for_number(
+            &ws.id,
+            pane_number,
+        ))
     }
 
     pub(super) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
@@ -52,7 +57,21 @@ impl App {
 
         let (ws_raw, tab_raw) = id.rsplit_once(':')?;
         let ws_idx = self.parse_workspace_id(ws_raw)?;
-        let tab_idx = tab_raw.parse::<usize>().ok()?.checked_sub(1)?;
+        // Public format `:tN` (Crockford base32, #25). Look up by stable
+        // tab.number so the id keeps targeting the same tab even after
+        // closes, moves, or reorders.
+        let tab_idx = if let Some(encoded) = tab_raw.strip_prefix('t') {
+            let tab_number = crate::workspace::decode_public_number(encoded)?;
+            self.state
+                .workspaces
+                .get(ws_idx)?
+                .tabs
+                .iter()
+                .position(|tab| tab.number == tab_number)?
+        } else {
+            // Legacy format `:N` is interpreted as a 1-based tab position.
+            tab_raw.parse::<usize>().ok()?.checked_sub(1)?
+        };
         self.state.workspaces.get(ws_idx)?.tabs.get(tab_idx)?;
         Some((ws_idx, tab_idx))
     }
@@ -183,6 +202,20 @@ impl App {
             return self.find_pane(pane_id).map(|(ws_idx, _)| (ws_idx, pane_id));
         }
 
+        // New public format `<workspace>:p<encoded>` (#25). Stable: closed
+        // numbers are not reused, so old hook ids can't retarget a new pane.
+        if let Some((ws_raw, pane_number_raw)) = id.rsplit_once(":p") {
+            let ws_idx = self.parse_workspace_id(ws_raw)?;
+            let pane_number = crate::workspace::decode_public_number(pane_number_raw)?;
+            let ws = self.state.workspaces.get(ws_idx)?;
+            let pane_id = ws
+                .public_pane_numbers
+                .iter()
+                .find_map(|(pane_id, number)| (*number == pane_number).then_some(*pane_id))?;
+            return Some((ws_idx, pane_id));
+        }
+
+        // Legacy public format `<workspace>-<decimal>`.
         let (ws_raw, pane_number_raw) = id.rsplit_once('-')?;
         let ws_idx = self.parse_workspace_id(ws_raw)?;
         let pane_number = pane_number_raw.parse::<usize>().ok()?;

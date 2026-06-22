@@ -2586,7 +2586,7 @@ fn closing_workspace_terminates_processes_inside_it() {
 }
 
 #[test]
-fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
+fn workspace_ids_and_public_pane_ids_are_stable() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -2608,9 +2608,11 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
         &socket_path,
         &["pane", "split", "1-1", "--direction", "right", "--no-focus"],
     );
+    // New public pane id format `<ws>:p<n>` (#25). Legacy form `1-1` still
+    // accepted as input but the response uses the new form.
     assert_eq!(
         split_12_json["result"]["pane"]["pane_id"],
-        format!("{ws1_id}-2")
+        format!("{ws1_id}:p2")
     );
 
     let split_13_json = run_cli_json(
@@ -2619,7 +2621,7 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
     );
     assert_eq!(
         split_13_json["result"]["pane"]["pane_id"],
-        format!("{ws1_id}-3")
+        format!("{ws1_id}:p3")
     );
 
     let ws2_json = run_cli_json(
@@ -2645,7 +2647,7 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
     );
     assert_eq!(
         ws2_split_json["result"]["pane"]["pane_id"],
-        format!("{ws2_id}-2")
+        format!("{ws2_id}:p2")
     );
 
     let ws3_json = run_cli_json(
@@ -2690,9 +2692,10 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
     let ws3_panes_json = run_cli_json(&socket_path, &["pane", "list", "--workspace", &ws3_id]);
     assert_eq!(
         ws3_panes_json["result"]["panes"][0]["pane_id"],
-        format!("{ws3_id}-1")
+        format!("{ws3_id}:p1")
     );
 
+    // Close the middle pane via the legacy form to prove it still parses.
     let close_middle = run_cli(&socket_path, &["pane", "close", &format!("{ws1_id}-2")]);
     assert!(
         close_middle.status.success(),
@@ -2700,6 +2703,8 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
         String::from_utf8_lossy(&close_middle.stderr)
     );
 
+    // Stable pane numbers: closed pane 2's slot is NOT reused — surviving
+    // panes keep their original public numbers (1 and 3).
     let ws1_panes_json = run_cli_json(&socket_path, &["pane", "list", "--workspace", &ws1_id]);
     let pane_ids: Vec<String> = ws1_panes_json["result"]["panes"]
         .as_array()
@@ -2707,7 +2712,35 @@ fn workspace_ids_are_stable_and_pane_numbers_stay_compact() {
         .iter()
         .map(|pane| pane["pane_id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(pane_ids, vec![format!("{ws1_id}-1"), format!("{ws1_id}-2")]);
+    assert_eq!(
+        pane_ids,
+        vec![format!("{ws1_id}:p1"), format!("{ws1_id}:p3")]
+    );
+
+    // The closed pane id no longer retargets a different live pane.
+    let closed_lookup = run_cli(&socket_path, &["pane", "get", &format!("{ws1_id}:p2")]);
+    assert!(
+        !closed_lookup.status.success(),
+        "closed pane id should not retarget: {}",
+        String::from_utf8_lossy(&closed_lookup.stdout)
+    );
+
+    // A new split allocates the NEXT number, never reuses 2.
+    let split_14_json = run_cli_json(
+        &socket_path,
+        &[
+            "pane",
+            "split",
+            &format!("{ws1_id}:p1"),
+            "--direction",
+            "right",
+            "--no-focus",
+        ],
+    );
+    assert_eq!(
+        split_14_json["result"]["pane"]["pane_id"],
+        format!("{ws1_id}:p4")
+    );
 
     cleanup_spawned_flock(flock, base);
 }

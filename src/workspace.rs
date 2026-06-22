@@ -3,7 +3,6 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
@@ -71,14 +70,86 @@ impl WorkspaceGitStatusSnapshot {
 }
 
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
+const PUBLIC_ID_ALPHABET: &[u8; 32] = b"123456789ABCDEFGHJKMNPQRSTVWXYZ0";
 
 pub(crate) fn generate_workspace_id() -> String {
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros())
-        .unwrap_or(0);
     let counter = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
-    format!("w{micros:x}{counter:x}")
+    format!("w{}", encode_public_number(counter as usize))
+}
+
+/// Encode a 1-based public number as a short, human-readable handle using a
+/// Crockford-style base32 alphabet (no `I`, `L`, `O`, `U`). The handle is
+/// stable per number and avoids look-alike characters.
+pub(crate) fn encode_public_number(mut value: usize) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+
+    let mut encoded = Vec::new();
+    while value > 0 {
+        let digit = (value - 1) % PUBLIC_ID_ALPHABET.len();
+        encoded.push(PUBLIC_ID_ALPHABET[digit] as char);
+        value = (value - 1) / PUBLIC_ID_ALPHABET.len();
+    }
+    encoded.iter().rev().collect()
+}
+
+pub(crate) fn decode_public_number(value: &str) -> Option<usize> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut decoded = 0usize;
+    for ch in value.chars() {
+        let digit = PUBLIC_ID_ALPHABET
+            .iter()
+            .position(|candidate| *candidate as char == ch)?;
+        decoded = decoded
+            .checked_mul(PUBLIC_ID_ALPHABET.len())?
+            .checked_add(digit + 1)?;
+    }
+    Some(decoded)
+}
+
+pub(crate) fn public_workspace_number(id: &str) -> Option<usize> {
+    id.strip_prefix('w').and_then(decode_public_number)
+}
+
+pub(crate) fn public_pane_id_for_number(workspace_id: &str, pane_number: usize) -> String {
+    format!("{workspace_id}:p{}", encode_public_number(pane_number))
+}
+
+pub(crate) fn public_tab_id_for_number(workspace_id: &str, tab_number: usize) -> String {
+    format!("{workspace_id}:t{}", encode_public_number(tab_number))
+}
+
+/// After restoring workspaces from a snapshot, bump the global workspace id
+/// counter past every restored id so freshly generated ids cannot collide
+/// with what's already on disk. Ids that don't decode cleanly (e.g. legacy
+/// hex-format ids from older snapshots) are silently ignored — they
+/// preserve themselves on disk via direct equality lookup and won't clash
+/// with the small numeric ids the new generator hands out.
+pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
+    let Some(next) = workspaces
+        .iter()
+        .filter_map(|workspace| public_workspace_number(&workspace.id))
+        .max()
+        .and_then(|max| u64::try_from(max.checked_add(1)?).ok())
+    else {
+        return;
+    };
+
+    let mut current = NEXT_WORKSPACE_ID.load(Ordering::Relaxed);
+    while current < next {
+        match NEXT_WORKSPACE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// A named workspace containing tabs.
@@ -104,10 +175,15 @@ pub struct Workspace {
     pub(crate) git_identity_resolved: bool,
     /// Explicit Flock-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
-    /// Stable-ish public pane numbers within this workspace.
-    /// New panes append at the end; closing a pane compacts higher numbers down.
+    /// Public pane numbers within this workspace. Numbers are assigned
+    /// monotonically on creation and are NEVER reused: closing pane N does
+    /// not retarget N to a different pane later (#25).
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
+    /// Next stable public tab number. Like pane numbers, closed tab numbers
+    /// are not reused, so external references to a closed tab won't silently
+    /// land on a new tab.
+    pub(crate) next_public_tab_number: usize,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     #[cfg(test)]
@@ -236,6 +312,7 @@ impl Workspace {
                 worktree_space: None,
                 public_pane_numbers,
                 next_public_pane_number: 2,
+                next_public_tab_number: 2,
                 tabs: vec![tab],
                 active_tab: 0,
                 #[cfg(test)]
@@ -303,7 +380,9 @@ impl Workspace {
         shell_config: crate::pane::PaneShellConfig<'_>,
         argv: Option<&[String]>,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
-        let number = self.tabs.len() + 1;
+        let number = self.next_public_tab_number;
+        self.next_public_tab_number += 1;
+        let pane_number = self.next_public_pane_number;
         let events = self
             .active_tab()
             .map(|tab| tab.events.clone())
@@ -344,7 +423,7 @@ impl Workspace {
                 render_dirty,
             )?
         };
-        self.register_new_pane(tab.root_pane);
+        self.register_new_pane_with_number(tab.root_pane, pane_number);
         self.tabs.push(tab);
         Ok((self.tabs.len() - 1, terminal, runtime))
     }
@@ -357,7 +436,6 @@ impl Workspace {
         for pane_id in tab.panes.keys() {
             self.unregister_pane(*pane_id);
         }
-        self.renumber_tabs();
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         } else if idx <= self.active_tab && self.active_tab > 0 {
@@ -385,7 +463,6 @@ impl Workspace {
         let active_root_pane = self.tabs.get(self.active_tab).map(|tab| tab.root_pane);
         let tab = self.tabs.remove(source_idx);
         self.tabs.insert(target_idx, tab);
-        self.renumber_tabs();
         self.active_tab = active_root_pane
             .and_then(|root_pane| self.tabs.iter().position(|tab| tab.root_pane == root_pane))
             .unwrap_or(target_idx);
@@ -558,7 +635,6 @@ impl Workspace {
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
-            self.renumber_tabs();
             if self.active_tab >= self.tabs.len() {
                 self.active_tab = self.tabs.len() - 1;
             } else if tab_idx <= self.active_tab && self.active_tab > 0 {
@@ -575,6 +651,16 @@ impl Workspace {
 
     pub fn public_pane_number(&self, pane_id: PaneId) -> Option<usize> {
         self.public_pane_numbers.get(&pane_id).copied()
+    }
+
+    pub fn public_tab_number(&self, tab_idx: usize) -> Option<usize> {
+        self.tabs.get(tab_idx).map(|tab| tab.number)
+    }
+
+    #[cfg(test)]
+    pub fn public_tab_number_for_pane(&self, pane_id: PaneId) -> Option<usize> {
+        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+        self.public_tab_number(tab_idx)
     }
 
     pub fn set_custom_name(&mut self, name: String) {
@@ -738,7 +824,6 @@ impl Workspace {
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
-            self.renumber_tabs();
             if self.active_tab >= self.tabs.len() {
                 self.active_tab = self.tabs.len() - 1;
             } else if tab_idx <= self.active_tab && self.active_tab > 0 {
@@ -754,26 +839,20 @@ impl Workspace {
     }
 
     fn register_new_pane(&mut self, pane_id: PaneId) {
-        self.public_pane_numbers
-            .insert(pane_id, self.next_public_pane_number);
-        self.next_public_pane_number += 1;
+        let number = self.next_public_pane_number;
+        self.register_new_pane_with_number(pane_id, number);
+    }
+
+    fn register_new_pane_with_number(&mut self, pane_id: PaneId, number: usize) {
+        self.public_pane_numbers.insert(pane_id, number);
+        self.next_public_pane_number = self.next_public_pane_number.max(number + 1);
     }
 
     fn unregister_pane(&mut self, pane_id: PaneId) {
-        if let Some(removed_number) = self.public_pane_numbers.remove(&pane_id) {
-            for number in self.public_pane_numbers.values_mut() {
-                if *number > removed_number {
-                    *number -= 1;
-                }
-            }
-            self.next_public_pane_number = self.public_pane_numbers.len() + 1;
-        }
-    }
-
-    fn renumber_tabs(&mut self) {
-        for (idx, tab) in self.tabs.iter_mut().enumerate() {
-            tab.number = idx + 1;
-        }
+        // Closed pane numbers are not reused (#25): drop the mapping but
+        // leave the surrounding numbers alone so a stale public id from a
+        // hook script won't silently retarget a different pane.
+        self.public_pane_numbers.remove(&pane_id);
     }
 
     fn close_active_tab_and_report(&mut self) -> bool {
@@ -822,6 +901,7 @@ impl Workspace {
             worktree_space: None,
             public_pane_numbers,
             next_public_pane_number: 2,
+            next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
             test_runtimes: HashMap::new(),
@@ -850,7 +930,7 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
         let tab = Tab {
             custom_name: name.map(str::to_string),
-            number: self.tabs.len() + 1,
+            number: self.next_public_tab_number,
             root_pane: root_id,
             layout,
             panes,
@@ -860,6 +940,7 @@ impl Workspace {
             render_notify,
             render_dirty,
         };
+        self.next_public_tab_number += 1;
         self.register_new_pane(root_id);
         self.tabs.push(tab);
         self.tabs.len() - 1
@@ -891,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_tab_keeps_active_identity_and_renumbers_auto_tabs() {
+    fn moving_tab_keeps_active_identity_and_stable_tab_numbers() {
         let mut ws = Workspace::test_new("test");
         let moved_root = ws.tabs[0].root_pane;
         ws.test_add_tab(Some("foo"));
@@ -901,12 +982,102 @@ mod tests {
 
         assert!(ws.move_tab(0, ws.tabs.len()));
 
+        // Tab numbers travel with the tab itself — moving does not renumber.
         let labels: Vec<_> = ws.tabs.iter().map(|tab| tab.display_name()).collect();
-        assert_eq!(labels, vec!["foo", "2", "3"]);
+        assert_eq!(labels, vec!["foo", "3", "1"]);
         assert_eq!(ws.tabs[0].custom_name.as_deref(), Some("foo"));
         assert!(ws.tabs[1].custom_name.is_none());
         assert!(ws.tabs[2].custom_name.is_none());
+        assert_eq!(ws.tabs[0].number, 2);
+        assert_eq!(ws.tabs[1].number, 3);
+        assert_eq!(ws.tabs[2].number, 1);
         assert_eq!(ws.tabs[2].root_pane, moved_root);
         assert_eq!(ws.tabs[ws.active_tab].root_pane, active_root);
+    }
+
+    #[test]
+    fn generated_workspace_ids_are_short_base32_handles() {
+        let first = generate_workspace_id();
+        let second = generate_workspace_id();
+
+        assert!(first.starts_with('w'));
+        assert!(second.starts_with('w'));
+        assert_ne!(first, second);
+        assert!(first.len() <= 4, "unexpectedly long workspace id: {first}");
+        assert!(
+            second.len() <= 4,
+            "unexpectedly long workspace id: {second}"
+        );
+    }
+
+    #[test]
+    fn public_numbers_round_trip_readable_base32_handles() {
+        assert_eq!(encode_public_number(1), "1");
+        assert_eq!(encode_public_number(9), "9");
+        assert_eq!(encode_public_number(10), "A");
+        assert_eq!(encode_public_number(31), "Z");
+        assert_eq!(encode_public_number(32), "0");
+        assert_eq!(encode_public_number(33), "11");
+
+        for value in [1, 9, 10, 31, 32, 33, 1024, 1025] {
+            let encoded = encode_public_number(value);
+            assert_eq!(decode_public_number(&encoded), Some(value));
+        }
+    }
+
+    #[test]
+    fn reserving_restored_workspace_ids_prevents_reuse() {
+        let mut restored = Workspace::test_new("restored");
+        restored.id = "wZ".to_string();
+
+        reserve_workspace_ids(&[restored]);
+
+        let generated = generate_workspace_id();
+        assert_ne!(generated, "wZ");
+        assert!(public_workspace_number(&generated) > public_workspace_number("wZ"));
+    }
+
+    #[test]
+    fn pane_public_numbers_are_stable_and_not_reused_after_close() {
+        let mut ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
+        let second = ws.test_split(Direction::Horizontal);
+        let third = ws.test_split(Direction::Vertical);
+
+        assert_eq!(ws.public_pane_number(root), Some(1));
+        assert_eq!(ws.public_pane_number(second), Some(2));
+        assert_eq!(ws.public_pane_number(third), Some(3));
+
+        assert!(!ws.close_pane(second));
+
+        assert_eq!(ws.public_pane_number(root), Some(1));
+        assert_eq!(ws.public_pane_number(second), None);
+        assert_eq!(ws.public_pane_number(third), Some(3));
+
+        let fourth = ws.test_split(Direction::Horizontal);
+        assert_eq!(ws.public_pane_number(fourth), Some(4));
+    }
+
+    #[test]
+    fn tab_public_numbers_are_stable_and_not_reused_after_close() {
+        let mut ws = Workspace::test_new("test");
+        let first_root = ws.tabs[0].root_pane;
+        let second_tab = ws.test_add_tab(None);
+        let second_root = ws.tabs[second_tab].root_pane;
+        let third_tab = ws.test_add_tab(None);
+        let third_root = ws.tabs[third_tab].root_pane;
+
+        assert_eq!(ws.public_tab_number_for_pane(first_root), Some(1));
+        assert_eq!(ws.public_tab_number_for_pane(second_root), Some(2));
+        assert_eq!(ws.public_tab_number_for_pane(third_root), Some(3));
+
+        assert!(ws.close_tab(second_tab));
+
+        assert_eq!(ws.public_tab_number_for_pane(first_root), Some(1));
+        assert_eq!(ws.public_tab_number_for_pane(third_root), Some(3));
+
+        let fourth_tab = ws.test_add_tab(None);
+        let fourth_root = ws.tabs[fourth_tab].root_pane;
+        assert_eq!(ws.public_tab_number_for_pane(fourth_root), Some(4));
     }
 }
