@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// `ClientMessage` (existing variant indices unchanged on the positional wire),
 /// but the new message is a wire-format change — deliberate bump. Single-owner
 /// fleet, lockstep deploys.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`

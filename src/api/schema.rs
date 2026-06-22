@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
     #[serde(flatten)]
     pub method: Method,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
     #[serde(rename = "ping")]
@@ -74,6 +74,8 @@ pub enum Method {
     AgentStart(AgentStartParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
+    #[serde(rename = "pane.move")]
+    PaneMove(PaneMoveParams),
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
     #[serde(rename = "pane.get")]
@@ -355,6 +357,65 @@ pub enum SplitDirection {
     Down,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneMoveParams {
+    pub pane_id: String,
+    pub destination: PaneMoveDestination,
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneMoveDestination {
+    Tab {
+        tab_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_pane_id: Option<String>,
+        split: SplitDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<f32>,
+    },
+    NewTab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    NewWorkspace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_label: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneMoveResult {
+    pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PaneMoveReason>,
+    pub previous_pane_id: String,
+    pub previous_workspace_id: String,
+    pub previous_tab_id: String,
+    pub pane: Box<PaneInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_workspace: Option<WorkspaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_tab: Option<TabInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_tab_id: Option<String>,
+    pub focused_pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneMoveReason {
+    SameTab,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -591,6 +652,8 @@ pub enum Subscription {
     PaneClosed {},
     #[serde(rename = "pane.focused")]
     PaneFocused {},
+    #[serde(rename = "pane.moved")]
+    PaneMoved {},
     #[serde(rename = "pane.exited")]
     PaneExited {},
     #[serde(rename = "pane.agent_detected")]
@@ -714,6 +777,9 @@ pub enum EventMatch {
     PaneFocused {
         pane_id: String,
     },
+    PaneMoved {
+        pane_id: String,
+    },
     PaneOutputChanged {
         pane_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -748,13 +814,14 @@ pub enum EventKind {
     PaneCreated,
     PaneClosed,
     PaneFocused,
+    PaneMoved,
     PaneOutputChanged,
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SuccessResponse {
     pub id: String,
     pub result: ResponseResult,
@@ -777,7 +844,7 @@ pub struct ServerCapabilities {
     pub live_handoff: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
     Pong {
@@ -868,6 +935,9 @@ pub enum ResponseResult {
     },
     PaneInfo {
         pane: PaneInfo,
+    },
+    PaneMove {
+        move_result: PaneMoveResult,
     },
     PaneList {
         panes: Vec<PaneInfo>,
@@ -1046,7 +1116,7 @@ pub struct IntegrationUninstallResult {
     pub messages: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event: EventKind,
     pub data: EventData,
@@ -1097,7 +1167,7 @@ pub struct PaneAgentStatusChangedEvent {
     pub state_labels: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
     WorkspaceCreated {
@@ -1142,6 +1212,20 @@ pub enum EventData {
     PaneFocused {
         pane_id: String,
         workspace_id: String,
+    },
+    PaneMoved {
+        previous_pane_id: String,
+        previous_workspace_id: String,
+        previous_tab_id: String,
+        pane: Box<PaneInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_workspace: Option<WorkspaceInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_tab: Option<TabInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed_tab_id: Option<String>,
     },
     PaneOutputChanged {
         pane_id: String,

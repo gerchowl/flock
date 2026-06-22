@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added the `pane.move` socket API method and the `flock pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT]`, `flock pane move <pane_id> --new-tab [--workspace ID] [--label TEXT]`, and `flock pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT]` CLI forms to relocate a running pane into another tab, a new tab, or a new workspace without restarting its terminal process. The pane's PTY and terminal id are preserved across the move; under Flock's per-workspace stable public ids a cross-workspace move rescopes the pane's public id under the new workspace (closed numbers are never reused). When the source workspace empties out it is closed and the existing `workspace.closed` event fires, so federated peer summaries stay aligned without extra reconciliation. Bumped the client/server protocol from 19 to 20. Ported from herdr #299. (#24)
 - Added the `notification.show` socket API method and `flock notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]` CLI subcommand for raising notifications through the configured toast delivery. Added `[ui.toast.flock] position`, `[ui.toast.clipboard] enabled`/`position`, and `[ui.toast] delay_seconds` config so in-app toast and clipboard feedback placement and timing are configurable. Bumped the wire protocol from 18 to 19 so clients can carry an optional notification body alongside the title. Ported from herdr #486. (#26)
 
 ### Changed

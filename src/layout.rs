@@ -125,6 +125,37 @@ impl TileLayout {
         new_id
     }
 
+    /// Insert an existing pane id next to a target pane without allocating a new
+    /// pane or spawning a terminal runtime. Used by `pane.move` to relocate a
+    /// live pane (with its still-running PTY) into a different tab/workspace.
+    /// `ratio` is clamped to a valid split range.
+    pub fn insert_pane_near(
+        &mut self,
+        target: PaneId,
+        moved: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> bool {
+        if target == moved {
+            return false;
+        }
+        let ids = self.pane_ids();
+        if !ids.contains(&target) || ids.contains(&moved) {
+            return false;
+        }
+
+        let clamped = if ratio.is_finite() {
+            ratio.clamp(0.1, 0.9)
+        } else {
+            0.5
+        };
+        let placeholder = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        self.root = split_at_with_ratio(old, target, direction, moved, clamped);
+        self.focus = moved;
+        true
+    }
+
     /// Close the focused pane. Returns false if it's the last pane.
     pub fn close_focused(&mut self) -> bool {
         if self.pane_count() <= 1 {
@@ -331,24 +362,38 @@ fn collect_ids(node: &Node, ids: &mut Vec<PaneId>) {
 }
 
 fn split_at(node: Node, target: PaneId, direction: Direction, new_id: PaneId) -> Node {
+    split_at_with_ratio(node, target, direction, new_id, 0.5)
+}
+
+fn split_at_with_ratio(
+    node: Node,
+    target: PaneId,
+    direction: Direction,
+    new_id: PaneId,
+    ratio: f32,
+) -> Node {
     match node {
         Node::Pane(id) if id == target => Node::Split {
             direction,
-            ratio: 0.5,
+            ratio,
             first: Box::new(Node::Pane(id)),
             second: Box::new(Node::Pane(new_id)),
         },
         Node::Pane(_) => node,
         Node::Split {
             direction: d,
-            ratio,
+            ratio: existing,
             first,
             second,
         } => Node::Split {
             direction: d,
-            ratio,
-            first: Box::new(split_at(*first, target, direction, new_id)),
-            second: Box::new(split_at(*second, target, direction, new_id)),
+            ratio: existing,
+            first: Box::new(split_at_with_ratio(
+                *first, target, direction, new_id, ratio,
+            )),
+            second: Box::new(split_at_with_ratio(
+                *second, target, direction, new_id, ratio,
+            )),
         },
     }
 }
