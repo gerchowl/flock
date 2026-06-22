@@ -2006,14 +2006,13 @@ impl PaneRuntime {
     }
 
     pub fn wheel_routing(&self) -> Option<WheelRouting> {
-        let input_state = self.input_state()?;
-        Some(if input_state.mouse_reporting_enabled() {
-            WheelRouting::MouseReport
-        } else if input_state.alternate_screen && input_state.mouse_alternate_scroll {
-            WheelRouting::AlternateScroll
-        } else {
-            WheelRouting::HostScroll
-        })
+        // Delegate to the terminal's narrow mouse-mode probe rather than
+        // building a full `InputState` (which reads ~10 modes plus the
+        // kitty-keyboard ANSI replay). On the headless server this is hit
+        // on every scroll tick for every pane that participates in wheel
+        // routing — keeping it cheap avoids repeated scrollback / mode work
+        // for inactive panes (ported from herdr #512).
+        self.terminal.wheel_routing()
     }
 
     pub fn encode_mouse_button(

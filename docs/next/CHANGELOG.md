@@ -10,6 +10,7 @@
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
 - Linux clipboard image reads now validate image payloads before accepting them, preventing malformed clipboard data from reaching pane image paste flows. (#18)
 - Pane resize keybindings now shrink panes again instead of only being able to grow them; when the focused pane has no split on the requested edge, the resize falls back to the opposite-edge split so an ancestor border still moves. (#23)
+- Headless servers now avoid repeated scrollback rendering work for inactive panes, reducing CPU in large sessions. Wheel-routing lookups go through a narrow mouse-mode probe instead of building a full input-state snapshot, and per-client frame preparation moves the frame through prepare/commit instead of cloning it on every send. Ported from herdr #512. (#17)
 
 ## [0.6.8] - 2026-06-04
 
