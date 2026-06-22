@@ -4,6 +4,7 @@
 
 ### Fixed
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
+- Nested agent session reports from child terminals no longer overwrite the owning pane's restored agent session id. (#20)
 
 ## [0.6.8] - 2026-06-04
 
