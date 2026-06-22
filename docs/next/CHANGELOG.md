@@ -13,6 +13,7 @@
 - Headless servers now avoid repeated scrollback rendering work for inactive panes, reducing CPU in large sessions. Wheel-routing lookups go through a narrow mouse-mode probe instead of building a full input-state snapshot, and per-client frame preparation moves the frame through prepare/commit instead of cloning it on every send. Ported from herdr #512. (#17)
 - F1-F4 key presses sent as `ESC[11~` through `ESC[14~` now reach pane apps instead of being dropped. (#22)
 - Numeric keypad keys that send VT100 application-keypad escape sequences (`ESC O p` through `ESC O y`, plus the operators) now enter their digits and operators instead of being dropped. (#22)
+- Nested agent session reports from child terminals no longer overwrite the owning pane's restored agent session id. (#20)
 
 ## [0.6.8] - 2026-06-04
 
