@@ -1587,6 +1587,10 @@ async fn run_client_loop(
     // One-shot guard for the first-paint trace event so subsequent frames are
     // a single cheap bool check.
     let mut first_paint_logged = false;
+    // Per-switch timing (#43): armed when a host switch is applied (warm flip or
+    // a completed cold dial), logged once at the next painted frame. Tuple is
+    // (switch start Instant, target display, warm-flip?).
+    let mut switch_timing: Option<(Instant, String, bool)> = None;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active,
@@ -1894,6 +1898,16 @@ async fn run_client_loop(
                                 "attach: first frame painted"
                             );
                         }
+                        if let Some((switch_t0, to, warm)) = switch_timing.take() {
+                            debug!(
+                                target: "flock::attach",
+                                stage = "switch",
+                                to = %to,
+                                warm,
+                                elapsed_ms = switch_t0.elapsed().as_millis() as u64,
+                                "attach: switch first frame painted"
+                            );
+                        }
                     }
                     ServerMessage::Terminal(frame) => {
                         if state.kitty_graphics_enabled
@@ -1921,6 +1935,8 @@ async fn run_client_loop(
                         fleet,
                         focus_workspace,
                     } => {
+                        // #43: time the switch from request to first painted frame.
+                        let switch_received = Instant::now();
                         // Slots-enabled path (#93): try a WARM flip first, else
                         // arm a cancellable cold dial under the popup. The legacy
                         // exit-and-relaunch path below stays in place for the
@@ -1949,6 +1965,8 @@ async fn run_client_loop(
                                         &should_quit,
                                         max_frame_size,
                                     )?;
+                                    switch_timing =
+                                        Some((switch_received, slot_display_label(&target), true));
                                     // PopupGuard invariant: if a switch was in
                                     // flight when the server preempted us with
                                     // a different warm flip, clear the popup.
@@ -2156,6 +2174,9 @@ async fn run_client_loop(
                             Ok(Some(new_stream)) => {
                                 // Teardown popup BEFORE applying further events
                                 // (PopupGuard discipline #93).
+                                let cold_timing = pending_switch
+                                    .as_ref()
+                                    .map(|p| (p.started_at, p.target_display.clone()));
                                 pending_switch = None;
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
@@ -2170,6 +2191,10 @@ async fn run_client_loop(
                                     &should_quit,
                                     max_frame_size,
                                 )?;
+                                // #43: cold-dial switch — time from request to next paint.
+                                if let Some((t0, to)) = cold_timing {
+                                    switch_timing = Some((t0, to, false));
+                                }
                             }
                             Ok(None) | Err(_) => {
                                 // Unexpected — the slot was just registered.
