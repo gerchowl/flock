@@ -988,29 +988,69 @@ const SERVER_ROW_LINES: u16 = 2;
 
 /// The band's two-line rows in render order: the home/origin row pinned
 /// first when the attached client carried a fleet snapshot, then the local
-/// server (`None` — it never gets a switch hit-area), then the carried
-/// snapshot rows, then the server's own configured peers. A locally
-/// attached client has no snapshot: just self + config peers, as before.
+/// server (`None` — it never gets a switch hit-area), then every peer row
+/// (carried snapshot rows + the server's own configured peers) sorted by the
+/// peer's machine-independent identity. A locally attached client has no
+/// snapshot: just self + config peers.
+///
+/// The peer tail is sorted so the band reads the same order on every server
+/// (#51) — without it the order was viewer-relative (each server's `[[peers]]`
+/// order + the carried snapshot's arrival order), so switching servers
+/// reshuffled the list. This mirrors the spaces fleet-stable sort (#85). Home
+/// and self stay pinned above the sorted tail (they are viewer-relative by
+/// definition and serve as a "you are here" affordance).
 fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
     use crate::app::state::PeerSwitchRequest;
     let mut slots = Vec::new();
-    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
+    if app.fleet_snapshot.is_some() {
         slots.push(Some(PeerSwitchRequest::Home));
-        slots.push(None);
-        slots.extend(
+    }
+    slots.push(None);
+
+    let mut peers: Vec<Option<PeerSwitchRequest>> = Vec::new();
+    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
+        peers.extend(
             (0..snapshot.peers.len())
                 .map(|entry_idx| Some(PeerSwitchRequest::SnapshotPeer { entry_idx })),
         );
-    } else {
-        slots.push(None);
     }
-    slots.extend((0..app.peer_summaries.len()).map(|peer_idx| {
+    peers.extend((0..app.peer_summaries.len()).map(|peer_idx| {
         Some(PeerSwitchRequest::ConfigPeer {
             peer_idx,
             ws_idx: 0,
         })
     }));
+    peers.sort_by_cached_key(|slot| server_slot_sort_key(app, slot));
+    slots.extend(peers);
     slots
+}
+
+/// Machine-independent sort key for a peer band row: the host the peer reports
+/// about itself, falling back to its config name, lowercased. Reported host is
+/// the same regardless of which server is doing the looking, so keying on it
+/// makes the band order identical across the fleet (#51). Non-peer slots
+/// (Home / self) never reach here — they are pinned above the sorted tail.
+fn server_slot_sort_key(
+    app: &AppState,
+    slot: &Option<crate::app::state::PeerSwitchRequest>,
+) -> String {
+    use crate::app::state::PeerSwitchRequest;
+    let summary = match slot {
+        Some(PeerSwitchRequest::SnapshotPeer { entry_idx }) => app
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.peers.get(*entry_idx)),
+        Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => app.peer_summaries.get(*peer_idx),
+        _ => None,
+    };
+    summary
+        .map(|peer| {
+            peer.host
+                .clone()
+                .unwrap_or_else(|| peer.peer.clone())
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default()
 }
 
 /// The band rows actually rendered, honoring the servers scope toggle:
@@ -2864,6 +2904,40 @@ mod tests {
         peer
     }
 
+    /// A peer whose CONFIG name differs from the host it REPORTS about itself —
+    /// the case the fleet-stable sort must key on `host`, not the local name.
+    fn peer_named_with_host(name: &str, host: &str) -> crate::peers::PeerSummaryState {
+        let mut peer = peer_with_workspaces(name, vec![]);
+        peer.host = Some(host.to_string());
+        peer
+    }
+
+    fn carried_snapshot_with_hosts(
+        origin: &str,
+        peers: &[(&str, &str)],
+    ) -> crate::peers::FleetSnapshotState {
+        crate::peers::FleetSnapshotState {
+            origin: origin.to_string(),
+            peers: peers
+                .iter()
+                .map(|(name, host)| peer_named_with_host(name, host))
+                .collect(),
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Resolved host order of the band's peer rows (Home / self pins resolve to
+    /// an empty key and drop out), i.e. exactly what a viewer sees down the
+    /// servers band below the pins.
+    fn peer_host_sequence(app: &AppState) -> Vec<String> {
+        server_band_slots(app)
+            .iter()
+            .map(|slot| server_slot_sort_key(app, slot))
+            .filter(|key| !key.is_empty())
+            .collect()
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         spans_text(&line.spans)
     }
@@ -2949,9 +3023,12 @@ mod tests {
     }
 
     #[test]
-    fn server_band_orders_home_then_self_then_snapshot_then_config_peers() {
+    fn server_band_pins_home_self_then_sorts_peers() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
+        // Names already alphabetical (anvil < ksb < ownpeer), so the sorted
+        // peer tail keeps snapshot-then-config order here; the interleaving
+        // case is covered by `server_band_sorts_peers_fleet_stably`.
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
 
@@ -2983,6 +3060,76 @@ mod tests {
             PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }
         );
         assert_eq!(cards[1].rect.y, header.y + 1 + 2 * SERVER_ROW_LINES);
+    }
+
+    #[test]
+    fn server_band_sorts_peers_fleet_stably() {
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        // Unsorted across BOTH sources: snapshot arrives [ksb, anvil], config
+        // is written [zeta, beta]. The band must interleave and emit them in
+        // one host-sorted order — anvil, beta, ksb, zeta — regardless of which
+        // source each came from, so every server shows the same sequence (#51).
+        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["ksb", "anvil"]));
+        app.peer_summaries = vec![
+            peer_with_workspaces("zeta", vec![]),
+            peer_with_workspaces("beta", vec![]),
+        ];
+
+        assert_eq!(
+            server_band_slots(&app),
+            vec![
+                Some(PeerSwitchRequest::Home),
+                None,                                                   // self
+                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 1 }), // anvil
+                Some(PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 1, // beta
+                    ws_idx: 0,
+                }),
+                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }), // ksb
+                Some(PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0, // zeta
+                    ws_idx: 0,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn server_band_sort_keys_on_reported_host_not_config_name() {
+        let mut app = crate::app::state::AppState::test_new();
+        // Config calls it "z-anvil" but the box reports host "anvil". Keying on
+        // the config name would sort it last; keying on the reported host (what
+        // every other server also sees) sorts it first.
+        app.peer_summaries = vec![
+            peer_named_with_host("z-anvil", "anvil"),
+            peer_with_workspaces("beta", vec![]), // host=None → falls back to name
+        ];
+        assert_eq!(peer_host_sequence(&app), vec!["anvil", "beta"]);
+    }
+
+    #[test]
+    fn server_band_order_converges_across_viewers() {
+        // Two viewers of the SAME three machines (anvil/ksb/sage) that each
+        // learned them in a different order AND via a different source split
+        // (snapshot vs config). The band must present them in one identical
+        // host order regardless — that is the fleet-stability contract (#51).
+        let mut a = crate::app::state::AppState::test_new();
+        a.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("anvil", "anvil"), ("sage", "sage")],
+        ));
+        a.peer_summaries = vec![peer_named_with_host("ksb", "ksb")];
+
+        let mut b = crate::app::state::AppState::test_new();
+        b.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("sage", "sage"), ("ksb", "ksb")],
+        ));
+        b.peer_summaries = vec![peer_named_with_host("anvil", "anvil")];
+
+        assert_eq!(peer_host_sequence(&a), vec!["anvil", "ksb", "sage"]);
+        assert_eq!(peer_host_sequence(&a), peer_host_sequence(&b));
     }
 
     #[test]
