@@ -2062,7 +2062,7 @@ fn tab_management_commands_work() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(second_tab_id, format!("{workspace_id}:2"));
+    assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
 
     let listed_tabs = run_cli(&socket_path, &["tab", "list", "--workspace", &workspace_id]);
     assert!(listed_tabs.status.success());
