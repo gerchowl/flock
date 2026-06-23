@@ -818,6 +818,7 @@ fn do_handshake(
     // hands it `fleet: None` and the spoke loses its servers band/home row.
     fleet_override: Option<&protocol::FleetSnapshot>,
 ) -> Result<RenderEncoding, ClientError> {
+    let handshake_t0 = Instant::now();
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
@@ -864,7 +865,8 @@ fn do_handshake(
             if let Some(error) = error {
                 return Err(ClientError::HandshakeRejected { version, error });
             }
-            info!(version, ?encoding, "handshake succeeded");
+            let handshake_ms = handshake_t0.elapsed().as_millis() as u64;
+            info!(version, ?encoding, handshake_ms, "handshake succeeded");
             Ok(encoding)
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
@@ -1218,6 +1220,7 @@ fn run_attach_attempt(
     sound_config: &crate::config::SoundConfig,
     mouse_scroll_lines: usize,
     redraw_on_focus_gained: bool,
+    attach_t0: Instant,
 ) -> Result<(), AttachAttemptError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
@@ -1241,6 +1244,13 @@ fn run_attach_attempt(
         None, // initial attach: the launcher-carried snapshot (env) is correct
     )
     .map_err(AttachAttemptError::Handshake)?;
+
+    debug!(
+        target: "flock::attach",
+        stage = "connect_handshake",
+        elapsed_ms = attach_t0.elapsed().as_millis() as u64,
+        "attach: connected + handshake complete"
+    );
 
     if let Some((terminal_id, takeover)) = attach_request {
         let attach = ClientMessage::AttachTerminal {
@@ -1276,6 +1286,7 @@ fn run_attach_attempt(
         attach_escape,
         initial_input,
         stdin_rx,
+        attach_t0,
     ));
 
     // Restore the terminal before the caller prints anything.
@@ -1345,6 +1356,12 @@ fn run_client_with_mode(
 ) -> io::Result<()> {
     init_logging();
 
+    // Per-attach hot-path timing baseline. Plumbed through `run_attach_attempt`
+    // → `run_client_loop` so each milestone (theme, connect+handshake,
+    // first-paint) can log its delta from the same t0 under `FLOCK_LOG=
+    // flock=debug`. Pure observability — no behavior change.
+    let attach_t0 = Instant::now();
+
     // Each leg starts with no pending handoff: clear the flag a previous
     // in-process leg may have left set (#63) so a clean exit of THIS leg
     // restores the host terminal fully.
@@ -1387,7 +1404,21 @@ fn run_client_with_mode(
     let (host_theme, capture_leftover) = if direct_attach_requested {
         (None, Vec::new())
     } else {
-        capture_host_terminal_theme()
+        let theme_t0 = Instant::now();
+        let captured = capture_host_terminal_theme();
+        // Per-stage delta: the OSC 10/11 query waits up to
+        // HOST_THEME_CAPTURE_TIMEOUT (300ms) for terminals that never answer,
+        // so this is the single biggest avoidable attach-latency source on
+        // hosts that can't reply. Visible with `FLOCK_LOG=flock=debug`.
+        debug!(
+            target: "flock::attach",
+            stage = "theme_capture",
+            stage_ms = theme_t0.elapsed().as_millis() as u64,
+            elapsed_ms = attach_t0.elapsed().as_millis() as u64,
+            theme_present = captured.0.is_some(),
+            "attach: host terminal theme capture complete"
+        );
+        captured
     };
     let mut pending_stdin = (!capture_leftover.is_empty()).then_some(capture_leftover);
 
@@ -1444,6 +1475,7 @@ fn run_client_with_mode(
             &sound_config,
             mouse_scroll_lines,
             redraw_on_focus_gained,
+            attach_t0,
         ) {
             Ok(()) => break Ok(()),
             Err(err) => {
@@ -1548,9 +1580,17 @@ async fn run_client_loop(
     attach_escape: Option<AttachEscapeState>,
     initial_input: Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    attach_t0: Instant,
 ) -> Result<(), ClientError> {
     let (_, _, initial_cell_width, initial_cell_height) =
         current_terminal_geometry(kitty_graphics_enabled);
+    // One-shot guard for the first-paint trace event so subsequent frames are
+    // a single cheap bool check.
+    let mut first_paint_logged = false;
+    // Per-switch timing (#43): armed when a host switch is applied (warm flip or
+    // a completed cold dial), logged once at the next painted frame. Tuple is
+    // (switch start Instant, target display, warm-flip?).
+    let mut switch_timing: Option<(Instant, String, bool)> = None;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active,
@@ -1849,6 +1889,25 @@ async fn run_client_loop(
                         );
                         let _ = stdout.flush();
                         state.blit_encoder.commit(frame_data, encoded);
+                        if !first_paint_logged {
+                            first_paint_logged = true;
+                            debug!(
+                                target: "flock::attach",
+                                stage = "first_paint",
+                                elapsed_ms = attach_t0.elapsed().as_millis() as u64,
+                                "attach: first frame painted"
+                            );
+                        }
+                        if let Some((switch_t0, to, warm)) = switch_timing.take() {
+                            debug!(
+                                target: "flock::attach",
+                                stage = "switch",
+                                to = %to,
+                                warm,
+                                elapsed_ms = switch_t0.elapsed().as_millis() as u64,
+                                "attach: switch first frame painted"
+                            );
+                        }
                     }
                     ServerMessage::Terminal(frame) => {
                         if state.kitty_graphics_enabled
@@ -1876,6 +1935,8 @@ async fn run_client_loop(
                         fleet,
                         focus_workspace,
                     } => {
+                        // #43: time the switch from request to first painted frame.
+                        let switch_received = Instant::now();
                         // Slots-enabled path (#93): try a WARM flip first, else
                         // arm a cancellable cold dial under the popup. The legacy
                         // exit-and-relaunch path below stays in place for the
@@ -1904,6 +1965,8 @@ async fn run_client_loop(
                                         &should_quit,
                                         max_frame_size,
                                     )?;
+                                    switch_timing =
+                                        Some((switch_received, slot_display_label(&target), true));
                                     // PopupGuard invariant: if a switch was in
                                     // flight when the server preempted us with
                                     // a different warm flip, clear the popup.
@@ -2111,6 +2174,9 @@ async fn run_client_loop(
                             Ok(Some(new_stream)) => {
                                 // Teardown popup BEFORE applying further events
                                 // (PopupGuard discipline #93).
+                                let cold_timing = pending_switch
+                                    .as_ref()
+                                    .map(|p| (p.started_at, p.target_display.clone()));
                                 pending_switch = None;
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
@@ -2125,6 +2191,10 @@ async fn run_client_loop(
                                     &should_quit,
                                     max_frame_size,
                                 )?;
+                                // #43: cold-dial switch — time from request to next paint.
+                                if let Some((t0, to)) = cold_timing {
+                                    switch_timing = Some((t0, to, false));
+                                }
                             }
                             Ok(None) | Err(_) => {
                                 // Unexpected — the slot was just registered.
