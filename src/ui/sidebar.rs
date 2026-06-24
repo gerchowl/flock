@@ -312,7 +312,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
 
     let mut entries = Vec::new();
     for (peer_ref, peer) in peers {
-        let server = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+        let server = peer.display_name().to_string();
         for (ws_idx, summary) in peer.workspaces.iter().enumerate() {
             // Only workspaces actually running an agent surface here.
             let Some(agent) = summary.agent.as_deref() else {
@@ -906,7 +906,7 @@ fn server_filter_label(app: &AppState) -> Option<String> {
             app.remote_peers()
                 .into_iter()
                 .find(|(_, peer)| peer.ssh_target == *ssh_target)
-                .map(|(_, peer)| peer.host.clone().unwrap_or_else(|| peer.peer.clone()))
+                .map(|(_, peer)| peer.display_name().to_string())
                 .unwrap_or_else(|| ssh_target.clone()),
         ),
     }
@@ -2072,7 +2072,7 @@ fn peer_server_rows(
 ) -> ServerRowBuild {
     use crate::peers::PeerReachability;
     let reach = peer.reachability();
-    let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+    let host = peer.display_name().to_string();
 
     if reach == PeerReachability::Down {
         // Unreachable = the GHOST of the normal row (#42 refinement): the
@@ -3433,6 +3433,23 @@ mod tests {
             spans_text(&row.title_rest)
         );
         assert!(!health.contains("\u{f08ae}"), "{health}");
+    }
+
+    #[test]
+    fn peer_server_rows_show_configured_name_over_reported_host() {
+        // The peer is configured `[[peers]] name = "anvil"` but reports a raw
+        // OS hostname; the row must show the configured name (#42).
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.host = Some("mac-studio-12345.local".into());
+        peer.latency_ms = Some(10);
+
+        let name = spans_text(&peer_server_rows(&peer, &p).name);
+        assert_eq!(name, "anvil");
+        assert!(
+            !name.contains("mac-studio"),
+            "reported host must not win: {name}"
+        );
     }
 
     #[test]
