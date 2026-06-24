@@ -28,10 +28,24 @@ pub struct SystemStats {
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Resolve which path's volume the disk stat reports (#50): the configured
+/// `ui.disk_path` when set (any path — its containing mount is matched), else
+/// `$HOME`'s volume (the historical default). Empty/whitespace is treated as
+/// unset. `None` only when neither is available, which omits the disk metric.
+pub(crate) fn resolve_disk_target(disk_path: Option<&str>) -> Option<std::path::PathBuf> {
+    disk_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+}
+
 /// Spawn the sampler thread; it sends a snapshot through `notify` every
-/// interval until the receiver disappears.
+/// interval until the receiver disappears. `disk_path` (`ui.disk_path`) picks
+/// the volume the disk metric reports; `None` keeps the `$HOME` default.
 pub fn spawn_sampler(
     event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    disk_path: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("system-stats".into())
@@ -39,7 +53,7 @@ pub fn spawn_sampler(
             let mut system = sysinfo::System::new();
             let mut networks = sysinfo::Networks::new_with_refreshed_list();
             let disks = sysinfo::Disks::new_with_refreshed_list();
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let disk_target = resolve_disk_target(disk_path.as_deref());
             // First CPU sample needs a baseline.
             system.refresh_cpu_usage();
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
@@ -56,10 +70,10 @@ pub fn spawn_sampler(
                 let mem_total = Some(system.total_memory());
                 let mem_used = Some(system.used_memory());
 
-                let disk_free = home.as_deref().and_then(|home| {
+                let disk_free = disk_target.as_deref().and_then(|target| {
                     disks
                         .iter()
-                        .filter(|disk| home.starts_with(disk.mount_point()))
+                        .filter(|disk| target.starts_with(disk.mount_point()))
                         .max_by_key(|disk| disk.mount_point().as_os_str().len())
                         .map(|disk| disk.available_space())
                 });
@@ -170,6 +184,26 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_disk_target_prefers_configured_path() {
+        assert_eq!(
+            resolve_disk_target(Some("/data")),
+            Some(std::path::PathBuf::from("/data"))
+        );
+        assert_eq!(
+            resolve_disk_target(Some("/")),
+            Some(std::path::PathBuf::from("/"))
+        );
+    }
+
+    #[test]
+    fn resolve_disk_target_falls_back_to_home_when_unset_or_blank() {
+        // Unset and blank both defer to $HOME (the historical default).
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        assert_eq!(resolve_disk_target(None), home);
+        assert_eq!(resolve_disk_target(Some("   ")), home);
+    }
 
     #[test]
     fn parses_gpu_utilization_from_ioreg_block() {

@@ -292,7 +292,7 @@ impl App {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
-        crate::system_stats::spawn_sampler(event_tx.clone());
+        crate::system_stats::spawn_sampler(event_tx.clone(), config.ui.disk_path.clone());
         {
             // Slow PR-state poll tick: the shared event handler collects the
             // worktree branches and spawns the actual gh worker.
