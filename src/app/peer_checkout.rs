@@ -366,6 +366,7 @@ mod tests {
             ssh_target: "lars@anvil".into(),
             host: Some("anvil".into()),
             version: None,
+            protocol: None,
             system: None,
             latency_ms: Some(10),
             workspaces: vec![PeerWorkspaceSummary {

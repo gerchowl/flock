@@ -40,7 +40,11 @@ use serde::{Deserialize, Serialize};
 /// `ClientMessage` (existing variant indices unchanged on the positional wire),
 /// but the new message is a wire-format change — deliberate bump. Single-owner
 /// fleet, lockstep deploys.
-pub const PROTOCOL_VERSION: u32 = 20;
+///
+/// v21: `FleetPeer.protocol` (#58). The gossiped peer summary now carries the
+/// peer's wire protocol so a spoke can flag protocol skew in the sidebar, not
+/// just a semver mismatch. Additive field on a wire struct — deliberate bump.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -138,6 +142,9 @@ pub struct FleetPeer {
     pub host: Option<String>,
     /// flock version the peer reported.
     pub version: Option<String>,
+    /// Wire protocol the peer reported (#58) — lets a spoke flag a peer whose
+    /// protocol differs from the local one, the skew that blocks `--remote`.
+    pub protocol: Option<u32>,
     /// Machine health from the hub's last successful poll.
     pub system: Option<FleetSystem>,
     /// Round-trip latency of the hub's last successful poll.
@@ -1010,6 +1017,7 @@ mod tests {
                 ssh_target: "lars@anvil".to_owned(),
                 host: Some("anvil".to_owned()),
                 version: Some("0.9.0".to_owned()),
+                protocol: Some(21),
                 system: Some(FleetSystem {
                     cpu_percent: Some(42),
                     mem_used: Some(13 << 30),
@@ -1040,6 +1048,7 @@ mod tests {
                 ssh_target: HOME_SWITCH_TARGET.to_owned(),
                 host: Some("mba22".to_owned()),
                 version: Some("0.9.0".to_owned()),
+                protocol: Some(21),
                 system: Some(FleetSystem {
                     cpu_percent: Some(7),
                     mem_used: Some(8 << 30),
@@ -1610,7 +1619,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 20;
+    const PINNED_PROTOCOL_VERSION: u32 = 21;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1748,7 +1757,9 @@ mod tests {
                 "SwitchServer",
                 ServerMessage::SwitchServer {
                     ssh_target: "lars@sage".to_string(),
-                    fleet: None,
+                    // Carry a real snapshot so the golden also covers the
+                    // nested FleetSnapshot / FleetPeer wire shape (#58).
+                    fleet: Some(sample_fleet_snapshot()),
                     focus_workspace: None,
                 },
             ),
@@ -1828,7 +1839,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x1eafec6cccfe521d),
+            ("SwitchServer", 0x5b0104648107b9ea),
         ];
 
         if actual.as_slice() != GOLDEN {

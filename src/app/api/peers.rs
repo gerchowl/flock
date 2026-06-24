@@ -13,6 +13,7 @@ impl App {
             ResponseResult::PeersSummary {
                 host: short_host_name(),
                 version: Some(crate::build_info::version()),
+                protocol: Some(crate::protocol::PROTOCOL_VERSION),
                 system: self.state.system_stats.as_ref().map(system_summary),
                 workspaces: self.self_workspace_summaries(),
             },
@@ -98,6 +99,7 @@ impl App {
             ssh_target: crate::protocol::HOME_SWITCH_TARGET.to_string(),
             host: Some(short_host_name()),
             version: Some(crate::build_info::version()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
             system: self
                 .state
                 .system_stats
@@ -396,6 +398,7 @@ mod tests {
             ssh_target: ssh_target.to_string(),
             host: Some(name.to_string()),
             version: None,
+            protocol: None,
             system: None,
             latency_ms: Some(10),
             // Deliberately empty: prepare_peer_switch must not spawn the
