@@ -32,8 +32,8 @@ pub fn resolve_write_target() -> std::io::Result<PathBuf> {
     if !overlay.exists() {
         std::fs::write(
             &overlay,
-            "# flock overlay -- read after config.toml, adds scalar keys\n\
-             # the base config does not declare. See `flock config edit`.\n",
+            "# flock overlay -- deep-merged over config.toml: add new keys OR\n\
+             # override base-set scalars (overlay wins). See `flock config edit`.\n",
         )?;
     }
     Ok(overlay)
