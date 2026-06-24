@@ -563,6 +563,11 @@ pub struct UiConfig {
     /// Show the global machine status line (cpu/mem/disk/battery/net/gpu)
     /// above the tab bar. Default: true.
     pub status_line: bool,
+    /// Path whose containing volume's free space the status line's disk metric
+    /// reports. Any path works (its mount point is matched). Default (unset):
+    /// the volume holding `$HOME`. Set e.g. `disk_path = "/"` for the root
+    /// volume or a data-mount path. Takes effect on restart (#50).
+    pub disk_path: Option<String>,
     /// Capture mouse input for Flock's mouse UI. Default: true.
     pub mouse_capture: bool,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
@@ -831,6 +836,7 @@ impl Default for UiConfig {
             auto_collapse_groups: false,
             pane_header: true,
             status_line: true,
+            disk_path: None,
             mouse_capture: true,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
