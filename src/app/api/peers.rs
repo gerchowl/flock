@@ -167,7 +167,7 @@ impl App {
             PeerSwitchRequest::SnapshotPeer { entry_idx } => {
                 let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
                 let ssh_target = entry.ssh_target.clone();
-                let label = entry.host.clone().unwrap_or_else(|| entry.peer.clone());
+                let label = entry.display_name().to_string();
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
@@ -238,7 +238,7 @@ impl App {
     ) -> Option<(String, String)> {
         let peer = self.state.peer_summaries.get(peer_idx)?;
         let ssh_target = peer.ssh_target.clone();
-        let label = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+        let label = peer.display_name().to_string();
         if let Some(remote_ws) = peer.workspaces.get(ws_idx) {
             let label = format!("{label}:{}", remote_ws.workspace);
             // Workspace ids are server-assigned ("ws_3"); refuse anything

@@ -65,6 +65,14 @@ impl PeerSummaryState {
         }
     }
 
+    /// The name to DISPLAY for this node (#42): the configured `[[peers]]`
+    /// name (validated non-empty), chosen over the peer's self-reported
+    /// gethostname (`host`) so a node always shows the name you gave it —
+    /// `anvil`, not a raw OS hostname like `mac-studio-12345.local`.
+    pub fn display_name(&self) -> &str {
+        &self.peer
+    }
+
     /// Reachability for the sidebar dot: live / slow / stale-or-error.
     pub fn reachability(&self) -> PeerReachability {
         if self.is_stale() || self.error.is_some() {
