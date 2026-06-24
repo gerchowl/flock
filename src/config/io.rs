@@ -176,70 +176,58 @@ pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
     load_with_overlay(base.as_deref(), overlay.as_deref(), &overlay_path)
 }
 
-/// Concatenate base + overlay text before TOML parsing.
+/// Load the base config with the user overlay (`config.local.toml`)
+/// DEEP-MERGED on top (#45).
 ///
-/// The overlay's role is to ADD scalar keys the base does not set --
-/// e.g. the base is a read-only nix/HM symlink that omits
-/// `ui.sidebar_row_gap`, and the overlay supplies it.
+/// Both base and overlay are parsed to TOML tables and merged structurally:
+/// the overlay's scalars and whole values WIN, nested tables merge
+/// recursively, and `[[peers]]` arrays APPEND. This lets the overlay OVERRIDE
+/// a base-set scalar (e.g. `ui.tab_mode`) — the previous text-concatenation
+/// approach could only ADD keys the base never set, because re-declaring a
+/// `[section]` was a duplicate-key parse error.
 ///
-/// Caveats:
-///
-/// - toml 0.8 rejects re-declaring a `[section]` table (the strict-spec
-///   reading). So the overlay can only ADD new `[section]` blocks the
-///   base does not already declare, or extend a base section by writing
-///   sub-paths the base never touched -- it CANNOT override a scalar the
-///   base already sets in the same `[section]`. If you need to override
-///   a base-set key, the workable path is to delete the key from the
-///   base.
-/// - `[[peers]]`-style array-of-tables blocks APPEND, so overlays cannot
-///   "replace" peers, only add more.
-///
-/// A malformed overlay falls back to base-only with a diagnostic; the
-/// running config is never dropped.
+/// A malformed overlay falls back to base-only with a diagnostic; the running
+/// config is never dropped, preserving the per-section keep-current contract.
+/// A malformed BASE keeps the current config (propagated as `Err`), unchanged.
 fn load_with_overlay(
     base: Option<&str>,
     overlay: Option<&str>,
     overlay_path: &Path,
 ) -> Result<LoadedConfig, Vec<String>> {
-    let combined = match (base, overlay) {
-        (Some(b), Some(o)) => {
-            let mut combined = b.to_string();
-            if !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-            combined.push_str(o);
-            combined
-        }
-        (Some(b), None) => b.to_string(),
-        (None, Some(o)) => o.to_string(),
-        (None, None) => {
-            return Ok(LoadedConfig {
+    let mut merged = match base {
+        // A broken base keeps the current config (Err) — same as before.
+        Some(b) => parse_config_table(b)?,
+        None => toml::map::Map::new(),
+    };
+
+    let Some(overlay) = overlay else {
+        // No overlay: base-only, or defaults when neither is present.
+        return match base {
+            Some(_) => load_live_config_from_table(merged),
+            None => Ok(LoadedConfig {
                 config: Config::default(),
                 diagnostics: Vec::new(),
                 invalid_sections: Vec::new(),
-            });
-        }
+            }),
+        };
     };
 
-    if overlay.is_some() {
-        match load_live_config_from_str(&combined) {
-            Ok(loaded) => return Ok(loaded),
-            Err(diagnostics) => {
-                // The overlay made the concatenated text unparseable.
-                // Fall back to the base alone and surface the overlay
-                // failure as a non-fatal diagnostic -- matches the
-                // per-section keep-current contract.
-                let overlay_diag = format!(
-                    "overlay at {} broke parse: {}; ignoring overlay",
-                    overlay_path.display(),
-                    diagnostics.join("; ")
-                );
-                return load_with_overlay_diagnostic(base, Some(overlay_diag));
-            }
+    match parse_config_table(overlay) {
+        Ok(overlay_table) => {
+            deep_merge_tables(&mut merged, overlay_table);
+            load_live_config_from_table(merged)
+        }
+        Err(diagnostics) => {
+            // The overlay itself is unparseable; fall back to base alone and
+            // surface the overlay failure as a non-fatal diagnostic.
+            let overlay_diag = format!(
+                "overlay at {} broke parse: {}; ignoring overlay",
+                overlay_path.display(),
+                diagnostics.join("; ")
+            );
+            load_with_overlay_diagnostic(base, Some(overlay_diag))
         }
     }
-
-    load_live_config_from_str(&combined)
 }
 
 fn load_with_overlay_diagnostic(
@@ -263,20 +251,56 @@ fn load_with_overlay_diagnostic(
     Ok(loaded)
 }
 
-fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
+/// Parse TOML text into the top-level config table, mapping a parse error or
+/// a non-table top level to the keep-current diagnostic.
+fn parse_config_table(content: &str) -> Result<toml::map::Map<String, toml::Value>, Vec<String>> {
     // toml 1.x: `str::parse::<Value>` (FromStr) parses a single value, not a
     // document — use the serde document parser for the whole config file.
-    let value = toml::from_str::<toml::Value>(content)
-        .map_err(|err| vec![format!("config parse error: {err}; keeping current config")])?;
-    let table = value.as_table().ok_or_else(|| {
-        vec![
+    match toml::from_str::<toml::Value>(content) {
+        Ok(toml::Value::Table(table)) => Ok(table),
+        Ok(_) => Err(vec![
             "config parse error: top-level config must be a table; keeping current config"
                 .to_string(),
-        ]
-    })?;
+        ]),
+        Err(err) => Err(vec![format!(
+            "config parse error: {err}; keeping current config"
+        )]),
+    }
+}
 
+/// Deep-merge `overlay` into `base` (#45). Overlay scalars and whole values
+/// WIN over the base (so `config.local.toml` can OVERRIDE a base-set scalar
+/// like `ui.tab_mode`); nested tables merge recursively; arrays (e.g.
+/// `[[peers]]`) APPEND (base entries first, then overlay) — preserving the
+/// prior "overlay adds peers" behaviour while newly allowing scalar override.
+fn deep_merge_tables(
+    base: &mut toml::map::Map<String, toml::Value>,
+    overlay: toml::map::Map<String, toml::Value>,
+) {
+    for (key, overlay_value) in overlay {
+        match (base.get_mut(&key), overlay_value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                deep_merge_tables(base_table, overlay_table);
+            }
+            (Some(toml::Value::Array(base_array)), toml::Value::Array(overlay_array)) => {
+                base_array.extend(overlay_array);
+            }
+            (_, overlay_value) => {
+                base.insert(key, overlay_value);
+            }
+        }
+    }
+}
+
+fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
+    load_live_config_from_table(parse_config_table(content)?)
+}
+
+fn load_live_config_from_table(
+    table: toml::map::Map<String, toml::Value>,
+) -> Result<LoadedConfig, Vec<String>> {
     let mut config = Config::default();
-    let mut diagnostics = unknown_top_level_section_diagnostics(table);
+    let mut diagnostics = unknown_top_level_section_diagnostics(&table);
     let mut invalid_sections = Vec::new();
 
     if let Some(value) = table.get("onboarding") {
@@ -289,7 +313,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     }
 
     load_live_section(
-        table,
+        &table,
         "theme",
         "theme config",
         &mut diagnostics,
@@ -297,7 +321,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.theme = section,
     );
     load_live_section(
-        table,
+        &table,
         "keys",
         "keybinding config",
         &mut diagnostics,
@@ -305,7 +329,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.keys = section,
     );
     load_live_section(
-        table,
+        &table,
         "terminal",
         "terminal config",
         &mut diagnostics,
@@ -313,7 +337,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.terminal = section,
     );
     load_live_section(
-        table,
+        &table,
         "session",
         "session config",
         &mut diagnostics,
@@ -321,7 +345,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.session = section,
     );
     load_live_section(
-        table,
+        &table,
         "update",
         "update config",
         &mut diagnostics,
@@ -329,7 +353,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.update = section,
     );
     load_live_section(
-        table,
+        &table,
         "ui",
         "ui config",
         &mut diagnostics,
@@ -337,7 +361,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.ui = section,
     );
     load_live_section(
-        table,
+        &table,
         "advanced",
         "advanced config",
         &mut diagnostics,
@@ -345,7 +369,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.advanced = section,
     );
     load_live_section(
-        table,
+        &table,
         "worktrees",
         "worktree config",
         &mut diagnostics,
@@ -353,7 +377,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.worktrees = section,
     );
     load_live_section(
-        table,
+        &table,
         "experimental",
         "experimental config",
         &mut diagnostics,
@@ -361,7 +385,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.experimental = section,
     );
     load_live_section(
-        table,
+        &table,
         "remote",
         "remote config",
         &mut diagnostics,
@@ -369,7 +393,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         |section| config.remote = section,
     );
     load_live_section(
-        table,
+        &table,
         "peers",
         "peers config",
         &mut diagnostics,
@@ -953,28 +977,51 @@ mouse_capture = false
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
-    #[test]
-    fn malformed_overlay_keeps_base_and_surfaces_diagnostic() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let dir = unique_test_dir("flock-overlay");
-        let base = dir.join("config.toml");
-        let overlay = dir.join("config.local.toml");
-        std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();
-        // Concatenation produces a duplicate-key error (`sidebar_row_gap`
-        // appears twice in the same `[ui]` table).
-        std::fs::write(&overlay, "[ui]\nsidebar_row_gap = 9\n").unwrap();
-
+    /// Run `load_live_config` with `CONFIG_PATH_ENV_VAR` pointed at `base`,
+    /// restoring the prior env afterwards. The overlay sits beside the base
+    /// (see `config_overlay_path`).
+    fn load_live_config_with_base(base: &Path) -> LoadedConfig {
         let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &base);
-
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, base);
         let loaded = load_live_config().unwrap();
-
         match previous {
             Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
             None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
         }
+        loaded
+    }
 
-        // Overlay was rejected, base survived intact.
+    #[test]
+    fn overlay_overrides_base_set_scalar() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-overlay-override");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        // The base already sets the scalar; the overlay re-sets it in the same
+        // `[ui]` table. Deep-merge makes the overlay WIN (#45) — text
+        // concatenation rejected this as a duplicate key.
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();
+        std::fs::write(&overlay, "[ui]\nsidebar_row_gap = 9\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
+        assert_eq!(loaded.config.ui.sidebar_row_gap, 9);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn unparseable_overlay_keeps_base_and_surfaces_diagnostic() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-overlay-bad");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();
+        // Not valid TOML (a bare line with no `=`): the overlay is dropped and
+        // the base survives intact, with a diagnostic.
+        std::fs::write(&overlay, "this is not valid toml\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
         assert_eq!(loaded.config.ui.sidebar_row_gap, 2);
         assert!(
             loaded
@@ -984,6 +1031,27 @@ mouse_capture = false
             "expected overlay diagnostic, got {:?}",
             loaded.diagnostics
         );
+    }
+
+    #[test]
+    fn overlay_peers_append_to_base_peers() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-overlay-peers");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[[peers]]\nname = \"anvil\"\n").unwrap();
+        std::fs::write(&overlay, "[[peers]]\nname = \"sage\"\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
+        let names: Vec<&str> = loaded
+            .config
+            .peers
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["anvil", "sage"], "overlay peers should append");
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]
