@@ -854,6 +854,21 @@ fn remote_server_restart_reason(
     None
 }
 
+/// Plain-language explanation of a protocol-skew block, naming both wire
+/// protocols so the user knows it is a same-build/deploy-lag problem (not a
+/// transient error) and what to do about it. Pure, so it is unit-testable
+/// without the interactive prompt. See #52.
+fn protocol_mismatch_blurb(server_protocol: Option<u32>) -> String {
+    match server_protocol {
+        Some(server_protocol) => format!(
+            "the remote server speaks wire protocol {server_protocol}, this client speaks {CURRENT_PROTOCOL} — the two flock builds are wire-incompatible. the remote server must stop and relaunch on the prepared binary before this client can attach."
+        ),
+        None => format!(
+            "the remote server's wire protocol is unknown and may be incompatible with this client's {CURRENT_PROTOCOL}. it must stop and relaunch on the prepared binary before this client can attach."
+        ),
+    }
+}
+
 fn confirm_remote_install_with_running_server(
     target: &str,
     remote_flock: &RemoteFlock,
@@ -1003,7 +1018,7 @@ fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatu
 fn confirm_remote_server_stop(
     target: &str,
     version: Option<&str>,
-    _protocol: Option<u32>,
+    protocol: Option<u32>,
     reason: RemoteServerRestartReason,
     context: LaunchContext,
 ) -> io::Result<bool> {
@@ -1021,7 +1036,8 @@ fn confirm_remote_server_stop(
     if !io::stdin().is_terminal() {
         if reason == RemoteServerRestartReason::ProtocolMismatch {
             return Err(io::Error::other(format!(
-                "remote flock server on {target} must stop before this client can attach; run from an interactive terminal to approve stopping it"
+                "cannot attach to remote flock server on {target}: {} run from an interactive terminal to approve stopping it.",
+                protocol_mismatch_blurb(protocol)
             )));
         }
 
@@ -1034,13 +1050,20 @@ fn confirm_remote_server_stop(
     }
 
     eprintln!("remote flock server on {target} is currently running:");
-    eprintln!("  server: v{}", version_label(version));
-    eprintln!("  prepared binary: {}", current_version());
+    eprintln!(
+        "  server: v{} (wire protocol {})",
+        version_label(version),
+        protocol.map_or_else(|| "unknown".to_string(), |p| p.to_string())
+    );
+    eprintln!(
+        "  prepared binary: {} (wire protocol {CURRENT_PROTOCOL})",
+        current_version()
+    );
     eprintln!();
 
     match reason {
         RemoteServerRestartReason::ProtocolMismatch => {
-            eprintln!("the remote server must stop before this client can attach.");
+            eprintln!("{}", protocol_mismatch_blurb(protocol));
         }
         RemoteServerRestartReason::BinaryUpdated => {
             eprintln!(
@@ -1965,6 +1988,33 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_mismatch_blurb_names_both_protocols() {
+        let blurb = protocol_mismatch_blurb(Some(18));
+        assert!(
+            blurb.contains("18"),
+            "should name the remote protocol: {blurb}"
+        );
+        assert!(
+            blurb.contains(&CURRENT_PROTOCOL.to_string()),
+            "should name this client's protocol: {blurb}"
+        );
+        assert!(
+            blurb.contains("relaunch"),
+            "should tell the user to relaunch: {blurb}"
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_blurb_handles_unknown_remote_protocol() {
+        let blurb = protocol_mismatch_blurb(None);
+        assert!(
+            blurb.contains("unknown"),
+            "should flag unknown protocol: {blurb}"
+        );
+        assert!(blurb.contains(&CURRENT_PROTOCOL.to_string()));
+    }
 
     #[test]
     fn bridge_socket_is_user_only() {

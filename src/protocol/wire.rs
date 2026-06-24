@@ -859,11 +859,11 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your flock client"
+            "client protocol {client_version} is older than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock client (a running server keeps its old protocol until it is relaunched)"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the flock server"
+            "client protocol {client_version} is newer than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock server (a running server keeps its old protocol until it is relaunched)"
         ))
     }
 }
@@ -1591,6 +1591,255 @@ mod tests {
         match response {
             ServerMessage::Welcome { error: Some(_), .. } => {}
             other => panic!("expected Welcome with error, got: {other:?}"),
+        }
+    }
+
+    // ---- Wire-compat gate (#52b) ----
+    //
+    // Guards against accidental wire-shape changes that ship WITHOUT a
+    // PROTOCOL_VERSION bump — the silent root cause of cross-version corruption
+    // between two same-numbered builds (see the #52 spike). Two layers:
+    //   1. `_client_message_wire_coverage` / `_server_message_wire_coverage`:
+    //      adding, removing, or renaming a variant fails to COMPILE until the
+    //      golden sample below is updated.
+    //   2. `wire_shape_is_pinned`: a fixed canonical instance of every variant
+    //      is bincode-encoded and checksummed; a field type/order change alters
+    //      the bytes and trips the assertion.
+    //
+    // When the wire shape changes on purpose: bump PROTOCOL_VERSION, then set
+    // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
+    // test prints it paste-ready).
+
+    const PINNED_PROTOCOL_VERSION: u32 = 20;
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn golden_client_messages() -> Vec<(&'static str, ClientMessage)> {
+        vec![
+            (
+                "Hello",
+                ClientMessage::Hello {
+                    version: 20,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                    requested_encoding: RenderEncoding::SemanticFrame,
+                    keybindings: ClientKeybindings::Server,
+                    launch_mode: ClientLaunchMode::App,
+                    fleet: None,
+                    host_theme: None,
+                    notice: None,
+                },
+            ),
+            (
+                "Input",
+                ClientMessage::Input {
+                    data: vec![1, 2, 3],
+                },
+            ),
+            (
+                "ClipboardImage",
+                ClientMessage::ClipboardImage {
+                    extension: "png".to_string(),
+                    data: vec![9, 8, 7],
+                },
+            ),
+            (
+                "Resize",
+                ClientMessage::Resize {
+                    cols: 100,
+                    rows: 40,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                },
+            ),
+            ("Detach", ClientMessage::Detach),
+            (
+                "AttachTerminal",
+                ClientMessage::AttachTerminal {
+                    terminal_id: "w1:t1".to_string(),
+                    takeover: true,
+                },
+            ),
+            (
+                "AttachScroll",
+                ClientMessage::AttachScroll {
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Up,
+                    lines: 3,
+                    column: Some(5),
+                    row: Some(6),
+                    modifiers: 0,
+                },
+            ),
+            (
+                "SetFrameSubscription",
+                ClientMessage::SetFrameSubscription { enabled: true },
+            ),
+        ]
+    }
+
+    fn golden_server_messages() -> Vec<(&'static str, ServerMessage)> {
+        vec![
+            (
+                "Welcome",
+                ServerMessage::Welcome {
+                    version: 20,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: None,
+                },
+            ),
+            (
+                "Frame",
+                ServerMessage::Frame(FrameData {
+                    cells: vec![],
+                    width: 0,
+                    height: 0,
+                    cursor: None,
+                    hyperlinks: vec![],
+                    graphics: vec![],
+                }),
+            ),
+            (
+                "Terminal",
+                ServerMessage::Terminal(TerminalFrame {
+                    seq: 1,
+                    width: 80,
+                    height: 24,
+                    full: true,
+                    bytes: vec![27, b'[', b'2', b'J'],
+                }),
+            ),
+            ("Graphics", ServerMessage::Graphics { bytes: vec![1, 2] }),
+            (
+                "ServerShutdown",
+                ServerMessage::ServerShutdown {
+                    reason: Some("bye".to_string()),
+                },
+            ),
+            (
+                "Notify",
+                ServerMessage::Notify {
+                    kind: NotifyKind::Toast,
+                    message: "hi".to_string(),
+                    body: None,
+                },
+            ),
+            (
+                "Clipboard",
+                ServerMessage::Clipboard {
+                    data: "Zm9v".to_string(),
+                },
+            ),
+            ("ReloadSoundConfig", ServerMessage::ReloadSoundConfig),
+            (
+                "MouseCapture",
+                ServerMessage::MouseCapture { enabled: true },
+            ),
+            (
+                "SwitchServer",
+                ServerMessage::SwitchServer {
+                    ssh_target: "lars@sage".to_string(),
+                    fleet: None,
+                    focus_workspace: None,
+                },
+            ),
+        ]
+    }
+
+    // Compile-time coverage: a new/removed/renamed variant breaks these
+    // matches, forcing the golden sample (and a PROTOCOL_VERSION bump) to be
+    // updated. Field changes are caught by `wire_shape_is_pinned` instead.
+    #[allow(dead_code)]
+    fn _client_message_wire_coverage(message: &ClientMessage) {
+        match message {
+            ClientMessage::Hello { .. } => {}
+            ClientMessage::Input { .. } => {}
+            ClientMessage::ClipboardImage { .. } => {}
+            ClientMessage::Resize { .. } => {}
+            ClientMessage::Detach => {}
+            ClientMessage::AttachTerminal { .. } => {}
+            ClientMessage::AttachScroll { .. } => {}
+            ClientMessage::SetFrameSubscription { .. } => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn _server_message_wire_coverage(message: &ServerMessage) {
+        match message {
+            ServerMessage::Welcome { .. } => {}
+            ServerMessage::Frame(_) => {}
+            ServerMessage::Terminal(_) => {}
+            ServerMessage::Graphics { .. } => {}
+            ServerMessage::ServerShutdown { .. } => {}
+            ServerMessage::Notify { .. } => {}
+            ServerMessage::Clipboard { .. } => {}
+            ServerMessage::ReloadSoundConfig => {}
+            ServerMessage::MouseCapture { .. } => {}
+            ServerMessage::SwitchServer { .. } => {}
+        }
+    }
+
+    #[test]
+    fn wire_shape_is_pinned() {
+        assert_eq!(
+            PROTOCOL_VERSION, PINNED_PROTOCOL_VERSION,
+            "PROTOCOL_VERSION changed: if the wire shape changed on purpose, \
+             refresh the golden table in this test and set \
+             PINNED_PROTOCOL_VERSION = {PROTOCOL_VERSION}"
+        );
+
+        let cfg = bincode::config::standard();
+        let mut actual: Vec<(&str, u64)> = Vec::new();
+        for (name, message) in golden_client_messages() {
+            let bytes =
+                bincode::serde::encode_to_vec(&message, cfg).expect("encode client message");
+            actual.push((name, fnv1a(&bytes)));
+        }
+        for (name, message) in golden_server_messages() {
+            let bytes =
+                bincode::serde::encode_to_vec(&message, cfg).expect("encode server message");
+            actual.push((name, fnv1a(&bytes)));
+        }
+
+        const GOLDEN: &[(&str, u64)] = &[
+            ("Hello", 0xd9ad8d15121df7a9),
+            ("Input", 0xaf5ac0c7a59b7a93),
+            ("ClipboardImage", 0x561fa2e7cbfcd36c),
+            ("Resize", 0xc9b67e4613a1c8f6),
+            ("Detach", 0xaf63b94c8601b113),
+            ("AttachTerminal", 0x26a01cb06779cd57),
+            ("AttachScroll", 0x914009b2bc7c845d),
+            ("SetFrameSubscription", 0x08285707b4e2c825),
+            ("Welcome", 0x9fe7da7f3bae2e99),
+            ("Frame", 0xb2389e8a64b397cc),
+            ("Terminal", 0x3b9726512f3c77d7),
+            ("Graphics", 0xdbd09087ea36b2f3),
+            ("ServerShutdown", 0xbc3315fc310ae6bd),
+            ("Notify", 0xaefb5516180754d8),
+            ("Clipboard", 0x40c41ce0c93f16c9),
+            ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
+            ("MouseCapture", 0x084db707b5028782),
+            ("SwitchServer", 0x1eafec6cccfe521d),
+        ];
+
+        if actual.as_slice() != GOLDEN {
+            let mut rendered = String::from("\nwire shape changed — refreshed GOLDEN table:\n");
+            for (name, checksum) in &actual {
+                rendered.push_str(&format!("            (\"{name}\", {checksum:#018x}),\n"));
+            }
+            panic!(
+                "{rendered}\nIf this change is intentional: bump PROTOCOL_VERSION, set \
+                 PINNED_PROTOCOL_VERSION to match, and paste the table above into GOLDEN."
+            );
         }
     }
 
