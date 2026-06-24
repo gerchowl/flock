@@ -2136,6 +2136,19 @@ fn peer_server_rows(
             Style::default().fg(color),
         ));
     }
+    // Protocol-skew badge (#58): a reachable peer on a different wire protocol
+    // can't be `--remote`-attached until both ends run the same build. Surface
+    // it here — the gossiped `protocol` makes the mismatch visible before the
+    // user even tries to switch. `None` (pre-#58 peer / not yet polled) stays
+    // silent; only a known, differing protocol badges.
+    if let Some(proto) = peer.protocol {
+        if proto != crate::protocol::PROTOCOL_VERSION {
+            title_rest.push(Span::styled(
+                format!("\u{f0026} p{proto}"), // nf-md-alert
+                Style::default().fg(p.red),
+            ));
+        }
+    }
 
     let mut health: Vec<Span<'static>> = Vec::new();
     if let Some(system) = peer.system.as_ref() {
@@ -3459,6 +3472,41 @@ mod tests {
         assert!(!health.contains('\u{2776}'), "{health}");
         assert_eq!(row.tally, Some(tally_states([StateClass::Working])));
         assert!(!health.contains("anvil"), "{health}");
+    }
+
+    #[test]
+    fn peer_server_rows_badges_protocol_skew() {
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.host = Some("anvil".into());
+        peer.latency_ms = Some(10);
+
+        // A reachable peer on a DIFFERENT wire protocol gets the alert badge
+        // naming its protocol (#58).
+        let skewed = crate::protocol::PROTOCOL_VERSION - 1;
+        peer.protocol = Some(skewed);
+        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        assert!(rest.contains('\u{f0026}'), "expected alert glyph: {rest}");
+        assert!(
+            rest.contains(&format!("p{skewed}")),
+            "expected protocol: {rest}"
+        );
+
+        // Same protocol → no badge.
+        peer.protocol = Some(crate::protocol::PROTOCOL_VERSION);
+        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        assert!(
+            !rest.contains('\u{f0026}'),
+            "matching protocol must not badge: {rest}"
+        );
+
+        // Unknown protocol (pre-#58 peer / not yet polled) → no badge.
+        peer.protocol = None;
+        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        assert!(
+            !rest.contains('\u{f0026}'),
+            "unknown protocol must not badge: {rest}"
+        );
     }
 
     #[test]

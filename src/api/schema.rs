@@ -863,6 +863,10 @@ pub enum ResponseResult {
         /// flock version string of the answering server (spot un-deployed peers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
+        /// Wire protocol of the answering server (#58) — lets the poller flag
+        /// protocol skew, the mismatch that actually blocks `--remote`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<u32>,
         /// Machine health snapshot, piggybacked from the peer's existing
         /// status-line sampler (no extra sampling cost).
         #[serde(default, skip_serializing_if = "Option::is_none")]

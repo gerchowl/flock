@@ -3723,6 +3723,7 @@ mod tests {
                 ssh_target: "lars@anvil".to_string(),
                 host: Some("anvil".to_string()),
                 version: None,
+                protocol: None,
                 system: None,
                 latency_ms: Some(21),
                 workspaces: Vec::new(),

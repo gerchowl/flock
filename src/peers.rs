@@ -30,6 +30,8 @@ pub struct PeerSummaryState {
     pub host: Option<String>,
     /// flock version the peer reported (spot un-deployed peers).
     pub version: Option<String>,
+    /// Wire protocol the peer reported (#58) — drives the sidebar skew badge.
+    pub protocol: Option<u32>,
     /// Machine health snapshot from the last successful poll.
     pub system: Option<crate::api::schema::PeerSystemSummary>,
     /// Round-trip latency of the last successful summary poll.
@@ -47,6 +49,7 @@ impl PeerSummaryState {
             ssh_target: config.ssh_target().to_string(),
             host: None,
             version: None,
+            protocol: None,
             system: None,
             latency_ms: None,
             workspaces: Vec::new(),
@@ -151,6 +154,7 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         ssh_target: peer.ssh_target.clone(),
         host: peer.host.clone(),
         version: peer.version.clone(),
+        protocol: peer.protocol,
         system: peer.system.clone().map(Into::into),
         latency_ms: peer.latency_ms,
         workspaces: peer.workspaces.iter().cloned().map(Into::into).collect(),
@@ -168,6 +172,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         ssh_target: peer.ssh_target,
         host: peer.host,
         version: peer.version,
+        protocol: peer.protocol,
         system: peer.system.map(Into::into),
         latency_ms: peer.latency_ms,
         workspaces: peer.workspaces.into_iter().map(Into::into).collect(),
@@ -183,6 +188,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
 pub struct PeerSummaryPayload {
     pub host: String,
     pub version: Option<String>,
+    pub protocol: Option<u32>,
     pub system: Option<crate::api::schema::PeerSystemSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
@@ -352,6 +358,10 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .get("version")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let protocol = result
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok());
     let system = result
         .get("system")
         .filter(|system| !system.is_null())
@@ -369,6 +379,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
     Ok(PeerSummaryPayload {
         host,
         version,
+        protocol,
         system,
         workspaces,
         latency_ms,
@@ -384,6 +395,7 @@ mod tests {
             ssh_target: name.to_string(),
             host: None,
             version: None,
+            protocol: None,
             system: None,
             latency_ms: None,
             workspaces: Vec::new(),
@@ -426,6 +438,7 @@ mod tests {
             ssh_target: ssh_target.to_string(),
             host: Some(format!("{name}-host")),
             version: Some("0.9.0".to_string()),
+            protocol: None,
             system: Some(crate::api::schema::PeerSystemSummary {
                 cpu_percent: Some(42),
                 mem_used: Some(13 << 30),

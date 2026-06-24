@@ -185,6 +185,7 @@ impl App {
                 Ok(payload) => {
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
+                    summary.protocol = payload.protocol;
                     summary.system = payload.system;
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
@@ -999,6 +1000,7 @@ mod tests {
                 result: Ok(crate::peers::PeerSummaryPayload {
                     host: "anvil-host".into(),
                     version: Some("0.6.8".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
                     system: Some(crate::api::schema::PeerSystemSummary {
                         cpu_percent: Some(71),
                         mem_used: Some(48_000_000_000),
