@@ -61,6 +61,7 @@ pub(super) fn has_working_chrome(content: &str) -> bool {
         || above_lower.contains("ctrl+c to interrupt")
         || has_running_status_line(above)
         || has_spinner_activity(above)
+        || has_background_shell_footer(content)
 }
 
 pub(super) fn is_transcript_viewer(content: &str) -> bool {
@@ -186,6 +187,41 @@ fn is_still_running_status_line(line: &str) -> bool {
     }
 
     false
+}
+
+/// Claude's bottom status bar carries a background-task counter — e.g.
+/// `⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage` — that PERSISTS
+/// below the prompt box after the transient "N shell still running" activity
+/// line has scrolled off. `has_running_status_line` only inspects the line
+/// ABOVE the prompt box, so that footer-only state read as idle (#47). Detect a
+/// footer shell/agent counter (> 0) here, gated on the `↓ to manage` affordance
+/// Claude only renders when background tasks exist — so a stray "1 shell"
+/// elsewhere (e.g. the agent-picker hint) can't trip it.
+fn has_background_shell_footer(content: &str) -> bool {
+    bottom_non_empty_lines(content, 5).iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("to manage") && footer_background_task_count(&lower) > 0
+    })
+}
+
+/// Count of background shells/agents named in a footer line: `N shell(s)` or
+/// `N agent(s)` immediately after a number. The nav hint `← for agents` has no
+/// leading number, so it never contributes.
+fn footer_background_task_count(lower_line: &str) -> u32 {
+    let words: Vec<&str> = lower_line.split_whitespace().collect();
+    let mut total = 0;
+    for (index, word) in words.iter().enumerate() {
+        let Ok(count) = word.parse::<u32>() else {
+            continue;
+        };
+        let next = words
+            .get(index + 1)
+            .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()));
+        if matches!(next, Some("shell" | "shells" | "agent" | "agents")) {
+            total += count;
+        }
+    }
+    total
 }
 
 fn has_claude_yes_no_choice(content: &str) -> bool {
@@ -371,6 +407,45 @@ mod tests {
     fn lower_agent_picker_shell_count_is_not_working_chrome() {
         let content = prompt_box_below("  ~/P/flock ⎇ master ▱▱▱▱▱ 0%\n  1 shell · ← for agents");
 
+        assert_eq!(detect(&content), AgentState::Idle);
+        assert!(!has_working_chrome(&content));
+    }
+
+    /// A prompt box with `footer` as the bottom status bar BELOW it — the
+    /// real Claude layout (output, prompt box, then the footer/manage bar).
+    fn with_footer(footer: &str) -> String {
+        format!(
+            "● Started the task.\n────────────────────────────────\n❯ \n────────────────────────────────\n{footer}\n"
+        )
+    }
+
+    #[test]
+    fn footer_background_shell_counter_is_working() {
+        // The transient "still running" line is gone; only the persistent
+        // footer counter remains, BELOW the prompt box (#47).
+        let content = with_footer("⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage");
+        assert_eq!(detect(&content), AgentState::Working);
+        assert!(has_working_chrome(&content));
+    }
+
+    #[test]
+    fn footer_background_agents_counter_is_working() {
+        let content = with_footer("⏵⏵ auto mode on · 2 agents · ↓ to manage");
+        assert_eq!(detect(&content), AgentState::Working);
+    }
+
+    #[test]
+    fn footer_without_background_tasks_is_idle() {
+        let content = with_footer("⏵⏵ auto-accept edits on (shift+tab to cycle)");
+        assert_eq!(detect(&content), AgentState::Idle);
+        assert!(!has_working_chrome(&content));
+    }
+
+    #[test]
+    fn footer_manage_hint_with_only_nav_agents_is_idle() {
+        // "← for agents" is a nav hint (no leading count); with no real
+        // shell/agent count the manage line must not read as working.
+        let content = with_footer("⏵⏵ auto mode on · ← for agents · ↓ to manage");
         assert_eq!(detect(&content), AgentState::Idle);
         assert!(!has_working_chrome(&content));
     }
