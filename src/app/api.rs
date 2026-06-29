@@ -186,11 +186,35 @@ impl App {
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
-                    summary.system = payload.system;
+                    // Retain the last-known health when a poll omits the system
+                    // block, rather than blanking cpu/mem until the next good
+                    // poll (#4). Note this is the OPPOSITE policy to `host` above
+                    // (which clears on empty): a momentarily-missing system block
+                    // is more plausibly a transient sampler gap than real, and
+                    // showing slightly-stale cpu/mem beats a blank column. A peer
+                    // that goes fully unreachable still degrades via `error` /
+                    // staleness. `workspaces` stays unconditional — an empty list
+                    // there is meaningful (the peer really has none), so it must
+                    // still clear.
+                    if payload.system.is_some() {
+                        summary.system = payload.system;
+                    }
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
+                    // Per-poll trace so a "peer row looks stale" report is
+                    // diagnosable live (FLOCK_LOG=flock=debug + `flock peers
+                    // logs`): shows exactly what each poll applied (#4, #67).
+                    tracing::debug!(
+                        target: "flock::peers",
+                        peer = %summary.peer,
+                        host = summary.host.as_deref().unwrap_or(""),
+                        has_system = summary.system.is_some(),
+                        workspaces = summary.workspaces.len(),
+                        latency_ms = summary.latency_ms.unwrap_or_default(),
+                        "peer summary applied"
+                    );
                 }
                 Err(error) => summary.error = Some(error),
             }
@@ -1055,6 +1079,88 @@ mod tests {
             },
         ));
         assert_eq!(app.state.peer_summaries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_summary_keeps_last_known_system_when_poll_omits_it() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.peers = vec![crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        }];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let workspaces = |n: usize| -> Vec<crate::api::schema::PeerWorkspaceSummary> {
+            (0..n)
+                .map(|i| crate::api::schema::PeerWorkspaceSummary {
+                    id: format!("ws_{i}"),
+                    workspace: format!("w{i}"),
+                    project_key: None,
+                    project_label: None,
+                    branch: None,
+                    is_linked_worktree: false,
+                    agent: None,
+                    status: crate::api::schema::AgentStatus::Idle,
+                    status_age_secs: None,
+                    activity: None,
+                })
+                .collect()
+        };
+        let sys = |cpu: u8| {
+            Some(crate::api::schema::PeerSystemSummary {
+                cpu_percent: Some(cpu),
+                mem_used: None,
+                mem_total: None,
+                disk_free: None,
+            })
+        };
+        let fetch = |system: Option<crate::api::schema::PeerSystemSummary>,
+                     ws: Vec<crate::api::schema::PeerWorkspaceSummary>| {
+            AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
+                peer: "anvil".into(),
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    host: "anvil-host".into(),
+                    version: None,
+                    protocol: None,
+                    system,
+                    latency_ms: 10,
+                    workspaces: ws,
+                }),
+            })
+        };
+
+        // First poll: full system + 1 workspace.
+        app.handle_internal_event(fetch(sys(71), workspaces(1)));
+        // Second poll omits the system block but reports 2 workspaces.
+        app.handle_internal_event(fetch(None, workspaces(2)));
+        let summary = &app.state.peer_summaries[0];
+        // Health is retained from the last good poll (not blanked, #4)...
+        assert_eq!(
+            summary.system.as_ref().and_then(|s| s.cpu_percent),
+            Some(71)
+        );
+        // ...while workspaces (empty IS meaningful) still track live.
+        assert_eq!(summary.workspaces.len(), 2);
+
+        // A poll that omits system AND has zero workspaces: system is still
+        // retained, but workspaces clears (the guard is system-only).
+        app.handle_internal_event(fetch(None, workspaces(0)));
+        let summary = &app.state.peer_summaries[0];
+        assert_eq!(
+            summary.system.as_ref().and_then(|s| s.cpu_percent),
+            Some(71)
+        );
+        assert!(summary.workspaces.is_empty());
+
+        // A later poll WITH a system block updates it.
+        app.handle_internal_event(fetch(sys(40), workspaces(1)));
+        let summary = &app.state.peer_summaries[0];
+        assert_eq!(
+            summary.system.as_ref().and_then(|s| s.cpu_percent),
+            Some(40)
+        );
+        assert_eq!(summary.workspaces.len(), 1);
     }
 
     #[tokio::test]
