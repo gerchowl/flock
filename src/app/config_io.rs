@@ -219,6 +219,18 @@ impl App {
         }
     }
 
+    pub(super) fn save_idle_setting(
+        &mut self,
+        setting: crate::app::state::IdleSetting,
+        enabled: bool,
+    ) {
+        if self.update_config_file("idle setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.idle", setting.config_key(), enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
     pub(super) fn save_agent_panel_scope(&mut self, scope: crate::app::state::AgentPanelScope) {
         let value = match scope {
             crate::app::state::AgentPanelScope::CurrentWorkspace => {
