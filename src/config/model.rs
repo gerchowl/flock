@@ -544,6 +544,88 @@ impl PeerConfig {
     }
 }
 
+/// Idle animations on the sidebar (#16): the stage-1 grazing sheep and the
+/// stage-2 full screensaver. Every field has a sane default that preserves the
+/// shipped behavior (on), but each is opt-out-able and the thresholds are
+/// tunable — the fork guardrail that no user-visible feature is hardcoded
+/// always-on with no escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct IdleConfig {
+    /// Master switch for ALL idle animations. False disables sheep and
+    /// screensaver regardless of their individual toggles. Default: true.
+    pub enable: bool,
+    /// Stage-1 grazing sheep on the sidebar separator bars. Default: true.
+    pub sheep: bool,
+    /// Stage-2 full-sidebar screensaver after a long idle. Default: true.
+    pub screensaver: bool,
+    /// Seconds of inactivity before the sheep wander in. Default: 20.
+    pub idle_after_secs: u64,
+    /// Seconds of inactivity before the stage-2 screensaver. Default: 1200 (20 min).
+    pub screensaver_after_secs: u64,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        // Defaults mirror the sim's built-in thresholds so there's one source of
+        // truth and the shipped behavior is preserved when the keys are unset.
+        Self {
+            enable: true,
+            sheep: true,
+            screensaver: true,
+            idle_after_secs: crate::ui::sheep::IDLE_THRESHOLD.as_secs(),
+            screensaver_after_secs: crate::ui::screensaver::SCREENSAVER_THRESHOLD.as_secs(),
+        }
+    }
+}
+
+impl IdleConfig {
+    /// Stage-1 sheep show only when the master switch AND the sheep toggle are on.
+    pub fn sheep_enabled(&self) -> bool {
+        self.enable && self.sheep
+    }
+
+    /// Stage-2 screensaver shows only when the master switch AND its toggle are on.
+    pub fn screensaver_enabled(&self) -> bool {
+        self.enable && self.screensaver
+    }
+
+    pub fn idle_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_after_secs)
+    }
+
+    pub fn screensaver_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.screensaver_after_secs)
+    }
+
+    /// The earliest ENABLED idle stage's threshold, or `None` when idle
+    /// animations are off — drives the wake that starts an idle animation so the
+    /// loop isn't scheduled for a stage that will never render (#16).
+    pub fn next_idle_wake_after(&self) -> Option<std::time::Duration> {
+        if self.sheep_enabled() {
+            Some(self.idle_after())
+        } else if self.screensaver_enabled() {
+            Some(self.screensaver_after())
+        } else {
+            None
+        }
+    }
+
+    /// Config diagnostics surfaced via the standard config-diagnostic path: the
+    /// stage-2 screensaver must come no earlier than the stage-1 sheep, else the
+    /// two-stage idle sequence is incoherent.
+    pub fn diagnostics(&self) -> Vec<String> {
+        if self.screensaver_after_secs < self.idle_after_secs {
+            vec![format!(
+                "[ui.idle] screensaver_after_secs ({}) is less than idle_after_secs ({}); the screensaver would precede the sheep",
+                self.screensaver_after_secs, self.idle_after_secs
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -616,6 +698,8 @@ pub struct UiConfig {
     pub toast: ToastConfig,
     /// Play sounds when agents change state in background workspaces.
     pub sound: SoundConfig,
+    /// Idle sidebar animations (grazing sheep + screensaver): opt-out + thresholds.
+    pub idle: IdleConfig,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -860,6 +944,7 @@ impl Default for UiConfig {
             accent: "cyan".into(),
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
+            idle: IdleConfig::default(),
         }
     }
 }
@@ -990,6 +1075,89 @@ shell_mode = "non_login"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.terminal.default_shell, "nu");
         assert_eq!(config.terminal.shell_mode, ShellModeConfig::NonLogin);
+    }
+
+    #[test]
+    fn idle_config_defaults_on_and_parses_toggles() {
+        let default_config = Config::default();
+        let idle = default_config.ui.idle;
+        assert!(idle.enable && idle.sheep && idle.screensaver);
+        assert!(idle.sheep_enabled() && idle.screensaver_enabled());
+        // Defaults mirror the sim thresholds.
+        assert_eq!(idle.idle_after(), crate::ui::sheep::IDLE_THRESHOLD);
+        assert_eq!(
+            idle.screensaver_after(),
+            crate::ui::screensaver::SCREENSAVER_THRESHOLD
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[ui.idle]
+enable = true
+sheep = false
+screensaver = false
+idle_after_secs = 5
+screensaver_after_secs = 600
+"#,
+        )
+        .unwrap();
+        let idle = config.ui.idle;
+        // Master on but both sub-toggles off → neither animates.
+        assert!(!idle.sheep_enabled() && !idle.screensaver_enabled());
+        assert_eq!(idle.idle_after_secs, 5);
+        assert_eq!(idle.screensaver_after_secs, 600);
+    }
+
+    #[test]
+    fn idle_next_wake_after_picks_earliest_enabled_stage() {
+        let mut idle = IdleConfig::default();
+        // Sheep on → wake at the (earlier) sheep threshold.
+        assert_eq!(idle.next_idle_wake_after(), Some(idle.idle_after()));
+        // Sheep off, screensaver on → wake at the screensaver threshold.
+        idle.sheep = false;
+        assert_eq!(idle.next_idle_wake_after(), Some(idle.screensaver_after()));
+        // Both stages off → never wake for an idle animation.
+        idle.screensaver = false;
+        assert_eq!(idle.next_idle_wake_after(), None);
+        // Master off overrides the sub-toggles.
+        idle.sheep = true;
+        idle.screensaver = true;
+        idle.enable = false;
+        assert_eq!(idle.next_idle_wake_after(), None);
+    }
+
+    #[test]
+    fn idle_config_master_switch_overrides_sub_toggles() {
+        let config: Config = toml::from_str(
+            r#"
+[ui.idle]
+enable = false
+sheep = true
+screensaver = true
+"#,
+        )
+        .unwrap();
+        assert!(!config.ui.idle.sheep_enabled());
+        assert!(!config.ui.idle.screensaver_enabled());
+    }
+
+    #[test]
+    fn idle_config_flags_screensaver_before_sheep() {
+        let bad: Config = toml::from_str(
+            r#"
+[ui.idle]
+idle_after_secs = 60
+screensaver_after_secs = 10
+"#,
+        )
+        .unwrap();
+        let diags = bad.collect_diagnostics();
+        assert!(
+            diags.iter().any(|d| d.contains("screensaver_after_secs")),
+            "{diags:?}"
+        );
+        // Sane ordering produces no diagnostic.
+        assert!(Config::default().collect_diagnostics().is_empty());
     }
 
     #[test]

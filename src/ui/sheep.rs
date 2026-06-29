@@ -66,10 +66,13 @@ pub enum FlockPhase {
 }
 
 /// Resolve the flock phase from interaction timing, or `None` when active.
+/// `idle_after` is the configured idle threshold ([`IDLE_THRESHOLD`] by default,
+/// #16) — the grazing flock wanders in once the user has been idle that long.
 pub fn flock_phase(
     last_interaction: Instant,
     flee_until: Option<Instant>,
     now: Instant,
+    idle_after: Duration,
 ) -> Option<FlockPhase> {
     if let Some(until) = flee_until {
         if now < until {
@@ -78,7 +81,7 @@ pub fn flock_phase(
             return Some(FlockPhase::Fleeing(progress));
         }
     }
-    (now.duration_since(last_interaction) >= IDLE_THRESHOLD).then_some(FlockPhase::Grazing)
+    (now.duration_since(last_interaction) >= idle_after).then_some(FlockPhase::Grazing)
 }
 
 fn grass_glyph(height: f32) -> Option<&'static str> {
@@ -508,12 +511,18 @@ mod tests {
     #[test]
     fn phase_transitions() {
         let now = Instant::now();
-        assert_eq!(flock_phase(now - Duration::from_secs(3), None, now), None);
+        assert_eq!(
+            flock_phase(now - Duration::from_secs(3), None, now, IDLE_THRESHOLD),
+            None
+        );
         let stale = now - (IDLE_THRESHOLD + Duration::from_secs(1));
-        assert_eq!(flock_phase(stale, None, now), Some(FlockPhase::Grazing));
+        assert_eq!(
+            flock_phase(stale, None, now, IDLE_THRESHOLD),
+            Some(FlockPhase::Grazing)
+        );
         let until = now + FLEE_DURATION / 2;
         assert!(matches!(
-            flock_phase(stale, Some(until), now),
+            flock_phase(stale, Some(until), now, IDLE_THRESHOLD),
             Some(FlockPhase::Fleeing(_))
         ));
     }

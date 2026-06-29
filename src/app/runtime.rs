@@ -307,12 +307,15 @@ impl App {
         if self.agent_panel_has_animation() || flock_on_screen {
             self.next_animation_tick.get_or_insert(now + interval);
         } else if self.has_foreground_viewer {
-            // Nothing animating yet, but the flock wanders in at the idle
-            // threshold — wake the loop then so it can start grazing.
+            // Nothing animating yet, but an idle stage may wander in — wake the
+            // loop at the earliest ENABLED threshold so it can start. None when
+            // idle animations are disabled via `[ui.idle]` (#16), so the loop
+            // isn't woken for an animation that will never render.
             self.next_animation_tick = self
                 .state
-                .last_interaction
-                .checked_add(crate::ui::sheep::IDLE_THRESHOLD)
+                .idle
+                .next_idle_wake_after()
+                .and_then(|after| self.state.last_interaction.checked_add(after))
                 .filter(|due| *due > now);
         } else {
             self.next_animation_tick = None;

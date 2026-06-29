@@ -69,10 +69,13 @@ pub enum ScreensaverPhase {
 
 /// Resolve the screensaver phase from interaction timing, or `None` when the
 /// user is active (or only idle enough for stage-1 bar grazing).
+/// `screensaver_after` is the configured stage-2 threshold ([`SCREENSAVER_THRESHOLD`]
+/// by default, #16).
 pub fn phase(
     last_interaction: Instant,
     wipe_until: Option<Instant>,
     now: Instant,
+    screensaver_after: Duration,
 ) -> Option<ScreensaverPhase> {
     if let Some(until) = wipe_until {
         if now < until {
@@ -81,8 +84,7 @@ pub fn phase(
             return Some(ScreensaverPhase::Wiping(progress));
         }
     }
-    (now.duration_since(last_interaction) >= SCREENSAVER_THRESHOLD)
-        .then_some(ScreensaverPhase::Active)
+    (now.duration_since(last_interaction) >= screensaver_after).then_some(ScreensaverPhase::Active)
 }
 
 fn grass_glyph(height: f32) -> Option<&'static str> {
@@ -581,12 +583,23 @@ mod tests {
     #[test]
     fn phase_transitions() {
         let now = Instant::now();
-        assert_eq!(phase(now - Duration::from_secs(3), None, now), None);
+        assert_eq!(
+            phase(
+                now - Duration::from_secs(3),
+                None,
+                now,
+                SCREENSAVER_THRESHOLD
+            ),
+            None
+        );
         let stale = now - (SCREENSAVER_THRESHOLD + Duration::from_secs(1));
-        assert_eq!(phase(stale, None, now), Some(ScreensaverPhase::Active));
+        assert_eq!(
+            phase(stale, None, now, SCREENSAVER_THRESHOLD),
+            Some(ScreensaverPhase::Active)
+        );
         let until = now + WIPE_DURATION / 2;
         assert!(matches!(
-            phase(stale, Some(until), now),
+            phase(stale, Some(until), now, SCREENSAVER_THRESHOLD),
             Some(ScreensaverPhase::Wiping(_))
         ));
     }
