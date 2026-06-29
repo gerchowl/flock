@@ -288,9 +288,46 @@ fn agent_panel_entries_with_runtimes(
             // server switch its workspace row would. The server filter is
             // honored: `Local` hides remote rows, `Peer` keeps only that peer.
             entries.extend(remote_agent_panel_entries(app));
+            // Fleet-stable order (#62), mirroring the spaces-list (#85) and
+            // servers-band (#51) sorts: without it the panel concatenates
+            // locals (in `workspaces` storage order) ahead of remotes (in
+            // peer-config order), so the SAME agent jumps position — and
+            // local/remote section — depending on which server you view from.
+            // Re-key on machine-independent identity instead.
+            entries.sort_by_cached_key(agent_panel_sort_key);
             entries
         }
     }
+}
+
+/// Machine-independent sort key for an agents-panel row so the list reads the
+/// (near-)same on every fleet server (#62). Group by project identity (origin-
+/// derived, shared fleet-wide), then the workspace/branch target, then the host
+/// label as a best-effort final discriminator. The (project, target) prefix is
+/// what carries cross-viewer stability and is almost always unique per row;
+/// `server` only tie-breaks two otherwise-identical rows (same repo+branch on
+/// two machines). Note `server` is NOT perfectly viewer-invariant: a local row
+/// uses this host's `local_server_name()` while the same agent seen remotely
+/// uses the viewer's configured `[[peers]].name` for that host — they match only
+/// when peers are named after their hostnames (the common case), so divergence
+/// is possible but confined to that rare tie-break.
+///
+/// Deliberately NOT keyed on the agent label or pane id: the sort is stable, so
+/// multiple panes of one workspace keep their natural tab/pane order (itself
+/// host-independent) instead of being alphabetized by agent — mirroring the
+/// spaces list's `(key, idx)` sort. ASCII-lowercased (not Unicode) to match the
+/// other sidebar sorts; a non-ASCII label sorts by code point, which is fine for
+/// the typical repo/branch alphabet.
+fn agent_panel_sort_key(entry: &AgentPanelEntry) -> (String, String, String) {
+    (
+        entry
+            .project
+            .clone()
+            .unwrap_or_else(|| entry.primary_label.clone())
+            .to_ascii_lowercase(),
+        entry.target.to_ascii_lowercase(),
+        entry.server.to_ascii_lowercase(),
+    )
 }
 
 /// Remote agent rows for the all-scope agents panel: one per peer workspace
@@ -5318,6 +5355,52 @@ mod tests {
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "bridge");
         assert_eq!(entries[0].agent_label.as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_interleaves_local_and_remote_by_identity() {
+        // A local workspace whose identity ("mmm") sorts BETWEEN the two
+        // remote ones ("aaa" / "zzz"). Build the panel twice, differing only
+        // in which peer is configured first, and assert the rows come out in
+        // the same identity order both times — and that the local row is
+        // INTERLEAVED by identity rather than forced ahead of the remotes
+        // (the bug: it always led, so an agent jumped section per viewer). This
+        // proves order is independent of the local-vs-remote split and of
+        // peer-config order; the full local-on-A/remote-on-B invariant isn't
+        // unit-testable here because `short_host_name()` caches in a OnceLock.
+        let order_with = |aaa_first: bool| {
+            let mut app = crate::app::state::AppState::test_new();
+            let local = Workspace::test_new("mmm");
+            let pane = local.tabs[0].root_pane;
+            app.workspaces = vec![local];
+            app.ensure_test_terminals();
+            let tid = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
+            app.active = Some(0);
+            app.selected = 0;
+            app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+            app.server_filter = None;
+
+            let aaa = peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
+            let zzz = peer_with_workspaces("sage", vec![remote_summary("zzz", None, None, None)]);
+            app.peer_summaries = if aaa_first {
+                vec![aaa, zzz]
+            } else {
+                vec![zzz, aaa]
+            };
+
+            agent_panel_entries(&app)
+                .into_iter()
+                .map(|e| e.primary_label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(order_with(true), vec!["aaa", "mmm", "zzz"]);
+        // Same order even though the peers were configured in the reverse
+        // order — proof the sort is keyed on identity, not collection order.
+        assert_eq!(order_with(false), vec!["aaa", "mmm", "zzz"]);
     }
 
     #[test]
