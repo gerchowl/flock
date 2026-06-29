@@ -312,6 +312,15 @@ fn load_live_config_from_table(
         }
     }
 
+    if let Some(value) = table.get("name") {
+        match value.clone().try_into::<String>() {
+            Ok(name) => config.name = name,
+            Err(err) => diagnostics.push(format!(
+                "invalid name setting: {err}; keeping current node name"
+            )),
+        }
+    }
+
     load_live_section(
         &table,
         "theme",
@@ -738,6 +747,32 @@ resume_agents_on_restore = true
         assert!(loaded.config.session.resume_agents_on_restore);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_reads_top_level_node_name() {
+        let loaded = load_live_config_from_str("name = \"mba22\"\n").unwrap();
+        assert_eq!(loaded.config.name, "mba22");
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn overlay_can_set_node_name_when_base_omits_it() {
+        // The centrally-managed-box case (#42): the base config.toml is a
+        // read-only symlink with no `name`, and the user sets it in the
+        // writable config.local.toml overlay. It must take effect.
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-overlay-node-name");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
+        std::fs::write(&overlay, "name = \"ksb\"\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
+        assert_eq!(loaded.config.name, "ksb");
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]

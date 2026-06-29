@@ -300,6 +300,13 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Friendly display name for THIS node (#42), shown on the local status
+    /// line, self server row, and reported to peers — overriding the OS
+    /// `gethostname()`. Empty falls back to the OS host name. Useful on
+    /// centrally-managed boxes whose hostname is an opaque asset tag. The peer
+    /// side already honors `[[peers]].name` (#63); this fixes a node's view of
+    /// its OWN identity.
+    pub name: String,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
@@ -945,6 +952,15 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_name_defaults_empty_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.name.is_empty());
+
+        let config: Config = toml::from_str(r#"name = "mba22""#).unwrap();
+        assert_eq!(config.name, "mba22");
+    }
 
     #[test]
     fn update_channel_defaults_stable_and_parses() {

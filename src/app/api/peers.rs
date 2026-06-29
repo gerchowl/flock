@@ -286,6 +286,13 @@ fn compute_short_host_name() -> String {
             return name.to_string();
         }
     }
+    // The `name` set in config.toml is this node's intended identity (#42), so
+    // it overrides gethostname()/LocalHostName — only the explicit env pin above
+    // wins. Read once (short_host_name caches), so a changed name takes effect
+    // on restart, matching how the OS host name is treated as fixed per-process.
+    if let Some(name) = configured_node_name() {
+        return name;
+    }
     #[cfg(target_os = "macos")]
     if let Some(name) = macos_local_host_name() {
         return name;
@@ -293,6 +300,17 @@ fn compute_short_host_name() -> String {
     sysinfo::System::host_name()
         .map(|h| h.split('.').next().unwrap_or(&h).to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The `name` from config.toml, if set — the node's friendly self-label (#42).
+/// Uses the overlay-aware load so a `name` set in `config.local.toml` works for
+/// nix/HM users whose base `config.toml` is a read-only symlink (the exact
+/// centrally-managed-box population this targets). A broken config falls back to
+/// the OS host name rather than failing hostname resolution.
+fn configured_node_name() -> Option<String> {
+    let name = crate::config::load_live_config().ok()?.config.name;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(target_os = "macos")]

@@ -69,6 +69,12 @@ fn init_logging() {
 const DEFAULT_CONFIG: &str = r##"# flock configuration
 # Place this file at ~/.config/flock/config.toml
 
+# Friendly display name for this node, shown on the status line / self row and
+# reported to peers. Overrides the OS hostname — handy on centrally-managed
+# boxes whose hostname is an opaque asset tag. Unset falls back to gethostname().
+# (Peers honor their own [[peers]].name; this sets a node's view of itself.)
+# name = "mba22"
+
 # Show first-run notification setup on startup.
 # Missing also shows onboarding; set false after you've chosen.
 # onboarding = true
