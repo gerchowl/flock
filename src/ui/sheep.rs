@@ -37,8 +37,8 @@ const MAX_GRASS: f32 = 2.0;
 const SPROUT_AT: f32 = 0.5; // height at which bare ground shows a sprout
 const RIPE: f32 = 1.4; // a sheep only commits to grass at least this tall
 const CROPPED: f32 = 0.3; // grass is "eaten" below this
-const WALK: f32 = 3.0; // horizontal cells/sec — deliberately unhurried
-const CLIMB: f32 = 1.6; // vertical rows/sec when arcing around — eased, not snappy
+const WALK: f32 = 1.6; // horizontal cells/sec — deliberately unhurried
+const CLIMB: f32 = 0.9; // vertical rows/sec when arcing around — eased, not snappy
 const BAND: f32 = 2.0; // sheep may stray this many rows above/below their bar
 const EAT: f32 = 0.9; // grass-height/sec while grazing
 const FLEE: f32 = 42.0; // cells/sec bolting off the side
@@ -306,7 +306,13 @@ impl SheepSim {
 
     fn draw(&self, buf: &mut Buffer, palette: &Palette) {
         let grass_style = Style::default().fg(palette.green);
-        let sheep_style = Style::default().add_modifier(Modifier::BOLD);
+        // Set an explicit foreground so the sprite reads as a sheep and not the
+        // grey of the separator line it walks on (which is what it inherits with
+        // no fg of its own). `palette.text` is the theme's high-contrast main-
+        // text token — woolly white on dark themes, legibly dark on light ones.
+        let sheep_style = Style::default()
+            .fg(palette.text)
+            .add_modifier(Modifier::BOLD);
         let (min_y, max_y) = (buf.area().top() as i32, buf.area().bottom() as i32);
         for lane in &self.lanes {
             for t in &lane.tufts {
