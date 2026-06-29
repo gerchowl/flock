@@ -1247,6 +1247,7 @@ fn run_attach_attempt(
 
     debug!(
         target: "flock::attach",
+        side = "client",
         stage = "connect_handshake",
         elapsed_ms = attach_t0.elapsed().as_millis() as u64,
         "attach: connected + handshake complete"
@@ -1412,6 +1413,7 @@ fn run_client_with_mode(
         // hosts that can't reply. Visible with `FLOCK_LOG=flock=debug`.
         debug!(
             target: "flock::attach",
+            side = "client",
             stage = "theme_capture",
             stage_ms = theme_t0.elapsed().as_millis() as u64,
             elapsed_ms = attach_t0.elapsed().as_millis() as u64,
@@ -1893,6 +1895,7 @@ async fn run_client_loop(
                             first_paint_logged = true;
                             debug!(
                                 target: "flock::attach",
+                                side = "client",
                                 stage = "first_paint",
                                 elapsed_ms = attach_t0.elapsed().as_millis() as u64,
                                 "attach: first frame painted"
@@ -1901,6 +1904,7 @@ async fn run_client_loop(
                         if let Some((switch_t0, to, warm)) = switch_timing.take() {
                             debug!(
                                 target: "flock::attach",
+                                side = "client",
                                 stage = "switch",
                                 to = %to,
                                 warm,
