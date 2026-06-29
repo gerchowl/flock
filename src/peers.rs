@@ -307,6 +307,50 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
     run_peer_ssh(peer, &peer.summary_command)
 }
 
+/// Fetch the tail of a peer's session logs over SSH for the cross-host log view
+/// (#67). Mirrors `run_checkout_prepare_command`: a login-shell `flock peers
+/// logs --json` whose envelope we parse. `lines` is a bounded integer we format
+/// ourselves, so nothing user-controlled reaches the remote shell. Blocking; run
+/// off the UI thread.
+pub fn run_logs_command(
+    peer: &PeerConfig,
+    lines: u32,
+) -> Result<Vec<crate::logging::LogLine>, String> {
+    let remote = format!("sh -lc 'flock peers logs --json --lines {lines}'");
+    let stdout = run_peer_ssh(peer, &remote)?;
+    parse_logs_response(&stdout)
+}
+
+/// Parse the `peers logs` response envelope:
+/// `{"id":..,"result":{"type":"peers_logs","host":..,"lines":[..]}}`.
+fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('{'))
+        .ok_or_else(|| "no JSON in logs output".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|err| format!("logs parse error: {err}"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("peer error: {message}"));
+    }
+    let result = value
+        .get("result")
+        .ok_or_else(|| "logs response has no result".to_string())?;
+    let lines: Vec<crate::logging::LogLine> = result
+        .get("lines")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| format!("logs parse error: {err}"))?
+        .unwrap_or_default();
+    Ok(lines)
+}
+
 /// Run one command on a peer over SSH (batch mode, short timeouts), returning
 /// stdout. Shared by the summary poll and the checkout-prepare invocation.
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
@@ -633,6 +677,44 @@ Last login: banner noise
         // Never spawns ssh: the guard rejects shell-unsafe ids before dialing.
         assert!(run_checkout_prepare_command(&peer, "ws_3; rm -rf /", false).is_err());
         assert!(run_checkout_prepare_command(&peer, "", false).is_err());
+    }
+
+    #[test]
+    fn parse_logs_response_reads_lines_and_surfaces_errors() {
+        // Login-shell banner before the envelope, as a real peer would emit.
+        let stdout = r#"
+Last login: banner noise
+{"id":"cli:peers:logs","result":{"type":"peers_logs","host":"anvil","lines":[{"ts":"2026-06-29T00:00:01Z","level":"INFO","target":"flock::app","message":"up","source":"flock-server.log"}]}}
+"#;
+        let lines = parse_logs_response(stdout).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].target, "flock::app");
+        assert_eq!(lines[0].source.as_deref(), Some("flock-server.log"));
+
+        let err = parse_logs_response(r#"{"id":"x","error":{"message":"nope"}}"#).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(parse_logs_response("no json here").is_err());
+    }
+
+    #[test]
+    fn parse_logs_response_round_trips_serialized_log_lines() {
+        // Build the SAME envelope the CLI's print_logs_json emits (a serialized
+        // LogLine inside result.lines) and parse it back — catches any drift
+        // between the producer's serde field names and the consumer.
+        let original = crate::logging::LogLine {
+            ts: "2026-06-29T00:00:01Z".into(),
+            level: "INFO".into(),
+            target: "flock::app::api".into(),
+            message: "ok".into(),
+            source: Some("flock-server.log".into()),
+            host: None,
+        };
+        let envelope = serde_json::json!({
+            "id": "cli:peers:logs",
+            "result": { "type": "peers_logs", "host": "anvil", "lines": [original.clone()] },
+        });
+        let parsed = parse_logs_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed, vec![original]);
     }
 
     #[test]
