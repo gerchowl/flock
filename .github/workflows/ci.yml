@@ -41,7 +41,12 @@ jobs:
         include:
           - os: ubuntu-latest
             nextest_filter: all()
-          - os: macos-latest
+          # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to
+          # the macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt
+          # zig 0.15.2 build can't link against (undefined libSystem symbols like
+          # __availability_version_check). macos-15 is the last image this
+          # toolchain builds on. Revisit when zig gains macOS 26 SDK support.
+          - os: macos-15
             nextest_filter: not binary(live_handoff)
     runs-on: ${{ matrix.os }}
     # Serializing the heavy multi-process PTY suites (see .config/nextest.toml)
