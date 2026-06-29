@@ -56,26 +56,54 @@ fn main() {
         .to_string();
 
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
-    let mut command = Command::new(zig);
-    command
-        .arg("build")
-        .arg("-Demit-lib-vt")
-        .arg(format!("-Doptimize={optimize}"))
-        .arg(format!("-Dsimd={simd}"))
-        .arg(format!("-Dtarget={zig_target}"))
-        .arg(format!("-Dversion-string={version_string}"))
-        .arg("-Demit-xcframework=false");
-    if let Ok(system_dir) = env::var("LIBGHOSTTY_VT_ZIG_SYSTEM_DIR") {
-        command.arg("--system").arg(system_dir);
+    let system_dir = env::var("LIBGHOSTTY_VT_ZIG_SYSTEM_DIR").ok();
+
+    // The vendored zig build is intermittently flaky on CI — notably the
+    // macOS runner throws transient linker "undefined symbol" failures that
+    // pass on a plain re-run (flock#56). Retry a few times, wiping zig's build
+    // cache between attempts in case a partial/corrupt cache is the cause,
+    // before giving up.
+    const ATTEMPTS: u32 = 3;
+    let mut status = None;
+    for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            eprintln!(
+                "libghostty-vt: zig build failed; wiping cache and retrying ({attempt}/{ATTEMPTS})"
+            );
+            for cache in [".zig-cache", "zig-cache", "zig-out"] {
+                let _ = fs::remove_dir_all(vendored_dir.join(cache));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+
+        let mut command = Command::new(&zig);
+        command
+            .arg("build")
+            .arg("-Demit-lib-vt")
+            .arg(format!("-Doptimize={optimize}"))
+            .arg(format!("-Dsimd={simd}"))
+            .arg(format!("-Dtarget={zig_target}"))
+            .arg(format!("-Dversion-string={version_string}"))
+            .arg("-Demit-xcframework=false");
+        if let Some(system_dir) = system_dir.as_ref() {
+            command.arg("--system").arg(system_dir);
+        }
+
+        let result = command
+            .current_dir(&vendored_dir)
+            .status()
+            .expect("failed to execute zig build for vendored libghostty-vt");
+        let success = result.success();
+        status = Some(result);
+        if success {
+            break;
+        }
     }
 
-    let status = command
-        .current_dir(&vendored_dir)
-        .status()
-        .expect("failed to execute zig build for vendored libghostty-vt");
+    let status = status.expect("zig build should have produced a status");
     assert!(
         status.success(),
-        "zig build for vendored libghostty-vt failed: {status}"
+        "zig build for vendored libghostty-vt failed after {ATTEMPTS} attempts: {status}"
     );
 
     let lib_dir = vendored_dir.join("zig-out/lib");
