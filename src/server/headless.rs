@@ -81,6 +81,27 @@ fn rect_fits_frame(rect: Rect, frame: &FrameData) -> bool {
         && rect.y.saturating_add(rect.height) <= frame.height
 }
 
+/// One-shot server-side first-frame attach trace (#43): the first time a frame
+/// is actually queued to a freshly attached client's writer, log the delta from
+/// when the connection was accepted. Pairs with the client's `first_paint`
+/// (`side="client"`) so the attach gap splits into server-produce vs
+/// wire+decode time, and across hosts the two correlate by `client_id` through
+/// `flock peers logs`. Pure observability — visible at `FLOCK_LOG=flock=debug`.
+fn log_first_frame_sent(client_id: u64, client: &mut ClientConnection) {
+    if client.first_frame_sent {
+        return;
+    }
+    client.first_frame_sent = true;
+    debug!(
+        target: "flock::attach",
+        side = "server",
+        stage = "first_frame_sent",
+        client_id,
+        elapsed_ms = client.attached_at.elapsed().as_millis() as u64,
+        "attach: first frame queued to client writer"
+    );
+}
+
 fn apply_terminal_dirty_patch(
     frame: &mut FrameData,
     area: Rect,
@@ -2735,6 +2756,7 @@ impl HeadlessServer {
             Ok(()) => {
                 client.render_pending = false;
                 client.render_state.commit_sent_frame(prepared);
+                log_first_frame_sent(client_id, client);
                 crate::render_prof::event("retained_send.sent");
                 crate::render_prof::duration_since("retained_send.try_send", send_started);
                 true
@@ -3005,6 +3027,7 @@ impl HeadlessServer {
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    log_first_frame_sent(client_id, client);
                     crate::render_prof::event("full_render.sent");
                     crate::render_prof::duration_since("full_render.try_send", send_started);
                 }
@@ -3504,6 +3527,28 @@ mod tests {
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+
+    #[test]
+    fn first_frame_sent_attach_trace_fires_once() {
+        let mut client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        );
+        assert!(!client.first_frame_sent);
+        log_first_frame_sent(7, &mut client);
+        assert!(
+            client.first_frame_sent,
+            "first send flips the one-shot guard"
+        );
+        // Idempotent: a later send leaves it set and does not re-fire.
+        log_first_frame_sent(7, &mut client);
+        assert!(client.first_frame_sent);
+    }
 
     fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();

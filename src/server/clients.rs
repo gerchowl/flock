@@ -59,6 +59,11 @@ pub(crate) struct ClientConnection {
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
+    /// When this connection was accepted (handshake complete) — the baseline for
+    /// the one-shot server-side first-frame attach trace (#43).
+    pub(crate) attached_at: std::time::Instant,
+    /// One-shot guard so the server-side first-frame attach trace fires once.
+    pub(crate) first_frame_sent: bool,
 }
 
 impl ClientConnection {
@@ -116,6 +121,8 @@ impl ClientConnection {
             host_mouse_capture_active: None,
             staged_clipboard_files: Vec::new(),
             writer,
+            attached_at: std::time::Instant::now(),
+            first_frame_sent: false,
         }
     }
 
