@@ -3,7 +3,10 @@ use ratatui::layout::Rect;
 
 use crate::{
     app::{
-        state::{AppState, ExperimentSetting, SettingsSection, SidebarGapSetting, THEME_NAMES},
+        state::{
+            AppState, ExperimentSetting, IdleSetting, SettingsSection, SidebarGapSetting,
+            THEME_NAMES,
+        },
         App, Mode,
     },
     config::ToastDelivery,
@@ -21,7 +24,17 @@ pub(super) enum SettingsAction {
     SaveSidebarPaneGap(u16),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
+    SaveIdleSetting(IdleSetting, bool),
     InstallRecommendedIntegrations,
+}
+
+/// Map an Idle row index to the toggle action that flips it (#16).
+fn idle_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
+    let setting = IdleSetting::ALL.get(idx).copied()?;
+    Some(SettingsAction::SaveIdleSetting(
+        setting,
+        !setting.enabled(state),
+    ))
 }
 
 /// Map a Sidebar row index to the cycle action that steps its value.
@@ -66,6 +79,9 @@ impl App {
                 }
                 SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                     self.save_switch_ascii_input_source_in_prefix(enabled)
+                }
+                SettingsAction::SaveIdleSetting(setting, enabled) => {
+                    self.save_idle_setting(setting, enabled)
                 }
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
@@ -272,6 +288,30 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Idle;
+                state.settings.list.selected = 0;
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
+        SettingsSection::Idle => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.settings.list.move_next(IdleSetting::ALL.len())
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return idle_toggle_action(state, state.settings.list.selected);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::Sidebar;
+                state.settings.list.selected = 0;
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Integrations;
                 state.settings.list.selected = 0;
             }
@@ -312,7 +352,7 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 return Some(SettingsAction::InstallRecommendedIntegrations);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::Sidebar;
+                state.settings.section = SettingsSection::Idle;
                 state.settings.list.selected = 0;
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
@@ -344,6 +384,7 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
         SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
         SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
         SettingsSection::Sidebar => 0,
+        SettingsSection::Idle => 0,
         SettingsSection::Experiments => 0,
         SettingsSection::Integrations => 0,
     };
@@ -442,6 +483,14 @@ impl AppState {
                     None
                 }
             }
+            SettingsSection::Idle => {
+                let list_y = area.y + 3;
+                if row >= list_y && row < list_y + IdleSetting::ALL.len() as u16 {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
             SettingsSection::Experiments => {
                 let list_y = area.y + 3;
                 if row >= list_y && row < list_y + ExperimentSetting::ALL.len() as u16 {
@@ -467,6 +516,7 @@ impl AppState {
                             usize::from(!self.agent_border_labels_enabled())
                         }
                         SettingsSection::Sidebar => 0,
+                        SettingsSection::Idle => 0,
                         SettingsSection::Experiments => 0,
                         SettingsSection::Integrations => 0,
                     });
@@ -492,6 +542,7 @@ impl AppState {
                             Some(SettingsAction::SaveAgentBorderLabels(enabled))
                         }
                         SettingsSection::Sidebar => sidebar_gap_cycle_action(self, idx),
+                        SettingsSection::Idle => idle_toggle_action(self, idx),
                         SettingsSection::Experiments => experiment_toggle_action(self, idx),
                         SettingsSection::Integrations => None,
                     };
@@ -633,6 +684,12 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         );
+        assert_eq!(state.settings.section, SettingsSection::Idle);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
         assert_eq!(state.settings.section, SettingsSection::Integrations);
 
         update_settings_state(
@@ -663,7 +720,45 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
+        assert_eq!(state.settings.section, SettingsSection::Idle);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+        );
         assert_eq!(state.settings.section, SettingsSection::Sidebar);
+    }
+
+    #[test]
+    fn settings_idle_toggles_master_switch_and_sheep() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Idle);
+        assert_eq!(state.settings.list.selected, 0);
+
+        // Master switch defaults on -> Enter returns a disable action (#16).
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveIdleSetting(IdleSetting::Enable, false))
+        );
+
+        // Second row toggles the stage-1 sheep.
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveIdleSetting(IdleSetting::Sheep, false))
+        );
+        assert_eq!(state.mode, Mode::Settings);
     }
 
     #[test]

@@ -1116,6 +1116,7 @@ pub enum SettingsSection {
     Toast,
     PaneLabels,
     Sidebar,
+    Idle,
     Experiments,
     Integrations,
 }
@@ -1127,6 +1128,7 @@ impl SettingsSection {
         Self::Toast,
         Self::PaneLabels,
         Self::Sidebar,
+        Self::Idle,
         Self::Integrations,
         Self::Experiments,
     ];
@@ -1138,8 +1140,49 @@ impl SettingsSection {
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
             Self::Sidebar => "sidebar",
+            Self::Idle => "idle",
             Self::Experiments => "experiments",
             Self::Integrations => "integrations",
+        }
+    }
+}
+
+/// A toggle in the settings pane's Idle section (#16): the idle animations'
+/// master switch and the two stage toggles. Mirrors `ExperimentSetting`. The
+/// numeric thresholds stay config-only (`[ui.idle]`) — a per-second stepper
+/// would be unusable for a 20-minute default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleSetting {
+    Enable,
+    Sheep,
+    Screensaver,
+}
+
+impl IdleSetting {
+    pub(crate) const ALL: [Self; 3] = [Self::Enable, Self::Sheep, Self::Screensaver];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Enable => "idle animations (master switch)",
+            Self::Sheep => "grazing sheep (stage 1)",
+            Self::Screensaver => "screensaver (stage 2)",
+        }
+    }
+
+    /// The `[ui.idle]` key this toggle writes.
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Sheep => "sheep",
+            Self::Screensaver => "screensaver",
+        }
+    }
+
+    pub(crate) fn enabled(self, state: &AppState) -> bool {
+        match self {
+            Self::Enable => state.idle.enable,
+            Self::Sheep => state.idle.sheep,
+            Self::Screensaver => state.idle.screensaver,
         }
     }
 }
