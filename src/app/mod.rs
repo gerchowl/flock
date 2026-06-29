@@ -641,6 +641,7 @@ impl App {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
+            idle: config.ui.idle,
             palette: resolve_palette(config),
             theme_name: config
                 .theme
@@ -1312,6 +1313,7 @@ impl App {
                     crate::config::validated_prompt_float_lines(config.ui.prompt_float_lines);
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
                 self.state.tab_mode = config.ui.tab_mode;
+                self.state.idle = config.ui.idle;
                 self.state.server_state_mark = config.ui.server_state_mark;
                 self.state.pane_header = config.ui.pane_header;
                 self.state.status_line = config.ui.status_line;

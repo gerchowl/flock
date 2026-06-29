@@ -282,6 +282,21 @@ const DEFAULT_CONFIG: &str = r##"# flock configuration
 # [ui.sound.agents]
 # droid = "off"
 
+# Idle sidebar animations: stage-1 grazing sheep on the separator bars, then a
+# stage-2 full screensaver after a long idle. All on by default; each is
+# opt-out-able and the thresholds are tunable.
+[ui.idle]
+# Master switch for all idle animations.
+# enable = true
+# Stage-1 grazing sheep.
+# sheep = true
+# Stage-2 full-sidebar screensaver.
+# screensaver = true
+# Seconds idle before the sheep wander in.
+# idle_after_secs = 20
+# Seconds idle before the screensaver (must be >= idle_after_secs).
+# screensaver_after_secs = 1200
+
 [session]
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Flock server restart. Requires official integrations that report session refs.

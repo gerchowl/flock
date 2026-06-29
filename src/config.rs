@@ -19,10 +19,10 @@ pub use self::{
     },
     model::{
         validated_prompt_float_lines, validated_sidebar_bounds, validated_sidebar_pane_gap,
-        validated_sidebar_row_gap, Config, ConfigReloadReport, ConfigReloadStatus, KeysConfig,
-        NewTerminalCwdConfig, PanelScopeConfig, PeerConfig, ServerStateMarkConfig, ShellModeConfig,
-        TabModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery, ToastFlockPosition,
-        UpdateChannelConfig,
+        validated_sidebar_row_gap, Config, ConfigReloadReport, ConfigReloadStatus, IdleConfig,
+        KeysConfig, NewTerminalCwdConfig, PanelScopeConfig, PeerConfig, ServerStateMarkConfig,
+        ShellModeConfig, TabModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastFlockPosition, UpdateChannelConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
@@ -72,6 +72,7 @@ impl Config {
             .into_iter()
             .chain(keybind_diags)
             .chain(self.ui.sound.diagnostics())
+            .chain(self.ui.idle.diagnostics())
             .collect()
     }
 
