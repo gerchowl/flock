@@ -1057,9 +1057,33 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
             ws_idx: 0,
         })
     }));
-    peers.sort_by_cached_key(|slot| server_slot_sort_key(app, slot));
+    // Sort by machine identity, breaking ties so a locally-polled config peer
+    // sorts before a carried snapshot row for the SAME host (#40) — then dedup
+    // adjacent identical identities, keeping the first (the config peer). A host
+    // advertised both via a carried snapshot and the server's own `[[peers]]`
+    // (multi-hub fleets) must appear ONCE, not twice.
+    peers.sort_by_cached_key(|slot| {
+        (
+            server_slot_sort_key(app, slot),
+            server_slot_source_rank(slot),
+        )
+    });
+    let mut seen = std::collections::HashSet::new();
+    peers.retain(|slot| {
+        let key = server_slot_sort_key(app, slot);
+        key.is_empty() || seen.insert(key)
+    });
     slots.extend(peers);
     slots
+}
+
+/// Dedup tie-break: a locally-polled config peer (fresher) wins over a carried
+/// snapshot row for the same host (#40).
+fn server_slot_source_rank(slot: &Option<crate::app::state::PeerSwitchRequest>) -> u8 {
+    match slot {
+        Some(crate::app::state::PeerSwitchRequest::ConfigPeer { .. }) => 0,
+        _ => 1,
+    }
 }
 
 /// Machine-independent sort key for a peer band row: the host the peer reports
@@ -3156,6 +3180,39 @@ mod tests {
             peer_with_workspaces("beta", vec![]), // host=None → falls back to name
         ];
         assert_eq!(peer_host_sequence(&app), vec!["anvil", "beta"]);
+    }
+
+    #[test]
+    fn server_band_dedups_same_host_keeping_config_peer() {
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        // `anvil` advertised BOTH as a carried snapshot row and a local config
+        // peer (the multi-hub double-count in #40). It must appear once.
+        app.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("anvil-snap", "anvil")],
+        ));
+        app.peer_summaries = vec![peer_named_with_host("anvil-cfg", "anvil")];
+
+        let peer_slots: Vec<PeerSwitchRequest> = server_band_slots(&app)
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                matches!(
+                    s,
+                    PeerSwitchRequest::SnapshotPeer { .. } | PeerSwitchRequest::ConfigPeer { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            peer_slots.len(),
+            1,
+            "same host must appear once: {peer_slots:?}"
+        );
+        assert!(
+            matches!(peer_slots[0], PeerSwitchRequest::ConfigPeer { .. }),
+            "the locally-polled config peer should win the dedup: {peer_slots:?}"
+        );
     }
 
     #[test]
