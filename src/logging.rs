@@ -38,6 +38,114 @@ pub(crate) fn help_log_paths_summary() -> String {
     )
 }
 
+/// The session's log files, in role order. The fixed set `peers logs` is
+/// allowed to read — never an arbitrary path (#67).
+const SESSION_LOG_FILES: [&str; 3] = ["flock.log", "flock-server.log", "flock-client.log"];
+
+/// One parsed tracing line for the cross-host log view (#67). Mirrors the
+/// default `tracing_subscriber::fmt` layout: `<rfc3339-utc>  <LEVEL> <target>:
+/// <message>`. `source`/`host` are filled in as records are tagged with their
+/// origin file and (for merged fleet output) their node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogLine {
+    pub ts: String,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// Parse the text emitted by our `fmt` subscriber back into records. One event
+/// is one line; a line that doesn't start with `<timestamp> <LEVEL> ` is treated
+/// as a continuation of the previous record's message (a `\n` embedded in a
+/// field), so multi-line values are preserved rather than dropped. `source`
+/// tags every record with the file it came from.
+pub fn parse_log_lines(content: &str, source: Option<&str>) -> Vec<LogLine> {
+    let mut records: Vec<LogLine> = Vec::new();
+    for raw in content.lines() {
+        match parse_log_record(raw, source) {
+            Some(record) => records.push(record),
+            None => {
+                if let Some(last) = records.last_mut() {
+                    last.message.push('\n');
+                    last.message.push_str(raw);
+                }
+                // A leading continuation with no prior record is dropped: it's a
+                // partial tail we can't attribute. Rare; our emitters are flat.
+            }
+        }
+    }
+    records
+}
+
+/// Parse a single full-format line, or `None` if it isn't a fresh record.
+fn parse_log_record(line: &str, source: Option<&str>) -> Option<LogLine> {
+    // `<ts>  <LEVEL> <target>: <message>` — timestamp first, then the level
+    // (which our config left-pads), then `target: message`.
+    let (ts, rest) = line.split_once(char::is_whitespace)?;
+    if !looks_like_timestamp(ts) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (level, rest) = rest.split_once(char::is_whitespace)?;
+    if !is_log_level(level) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (target, message) = rest.split_once(": ").unwrap_or((rest, ""));
+    Some(LogLine {
+        ts: ts.to_string(),
+        level: level.to_string(),
+        target: target.to_string(),
+        message: message.to_string(),
+        source: source.map(str::to_string),
+        host: None,
+    })
+}
+
+fn looks_like_timestamp(token: &str) -> bool {
+    // RFC3339 UTC as emitted by the fmt layer, e.g. 2026-06-29T09:33:48.618253Z.
+    token.len() >= 20
+        && token.ends_with('Z')
+        && token.contains('T')
+        && token.starts_with(|c: char| c.is_ascii_digit())
+}
+
+fn is_log_level(token: &str) -> bool {
+    matches!(token, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR")
+}
+
+/// Tail this node's session logs: read each of the fixed log files, parse, tag
+/// by source, merge by timestamp, and return the last `lines` records. RFC3339
+/// UTC timestamps sort correctly lexicographically. Missing files are treated
+/// as empty (a fresh node may not have every role's log yet).
+pub fn tail_session_logs(lines: usize) -> Vec<LogLine> {
+    let dir = crate::session::data_dir();
+    let mut records: Vec<LogLine> = Vec::new();
+    for file in SESSION_LOG_FILES {
+        if let Ok(content) = fs::read_to_string(dir.join(file)) {
+            records.extend(parse_log_lines(&content, Some(file)));
+        }
+    }
+    merge_log_records(records, lines)
+}
+
+/// Stable-sort records by timestamp and keep the last `lines`. Stable so two
+/// events with the same timestamp keep file/arrival order. Relies on every node
+/// emitting RFC3339 UTC at the SAME fixed sub-second precision (one `fmt`
+/// config, fleet-wide) so the byte compare matches chronological order — if the
+/// subscriber's timestamp format ever changes, revisit (`.` < `Z`, so a coarser
+/// `…:01Z` would sort after a finer `…:01.000001Z`).
+pub fn merge_log_records(mut records: Vec<LogLine>, lines: usize) -> Vec<LogLine> {
+    records.sort_by(|a, b| a.ts.cmp(&b.ts));
+    let start = records.len().saturating_sub(lines);
+    records.drain(..start);
+    records
+}
+
 pub(crate) fn startup(role: &'static str) {
     tracing::info!(
         event = "app.startup",
@@ -653,5 +761,73 @@ mod tests {
         assert!(!rotated_log_path(&path, 1).exists());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_log_lines_reads_full_format_records() {
+        let content = "\
+2026-06-29T09:33:48.618253Z  INFO flock::app::api: api request completed id=7
+2026-06-29T09:33:49.001000Z  WARN flock::peers: poll failed err=timeout
+";
+        let records = parse_log_lines(content, Some("flock-server.log"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].ts, "2026-06-29T09:33:48.618253Z");
+        assert_eq!(records[0].level, "INFO");
+        assert_eq!(records[0].target, "flock::app::api");
+        assert_eq!(records[0].message, "api request completed id=7");
+        assert_eq!(records[0].source.as_deref(), Some("flock-server.log"));
+        assert_eq!(records[1].level, "WARN");
+        assert_eq!(records[1].target, "flock::peers");
+    }
+
+    #[test]
+    fn parse_log_lines_folds_continuations_into_prior_message() {
+        // A `\n` embedded in a field is not a fresh record; it must attach to
+        // the previous one rather than be dropped or mis-parsed.
+        let content = "\
+2026-06-29T09:33:48.618253Z ERROR flock::pane: spawn failed
+  caused by: No such file or directory
+2026-06-29T09:33:49.000000Z  INFO flock::app: ok
+";
+        let records = parse_log_lines(content, None);
+        assert_eq!(records.len(), 2);
+        assert!(records[0].message.contains("spawn failed"));
+        assert!(records[0]
+            .message
+            .contains("caused by: No such file or directory"));
+        assert_eq!(records[1].target, "flock::app");
+    }
+
+    #[test]
+    fn parse_log_lines_drops_leading_orphan_continuation() {
+        // A partial tail whose first line is a continuation with no record to
+        // attach to is dropped, not mis-parsed into a bogus record.
+        let content = "  orphaned continuation with no parent\n\
+2026-06-29T09:33:48.618253Z  INFO flock::app: real\n";
+        let records = parse_log_lines(content, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].message, "real");
+    }
+
+    #[test]
+    fn merge_log_records_sorts_by_ts_and_keeps_last_n() {
+        let mk = |ts: &str| LogLine {
+            ts: ts.into(),
+            level: "INFO".into(),
+            target: "t".into(),
+            message: "m".into(),
+            source: None,
+            host: None,
+        };
+        // Out of order across two source files; merge orders by timestamp.
+        let records = vec![
+            mk("2026-06-29T00:00:03Z"),
+            mk("2026-06-29T00:00:01Z"),
+            mk("2026-06-29T00:00:02Z"),
+        ];
+        let merged = merge_log_records(records, 2);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].ts, "2026-06-29T00:00:02Z");
+        assert_eq!(merged[1].ts, "2026-06-29T00:00:03Z");
     }
 }
