@@ -827,6 +827,71 @@ pub struct WorktreeRemoveState {
     pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
 }
 
+/// One worktree's row in the fleet-wide kill sweep (#81).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeKillRow {
+    pub workspace_id: String,
+    /// Display label (workspace name / branch) for the dry-run list.
+    pub label: String,
+    /// The MAIN checkout root (where `git worktree remove` / `git branch -D` run).
+    pub repo_root: std::path::PathBuf,
+    /// This workspace's checkout (== repo_root for a main checkout).
+    pub checkout: std::path::PathBuf,
+    /// Adopted ad hoc (not a flock-managed membership) — labelled distinctly.
+    pub managed: bool,
+    /// The checkout's branch, when on one.
+    pub branch: Option<String>,
+    /// Has uncommitted/untracked changes.
+    pub dirty: bool,
+    /// A pane in this workspace has a working agent (kept so the tier can be
+    /// recomputed when the gate lands without re-probing).
+    pub working_agent: bool,
+    /// None while the merge gate is still resolving (linked rows only); always
+    /// Some for main-checkout rows (which need no gate).
+    pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
+    /// The action tier, recomputed as the gate resolves.
+    pub tier: crate::worktree::KillTier,
+    /// Per-row execution status.
+    pub status: WorktreeKillRowStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WorktreeKillRowStatus {
+    #[default]
+    Pending,
+    Removing,
+    Done,
+    Error(String),
+}
+
+/// State of the fleet-wide kill sweep dialog (#81): the resolved plan plus the
+/// force toggle that opts unmerged-dirty rows into a checkout-only removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeKillAllState {
+    pub rows: Vec<WorktreeKillRow>,
+    /// True once the user confirmed and rows are executing.
+    pub executing: bool,
+    /// Include unmerged-dirty rows (as checkout-only) — the force escalation.
+    pub force_dirty: bool,
+}
+
+impl WorktreeKillAllState {
+    /// True while any linked row's merge gate is still resolving — the confirm
+    /// is held until the whole plan is known (mirrors the single-kill wait).
+    pub fn resolving(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| !row.checkout_is_main() && row.merge_gate.is_none())
+    }
+}
+
+impl WorktreeKillRow {
+    /// A main-checkout row carries its checkout == repo_root and needs no gate.
+    pub fn checkout_is_main(&self) -> bool {
+        self.checkout == self.repo_root
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeOpenEntry {
     pub path: std::path::PathBuf,
@@ -993,6 +1058,7 @@ pub enum Mode {
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
+    ConfirmKillAllWorktrees,
     /// Confirm a cross-machine checkout (#125) after the read-only probe, so the
     /// user sees the host, branch, and any dirty / unpushed warnings before the
     /// branch is pushed to origin and fetched locally.
@@ -1686,6 +1752,9 @@ pub struct AppState {
     pub request_new_linked_worktree: Option<NewLinkedWorktreeRequest>,
     pub request_branch_session: Option<usize>,
     pub request_kill_worktree: Option<usize>,
+    /// Fleet-wide worktree sweep requested (#81): drained on the main loop into
+    /// the batch-confirm dialog.
+    pub request_kill_all_worktrees: bool,
     /// One-shot guard so the attention all-clear chime fires once per
     /// empty-queue episode instead of on every keypress.
     pub attention_all_clear_chimed: bool,
@@ -1751,6 +1820,8 @@ pub struct AppState {
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
+    /// Fleet-wide kill sweep dialog state (#81).
+    pub worktree_kill_all: Option<WorktreeKillAllState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
     pub request_complete_onboarding: bool,
@@ -2286,6 +2357,7 @@ impl AppState {
             request_new_linked_worktree: None,
             request_branch_session: None,
             request_kill_worktree: None,
+            request_kill_all_worktrees: false,
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             action_notice: None,
@@ -2317,6 +2389,7 @@ impl AppState {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            worktree_kill_all: None,
             worktree_directory: std::path::PathBuf::from("/tmp/flock-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
             request_complete_onboarding: false,

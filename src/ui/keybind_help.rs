@@ -120,6 +120,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             keybind_label(&kb.kill_worktree),
             "kill worktree & branch (PR-merged gate)",
         ),
+        help_entry(
+            keybind_label(&kb.kill_all_worktrees),
+            "sweep all worktrees (state-escalated, batch confirm)",
+        ),
         help_entry(keybind_label(&kb.rename_workspace), "rename workspace"),
         help_entry(keybind_label(&kb.close_workspace), "close workspace"),
         help_entry(keybind_label(&kb.previous_workspace), "previous workspace"),

@@ -363,6 +363,12 @@ pub struct KeysConfig {
     /// gate (PR merged / branch merged into the default branch) passes.
     /// Unset by default.
     pub kill_worktree: BindingConfig,
+    /// Sweep ALL worktrees at once (#81): each is handled at the level safe for
+    /// its state — merged ones killed (checkout + branch), unmerged clean ones
+    /// removed checkout-only, the clean+idle main checkout's pane closed, and
+    /// unmerged-dirty / agent-busy ones skipped — behind one batch confirm.
+    /// Unset by default.
+    pub kill_all_worktrees: BindingConfig,
     /// Focus the agent most in need of attention (blocked oldest-first, then
     /// unseen-done). Unset by default.
     pub focus_attention: BindingConfig,
@@ -844,6 +850,7 @@ impl Default for KeysConfig {
             toggle_prompt_expand: BindingConfig::empty(),
             toggle_float: BindingConfig::empty(),
             kill_worktree: BindingConfig::empty(),
+            kill_all_worktrees: BindingConfig::empty(),
             focus_attention: BindingConfig::empty(),
             focus_attention_previous: BindingConfig::empty(),
             focus_attention_project: BindingConfig::empty(),

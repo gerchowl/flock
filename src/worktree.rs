@@ -208,6 +208,107 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
         .filter(|branch| !branch.is_empty())
 }
 
+/// Whether `checkout` has uncommitted or untracked changes. `None` when git
+/// can't be queried — callers treat unknown as "assume dirty" and skip rather
+/// than risk a destructive remove on a guess.
+pub(crate) fn checkout_is_dirty(checkout: &std::path::Path) -> Option<bool> {
+    let path = checkout.to_string_lossy().to_string();
+    run_command_capture("git", &["-C", &path, "status", "--porcelain"], None)
+        .ok()
+        .map(|status| !status.trim().is_empty())
+}
+
+/// What the all-worktrees sweep (#81) does to ONE worktree, decided from its
+/// resolved state. Ordered safest → most aggressive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillTier {
+    /// Main checkout, clean, no running agent: close its flock pane/workspace
+    /// only — nothing is touched on disk.
+    ClosePane,
+    /// Linked worktree whose branch is merged: remove the checkout AND delete
+    /// the local branch. `dirty` flags uncommitted scratch that will be lost
+    /// (the committed work is recorded elsewhere, so it is safe).
+    KillBranch { dirty: bool },
+    /// Linked worktree, not merged, clean: remove the checkout, keep the branch.
+    CheckoutOnly,
+    /// Linked worktree, not merged, with uncommitted/untracked work: skipped on
+    /// the default sweep; only force escalates it to a checkout-only removal.
+    SkipUnmergedDirty,
+    /// Main checkout with uncommitted changes: left alone.
+    SkipMainDirty,
+    /// A running/working agent lives here: never disturbed by the sweep.
+    SkipAgent,
+}
+
+/// The resolved state of one worktree feeding [`classify_kill_tier`] (#81).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillFacts {
+    /// This workspace is the repo's main checkout, not a linked worktree.
+    pub is_main: bool,
+    /// A pane in this workspace has a working agent.
+    pub working_agent: bool,
+    /// The checkout has uncommitted/untracked changes.
+    pub dirty: bool,
+    /// The branch merge gate found positive evidence.
+    pub merged: bool,
+}
+
+/// Map a worktree's resolved facts to its sweep tier (#81). Pure so the tier
+/// policy is exhaustively testable. A running agent wins over everything — the
+/// sweep never disturbs active work, main or linked.
+pub fn classify_kill_tier(facts: KillFacts) -> KillTier {
+    if facts.working_agent {
+        return KillTier::SkipAgent;
+    }
+    if facts.is_main {
+        return if facts.dirty {
+            KillTier::SkipMainDirty
+        } else {
+            KillTier::ClosePane
+        };
+    }
+    if facts.merged {
+        KillTier::KillBranch { dirty: facts.dirty }
+    } else if facts.dirty {
+        KillTier::SkipUnmergedDirty
+    } else {
+        KillTier::CheckoutOnly
+    }
+}
+
+/// The concrete operation the sweep performs on a row this pass (#81).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillAction {
+    /// Close the flock pane/workspace; nothing on disk.
+    ClosePane,
+    /// `git worktree remove` then `git branch -D`. `dirty` ⇒ force-remove.
+    KillBranch { dirty: bool },
+    /// `git worktree remove`, keep the branch.
+    CheckoutOnly,
+    /// Do nothing this pass.
+    Skip,
+}
+
+/// Resolve a tier to the action taken this pass, given whether the user has
+/// engaged `force` (#81). Force only ever ESCALATES the otherwise-skipped
+/// unmerged-dirty rows to a checkout-only removal — it never deletes a branch
+/// without merge evidence, and never touches the protected skips.
+pub fn planned_action(tier: KillTier, force_dirty: bool) -> KillAction {
+    match tier {
+        KillTier::ClosePane => KillAction::ClosePane,
+        KillTier::KillBranch { dirty } => KillAction::KillBranch { dirty },
+        KillTier::CheckoutOnly => KillAction::CheckoutOnly,
+        KillTier::SkipUnmergedDirty => {
+            if force_dirty {
+                KillAction::CheckoutOnly
+            } else {
+                KillAction::Skip
+            }
+        }
+        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+    }
+}
+
 /// What the spoke found (and did) when preparing a branch for a cross-machine
 /// checkout (#125). The spoke runs this on ITS OWN repo; the hub then fetches
 /// the branch from origin — each node touches only its own git (hub-spoke).
@@ -698,6 +799,90 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_kill_tier_covers_every_state() {
+        let facts = |is_main, working_agent, dirty, merged| KillFacts {
+            is_main,
+            working_agent,
+            dirty,
+            merged,
+        };
+
+        // A running agent is protected first, whatever else is true.
+        assert_eq!(
+            classify_kill_tier(facts(false, true, false, true)),
+            KillTier::SkipAgent
+        );
+        assert_eq!(
+            classify_kill_tier(facts(true, true, false, false)),
+            KillTier::SkipAgent
+        );
+
+        // Main checkout: close-pane when clean, skip when dirty.
+        assert_eq!(
+            classify_kill_tier(facts(true, false, false, false)),
+            KillTier::ClosePane
+        );
+        assert_eq!(
+            classify_kill_tier(facts(true, false, true, false)),
+            KillTier::SkipMainDirty
+        );
+
+        // Linked + merged: kill branch either way; dirty is just flagged.
+        assert_eq!(
+            classify_kill_tier(facts(false, false, false, true)),
+            KillTier::KillBranch { dirty: false }
+        );
+        assert_eq!(
+            classify_kill_tier(facts(false, false, true, true)),
+            KillTier::KillBranch { dirty: true }
+        );
+
+        // Linked + not merged: checkout-only when clean, force-only when dirty.
+        assert_eq!(
+            classify_kill_tier(facts(false, false, false, false)),
+            KillTier::CheckoutOnly
+        );
+        assert_eq!(
+            classify_kill_tier(facts(false, false, true, false)),
+            KillTier::SkipUnmergedDirty
+        );
+    }
+
+    #[test]
+    fn planned_action_force_only_escalates_unmerged_dirty() {
+        // Force never changes the safe tiers.
+        for force in [false, true] {
+            assert_eq!(
+                planned_action(KillTier::ClosePane, force),
+                KillAction::ClosePane
+            );
+            assert_eq!(
+                planned_action(KillTier::KillBranch { dirty: true }, force),
+                KillAction::KillBranch { dirty: true }
+            );
+            assert_eq!(
+                planned_action(KillTier::CheckoutOnly, force),
+                KillAction::CheckoutOnly
+            );
+            // Protected skips stay skipped even under force.
+            assert_eq!(
+                planned_action(KillTier::SkipMainDirty, force),
+                KillAction::Skip
+            );
+            assert_eq!(planned_action(KillTier::SkipAgent, force), KillAction::Skip);
+        }
+        // Only the unmerged-dirty tier moves, and only to checkout-only.
+        assert_eq!(
+            planned_action(KillTier::SkipUnmergedDirty, false),
+            KillAction::Skip
+        );
+        assert_eq!(
+            planned_action(KillTier::SkipUnmergedDirty, true),
+            KillAction::CheckoutOnly
+        );
+    }
 
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

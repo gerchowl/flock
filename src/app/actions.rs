@@ -1945,7 +1945,7 @@ impl AppState {
     /// Remove the given workspace indices, dropping their unattached terminals
     /// and re-anchoring selection/active/scroll. Shared by single-workspace and
     /// whole-space closes (#62).
-    fn close_workspace_indices(&mut self, close_indices: Vec<usize>) {
+    pub(crate) fn close_workspace_indices(&mut self, close_indices: Vec<usize>) {
         if close_indices.is_empty() {
             return;
         }
@@ -3047,6 +3047,7 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeKillGateFinished(_) => Vec::new(),
             AppEvent::WorktreeBranchDeleteFinished(_) => Vec::new(),
+            AppEvent::WorktreeKillAllFinished(_) => Vec::new(),
         }
     }
 
