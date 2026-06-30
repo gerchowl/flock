@@ -1831,6 +1831,43 @@ async fn run_client_loop(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
+                // Drag-drop of a file lands as a bracketed paste of its LOCAL
+                // path. Ferry the bytes to the server (which may be remote)
+                // over the existing channel, rather than typing a local path
+                // the server can't resolve (#79).
+                if let Some(file_path) = bracketed_paste_local_file(&data) {
+                    match std::fs::read(&file_path) {
+                        Ok(bytes) if bytes.len() <= MAX_CLIPBOARD_IMAGE_PAYLOAD => {
+                            let extension = file_path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("bin")
+                                .to_owned();
+                            info!(
+                                bytes = bytes.len(),
+                                extension = extension.as_str(),
+                                "bridging dropped local file to remote server"
+                            );
+                            let msg = ClientMessage::ClipboardImage {
+                                extension,
+                                data: bytes,
+                            };
+                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                return Err(ClientError::ConnectionLost(e));
+                            }
+                            continue;
+                        }
+                        Ok(bytes) => warn!(
+                            bytes = bytes.len(),
+                            max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
+                            "dropped file too large to bridge; passing the paste through"
+                        ),
+                        Err(err) => warn!(
+                            err = %err,
+                            "failed to read dropped local file; passing the paste through"
+                        ),
+                    }
+                }
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
@@ -3231,6 +3268,37 @@ fn should_bridge_clipboard_image_paste(data: &[u8]) -> bool {
     )
 }
 
+/// If `data` is a bracketed paste whose entire content is a single existing
+/// local file, return that path. Terminals deliver a file dropped onto a pane
+/// as a bracketed paste of its path, so this recognises a drag-drop — letting
+/// us ferry the file's BYTES to the (possibly remote) server instead of typing
+/// a local path the server can't resolve (#79). Conservative: a single path
+/// only (no embedded newlines), and only when the file actually exists, so an
+/// ordinary multi-line paste falls through untouched.
+fn bracketed_paste_local_file(data: &[u8]) -> Option<std::path::PathBuf> {
+    let text = std::str::from_utf8(data).ok()?;
+    let inner = text
+        .strip_prefix("\u{1b}[200~")?
+        .strip_suffix("\u{1b}[201~")?
+        .trim();
+    if inner.is_empty() || inner.contains(['\n', '\r']) {
+        return None;
+    }
+    // Drag-drop often single/double-quotes paths with spaces and/or uses a
+    // file:// URI.
+    let unquoted = inner
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(inner);
+    let path = unquoted.strip_prefix("file://").unwrap_or(unquoted);
+    if path.is_empty() {
+        return None;
+    }
+    let candidate = std::path::PathBuf::from(path);
+    candidate.is_file().then_some(candidate)
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
 // ---------------------------------------------------------------------------
@@ -4032,6 +4100,50 @@ mod tests {
             b"\x1b[200~text\x1b[201~"
         ));
         assert!(!should_bridge_clipboard_image_paste(b"v"));
+    }
+
+    #[test]
+    fn bracketed_paste_local_file_recognizes_a_dropped_path() {
+        let file = std::env::temp_dir().join(format!(
+            "flock-drop-test-{}-{}.pdf",
+            std::process::id(),
+            "x"
+        ));
+        std::fs::write(&file, b"%PDF").unwrap();
+        let p = file.to_string_lossy().into_owned();
+
+        // Plain, single-quoted, and file:// forms all resolve to the path.
+        for body in [
+            format!("\x1b[200~{p}\x1b[201~"),
+            format!("\x1b[200~'{p}'\x1b[201~"),
+            format!("\x1b[200~file://{p}\x1b[201~"),
+        ] {
+            assert_eq!(
+                bracketed_paste_local_file(body.as_bytes()),
+                Some(file.clone()),
+                "should detect drop: {body:?}"
+            );
+        }
+
+        // Not a file drop: empty paste, multi-line, a non-existent path, and
+        // plain (non-paste) input all fall through.
+        assert_eq!(bracketed_paste_local_file(b"\x1b[200~\x1b[201~"), None);
+        assert_eq!(
+            bracketed_paste_local_file(b"\x1b[200~/a/b\n/c/d\x1b[201~"),
+            None
+        );
+        assert_eq!(
+            bracketed_paste_local_file(b"\x1b[200~/no/such/file/here.pdf\x1b[201~"),
+            None
+        );
+        assert_eq!(bracketed_paste_local_file(b"hello world"), None);
+
+        std::fs::remove_file(&file).unwrap();
+        // Once removed, the same paste no longer counts as a file drop.
+        assert_eq!(
+            bracketed_paste_local_file(format!("\x1b[200~{p}\x1b[201~").as_bytes()),
+            None
+        );
     }
 
     #[test]
