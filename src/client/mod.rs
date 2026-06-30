@@ -1586,6 +1586,9 @@ async fn run_client_loop(
 ) -> Result<(), ClientError> {
     let (_, _, initial_cell_width, initial_cell_height) =
         current_terminal_geometry(kitty_graphics_enabled);
+    // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
+    // server. Read once per attach leg (cheap; file-drops are rare).
+    let file_drop_mode = crate::config::Config::load().config.ui.file_drop;
     // One-shot guard for the first-paint trace event so subsequent frames are
     // a single cheap bool check.
     let mut first_paint_logged = false;
@@ -1834,38 +1837,41 @@ async fn run_client_loop(
                 // Drag-drop of a file lands as a bracketed paste of its LOCAL
                 // path. Ferry the bytes to the server (which may be remote)
                 // over the existing channel, rather than typing a local path
-                // the server can't resolve (#79).
-                if let Some(file_path) = bracketed_paste_local_file(&data) {
-                    match std::fs::read(&file_path) {
-                        Ok(bytes) if bytes.len() <= MAX_CLIPBOARD_IMAGE_PAYLOAD => {
-                            let extension = file_path
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or("bin")
-                                .to_owned();
-                            info!(
-                                bytes = bytes.len(),
-                                extension = extension.as_str(),
-                                "bridging dropped local file to remote server"
-                            );
-                            let msg = ClientMessage::ClipboardImage {
-                                extension,
-                                data: bytes,
-                            };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
-                                return Err(ClientError::ConnectionLost(e));
+                // the server can't resolve (#79). `ui.file_drop = "never"`
+                // disables this — the path then passes through as text.
+                if file_drop_mode != crate::config::FileDropMode::Never {
+                    if let Some(file_path) = bracketed_paste_local_file(&data) {
+                        match std::fs::read(&file_path) {
+                            Ok(bytes) if bytes.len() <= MAX_CLIPBOARD_IMAGE_PAYLOAD => {
+                                let extension = file_path
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .unwrap_or("bin")
+                                    .to_owned();
+                                info!(
+                                    bytes = bytes.len(),
+                                    extension = extension.as_str(),
+                                    "bridging dropped local file to remote server"
+                                );
+                                let msg = ClientMessage::ClipboardImage {
+                                    extension,
+                                    data: bytes,
+                                };
+                                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                    return Err(ClientError::ConnectionLost(e));
+                                }
+                                continue;
                             }
-                            continue;
+                            Ok(bytes) => warn!(
+                                bytes = bytes.len(),
+                                max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
+                                "dropped file too large to bridge; passing the paste through"
+                            ),
+                            Err(err) => warn!(
+                                err = %err,
+                                "failed to read dropped local file; passing the paste through"
+                            ),
                         }
-                        Ok(bytes) => warn!(
-                            bytes = bytes.len(),
-                            max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
-                            "dropped file too large to bridge; passing the paste through"
-                        ),
-                        Err(err) => warn!(
-                            err = %err,
-                            "failed to read dropped local file; passing the paste through"
-                        ),
                     }
                 }
                 let msg = ClientMessage::Input { data };

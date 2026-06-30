@@ -228,6 +228,22 @@ pub enum ServerStateMarkConfig {
     MedallionQuadrant,
 }
 
+/// How flock handles a file dropped onto an agent pane (#79). A drag-drop
+/// arrives as a paste of the LOCAL path; flock ferries the file's BYTES to the
+/// (possibly remote) server so the agent gets a path it can actually read.
+/// `auto` (default) ferries and hands the staged path to the agent; `never`
+/// disables it (the local path just passes through as text). The agent only
+/// receives an injected `read this file: <path>` in its prompt — which the
+/// user reviews before sending — so there's already a confirmation step; a
+/// dedicated `ask` modal is a tracked follow-up (#79).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDropMode {
+    Never,
+    #[default]
+    Auto,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
@@ -687,6 +703,9 @@ pub struct UiConfig {
     /// Servers-band leading state mark: "counts" (default), or
     /// "medallion_sextant" / "medallion_quadrant".
     pub server_state_mark: ServerStateMarkConfig,
+    /// How a file dropped onto an agent pane is handled (#79): "never" / "ask"
+    /// (default) / "auto".
+    pub file_drop: FileDropMode,
     /// Display alias overrides for agent labels in the sidebar, e.g.
     /// `agent_aliases = { claude = "CC" }`. Built-in short codes apply
     /// when no override is set (claude -> cc, codex -> cd, ...).
@@ -940,6 +959,7 @@ impl Default for UiConfig {
             servers_panel_scope: PanelScopeConfig::All,
             spaces_panel_scope: PanelScopeConfig::All,
             server_state_mark: ServerStateMarkConfig::default(),
+            file_drop: FileDropMode::default(),
             agent_aliases: std::collections::HashMap::new(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1173,6 +1193,14 @@ tab_mode = "workspace"
         )
         .unwrap();
         assert_eq!(config.ui.tab_mode, TabModeConfig::Workspace);
+    }
+
+    #[test]
+    fn file_drop_defaults_auto_and_parses_never() {
+        assert_eq!(Config::default().ui.file_drop, FileDropMode::Auto);
+
+        let config: Config = toml::from_str("[ui]\nfile_drop = \"never\"\n").unwrap();
+        assert_eq!(config.ui.file_drop, FileDropMode::Never);
     }
 
     #[test]

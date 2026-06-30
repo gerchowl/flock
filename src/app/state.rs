@@ -1117,6 +1117,7 @@ pub enum SettingsSection {
     PaneLabels,
     Sidebar,
     Idle,
+    FileDrop,
     Experiments,
     Integrations,
 }
@@ -1129,6 +1130,7 @@ impl SettingsSection {
         Self::PaneLabels,
         Self::Sidebar,
         Self::Idle,
+        Self::FileDrop,
         Self::Integrations,
         Self::Experiments,
     ];
@@ -1141,6 +1143,7 @@ impl SettingsSection {
             Self::PaneLabels => "pane labels",
             Self::Sidebar => "sidebar",
             Self::Idle => "idle",
+            Self::FileDrop => "file drop",
             Self::Experiments => "experiments",
             Self::Integrations => "integrations",
         }
@@ -1832,6 +1835,9 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
+    /// How a file dropped onto an agent pane is handled (#79): `never` or
+    /// `auto` (default). Surfaced as a settings toggle.
+    pub file_drop: crate::config::FileDropMode,
     /// The pending confirm-close is the whole-space affordance (#62): close
     /// every member, not just the selected workspace. Set when opening the
     /// confirm for "Close group"; cleared on accept/cancel.
@@ -2099,6 +2105,12 @@ impl AppState {
 
     pub fn agent_border_labels_enabled(&self) -> bool {
         self.show_agent_labels_on_pane_borders
+    }
+
+    /// Whether dropped files are ferried to the agent (#79) — `auto`. The
+    /// settings toggle reads/writes this; `never` is "off".
+    pub fn file_drop_enabled(&self) -> bool {
+        self.file_drop == crate::config::FileDropMode::Auto
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
@@ -2396,6 +2408,7 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
+            file_drop: crate::config::FileDropMode::default(),
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
