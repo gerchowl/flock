@@ -41,10 +41,17 @@ pub(crate) fn stage(
             Err(err) => return Err(err),
         };
         file.write_all(data)?;
-        return Ok(StagedClipboardImage {
-            paste_text: path.to_string_lossy().into_owned(),
-            path,
-        });
+        let path_str = path.to_string_lossy().into_owned();
+        let paste_text = if is_image_extension(&extension) {
+            // A bare image path is what Claude Code captures as `[Image #N]`.
+            path_str
+        } else {
+            // A bare path is opaque for a non-image file (and for non-CC
+            // agents), so inject an explicit, agent-agnostic instruction (#79)
+            // pointing at the SERVER-side staged copy.
+            format!("read this file: {path_str}")
+        };
+        return Ok(StagedClipboardImage { paste_text, path });
     }
 
     Err(io::Error::new(
@@ -59,20 +66,28 @@ pub(crate) fn remove_files(paths: Vec<PathBuf>) {
     }
 }
 
-fn sanitize_extension(extension: &str) -> &'static str {
-    if extension.eq_ignore_ascii_case("png") {
-        "png"
-    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-        "jpg"
-    } else if extension.eq_ignore_ascii_case("gif") {
-        "gif"
-    } else if extension.eq_ignore_ascii_case("webp") {
-        "webp"
-    } else if extension.eq_ignore_ascii_case("bmp") {
-        "bmp"
+/// Reduce a client-supplied extension to a safe, real extension to stage under
+/// (#79). Takes only the bare token after the last `.`/`/`/`\`, lowercased,
+/// and keeps it only when it's a short alphanumeric string — so a PDF stays
+/// `.pdf` while traversal/garbage (`../etc`, spaces, overlong) becomes an
+/// opaque `.bin`. Generalised from the old image-only allowlist that forced
+/// everything to `.png`.
+fn sanitize_extension(extension: &str) -> String {
+    let ext = extension
+        .rsplit(['/', '.', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !ext.is_empty() && ext.len() <= 8 && ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        ext
     } else {
-        "png"
+        "bin".to_string()
     }
+}
+
+fn is_image_extension(extension: &str) -> bool {
+    matches!(extension, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
 }
 
 fn staging_dir() -> PathBuf {
@@ -119,10 +134,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_extension_accepts_known_image_extensions() {
+    fn sanitize_extension_keeps_safe_real_extensions() {
         assert_eq!(sanitize_extension("PNG"), "png");
-        assert_eq!(sanitize_extension("jpeg"), "jpg");
+        assert_eq!(sanitize_extension("jpeg"), "jpeg");
         assert_eq!(sanitize_extension("webp"), "webp");
-        assert_eq!(sanitize_extension("sh"), "png");
+        // Non-image extensions are now preserved (no longer forced to png).
+        assert_eq!(sanitize_extension("pdf"), "pdf");
+        assert_eq!(sanitize_extension("md"), "md");
+        // A full filename reduces to its bare token; traversal is stripped.
+        assert_eq!(sanitize_extension("report.pdf"), "pdf");
+        assert_eq!(sanitize_extension("../../etc/passwd"), "passwd");
+        // Garbage / unsafe / overlong falls back to an opaque blob.
+        assert_eq!(sanitize_extension(""), "bin");
+        assert_eq!(sanitize_extension("a b"), "bin");
+        assert_eq!(sanitize_extension("toolongextension"), "bin");
+    }
+
+    #[test]
+    fn stage_image_injects_bare_path_doc_injects_read_instruction() {
+        // Image: bare path (so Claude Code captures it as [Image #N]).
+        let img = stage(7, "png", b"\x89PNG\r\n").unwrap();
+        assert!(img.path.to_string_lossy().ends_with(".png"));
+        assert_eq!(img.paste_text, img.path.to_string_lossy());
+        let _ = fs::remove_file(&img.path);
+
+        // Non-image: real extension kept + explicit, agent-agnostic instruction.
+        let doc = stage(7, "pdf", b"%PDF-1.7 hello").unwrap();
+        let doc_path = doc.path.to_string_lossy().into_owned();
+        assert!(
+            doc_path.ends_with(".pdf"),
+            "kept real extension: {doc_path}"
+        );
+        assert!(
+            doc.paste_text.contains("read this file"),
+            "{}",
+            doc.paste_text
+        );
+        assert!(doc.paste_text.contains(&doc_path), "{}", doc.paste_text);
+        assert_eq!(fs::read(&doc.path).unwrap(), b"%PDF-1.7 hello");
+        let _ = fs::remove_file(&doc.path);
     }
 }
