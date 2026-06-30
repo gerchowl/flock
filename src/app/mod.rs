@@ -487,6 +487,7 @@ impl App {
             request_new_linked_worktree: None,
             request_branch_session: None,
             request_kill_worktree: None,
+            request_kill_all_worktrees: false,
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             action_notice: None,
@@ -522,6 +523,7 @@ impl App {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            worktree_kill_all: None,
             worktree_directory,
             collapsed_space_keys,
             request_complete_onboarding: false,
@@ -932,6 +934,11 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_kill_worktree.take() {
                 self.open_kill_worktree_confirmation(ws_idx);
+                needs_render = true;
+            }
+
+            if std::mem::take(&mut self.state.request_kill_all_worktrees) {
+                self.open_kill_all_worktrees_confirmation();
                 needs_render = true;
             }
 
@@ -1576,6 +1583,9 @@ impl App {
             }
             Mode::ConfirmRemoveWorktree => {
                 self.handle_worktree_remove_key(key_event);
+            }
+            Mode::ConfirmKillAllWorktrees => {
+                self.handle_worktree_kill_all_key(key_event);
             }
             Mode::ConfirmCrossCheckout => match key_event.code {
                 crossterm::event::KeyCode::Enter => self.confirm_peer_checkout(),

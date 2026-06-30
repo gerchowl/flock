@@ -503,6 +503,13 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
             }
 
+            if std::mem::take(&mut self.app.state.request_kill_all_worktrees) {
+                self.app.open_kill_all_worktrees_confirmation();
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+            }
+
             if let Some((peer_idx, ws_idx)) = self.app.state.request_peer_checkout.take() {
                 self.app.begin_peer_checkout(peer_idx, ws_idx);
                 needs_render = true;

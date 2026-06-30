@@ -36,6 +36,14 @@ pub struct WorktreeRemoveResult {
     pub result: Result<(), String>,
 }
 
+/// Outcome of the fleet-wide kill sweep's git work (#81): one entry per linked
+/// row that was acted on, keyed by workspace id. `Ok` means the checkout (and,
+/// for merged rows, the branch) was removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeKillAllResult {
+    pub outcomes: Vec<(String, Result<(), String>)>,
+}
+
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -194,4 +202,5 @@ pub enum AppEvent {
     WorktreeRemoveFinished(WorktreeRemoveResult),
     WorktreeKillGateFinished(WorktreeKillGateResult),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
+    WorktreeKillAllFinished(WorktreeKillAllResult),
 }

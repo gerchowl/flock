@@ -269,6 +269,7 @@ pub struct Keybinds {
     pub toggle_prompt_expand: ActionKeybinds,
     pub toggle_float: ActionKeybinds,
     pub kill_worktree: ActionKeybinds,
+    pub kill_all_worktrees: ActionKeybinds,
     pub focus_attention: ActionKeybinds,
     pub focus_attention_previous: ActionKeybinds,
     pub focus_attention_project: ActionKeybinds,
@@ -465,6 +466,7 @@ impl Config {
             ),
             toggle_float: action!("keys.toggle_float", &self.keys.toggle_float),
             kill_worktree: action!("keys.kill_worktree", &self.keys.kill_worktree),
+            kill_all_worktrees: action!("keys.kill_all_worktrees", &self.keys.kill_all_worktrees),
             focus_attention: action!("keys.focus_attention", &self.keys.focus_attention),
             focus_attention_previous: action!(
                 "keys.focus_attention_previous",
@@ -1372,6 +1374,23 @@ next_tab = "prefix+n"
         let kb = Config::default().keybinds();
         assert!(kb.open_worktree.bindings.is_empty());
         assert!(kb.remove_worktree.bindings.is_empty());
+    }
+
+    #[test]
+    fn kill_all_worktrees_keybind_unset_by_default_and_parses_as_direct() {
+        let kb = Config::default().keybinds();
+        assert!(kb.kill_all_worktrees.bindings.is_empty());
+
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+kill_all_worktrees = "ctrl+shift+k"
+"#,
+        )
+        .unwrap();
+        let kb = config.keybinds();
+        assert_eq!(kb.kill_all_worktrees.bindings.len(), 1);
+        assert!(kb.kill_all_worktrees.bindings[0].trigger.is_direct());
     }
 
     #[test]

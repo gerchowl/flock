@@ -248,6 +248,11 @@ impl App {
             return;
         }
 
+        if let AppEvent::WorktreeKillAllFinished(result) = ev {
+            self.handle_worktree_kill_all_finished(result);
+            return;
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             // Floating panes live outside the workspace tree: when their
             // process exits, reap the float here (this handler runs in both

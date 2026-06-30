@@ -503,6 +503,7 @@ pub(crate) enum NavigateAction {
     NewWorktree,
     BranchSession,
     KillWorktree,
+    KillAllWorktrees,
     FocusAttention,
     FocusAttentionPrevious,
     FocusAttentionProject,
@@ -628,6 +629,7 @@ fn action_for_key(
         (&kb.open_worktree, NavigateAction::OpenWorktree),
         (&kb.remove_worktree, NavigateAction::RemoveWorktree),
         (&kb.kill_worktree, NavigateAction::KillWorktree),
+        (&kb.kill_all_worktrees, NavigateAction::KillAllWorktrees),
         (&kb.rename_workspace, NavigateAction::RenameWorkspace),
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
@@ -777,6 +779,12 @@ pub(super) fn execute_navigate_action_in_context(
                 state.request_kill_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
+        }
+        NavigateAction::KillAllWorktrees => {
+            // Fleet-wide sweep (#81): no per-workspace target — it acts on every
+            // worktree at once, behind a batch confirmation.
+            state.request_kill_all_worktrees = true;
+            leave_navigate_mode(state);
         }
         NavigateAction::RenameWorkspace => {
             if let Some(ws_idx) = workspace_action_target(state, context) {

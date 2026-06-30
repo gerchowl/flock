@@ -4,10 +4,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    state::{WorktreeCreateState, WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState},
+    state::{
+        WorktreeCreateState, WorktreeKillAllState, WorktreeKillRow, WorktreeKillRowStatus,
+        WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState,
+    },
     App, Mode,
 };
-use crate::events::{AppEvent, WorktreeAddResult, WorktreeRemoveResult};
+use crate::events::{AppEvent, WorktreeAddResult, WorktreeKillAllResult, WorktreeRemoveResult};
+use crate::worktree::{KillAction, KillFacts};
+
+/// Dry-run label for one sweep row: the branch (or checkout dir name), with a
+/// `(main)` / `[adopted]` marker so the batch list reads clearly (#81).
+fn kill_all_row_label(
+    branch: &Option<String>,
+    checkout: &std::path::Path,
+    is_main: bool,
+    managed: bool,
+) -> String {
+    let base = branch.clone().unwrap_or_else(|| {
+        checkout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?")
+            .to_string()
+    });
+    let mut label = if is_main {
+        format!("{base} (main)")
+    } else {
+        base
+    };
+    if !managed {
+        label.push_str(" [adopted]");
+    }
+    label
+}
 
 impl App {
     fn worktree_source_metadata(
@@ -268,6 +298,12 @@ impl App {
         &mut self,
         result: crate::events::WorktreeKillGateResult,
     ) {
+        // The fleet sweep (#81) shares the gate event/worker; route to its row
+        // when its dialog is open.
+        if self.state.worktree_kill_all.is_some() {
+            self.apply_kill_all_gate(result);
+            return;
+        }
         let Some(remove) = &mut self.state.worktree_remove else {
             return;
         };
@@ -287,6 +323,332 @@ impl App {
         remove.merge_gate = Some(result.gate);
         self.render_dirty.store(true, Ordering::Release);
         self.render_notify.notify_one();
+    }
+
+    /// Fleet-wide sweep (#81): enumerate every worktree flock knows (managed,
+    /// adopted, external, plus main checkouts), classify each into its tier, and
+    /// open the batch-confirm dialog. Linked rows resolve their merge gate async
+    /// (the confirm is held until the whole plan is known).
+    pub(crate) fn open_kill_all_worktrees_confirmation(&mut self) {
+        let mut rows: Vec<WorktreeKillRow> = Vec::new();
+        for ws in &self.state.workspaces {
+            let candidate = if let Some(space) =
+                ws.worktree_space().filter(|space| space.is_linked_worktree)
+            {
+                Some((
+                    space.repo_root.clone(),
+                    space.checkout_path.clone(),
+                    true,
+                    false,
+                ))
+            } else {
+                let git_space = ws.git_space().cloned().or_else(|| {
+                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                        .as_deref()
+                        .and_then(crate::workspace::git_space_metadata)
+                });
+                match git_space {
+                    Some(space) if space.is_linked_worktree => {
+                        let main_root = crate::worktree::main_root_from_common_dir(
+                            std::path::Path::new(&space.key),
+                        );
+                        Some((main_root, space.repo_root, false, false))
+                    }
+                    // A non-linked git workspace is the main checkout.
+                    Some(space) => Some((space.repo_root.clone(), space.repo_root, true, true)),
+                    // Not a git workspace at all — not part of the sweep.
+                    None => None,
+                }
+            };
+            let Some((repo_root, checkout, managed, is_main)) = candidate else {
+                continue;
+            };
+            let working_agent = ws.has_working_pane(&self.state.terminals);
+            // Unknown dirtiness ⇒ treat as dirty: an unmerged row then skips
+            // (safe), and a merged row only force-removes scratch the merge gate
+            // already proved redundant — never committed work.
+            let dirty = crate::worktree::checkout_is_dirty(&checkout).unwrap_or(true);
+            let branch = crate::worktree::checkout_branch_name(&checkout);
+            // Main rows need no gate and resolve immediately; linked rows wait.
+            let merge_gate = is_main.then_some(crate::worktree::WorktreeMergeGate::NotMerged);
+            let tier = crate::worktree::classify_kill_tier(KillFacts {
+                is_main,
+                working_agent,
+                dirty,
+                merged: false,
+            });
+            rows.push(WorktreeKillRow {
+                workspace_id: ws.id.clone(),
+                label: kill_all_row_label(&branch, &checkout, is_main, managed),
+                repo_root,
+                checkout,
+                managed,
+                branch,
+                dirty,
+                working_agent,
+                merge_gate,
+                tier,
+                status: WorktreeKillRowStatus::Pending,
+            });
+        }
+
+        if rows.is_empty() {
+            self.show_action_notice("kill all: no worktrees to sweep");
+            return;
+        }
+
+        // Resolve the merge gate for each linked row that could still be killed
+        // (agent-busy rows are already a protected skip — don't dial gh for them).
+        for row in &rows {
+            if row.checkout_is_main() || row.working_agent {
+                continue;
+            }
+            let workspace_id = row.workspace_id.clone();
+            let repo_root = row.repo_root.clone();
+            let checkout = row.checkout.clone();
+            let branch = row.branch.clone();
+            let event_tx = self.event_tx.clone();
+            std::thread::spawn(move || {
+                let gate = match branch.as_deref() {
+                    Some(branch) => {
+                        crate::worktree::branch_merge_gate(&repo_root, &checkout, branch)
+                    }
+                    None => crate::worktree::WorktreeMergeGate::NotMerged,
+                };
+                let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
+                    crate::events::WorktreeKillGateResult {
+                        workspace_id,
+                        path: checkout,
+                        branch,
+                        gate,
+                    },
+                ));
+            });
+        }
+
+        self.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows,
+            executing: false,
+            force_dirty: false,
+        });
+        self.state.mode = Mode::ConfirmKillAllWorktrees;
+    }
+
+    /// Fold one resolved merge gate into its sweep row and recompute its tier.
+    fn apply_kill_all_gate(&mut self, result: crate::events::WorktreeKillGateResult) {
+        let Some(kill_all) = &mut self.state.worktree_kill_all else {
+            return;
+        };
+        let Some(row) = kill_all
+            .rows
+            .iter_mut()
+            .find(|row| row.workspace_id == result.workspace_id && row.checkout == result.path)
+        else {
+            return;
+        };
+        let merged = matches!(
+            result.gate,
+            crate::worktree::WorktreeMergeGate::Merged { .. }
+        );
+        row.branch = result.branch;
+        row.merge_gate = Some(result.gate);
+        row.tier = crate::worktree::classify_kill_tier(KillFacts {
+            is_main: row.checkout_is_main(),
+            working_agent: row.working_agent,
+            dirty: row.dirty,
+            merged,
+        });
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    /// Key handling for the batch-confirm dialog: Esc cancels, `f` toggles the
+    /// force escalation (unmerged-dirty → checkout-only), Enter executes once
+    /// the whole plan is resolved.
+    pub(crate) fn handle_worktree_kill_all_key(&mut self, key: KeyEvent) {
+        let Some(kill_all) = &mut self.state.worktree_kill_all else {
+            return;
+        };
+        if kill_all.executing {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.state.worktree_kill_all = None;
+                self.state.mode = if self.state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                kill_all.force_dirty = !kill_all.force_dirty;
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+            }
+            KeyCode::Enter if !kill_all.resolving() => self.start_kill_all_worktrees(),
+            _ => {}
+        }
+    }
+
+    /// Execute the sweep: fire the checkout removals (+ branch deletes for merged
+    /// rows) on a worker thread; main-checkout "close pane" rows and the final
+    /// workspace closes are applied when the worker reports back.
+    pub(crate) fn start_kill_all_worktrees(&mut self) {
+        let Some(kill_all) = &mut self.state.worktree_kill_all else {
+            return;
+        };
+        if kill_all.executing || kill_all.resolving() {
+            return;
+        }
+        let force = kill_all.force_dirty;
+        // (workspace_id, repo_root, checkout, branch_to_delete, force_remove)
+        let mut jobs: Vec<(
+            String,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            Option<String>,
+            bool,
+        )> = Vec::new();
+        let mut acted = false;
+        for row in &mut kill_all.rows {
+            match crate::worktree::planned_action(row.tier, force) {
+                KillAction::KillBranch { dirty } => {
+                    row.status = WorktreeKillRowStatus::Removing;
+                    jobs.push((
+                        row.workspace_id.clone(),
+                        row.repo_root.clone(),
+                        row.checkout.clone(),
+                        row.branch.clone(),
+                        dirty,
+                    ));
+                    acted = true;
+                }
+                KillAction::CheckoutOnly => {
+                    row.status = WorktreeKillRowStatus::Removing;
+                    // Force-remove only when dirty (the forced unmerged-dirty case).
+                    jobs.push((
+                        row.workspace_id.clone(),
+                        row.repo_root.clone(),
+                        row.checkout.clone(),
+                        None,
+                        row.dirty,
+                    ));
+                    acted = true;
+                }
+                KillAction::ClosePane => acted = true,
+                KillAction::Skip => {}
+            }
+        }
+
+        if !acted {
+            self.state.worktree_kill_all = None;
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+            self.show_action_notice("kill all: nothing eligible");
+            return;
+        }
+
+        kill_all.executing = true;
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+
+        if jobs.is_empty() {
+            // Only close-pane rows — no git work; finalize immediately.
+            self.handle_worktree_kill_all_finished(WorktreeKillAllResult {
+                outcomes: Vec::new(),
+            });
+            return;
+        }
+
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for (ws_id, repo_root, checkout, branch_to_delete, force_remove) in jobs {
+                let command = crate::worktree::build_worktree_remove_command(
+                    &repo_root,
+                    &checkout,
+                    force_remove,
+                );
+                let outcome = match crate::worktree::run_worktree_command(&command) {
+                    Ok(()) => {
+                        if let Some(branch) = branch_to_delete {
+                            // Best-effort: the checkout is already gone; a failed
+                            // branch delete is surfaced via tracing, not a row error.
+                            if let Err(err) =
+                                crate::worktree::delete_local_branch(&repo_root, &branch)
+                            {
+                                tracing::warn!(branch, err, "kill all: branch delete failed");
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                };
+                outcomes.push((ws_id, outcome));
+            }
+            let _ =
+                event_tx.blocking_send(AppEvent::WorktreeKillAllFinished(WorktreeKillAllResult {
+                    outcomes,
+                }));
+        });
+    }
+
+    /// Finalize the sweep: record per-row results, then close every workspace
+    /// whose checkout was removed and every clean+idle main checkout, and report
+    /// a one-line summary.
+    pub(crate) fn handle_worktree_kill_all_finished(&mut self, result: WorktreeKillAllResult) {
+        let Some(kill_all) = &mut self.state.worktree_kill_all else {
+            return;
+        };
+        let force = kill_all.force_dirty;
+        let mut close_ws_ids: Vec<String> = Vec::new();
+        let mut errors = 0usize;
+        for (ws_id, outcome) in &result.outcomes {
+            if let Some(row) = kill_all.rows.iter_mut().find(|r| &r.workspace_id == ws_id) {
+                match outcome {
+                    Ok(()) => {
+                        row.status = WorktreeKillRowStatus::Done;
+                        close_ws_ids.push(ws_id.clone());
+                    }
+                    Err(err) => {
+                        row.status = WorktreeKillRowStatus::Error(err.clone());
+                        errors += 1;
+                    }
+                }
+            }
+        }
+        let removed = close_ws_ids.len();
+        let mut closed_panes = 0usize;
+        for row in &kill_all.rows {
+            if matches!(
+                crate::worktree::planned_action(row.tier, force),
+                KillAction::ClosePane
+            ) {
+                close_ws_ids.push(row.workspace_id.clone());
+                closed_panes += 1;
+            }
+        }
+
+        let indices: Vec<usize> = close_ws_ids
+            .iter()
+            .filter_map(|id| self.state.workspaces.iter().position(|ws| &ws.id == id))
+            .collect();
+        self.state.worktree_kill_all = None;
+        if !indices.is_empty() {
+            self.state.close_workspace_indices(indices);
+        }
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+        self.show_action_notice(format!(
+            "kill all: {removed} removed · {closed_panes} pane(s) closed · {errors} error(s)"
+        ));
     }
 
     pub(crate) fn handle_worktree_branch_delete_finished(

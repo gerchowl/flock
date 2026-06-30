@@ -27,7 +27,7 @@ mod tabs;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_cross_checkout_overlay,
+    render_confirm_close_overlay, render_cross_checkout_overlay, render_kill_all_worktrees_overlay,
     render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
     render_remove_worktree_overlay, render_rename_overlay,
 };
@@ -517,6 +517,9 @@ pub fn render_with_runtime_registry(
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
+        Mode::ConfirmKillAllWorktrees => {
+            render_kill_all_worktrees_overlay(app, frame, frame.area())
+        }
         Mode::ConfirmCrossCheckout => render_cross_checkout_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),

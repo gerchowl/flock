@@ -453,6 +453,180 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     );
 }
 
+/// The fleet-wide kill sweep dialog (#81): a per-worktree dry-run plan + counts,
+/// the force toggle, and execute/cancel. Confirm is held until every linked
+/// row's merge gate has resolved.
+pub(super) fn render_kill_all_worktrees_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    use crate::app::state::WorktreeKillRowStatus;
+    use crate::worktree::{KillAction, KillTier};
+
+    let Some(kill_all) = app.worktree_kill_all.as_ref() else {
+        return;
+    };
+    super::dim_background(frame, area);
+
+    let force = kill_all.force_dirty;
+    let resolving = kill_all.resolving();
+
+    let mut lines: Vec<Line> = Vec::new();
+    let (mut n_kill, mut n_checkout, mut n_close, mut n_skip) = (0usize, 0usize, 0usize, 0usize);
+    for row in &kill_all.rows {
+        let (verb, color) = match crate::worktree::planned_action(row.tier, force) {
+            KillAction::KillBranch { dirty } => {
+                n_kill += 1;
+                (
+                    if dirty {
+                        "kill + branch (dirty!)"
+                    } else {
+                        "kill + branch"
+                    },
+                    app.palette.red,
+                )
+            }
+            KillAction::CheckoutOnly => {
+                n_checkout += 1;
+                ("checkout only", app.palette.peach)
+            }
+            KillAction::ClosePane => {
+                n_close += 1;
+                ("close pane", app.palette.blue)
+            }
+            KillAction::Skip => {
+                n_skip += 1;
+                let reason = match row.tier {
+                    KillTier::SkipUnmergedDirty => "skip — unmerged + dirty",
+                    KillTier::SkipMainDirty => "skip — main, dirty",
+                    KillTier::SkipAgent => "skip — agent busy",
+                    _ => "skip",
+                };
+                (reason, app.palette.overlay0)
+            }
+        };
+        let status = match &row.status {
+            WorktreeKillRowStatus::Removing => "  …",
+            WorktreeKillRowStatus::Done => "  ✓",
+            WorktreeKillRowStatus::Error(_) => "  ✗err",
+            WorktreeKillRowStatus::Pending => "",
+        };
+        let gate = if !row.checkout_is_main() && row.merge_gate.is_none() {
+            "  ⏳"
+        } else {
+            ""
+        };
+        let label = truncate_text(&row.label, 30);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {label:<30} "),
+                Style::default().fg(app.palette.text),
+            ),
+            Span::styled(verb, Style::default().fg(color)),
+            Span::styled(
+                format!("{gate}{status}"),
+                Style::default().fg(app.palette.overlay0),
+            ),
+        ]));
+    }
+    const MAX_ROWS: usize = 14;
+    let hidden = lines.len().saturating_sub(MAX_ROWS);
+    lines.truncate(MAX_ROWS);
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" … and {hidden} more"),
+            Style::default().fg(app.palette.overlay0),
+        )));
+    }
+
+    let body_h = lines.len().max(1) as u16;
+    let popup_h = (body_h + 6).min(area.height.saturating_sub(2));
+    let Some(popup) = centered_popup_rect(area, 80, popup_h) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, app.palette.red, app.palette.panel_bg)
+    else {
+        return;
+    };
+
+    let layout = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas::<5>(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " kill all worktrees",
+            Style::default()
+                .fg(app.palette.red)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        layout[0],
+    );
+
+    let summary = if resolving {
+        " resolving merge status…".to_string()
+    } else {
+        format!(
+            " {n_kill} kill · {n_checkout} checkout-only · {n_close} close pane · {n_skip} skipped"
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(summary).style(Style::default().fg(app.palette.subtext0)),
+        layout[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(app.palette.text)),
+        layout[2],
+    );
+
+    let hint = if force {
+        " [f] force ON — unmerged+dirty becomes checkout-only"
+    } else {
+        " [f] include unmerged+dirty as checkout-only"
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(if force {
+            app.palette.peach
+        } else {
+            app.palette.overlay0
+        })),
+        layout[3],
+    );
+
+    let exec_label = if kill_all.executing {
+        "executing…"
+    } else if resolving {
+        "resolving…"
+    } else {
+        "execute"
+    };
+    let buttons = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas::<2>(layout[4]);
+    render_action_button(
+        frame,
+        buttons[0],
+        Some("↵"),
+        exec_label,
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        buttons[1],
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     let Some(open) = app.worktree_open.as_ref() else {
         return;
