@@ -251,6 +251,7 @@ impl App {
                     SettingsAction::SaveIdleSetting(setting, enabled) => {
                         self.save_idle_setting(setting, enabled)
                     }
+                    SettingsAction::SaveFileDrop(enabled) => self.save_file_drop(enabled),
                     SettingsAction::InstallRecommendedIntegrations => {
                         self.install_recommended_integrations()
                     }

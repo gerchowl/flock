@@ -231,6 +231,15 @@ impl App {
         }
     }
 
+    pub(super) fn save_file_drop(&mut self, enabled: bool) {
+        let value = if enabled { "\"auto\"" } else { "\"never\"" };
+        if self.update_config_file("file drop", |content| {
+            crate::config::upsert_section_value(content, "ui", "file_drop", value)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
     pub(super) fn save_agent_panel_scope(&mut self, scope: crate::app::state::AgentPanelScope) {
         let value = match scope {
             crate::app::state::AgentPanelScope::CurrentWorkspace => {

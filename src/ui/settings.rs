@@ -140,6 +140,17 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
         SettingsSection::Idle => {
             render_settings_idle(app, frame, content_area);
         }
+        SettingsSection::FileDrop => {
+            render_settings_toggle(
+                frame,
+                content_area,
+                p,
+                "file drop transfer",
+                "ferry a file dropped on a pane to the agent's machine",
+                app.file_drop_enabled(),
+                app.settings.list.selected,
+            );
+        }
         SettingsSection::Experiments => {
             render_settings_experiments(app, frame, content_area);
         }

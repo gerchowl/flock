@@ -229,6 +229,12 @@ const DEFAULT_CONFIG: &str = r##"# flock configuration
 # Ask for confirmation before closing a workspace
 # confirm_close = true
 
+# How a file dropped onto an agent pane is handled (#79). A drag-drop ferries
+# the file's bytes to the (possibly remote) server so the agent gets a path it
+# can read. "auto" (default) does this; "never" disables it (the local path
+# passes through as text).
+# file_drop = "auto"
+
 # Ask for a tab name before creating a new tab.
 # Set false to create tabs immediately with generated names.
 # prompt_new_tab_name = true

@@ -25,6 +25,7 @@ pub(super) enum SettingsAction {
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
     SaveIdleSetting(IdleSetting, bool),
+    SaveFileDrop(bool),
     InstallRecommendedIntegrations,
 }
 
@@ -83,6 +84,7 @@ impl App {
                 SettingsAction::SaveIdleSetting(setting, enabled) => {
                     self.save_idle_setting(setting, enabled)
                 }
+                SettingsAction::SaveFileDrop(enabled) => self.save_file_drop(enabled),
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
                 }
@@ -312,6 +314,30 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 state.settings.list.selected = 0;
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::FileDrop;
+                state.settings.list.selected = 0;
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
+        SettingsSection::FileDrop => match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                state.settings.list.selected = 1 - state.settings.list.selected.min(1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let enabled = state.settings.list.selected == 0;
+                return Some(SettingsAction::SaveFileDrop(enabled));
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::Idle;
+                state.settings.list.selected = 0;
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Integrations;
                 state.settings.list.selected = 0;
             }
@@ -352,7 +378,7 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 return Some(SettingsAction::InstallRecommendedIntegrations);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::Idle;
+                state.settings.section = SettingsSection::FileDrop;
                 state.settings.list.selected = 0;
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
@@ -385,6 +411,7 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
         SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
         SettingsSection::Sidebar => 0,
         SettingsSection::Idle => 0,
+        SettingsSection::FileDrop => usize::from(!state.file_drop_enabled()),
         SettingsSection::Experiments => 0,
         SettingsSection::Integrations => 0,
     };
@@ -491,6 +518,14 @@ impl AppState {
                     None
                 }
             }
+            SettingsSection::FileDrop => {
+                let list_y = area.y + 3;
+                if row >= list_y && row < list_y + 2 {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
             SettingsSection::Experiments => {
                 let list_y = area.y + 3;
                 if row >= list_y && row < list_y + ExperimentSetting::ALL.len() as u16 {
@@ -517,6 +552,7 @@ impl AppState {
                         }
                         SettingsSection::Sidebar => 0,
                         SettingsSection::Idle => 0,
+                        SettingsSection::FileDrop => usize::from(!self.file_drop_enabled()),
                         SettingsSection::Experiments => 0,
                         SettingsSection::Integrations => 0,
                     });
@@ -543,6 +579,10 @@ impl AppState {
                         }
                         SettingsSection::Sidebar => sidebar_gap_cycle_action(self, idx),
                         SettingsSection::Idle => idle_toggle_action(self, idx),
+                        SettingsSection::FileDrop => {
+                            let enabled = idx == 0;
+                            Some(SettingsAction::SaveFileDrop(enabled))
+                        }
                         SettingsSection::Experiments => experiment_toggle_action(self, idx),
                         SettingsSection::Integrations => None,
                     };
@@ -690,6 +730,12 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         );
+        assert_eq!(state.settings.section, SettingsSection::FileDrop);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
         assert_eq!(state.settings.section, SettingsSection::Integrations);
 
         update_settings_state(
@@ -720,6 +766,12 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
+        assert_eq!(state.settings.section, SettingsSection::FileDrop);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+        );
         assert_eq!(state.settings.section, SettingsSection::Idle);
 
         update_settings_state(
@@ -727,6 +779,26 @@ mod tests {
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
         assert_eq!(state.settings.section, SettingsSection::Sidebar);
+    }
+
+    #[test]
+    fn settings_file_drop_toggle_returns_save_action() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::FileDrop);
+        // Default mode is `auto` (enabled) → the "on" row is selected.
+        assert_eq!(state.settings.list.selected, 0);
+
+        // Move to "off" and toggle → a save-disable action (#79).
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(action, Some(SettingsAction::SaveFileDrop(false)));
+        assert_eq!(state.mode, Mode::Settings);
     }
 
     #[test]
