@@ -141,6 +141,18 @@ pub struct PeerSummaryState {
     pub last_ok: Option<Instant>,
     /// Last poll error, cleared on success.
     pub error: Option<String>,
+    /// Gossip v3 (#101 part 2): the ORIGIN's report age at CAPTURE time, in
+    /// seconds. FROZEN — receiver dwell does NOT tick it up. Set from a wire
+    /// [`crate::protocol::FleetPeer::origin_last_ok_secs`] on snapshot ingest
+    /// and from a relayed entry's field on cache merge. `None` for locally
+    /// polled config peers, where `last_ok` (a real Instant) carries the
+    /// freshness and staleness falls back to the local-dwell path.
+    pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
+    /// peer. Set by the hub on relay so a receiver dialing a snapshot row
+    /// routes through the hub instead of trying the target directly. `None`
+    /// for entries the receiver can dial straight (its own config peers).
+    pub proxy_jump: Option<String>,
 }
 
 impl PeerSummaryState {
@@ -156,6 +168,8 @@ impl PeerSummaryState {
             workspaces: Vec::new(),
             last_ok: None,
             error: None,
+            origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -163,9 +177,17 @@ impl PeerSummaryState {
         self.is_stale_with(PEER_STALE_AFTER_SECS)
     }
 
-    /// Config-aware staleness (#96): uses the caller-supplied threshold. The
-    /// zero-arg `is_stale()` above stays as the fleet-snapshot seam (#101).
+    /// Config-aware staleness (#96): uses the caller-supplied threshold.
+    ///
+    /// Gossip v3 (#101 part 2): a carried / relayed entry judges freshness
+    /// against the ORIGIN's report age at capture — FROZEN, not the receiver's
+    /// dwell — so a snapshot entry that the origin polled 5s before capture
+    /// stays fresh even after 90s of local dwell. Locally-polled entries
+    /// (`origin_last_ok_secs = None`) keep the pre-v3 last_ok.elapsed() path.
     pub fn is_stale_with(&self, stale_after_secs: u64) -> bool {
+        if let Some(origin_secs) = self.origin_last_ok_secs {
+            return origin_secs > stale_after_secs;
+        }
         match self.last_ok {
             Some(at) => at.elapsed().as_secs() > stale_after_secs,
             None => true,
@@ -285,12 +307,22 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         workspaces: peer.workspaces.iter().cloned().map(Into::into).collect(),
         age_secs: peer.last_ok.map(|at| at.elapsed().as_secs()),
         error: peer.error.clone(),
+        // Gossip v3 (#101 part 2): forward the frozen origin assertion when
+        // the source was a snapshot / relay entry that already carried it.
+        // Otherwise the local-poll last_ok IS the origin and doubles as the
+        // frozen assertion at capture time (age_secs).
+        origin_last_ok_secs: peer
+            .origin_last_ok_secs
+            .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
+        proxy_jump: peer.proxy_jump.clone(),
     }
 }
 
-/// Rehydrate a carried peer entry into the poller's cache shape. The age is
-/// mapped back onto a synthetic `last_ok` instant so `is_stale`/`reachability`
-/// keep working — and keep decaying — without any reverse polling.
+/// Rehydrate a carried peer entry into the poller's cache shape. `last_ok`
+/// is mapped back onto a synthetic `Instant` so the local-dwell display and
+/// pre-v3 fallback keep working; `origin_last_ok_secs` carries the FROZEN
+/// origin assertion (#101 part 2) that staleness now judges against, so a
+/// receiver's dwell no longer cliffs a snapshot entry at `stale_after`.
 pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
     PeerSummaryState {
         peer: peer.name,
@@ -305,6 +337,11 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
             .age_secs
             .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
         error: peer.error,
+        // Prefer the explicit origin field; fall back to `age_secs` for
+        // pre-v22 wires so an entry from an older peer still gets the
+        // origin-honest staleness path instead of decaying against dwell.
+        origin_last_ok_secs: peer.origin_last_ok_secs.or(peer.age_secs),
+        proxy_jump: peer.proxy_jump,
     }
 }
 
@@ -318,6 +355,10 @@ pub struct PeerSummaryPayload {
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
     pub latency_ms: u64,
+    /// Gossip v3 relay: the peer's own polled peers, so the hub can render
+    /// two-hop fleet visibility. Empty when the peer is v(N-1) — additive
+    /// with a serde default keeps mixed-version fleets safe.
+    pub relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer>,
 }
 
 /// Result of one poll of one peer, sent back as an AppEvent.
@@ -544,6 +585,15 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .transpose()
         .map_err(|err| format!("summary workspaces parse error: {err}"))?
         .unwrap_or_default();
+    // Gossip v3 (#101): relayed_fleet is additive with a serde default so a
+    // v(N-1) peer that never emits the field parses cleanly.
+    let relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer> = result
+        .get("relayed_fleet")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| format!("summary relayed_fleet parse error: {err}"))?
+        .unwrap_or_default();
     Ok(PeerSummaryPayload {
         host,
         version,
@@ -551,6 +601,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         system,
         workspaces,
         latency_ms,
+        relayed_fleet,
     })
 }
 
@@ -569,6 +620,8 @@ mod tests {
             workspaces: Vec::new(),
             last_ok: None,
             error: None,
+            origin_last_ok_secs: None,
+            proxy_jump: None,
         };
         let mut peers: Vec<PeerSummaryState> = (0..FLEET_SNAPSHOT_MAX_PEERS + 3)
             .map(|i| mk(&format!("p{i}")))
@@ -629,6 +682,8 @@ mod tests {
             last_ok: age_secs
                 .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
             error: None,
+            origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -728,6 +783,27 @@ Last login: whatever banner
         assert_eq!(payload.workspaces[0].status, AgentStatus::Blocked);
         assert_eq!(payload.workspaces[0].status_age_secs, Some(840));
         assert!(payload.workspaces[0].is_linked_worktree);
+    }
+
+    #[test]
+    fn parse_summary_response_reads_relayed_fleet() {
+        // Gossip v3 (#101): peers.summary carries relayed_fleet — one hop of
+        // the polling hub's own peers, so a spoke attaching to this hub sees
+        // the FULL fleet, not just this hub's direct rows.
+        let stdout = r#"{"id":"x","result":{"host":"hub","workspaces":[],"relayed_fleet":[{"name":"spoke2","ssh_target":"lars@spoke2","host":"spoke2","workspaces":[],"origin":"hub"}]}}"#;
+        let payload = parse_summary_response(stdout, 4).unwrap();
+        assert_eq!(payload.relayed_fleet.len(), 1);
+        assert_eq!(payload.relayed_fleet[0].name, "spoke2");
+        assert_eq!(payload.relayed_fleet[0].origin, "hub");
+    }
+
+    #[test]
+    fn parse_summary_response_treats_missing_relayed_fleet_as_empty() {
+        // Additive-with-default: a v(N-1) peer that never emits relayed_fleet
+        // parses cleanly and the merged cache stays empty.
+        let stdout = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        let payload = parse_summary_response(stdout, 5).unwrap();
+        assert!(payload.relayed_fleet.is_empty());
     }
 
     #[test]
@@ -879,6 +955,115 @@ Last login: banner noise
             PeerReachability::Slow,
             "50ms > slow_threshold=20 renders Slow"
         );
+    }
+
+    #[test]
+    fn carried_entry_fresh_by_origin_survives_dwell_past_stale_after() {
+        // Gossip v3 (#101) part 2 (RED): the 60s-dwell ghost cliff dies.
+        // A carried snapshot entry whose local `last_ok` is far past the
+        // configured `stale_after` still renders Live when the ORIGIN's
+        // frozen assertion (`origin_last_ok_secs`) says fresh. Without
+        // origin_last_ok_secs, this test fails because is_stale_with falls
+        // through to last_ok.elapsed() and cliffs the row.
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "sage".into(),
+            ..Default::default()
+        });
+        // Dwell = 90s (past stale_after = 60), but origin polled sage 5s ago.
+        peer.last_ok = Instant::now().checked_sub(std::time::Duration::from_secs(90));
+        peer.origin_last_ok_secs = Some(5);
+        peer.latency_ms = Some(20);
+
+        assert!(
+            !peer.is_stale_with(60),
+            "origin-fresh entry must not cliff at local dwell = 90s"
+        );
+        assert_eq!(
+            peer.reachability_with(60, 200),
+            PeerReachability::Live,
+            "dwell past stale_after cannot ghost an origin-fresh row"
+        );
+
+        // The FROZEN origin assertion also blocks Down: if the origin's
+        // assertion says stale (origin_last_ok_secs > stale_after), we ARE
+        // stale regardless of what a fresh local last_ok would say.
+        peer.last_ok = Some(Instant::now());
+        peer.origin_last_ok_secs = Some(120);
+        assert!(
+            peer.is_stale_with(60),
+            "origin-stale entry must render Down"
+        );
+        assert_eq!(
+            peer.reachability_with(60, 200),
+            PeerReachability::Down,
+            "origin's stale assertion wins over fresh local last_ok"
+        );
+    }
+
+    #[test]
+    fn fleet_peer_wire_missing_origin_last_ok_falls_back_to_age_secs() {
+        // Mixed-version safety (#101 part 2): a pre-v22 wire has
+        // origin_last_ok_secs=None on decode. peer_from_wire falls back to
+        // age_secs, so the origin-honest staleness path applies even for
+        // entries from an older peer — the 60s cliff dies for those too.
+        let wire = crate::protocol::FleetPeer {
+            name: "old".into(),
+            ssh_target: "lars@old".into(),
+            host: Some("old".into()),
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: Some(5),
+            error: None,
+            origin_last_ok_secs: None,
+            proxy_jump: None,
+        };
+        let state = peer_from_wire(wire);
+        assert_eq!(state.origin_last_ok_secs, Some(5));
+        assert!(!state.is_stale_with(60));
+    }
+
+    #[test]
+    fn relayed_fleet_peer_json_round_trips_both_ways_missing_field() {
+        // Mixed-version JSON safety (#101 part 2): a v(N-1) peer that never
+        // emits origin_last_ok_secs decodes to None (round-trip forward), and
+        // a v(N) peer that emits it decodes intact (round-trip backward).
+        use crate::api::schema::RelayedFleetPeer;
+
+        // v(N-1) JSON → v(N) struct: origin_last_ok_secs missing → None.
+        let json_old =
+            r#"{"name":"sage","ssh_target":"lars@sage","workspaces":[],"origin":"anvil"}"#;
+        let decoded: RelayedFleetPeer = serde_json::from_str(json_old).expect("parse old wire");
+        assert_eq!(decoded.origin_last_ok_secs, None);
+
+        // v(N) struct → JSON → v(N) struct: value preserved.
+        let full = RelayedFleetPeer {
+            name: "sage".into(),
+            ssh_target: "lars@sage".into(),
+            host: None,
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: Some(3),
+            error: None,
+            origin: "anvil".into(),
+            origin_last_ok_secs: Some(3),
+            proxy_jump: Some("anvil".into()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: RelayedFleetPeer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, full);
+
+        // v(N) JSON → hypothetical v(N-1) struct: unknown fields ignored is
+        // serde_json's default; simulate by decoding into a value and checking
+        // known fields, which is the only cross-version compat guarantee.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["name"], "sage");
+        assert_eq!(value["origin_last_ok_secs"], 3);
     }
 
     #[test]

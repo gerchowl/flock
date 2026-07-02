@@ -269,6 +269,10 @@ fn decide_next_leg(
                 // the user lands back at the previous leg with a top-right
                 // failure notice (#67).
                 context: remote::LaunchContext::FederationSwitch,
+                // Gossip v3 (#101 part 3): a snapshot-derived switch target
+                // rides its stamped ProxyJump; a config peer / home target
+                // carries None here and dials directly.
+                proxy_jump: switch.proxy_jump,
             });
             LegStep::Switch {
                 previous: (current.clone(), switch_failure_label(&next)),
@@ -777,6 +781,7 @@ mod tests {
             live_handoff: false,
             fleet: None,
             context: remote::LaunchContext::Cli,
+            proxy_jump: None,
         });
         assert_eq!(switch_failure_label(&leg), "lars@sage");
     }
@@ -800,6 +805,7 @@ mod tests {
             live_handoff: false,
             fleet: None,
             context: remote::LaunchContext::FederationSwitch,
+            proxy_jump: None,
         })
     }
 
@@ -809,6 +815,7 @@ mod tests {
             target: "lars@sage".to_string(),
             fleet: None,
             focus_workspace: None,
+            proxy_jump: None,
         });
         match decide_next_leg(&AttachLeg::Local, switch, Ok(()), None, false) {
             LegStep::Switch { next, previous } => {

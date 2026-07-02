@@ -375,7 +375,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                     .map(super::grammar::project_identity_label)
                     .or_else(|| summary.project_label.clone()),
                 target: super::grammar::remote_member_target(summary),
-                remote: Some((peer_ref, ws_idx)),
+                remote: Some((peer_ref.clone(), ws_idx)),
             });
         }
     }
@@ -779,7 +779,7 @@ fn single_peer_entries(app: &AppState, ssh_target: &str) -> Vec<WorkspaceListEnt
     for (_, rows) in by_project {
         for (offset, ws_idx) in rows.into_iter().enumerate() {
             entries.push(WorkspaceListEntry::Remote {
-                peer: peer_ref,
+                peer: peer_ref.clone(),
                 ws_idx,
                 indented: offset > 0,
             });
@@ -856,7 +856,7 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
                 project_order.push(project_key);
                 Vec::new()
             });
-            rows.push((peer_ref, ws_idx));
+            rows.push((peer_ref.clone(), ws_idx));
         }
     }
     if remotes_by_project.is_empty() {
@@ -903,7 +903,7 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
             entries.insert(
                 end + 1 + offset,
                 WorkspaceListEntry::Remote {
-                    peer: *peer_ref,
+                    peer: peer_ref.clone(),
                     ws_idx: *ws_idx,
                     indented: true,
                 },
@@ -925,7 +925,7 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
         }
         for (offset, (peer_ref, ws_idx)) in remotes_by_project[project_key].iter().enumerate() {
             entries.push(WorkspaceListEntry::Remote {
-                peer: *peer_ref,
+                peer: peer_ref.clone(),
                 ws_idx: *ws_idx,
                 indented: offset > 0,
             });
@@ -957,7 +957,7 @@ fn server_filter_label(app: &AppState) -> Option<String> {
 /// peer's display label when it doesn't, the workspace name as a last resort.
 pub(crate) fn remote_entry_label(
     app: &AppState,
-    peer_ref: crate::app::state::RemotePeerRef,
+    peer_ref: &crate::app::state::RemotePeerRef,
     ws_idx: usize,
     indented: bool,
 ) -> String {
@@ -998,7 +998,7 @@ pub(crate) fn remote_entry_label(
 fn remote_project_has_siblings(
     app: &AppState,
     project_key: Option<&str>,
-    peer_ref: crate::app::state::RemotePeerRef,
+    peer_ref: &crate::app::state::RemotePeerRef,
     ws_idx: usize,
 ) -> bool {
     let Some(project_key) = project_key else {
@@ -1010,7 +1010,7 @@ fn remote_project_has_siblings(
             .enumerate()
             .any(|(other_idx, other_ws)| {
                 other_ws.project_key.as_deref() == Some(project_key)
-                    && !(other_ref == peer_ref && other_idx == ws_idx)
+                    && !(&other_ref == peer_ref && other_idx == ws_idx)
             })
     })
 }
@@ -1044,46 +1044,24 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
     }
     slots.push(None);
 
+    // Gossip v3 (#101 part 4): the band and the spaces list share ONE deduped
+    // remote-row list. Same key (lowercased reported host), same tier + freshness
+    // tie-break — so a two-hub fleet CANNOT produce a duplicate row here that
+    // the spaces list also shows, and both surfaces agree on which entry won.
     let mut peers: Vec<Option<PeerSwitchRequest>> = Vec::new();
-    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
-        peers.extend(
-            (0..snapshot.peers.len())
-                .map(|entry_idx| Some(PeerSwitchRequest::SnapshotPeer { entry_idx })),
-        );
+    for (peer_ref, _peer) in app.remote_peers() {
+        // Origin rows fold into the spaces list, never a band slot — the Home
+        // row above already stands for the origin server here.
+        if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
+            continue;
+        }
+        peers.push(Some(peer_ref.switch_request(0)));
     }
-    peers.extend((0..app.peer_summaries.len()).map(|peer_idx| {
-        Some(PeerSwitchRequest::ConfigPeer {
-            peer_idx,
-            ws_idx: 0,
-        })
-    }));
-    // Sort by machine identity, breaking ties so a locally-polled config peer
-    // sorts before a carried snapshot row for the SAME host (#40) — then dedup
-    // adjacent identical identities, keeping the first (the config peer). A host
-    // advertised both via a carried snapshot and the server's own `[[peers]]`
-    // (multi-hub fleets) must appear ONCE, not twice.
-    peers.sort_by_cached_key(|slot| {
-        (
-            server_slot_sort_key(app, slot),
-            server_slot_source_rank(slot),
-        )
-    });
-    let mut seen = std::collections::HashSet::new();
-    peers.retain(|slot| {
-        let key = server_slot_sort_key(app, slot);
-        key.is_empty() || seen.insert(key)
-    });
+    // Stable order across peers so band layout does not shuffle: sort by the
+    // shared host key (lowercased reported host).
+    peers.sort_by_cached_key(|slot| server_slot_sort_key(app, slot));
     slots.extend(peers);
     slots
-}
-
-/// Dedup tie-break: a locally-polled config peer (fresher) wins over a carried
-/// snapshot row for the same host (#40).
-fn server_slot_source_rank(slot: &Option<crate::app::state::PeerSwitchRequest>) -> u8 {
-    match slot {
-        Some(crate::app::state::PeerSwitchRequest::ConfigPeer { .. }) => 0,
-        _ => 1,
-    }
 }
 
 /// Machine-independent sort key for a peer band row: the host the peer reports
@@ -1430,7 +1408,7 @@ pub(crate) fn compute_workspace_list_areas(
                     break;
                 }
                 remote_cards.push(crate::app::state::RemoteCardArea {
-                    peer: *peer,
+                    peer: peer.clone(),
                     ws_idx: *ws_idx,
                     rect: Rect::new(body.x, row_y, body.width, 1),
                     indented: *indented,
@@ -1836,6 +1814,13 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                     continue;
                 };
                 peer_server_rows(peer, p)
+            }
+            Some(crate::app::state::PeerSwitchRequest::RelayedPeer { .. }) => {
+                // Rendering relayed cache rows on the LOCAL band is deferred
+                // (#101 gossip v3 part 4): the RelayedPeer switch variant
+                // exists for a follow-up that materialises PeerSummaryState
+                // from the relayed cache. Skip for now — no band row.
+                continue;
             }
             // Origin-workspace rows fold into the spaces list rather than the band —
             // the home row already stands for the origin server here.
@@ -2617,7 +2602,7 @@ fn render_workspace_list(
     }
 
     for card in &app.view.remote_card_areas {
-        let Some(peer) = app.remote_peer(card.peer) else {
+        let Some(peer) = app.remote_peer(&card.peer) else {
             continue;
         };
         let Some(remote_ws) = peer.workspaces.get(card.ws_idx) else {
@@ -2628,7 +2613,7 @@ fn render_workspace_list(
         }
         let stale = peer.is_stale() || peer.error.is_some();
         let (icon, icon_style) = remote_agent_icon(remote_ws.status, app.spinner_tick, p);
-        let label = remote_entry_label(app, card.peer, card.ws_idx, card.indented);
+        let label = remote_entry_label(app, &card.peer, card.ws_idx, card.indented);
         let max_label =
             (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
@@ -3226,6 +3211,100 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_dedup_makes_band_and_spaces_list_agree_on_same_host() {
+        // Gossip v3 (#101 part 4) RED: the band and the spaces list share a
+        // single deduped remote-row list (lowercased reported host as key).
+        // Two-source fixture: same host advertised via a carried snapshot AND
+        // a local config peer. Both surfaces must show ONE row about that
+        // host, and the LOCALLY-POLLED config peer must win the tie.
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("anvil-from-snap", "anvil")],
+        ));
+        app.peer_summaries = vec![peer_named_with_host("anvil-cfg", "anvil")];
+
+        // Servers band: one non-Home/non-Self entry, and it MUST be the
+        // config peer (rank 0 beats the snapshot rank 2).
+        let band_peers: Vec<crate::app::state::PeerSwitchRequest> = server_band_slots(&app)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                !matches!(
+                    slot,
+                    crate::app::state::PeerSwitchRequest::Home
+                        | crate::app::state::PeerSwitchRequest::OriginWorkspace { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            band_peers.len(),
+            1,
+            "band must show ONE row: {band_peers:?}"
+        );
+        assert!(
+            matches!(
+                band_peers[0],
+                crate::app::state::PeerSwitchRequest::ConfigPeer { .. }
+            ),
+            "locally polled config peer must win the dedup: {band_peers:?}"
+        );
+
+        // Spaces list source of truth: single row about `anvil`, and it is
+        // the config peer ref (not the snapshot one). Both surfaces agree.
+        let remote_rows: Vec<crate::app::state::RemotePeerRef> = app
+            .remote_peers()
+            .into_iter()
+            .map(|(peer_ref, _)| peer_ref)
+            .collect();
+        assert_eq!(
+            remote_rows.len(),
+            1,
+            "spaces list must show ONE row: {remote_rows:?}"
+        );
+        assert!(
+            matches!(
+                remote_rows[0],
+                crate::app::state::RemotePeerRef::Config { .. }
+            ),
+            "spaces list must agree with band: config peer wins: {remote_rows:?}"
+        );
+    }
+
+    #[test]
+    fn consolidated_dedup_snapshot_ties_break_by_frozen_origin_freshness() {
+        // Gossip v3 (#101 part 4) RED: same-source ties (two snapshot rows
+        // about the same host — a scenario possible once relays fold into
+        // fleet_snapshot) break on frozen origin freshness. The SMALLER
+        // origin_last_ok_secs (fresher origin assertion) wins.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut stale = peer_named_with_host("anvil", "anvil");
+        stale.origin_last_ok_secs = Some(45);
+        let mut fresh = peer_named_with_host("anvil", "anvil");
+        fresh.origin_last_ok_secs = Some(3);
+        let snapshot = crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: vec![stale, fresh],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        };
+        app.fleet_snapshot = Some(snapshot);
+
+        let remote_rows = app.remote_peers();
+        assert_eq!(
+            remote_rows.len(),
+            1,
+            "same-host duplicates must dedupe: {remote_rows:?}"
+        );
+        // The winner is the FRESHER of the two — origin_last_ok_secs = 3.
+        assert_eq!(
+            remote_rows[0].1.origin_last_ok_secs,
+            Some(3),
+            "fresher origin assertion must win same-source tie"
+        );
+    }
+
+    #[test]
     fn server_band_order_converges_across_viewers() {
         // Two viewers of the SAME three machines (anvil/ksb/sage) that each
         // learned them in a different order AND via a different source split
@@ -3772,7 +3851,7 @@ mod tests {
         assert_eq!(
             remote_entry_label(
                 &app,
-                crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                &crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
                 0,
                 true
             ),
@@ -3830,11 +3909,11 @@ mod tests {
         // erase the project name. The indented members carry the member grammar.
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
-            remote_entry_label(&app, config_peer, 0, false),
+            remote_entry_label(&app, &config_peer, 0, false),
             "gerchowl/dotfiles"
         );
         assert_eq!(
-            remote_entry_label(&app, config_peer, 1, true),
+            remote_entry_label(&app, &config_peer, 1, true),
             "sage:vm-dev"
         );
     }
@@ -3857,7 +3936,7 @@ mod tests {
         )];
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
-            remote_entry_label(&app, config_peer, 0, false),
+            remote_entry_label(&app, &config_peer, 0, false),
             "gerchowl/dotfiles · sage:main"
         );
     }
@@ -3968,7 +4047,7 @@ mod tests {
         );
         // Snapshot rows label like config-peer rows: carried host + branch.
         assert_eq!(
-            remote_entry_label(&app, RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
+            remote_entry_label(&app, &RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
             "anvil:fix/pty"
         );
 
@@ -4022,7 +4101,7 @@ mod tests {
         );
         // Labels by the origin host (#62 grammar): `mba22:<branch>`.
         assert_eq!(
-            remote_entry_label(&app, RemotePeerRef::Origin, 0, true),
+            remote_entry_label(&app, &RemotePeerRef::Origin, 0, true),
             "mba22:keyboard-shorcuts"
         );
         // Clicking it emits a home-bound switch with the workspace focus.
@@ -4174,12 +4253,12 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Remote {
-                    peer: sage,
+                    peer: sage.clone(),
                     ws_idx: 0,
                     indented: false
                 },
                 WorkspaceListEntry::Remote {
-                    peer: sage,
+                    peer: sage.clone(),
                     ws_idx: 2,
                     indented: true
                 },

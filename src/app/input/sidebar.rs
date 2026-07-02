@@ -524,10 +524,20 @@ impl AppState {
             None => return Some(ServerFilter::Local),
             Some(PeerSwitchRequest::Home) => return None,
             Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
-                self.remote_peer(crate::app::state::RemotePeerRef::Config { peer_idx })
+                self.remote_peer(&crate::app::state::RemotePeerRef::Config { peer_idx })
             }
             Some(PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
-                self.remote_peer(crate::app::state::RemotePeerRef::Snapshot { entry_idx })
+                self.remote_peer(&crate::app::state::RemotePeerRef::Snapshot { entry_idx })
+            }
+            Some(PeerSwitchRequest::RelayedPeer { host_key }) => {
+                // Resolve via the relayed cache: derive the ssh_target for the
+                // server-scope filter, then fall through.
+                return self
+                    .relayed_fleet_cache
+                    .get(&host_key)
+                    .map(|entry| ServerFilter::Peer {
+                        ssh_target: entry.ssh_target.clone(),
+                    });
             }
             // Origin-workspace rows are spaces-list folds, never band slots,
             // so there's no server filter to derive for one.

@@ -577,6 +577,7 @@ pub(crate) fn remote_bridge_started(
     ssh_config_file: Option<&Path>,
     ssh_opts: &[&str],
     remote_command: &str,
+    proxy_jump: Option<&str>,
 ) {
     tracing::info!(
         event = "remote.bridge.started",
@@ -588,6 +589,10 @@ pub(crate) fn remote_bridge_started(
             .unwrap_or_default(),
         ssh_opts = ssh_opts.join(","),
         remote_command,
+        // Gossip v3 (#101 part 3): a snapshot-derived leg's ProxyJump
+        // identity rides the observability event so a failed multi-hop dial
+        // is diagnosable from flock.log at DEFAULT level.
+        proxy_jump = proxy_jump.unwrap_or_default(),
         "ssh bridge starting"
     );
 }
@@ -3061,6 +3066,7 @@ mod tests {
                 Some(Path::new("/tmp/keepalive-cfg")),
                 &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
                 "exec \"$HOME/.local/bin/flk\" remote-client-bridge",
+                None,
             );
         });
         assert!(out.contains("event=\"remote.bridge.started\""), "{out}");
@@ -3076,6 +3082,26 @@ mod tests {
             "the full remote command must be visible at INFO: {out}"
         );
         assert!(out.contains("INFO"), "bridge start must be INFO: {out}");
+    }
+
+    #[test]
+    fn remote_bridge_started_logs_proxy_jump_when_set() {
+        // Gossip v3 (#101 part 3): a snapshot-derived leg's ProxyJump
+        // identity must ride the observability event so a failed multi-hop
+        // dial is diagnosable from flock.log at DEFAULT level.
+        let out = capture_logs(|| {
+            remote_bridge_started(
+                "spoke2",
+                None,
+                &["-o", "BatchMode=yes"],
+                "exec flk remote-client-bridge",
+                Some("hub"),
+            );
+        });
+        assert!(
+            out.contains("proxy_jump=\"hub\""),
+            "proxy_jump must appear: {out}"
+        );
     }
 
     #[test]

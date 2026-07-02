@@ -200,6 +200,51 @@ impl App {
             };
             match fetch.result {
                 Ok(payload) => {
+                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
+                    // into our cache BEFORE we mutate `summary`. Loop
+                    // prevention rides on the origin field: we drop entries
+                    // whose origin is us (the ONE full-cycle we could see —
+                    // hub A polls hub B, hub B relayed A's own peers back).
+                    let self_host = crate::app::api::peers::short_host_name();
+                    let self_host_lower = self_host.to_ascii_lowercase();
+                    for entry in payload.relayed_fleet {
+                        if entry.origin.eq_ignore_ascii_case(&self_host) {
+                            continue;
+                        }
+                        let host_key = entry
+                            .host
+                            .as_deref()
+                            .filter(|host| !host.is_empty())
+                            .unwrap_or(&entry.ssh_target)
+                            .to_ascii_lowercase();
+                        if host_key == self_host_lower {
+                            // Never store an entry about ourselves as a
+                            // relayed row — the self row lives on the
+                            // origin_summary path.
+                            continue;
+                        }
+                        // Freshest-wins: replace an older cached entry using
+                        // the origin's own assertion (`origin_last_ok_secs`,
+                        // #101 part 2) so cross-hub ties resolve honestly,
+                        // falling back to `age_secs` for a v(N-1) origin.
+                        let existing_freshness = |peer: &crate::api::schema::RelayedFleetPeer| {
+                            peer.origin_last_ok_secs.or(peer.age_secs)
+                        };
+                        let insert = match self.state.relayed_fleet_cache.get(&host_key) {
+                            Some(existing) => {
+                                match (existing_freshness(existing), existing_freshness(&entry)) {
+                                    (Some(cur), Some(new)) => new <= cur,
+                                    (None, Some(_)) => true,
+                                    (Some(_), None) => false,
+                                    (None, None) => true,
+                                }
+                            }
+                            None => true,
+                        };
+                        if insert {
+                            self.state.relayed_fleet_cache.insert(host_key, entry);
+                        }
+                    }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
@@ -1060,6 +1105,7 @@ mod tests {
                         status_age_secs: Some(840),
                         activity: None,
                     }],
+                    relayed_fleet: Vec::new(),
                 }),
             },
         ));
@@ -1142,6 +1188,7 @@ mod tests {
                     system,
                     latency_ms: 10,
                     workspaces: ws,
+                    relayed_fleet: Vec::new(),
                 }),
             })
         };

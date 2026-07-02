@@ -665,6 +665,10 @@ pub enum PeerSwitchRequest {
     ConfigPeer { peer_idx: usize, ws_idx: usize },
     /// A carried fleet-snapshot row: index into `fleet_snapshot.peers`.
     SnapshotPeer { entry_idx: usize },
+    /// A relayed-cache row (#101 gossip v3 part 4): keyed by lowercased host
+    /// into `state.relayed_fleet_cache`. Resolves the target and any stamped
+    /// ProxyJump identity from the cached entry.
+    RelayedPeer { host_key: String },
     /// A row from the origin (hub) server's OWN summary (#66): re-attach home
     /// via the reserved target, carrying the selected workspace as the
     /// post-attach focus target so the hub lands on that space.
@@ -686,16 +690,23 @@ pub struct ServerCardArea {
 }
 
 /// Which cache a federated remote row in the spaces list reads from: a
-/// config-owned peer (live-polled `peer_summaries`) or a carried
-/// fleet-snapshot entry (render-only, freshness just decays). Selecting a
-/// row maps back onto the matching [`PeerSwitchRequest`] variant so both
-/// reuse the same switch path as the servers band.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// config-owned peer (live-polled `peer_summaries`), a carried
+/// fleet-snapshot entry (render-only, freshness just decays), a relayed
+/// cache row (#101 gossip v3), or the origin summary. Selecting a row maps
+/// back onto the matching [`PeerSwitchRequest`] variant so both reuse the
+/// same switch path as the servers band.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemotePeerRef {
     /// Index into `state.peer_summaries`.
     Config { peer_idx: usize },
     /// Index into `state.fleet_snapshot.peers`.
     Snapshot { entry_idx: usize },
+    /// Lowercased-host key into `state.relayed_fleet_cache` (#101 gossip v3).
+    /// Constructed by a follow-up that materialises PeerSummaryState from the
+    /// relayed cache so it can render on the local sidebar. Reserved slot in
+    /// the ranked dedup today (`REMOTE_ROW_RANK_RELAYED`).
+    #[allow(dead_code)]
+    Relayed { host_key: String },
     /// The carried origin (hub) server's OWN summary (#66): its workspaces
     /// fold into the spaces list like any peer, but selecting one switches
     /// HOME with that workspace focused, never an ssh dial.
@@ -707,10 +718,18 @@ impl RemotePeerRef {
     /// carry the workspace index for the best-effort remote pre-focus;
     /// snapshot rows reuse the band's plain pass-through switch; origin rows
     /// land home with the workspace as the post-attach focus target.
-    pub(crate) fn switch_request(self, ws_idx: usize) -> PeerSwitchRequest {
+    pub(crate) fn switch_request(&self, ws_idx: usize) -> PeerSwitchRequest {
         match self {
-            Self::Config { peer_idx } => PeerSwitchRequest::ConfigPeer { peer_idx, ws_idx },
-            Self::Snapshot { entry_idx } => PeerSwitchRequest::SnapshotPeer { entry_idx },
+            Self::Config { peer_idx } => PeerSwitchRequest::ConfigPeer {
+                peer_idx: *peer_idx,
+                ws_idx,
+            },
+            Self::Snapshot { entry_idx } => PeerSwitchRequest::SnapshotPeer {
+                entry_idx: *entry_idx,
+            },
+            Self::Relayed { host_key } => PeerSwitchRequest::RelayedPeer {
+                host_key: host_key.clone(),
+            },
             Self::Origin => PeerSwitchRequest::OriginWorkspace { ws_idx },
         }
     }
@@ -1777,6 +1796,14 @@ pub struct AppState {
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
+    /// Gossip v3 relay cache (#101): fleet entries this server received via
+    /// its config peers' `relayed_fleet`. Keyed on lowercased reported host
+    /// (fallback: ssh_target), so a host advertised by two hubs collapses to
+    /// one row with the freshest wins. Never re-relayed — the answering
+    /// server's own `peers.summary` only relays its OWN polled peers,
+    /// bounding hop count to one.
+    pub relayed_fleet_cache:
+        std::collections::HashMap<String, crate::api::schema::RelayedFleetPeer>,
     /// Fleet snapshot carried by the attached client's handshake
     /// (hub-and-spoke down-gossip): origin/home label + render-only peer
     /// rows. None when the client attached locally — no home row then.
@@ -2070,55 +2097,159 @@ impl AppState {
         }
     }
 
-    /// Federated peers feeding the spaces list's remote rows: every config
-    /// peer (live-polled), then carried fleet-snapshot entries not shadowed
-    /// by a config peer — dedup by ssh target, the polled entry wins. A
-    /// spoke has no config peers, so its whole carried fleet folds in;
-    /// render-only either way, snapshot freshness just decays (#46).
+    // ---- Consolidated remote-row dedup (#101 gossip v3 part 4) ----
+
+    // Rank tiers for `remote_row_candidates` — LOWER wins. Kept as
+    // module-private constants so the reader sees the ordering in one place.
+
+    /// Federated peers feeding BOTH the servers band and the spaces list's
+    /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
+    /// lowercased reported host (fallback: ssh_target). Tie-break tier:
+    /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
+    /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
+    /// same-source ties the entry with the smaller `origin_last_ok_secs`
+    /// wins (fresher). Rendering surfaces read from the same source of
+    /// truth, so a two-hub fleet cannot produce duplicate rows or divergent
+    /// state across surfaces.
     pub(crate) fn remote_peers(&self) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
-        let mut peers: Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> = self
-            .peer_summaries
-            .iter()
-            .enumerate()
-            .map(|(peer_idx, peer)| (RemotePeerRef::Config { peer_idx }, peer))
-            .collect();
-        if let Some(snapshot) = self.fleet_snapshot.as_ref() {
-            // The hub's OWN workspaces (#66) fold first, ahead of carried
-            // peers — the home spaces are the most relevant on a spoke.
-            if let Some(origin) = snapshot.origin_summary.as_ref() {
-                peers.push((RemotePeerRef::Origin, origin));
+        // Single pass, insertion-order preserved: for each candidate in the
+        // enumeration order, record either the first sighting of its host
+        // key or REPLACE the previous winner in place when the new one has a
+        // strictly higher tier / freshness. This keeps the layout stable
+        // across renders — no hashmap-hop or `.sort()` shuffle.
+        let mut ordered: Vec<(
+            RemotePeerRef,
+            &crate::peers::PeerSummaryState,
+            u8,
+            Option<u64>,
+        )> = Vec::new();
+        let mut host_to_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for (rank, entry_ref, peer) in self.remote_row_candidates() {
+            let host_key = row_host_key(peer);
+            let freshness = row_freshness(peer);
+            if let Some(&idx) = host_to_idx.get(&host_key) {
+                let (_, _, cur_rank, cur_fresh) = ordered[idx];
+                // Lower rank number = higher tier (0 = ConfigPeer wins).
+                let replace = if rank != cur_rank {
+                    rank < cur_rank
+                } else {
+                    // Same source tier: freshest (smaller frozen origin
+                    // seconds) wins; a Some value beats None.
+                    match (cur_fresh, freshness) {
+                        (Some(cur), Some(new)) => new < cur,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    }
+                };
+                if replace {
+                    ordered[idx] = (entry_ref, peer, rank, freshness);
+                }
+            } else {
+                host_to_idx.insert(host_key, ordered.len());
+                ordered.push((entry_ref, peer, rank, freshness));
             }
-            peers.extend(
-                snapshot
-                    .peers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| {
-                        !self
-                            .peer_summaries
-                            .iter()
-                            .any(|config| config.ssh_target == entry.ssh_target)
-                    })
-                    .map(|(entry_idx, entry)| (RemotePeerRef::Snapshot { entry_idx }, entry)),
-            );
         }
-        peers
+
+        ordered
+            .into_iter()
+            .map(|(entry_ref, peer, _, _)| (entry_ref, peer))
+            .collect()
+    }
+
+    /// All candidate remote-row sources with their dedup rank (lower =
+    /// higher priority). Consumed by [`remote_peers`](Self::remote_peers)
+    /// and any other surface that must render the same deduped set.
+    fn remote_row_candidates(&self) -> Vec<(u8, RemotePeerRef, &crate::peers::PeerSummaryState)> {
+        let mut candidates: Vec<(u8, RemotePeerRef, &crate::peers::PeerSummaryState)> = Vec::new();
+        // Rank 0: locally polled — freshest live data, always wins ties.
+        candidates.extend(
+            self.peer_summaries
+                .iter()
+                .enumerate()
+                .map(|(peer_idx, peer)| {
+                    (
+                        REMOTE_ROW_RANK_CONFIG,
+                        RemotePeerRef::Config { peer_idx },
+                        peer,
+                    )
+                }),
+        );
+        // Rank 1 (relayed cache) is reserved for a follow-up: rendering
+        // requires a materialised `PeerSummaryState`, so relayed entries
+        // ride the outgoing snapshot path today but do not render on the
+        // LOCAL sidebar. The `RelayedPeer` switch variant and this rank slot
+        // exist so that future rendering is a pure additive change.
+        if let Some(snapshot) = self.fleet_snapshot.as_ref() {
+            // Rank 2: carried snapshot peers.
+            candidates.extend(snapshot.peers.iter().enumerate().map(|(entry_idx, entry)| {
+                (
+                    REMOTE_ROW_RANK_SNAPSHOT,
+                    RemotePeerRef::Snapshot { entry_idx },
+                    entry,
+                )
+            }));
+            // Rank 3: origin summary. The hub's own workspaces fold in
+            // ahead of carried peers (#66); loses to a same-host config
+            // peer or a snapshot row about the same host.
+            if let Some(origin) = snapshot.origin_summary.as_ref() {
+                candidates.push((REMOTE_ROW_RANK_ORIGIN, RemotePeerRef::Origin, origin));
+            }
+        }
+        candidates
     }
 
     /// Resolve a remote-row peer reference back to its cached summary.
     pub(crate) fn remote_peer(
         &self,
-        peer: RemotePeerRef,
+        peer: &RemotePeerRef,
     ) -> Option<&crate::peers::PeerSummaryState> {
         match peer {
-            RemotePeerRef::Config { peer_idx } => self.peer_summaries.get(peer_idx),
+            RemotePeerRef::Config { peer_idx } => self.peer_summaries.get(*peer_idx),
             RemotePeerRef::Snapshot { entry_idx } => {
-                self.fleet_snapshot.as_ref()?.peers.get(entry_idx)
+                self.fleet_snapshot.as_ref()?.peers.get(*entry_idx)
             }
+            RemotePeerRef::Relayed { .. } => None,
             RemotePeerRef::Origin => self.fleet_snapshot.as_ref()?.origin_summary.as_ref(),
         }
     }
+}
 
+/// Consolidated dedup ranks for remote rows (#101 gossip v3 part 4).
+/// LOWER wins — a locally-polled config peer beats a carried snapshot row.
+const REMOTE_ROW_RANK_CONFIG: u8 = 0;
+#[allow(dead_code)]
+const REMOTE_ROW_RANK_RELAYED: u8 = 1;
+const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
+const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
+
+/// Machine-independent host key: the peer's reported host (fallback: config
+/// name or ssh_target), lowercased. Used across surfaces so a host cannot
+/// dedupe under different keys on the band vs. the spaces list.
+fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
+    let fallback = if peer.peer.is_empty() {
+        peer.ssh_target.as_str()
+    } else {
+        peer.peer.as_str()
+    };
+    let raw = peer
+        .host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(fallback);
+    raw.to_ascii_lowercase()
+}
+
+/// Frozen origin freshness (#101 part 2): the origin's report age at capture
+/// in seconds. Smaller = fresher. `None` when this row has never been polled
+/// or was ingested without an origin assertion (v(N-1) wire).
+fn row_freshness(peer: &crate::peers::PeerSummaryState) -> Option<u64> {
+    peer.origin_last_ok_secs
+        .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs()))
+}
+
+impl AppState {
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
         // Lazy GC: drop aliases whose target pane no longer exists. Runs on
@@ -2432,6 +2563,7 @@ impl AppState {
             branch_pivot_message: String::new(),
             peers: Vec::new(),
             peer_summaries: Vec::new(),
+            relayed_fleet_cache: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,
