@@ -545,6 +545,42 @@ mod tests {
     }
 
     #[test]
+    fn env_gossip_poll_interval_secs_maps_to_config() {
+        // #96: the generic FLOCK_<UPPER_SNAKE_PATH> layer must reach the new
+        // [gossip] section by convention — no extra plumbing per field.
+        let _lock = poisoned_lock(crate::config::test_config_env_lock());
+        let _e = EnvGuard::set("FLOCK_GOSSIP_POLL_INTERVAL_SECS", "2");
+        let _s = EnvGuard::unset("FLOCK_DISABLE_SOUND");
+        let _h = EnvGuard::unset("FLOCK_HOST_NAME");
+
+        let loaded = load_env_only();
+
+        assert_eq!(
+            loaded.config.gossip.poll_interval_secs, 2,
+            "FLOCK_GOSSIP_POLL_INTERVAL_SECS must reach [gossip] poll_interval_secs"
+        );
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "no diagnostics for a valid env value, got {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn env_gossip_stale_after_secs_maps_to_config() {
+        // Cross-check that the mapping is not a special-case for one field —
+        // any [gossip] scalar picks up the FLOCK_GOSSIP_* env by convention.
+        let _lock = poisoned_lock(crate::config::test_config_env_lock());
+        let _e = EnvGuard::set("FLOCK_GOSSIP_STALE_AFTER_SECS", "45");
+        let _s = EnvGuard::unset("FLOCK_DISABLE_SOUND");
+        let _h = EnvGuard::unset("FLOCK_HOST_NAME");
+
+        let loaded = load_env_only();
+
+        assert_eq!(loaded.config.gossip.stale_after_secs, 45);
+    }
+
+    #[test]
     fn blocklist_matches_segment_aligned_prefixes() {
         assert!(is_blocklisted("keys"));
         assert!(is_blocklisted("keys.prefix"));

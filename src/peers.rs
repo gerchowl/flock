@@ -4,12 +4,19 @@
 //!
 //! Peers never share PTYs or frames — only this lightweight summary gossip.
 
-use std::time::Instant;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::api::schema::PeerWorkspaceSummary;
 use crate::config::PeerConfig;
 
-/// Seconds between summary poll rounds.
+/// Seconds between summary poll rounds — the shipped default and the ONE
+/// source of truth `GossipConfig::default()` reads. Live callers threaded to
+/// config (`app::App::gossip_poll_interval_secs` and the round handler) pick
+/// up the tunable value; the fleet-snapshot rendering path (see
+/// `PeerSummaryState::is_stale` / `reachability`) still reads the const —
+/// documented seam for #101 (staleness rework), whose new model will thread
+/// config where reachable and retire the const consumers.
 pub const PEER_POLL_INTERVAL_SECS: u64 = 15;
 /// First poll fires shortly after startup so the sidebar populates fast.
 pub const PEER_POLL_INITIAL_DELAY_SECS: u64 = 3;
@@ -18,6 +25,100 @@ pub const PEER_STALE_AFTER_SECS: u64 = 60;
 
 /// A peer whose latency exceeds this renders as "slow" (yellow dot).
 pub const PEER_SLOW_LATENCY_MS: u64 = 150;
+
+/// Overlap-safe per-peer round dispatcher (#96): the round handler consults
+/// the tracker to decide whether to spawn a fetch for each peer. Two guards:
+///
+/// 1. **In-flight guard** — a peer whose previous poll has not completed
+///    (still-running SSH `flock peers summary`) is skipped this round. A slow
+///    ProxyJump peer polled at a short cadence cannot stack concurrent SSH
+///    invocations against itself, no matter what interval is set.
+/// 2. **Next-due guard** — a peer with a per-`[[peers]]` `poll_interval_secs`
+///    override longer than the global cadence is polled only when its per-peer
+///    deadline has arrived.
+///
+/// The tracker is memory-only. On config reload the round handler retains only
+/// the entries for still-configured peer names.
+#[derive(Debug, Default)]
+pub struct PeerPollTracker {
+    entries: HashMap<String, PeerPollEntry>,
+}
+
+#[derive(Debug)]
+struct PeerPollEntry {
+    /// A dispatched fetch is still running (SSH round-trip in-flight).
+    in_flight: bool,
+    /// Earliest instant a NEW poll may fire — set to `now + effective_interval`
+    /// when the previous one was dispatched. `None` = no history yet, so the
+    /// first `should_poll_now` call always dispatches.
+    next_due: Option<Instant>,
+}
+
+impl PeerPollTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide whether to dispatch a poll for `peer_name` NOW. Returns `true`
+    /// when the round should spawn a fetch — and eagerly marks the peer as
+    /// in-flight, so back-to-back calls within one round each dispatch at most
+    /// once. Callers MUST invoke `mark_finished` on completion (both success
+    /// and error), else this peer is silently frozen out until config reload.
+    pub fn should_poll_now(
+        &mut self,
+        peer_name: &str,
+        now: Instant,
+        effective_interval: Duration,
+    ) -> bool {
+        let entry = self
+            .entries
+            .entry(peer_name.to_string())
+            .or_insert(PeerPollEntry {
+                in_flight: false,
+                next_due: None,
+            });
+        if entry.in_flight {
+            return false;
+        }
+        if let Some(due) = entry.next_due {
+            if now < due {
+                return false;
+            }
+        }
+        entry.in_flight = true;
+        entry.next_due = Some(now + effective_interval);
+        true
+    }
+
+    /// Release the in-flight lock for `peer_name`. Called from the
+    /// `PeerSummaryFetched` handler regardless of `Ok`/`Err` — the next
+    /// round's `should_poll_now` will then decide from the next-due gate.
+    pub fn mark_finished(&mut self, peer_name: &str) {
+        if let Some(entry) = self.entries.get_mut(peer_name) {
+            entry.in_flight = false;
+        }
+    }
+
+    /// Prune entries for peers no longer in config. Preserves in-flight state
+    /// for surviving peers so a reload during a slow poll doesn't accidentally
+    /// permit a concurrent dispatch.
+    pub fn retain_only<I>(&mut self, names: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let keep: std::collections::HashSet<String> =
+            names.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.entries.retain(|k, _| keep.contains(k));
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self, peer_name: &str) -> bool {
+        self.entries
+            .get(peer_name)
+            .is_some_and(|entry| entry.in_flight)
+    }
+}
 
 /// Cached state of one configured peer, updated by the poll loop.
 #[derive(Debug, Clone)]
@@ -59,8 +160,14 @@ impl PeerSummaryState {
     }
 
     pub fn is_stale(&self) -> bool {
+        self.is_stale_with(PEER_STALE_AFTER_SECS)
+    }
+
+    /// Config-aware staleness (#96): uses the caller-supplied threshold. The
+    /// zero-arg `is_stale()` above stays as the fleet-snapshot seam (#101).
+    pub fn is_stale_with(&self, stale_after_secs: u64) -> bool {
         match self.last_ok {
-            Some(at) => at.elapsed().as_secs() > PEER_STALE_AFTER_SECS,
+            Some(at) => at.elapsed().as_secs() > stale_after_secs,
             None => true,
         }
     }
@@ -75,9 +182,19 @@ impl PeerSummaryState {
 
     /// Reachability for the sidebar dot: live / slow / stale-or-error.
     pub fn reachability(&self) -> PeerReachability {
-        if self.is_stale() || self.error.is_some() {
+        self.reachability_with(PEER_STALE_AFTER_SECS, PEER_SLOW_LATENCY_MS)
+    }
+
+    /// Config-aware reachability (#96) — the live-config path. The zero-arg
+    /// twin above stays for the fleet-snapshot rendering seam (#101).
+    pub fn reachability_with(
+        &self,
+        stale_after_secs: u64,
+        slow_threshold_ms: u64,
+    ) -> PeerReachability {
+        if self.is_stale_with(stale_after_secs) || self.error.is_some() {
             PeerReachability::Down
-        } else if self.latency_ms.is_some_and(|ms| ms > PEER_SLOW_LATENCY_MS) {
+        } else if self.latency_ms.is_some_and(|ms| ms > slow_threshold_ms) {
             PeerReachability::Slow
         } else {
             PeerReachability::Live
@@ -731,5 +848,100 @@ Last login: banner noise
         assert_eq!(peer.reachability(), PeerReachability::Slow);
         peer.error = Some("timeout".into());
         assert_eq!(peer.reachability(), PeerReachability::Down);
+    }
+
+    #[test]
+    fn reachability_with_uses_configured_thresholds() {
+        // The config-threaded variants (#96) must gate on the caller-supplied
+        // thresholds, not the const default. A 30s-stale peer is Live when
+        // stale_after=60, Down when stale_after=15.
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        });
+        peer.last_ok = Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        peer.latency_ms = Some(50);
+        assert!(!peer.is_stale_with(60));
+        assert_eq!(
+            peer.reachability_with(60, 200),
+            PeerReachability::Live,
+            "50ms < slow_threshold=200 keeps peer live"
+        );
+        assert!(peer.is_stale_with(15));
+        assert_eq!(
+            peer.reachability_with(15, 200),
+            PeerReachability::Down,
+            "shorter stale threshold flips to Down"
+        );
+        // A tighter slow threshold flips the color.
+        peer.last_ok = Some(Instant::now());
+        assert_eq!(
+            peer.reachability_with(60, 20),
+            PeerReachability::Slow,
+            "50ms > slow_threshold=20 renders Slow"
+        );
+    }
+
+    #[test]
+    fn peer_poll_tracker_dispatches_first_call_and_arms_next_due() {
+        // First call on a fresh peer: always dispatch, mark in-flight.
+        // Callers must invoke mark_finished before the next round.
+        let mut tracker = PeerPollTracker::new();
+        let now = Instant::now();
+        assert!(
+            tracker.should_poll_now("anvil", now, Duration::from_secs(15)),
+            "first call must dispatch"
+        );
+        assert!(tracker.in_flight("anvil"));
+        assert!(
+            !tracker.should_poll_now("anvil", now, Duration::from_secs(15)),
+            "second call while in-flight must skip (overlap guard)"
+        );
+        tracker.mark_finished("anvil");
+        assert!(
+            !tracker.should_poll_now(
+                "anvil",
+                now + Duration::from_secs(1),
+                Duration::from_secs(15)
+            ),
+            "not-yet-due skips even after the previous call finished"
+        );
+        assert!(
+            tracker.should_poll_now(
+                "anvil",
+                now + Duration::from_secs(15),
+                Duration::from_secs(15)
+            ),
+            "at-or-past next_due dispatches"
+        );
+    }
+
+    #[test]
+    fn peer_poll_tracker_overlap_guard_holds_across_config_reload() {
+        // A slow ProxyJump peer polling at 2s must not stack: if the previous
+        // fetch is still in flight, the next round MUST skip that peer even
+        // though `now` is far past `next_due`. Then `retain_only` on a config
+        // reload (peer still present) preserves the in-flight lock.
+        let mut tracker = PeerPollTracker::new();
+        let t0 = Instant::now();
+        assert!(tracker.should_poll_now("sage", t0, Duration::from_secs(2)));
+
+        // Two rounds later, the slow SSH is still running.
+        assert!(
+            !tracker.should_poll_now("sage", t0 + Duration::from_secs(4), Duration::from_secs(2)),
+            "in-flight guard MUST hold even past next_due — a hung SSH cannot pile"
+        );
+        // Config reload (peer still present): the in-flight lock survives.
+        tracker.retain_only(vec!["sage"]);
+        assert!(
+            !tracker.should_poll_now("sage", t0 + Duration::from_secs(8), Duration::from_secs(2)),
+            "reload must NOT drop the in-flight lock for a surviving peer"
+        );
+        // Retain that drops the peer clears its state.
+        tracker.retain_only::<Vec<&str>>(vec![]);
+        assert!(
+            tracker.should_poll_now("sage", t0 + Duration::from_secs(9), Duration::from_secs(2)),
+            "peer dropped from config, then re-added, starts fresh"
+        );
     }
 }

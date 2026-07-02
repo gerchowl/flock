@@ -1745,10 +1745,19 @@ pub(crate) fn server_band_slot_at(
 
 fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
+    // #96: the header down-count is the ONE sidebar consumer that has
+    // AppState reach and therefore the live [gossip] thresholds. The shared
+    // peer/snapshot row builders below still use the const-default reachability
+    // methods — that's the documented seam left for #101 (staleness rework).
+    let stale_after_secs = app.config.gossip.stale_after();
+    let slow_threshold_ms = app.config.gossip.slow_threshold_ms();
     let down = app
         .peer_summaries
         .iter()
-        .filter(|peer| peer.reachability() == crate::peers::PeerReachability::Down)
+        .filter(|peer| {
+            peer.reachability_with(stale_after_secs.as_secs(), slow_threshold_ms)
+                == crate::peers::PeerReachability::Down
+        })
         .count();
     let header = if down > 0 {
         format!(" servers ({down} down)")

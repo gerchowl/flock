@@ -74,6 +74,7 @@ impl Config {
             .chain(keybind_diags)
             .chain(self.ui.sound.diagnostics())
             .chain(self.ui.idle.diagnostics())
+            .chain(self.gossip.diagnostics())
             .collect()
     }
 
