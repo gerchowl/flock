@@ -5,7 +5,9 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+use crate::process::TracedCommand;
 
 use serde::Deserialize;
 use std::sync::{
@@ -1240,11 +1242,11 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
 
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("flock.tmp");
-    let status = Command::new("curl")
+    let status = TracedCommand::new("curl", "remote")
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&path)
         .arg(&asset.url)
-        .status()
+        .status_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("download failed: {err}")))?;
     if !status.success() {
         let _ = fs::remove_dir_all(&dir);
@@ -1264,7 +1266,7 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
 }
 
 fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
-    let output = Command::new("curl")
+    let output = TracedCommand::new("curl", "remote")
         .args([
             "-sfL",
             "--retry",
@@ -1275,7 +1277,7 @@ fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
             "20",
             url,
         ])
-        .output()
+        .output_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("curl failed: {err}")))?;
     if !output.status.success() {
         return Err(command_failed("failed to fetch update manifest", &output));
@@ -1446,14 +1448,14 @@ mv "$tmp" "$dest"
         install_suffix = remote_flock.install_suffix
     );
 
-    let mut child = Command::new("ssh")
+    let mut child = TracedCommand::new("ssh", "remote")
         .arg("-T")
         .arg(target)
         .arg(format!("/bin/sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
+        .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
     let mut source = File::open(source_path)?;
@@ -1496,7 +1498,7 @@ const SSH_NONINTERACTIVE_OPTS: &[&str] = &[
 fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
     // Feed POSIX bootstrap scripts to /bin/sh so the user's login shell only
     // has to parse a simple executable invocation.
-    let mut child = Command::new("ssh")
+    let mut child = TracedCommand::new("ssh", "remote")
         .arg("-T")
         .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
@@ -1504,7 +1506,7 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn_traced()?;
 
     let write_result = if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes())
@@ -1520,12 +1522,12 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
 }
 
 fn ssh_user_shell_output(target: &str, command: &str) -> io::Result<Output> {
-    Command::new("ssh")
+    TracedCommand::new("ssh", "remote")
         .arg("-T")
         .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
         .arg(command)
-        .output()
+        .output_traced()
 }
 
 fn remote_bridge_command(remote_flock: &RemoteFlock, session_name: &str) -> String {
@@ -1896,7 +1898,7 @@ fn bridge_connection(
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
 ) -> io::Result<()> {
-    let mut command = Command::new("ssh");
+    let mut command = TracedCommand::new("ssh", "remote");
     // Use the generated keepalive ssh config when present; otherwise plain ssh.
     if let Some(ssh_config) = keepalive_ssh_config {
         command.arg("-F").arg(ssh_config);
@@ -1912,7 +1914,7 @@ fn bridge_connection(
         .stderr(Stdio::inherit());
 
     let mut child = command
-        .spawn()
+        .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
     let mut child_stdin = child
         .stdin
@@ -1976,7 +1978,7 @@ fn run_client_process(
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let fleet_json = serde_json::to_string(fleet).map_err(io::Error::other)?;
-    let status = Command::new(exe)
+    let status = TracedCommand::new(exe, "remote")
         .arg("client")
         .env(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
@@ -1992,7 +1994,7 @@ fn run_client_process(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()?;
+        .status_traced()?;
 
     if status.success() {
         Ok(())

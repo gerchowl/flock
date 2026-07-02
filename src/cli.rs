@@ -243,12 +243,12 @@ fn config_edit(args: &[String]) -> std::io::Result<i32> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     // Spawn $EDITOR directly on the target -- the CLI is already in a
     // terminal, no float/overlay needed (the spike calls this out).
-    let status = std::process::Command::new("/bin/sh")
+    let status = crate::process::TracedCommand::new("/bin/sh", "cli")
         .arg("-c")
         .arg(format!("{editor} \"$1\"", editor = editor))
         .arg("sh")
         .arg(target.as_os_str())
-        .status()?;
+        .status_traced()?;
 
     if !status.success() {
         eprintln!("flock config edit: editor exited non-zero, no reload triggered");

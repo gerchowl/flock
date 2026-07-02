@@ -129,6 +129,12 @@ impl TracedCommand {
         self
     }
 
+    /// Read-only view of the accumulated env overrides. Used by tests that
+    /// assert env plumbing shape (e.g. autodetect socket-override clearing).
+    pub(crate) fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.inner.get_envs()
+    }
+
     /// Detach into a new process group so the child survives its parent's
     /// exit (`process_group(0)` = new session leader). Unix-only, matches
     /// `std::os::unix::process::CommandExt::process_group`.

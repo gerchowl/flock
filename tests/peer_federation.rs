@@ -2,6 +2,11 @@
 //! a fake-ssh shim), the poller folds the peer's workspaces into the spaces
 //! sidebar, and clicking a remote row yields ServerMessage::SwitchServer.
 
+// Integration tests exec real ssh/git/hostname invocations to set up their
+// fake fleet — the TracedCommand funnel (logging redesign PR-3) doesn't apply
+// to test scaffolding, so exempt at file scope (mirrors allow-print-in-tests).
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::fs;

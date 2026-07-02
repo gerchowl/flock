@@ -354,7 +354,7 @@ fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, Str
 /// Run one command on a peer over SSH (batch mode, short timeouts), returning
 /// stdout. Shared by the summary poll and the checkout-prepare invocation.
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
-    let output = std::process::Command::new("ssh")
+    let output = crate::process::TracedCommand::new("ssh", "peers")
         .args([
             "-o",
             "BatchMode=yes",
@@ -368,7 +368,7 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
             remote_command,
         ])
         .stdin(std::process::Stdio::null())
-        .output()
+        .output_traced()
         .map_err(|err| format!("ssh spawn failed: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

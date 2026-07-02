@@ -10,15 +10,14 @@
 
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use tracing::{info, warn};
 
 use super::socket_paths::client_socket_path;
+use crate::process::TracedCommand;
 
 /// Maximum time to wait for the server's client socket to become ready
 /// after spawning the server process.
@@ -137,7 +136,7 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
 
     let mut command = build_server_daemon_command(exe);
 
-    let child = command.spawn().map_err(|err: io::Error| {
+    let child = command.spawn_traced().map_err(|err: io::Error| {
         io::Error::new(err.kind(), format!("failed to spawn flock server: {err}"))
     })?;
 
@@ -147,8 +146,8 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
     Ok(pid)
 }
 
-fn build_server_daemon_command(exe: PathBuf) -> Command {
-    let mut command = Command::new(&exe);
+fn build_server_daemon_command(exe: PathBuf) -> TracedCommand {
+    let mut command = TracedCommand::new(&exe, "server");
     command
         .arg("server")
         // Create a new process group so the server survives the parent's exit

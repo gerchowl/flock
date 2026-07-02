@@ -1,5 +1,9 @@
 //! Integration tests for thin client mode.
 
+// TracedCommand (logging redesign PR-3) polices flock's shipped code — this
+// harness drives the compiled flock binary through raw Command; exempt.
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::fs;
