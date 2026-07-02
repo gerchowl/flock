@@ -711,6 +711,98 @@ pub(crate) fn remote_install_declined(target: &str, dest: &str) {
     );
 }
 
+// --- process family (logging redesign PR-3) --------------------------------
+// One traced funnel: every external process flock spawns emits its command
+// line here so the "what did flock actually run?" question is answerable from
+// the log tail. `src/process.rs` owns the invocation sites; this facade owns
+// the schema. Non-zero exit is WARN (a caller's story is broken), zero exit
+// is INFO (routine but audit-worthy), spawn failure is ERROR (the command
+// never ran — the loudest failure to surface).
+
+/// A child process finished. `status` is `None` if the wrapper never got a
+/// `Wait`ed status (currently unused: `output`/`status` always yield one).
+/// The exit-code component drives level selection so a caller's non-zero exit
+/// lands at WARN in the tail without extra ceremony at the call site.
+pub(crate) fn process_exec_completed(
+    subsystem: &'static str,
+    program: &str,
+    args: &str,
+    status: Option<std::process::ExitStatus>,
+    duration_ms: u64,
+) {
+    let event = "process.exec";
+    let code = status.and_then(|s| s.code());
+    let status_str = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into());
+    if code == Some(0) {
+        tracing::info!(
+            event,
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec completed"
+        );
+    } else {
+        tracing::warn!(
+            event,
+            subsystem,
+            outcome = "error",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec exited non-zero"
+        );
+    }
+}
+
+/// A child process could not be reaped (I/O error mid-wait, or the child's
+/// stdio pipes broke). Rare — but the tail needs the story.
+pub(crate) fn process_exec_failed(subsystem: &'static str, program: &str, args: &str, err: &str) {
+    tracing::error!(
+        event = "process.exec",
+        subsystem,
+        outcome = "error",
+        program,
+        args,
+        err,
+        "process exec failed"
+    );
+}
+
+/// A child process was spawned (fire-and-follow: the caller wires up its own
+/// wait/kill semantics). The child's later exit is the caller's event, not
+/// this facade's.
+pub(crate) fn process_spawned(subsystem: &'static str, program: &str, args: &str, pid: u32) {
+    tracing::info!(
+        event = "process.spawn",
+        subsystem,
+        outcome = "ok",
+        program,
+        args,
+        pid,
+        "process spawned"
+    );
+}
+
+/// `Command::spawn` refused: the program isn't executable, isn't on PATH, or
+/// the OS rejected the fork/exec. The command never ran — surface loudly.
+pub(crate) fn process_spawn_failed(subsystem: &'static str, program: &str, args: &str, err: &str) {
+    tracing::error!(
+        event = "process.spawn",
+        subsystem,
+        outcome = "error",
+        program,
+        args,
+        err,
+        "process spawn failed"
+    );
+}
+
 pub(crate) fn remote_ssh_keepalive_config_missing(err: &str) {
     tracing::info!(
         event = "remote.ssh_config",

@@ -247,7 +247,7 @@ impl App {
             if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 let target = ssh_target.clone();
                 std::thread::spawn(move || {
-                    let _ = std::process::Command::new("ssh")
+                    let _ = crate::process::TracedCommand::new("ssh", "peers")
                         .args([
                             "-o",
                             "BatchMode=yes",
@@ -257,7 +257,7 @@ impl App {
                             &format!("sh -lc 'flock workspace focus --workspace {id}'"),
                         ])
                         .stdin(std::process::Stdio::null())
-                        .output();
+                        .output_traced();
                 });
             }
             return Some((ssh_target, label));
@@ -315,9 +315,9 @@ fn configured_node_name() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn macos_local_host_name() -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/scutil")
+    let out = crate::process::TracedCommand::new("/usr/sbin/scutil", "peers")
         .args(["--get", "LocalHostName"])
-        .output()
+        .output_traced()
         .ok()?;
     if !out.status.success() {
         return None;

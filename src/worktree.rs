@@ -137,9 +137,9 @@ pub(crate) fn build_worktree_add_new_branch_command(
 }
 
 pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
-    let output = std::process::Command::new(&command.program)
+    let output = crate::process::TracedCommand::new(&command.program, "worktree")
         .args(&command.args)
-        .output()
+        .output_traced()
         .map_err(|err| err.to_string())?;
 
     if output.status.success() {
@@ -170,12 +170,12 @@ fn run_command_capture(
     args: &[&str],
     cwd: Option<&std::path::Path>,
 ) -> Result<String, String> {
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output().map_err(|err| err.to_string())?;
+    let output = command.output_traced().map_err(|err| err.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -776,11 +776,11 @@ pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktre
 }
 
 pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWorktree>, String> {
-    let output = std::process::Command::new("git")
+    let output = crate::process::TracedCommand::new("git", "worktree")
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "list", "--porcelain"])
-        .output()
+        .output_traced()
         .map_err(|err| err.to_string())?;
 
     if output.status.success() {
@@ -797,6 +797,7 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
 

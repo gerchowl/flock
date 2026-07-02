@@ -603,9 +603,9 @@ enum FunnelCheck {
 }
 
 fn tailscale_funnel_status() -> FunnelCheck {
-    let output = std::process::Command::new("tailscale")
+    let output = crate::process::TracedCommand::new("tailscale", "web")
         .args(["serve", "status", "--json"])
-        .output();
+        .output_traced();
     match output {
         Ok(out) if out.status.success() => {
             match serde_json::from_slice::<serde_json::Value>(&out.stdout) {

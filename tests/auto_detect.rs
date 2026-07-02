@@ -1,6 +1,9 @@
 //! Integration tests for auto-detect launch behavior.
 
 #![cfg(not(target_os = "macos"))]
+// TracedCommand (logging redesign PR-3) polices flock's shipped code; this
+// harness drives the compiled flock binary through raw Command.
+#![allow(clippy::disallowed_methods)]
 
 mod support;
 

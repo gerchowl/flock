@@ -1,15 +1,15 @@
 #[cfg(unix)]
+use crate::process::TracedCommand;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::process::{Child, Command};
+use std::process::Child;
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ pub(crate) fn spawn_handoff_import(
         })?;
         &fallback_exe
     };
-    let mut command = Command::new(exe);
+    let mut command = TracedCommand::new(exe, "server");
     command
         .arg("server")
         .arg("--handoff-import")
@@ -83,7 +83,7 @@ pub(crate) fn spawn_handoff_import(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    command.spawn().map_err(|err| {
+    command.spawn_traced().map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(

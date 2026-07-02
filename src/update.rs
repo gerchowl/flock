@@ -12,7 +12,8 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use crate::process::TracedCommand;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
@@ -282,7 +283,7 @@ fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
 {
-    let output = Command::new("curl")
+    let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
             "--retry",
@@ -293,7 +294,7 @@ where
             "20",
             url,
         ])
-        .output()
+        .output_traced()
         .map_err(|e| format!("curl failed: {e}"))?;
 
     if !output.status.success() {
@@ -494,7 +495,7 @@ fn homebrew_update_from_formula_json(
 fn check_homebrew_latest() -> Result<Option<Version>, String> {
     let current = Version::current();
 
-    let output = Command::new("curl")
+    let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
             "--retry",
@@ -505,7 +506,7 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
             "10",
             HOMEBREW_FORMULA_API_URL,
         ])
-        .output()
+        .output_traced()
         .map_err(|e| format!("curl failed: {e}"))?;
 
     if !output.status.success() {
@@ -554,11 +555,11 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     let tmp_path = parent.join(format!(".flock-update-{}.tmp", std::process::id()));
 
     // Download the exact asset URL (pinned to the release we checked)
-    let status = Command::new("curl")
+    let status = TracedCommand::new("curl", "update")
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&tmp_path)
         .arg(&release.download_url)
-        .status()
+        .status_traced()
         .map_err(|e| format!("download failed: {e}"))?;
 
     if !status.success() {
@@ -1965,9 +1966,9 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
 }
 
 fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
-    let status = Command::new(updated_exe)
+    let status = TracedCommand::new(updated_exe, "update")
         .args(["integration", "status", "--outdated-only"])
-        .status();
+        .status_traced();
 
     if !status.is_ok_and(|status| status.success()) {
         crate::integration::print_outdated_update_notice();

@@ -45,6 +45,7 @@ mod pane;
 mod peers;
 mod persist;
 mod platform;
+mod process;
 mod product_announcements;
 mod protocol;
 mod pty;

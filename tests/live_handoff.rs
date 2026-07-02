@@ -1,3 +1,7 @@
+// TracedCommand (logging redesign PR-3) polices shipped code; this harness
+// exec's raw lsof/pgrep to inspect the running system under test.
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::fs;

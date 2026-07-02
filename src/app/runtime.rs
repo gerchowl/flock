@@ -637,6 +637,7 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::app::state;

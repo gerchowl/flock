@@ -7,6 +7,9 @@
 //! at the DEFAULT level.
 
 #![cfg(unix)]
+// This harness drives the compiled flock binary directly (Command::new(CARGO_BIN_EXE_flock))
+// — TracedCommand (logging redesign PR-3) is a source-code lint, not a test-scaffolding one.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

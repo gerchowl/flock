@@ -63,6 +63,7 @@ fn toast_event_text(kind: app::state::ToastKind) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::detect::Agent;

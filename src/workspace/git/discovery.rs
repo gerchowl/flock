@@ -297,11 +297,11 @@ fn strip_git_config_comment(value: &str) -> &str {
 }
 
 fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::process::TracedCommand::new("git", "git")
         .arg("-C")
         .arg(repo_root)
         .args(args)
-        .output()
+        .output_traced()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -358,6 +358,7 @@ pub(super) fn read_ref_oid(common_dir: &Path, full_ref: &str) -> Option<String> 
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
