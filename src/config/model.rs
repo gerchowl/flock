@@ -168,13 +168,27 @@ pub struct ClipboardToastConfig {
     pub position: ToastClipboardPosition,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum NewTerminalCwdConfig {
     #[default]
     Follow,
     Home,
     Current,
     Path(String),
+}
+
+// Serialize mirrors the string forms Deserialize accepts, so the derived
+// default config round-trips (ADR-0002 phase g). A derived Serialize emitted
+// enum tagging ({"Path": …}) that the string-form Deserialize rejects.
+impl Serialize for NewTerminalCwdConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Follow => serializer.serialize_str("follow"),
+            Self::Home => serializer.serialize_str("home"),
+            Self::Current => serializer.serialize_str("current"),
+            Self::Path(path) => serializer.serialize_str(path),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for NewTerminalCwdConfig {
