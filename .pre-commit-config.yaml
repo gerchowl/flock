@@ -7,7 +7,7 @@
 # is clean of real stubs and debug spew; the few flagged lines are legitimate CLI
 # output (allowlisted via GUARDRAILS_OUTPUT_GLOBS) or doc-comment prose/examples
 # (annotated `guardrails-ok`). Per-line escape hatch anywhere: `guardrails-ok`.
-default_install_hook_types: [pre-commit, commit-msg]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 repos:
   - repo: local
     hooks:
@@ -90,6 +90,29 @@ repos:
         entry: cargo deny check
         language: system
         files: (Cargo\.(toml|lock)|deny\.toml)$
+        pass_filenames: false
+
+      # CI must stay a shim over locally-runnable checks; new workflows with bare
+      # run: logic block unless annotated `guardrails-ok(ci-shim): <reason>`.
+      - id: ci-shim
+        name: "CI is a shim over `nix flake check`"
+        entry: env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: true
+
+      # --- pre-push (CI-deep; inert until the first criterion bench lands) ------
+      - id: perf-budget
+        name: "perf regressions vs perf-budgets.toml"
+        entry: guardrails-perf-budget
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+      - id: perf-record
+        name: "append bench medians to perf-history.csv"
+        entry: guardrails-perf-record
+        language: system
+        stages: [pre-push]
         pass_filenames: false
 
       # --- commit message ------------------------------------------------------
