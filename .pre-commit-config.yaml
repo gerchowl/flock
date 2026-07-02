@@ -51,6 +51,22 @@ repos:
         language: system
         pass_filenames: true
 
+      # Derived/generated doc regions must match their source-of-truth command
+      # (docs/DEBT.md census etc.). Drift → unified diff; `--fix` regenerates.
+      - id: derived-docs
+        name: "derived docs match their source of truth"
+        entry: guardrails-derived-docs
+        language: system
+        pass_filenames: true
+      # Every Accepted ADR (docs/adr/README.md index) must be cited as ADR-NNNN
+      # in FEATURE-MATRIX.md — decided designs can't silently outrun the matrix.
+      - id: adr-matrix
+        name: "every Accepted ADR cited in FEATURE-MATRIX.md"
+        entry: guardrails-adr-matrix
+        language: system
+        pass_filenames: false
+        files: (^docs/adr/|^FEATURE-MATRIX\.md$)
+
       # --- hard gates ----------------------------------------------------------
       - id: gitleaks
         name: secrets scan
