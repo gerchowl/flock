@@ -631,7 +631,6 @@ impl App {
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
-            sound: config.ui.sound.clone(),
             local_sound_playback: true,
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
@@ -951,7 +950,7 @@ impl App {
             if self.state.pending_attention_chime {
                 self.state.pending_attention_chime = false;
                 if self.state.sound_enabled() {
-                    crate::sound::play(crate::sound::Sound::AllClear, &self.state.sound);
+                    crate::sound::play(crate::sound::Sound::AllClear, self.state.sound_config());
                 }
             }
 
@@ -1272,6 +1271,10 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        // Snapshot fields that need to detect a change relative to the
+        // previous live config BEFORE we overwrite it below.
+        let previous_sound = self.state.config.ui.sound.clone();
+
         // Live source of truth for the settings pane (ADR-0002 phase (f)):
         // re-clone after every reload so accessors that read `state.config`
         // reflect the new values without a per-knob mirror copy below.
@@ -1377,10 +1380,9 @@ impl App {
                     panel_scope_from_config(config.ui.spaces_panel_scope);
                 self.state.workspace_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
-                if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
+                if !self.state.local_sound_playback && previous_sound != config.ui.sound {
                     self.state.request_client_config_reload = true;
                 }
-                self.state.sound = config.ui.sound.clone();
                 self.state.toast_config = config.ui.toast.clone();
             }
         }

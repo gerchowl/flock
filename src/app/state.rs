@@ -1,4 +1,4 @@
-use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::config::{Keybinds, NewTerminalCwdConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
@@ -1934,7 +1934,6 @@ pub struct AppState {
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
-    pub sound: SoundConfig,
     pub local_sound_playback: bool,
     pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
@@ -2159,7 +2158,13 @@ impl AppState {
     }
 
     pub fn sound_enabled(&self) -> bool {
-        self.sound.enabled
+        self.config.ui.sound.enabled
+    }
+
+    /// The live `SoundConfig` used by the notification playback path.
+    /// Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sound_config(&self) -> &crate::config::SoundConfig {
+        &self.config.ui.sound
     }
 
     /// Sidebar display alias for an agent label: config override first,
@@ -2498,10 +2503,6 @@ impl AppState {
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
-            sound: SoundConfig {
-                enabled: false,
-                ..SoundConfig::default()
-            },
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
@@ -2570,6 +2571,18 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn sound_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's Sound section is a shim
+        // over `state.config.ui.sound`, not the copied mirror.
+        let mut state = AppState::test_new();
+        state.config.ui.sound.enabled = true;
+        assert!(state.sound_enabled());
+
+        state.config.ui.sound.enabled = false;
+        assert!(!state.sound_enabled());
+    }
 
     #[test]
     fn file_drop_enabled_reads_from_state_config_not_mirror_field() {

@@ -656,6 +656,8 @@ mod tests {
     #[test]
     fn settings_sound_toggle_returns_save_action() {
         let mut state = state_with_workspaces(&["test"]);
+        // Start disabled so selecting "on" (index 0) generates a real toggle.
+        state.config.ui.sound.enabled = false;
         open_settings(&mut state);
         state.settings.section = crate::app::state::SettingsSection::Sound;
         state.settings.list.selected = 0;
@@ -666,7 +668,7 @@ mod tests {
         );
 
         assert_eq!(action, Some(SettingsAction::SaveSound(true)));
-        assert!(!state.sound.enabled);
+        assert!(!state.sound_enabled());
         assert_eq!(state.mode, Mode::Settings);
     }
 

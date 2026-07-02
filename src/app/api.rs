@@ -950,11 +950,11 @@ impl App {
     }
 
     fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
-        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
+        if !self.state.local_sound_playback || !self.state.sound_config().allows(None) {
             return;
         }
         if let Some(sound) = sound.to_sound() {
-            crate::sound::play(sound, &self.state.sound);
+            crate::sound::play(sound, self.state.sound_config());
         }
     }
 

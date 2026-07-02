@@ -1472,7 +1472,7 @@ impl HeadlessServer {
 
                 let next_state = self.pane_effective_state(pane_id_val);
 
-                if self.app.state.sound.allows(agent_val) {
+                if self.app.state.sound_config().allows(agent_val) {
                     if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                         suppress_active_tab_notifications,
                         prev_state,
@@ -1560,7 +1560,7 @@ impl HeadlessServer {
 
                 let next_state = self.pane_effective_state(pane_id_val);
 
-                if self.app.state.sound.allows(agent_val) {
+                if self.app.state.sound_config().allows(agent_val) {
                     if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                         suppress_active_tab_notifications,
                         prev_state,
@@ -2527,7 +2527,7 @@ impl HeadlessServer {
 
             // Forward sound notification when server-side sound policy allows it.
             // Clients still decide locally whether they can execute the side effect.
-            if self.app.state.sound.allows(agent) {
+            if self.app.state.sound_config().allows(agent) {
                 if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                     suppress_active_tab_notifications,
                     *prev_state,

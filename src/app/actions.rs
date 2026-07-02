@@ -3141,13 +3141,13 @@ impl AppState {
         }
         let seen = pane.seen;
 
-        if self.local_sound_playback && self.sound.allows(change.known_agent) {
+        if self.local_sound_playback && self.sound_config().allows(change.known_agent) {
             if let Some(sound) = notification_sound_for_state_change(
                 suppress_active_tab_notifications,
                 change.previous_state,
                 change.state,
             ) {
-                crate::sound::play(sound, &self.sound);
+                crate::sound::play(sound, self.sound_config());
             }
         }
 
