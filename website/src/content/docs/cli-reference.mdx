@@ -264,4 +264,5 @@ flock integration status [--outdated-only]
 | `FLOCK_SOCKET_PATH` | Low-level socket path override. |
 | `FLOCK_LOG` | Set log filter, for example `FLOCK_LOG=flock=debug`. |
 | `FLOCK_PANE_ID` | Baked into every pane's environment; the default pane for `pane set-field`/`clear-field`. Stale values are healed by process ancestry. |
-| `FLOCK_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |
+| `FLOCK_<UPPER_SNAKE_PATH>` | Generic override for any scalar config field (ADR-0002); sits BELOW the config file. |
+| `FLOCK_DISABLE_SOUND` | Deprecated alias for `FLOCK_UI_SOUND_ENABLED=false`. Sits below the file (removal after one release). |

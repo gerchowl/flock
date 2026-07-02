@@ -531,7 +531,9 @@ You can also toggle it from Settings > Experiments > switch to ascii input sourc
 | `FLOCK_SESSION` | Select a named session for CLI commands. |
 | `FLOCK_SOCKET_PATH` | Low-level socket path override. |
 | `FLOCK_LOG` | Set log filtering, for example `FLOCK_LOG=flock=debug`. |
-| `FLOCK_DISABLE_SOUND` | Disable sound playback even when `[ui.sound] enabled = true`. |
+| `FLOCK_<UPPER_SNAKE_PATH>` | Generic override for any scalar config field, e.g. `FLOCK_UI_IDLE_ENABLE=false`. Sits BELOW the config file (ADR-0002): file values win. |
+| `FLOCK_DISABLE_SOUND` | Deprecated one-release alias for `FLOCK_UI_SOUND_ENABLED=false`. Sits below the file — a file-set `[ui.sound] enabled = true` now overrides it. |
+| `FLOCK_HOST_NAME` | Deprecated one-release alias for `FLOCK_NAME` (top-level `name`). Sits below the file. |
 
 ## Logs
 
