@@ -18,6 +18,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "theme",
     "ui",
     "update",
+    "web",
     "worktrees",
 ];
 
@@ -425,6 +426,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.slots = section,
+    );
+    load_live_section(
+        &table,
+        "web",
+        "web config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.web = section,
     );
     validate_peers(&mut config.peers, &mut diagnostics);
 

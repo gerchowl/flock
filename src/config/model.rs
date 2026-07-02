@@ -1,4 +1,5 @@
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -327,6 +328,69 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
+/// Default bind for `flock web` — loopback only, xterm.js port.
+pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:7681";
+
+/// Default concurrent-session cap for `flock web` — a PTY-exhaustion backstop,
+/// generous for a personal fleet. `0` disables the cap.
+pub const DEFAULT_WEB_MAX_SESSIONS: usize = 16;
+
+/// `flock web` configuration (ADR-0002 phase e). The web bridge previously
+/// carried a parallel config universe (six `FLOCK_WEB_*` env reads + CLI
+/// flags, no file). This section folds every persistent knob into the real
+/// [`Config`], so the generic env layer, overlay deep-merge, and drift-proofing
+/// all apply.
+///
+/// Precedence at runtime: `[web]` in config (with env<file<overlay merged in)
+/// < CLI flags. The scalar env reads (BIND / SESSION / FLOCK_BIN /
+/// MAX_SESSIONS / IDLE_TIMEOUT_SECS) are subsumed by the generic
+/// `FLOCK_<UPPER_SNAKE>` layer (ADR-0002 phase d). List-valued env vars
+/// (`FLOCK_WEB_ALLOWED_ORIGINS` / `FLOCK_WEB_ALLOWED_USERS`) keep CSV parsing
+/// as a documented web-only exception, applied only when the file leaves the
+/// list empty (see `flock web`'s arg parser).
+///
+/// CLI-only booleans (`--allow-non-loopback`, `--allow-funnel`,
+/// `--allow-any-origin`) are per-invocation overrides and are NOT modelled
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WebSectionConfig {
+    /// Listener socket address, e.g. `127.0.0.1:7681`. Parsed at runtime; a
+    /// bad value surfaces via the arg parser's diagnostic. Empty falls back
+    /// to [`DEFAULT_WEB_BIND`].
+    pub bind: String,
+    /// Path to the `flock` binary to spawn per WS connection. Empty means
+    /// "the currently-running executable" (`current_exe()`).
+    pub flock_bin: PathBuf,
+    /// Session name forwarded to the spawned client as `--session <name>`.
+    /// Empty means no `--session` flag.
+    pub session: String,
+    /// Extra allowed WS Origins for the CSWSH check (adds to same-origin).
+    pub allowed_origins: Vec<String>,
+    /// Tailscale identities (`Tailscale-User-Login`) allowed to connect.
+    /// Empty = identity not enforced (loopback / tailnet membership is the
+    /// boundary).
+    pub allowed_users: Vec<String>,
+    /// Concurrent WS sessions allowed (`0` = unlimited).
+    pub max_sessions: usize,
+    /// Close a WS after this long with no inbound frame (`0` = disabled).
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for WebSectionConfig {
+    fn default() -> Self {
+        Self {
+            bind: DEFAULT_WEB_BIND.to_string(),
+            flock_bin: PathBuf::new(),
+            session: String::new(),
+            allowed_origins: Vec::new(),
+            allowed_users: Vec::new(),
+            max_sessions: DEFAULT_WEB_MAX_SESSIONS,
+            idle_timeout_secs: 0,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -349,6 +413,7 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub slots: SlotsConfig,
+    pub web: WebSectionConfig,
     pub peers: Vec<PeerConfig>,
 }
 
