@@ -682,18 +682,30 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
 
     wait_for_log_contains(
         &client_log,
-        "event=\"app.startup\" subsystem=\"client\"",
+        "\"event\":\"app.startup\"",
         Duration::from_secs(10),
+    );
+    assert!(
+        fs::read_to_string(&client_log)
+            .unwrap_or_default()
+            .contains("\"subsystem\":\"client\""),
+        "client startup record must be attributed to the client subsystem"
     );
     wait_for_log_contains(
         &server_log,
-        "event=\"app.startup\" subsystem=\"server\"",
+        "\"event\":\"app.startup\"",
         Duration::from_secs(10),
+    );
+    assert!(
+        fs::read_to_string(&server_log)
+            .unwrap_or_default()
+            .contains("\"subsystem\":\"server\""),
+        "server startup record must be attributed to the server subsystem"
     );
 
     let monolith_content = fs::read_to_string(&monolith_log).unwrap_or_default();
     assert!(
-        !monolith_content.contains("subsystem=\"client\""),
+        !monolith_content.contains("\"subsystem\":\"client\""),
         "persistent client logs should not land in flock.log: {monolith_content}"
     );
 
@@ -721,8 +733,14 @@ fn no_session_writes_startup_logs_to_monolith_file() {
 
     wait_for_log_contains(
         &monolith_log,
-        "event=\"app.startup\" subsystem=\"app\"",
+        "\"event\":\"app.startup\"",
         Duration::from_secs(10),
+    );
+    assert!(
+        fs::read_to_string(&monolith_log)
+            .unwrap_or_default()
+            .contains("\"subsystem\":\"app\""),
+        "monolith startup record must be attributed to the app subsystem"
     );
 
     cleanup_spawned_flock(spawned, base);
