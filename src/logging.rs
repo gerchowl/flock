@@ -1500,6 +1500,158 @@ pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
     );
 }
 
+// --- pane runtime family (logging redesign PR-6) ---------------------------
+// Pane-runtime failures for state-change / handoff / OSC 52 / spawn paths.
+// Every raw ?field at these sites (child pids list, agent + previous-agent
+// Option<Agent>, focus event) is Debug-shaped at the call site so no other
+// module carries the `?expr` — the schema surface stays here.
+//
+// Level discipline is preserved verbatim from pre-facade code:
+//   * StateChanged deliver + OSC 52 queue/send + focus forward = WARN
+//   * forced-shutdown survivors + PTY handoff release/pause failures = WARN
+//   * spawn + PaneDied send failures = ERROR (pane can't come up / caller
+//     never learns it died)
+//   * agent-changed = INFO (rare, story-critical for detection debugging)
+
+pub(crate) fn pane_state_change_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.state_change.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to deliver StateChanged event"
+    );
+}
+
+pub(crate) fn pane_forced_shutdown_survivors(pane: u32, pid: u32, pids: &str) {
+    tracing::warn!(
+        event = "pane.session.shutdown",
+        subsystem = "pane",
+        outcome = "survivors",
+        pane,
+        pid,
+        pids,
+        "pane session still alive after forced shutdown"
+    );
+}
+
+pub(crate) fn pane_pty_release_after_handoff_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.release",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
+    );
+}
+
+pub(crate) fn pane_pty_handoff_pause_update_failed(pane: u32, paused: bool, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.handoff_pause",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        paused,
+        err,
+        "failed to update PTY actor handoff pause state"
+    );
+}
+
+pub(crate) fn pane_osc52_queue_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.queue",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to queue OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_osc52_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_spawn_error(pane: u32, err: &str, message: &'static str) {
+    tracing::error!(
+        event = "pane.spawn",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn pane_died_send_failed(pane: u32, err: &str) {
+    tracing::error!(
+        event = "pane.died.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send PaneDied event"
+    );
+}
+
+/// Agent-detection observed a transition (previous → current). `process` is
+/// only present on the process-probe branch; the two callers previously used
+/// two separate `info!` blocks with the same fields modulo the process one —
+/// one facade collapses both by taking `Option<&str>` and only emitting the
+/// field when present. All Debug shapes (`Option<Agent>`, foreground pgid)
+/// are formatted at the call side so subsystem code stays raw-field-free.
+pub(crate) fn pane_agent_changed(
+    pane: u32,
+    previous_agent: &str,
+    agent: &str,
+    process: Option<&str>,
+    pgid: &str,
+) {
+    match process {
+        Some(process) => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            process,
+            pgid,
+            "agent changed"
+        ),
+        None => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            pgid,
+            "agent changed"
+        ),
+    }
+}
+
+pub(crate) fn pane_focus_forward_failed(err: &str, event: &str) {
+    tracing::warn!(
+        event = "pane.focus.forward",
+        subsystem = "pane",
+        outcome = "error",
+        err,
+        focus_event = event,
+        "failed to forward pane focus event"
+    );
+}
+
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
 // action / custom command / pane scroll), which was dropped as
@@ -3143,5 +3295,98 @@ mod tests {
         assert!(out.contains("diagnostic=\"bad toml at line 3\""), "{out}");
         assert!(out.contains("config load error, using defaults"), "{out}");
         assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_state_change_and_osc52_and_focus_failures_are_warn() {
+        let state = capture_logs(|| pane_state_change_send_failed(7, "channel full"));
+        assert!(
+            state.contains("event=\"pane.state_change.send\""),
+            "{state}"
+        );
+        assert!(state.contains("pane=7"), "{state}");
+        assert!(state.contains("err=\"channel full\""), "{state}");
+        assert!(state.contains("WARN"), "{state}");
+
+        let queue = capture_logs(|| pane_osc52_queue_failed(7, "channel full"));
+        assert!(queue.contains("event=\"pane.osc52.queue\""), "{queue}");
+        assert!(queue.contains("WARN"), "{queue}");
+
+        let send = capture_logs(|| pane_osc52_send_failed(7, "channel full"));
+        assert!(send.contains("event=\"pane.osc52.send\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
+
+        let focus = capture_logs(|| pane_focus_forward_failed("channel full", "FocusIn"));
+        assert!(focus.contains("event=\"pane.focus.forward\""), "{focus}");
+        assert!(focus.contains("focus_event=\"FocusIn\""), "{focus}");
+        assert!(focus.contains("WARN"), "{focus}");
+    }
+
+    #[test]
+    fn pane_forced_shutdown_survivors_lists_pids_at_warn() {
+        let out = capture_logs(|| pane_forced_shutdown_survivors(7, 4711, "[4711, 4720]"));
+        assert!(out.contains("event=\"pane.session.shutdown\""), "{out}");
+        assert!(out.contains("outcome=\"survivors\""), "{out}");
+        assert!(out.contains("pid=4711"), "{out}");
+        assert!(out.contains("pids=\"[4711, 4720]\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_pty_handoff_failures_carry_paused_flag_and_err() {
+        let release = capture_logs(|| pane_pty_release_after_handoff_failed(7, "ENOENT"));
+        assert!(release.contains("event=\"pane.pty.release\""), "{release}");
+        assert!(release.contains("WARN"), "{release}");
+        assert!(
+            release.contains("failed to release PTY actor after handoff commit"),
+            "{release}"
+        );
+
+        let pause = capture_logs(|| pane_pty_handoff_pause_update_failed(7, true, "EAGAIN"));
+        assert!(
+            pause.contains("event=\"pane.pty.handoff_pause\""),
+            "{pause}"
+        );
+        assert!(pause.contains("paused=true"), "{pause}");
+        assert!(pause.contains("err=\"EAGAIN\""), "{pause}");
+        assert!(pause.contains("WARN"), "{pause}");
+    }
+
+    #[test]
+    fn pane_spawn_and_died_failures_are_error() {
+        let spawn = capture_logs(|| pane_spawn_error(7, "EACCES", "failed to spawn shell"));
+        assert!(spawn.contains("event=\"pane.spawn\""), "{spawn}");
+        assert!(spawn.contains("failed to spawn shell"), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("ERROR"), "spawn must be ERROR: {spawn}");
+
+        let died = capture_logs(|| pane_died_send_failed(7, "channel closed"));
+        assert!(died.contains("event=\"pane.died.send\""), "{died}");
+        assert!(
+            died.contains("ERROR"),
+            "PaneDied send must be ERROR: {died}"
+        );
+    }
+
+    #[test]
+    fn pane_agent_changed_omits_process_when_absent() {
+        let with = capture_logs(|| {
+            pane_agent_changed(7, "None", "Some(Claude)", Some("claude"), "Some(4711)")
+        });
+        assert!(with.contains("event=\"pane.agent.changed\""), "{with}");
+        assert!(with.contains("previous_agent=\"None\""), "{with}");
+        assert!(with.contains("agent=\"Some(Claude)\""), "{with}");
+        assert!(with.contains("process=\"claude\""), "{with}");
+        assert!(with.contains("pgid=\"Some(4711)\""), "{with}");
+        assert!(with.contains("INFO"), "{with}");
+
+        let without =
+            capture_logs(|| pane_agent_changed(7, "None", "Some(Claude)", None, "Some(4711)"));
+        assert!(
+            !without.contains("process="),
+            "process field must be omitted when absent: {without}"
+        );
+        assert!(without.contains("agent=\"Some(Claude)\""), "{without}");
+        assert!(without.contains("INFO"), "{without}");
     }
 }
