@@ -217,6 +217,11 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 }
 
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+    // The remote launcher ran with NO file logging at all — a failed connect
+    // left nothing diagnosable at any FLOCK_LOG level (the origin of the
+    // logging redesign). try_init makes this a no-op when a subscriber is
+    // already wired (federation switch inside a running client).
+    crate::logging::init_file_logging("flock.log");
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     // The active ssh target for the spawned client's slot manager (#65),
@@ -560,6 +565,12 @@ fn prepare_remote_flock(
             .as_ref()
             .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
         {
+            crate::logging::remote_binary_resolved(
+                target,
+                &path_remote_flock.shell_path,
+                &current_version(),
+                "path",
+            );
             return Ok(PreparedRemoteFlock {
                 remote_flock: path_remote_flock.clone(),
                 installed_or_replaced: false,
@@ -567,6 +578,12 @@ fn prepare_remote_flock(
             });
         }
         if remote_binary_matches(target, &remote_flock)? {
+            crate::logging::remote_binary_resolved(
+                target,
+                &remote_flock.shell_path,
+                &current_version(),
+                "default",
+            );
             return Ok(PreparedRemoteFlock {
                 remote_flock,
                 installed_or_replaced: false,
@@ -608,6 +625,12 @@ fn prepare_remote_flock(
     }
     warn_if_remote_bin_not_on_path(target)?;
 
+    crate::logging::remote_binary_resolved(
+        target,
+        &remote_flock.shell_path,
+        &current_version(),
+        "installed",
+    );
     Ok(PreparedRemoteFlock {
         remote_flock,
         installed_or_replaced: true,
@@ -618,20 +641,27 @@ fn prepare_remote_flock(
 fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
     let output = ssh_sh_output(target, "uname -s\nuname -m\n")?;
     if !output.status.success() {
-        return Err(command_failed("remote platform detection failed", &output));
+        let err = command_failed("remote platform detection failed", &output);
+        crate::logging::remote_probe_failed(target, "uname", &err.to_string());
+        return Err(err);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
     let os = lines.next().unwrap_or_default();
     let arch = lines.next().unwrap_or_default();
-    RemotePlatform::from_uname(os, arch).ok_or_else(|| {
+    let platform = RemotePlatform::from_uname(os, arch).ok_or_else(|| {
         io::Error::other(format!(
             "unsupported remote platform: {} {}",
             os.trim(),
             arch.trim()
         ))
-    })
+    });
+    match &platform {
+        Ok(platform) => crate::logging::remote_probe_result(target, platform.os, platform.arch),
+        Err(err) => crate::logging::remote_probe_failed(target, "uname", &err.to_string()),
+    }
+    platform
 }
 
 fn remote_binary_on_path_any(
@@ -1362,6 +1392,7 @@ fn confirm_remote_install(
     // server with a top-right notice (#67) instead of corrupting the held
     // terminal with a stdin read while the alt-screen is held.
     if !context.allows_install_prompt() || !io::stdin().is_terminal() {
+        crate::logging::remote_install_declined(target, &remote_flock.shell_path);
         return Err(io::Error::other(format!(
             "matching remote flock {} is not installed at {}; run from an interactive terminal to approve installation",
             current_version(),
@@ -1398,6 +1429,11 @@ fn install_remote_flock(
     remote_flock: &RemoteFlock,
     source_path: &Path,
 ) -> io::Result<()> {
+    crate::logging::remote_install_started(
+        target,
+        &source_path.display().to_string(),
+        &remote_flock.shell_path,
+    );
     let script = format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
@@ -1433,11 +1469,12 @@ mv "$tmp" "$dest"
     copy_result?;
 
     if status.success() {
+        crate::logging::remote_install_completed(target, &remote_flock.shell_path);
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "remote install exited with {status}"
-        )))
+        let err = format!("remote install exited with {status}");
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &err);
+        Err(io::Error::other(err))
     }
 }
 
@@ -1577,13 +1614,22 @@ impl SshStdioBridge {
         let keepalive_ssh_config = if manage_ssh_config {
             write_keepalive_ssh_config()
                 .inspect_err(|err| {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    tracing::debug!(%err, "could not write ssh keepalive config; using plain ssh");
+                    crate::logging::remote_ssh_keepalive_config_missing(&err.to_string());
                 })
                 .ok()
         } else {
             None
         };
+
+        // The exact command every bridge connection will run — logged ONCE at
+        // INFO from the launcher thread so a failed remote connect is
+        // diagnosable from flock.log (the origin story of the logging redesign).
+        crate::logging::remote_bridge_started(
+            &target,
+            keepalive_ssh_config.as_deref(),
+            SSH_NONINTERACTIVE_OPTS,
+            &remote_bridge_command(&remote_flock, &session_name),
+        );
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
@@ -1605,6 +1651,7 @@ impl SshStdioBridge {
                             &session_name,
                             thread_ssh_config.as_deref(),
                         ) {
+                            crate::logging::remote_bridge_failed(&target, &err.to_string());
                             eprintln!("flock: remote bridge failed: {err}");
                         }
                     }
@@ -1890,6 +1937,7 @@ fn bridge_connection(
     let _ = upload.join();
     let _ = download.join();
 
+    crate::logging::remote_bridge_exited(target, status.code());
     if status.success() {
         Ok(())
     } else {
@@ -2047,6 +2095,43 @@ mod tests {
             "should flag unknown protocol: {blurb}"
         );
         assert!(blurb.contains(&CURRENT_PROTOCOL.to_string()));
+    }
+
+    #[test]
+    fn bridge_start_logs_full_ssh_command_shape_at_info() {
+        // The failed-remote-connect story: the exact command we are about to
+        // run over ssh must be visible in the log at DEFAULT level — this was
+        // invisible at any FLOCK_LOG level before the logging redesign.
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-bridge-log-{}.sock", std::process::id()));
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let out = crate::logging::capture_logs(|| {
+            let bridge = SshStdioBridge::start(
+                "logshape-target".to_string(),
+                remote_flock,
+                socket.clone(),
+                "default".to_string(),
+                false,
+            )
+            .expect("start bridge listener");
+            drop(bridge);
+        });
+        let _ = std::fs::remove_file(socket);
+
+        assert!(out.contains("event=\"remote.bridge.started\""), "{out}");
+        assert!(out.contains("target=\"logshape-target\""), "{out}");
+        assert!(
+            out.contains("remote-client-bridge"),
+            "full remote command must be visible: {out}"
+        );
+        assert!(
+            out.contains("BatchMode=yes"),
+            "ssh opts must be visible: {out}"
+        );
+        assert!(out.contains("INFO"), "must log at default level: {out}");
     }
 
     #[test]
