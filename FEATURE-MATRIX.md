@@ -18,4 +18,4 @@ the full archive.
 | Panes / HUD | Reserved headers, status line, floating prompt, attention cycling | Shipped | — | #1, #5, #8, #12, #24 |
 | Worktrees | Merge-gated kill, fleet sweep, workspace-as-unit | Shipped | — | #2, #4, #81, #83 |
 | Governance | guardrails gates, clippy print funnel, trace-field debt registry | Shipped | — | #21, #22, docs/DEBT.md |
-| Observability | JSONL logging spine, remote.rs facade instrumentation | Planned (logging redesign) | — | docs/DEBT.md |
+| Observability | JSONL logging spine, named-facade schema surface (raw trace-field debt census: 0) | Shipped | — | #87, docs/DEBT.md |

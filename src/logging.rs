@@ -2352,6 +2352,497 @@ pub(crate) fn config_load_defaults_diagnostic(diagnostic: &str) {
     );
 }
 
+// --- pty family (logging redesign PR-7) ------------------------------------
+// The PtyIoActor is the fd-poll/read/write/resize/wake loop behind every pane's
+// terminal. Its five failure surfaces (wake pipe, wake drain, poll, read,
+// write, resize) plus one no-pane variant all reached tracing through raw
+// `err = %err` fields. The facade below owns the schema — one event family
+// with `pane` present when known and absent for the shared wake-writer's
+// caller-less variant. Level discipline preserved verbatim from pre-facade:
+// wake/drain/poll/read/resize failures are DEBUG (the actor already unwinds
+// on its own, and the story shows up in the log tail without escalating),
+// write failures are WARN (the pending write is dropped and the caller's
+// keystrokes are lost).
+
+pub(crate) fn pty_wake_failed(err: &str) {
+    tracing::debug!(
+        event = "pty.wake",
+        subsystem = "pty",
+        outcome = "error",
+        err,
+        "failed to wake PTY actor"
+    );
+}
+
+pub(crate) fn pty_wake_drain_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.wake.drain",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor wake drain failed"
+    );
+}
+
+pub(crate) fn pty_poll_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.poll",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor poll failed"
+    );
+}
+
+pub(crate) fn pty_read_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.read",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor read failed"
+    );
+}
+
+pub(crate) fn pty_write_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor write failed"
+    );
+}
+
+pub(crate) fn pty_resize_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.resize",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY resize failed"
+    );
+}
+
+// --- api server family (logging redesign PR-7) -----------------------------
+// The api unix-socket server (src/api/server.rs) reached tracing with raw
+// `%err` / `%path.display()` fields for four socket lifecycle sites (drop
+// remove, listen, accept, per-connection) plus one write-timeout diagnostic.
+// The facade below owns the schema; call sites carry no raw formatter. Level
+// discipline preserved: listen bind is INFO (the "did the api server come
+// up?" story), remove-on-drop / per-connection failures are WARN (the
+// listener stays up), accept-loop failure is ERROR (the server can no longer
+// take new clients), write-timeout unavailability is DEBUG (a pre-request
+// diagnostic that never affects the response path).
+
+pub(crate) fn api_socket_remove_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "api.socket.remove",
+        subsystem = "api",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "failed to remove api socket on shutdown"
+    );
+}
+
+pub(crate) fn api_server_listening(path: &Path) {
+    tracing::info!(
+        event = "api.server.listen",
+        subsystem = "api",
+        outcome = "ok",
+        path = %path.display(),
+        "api server listening"
+    );
+}
+
+pub(crate) fn api_connection_failed(err: &str) {
+    tracing::warn!(
+        event = "api.connection",
+        subsystem = "api",
+        outcome = "error",
+        err,
+        "api connection failed"
+    );
+}
+
+pub(crate) fn api_listener_accept_failed(err: &str) {
+    tracing::error!(
+        event = "api.listener.accept",
+        subsystem = "api",
+        outcome = "error",
+        err,
+        "api listener accept failed"
+    );
+}
+
+pub(crate) fn api_connection_write_timeout_unavailable(err: &str) {
+    tracing::debug!(
+        event = "api.connection.write_timeout",
+        subsystem = "api",
+        outcome = "unavailable",
+        err,
+        "api connection write timeout unavailable"
+    );
+}
+
+// --- app api / peers + config + respawn (logging redesign PR-7) ------------
+// Three `src/app/api.rs` sites: the peers-summary per-poll trace (still on
+// the flock::peers target so `flk peers logs` can filter on it), the
+// config-edit rollback write failure (target and err are both display-shaped
+// paths/errors), and the launch-shell respawn failure that names the pane +
+// terminal. TerminalId is Display-shaped at the call side so the facade
+// takes a plain `&str`. Level discipline preserved: peers-summary is DEBUG
+// (per-poll volume); rollback-write is WARN (backup restore couldn't land,
+// user is toasted separately); respawn is WARN (the pane exits into
+// Navigate but the app keeps running).
+
+pub(crate) fn peer_summary_applied(
+    peer: &str,
+    host: &str,
+    has_system: bool,
+    workspaces: usize,
+    latency_ms: u64,
+) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.summary.applied",
+        subsystem = "peers",
+        outcome = "ok",
+        peer,
+        host,
+        has_system,
+        workspaces,
+        latency_ms,
+        "peer summary applied"
+    );
+}
+
+pub(crate) fn config_edit_rollback_write_failed(target: &Path, err: &str) {
+    tracing::warn!(
+        event = "config.edit.rollback",
+        subsystem = "config",
+        outcome = "error",
+        target = %target.display(),
+        err,
+        "config edit rollback write failed"
+    );
+}
+
+pub(crate) fn pane_respawn_shell_failed(pane: u32, terminal: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.respawn_shell",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        terminal,
+        err,
+        "failed to respawn shell after launch command exited"
+    );
+}
+
+// --- web family (logging redesign PR-7) ------------------------------------
+// The `flk web` xterm.js <-> PTY bridge (feature = "web"). Six sites reach
+// tracing with raw `?origin` / `?user` / `%err` / `%e` fields; the facade
+// below owns the schema unconditionally (the fns are cheap wrappers on
+// `tracing::` macros; only the call sites live behind `cfg(feature = "web")`).
+// Level discipline preserved: security rejections (origin, identity) and
+// per-connection error termination are WARN (a phone's browser saw an
+// error the user needs to know about); PTY read EOF is DEBUG (routine — the
+// child exit is the primary story); pre-init framing errors and PTY resize
+// errors are WARN (the frame's dropped or the resize is lost, but the WS
+// keeps running).
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_origin_rejected(origin: Option<&str>, host: Option<&str>) {
+    tracing::warn!(
+        event = "web.ws.origin_rejected",
+        subsystem = "web",
+        outcome = "rejected",
+        origin = origin.unwrap_or("<absent>"),
+        host = host.unwrap_or("<absent>"),
+        "rejecting cross-origin WS upgrade"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_identity_rejected(user: Option<&str>) {
+    tracing::warn!(
+        event = "web.ws.identity_rejected",
+        subsystem = "web",
+        outcome = "rejected",
+        user = user.unwrap_or("<absent>"),
+        "rejecting WS upgrade: identity not in allow-list"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_session_ended_error(err: &str) {
+    tracing::warn!(
+        event = "web.ws.session",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "ws session ended with error"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_pre_init_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "web.ws.pre_init",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "ignoring non-init control msg pre-init"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_pty_resize_failed(err: &str) {
+    tracing::warn!(
+        event = "web.pty.resize",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "pty resize"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_pty_read_ended(err: &str) {
+    tracing::debug!(
+        event = "web.pty.read",
+        subsystem = "web",
+        outcome = "ended",
+        err,
+        "pty read ended"
+    );
+}
+
+// --- kitty_graphics family (logging redesign PR-7) -------------------------
+// Three debug-tail sites in `src/kitty_graphics.rs` that walk the pane-info
+// tree and log the entry/clip/runtime-not-found story. `active` is Debug of
+// `Option<usize>` (workspace index) and `pane_id` is Debug of PaneId (a
+// `struct PaneId(u32)`). Both are shaped at the call side so the raw `?`
+// formatter stays confined to logging.rs — `active` becomes a `&str` we
+// carry as-is (`Some(3)` / `None`) and `pane_id` becomes the underlying u32
+// (the PaneId(N) wrapper is dropped so the tail's `pane_id` column stays a
+// flat integer, matching every other facade fn that names a pane).
+
+pub(crate) fn kitty_paint_local_pane_graphics_entry(
+    mode_ok: bool,
+    cell_ok: bool,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    active: &str,
+    pane_infos_len: usize,
+) {
+    tracing::debug!(
+        event = "kitty.paint.entry",
+        subsystem = "kitty",
+        outcome = "ok",
+        mode_ok,
+        cell_ok,
+        cell_width_px,
+        cell_height_px,
+        active,
+        pane_infos_len,
+        "paint_local_pane_graphics entry"
+    );
+}
+
+pub(crate) fn kitty_clipped_placement_result(
+    pane_id: u32,
+    has_clipped: bool,
+    grid_cols: u32,
+    grid_rows: u32,
+    viewport_col: i32,
+    viewport_row: i32,
+    area_w: u16,
+    area_h: u16,
+) {
+    tracing::debug!(
+        event = "kitty.clipped_placement",
+        subsystem = "kitty",
+        outcome = "ok",
+        pane_id,
+        has_clipped,
+        grid_cols,
+        grid_rows,
+        viewport_col,
+        viewport_row,
+        area_w,
+        area_h,
+        "clipped_placement result"
+    );
+}
+
+pub(crate) fn kitty_collect_placements_runtime_missing(pane_id: u32) {
+    tracing::debug!(
+        event = "kitty.collect_placements",
+        subsystem = "kitty",
+        outcome = "runtime_missing",
+        pane_id,
+        "collect_visible_placements: runtime not found"
+    );
+}
+
+// --- workspace/tab creation family (logging redesign PR-7) -----------------
+// Three sibling sites in `src/app/creation.rs` — new workspace / new tab /
+// new sibling workspace — all reached tracing with `err = %e`. Every failure
+// is ERROR: the caller falls back to Navigate mode, but the tab/workspace
+// creation the user asked for did NOT happen and the tail must surface it
+// prominently.
+
+pub(crate) fn workspace_create_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        err,
+        "failed to create workspace"
+    );
+}
+
+pub(crate) fn tab_create_failed(err: &str) {
+    tracing::error!(
+        event = "tab.create",
+        subsystem = "tab",
+        outcome = "error",
+        err,
+        "failed to create tab"
+    );
+}
+
+pub(crate) fn sibling_workspace_create_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        variant = "sibling",
+        err,
+        "failed to create sibling workspace"
+    );
+}
+
+// --- platform nofile family (logging redesign PR-7) ------------------------
+// macOS raises the server's file-descriptor soft limit at startup. Success is
+// INFO and already flows through named fields (no facade needed for the OK
+// path). Failure was the last raw `err = %err` in src/platform/macos.rs.
+// Level stays WARN — the server keeps running with the OS default
+// (`ulimit -n`) but a packed fleet may hit accept() ceilings sooner.
+
+pub(crate) fn server_nofile_raise_failed(err: &str) {
+    tracing::warn!(
+        event = "platform.nofile.raise",
+        subsystem = "platform",
+        outcome = "error",
+        err,
+        "failed to raise server file descriptor limit"
+    );
+}
+
+// --- terminal session-ref eviction (logging redesign PR-7) -----------------
+// `App::evict_duplicate_session_refs` (src/app/actions.rs) logs each
+// terminal a stale session id was cleared from. Pre-facade the site used
+// `?terminal_id` (Debug of TerminalId, a `struct TerminalId(String)`) — the
+// wrapper is dropped at the call side so the tail carries a flat `terminal`
+// string. Level stays INFO: rare, but load-bearing for detection debugging.
+
+pub(crate) fn terminal_duplicate_session_ref_evicted(terminal: &str) {
+    tracing::info!(
+        event = "terminal.session_ref.evict",
+        subsystem = "terminal",
+        outcome = "ok",
+        terminal,
+        "evicted duplicate agent session ref"
+    );
+}
+
+// --- update family (logging redesign PR-7) ---------------------------------
+// Two long-lived `%expr` / `?expr` fields in the update flow: the sha256
+// verification confirmation after downloading a release, and the
+// preview-build selection trace that names the resolved commit + build_id.
+// The facade takes the Debug shape of `Option<String>` as a shaped `&str`
+// so the subsystem carries no raw `?field`.
+
+pub(crate) fn update_checksum_verified(sha256: &str) {
+    tracing::info!(
+        event = "update.checksum.verify",
+        subsystem = "update",
+        outcome = "ok",
+        sha256,
+        "downloaded update checksum verified"
+    );
+}
+
+pub(crate) fn update_preview_build_selected(commit: &str, build_id: &str) {
+    tracing::info!(
+        event = "update.preview_build.select",
+        subsystem = "update",
+        outcome = "ok",
+        commit,
+        build_id,
+        "selected preview update build"
+    );
+}
+
+// --- sound family (logging redesign PR-7) ----------------------------------
+// Notification-sound playback via afplay / linux mp3 players. Two failure
+// modes: a custom user-configured path failed (fall back to the built-in
+// sample) and the built-in playback failed (silent failure — the sound is
+// lost). `sound` is Debug of a copy-shaped Sound enum (`Done`/`Request`/
+// `AllClear`) — the variant name is stable so the facade takes it as a
+// shaped `&str`.
+
+pub(crate) fn sound_custom_playback_failed(path: &Path, sound: &str, err: &str) {
+    tracing::warn!(
+        event = "sound.playback",
+        subsystem = "sound",
+        outcome = "error",
+        variant = "custom",
+        path = %path.display(),
+        sound,
+        err,
+        "custom sound playback failed, falling back to built-in sound"
+    );
+}
+
+pub(crate) fn sound_playback_failed(sound: &str, err: &str) {
+    tracing::warn!(
+        event = "sound.playback",
+        subsystem = "sound",
+        outcome = "error",
+        sound,
+        err,
+        "sound playback failed"
+    );
+}
+
+// --- render profiler window (logging redesign PR-7) ------------------------
+// The opt-in FLOCK_RENDER_PROF sampler flushes one INFO line per window
+// aggregating counters + duration stats. Both fields were `%counters` /
+// `%durations` (Display of the pre-formatted comma-joined string). The
+// facade takes shaped `&str` so no other module carries a raw formatter.
+
+pub(crate) fn render_prof_window(window_ms: u64, counters: &str, durations: &str) {
+    tracing::info!(
+        event = "render.prof",
+        subsystem = "render",
+        outcome = "ok",
+        window_ms,
+        counters,
+        durations,
+        "render profiler window"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -3869,5 +4360,289 @@ mod tests {
         );
         assert!(without.contains("agent=\"Some(Claude)\""), "{without}");
         assert!(without.contains("INFO"), "{without}");
+    }
+
+    // ------ logging redesign PR-7: pty family ------------------------------
+
+    #[test]
+    fn pty_family_events_carry_pane_and_correct_levels() {
+        let wake = capture_logs(|| pty_wake_failed("EPIPE"));
+        assert!(wake.contains("event=\"pty.wake\""), "{wake}");
+        assert!(wake.contains("err=\"EPIPE\""), "{wake}");
+        assert!(wake.contains("DEBUG"), "{wake}");
+
+        let drain = capture_logs(|| pty_wake_drain_failed(7, "EBADF"));
+        assert!(drain.contains("event=\"pty.wake.drain\""), "{drain}");
+        assert!(drain.contains("pane=7"), "{drain}");
+        assert!(drain.contains("DEBUG"), "{drain}");
+
+        let poll = capture_logs(|| pty_poll_failed(7, "EINTR"));
+        assert!(poll.contains("event=\"pty.poll\""), "{poll}");
+        assert!(poll.contains("pane=7"), "{poll}");
+        assert!(poll.contains("DEBUG"), "{poll}");
+
+        let read = capture_logs(|| pty_read_failed(7, "EIO"));
+        assert!(read.contains("event=\"pty.read\""), "{read}");
+        assert!(read.contains("DEBUG"), "{read}");
+
+        let write = capture_logs(|| pty_write_failed(7, "EPIPE"));
+        assert!(write.contains("event=\"pty.write\""), "{write}");
+        assert!(write.contains("pane=7"), "{write}");
+        assert!(
+            write.contains("WARN"),
+            "PTY write failures must WARN — the caller's keystrokes were dropped: {write}"
+        );
+
+        let resize = capture_logs(|| pty_resize_failed(7, "EINVAL"));
+        assert!(resize.contains("event=\"pty.resize\""), "{resize}");
+        assert!(resize.contains("DEBUG"), "{resize}");
+    }
+
+    // ------ logging redesign PR-7: api server family -----------------------
+
+    #[test]
+    fn api_server_family_splits_by_level_and_shapes_path() {
+        let remove =
+            capture_logs(|| api_socket_remove_failed(Path::new("/tmp/flock-api.sock"), "EACCES"));
+        assert!(remove.contains("event=\"api.socket.remove\""), "{remove}");
+        assert!(remove.contains("path=/tmp/flock-api.sock"), "{remove}");
+        assert!(remove.contains("err=\"EACCES\""), "{remove}");
+        assert!(remove.contains("WARN"), "{remove}");
+
+        let listen = capture_logs(|| api_server_listening(Path::new("/tmp/flock-api.sock")));
+        assert!(listen.contains("event=\"api.server.listen\""), "{listen}");
+        assert!(listen.contains("path=/tmp/flock-api.sock"), "{listen}");
+        assert!(listen.contains("INFO"), "{listen}");
+
+        let conn = capture_logs(|| api_connection_failed("framing"));
+        assert!(conn.contains("event=\"api.connection\""), "{conn}");
+        assert!(conn.contains("err=\"framing\""), "{conn}");
+        assert!(conn.contains("WARN"), "{conn}");
+
+        let accept = capture_logs(|| api_listener_accept_failed("EBADF"));
+        assert!(accept.contains("event=\"api.listener.accept\""), "{accept}");
+        assert!(
+            accept.contains("ERROR"),
+            "accept-loop dying is ERROR — the server can no longer take new clients: {accept}"
+        );
+
+        let timeout = capture_logs(|| api_connection_write_timeout_unavailable("ENOTSOCK"));
+        assert!(
+            timeout.contains("event=\"api.connection.write_timeout\""),
+            "{timeout}"
+        );
+        assert!(timeout.contains("outcome=\"unavailable\""), "{timeout}");
+        assert!(timeout.contains("DEBUG"), "{timeout}");
+    }
+
+    // ------ logging redesign PR-7: app api family --------------------------
+
+    #[test]
+    fn peer_summary_applied_targets_flock_peers_at_debug() {
+        let out = capture_logs(|| peer_summary_applied("sage", "sage.local", true, 3, 42));
+        assert!(out.contains("event=\"peer.summary.applied\""), "{out}");
+        assert!(out.contains("peer=\"sage\""), "{out}");
+        assert!(out.contains("host=\"sage.local\""), "{out}");
+        assert!(out.contains("has_system=true"), "{out}");
+        assert!(out.contains("workspaces=3"), "{out}");
+        assert!(out.contains("latency_ms=42"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+        assert!(
+            out.contains("flock::peers"),
+            "peers summary must keep the flock::peers target: {out}"
+        );
+    }
+
+    #[test]
+    fn config_edit_rollback_write_failed_shapes_path_and_err() {
+        let out = capture_logs(|| {
+            config_edit_rollback_write_failed(Path::new("/home/u/config.toml"), "EACCES")
+        });
+        assert!(out.contains("event=\"config.edit.rollback\""), "{out}");
+        assert!(out.contains("target=/home/u/config.toml"), "{out}");
+        assert!(out.contains("err=\"EACCES\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_respawn_shell_failed_is_warn_with_pane_and_terminal() {
+        let out = capture_logs(|| pane_respawn_shell_failed(7, "term-abc", "ENOENT"));
+        assert!(out.contains("event=\"pane.respawn_shell\""), "{out}");
+        assert!(out.contains("pane=7"), "{out}");
+        assert!(out.contains("terminal=\"term-abc\""), "{out}");
+        assert!(out.contains("err=\"ENOENT\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    // ------ logging redesign PR-7: web family ------------------------------
+
+    #[test]
+    fn web_ws_origin_rejected_names_both_headers() {
+        let with = capture_logs(|| {
+            web_ws_origin_rejected(Some("https://evil.example"), Some("flock.local"))
+        });
+        assert!(with.contains("event=\"web.ws.origin_rejected\""), "{with}");
+        assert!(with.contains("origin=\"https://evil.example\""), "{with}");
+        assert!(with.contains("host=\"flock.local\""), "{with}");
+        assert!(with.contains("WARN"), "{with}");
+
+        let absent = capture_logs(|| web_ws_origin_rejected(None, None));
+        assert!(absent.contains("origin=\"<absent>\""), "{absent}");
+        assert!(absent.contains("host=\"<absent>\""), "{absent}");
+    }
+
+    #[test]
+    fn web_ws_identity_rejected_and_session_and_resize_shapes() {
+        let ident = capture_logs(|| web_ws_identity_rejected(Some("bob@example")));
+        assert!(
+            ident.contains("event=\"web.ws.identity_rejected\""),
+            "{ident}"
+        );
+        assert!(ident.contains("user=\"bob@example\""), "{ident}");
+        assert!(ident.contains("WARN"), "{ident}");
+
+        let sess = capture_logs(|| web_ws_session_ended_error("closed"));
+        assert!(sess.contains("event=\"web.ws.session\""), "{sess}");
+        assert!(sess.contains("WARN"), "{sess}");
+
+        let init = capture_logs(|| web_ws_pre_init_parse_failed("bad json"));
+        assert!(init.contains("event=\"web.ws.pre_init\""), "{init}");
+        assert!(init.contains("WARN"), "{init}");
+
+        let resize = capture_logs(|| web_pty_resize_failed("EINVAL"));
+        assert!(resize.contains("event=\"web.pty.resize\""), "{resize}");
+        assert!(resize.contains("WARN"), "{resize}");
+
+        let read = capture_logs(|| web_pty_read_ended("EOF"));
+        assert!(read.contains("event=\"web.pty.read\""), "{read}");
+        assert!(read.contains("DEBUG"), "{read}");
+    }
+
+    // ------ logging redesign PR-7: kitty family ----------------------------
+
+    #[test]
+    fn kitty_family_events_carry_pane_and_geometry() {
+        let entry =
+            capture_logs(|| kitty_paint_local_pane_graphics_entry(true, true, 9, 18, "Some(0)", 3));
+        assert!(entry.contains("event=\"kitty.paint.entry\""), "{entry}");
+        assert!(entry.contains("active=\"Some(0)\""), "{entry}");
+        assert!(entry.contains("cell_width_px=9"), "{entry}");
+        assert!(entry.contains("DEBUG"), "{entry}");
+
+        let clip = capture_logs(|| kitty_clipped_placement_result(7, true, 40, 20, 0, 0, 80, 24));
+        assert!(clip.contains("event=\"kitty.clipped_placement\""), "{clip}");
+        assert!(clip.contains("pane_id=7"), "{clip}");
+        assert!(clip.contains("has_clipped=true"), "{clip}");
+        assert!(clip.contains("DEBUG"), "{clip}");
+
+        let missing = capture_logs(|| kitty_collect_placements_runtime_missing(7));
+        assert!(
+            missing.contains("event=\"kitty.collect_placements\""),
+            "{missing}"
+        );
+        assert!(missing.contains("outcome=\"runtime_missing\""), "{missing}");
+        assert!(missing.contains("pane_id=7"), "{missing}");
+    }
+
+    // ------ logging redesign PR-7: creation family -------------------------
+
+    #[test]
+    fn workspace_and_tab_and_sibling_create_failures_are_error() {
+        let ws = capture_logs(|| workspace_create_failed("no cwd"));
+        assert!(ws.contains("event=\"workspace.create\""), "{ws}");
+        assert!(ws.contains("err=\"no cwd\""), "{ws}");
+        assert!(ws.contains("ERROR"), "{ws}");
+        assert!(
+            !ws.contains("variant="),
+            "plain workspace has no variant field: {ws}"
+        );
+
+        let tab = capture_logs(|| tab_create_failed("no active ws"));
+        assert!(tab.contains("event=\"tab.create\""), "{tab}");
+        assert!(tab.contains("ERROR"), "{tab}");
+
+        let sib = capture_logs(|| sibling_workspace_create_failed("spawn failed"));
+        assert!(sib.contains("event=\"workspace.create\""), "{sib}");
+        assert!(sib.contains("variant=\"sibling\""), "{sib}");
+        assert!(sib.contains("ERROR"), "{sib}");
+    }
+
+    // ------ logging redesign PR-7: misc singletons -------------------------
+
+    #[test]
+    fn server_nofile_raise_failed_is_warn() {
+        let out = capture_logs(|| server_nofile_raise_failed("EPERM"));
+        assert!(out.contains("event=\"platform.nofile.raise\""), "{out}");
+        assert!(out.contains("err=\"EPERM\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn terminal_duplicate_session_ref_evicted_is_info() {
+        let out = capture_logs(|| terminal_duplicate_session_ref_evicted("term-99"));
+        assert!(
+            out.contains("event=\"terminal.session_ref.evict\""),
+            "{out}"
+        );
+        assert!(out.contains("terminal=\"term-99\""), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    // ------ logging redesign PR-7: update/sound/render_prof ----------------
+
+    #[test]
+    fn update_checksum_and_preview_build_are_info() {
+        let sum = capture_logs(|| update_checksum_verified("deadbeef"));
+        assert!(sum.contains("event=\"update.checksum.verify\""), "{sum}");
+        assert!(sum.contains("sha256=\"deadbeef\""), "{sum}");
+        assert!(sum.contains("INFO"), "{sum}");
+
+        let sel = capture_logs(|| update_preview_build_selected("abc123", "Some(\"20260702\")"));
+        assert!(
+            sel.contains("event=\"update.preview_build.select\""),
+            "{sel}"
+        );
+        assert!(sel.contains("commit=\"abc123\""), "{sel}");
+        assert!(sel.contains("build_id=\"Some(\\\"20260702\\\")\""), "{sel}");
+        assert!(sel.contains("INFO"), "{sel}");
+    }
+
+    #[test]
+    fn sound_playback_failure_variants_are_warn() {
+        let custom = capture_logs(|| {
+            sound_custom_playback_failed(Path::new("/tmp/done.mp3"), "Done", "no player")
+        });
+        assert!(custom.contains("event=\"sound.playback\""), "{custom}");
+        assert!(custom.contains("variant=\"custom\""), "{custom}");
+        assert!(custom.contains("path=/tmp/done.mp3"), "{custom}");
+        assert!(custom.contains("sound=\"Done\""), "{custom}");
+        assert!(custom.contains("WARN"), "{custom}");
+
+        let plain = capture_logs(|| sound_playback_failed("Done", "no player"));
+        assert!(plain.contains("event=\"sound.playback\""), "{plain}");
+        assert!(
+            !plain.contains("variant="),
+            "built-in playback has no variant field: {plain}"
+        );
+        assert!(plain.contains("WARN"), "{plain}");
+    }
+
+    #[test]
+    fn render_prof_window_is_info_with_counters_and_durations() {
+        let out = capture_logs(|| {
+            render_prof_window(
+                1000,
+                "frames=42,ticks=100",
+                "paint=count:42 avg_us:100 max_us:250",
+            )
+        });
+        assert!(out.contains("event=\"render.prof\""), "{out}");
+        assert!(out.contains("window_ms=1000"), "{out}");
+        assert!(out.contains("frames=42,ticks=100"), "{out}");
+        assert!(
+            out.contains("paint=count:42 avg_us:100 max_us:250"),
+            "{out}"
+        );
+        assert!(out.contains("INFO"), "{out}");
     }
 }

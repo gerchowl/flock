@@ -257,8 +257,7 @@ async fn ws_handler(
         &state.allowed_origins,
         state.allow_any_origin,
     ) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(?origin, ?host, "rejecting cross-origin WS upgrade");
+        crate::logging::web_ws_origin_rejected(origin.as_deref(), host.as_deref());
         return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
     }
 
@@ -267,8 +266,7 @@ async fn ws_handler(
     // not enforced (loopback / tailnet membership stays the boundary).
     let user = header_str(&headers, "tailscale-user-login");
     if !identity_allowed(user.as_deref(), &state.allowed_users) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(?user, "rejecting WS upgrade: identity not in allow-list");
+        crate::logging::web_ws_identity_rejected(user.as_deref());
         return (StatusCode::FORBIDDEN, "identity not allowed").into_response();
     }
 
@@ -314,8 +312,7 @@ async fn handle_socket(
     // Held for the connection lifetime; drops (releasing the slot) on return.
     let _guard = guard;
     if let Err(e) = pump(socket, state, idle).await {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(error = %e, "ws session ended with error");
+        crate::logging::web_ws_session_ended_error(&e.to_string());
     } else {
         info!("ws session ended cleanly");
     }
@@ -333,8 +330,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
                 // Tolerate resize-before-init from a racing client.
                 Ok(ClientMsg::Resize { cols, rows }) => break (cols.max(1), rows.max(1)),
                 Err(e) => {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    warn!(error = %e, "ignoring non-init control msg pre-init");
+                    crate::logging::web_ws_pre_init_parse_failed(&e.to_string());
                     continue;
                 }
             },
@@ -478,8 +474,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(error = %e, "pty resize");
+                crate::logging::web_pty_resize_failed(&e.to_string());
             } else {
                 debug!(cols, rows, "pty resized");
             }
@@ -530,8 +525,7 @@ fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender<V
                 }
             }
             Err(e) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(error = %e, "pty read ended");
+                crate::logging::web_pty_read_ended(&e.to_string());
                 break;
             }
         }
