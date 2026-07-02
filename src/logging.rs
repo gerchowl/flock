@@ -1787,6 +1787,54 @@ pub(crate) fn worktree_remove_failed(workspace_id: &str, path: &str, err: &str) 
     );
 }
 
+// --- persist io family (logging redesign PR-6) -----------------------------
+// The session file (workspaces/tabs/panes snapshot) and its history sidecar
+// (recent tab titles + labels) both have the same failure surfaces on load:
+// read-file failure, followed by parse failure. Four sites (io.rs) all had
+// raw %err fields — the facade fns below take a shaped &str so persist/io.rs
+// carries no raw formatter. Level stays WARN — a read/parse failure drops
+// the persisted state to defaults, which is user-visible but not fatal.
+
+pub(crate) fn session_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session file"
+    );
+}
+
+pub(crate) fn session_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session file, ignoring"
+    );
+}
+
+pub(crate) fn session_history_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session history file"
+    );
+}
+
+pub(crate) fn session_history_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session history file, ignoring"
+    );
+}
+
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
 // action / custom command / pane scroll), which was dropped as
@@ -3585,6 +3633,33 @@ mod tests {
             remove_fail.contains("WARN"),
             "remove fail is WARN: {remove_fail}"
         );
+    }
+
+    #[test]
+    fn persist_read_and_parse_failures_are_warn_with_err() {
+        let read = capture_logs(|| session_read_failed("ENOENT"));
+        assert!(read.contains("event=\"persist.read\""), "{read}");
+        assert!(read.contains("err=\"ENOENT\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let parse = capture_logs(|| session_parse_failed("expected map at line 1"));
+        assert!(parse.contains("event=\"persist.parse\""), "{parse}");
+        assert!(parse.contains("failed to parse session file"), "{parse}");
+        assert!(parse.contains("WARN"), "{parse}");
+
+        let hist_read = capture_logs(|| session_history_read_failed("EPERM"));
+        assert!(
+            hist_read.contains("event=\"persist.history.read\""),
+            "{hist_read}"
+        );
+        assert!(hist_read.contains("WARN"), "{hist_read}");
+
+        let hist_parse = capture_logs(|| session_history_parse_failed("bad TOML"));
+        assert!(
+            hist_parse.contains("event=\"persist.history.parse\""),
+            "{hist_parse}"
+        );
+        assert!(hist_parse.contains("WARN"), "{hist_parse}");
     }
 
     #[test]

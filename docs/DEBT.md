@@ -21,7 +21,6 @@ src/web/mod.rs:6
 src/pty/actor.rs:6
 src/app/api.rs:5
 src/api/server.rs:5
-src/persist/io.rs:4
 src/kitty_graphics.rs:3
 src/app/creation.rs:3
 src/update.rs:2
@@ -33,5 +32,5 @@ src/app/actions.rs:1
 <!-- guardrails:derived:end -->
 
 <!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | cut -d: -f2 | paste -sd+ - | bc | xargs -I{} echo total: {} marker sites" -->
-total: 56 marker sites
+total: 52 marker sites
 <!-- guardrails:derived:end -->
