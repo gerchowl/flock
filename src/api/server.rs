@@ -720,7 +720,16 @@ mod tests {
 
     #[test]
     fn restrict_socket_permissions_sets_user_only_mode() {
-        let dir = unique_test_path("socket-perms");
+        // SUN_LEN caps unix-socket paths at ~104 bytes on macOS. unique_test_path
+        // honors TMPDIR, which under `nix develop` gains a nix-shell.XXXXXX
+        // segment (~62 bytes before our name) — the bind then fails with
+        // "path must be shorter than SUN_LEN". Bind under /tmp with a short
+        // unique name instead; only this test actually binds a socket there.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from("/tmp").join(format!("flock-sp-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
         let _listener = UnixListener::bind(&path).unwrap();
