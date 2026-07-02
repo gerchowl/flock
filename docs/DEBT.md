@@ -15,15 +15,11 @@ functions. This census tracks per-file marker counts so PRs can burn it down
 visibly.
 
 <!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | sort -t: -k2 -rn" -->
-src/client/mod.rs:25
-src/app/input/terminal.rs:18
 src/config/keybinds.rs:15
 src/pane.rs:14
 src/app/worktrees.rs:14
 src/app/agent_resume.rs:8
-src/raw_input.rs:7
 src/persist/restore.rs:7
-src/app/input/mouse.rs:7
 src/web/mod.rs:6
 src/pty/actor.rs:6
 src/app/api.rs:5
@@ -37,10 +33,9 @@ src/render_prof.rs:2
 src/platform/macos.rs:1
 src/config/io.rs:1
 src/app/mod.rs:1
-src/app/input/mod.rs:1
 src/app/actions.rs:1
 <!-- guardrails:derived:end -->
 
 <!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | cut -d: -f2 | paste -sd+ - | bc | xargs -I{} echo total: {} marker sites" -->
-total: 158 marker sites
+total: 100 marker sites
 <!-- guardrails:derived:end -->

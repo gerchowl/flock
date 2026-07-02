@@ -766,8 +766,7 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     match serde_json::from_str(&raw) {
         Ok(fleet) => Some(fleet),
         Err(err) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(err = %err, "ignoring malformed fleet snapshot from launcher");
+            crate::logging::client_fleet_snapshot_invalid(&err.to_string());
             None
         }
     }
@@ -867,8 +866,11 @@ fn do_handshake(
                 return Err(ClientError::HandshakeRejected { version, error });
             }
             let handshake_ms = handshake_t0.elapsed().as_millis() as u64;
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            info!(version, ?encoding, handshake_ms, "handshake succeeded");
+            crate::logging::client_handshake_succeeded(
+                version,
+                &format!("{:?}", encoding),
+                handshake_ms,
+            );
             Ok(encoding)
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
@@ -1015,8 +1017,7 @@ fn read_host_theme_replies() -> (Option<crate::terminal_theme::TerminalTheme>, V
     if theme.is_empty() {
         debug!("host terminal did not answer the default color query");
     } else {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        info!(?theme, "captured host terminal theme for handshake");
+        crate::logging::client_host_theme_captured(&format!("{:?}", theme));
     }
     ((!theme.is_empty()).then_some(theme), buf)
 }
@@ -1400,8 +1401,7 @@ fn run_client_with_mode(
 
     let socket_path = client_socket_path();
     crate::logging::startup("client");
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    info!(path = %socket_path.display(), "{log_message}");
+    crate::logging::client_connecting(&socket_path, log_message);
 
     // Capture the host terminal theme before the handshake so it rides the
     // Hello (#47). Direct terminal attaches mirror a single pane and never
@@ -1611,8 +1611,7 @@ async fn run_client_loop(
         mouse_scroll_lines,
         redraw_on_focus_gained,
     };
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    debug!(?negotiated_encoding, "client render encoding active");
+    crate::logging::client_render_encoding_active(&format!("{:?}", negotiated_encoding));
 
     // Channel for events from the resize and server reader threads. The
     // stdin reader outlives this session (handoff retries reuse it), so it
@@ -1872,11 +1871,9 @@ async fn run_client_loop(
                                 max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
                                 "dropped file too large to bridge; passing the paste through"
                             ),
-                            Err(err) => warn!(
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                err = %err,
-                                "failed to read dropped local file; passing the paste through"
-                            ),
+                            Err(err) => {
+                                crate::logging::client_dropped_file_read_failed(&err.to_string())
+                            }
                         }
                     }
                 }
@@ -1915,14 +1912,12 @@ async fn run_client_loop(
                         if let Some(manager) = slot_manager.as_mut() {
                             manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
                         }
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "warm slot server shut down; demoted silently");
+                        crate::logging::client_slot_shutdown_demoted(&slot_key);
                         continue;
                     }
                     slots::SlotRouting::Drop => {
                         // Stale frame or other non-active-slot traffic: drop.
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "dropping message from non-active slot");
+                        crate::logging::client_slot_message_dropped(&slot_key);
                         continue;
                     }
                 }
@@ -1953,15 +1948,10 @@ async fn run_client_loop(
                             );
                         }
                         if let Some((switch_t0, to, warm)) = switch_timing.take() {
-                            debug!(
-                                target: "flock::attach",
-                                side = "client",
-                                stage = "switch",
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                to = %to,
+                            crate::logging::client_attach_switch_first_paint(
+                                &to,
                                 warm,
-                                elapsed_ms = switch_t0.elapsed().as_millis() as u64,
-                                "attach: switch first frame painted"
+                                switch_t0.elapsed().as_millis() as u64,
                             );
                         }
                     }
@@ -2075,8 +2065,10 @@ async fn run_client_loop(
                                     continue;
                                 }
                                 Err(err) => {
-                                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                    warn!(err = %err, target = %ssh_target, "slot flip failed; demoting");
+                                    crate::logging::client_slot_flip_failed(
+                                        &ssh_target,
+                                        &err.to_string(),
+                                    );
                                     manager.handle_dead(&target);
                                     // Surface in the popup as a switch failure
                                     // beat; the user sees the reason and the
@@ -2171,8 +2163,7 @@ async fn run_client_loop(
                         if let Some(manager) = slot_manager.as_mut() {
                             manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
                         }
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "warm slot disconnected; demoted silently");
+                        crate::logging::client_slot_disconnected_demoted(&slot_key);
                         continue;
                     }
                 }
@@ -2216,8 +2207,10 @@ async fn run_client_loop(
                                 bridge,
                             };
                             if let Err(err) = manager.add_warm(conn) {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                warn!(target = %key, err = %err, "switch-dial warmed slot but pause failed");
+                                crate::logging::client_slot_switch_pause_failed(
+                                    &key,
+                                    &err.to_string(),
+                                );
                                 // Treat as failure-beat.
                                 if let Some(p) = pending_switch.as_mut() {
                                     p.outcome_beat = Some((
@@ -2279,8 +2272,7 @@ async fn run_client_loop(
                             // sweep won the race for this peer). Drop the
                             // redundant transport off-loop rather than orphaning
                             // the live one (#139).
-                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                            debug!(target = %key, "slot already connected; dropping redundant pre-warm");
+                            crate::logging::client_slot_prewarm_redundant(&key);
                             std::thread::spawn(move || {
                                 drop(stream);
                                 drop(bridge);
@@ -2292,19 +2284,19 @@ async fn run_client_loop(
                                 bridge,
                             };
                             if let Err(err) = manager.add_warm(conn) {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                                crate::logging::client_slot_warm_pause_failed(
+                                    &key,
+                                    &err.to_string(),
+                                );
                             } else {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                debug!(target = %key, "slot warmed and paused");
+                                crate::logging::client_slot_warmed_paused(&key);
                             }
                         }
                     }
                 } else {
                     // Stale event: drop the stream + bridge. Plain drop closes
                     // the socket so the server sees a disconnect (#93).
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    debug!(target = %key, gen, "stale SlotWarmed; dropping stream");
+                    crate::logging::client_slot_warmed_stale(&key, gen);
                     // Detached drop: SshStdioBridge::drop joins its listener
                     // thread and can block on a live ssh child's teardown for
                     // seconds -- never on the loop thread.
@@ -2341,8 +2333,7 @@ async fn run_client_loop(
                             .mark_dial_failed(&slots::SlotTarget::from_key(&key), Instant::now());
                     }
                 } else {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    debug!(target = %key, gen, "stale SlotDialFailed; dropping");
+                    crate::logging::client_slot_dial_failed_stale(&key, gen);
                 }
             }
             ClientLoopEvent::Timer => {
@@ -2914,8 +2905,7 @@ fn spawn_warm_dial(
                 bridge: None,
             },
             Err(err) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, err = %err, "warm-all dial failed; slot stays cold");
+                crate::logging::client_slot_warm_all_dial_failed(&key, &err.to_string());
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -3036,8 +3026,7 @@ fn spawn_switch_dial(
                 bridge,
             },
             Ok(Err(err)) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, err = %err, "switch dial failed");
+                crate::logging::client_slot_switch_dial_failed(&key, &err.to_string());
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -3045,8 +3034,7 @@ fn spawn_switch_dial(
                 }
             }
             Err(_) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, "switch dial timed out");
+                crate::logging::client_slot_switch_dial_timed_out(&key);
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -3161,8 +3149,7 @@ fn server_reader_thread(
                 continue;
             }
             Err(err) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "server read error");
+                crate::logging::client_server_read_error(&err.to_string());
                 let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(slot_key));
                 break;
             }
@@ -3190,16 +3177,14 @@ fn reload_local_client_config(
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(diagnostic = %diagnostic, "local sound config diagnostic");
+                crate::logging::client_config_sound_diagnostic(&diagnostic.to_string());
             }
             *sound_config = loaded.config.ui.sound;
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+            crate::logging::client_config_reload_failed(&format!("{:?}", diagnostics));
         }
     }
 }
@@ -3254,8 +3239,7 @@ fn handle_notify_with_notifiers(
                 None => crate::terminal_notify::split_message(message),
             };
             if let Err(err) = show_terminal_notification(title, body) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "failed to emit terminal notification");
+                crate::logging::client_terminal_notification_failed(&err.to_string());
             }
         }
         NotifyKind::SystemToast => {
@@ -3268,8 +3252,7 @@ fn handle_notify_with_notifiers(
                 None => crate::terminal_notify::split_message(message),
             };
             if let Err(err) = show_system_notification(title, body) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "failed to emit system notification");
+                crate::logging::client_system_notification_failed(&err.to_string());
             }
         }
     }

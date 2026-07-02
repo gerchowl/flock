@@ -1327,6 +1327,542 @@ pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: O
     );
 }
 
+// --- raw_input family (logging redesign PR-5) ------------------------------
+// The stdin decoder is downstream of every keystroke the host terminal
+// produces, so its debug/warn tail runs hot. Byte payloads are Debug-formatted
+// but BOUNDED (see `bounded_bytes_debug`) so a runaway paste can't turn the log
+// into a memory hog. Levels mirror the pre-facade calls: unsupported/dropped
+// buffers are DEBUG (routine framing noise), the lone-escape flush is WARN
+// (may reach the pane as a spurious Esc), UTF-8-continuation waits are TRACE.
+
+const MAX_TRACE_BYTE_PREVIEW: usize = 64;
+
+/// Shape a byte slice for a tracing field so a runaway paste can't blow up
+/// the log. Long payloads are truncated with a "(+N more)" tail; the Debug
+/// form (`[0x1b, 0x5b, ...]`) survives.
+pub(crate) fn bounded_bytes_debug(bytes: &[u8]) -> String {
+    if bytes.len() <= MAX_TRACE_BYTE_PREVIEW {
+        format!("{:?}", bytes)
+    } else {
+        let head = &bytes[..MAX_TRACE_BYTE_PREVIEW];
+        format!(
+            "{:?} (+{} more)",
+            head,
+            bytes.len() - MAX_TRACE_BYTE_PREVIEW
+        )
+    }
+}
+
+pub(crate) fn raw_input_event_parsed(chunk: &[u8], event: &str) {
+    tracing::debug!(
+        event = "raw_input.parsed",
+        subsystem = "raw_input",
+        outcome = "ok",
+        raw_bytes = bounded_bytes_debug(chunk),
+        parsed = event,
+        "raw input event parsed"
+    );
+}
+
+pub(crate) fn raw_input_flushing_lone_escape(bytes: &[u8]) {
+    tracing::warn!(
+        event = "raw_input.flush",
+        subsystem = "raw_input",
+        outcome = "lone_escape",
+        bytes = bounded_bytes_debug(bytes),
+        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
+    );
+}
+
+pub(crate) fn raw_input_waiting_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_waiting_escaped_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "escaped_utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for escaped UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_dropping_incomplete_buffer(bytes: &[u8]) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "incomplete",
+        bytes = bounded_bytes_debug(bytes),
+        "dropping incomplete raw input buffer after timeout"
+    );
+}
+
+pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "unsupported_escape",
+        sequence,
+        "dropping unsupported escape sequence"
+    );
+}
+
+// --- pane input family (logging redesign PR-5) -----------------------------
+// Mouse-driven pane interactions the app can't recover from cleanly. Opening
+// a URL is a WARN because the click had a visible target — the user expects
+// the browser to launch.
+
+pub(crate) fn pane_open_url_failed(url: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.open_url",
+        subsystem = "pane",
+        outcome = "error",
+        url,
+        err,
+        "failed to open pane URL"
+    );
+}
+
+// --- pane_mouse family (logging redesign PR-5) -----------------------------
+// Encoding + forwarding failures for mouse events routed into a pane
+// runtime. `kind` is Debug-shaped at the call site (MouseEventKind is a
+// crossterm enum whose payload — button / column-delta — matters); the
+// facade takes it as an already-shaped string so the raw ?field stays
+// confined to logging.rs. Every failure is WARN: the pane misses an event
+// but keeps running.
+
+pub(crate) fn pane_mouse_wheel_encode_failed(pane: u32, kind: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "encode_error",
+        pane,
+        kind,
+        "failed to encode mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_wheel_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_button_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.button",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse button event"
+    );
+}
+
+pub(crate) fn pane_mouse_motion_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.motion",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse motion event"
+    );
+}
+
+pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.alternate_scroll",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward alternate-scroll key"
+    );
+}
+
+// --- terminal_key family (logging redesign PR-5) ---------------------------
+// Terminal-mode key decoding: which key was intercepted (for a navigate
+// action / custom command / pane scroll), which was dropped as
+// modifier-only, and which forwards were considered ambiguous (Esc / Alt
+// chords). `shape_key_event` is the single formatter for a crossterm
+// KeyEvent — the code / modifiers / kind / state tuple that every other
+// site would otherwise raw-Debug — and lives inside logging.rs so the gate
+// stays hard everywhere else. Level discipline mirrors pre-facade calls:
+// intercepts are DEBUG (routine but story-critical when a keybind misfires),
+// modifier-only drops are DEBUG, empty-encoding is WARN.
+
+/// Shape a crossterm KeyEvent for the tracing tail: the code / modifiers /
+/// kind / state tuple every terminal-key site cares about. Single formatter
+/// so a schema change lands in one place instead of eighteen.
+pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> String {
+    format!(
+        "code={:?} modifiers={:?} kind={:?} state={:?}",
+        event.code, event.modifiers, event.kind, event.state
+    )
+}
+
+pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, action: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "action",
+        key = shape_key_event(event),
+        action,
+        "intercepted terminal direct keybinding before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_intercept_command(event: &crossterm::event::KeyEvent, command: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "command",
+        key = shape_key_event(event),
+        command,
+        "intercepted terminal direct custom command before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_page_intercept(code: &crossterm::event::KeyCode, lines: usize) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "page_scroll",
+        code = format!("{:?}", code),
+        lines,
+        "intercepted page key for pane scrollback"
+    );
+}
+
+pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEvent) {
+    tracing::debug!(
+        event = "terminal_key.drop",
+        subsystem = "terminal_key",
+        outcome = "modifier_only",
+        key = shape_key_event(event),
+        "dropping modifier-only terminal key event instead of forwarding it to pane"
+    );
+}
+
+pub(crate) fn terminal_key_forward_ambiguous(
+    event: &crossterm::event::KeyEvent,
+    protocol: &str,
+    encoded: &[u8],
+) {
+    tracing::debug!(
+        event = "terminal_key.forward",
+        subsystem = "terminal_key",
+        outcome = "ambiguous",
+        key = shape_key_event(event),
+        protocol,
+        encoded = bounded_bytes_debug(encoded),
+        "forwarding potentially-ambiguous terminal key to pane"
+    );
+}
+
+pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
+    tracing::warn!(
+        event = "terminal_key.encode",
+        subsystem = "terminal_key",
+        outcome = "empty",
+        key = shape_key_event(event),
+        "key produced empty encoding"
+    );
+}
+
+// --- client family (logging redesign PR-5) ---------------------------------
+// The thin client's connection + slot lifecycle. Setup and handshake events
+// are INFO (rare, load-bearing for "did we come up?"). Runtime failures on
+// the active slot (server read error, dropped-file bridge, notifications,
+// config reload) are WARN — the session survives but the user notices
+// something. Slot lifecycle chatter (warm/pause/stale/switch dial) is DEBUG
+// — high volume during fleet churn, useful only when debugging a slot flip
+// that didn't stick. `err` / `diagnostic` payloads are shape-converted to
+// `&str` at the call side; Debug-shaped payloads (encoding / theme /
+// diagnostics slice) are formatted at the site so the raw ?field stays
+// confined to logging.rs.
+
+pub(crate) fn client_fleet_snapshot_invalid(err: &str) {
+    tracing::warn!(
+        event = "client.fleet_snapshot",
+        subsystem = "client",
+        outcome = "invalid",
+        err,
+        "ignoring malformed fleet snapshot from launcher"
+    );
+}
+
+pub(crate) fn client_handshake_succeeded(version: u32, encoding: &str, handshake_ms: u64) {
+    tracing::info!(
+        event = "client.handshake",
+        subsystem = "client",
+        outcome = "ok",
+        version,
+        encoding,
+        handshake_ms,
+        "handshake succeeded"
+    );
+}
+
+pub(crate) fn client_host_theme_captured(theme: &str) {
+    tracing::info!(
+        event = "client.host_theme",
+        subsystem = "client",
+        outcome = "captured",
+        theme,
+        "captured host terminal theme for handshake"
+    );
+}
+
+pub(crate) fn client_connecting(path: &Path, message: &str) {
+    tracing::info!(
+        event = "client.connect",
+        subsystem = "client",
+        outcome = "started",
+        path = %path.display(),
+        "{message}"
+    );
+}
+
+pub(crate) fn client_render_encoding_active(encoding: &str) {
+    tracing::debug!(
+        event = "client.render_encoding",
+        subsystem = "client",
+        outcome = "active",
+        encoding,
+        "client render encoding active"
+    );
+}
+
+pub(crate) fn client_dropped_file_read_failed(err: &str) {
+    tracing::warn!(
+        event = "client.dropped_file",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "failed to read dropped local file; passing the paste through"
+    );
+}
+
+/// The attach subsystem's per-switch first-frame timing (#43). This one
+/// keeps the flock::attach target since the /attach: log is a stable UX
+/// story separate from `client.*` operational chatter.
+pub(crate) fn client_attach_switch_first_paint(to: &str, warm: bool, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage = "switch",
+        to,
+        warm,
+        elapsed_ms,
+        "attach: switch first frame painted"
+    );
+}
+
+pub(crate) fn client_slot_shutdown_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.shutdown",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot server shut down; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_message_dropped(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.message",
+        subsystem = "client_slot",
+        outcome = "dropped",
+        slot,
+        "dropping message from non-active slot"
+    );
+}
+
+pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.flip",
+        subsystem = "client_slot",
+        outcome = "error",
+        target,
+        err,
+        "slot flip failed; demoting"
+    );
+}
+
+pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.disconnect",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot disconnected; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_switch_pause_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "switch-dial warmed slot but pause failed"
+    );
+}
+
+pub(crate) fn client_slot_prewarm_redundant(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "redundant",
+        target,
+        "slot already connected; dropping redundant pre-warm"
+    );
+}
+
+pub(crate) fn client_slot_warm_pause_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "failed to pause newly warmed slot"
+    );
+}
+
+pub(crate) fn client_slot_warmed_paused(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "ok",
+        target,
+        "slot warmed and paused"
+    );
+}
+
+pub(crate) fn client_slot_warmed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotWarmed; dropping stream"
+    );
+}
+
+pub(crate) fn client_slot_dial_failed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotDialFailed; dropping"
+    );
+}
+
+pub(crate) fn client_slot_warm_all_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "warm_all_failed",
+        target,
+        err,
+        "warm-all dial failed; slot stays cold"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_failed",
+        target,
+        err,
+        "switch dial failed"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_timed_out(target: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_timeout",
+        target,
+        "switch dial timed out"
+    );
+}
+
+pub(crate) fn client_server_read_error(err: &str) {
+    tracing::warn!(
+        event = "client.server_read",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "server read error"
+    );
+}
+
+pub(crate) fn client_config_sound_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "diagnostic",
+        diagnostic,
+        "local sound config diagnostic"
+    );
+}
+
+pub(crate) fn client_config_reload_failed(diagnostics: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "error",
+        diagnostics,
+        "failed to reload local client config; keeping current client config"
+    );
+}
+
+pub(crate) fn client_terminal_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "terminal",
+        err,
+        "failed to emit terminal notification"
+    );
+}
+
+pub(crate) fn client_system_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "system",
+        err,
+        "failed to emit system notification"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2184,5 +2720,364 @@ mod tests {
             without.contains("event=\"render.virtual_frame\""),
             "{without}"
         );
+    }
+
+    // ------ logging redesign PR-5: raw_input family ------------------------
+
+    #[test]
+    fn bounded_bytes_debug_truncates_long_payloads() {
+        let short = bounded_bytes_debug(&[1, 2, 3]);
+        assert_eq!(short, "[1, 2, 3]", "short payloads Debug as-is");
+        let long: Vec<u8> = (0..100).collect();
+        let shaped = bounded_bytes_debug(&long);
+        assert!(shaped.starts_with('['), "still Debug-shaped: {shaped}");
+        assert!(
+            shaped.contains("(+36 more)"),
+            "long payload truncated with count: {shaped}"
+        );
+        assert!(
+            !shaped.contains("99"),
+            "the tail is dropped so a runaway paste can't blow up the log: {shaped}"
+        );
+    }
+
+    #[test]
+    fn raw_input_event_parsed_is_debug_with_bounded_bytes() {
+        let out = capture_logs(|| raw_input_event_parsed(&[0x1b, 0x5b, 0x41], "Key(Up, empty)"));
+        assert!(out.contains("event=\"raw_input.parsed\""), "{out}");
+        assert!(out.contains("subsystem=\"raw_input\""), "{out}");
+        assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
+        assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_flushing_lone_escape_is_warn_with_bytes() {
+        let out = capture_logs(|| raw_input_flushing_lone_escape(&[0x1b]));
+        assert!(out.contains("event=\"raw_input.flush\""), "{out}");
+        assert!(out.contains("outcome=\"lone_escape\""), "{out}");
+        assert!(out.contains("bytes=\"[27]\""), "{out}");
+        assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+    }
+
+    #[test]
+    fn raw_input_waiting_events_are_trace() {
+        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(&[0xc3]));
+        assert!(utf8.contains("event=\"raw_input.wait\""), "{utf8}");
+        assert!(utf8.contains("outcome=\"utf8_continuation\""), "{utf8}");
+        assert!(utf8.contains("TRACE"), "{utf8}");
+
+        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(&[0x1b, 0xc3]));
+        assert!(
+            esc.contains("outcome=\"escaped_utf8_continuation\""),
+            "{esc}"
+        );
+        assert!(esc.contains("TRACE"), "{esc}");
+    }
+
+    #[test]
+    fn raw_input_dropping_incomplete_buffer_is_debug() {
+        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(&[0xff, 0xfe]));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"incomplete\""), "{out}");
+        assert!(out.contains("bytes=\"[255, 254]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_unsupported_escape_is_debug_with_sequence() {
+        let out = capture_logs(|| raw_input_unsupported_escape("\x1b[?9999z"));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
+        assert!(out.contains("sequence="), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn pane_open_url_failed_is_warn_with_url_and_err() {
+        let out = capture_logs(|| pane_open_url_failed("https://example.test", "no browser"));
+        assert!(out.contains("event=\"pane.open_url\""), "{out}");
+        assert!(out.contains("url=\"https://example.test\""), "{out}");
+        assert!(out.contains("err=\"no browser\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_mouse_wheel_encode_and_forward_failures_are_warn() {
+        let enc = capture_logs(|| pane_mouse_wheel_encode_failed(7, "ScrollDown"));
+        assert!(enc.contains("event=\"pane.mouse.wheel\""), "{enc}");
+        assert!(enc.contains("outcome=\"encode_error\""), "{enc}");
+        assert!(enc.contains("pane=7"), "{enc}");
+        assert!(enc.contains("kind=\"ScrollDown\""), "{enc}");
+        assert!(enc.contains("WARN"), "{enc}");
+
+        let fwd = capture_logs(|| pane_mouse_wheel_forward_failed(7, "closed"));
+        assert!(fwd.contains("event=\"pane.mouse.wheel\""), "{fwd}");
+        assert!(fwd.contains("outcome=\"forward_error\""), "{fwd}");
+        assert!(fwd.contains("err=\"closed\""), "{fwd}");
+        assert!(fwd.contains("WARN"), "{fwd}");
+    }
+
+    #[test]
+    fn pane_mouse_button_and_motion_and_alt_scroll_forward_failures() {
+        let b = capture_logs(|| pane_mouse_button_forward_failed(7, "Down(Left)", "closed"));
+        assert!(b.contains("event=\"pane.mouse.button\""), "{b}");
+        assert!(b.contains("kind=\"Down(Left)\""), "{b}");
+        assert!(b.contains("err=\"closed\""), "{b}");
+        assert!(b.contains("WARN"), "{b}");
+
+        let m = capture_logs(|| pane_mouse_motion_forward_failed(7, "Drag(Left)", "closed"));
+        assert!(m.contains("event=\"pane.mouse.motion\""), "{m}");
+        assert!(m.contains("kind=\"Drag(Left)\""), "{m}");
+        assert!(m.contains("WARN"), "{m}");
+
+        let a = capture_logs(|| pane_mouse_alternate_scroll_forward_failed(7, "closed"));
+        assert!(a.contains("event=\"pane.mouse.alternate_scroll\""), "{a}");
+        assert!(a.contains("WARN"), "{a}");
+    }
+
+    #[test]
+    fn shape_key_event_covers_all_four_fields() {
+        let ev = crossterm::event::KeyEvent::new_with_kind_and_state(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::empty(),
+        );
+        let shaped = shape_key_event(&ev);
+        assert!(shaped.contains("code="), "{shaped}");
+        assert!(shaped.contains("modifiers="), "{shaped}");
+        assert!(shaped.contains("kind="), "{shaped}");
+        assert!(shaped.contains("state="), "{shaped}");
+    }
+
+    #[test]
+    fn terminal_key_intercept_action_and_command_are_debug() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let a = capture_logs(|| terminal_key_intercept_action(&ev, "ToggleFloat"));
+        assert!(a.contains("event=\"terminal_key.intercept\""), "{a}");
+        assert!(a.contains("outcome=\"action\""), "{a}");
+        assert!(a.contains("action=\"ToggleFloat\""), "{a}");
+        assert!(a.contains("code="), "{a}");
+        assert!(a.contains("DEBUG"), "{a}");
+
+        let c = capture_logs(|| terminal_key_intercept_command(&ev, "edit config"));
+        assert!(c.contains("outcome=\"command\""), "{c}");
+        assert!(c.contains("command=\"edit config\""), "{c}");
+        assert!(c.contains("DEBUG"), "{c}");
+    }
+
+    #[test]
+    fn terminal_key_page_intercept_debug_shape() {
+        let out =
+            capture_logs(|| terminal_key_page_intercept(&crossterm::event::KeyCode::PageUp, 24));
+        assert!(out.contains("event=\"terminal_key.intercept\""), "{out}");
+        assert!(out.contains("outcome=\"page_scroll\""), "{out}");
+        assert!(out.contains("code=\"PageUp\""), "{out}");
+        assert!(out.contains("lines=24"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_modifier_only_dropped_debug_shape() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let out = capture_logs(|| terminal_key_modifier_only_dropped(&ev));
+        assert!(out.contains("event=\"terminal_key.drop\""), "{out}");
+        assert!(out.contains("outcome=\"modifier_only\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_forward_ambiguous_debug_with_protocol_and_encoded() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", &[0x1b]));
+        assert!(out.contains("event=\"terminal_key.forward\""), "{out}");
+        assert!(out.contains("outcome=\"ambiguous\""), "{out}");
+        assert!(out.contains("protocol=\"Legacy\""), "{out}");
+        assert!(out.contains("encoded=\"[27]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_empty_encoding_is_warn() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_empty_encoding(&ev));
+        assert!(out.contains("event=\"terminal_key.encode\""), "{out}");
+        assert!(out.contains("outcome=\"empty\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    // ------ logging redesign PR-5: client family ---------------------------
+
+    #[test]
+    fn client_fleet_snapshot_invalid_is_warn() {
+        let out = capture_logs(|| client_fleet_snapshot_invalid("bad json"));
+        assert!(out.contains("event=\"client.fleet_snapshot\""), "{out}");
+        assert!(out.contains("outcome=\"invalid\""), "{out}");
+        assert!(out.contains("err=\"bad json\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_handshake_succeeded_is_info_with_all_fields() {
+        let out = capture_logs(|| client_handshake_succeeded(3, "SemanticFrame", 42));
+        assert!(out.contains("event=\"client.handshake\""), "{out}");
+        assert!(out.contains("version=3"), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("handshake_ms=42"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_host_theme_captured_is_info_with_shaped_theme() {
+        let out = capture_logs(|| client_host_theme_captured("TerminalTheme { fg: .. }"));
+        assert!(out.contains("event=\"client.host_theme\""), "{out}");
+        assert!(out.contains("theme="), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_connecting_is_info_with_path_and_message() {
+        let out = capture_logs(|| client_connecting(Path::new("/tmp/x.sock"), "connecting"));
+        assert!(out.contains("event=\"client.connect\""), "{out}");
+        assert!(out.contains("path=/tmp/x.sock"), "{out}");
+        assert!(out.contains("connecting"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_render_encoding_active_is_debug() {
+        let out = capture_logs(|| client_render_encoding_active("SemanticFrame"));
+        assert!(out.contains("event=\"client.render_encoding\""), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_dropped_file_read_failed_is_warn() {
+        let out = capture_logs(|| client_dropped_file_read_failed("ENOENT"));
+        assert!(out.contains("event=\"client.dropped_file\""), "{out}");
+        assert!(out.contains("err=\"ENOENT\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_attach_switch_first_paint_keeps_flock_attach_target() {
+        let out = capture_logs(|| client_attach_switch_first_paint("host1", true, 42));
+        assert!(out.contains("flock::attach"), "{out}");
+        assert!(out.contains("stage=\"switch\""), "{out}");
+        assert!(out.contains("to=\"host1\""), "{out}");
+        assert!(out.contains("warm=true"), "{out}");
+        assert!(out.contains("elapsed_ms=42"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_slot_lifecycle_events_are_debug_with_slot_or_target() {
+        let sd = capture_logs(|| client_slot_shutdown_demoted("host1"));
+        assert!(sd.contains("event=\"client.slot.shutdown\""), "{sd}");
+        assert!(sd.contains("outcome=\"demoted\""), "{sd}");
+        assert!(sd.contains("DEBUG"), "{sd}");
+
+        let md = capture_logs(|| client_slot_message_dropped("host1"));
+        assert!(md.contains("event=\"client.slot.message\""), "{md}");
+        assert!(md.contains("outcome=\"dropped\""), "{md}");
+        assert!(md.contains("DEBUG"), "{md}");
+
+        let dd = capture_logs(|| client_slot_disconnected_demoted("host1"));
+        assert!(dd.contains("event=\"client.slot.disconnect\""), "{dd}");
+        assert!(dd.contains("DEBUG"), "{dd}");
+    }
+
+    #[test]
+    fn client_slot_warm_pause_stale_shapes() {
+        let sfp = capture_logs(|| client_slot_switch_pause_failed("host1", "EAGAIN"));
+        assert!(sfp.contains("event=\"client.slot.warm\""), "{sfp}");
+        assert!(sfp.contains("outcome=\"pause_failed\""), "{sfp}");
+        assert!(sfp.contains("WARN"), "{sfp}");
+
+        let red = capture_logs(|| client_slot_prewarm_redundant("host1"));
+        assert!(red.contains("outcome=\"redundant\""), "{red}");
+        assert!(red.contains("DEBUG"), "{red}");
+
+        let wpf = capture_logs(|| client_slot_warm_pause_failed("host1", "EAGAIN"));
+        assert!(wpf.contains("outcome=\"pause_failed\""), "{wpf}");
+        assert!(wpf.contains("DEBUG"), "{wpf}");
+
+        let ok = capture_logs(|| client_slot_warmed_paused("host1"));
+        assert!(ok.contains("outcome=\"ok\""), "{ok}");
+        assert!(ok.contains("DEBUG"), "{ok}");
+
+        let stale_w = capture_logs(|| client_slot_warmed_stale("host1", 3));
+        assert!(stale_w.contains("event=\"client.slot.warm\""), "{stale_w}");
+        assert!(stale_w.contains("outcome=\"stale\""), "{stale_w}");
+        assert!(stale_w.contains("gen=3"), "{stale_w}");
+        assert!(stale_w.contains("DEBUG"), "{stale_w}");
+
+        let stale_d = capture_logs(|| client_slot_dial_failed_stale("host1", 3));
+        assert!(stale_d.contains("event=\"client.slot.dial\""), "{stale_d}");
+        assert!(stale_d.contains("outcome=\"stale\""), "{stale_d}");
+        assert!(stale_d.contains("DEBUG"), "{stale_d}");
+    }
+
+    #[test]
+    fn client_slot_dial_failure_shapes() {
+        let flip = capture_logs(|| client_slot_flip_failed("host1", "EPIPE"));
+        assert!(flip.contains("event=\"client.slot.flip\""), "{flip}");
+        assert!(flip.contains("err=\"EPIPE\""), "{flip}");
+        assert!(flip.contains("WARN"), "{flip}");
+
+        let warm = capture_logs(|| client_slot_warm_all_dial_failed("host1", "EPIPE"));
+        assert!(warm.contains("outcome=\"warm_all_failed\""), "{warm}");
+        assert!(warm.contains("DEBUG"), "{warm}");
+
+        let switch = capture_logs(|| client_slot_switch_dial_failed("host1", "EPIPE"));
+        assert!(switch.contains("outcome=\"switch_failed\""), "{switch}");
+        assert!(switch.contains("DEBUG"), "{switch}");
+
+        let timeout = capture_logs(|| client_slot_switch_dial_timed_out("host1"));
+        assert!(timeout.contains("outcome=\"switch_timeout\""), "{timeout}");
+        assert!(timeout.contains("DEBUG"), "{timeout}");
+    }
+
+    #[test]
+    fn client_server_read_and_config_and_notifications_are_warn() {
+        let read = capture_logs(|| client_server_read_error("EOF"));
+        assert!(read.contains("event=\"client.server_read\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let diag = capture_logs(|| client_config_sound_diagnostic("volume missing"));
+        assert!(diag.contains("event=\"client.config.reload\""), "{diag}");
+        assert!(diag.contains("outcome=\"diagnostic\""), "{diag}");
+        assert!(diag.contains("WARN"), "{diag}");
+
+        let reload = capture_logs(|| client_config_reload_failed("[Diag1, Diag2]"));
+        assert!(reload.contains("outcome=\"error\""), "{reload}");
+        assert!(
+            reload.contains("diagnostics=\"[Diag1, Diag2]\""),
+            "{reload}"
+        );
+        assert!(reload.contains("WARN"), "{reload}");
+
+        let term = capture_logs(|| client_terminal_notification_failed("EPIPE"));
+        assert!(term.contains("event=\"client.notification\""), "{term}");
+        assert!(term.contains("kind=\"terminal\""), "{term}");
+        assert!(term.contains("WARN"), "{term}");
+
+        let sys = capture_logs(|| client_system_notification_failed("EPIPE"));
+        assert!(sys.contains("kind=\"system\""), "{sys}");
+        assert!(sys.contains("WARN"), "{sys}");
     }
 }
