@@ -1327,6 +1327,93 @@ pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: O
     );
 }
 
+// --- raw_input family (logging redesign PR-5) ------------------------------
+// The stdin decoder is downstream of every keystroke the host terminal
+// produces, so its debug/warn tail runs hot. Byte payloads are Debug-formatted
+// but BOUNDED (see `bounded_bytes_debug`) so a runaway paste can't turn the log
+// into a memory hog. Levels mirror the pre-facade calls: unsupported/dropped
+// buffers are DEBUG (routine framing noise), the lone-escape flush is WARN
+// (may reach the pane as a spurious Esc), UTF-8-continuation waits are TRACE.
+
+const MAX_TRACE_BYTE_PREVIEW: usize = 64;
+
+/// Shape a byte slice for a tracing field so a runaway paste can't blow up
+/// the log. Long payloads are truncated with a "(+N more)" tail; the Debug
+/// form (`[0x1b, 0x5b, ...]`) survives.
+pub(crate) fn bounded_bytes_debug(bytes: &[u8]) -> String {
+    if bytes.len() <= MAX_TRACE_BYTE_PREVIEW {
+        format!("{:?}", bytes)
+    } else {
+        let head = &bytes[..MAX_TRACE_BYTE_PREVIEW];
+        format!(
+            "{:?} (+{} more)",
+            head,
+            bytes.len() - MAX_TRACE_BYTE_PREVIEW
+        )
+    }
+}
+
+pub(crate) fn raw_input_event_parsed(chunk: &[u8], event: &str) {
+    tracing::debug!(
+        event = "raw_input.parsed",
+        subsystem = "raw_input",
+        outcome = "ok",
+        raw_bytes = bounded_bytes_debug(chunk),
+        parsed = event,
+        "raw input event parsed"
+    );
+}
+
+pub(crate) fn raw_input_flushing_lone_escape(bytes: &[u8]) {
+    tracing::warn!(
+        event = "raw_input.flush",
+        subsystem = "raw_input",
+        outcome = "lone_escape",
+        bytes = bounded_bytes_debug(bytes),
+        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
+    );
+}
+
+pub(crate) fn raw_input_waiting_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_waiting_escaped_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "escaped_utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for escaped UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_dropping_incomplete_buffer(bytes: &[u8]) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "incomplete",
+        bytes = bounded_bytes_debug(bytes),
+        "dropping incomplete raw input buffer after timeout"
+    );
+}
+
+pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "unsupported_escape",
+        sequence,
+        "dropping unsupported escape sequence"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2184,5 +2271,76 @@ mod tests {
             without.contains("event=\"render.virtual_frame\""),
             "{without}"
         );
+    }
+
+    // ------ logging redesign PR-5: raw_input family ------------------------
+
+    #[test]
+    fn bounded_bytes_debug_truncates_long_payloads() {
+        let short = bounded_bytes_debug(&[1, 2, 3]);
+        assert_eq!(short, "[1, 2, 3]", "short payloads Debug as-is");
+        let long: Vec<u8> = (0..100).collect();
+        let shaped = bounded_bytes_debug(&long);
+        assert!(shaped.starts_with('['), "still Debug-shaped: {shaped}");
+        assert!(
+            shaped.contains("(+36 more)"),
+            "long payload truncated with count: {shaped}"
+        );
+        assert!(
+            !shaped.contains("99"),
+            "the tail is dropped so a runaway paste can't blow up the log: {shaped}"
+        );
+    }
+
+    #[test]
+    fn raw_input_event_parsed_is_debug_with_bounded_bytes() {
+        let out = capture_logs(|| raw_input_event_parsed(&[0x1b, 0x5b, 0x41], "Key(Up, empty)"));
+        assert!(out.contains("event=\"raw_input.parsed\""), "{out}");
+        assert!(out.contains("subsystem=\"raw_input\""), "{out}");
+        assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
+        assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_flushing_lone_escape_is_warn_with_bytes() {
+        let out = capture_logs(|| raw_input_flushing_lone_escape(&[0x1b]));
+        assert!(out.contains("event=\"raw_input.flush\""), "{out}");
+        assert!(out.contains("outcome=\"lone_escape\""), "{out}");
+        assert!(out.contains("bytes=\"[27]\""), "{out}");
+        assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+    }
+
+    #[test]
+    fn raw_input_waiting_events_are_trace() {
+        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(&[0xc3]));
+        assert!(utf8.contains("event=\"raw_input.wait\""), "{utf8}");
+        assert!(utf8.contains("outcome=\"utf8_continuation\""), "{utf8}");
+        assert!(utf8.contains("TRACE"), "{utf8}");
+
+        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(&[0x1b, 0xc3]));
+        assert!(
+            esc.contains("outcome=\"escaped_utf8_continuation\""),
+            "{esc}"
+        );
+        assert!(esc.contains("TRACE"), "{esc}");
+    }
+
+    #[test]
+    fn raw_input_dropping_incomplete_buffer_is_debug() {
+        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(&[0xff, 0xfe]));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"incomplete\""), "{out}");
+        assert!(out.contains("bytes=\"[255, 254]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_unsupported_escape_is_debug_with_sequence() {
+        let out = capture_logs(|| raw_input_unsupported_escape("\x1b[?9999z"));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
+        assert!(out.contains("sequence="), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
     }
 }
