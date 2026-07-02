@@ -1585,6 +1585,284 @@ pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
     );
 }
 
+// --- client family (logging redesign PR-5) ---------------------------------
+// The thin client's connection + slot lifecycle. Setup and handshake events
+// are INFO (rare, load-bearing for "did we come up?"). Runtime failures on
+// the active slot (server read error, dropped-file bridge, notifications,
+// config reload) are WARN — the session survives but the user notices
+// something. Slot lifecycle chatter (warm/pause/stale/switch dial) is DEBUG
+// — high volume during fleet churn, useful only when debugging a slot flip
+// that didn't stick. `err` / `diagnostic` payloads are shape-converted to
+// `&str` at the call side; Debug-shaped payloads (encoding / theme /
+// diagnostics slice) are formatted at the site so the raw ?field stays
+// confined to logging.rs.
+
+pub(crate) fn client_fleet_snapshot_invalid(err: &str) {
+    tracing::warn!(
+        event = "client.fleet_snapshot",
+        subsystem = "client",
+        outcome = "invalid",
+        err,
+        "ignoring malformed fleet snapshot from launcher"
+    );
+}
+
+pub(crate) fn client_handshake_succeeded(version: u32, encoding: &str, handshake_ms: u64) {
+    tracing::info!(
+        event = "client.handshake",
+        subsystem = "client",
+        outcome = "ok",
+        version,
+        encoding,
+        handshake_ms,
+        "handshake succeeded"
+    );
+}
+
+pub(crate) fn client_host_theme_captured(theme: &str) {
+    tracing::info!(
+        event = "client.host_theme",
+        subsystem = "client",
+        outcome = "captured",
+        theme,
+        "captured host terminal theme for handshake"
+    );
+}
+
+pub(crate) fn client_connecting(path: &Path, message: &str) {
+    tracing::info!(
+        event = "client.connect",
+        subsystem = "client",
+        outcome = "started",
+        path = %path.display(),
+        "{message}"
+    );
+}
+
+pub(crate) fn client_render_encoding_active(encoding: &str) {
+    tracing::debug!(
+        event = "client.render_encoding",
+        subsystem = "client",
+        outcome = "active",
+        encoding,
+        "client render encoding active"
+    );
+}
+
+pub(crate) fn client_dropped_file_read_failed(err: &str) {
+    tracing::warn!(
+        event = "client.dropped_file",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "failed to read dropped local file; passing the paste through"
+    );
+}
+
+/// The attach subsystem's per-switch first-frame timing (#43). This one
+/// keeps the flock::attach target since the /attach: log is a stable UX
+/// story separate from `client.*` operational chatter.
+pub(crate) fn client_attach_switch_first_paint(to: &str, warm: bool, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage = "switch",
+        to,
+        warm,
+        elapsed_ms,
+        "attach: switch first frame painted"
+    );
+}
+
+pub(crate) fn client_slot_shutdown_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.shutdown",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot server shut down; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_message_dropped(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.message",
+        subsystem = "client_slot",
+        outcome = "dropped",
+        slot,
+        "dropping message from non-active slot"
+    );
+}
+
+pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.flip",
+        subsystem = "client_slot",
+        outcome = "error",
+        target,
+        err,
+        "slot flip failed; demoting"
+    );
+}
+
+pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.disconnect",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot disconnected; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_switch_pause_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "switch-dial warmed slot but pause failed"
+    );
+}
+
+pub(crate) fn client_slot_prewarm_redundant(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "redundant",
+        target,
+        "slot already connected; dropping redundant pre-warm"
+    );
+}
+
+pub(crate) fn client_slot_warm_pause_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "failed to pause newly warmed slot"
+    );
+}
+
+pub(crate) fn client_slot_warmed_paused(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "ok",
+        target,
+        "slot warmed and paused"
+    );
+}
+
+pub(crate) fn client_slot_warmed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotWarmed; dropping stream"
+    );
+}
+
+pub(crate) fn client_slot_dial_failed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotDialFailed; dropping"
+    );
+}
+
+pub(crate) fn client_slot_warm_all_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "warm_all_failed",
+        target,
+        err,
+        "warm-all dial failed; slot stays cold"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_failed",
+        target,
+        err,
+        "switch dial failed"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_timed_out(target: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_timeout",
+        target,
+        "switch dial timed out"
+    );
+}
+
+pub(crate) fn client_server_read_error(err: &str) {
+    tracing::warn!(
+        event = "client.server_read",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "server read error"
+    );
+}
+
+pub(crate) fn client_config_sound_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "diagnostic",
+        diagnostic,
+        "local sound config diagnostic"
+    );
+}
+
+pub(crate) fn client_config_reload_failed(diagnostics: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "error",
+        diagnostics,
+        "failed to reload local client config; keeping current client config"
+    );
+}
+
+pub(crate) fn client_terminal_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "terminal",
+        err,
+        "failed to emit terminal notification"
+    );
+}
+
+pub(crate) fn client_system_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "system",
+        err,
+        "failed to emit system notification"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2639,5 +2917,167 @@ mod tests {
         assert!(out.contains("event=\"terminal_key.encode\""), "{out}");
         assert!(out.contains("outcome=\"empty\""), "{out}");
         assert!(out.contains("WARN"), "{out}");
+    }
+
+    // ------ logging redesign PR-5: client family ---------------------------
+
+    #[test]
+    fn client_fleet_snapshot_invalid_is_warn() {
+        let out = capture_logs(|| client_fleet_snapshot_invalid("bad json"));
+        assert!(out.contains("event=\"client.fleet_snapshot\""), "{out}");
+        assert!(out.contains("outcome=\"invalid\""), "{out}");
+        assert!(out.contains("err=\"bad json\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_handshake_succeeded_is_info_with_all_fields() {
+        let out = capture_logs(|| client_handshake_succeeded(3, "SemanticFrame", 42));
+        assert!(out.contains("event=\"client.handshake\""), "{out}");
+        assert!(out.contains("version=3"), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("handshake_ms=42"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_host_theme_captured_is_info_with_shaped_theme() {
+        let out = capture_logs(|| client_host_theme_captured("TerminalTheme { fg: .. }"));
+        assert!(out.contains("event=\"client.host_theme\""), "{out}");
+        assert!(out.contains("theme="), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_connecting_is_info_with_path_and_message() {
+        let out = capture_logs(|| client_connecting(Path::new("/tmp/x.sock"), "connecting"));
+        assert!(out.contains("event=\"client.connect\""), "{out}");
+        assert!(out.contains("path=/tmp/x.sock"), "{out}");
+        assert!(out.contains("connecting"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_render_encoding_active_is_debug() {
+        let out = capture_logs(|| client_render_encoding_active("SemanticFrame"));
+        assert!(out.contains("event=\"client.render_encoding\""), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_dropped_file_read_failed_is_warn() {
+        let out = capture_logs(|| client_dropped_file_read_failed("ENOENT"));
+        assert!(out.contains("event=\"client.dropped_file\""), "{out}");
+        assert!(out.contains("err=\"ENOENT\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_attach_switch_first_paint_keeps_flock_attach_target() {
+        let out = capture_logs(|| client_attach_switch_first_paint("host1", true, 42));
+        assert!(out.contains("flock::attach"), "{out}");
+        assert!(out.contains("stage=\"switch\""), "{out}");
+        assert!(out.contains("to=\"host1\""), "{out}");
+        assert!(out.contains("warm=true"), "{out}");
+        assert!(out.contains("elapsed_ms=42"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_slot_lifecycle_events_are_debug_with_slot_or_target() {
+        let sd = capture_logs(|| client_slot_shutdown_demoted("host1"));
+        assert!(sd.contains("event=\"client.slot.shutdown\""), "{sd}");
+        assert!(sd.contains("outcome=\"demoted\""), "{sd}");
+        assert!(sd.contains("DEBUG"), "{sd}");
+
+        let md = capture_logs(|| client_slot_message_dropped("host1"));
+        assert!(md.contains("event=\"client.slot.message\""), "{md}");
+        assert!(md.contains("outcome=\"dropped\""), "{md}");
+        assert!(md.contains("DEBUG"), "{md}");
+
+        let dd = capture_logs(|| client_slot_disconnected_demoted("host1"));
+        assert!(dd.contains("event=\"client.slot.disconnect\""), "{dd}");
+        assert!(dd.contains("DEBUG"), "{dd}");
+    }
+
+    #[test]
+    fn client_slot_warm_pause_stale_shapes() {
+        let sfp = capture_logs(|| client_slot_switch_pause_failed("host1", "EAGAIN"));
+        assert!(sfp.contains("event=\"client.slot.warm\""), "{sfp}");
+        assert!(sfp.contains("outcome=\"pause_failed\""), "{sfp}");
+        assert!(sfp.contains("WARN"), "{sfp}");
+
+        let red = capture_logs(|| client_slot_prewarm_redundant("host1"));
+        assert!(red.contains("outcome=\"redundant\""), "{red}");
+        assert!(red.contains("DEBUG"), "{red}");
+
+        let wpf = capture_logs(|| client_slot_warm_pause_failed("host1", "EAGAIN"));
+        assert!(wpf.contains("outcome=\"pause_failed\""), "{wpf}");
+        assert!(wpf.contains("DEBUG"), "{wpf}");
+
+        let ok = capture_logs(|| client_slot_warmed_paused("host1"));
+        assert!(ok.contains("outcome=\"ok\""), "{ok}");
+        assert!(ok.contains("DEBUG"), "{ok}");
+
+        let stale_w = capture_logs(|| client_slot_warmed_stale("host1", 3));
+        assert!(stale_w.contains("event=\"client.slot.warm\""), "{stale_w}");
+        assert!(stale_w.contains("outcome=\"stale\""), "{stale_w}");
+        assert!(stale_w.contains("gen=3"), "{stale_w}");
+        assert!(stale_w.contains("DEBUG"), "{stale_w}");
+
+        let stale_d = capture_logs(|| client_slot_dial_failed_stale("host1", 3));
+        assert!(stale_d.contains("event=\"client.slot.dial\""), "{stale_d}");
+        assert!(stale_d.contains("outcome=\"stale\""), "{stale_d}");
+        assert!(stale_d.contains("DEBUG"), "{stale_d}");
+    }
+
+    #[test]
+    fn client_slot_dial_failure_shapes() {
+        let flip = capture_logs(|| client_slot_flip_failed("host1", "EPIPE"));
+        assert!(flip.contains("event=\"client.slot.flip\""), "{flip}");
+        assert!(flip.contains("err=\"EPIPE\""), "{flip}");
+        assert!(flip.contains("WARN"), "{flip}");
+
+        let warm = capture_logs(|| client_slot_warm_all_dial_failed("host1", "EPIPE"));
+        assert!(warm.contains("outcome=\"warm_all_failed\""), "{warm}");
+        assert!(warm.contains("DEBUG"), "{warm}");
+
+        let switch = capture_logs(|| client_slot_switch_dial_failed("host1", "EPIPE"));
+        assert!(switch.contains("outcome=\"switch_failed\""), "{switch}");
+        assert!(switch.contains("DEBUG"), "{switch}");
+
+        let timeout = capture_logs(|| client_slot_switch_dial_timed_out("host1"));
+        assert!(timeout.contains("outcome=\"switch_timeout\""), "{timeout}");
+        assert!(timeout.contains("DEBUG"), "{timeout}");
+    }
+
+    #[test]
+    fn client_server_read_and_config_and_notifications_are_warn() {
+        let read = capture_logs(|| client_server_read_error("EOF"));
+        assert!(read.contains("event=\"client.server_read\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let diag = capture_logs(|| client_config_sound_diagnostic("volume missing"));
+        assert!(diag.contains("event=\"client.config.reload\""), "{diag}");
+        assert!(diag.contains("outcome=\"diagnostic\""), "{diag}");
+        assert!(diag.contains("WARN"), "{diag}");
+
+        let reload = capture_logs(|| client_config_reload_failed("[Diag1, Diag2]"));
+        assert!(reload.contains("outcome=\"error\""), "{reload}");
+        assert!(
+            reload.contains("diagnostics=\"[Diag1, Diag2]\""),
+            "{reload}"
+        );
+        assert!(reload.contains("WARN"), "{reload}");
+
+        let term = capture_logs(|| client_terminal_notification_failed("EPIPE"));
+        assert!(term.contains("event=\"client.notification\""), "{term}");
+        assert!(term.contains("kind=\"terminal\""), "{term}");
+        assert!(term.contains("WARN"), "{term}");
+
+        let sys = capture_logs(|| client_system_notification_failed("EPIPE"));
+        assert!(sys.contains("kind=\"system\""), "{sys}");
+        assert!(sys.contains("WARN"), "{sys}");
     }
 }
