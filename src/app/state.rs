@@ -1249,9 +1249,9 @@ impl IdleSetting {
 
     pub(crate) fn enabled(self, state: &AppState) -> bool {
         match self {
-            Self::Enable => state.idle.enable,
-            Self::Sheep => state.idle.sheep,
-            Self::Screensaver => state.idle.screensaver,
+            Self::Enable => state.config.ui.idle.enable,
+            Self::Sheep => state.config.ui.idle.sheep,
+            Self::Screensaver => state.config.ui.idle.screensaver,
         }
     }
 }
@@ -1947,9 +1947,6 @@ pub struct AppState {
     pub sheep_wipe_until: Option<std::time::Instant>,
     /// Persistent state for the stage-2 sidebar screensaver simulation.
     pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
-    /// Idle-animation config (#16): opt-out toggles + thresholds for the sheep
-    /// and screensaver. Re-applied on config reload so it takes effect live.
-    pub idle: crate::config::IdleConfig,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1986,10 +1983,10 @@ impl AppState {
     pub(crate) fn note_interaction(&mut self) {
         let now = std::time::Instant::now();
         let idle = now.duration_since(self.last_interaction);
-        if idle >= self.idle.idle_after() {
+        if idle >= self.config.ui.idle.idle_after() {
             self.sheep_flee_until = Some(now + crate::ui::sheep::FLEE_DURATION);
         }
-        if idle >= self.idle.screensaver_after() {
+        if idle >= self.config.ui.idle.screensaver_after() {
             self.sheep_wipe_until = Some(now + crate::ui::screensaver::WIPE_DURATION);
         }
         self.last_interaction = now;
@@ -1998,14 +1995,14 @@ impl AppState {
     /// The current idle-flock phase (None when the user is active, or when the
     /// sheep are disabled via `[ui.idle]`, #16).
     pub(crate) fn flock_phase(&self) -> Option<crate::ui::sheep::FlockPhase> {
-        if !self.idle.sheep_enabled() {
+        if !self.config.ui.idle.sheep_enabled() {
             return None;
         }
         crate::ui::sheep::flock_phase(
             self.last_interaction,
             self.sheep_flee_until,
             std::time::Instant::now(),
-            self.idle.idle_after(),
+            self.config.ui.idle.idle_after(),
         )
     }
 
@@ -2013,14 +2010,14 @@ impl AppState {
     /// idle threshold, once the wipe completes, or when disabled via
     /// `[ui.idle]`, #16).
     pub(crate) fn screensaver_phase(&self) -> Option<crate::ui::screensaver::ScreensaverPhase> {
-        if !self.idle.screensaver_enabled() {
+        if !self.config.ui.idle.screensaver_enabled() {
             return None;
         }
         crate::ui::screensaver::phase(
             self.last_interaction,
             self.sheep_wipe_until,
             std::time::Instant::now(),
-            self.idle.screensaver_after(),
+            self.config.ui.idle.screensaver_after(),
         )
     }
 
@@ -2522,7 +2519,6 @@ impl AppState {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
-            idle: crate::config::IdleConfig::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
@@ -2579,6 +2575,20 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn idle_settings_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Idle section reads state.config.ui.idle.
+        let mut state = AppState::test_new();
+        state.config.ui.idle.enable = false;
+        state.config.ui.idle.sheep = false;
+        assert!(!IdleSetting::Enable.enabled(&state));
+        assert!(!IdleSetting::Sheep.enabled(&state));
+        state.config.ui.idle.enable = true;
+        state.config.ui.idle.sheep = true;
+        assert!(IdleSetting::Enable.enabled(&state));
+        assert!(IdleSetting::Sheep.enabled(&state));
+    }
 
     #[test]
     fn agent_border_labels_read_from_state_config_not_mirror_field() {
@@ -2659,13 +2669,13 @@ mod tests {
         assert!(state.screensaver_phase().is_some());
 
         // Sheep off, screensaver on.
-        state.idle.sheep = false;
+        state.config.ui.idle.sheep = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_some());
 
         // Master off → neither, regardless of sub-toggles.
-        state.idle.sheep = true;
-        state.idle.enable = false;
+        state.config.ui.idle.sheep = true;
+        state.config.ui.idle.enable = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_none());
     }

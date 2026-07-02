@@ -313,6 +313,8 @@ impl App {
             // isn't woken for an animation that will never render.
             self.next_animation_tick = self
                 .state
+                .config
+                .ui
                 .idle
                 .next_idle_wake_after()
                 .and_then(|after| self.state.last_interaction.checked_add(after))
