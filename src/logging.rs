@@ -813,6 +813,115 @@ pub(crate) fn remote_ssh_keepalive_config_missing(err: &str) {
     );
 }
 
+// --- client_conn family (logging redesign PR-4) ----------------------------
+// Every phase of a thin-client Unix-socket connection: nonblocking setup, the
+// listener accept/reject loop, the handshake read/write, and per-connection
+// read/write/flush failures once the session is running. A broken connection
+// is normal in fleet churn — DEBUG for benign disconnects, WARN for setup
+// misses, ERROR for the accept loop giving up (the server can no longer take
+// new clients).
+
+pub(crate) fn client_conn_nonblocking_failed(err: &str) {
+    tracing::warn!(
+        event = "client_conn.setup",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "nonblocking",
+        err,
+        "failed to set client stream nonblocking"
+    );
+}
+
+pub(crate) fn client_conn_accept_failed(err: &str) {
+    tracing::error!(
+        event = "client_conn.listener",
+        subsystem = "client_conn",
+        outcome = "error",
+        mode = "accept",
+        err,
+        "client listener accept failed"
+    );
+}
+
+pub(crate) fn client_conn_reject_failed(err: &str) {
+    tracing::error!(
+        event = "client_conn.listener",
+        subsystem = "client_conn",
+        outcome = "error",
+        mode = "reject",
+        err,
+        "client listener reject failed"
+    );
+}
+
+pub(crate) fn client_conn_refusal_send_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "handoff_refusal",
+        err,
+        "failed to send live-handoff refusal to pending client"
+    );
+}
+
+pub(crate) fn client_conn_handshake_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "handshake",
+        client_id,
+        err,
+        "client handshake failed"
+    );
+}
+
+pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "read_hello",
+        client_id,
+        err,
+        "failed to read client hello"
+    );
+}
+
+pub(crate) fn client_conn_write_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.write",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "write",
+        err,
+        "client write failed, closing writer"
+    );
+}
+
+pub(crate) fn client_conn_flush_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.write",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "flush",
+        err,
+        "client flush failed, closing writer"
+    );
+}
+
+pub(crate) fn client_conn_read_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.read",
+        subsystem = "client_conn",
+        outcome = "error",
+        client_id,
+        err,
+        "client read error, closing"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -1332,5 +1441,64 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].ts, "2026-06-29T00:00:02Z");
         assert_eq!(merged[1].ts, "2026-06-29T00:00:03Z");
+    }
+
+    // ------ logging redesign PR-4: client_conn family ----------------------
+
+    #[test]
+    fn client_conn_setup_and_accept_events_split_by_level() {
+        let nb = capture_logs(|| client_conn_nonblocking_failed("EAGAIN"));
+        assert!(nb.contains("event=\"client_conn.setup\""), "{nb}");
+        assert!(nb.contains("stage=\"nonblocking\""), "{nb}");
+        assert!(nb.contains("err=\"EAGAIN\""), "{nb}");
+        assert!(nb.contains("WARN"), "{nb}");
+
+        let acc = capture_logs(|| client_conn_accept_failed("EBADF"));
+        assert!(acc.contains("event=\"client_conn.listener\""), "{acc}");
+        assert!(acc.contains("mode=\"accept\""), "{acc}");
+        assert!(acc.contains("ERROR"), "{acc}");
+
+        let rej = capture_logs(|| client_conn_reject_failed("EBADF"));
+        assert!(rej.contains("mode=\"reject\""), "{rej}");
+        assert!(rej.contains("ERROR"), "{rej}");
+    }
+
+    #[test]
+    fn client_conn_handshake_stages_carry_client_id_when_present() {
+        let refusal = capture_logs(|| client_conn_refusal_send_failed("EPIPE"));
+        assert!(
+            refusal.contains("event=\"client_conn.handshake\""),
+            "{refusal}"
+        );
+        assert!(refusal.contains("stage=\"handoff_refusal\""), "{refusal}");
+        assert!(refusal.contains("DEBUG"), "{refusal}");
+
+        let hs = capture_logs(|| client_conn_handshake_failed(7, "framing"));
+        assert!(hs.contains("stage=\"handshake\""), "{hs}");
+        assert!(hs.contains("client_id=7"), "{hs}");
+        assert!(hs.contains("DEBUG"), "{hs}");
+
+        let hello = capture_logs(|| client_conn_hello_read_failed(11, "eof"));
+        assert!(hello.contains("stage=\"read_hello\""), "{hello}");
+        assert!(hello.contains("client_id=11"), "{hello}");
+        assert!(hello.contains("DEBUG"), "{hello}");
+    }
+
+    #[test]
+    fn client_conn_write_flush_read_split_by_stage() {
+        let w = capture_logs(|| client_conn_write_failed("EPIPE"));
+        assert!(w.contains("event=\"client_conn.write\""), "{w}");
+        assert!(w.contains("stage=\"write\""), "{w}");
+        assert!(w.contains("DEBUG"), "{w}");
+
+        let f = capture_logs(|| client_conn_flush_failed("EPIPE"));
+        assert!(f.contains("event=\"client_conn.write\""), "{f}");
+        assert!(f.contains("stage=\"flush\""), "{f}");
+
+        let r = capture_logs(|| client_conn_read_failed(5, "framing"));
+        assert!(r.contains("event=\"client_conn.read\""), "{r}");
+        assert!(r.contains("client_id=5"), "{r}");
+        assert!(r.contains("err=\"framing\""), "{r}");
+        assert!(r.contains("DEBUG"), "{r}");
     }
 }
