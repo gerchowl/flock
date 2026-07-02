@@ -26,11 +26,14 @@ test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run every guardrails gate over the tree (same set `nix flake check` runs).
+# Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
+# the guardrails devShell, so prek isn't on their PATH — gate enforcement in CI
+# lives in nix.yml's `flake check` (checks.gates), locally in the git hooks.
 gates:
     prek run --all-files
 
 # Run fast local lint checks
-lint: gates
+lint:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
 
