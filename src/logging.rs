@@ -1430,6 +1430,71 @@ pub(crate) fn pane_open_url_failed(url: &str, err: &str) {
     );
 }
 
+// --- pane_mouse family (logging redesign PR-5) -----------------------------
+// Encoding + forwarding failures for mouse events routed into a pane
+// runtime. `kind` is Debug-shaped at the call site (MouseEventKind is a
+// crossterm enum whose payload — button / column-delta — matters); the
+// facade takes it as an already-shaped string so the raw ?field stays
+// confined to logging.rs. Every failure is WARN: the pane misses an event
+// but keeps running.
+
+pub(crate) fn pane_mouse_wheel_encode_failed(pane: u32, kind: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "encode_error",
+        pane,
+        kind,
+        "failed to encode mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_wheel_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_button_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.button",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse button event"
+    );
+}
+
+pub(crate) fn pane_mouse_motion_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.motion",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse motion event"
+    );
+}
+
+pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.alternate_scroll",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward alternate-scroll key"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2367,5 +2432,39 @@ mod tests {
         assert!(out.contains("url=\"https://example.test\""), "{out}");
         assert!(out.contains("err=\"no browser\""), "{out}");
         assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_mouse_wheel_encode_and_forward_failures_are_warn() {
+        let enc = capture_logs(|| pane_mouse_wheel_encode_failed(7, "ScrollDown"));
+        assert!(enc.contains("event=\"pane.mouse.wheel\""), "{enc}");
+        assert!(enc.contains("outcome=\"encode_error\""), "{enc}");
+        assert!(enc.contains("pane=7"), "{enc}");
+        assert!(enc.contains("kind=\"ScrollDown\""), "{enc}");
+        assert!(enc.contains("WARN"), "{enc}");
+
+        let fwd = capture_logs(|| pane_mouse_wheel_forward_failed(7, "closed"));
+        assert!(fwd.contains("event=\"pane.mouse.wheel\""), "{fwd}");
+        assert!(fwd.contains("outcome=\"forward_error\""), "{fwd}");
+        assert!(fwd.contains("err=\"closed\""), "{fwd}");
+        assert!(fwd.contains("WARN"), "{fwd}");
+    }
+
+    #[test]
+    fn pane_mouse_button_and_motion_and_alt_scroll_forward_failures() {
+        let b = capture_logs(|| pane_mouse_button_forward_failed(7, "Down(Left)", "closed"));
+        assert!(b.contains("event=\"pane.mouse.button\""), "{b}");
+        assert!(b.contains("kind=\"Down(Left)\""), "{b}");
+        assert!(b.contains("err=\"closed\""), "{b}");
+        assert!(b.contains("WARN"), "{b}");
+
+        let m = capture_logs(|| pane_mouse_motion_forward_failed(7, "Drag(Left)", "closed"));
+        assert!(m.contains("event=\"pane.mouse.motion\""), "{m}");
+        assert!(m.contains("kind=\"Drag(Left)\""), "{m}");
+        assert!(m.contains("WARN"), "{m}");
+
+        let a = capture_logs(|| pane_mouse_alternate_scroll_forward_failed(7, "closed"));
+        assert!(a.contains("event=\"pane.mouse.alternate_scroll\""), "{a}");
+        assert!(a.contains("WARN"), "{a}");
     }
 }

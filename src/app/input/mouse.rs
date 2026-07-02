@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
-use tracing::warn;
 
 use crate::{
     app::state::{
@@ -1972,13 +1971,14 @@ impl AppState {
         let column = mouse.column.saturating_sub(info.inner_rect.x);
         let row = mouse.row.saturating_sub(info.inner_rect.y);
         let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers) else {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
+            crate::logging::pane_mouse_wheel_encode_failed(
+                info.id.raw(),
+                &format!("{:?}", mouse.kind),
+            );
             return true;
         };
         if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+            crate::logging::pane_mouse_wheel_forward_failed(info.id.raw(), &err.to_string());
         }
         true
     }
@@ -2111,8 +2111,11 @@ fn forward_runtime_mouse_button(
     };
     rt.scroll_reset();
     if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
+        crate::logging::pane_mouse_button_forward_failed(
+            pane.raw(),
+            &format!("{:?}", mouse.kind),
+            &err.to_string(),
+        );
     }
     true
 }
@@ -2131,8 +2134,11 @@ fn forward_runtime_mouse_motion(
         return false;
     };
     if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
+        crate::logging::pane_mouse_motion_forward_failed(
+            pane.raw(),
+            &format!("{:?}", mouse.kind),
+            &err.to_string(),
+        );
     }
     true
 }
@@ -2153,13 +2159,14 @@ fn forward_runtime_wheel(
             rt.scroll_reset();
             let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
             else {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
+                crate::logging::pane_mouse_wheel_encode_failed(
+                    pane.raw(),
+                    &format!("{:?}", mouse.kind),
+                );
                 return true;
             };
             if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), err = %err, "failed to forward mouse wheel event");
+                crate::logging::pane_mouse_wheel_forward_failed(pane.raw(), &err.to_string());
             }
             true
         }
@@ -2169,8 +2176,10 @@ fn forward_runtime_wheel(
                 return true;
             };
             if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), err = %err, "failed to forward alternate-scroll key");
+                crate::logging::pane_mouse_alternate_scroll_forward_failed(
+                    pane.raw(),
+                    &err.to_string(),
+                );
             }
             true
         }
