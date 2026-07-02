@@ -1134,14 +1134,25 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 65, 20));
 
-        let last_idx = app.workspaces[0].tabs.len() - 1;
-        assert!(app.view.tab_hit_areas[last_idx].width > 0);
+        // #102 part 3: tabs display in `(display_name, tab.number)`
+        // order, so the "last visible" tab is the storage index at the
+        // rightmost hit area, not the storage-last one.
+        let rightmost_idx = app
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.width > 0)
+            .max_by_key(|(_, rect)| rect.x)
+            .map(|(idx, _)| idx)
+            .expect("at least one tab is visible");
+        assert!(app.view.tab_hit_areas[rightmost_idx].width > 0);
         let clamped_scroll = app.tab_scroll;
 
         app.scroll_tabs_right();
 
         assert_eq!(app.tab_scroll, clamped_scroll);
-        assert!(app.view.tab_hit_areas[last_idx].width > 0);
+        assert!(app.view.tab_hit_areas[rightmost_idx].width > 0);
     }
 
     #[test]

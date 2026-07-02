@@ -942,6 +942,29 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    /// #102: the tab bar's display order — storage indices sorted by
+    /// `(display_name.lowercased(), tab.number)`. Tabs mode renders in
+    /// this order (per issue #102 part 3); storage stays untouched so
+    /// `active_tab`, hit-area indices, and public tab numbers remain the
+    /// same references they were. The `tab.number` tie-break keeps two
+    /// tabs with the same display label (auto-numbered clones) in a
+    /// deterministic order.
+    pub fn tab_display_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by(|&a, &b| {
+            let ka = (
+                self.tabs[a].display_name().to_ascii_lowercase(),
+                self.tabs[a].number,
+            );
+            let kb = (
+                self.tabs[b].display_name().to_ascii_lowercase(),
+                self.tabs[b].number,
+            );
+            ka.cmp(&kb)
+        });
+        order
+    }
+
     #[cfg(test)]
     pub fn refresh_git_ahead_behind(&mut self) {
         let cwd = self.resolved_identity_cwd();
@@ -1124,6 +1147,27 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #102 part 3: tabs render in `(display_name, tab.number)` order, so
+    /// re-adding a tab labelled `alpha` after `zeta` puts it FIRST on
+    /// screen, not last as with the storage order.
+    #[test]
+    fn tab_display_order_sorts_by_label_then_number() {
+        let mut ws = Workspace::test_new("host");
+        // The default first tab is auto-numbered "1". Rename it to
+        // sort last.
+        ws.tabs[0].custom_name = Some("zeta".into());
+        ws.test_add_tab(Some("middle"));
+        ws.test_add_tab(Some("alpha"));
+
+        // Storage order: [zeta (num 1), middle (num 2), alpha (num 3)]
+        // Display order sorts by display_name then number: alpha, middle, zeta.
+        assert_eq!(
+            ws.tabs.iter().map(|t| t.display_name()).collect::<Vec<_>>(),
+            vec!["zeta", "middle", "alpha"]
+        );
+        assert_eq!(ws.tab_display_order(), vec![2, 1, 0]);
+    }
 
     /// #102: the pending-probe jump fix. `sort_family_key` is frozen at
     /// spawn from `identity_cwd` — the SAME string before and after the git
