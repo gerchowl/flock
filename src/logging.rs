@@ -1495,6 +1495,96 @@ pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
     );
 }
 
+// --- terminal_key family (logging redesign PR-5) ---------------------------
+// Terminal-mode key decoding: which key was intercepted (for a navigate
+// action / custom command / pane scroll), which was dropped as
+// modifier-only, and which forwards were considered ambiguous (Esc / Alt
+// chords). `shape_key_event` is the single formatter for a crossterm
+// KeyEvent — the code / modifiers / kind / state tuple that every other
+// site would otherwise raw-Debug — and lives inside logging.rs so the gate
+// stays hard everywhere else. Level discipline mirrors pre-facade calls:
+// intercepts are DEBUG (routine but story-critical when a keybind misfires),
+// modifier-only drops are DEBUG, empty-encoding is WARN.
+
+/// Shape a crossterm KeyEvent for the tracing tail: the code / modifiers /
+/// kind / state tuple every terminal-key site cares about. Single formatter
+/// so a schema change lands in one place instead of eighteen.
+pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> String {
+    format!(
+        "code={:?} modifiers={:?} kind={:?} state={:?}",
+        event.code, event.modifiers, event.kind, event.state
+    )
+}
+
+pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, action: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "action",
+        key = shape_key_event(event),
+        action,
+        "intercepted terminal direct keybinding before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_intercept_command(event: &crossterm::event::KeyEvent, command: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "command",
+        key = shape_key_event(event),
+        command,
+        "intercepted terminal direct custom command before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_page_intercept(code: &crossterm::event::KeyCode, lines: usize) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "page_scroll",
+        code = format!("{:?}", code),
+        lines,
+        "intercepted page key for pane scrollback"
+    );
+}
+
+pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEvent) {
+    tracing::debug!(
+        event = "terminal_key.drop",
+        subsystem = "terminal_key",
+        outcome = "modifier_only",
+        key = shape_key_event(event),
+        "dropping modifier-only terminal key event instead of forwarding it to pane"
+    );
+}
+
+pub(crate) fn terminal_key_forward_ambiguous(
+    event: &crossterm::event::KeyEvent,
+    protocol: &str,
+    encoded: &[u8],
+) {
+    tracing::debug!(
+        event = "terminal_key.forward",
+        subsystem = "terminal_key",
+        outcome = "ambiguous",
+        key = shape_key_event(event),
+        protocol,
+        encoded = bounded_bytes_debug(encoded),
+        "forwarding potentially-ambiguous terminal key to pane"
+    );
+}
+
+pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
+    tracing::warn!(
+        event = "terminal_key.encode",
+        subsystem = "terminal_key",
+        outcome = "empty",
+        key = shape_key_event(event),
+        "key produced empty encoding"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2466,5 +2556,88 @@ mod tests {
         let a = capture_logs(|| pane_mouse_alternate_scroll_forward_failed(7, "closed"));
         assert!(a.contains("event=\"pane.mouse.alternate_scroll\""), "{a}");
         assert!(a.contains("WARN"), "{a}");
+    }
+
+    #[test]
+    fn shape_key_event_covers_all_four_fields() {
+        let ev = crossterm::event::KeyEvent::new_with_kind_and_state(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::empty(),
+        );
+        let shaped = shape_key_event(&ev);
+        assert!(shaped.contains("code="), "{shaped}");
+        assert!(shaped.contains("modifiers="), "{shaped}");
+        assert!(shaped.contains("kind="), "{shaped}");
+        assert!(shaped.contains("state="), "{shaped}");
+    }
+
+    #[test]
+    fn terminal_key_intercept_action_and_command_are_debug() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let a = capture_logs(|| terminal_key_intercept_action(&ev, "ToggleFloat"));
+        assert!(a.contains("event=\"terminal_key.intercept\""), "{a}");
+        assert!(a.contains("outcome=\"action\""), "{a}");
+        assert!(a.contains("action=\"ToggleFloat\""), "{a}");
+        assert!(a.contains("code="), "{a}");
+        assert!(a.contains("DEBUG"), "{a}");
+
+        let c = capture_logs(|| terminal_key_intercept_command(&ev, "edit config"));
+        assert!(c.contains("outcome=\"command\""), "{c}");
+        assert!(c.contains("command=\"edit config\""), "{c}");
+        assert!(c.contains("DEBUG"), "{c}");
+    }
+
+    #[test]
+    fn terminal_key_page_intercept_debug_shape() {
+        let out =
+            capture_logs(|| terminal_key_page_intercept(&crossterm::event::KeyCode::PageUp, 24));
+        assert!(out.contains("event=\"terminal_key.intercept\""), "{out}");
+        assert!(out.contains("outcome=\"page_scroll\""), "{out}");
+        assert!(out.contains("code=\"PageUp\""), "{out}");
+        assert!(out.contains("lines=24"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_modifier_only_dropped_debug_shape() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let out = capture_logs(|| terminal_key_modifier_only_dropped(&ev));
+        assert!(out.contains("event=\"terminal_key.drop\""), "{out}");
+        assert!(out.contains("outcome=\"modifier_only\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_forward_ambiguous_debug_with_protocol_and_encoded() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", &[0x1b]));
+        assert!(out.contains("event=\"terminal_key.forward\""), "{out}");
+        assert!(out.contains("outcome=\"ambiguous\""), "{out}");
+        assert!(out.contains("protocol=\"Legacy\""), "{out}");
+        assert!(out.contains("encoded=\"[27]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_empty_encoding_is_warn() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_empty_encoding(&ev));
+        assert!(out.contains("event=\"terminal_key.encode\""), "{out}");
+        assert!(out.contains("outcome=\"empty\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
     }
 }
