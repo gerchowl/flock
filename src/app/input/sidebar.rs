@@ -1690,25 +1690,41 @@ mod tests {
         app.state.tab_scroll_follow_active = false;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 65, 20));
 
-        let last_idx = app.state.workspaces[0].tabs.len() - 1;
-        let target = app.state.view.tab_hit_areas[last_idx];
+        // #102 part 3: tabs render in `(display_name, tab.number)` order,
+        // so "rightmost visible tab" is the storage-index with the largest
+        // x-coord in `tab_hit_areas`, not the storage-last index.
+        let rightmost_idx = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.width > 0)
+            .max_by_key(|(_, rect)| rect.x)
+            .map(|(idx, _)| idx)
+            .expect("at least one tab is visible");
+        let target = app.state.view.tab_hit_areas[rightmost_idx];
         let clamped_scroll = app.state.tab_scroll;
-        assert!(target.width > 0, "last tab should already be visible");
+        assert!(target.width > 0, "rightmost tab should be visible");
 
+        // Click the leftmost column of the target rect — its width may
+        // have been truncated to 1 at max scroll (#102 permuted layout),
+        // in which case `target.x + 1` would spill onto the scroll-right
+        // button and no tab press would register.
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            target.x + 1,
+            target.x,
             target.y,
         ));
         app.handle_mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
-            target.x + 1,
+            target.x,
             target.y,
         ));
 
-        assert_eq!(app.state.workspaces[0].active_tab, last_idx);
+        assert_eq!(app.state.workspaces[0].active_tab, rightmost_idx);
         assert_eq!(app.state.tab_scroll, clamped_scroll);
-        assert!(app.state.view.tab_hit_areas[last_idx].width > 0);
+        assert!(app.state.view.tab_hit_areas[rightmost_idx].width > 0);
     }
 
     #[test]

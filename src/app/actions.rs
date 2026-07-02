@@ -1090,12 +1090,14 @@ impl AppState {
         self.tab_mode == crate::config::TabModeConfig::Workspace && self.active.is_some()
     }
 
-    /// The member tab-strip content (#33): the active workspace's project
-    /// section in sidebar visual order — primary first, then the remaining
-    /// members in storage order. Local rows only (selecting a remote row is
-    /// a server switch, not a member switch) and collapse state is ignored:
-    /// the strip always shows the whole session. Sectionless workspaces
-    /// (pending probe, misc) get a single-member strip.
+    /// The member tab-strip content (#33 + #102 part 3): the active
+    /// workspace's project section — primary first, then the remaining
+    /// members sorted alphabetically by branch/label (with checkout-key
+    /// as tie-break for reproducibility). Local rows only (selecting a
+    /// remote row is a server switch, not a member switch); collapse
+    /// state is ignored — the strip always shows the whole session.
+    /// Sectionless workspaces (pending probe, misc) get a single-member
+    /// strip.
     pub(crate) fn workspace_strip_members(&self) -> Vec<usize> {
         let Some(active) = self.active.filter(|idx| *idx < self.workspaces.len()) else {
             return Vec::new();
@@ -1114,9 +1116,24 @@ impl AppState {
         else {
             return members;
         };
-        std::iter::once(primary)
-            .chain(members.into_iter().filter(|idx| *idx != primary))
-            .collect()
+        // Branch-alphabetical sort of the non-primary members. The
+        // branch is the member's most stable identity in a workspace
+        // strip; display name (with #62 grammar) collapses when the
+        // branch is missing. Ties fall back on ws_idx so drag reorder
+        // still has a deterministic starting order.
+        let mut rest: Vec<usize> = members.into_iter().filter(|idx| *idx != primary).collect();
+        rest.sort_by(|&a, &b| {
+            let ka = self.workspaces[a]
+                .branch()
+                .map(|b| b.to_ascii_lowercase())
+                .unwrap_or_else(|| self.workspaces[a].display_name().to_ascii_lowercase());
+            let kb = self.workspaces[b]
+                .branch()
+                .map(|b| b.to_ascii_lowercase())
+                .unwrap_or_else(|| self.workspaces[b].display_name().to_ascii_lowercase());
+            (ka, a).cmp(&(kb, b))
+        });
+        std::iter::once(primary).chain(rest).collect()
     }
 
     /// The primary row (main checkout) of the ACTIVE workspace's project
@@ -1500,6 +1517,11 @@ impl AppState {
         self.switch_workspace(prev);
     }
 
+    // #102 open question: since the spaces list now sorts on
+    // `sort_family_key` / project-key display, drag-reorder never sticks
+    // — the next render puts rows back in alphabetical order. Kept for
+    // now (drag targets still compile and mutate storage) pending the
+    // user's call on whether to remove it entirely.
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) {
         if source_idx >= self.workspaces.len() || insert_idx > self.workspaces.len() {
             return;
@@ -1543,6 +1565,10 @@ impl AppState {
         self.refresh_tab_bar_view();
     }
 
+    // #102 open question: tabs render in `(display_name, tab.number)`
+    // sort order (see `Workspace::tab_display_order`), so a drag-reorder
+    // is transient — the next render re-sorts. Kept compiling pending
+    // the user's call on whether to remove.
     pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) {
         if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
             if ws.move_tab(source_idx, insert_idx) {
@@ -4300,6 +4326,28 @@ mod tests {
         state.switch_workspace(1);
         state.collapsed_space_keys.insert("repo-key".into());
         assert_eq!(state.workspace_strip_members(), vec![0, 1, 2]);
+    }
+
+    /// #102 part 3: workspace-member strip renders primary first, then
+    /// the remaining members branch-alphabetically — NOT storage order.
+    /// Storage order here would be `[0, 1, 2, 3]` (main, then wt-one,
+    /// wt-two, wt-three) — but with branches `zeta`, `alpha`, `middle`
+    /// the strip must sort to `[0 (main), 2 (alpha), 3 (middle), 1 (zeta)]`.
+    #[test]
+    fn workspace_strip_members_sort_non_primary_by_branch_alphabetical() {
+        let mut state = app_with_workspaces(&["main", "wt-one", "wt-two", "wt-three"]);
+        mark_parent_worktree(&mut state, 0);
+        mark_linked_worktree(&mut state, 1);
+        mark_linked_worktree(&mut state, 2);
+        mark_linked_worktree(&mut state, 3);
+        state.workspaces[0].cached_git_branch = Some("main".into());
+        state.workspaces[1].cached_git_branch = Some("zeta".into());
+        state.workspaces[2].cached_git_branch = Some("alpha".into());
+        state.workspaces[3].cached_git_branch = Some("middle".into());
+        state.tab_mode = crate::config::TabModeConfig::Workspace;
+        state.switch_workspace(2);
+
+        assert_eq!(state.workspace_strip_members(), vec![0, 2, 3, 1]);
     }
 
     /// #33/#29 — in workspace tab-mode, switch_tab acts on the strip's

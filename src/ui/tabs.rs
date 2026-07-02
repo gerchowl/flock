@@ -104,15 +104,41 @@ pub(crate) fn compute_tab_bar_view(
     follow_active: bool,
     mouse_chrome: bool,
 ) -> TabBarView {
-    let widths: Vec<u16> = ws.tabs.iter().map(tab_width).collect();
-    compute_strip_view(
+    // #102 part 3: tabs render in `(display_name, tab.number)` order.
+    // Widths are computed in display order and the resulting hit rects
+    // are permuted back to storage indexing so downstream — mouse
+    // handlers, drag targets, tests keyed on `tab_hit_areas[storage_i]`
+    // — keep working. Only the on-screen x positions change.
+    let display_order = ws.tab_display_order();
+    let widths: Vec<u16> = display_order
+        .iter()
+        .map(|&i| tab_width(&ws.tabs[i]))
+        .collect();
+    let active_display_pos = display_order
+        .iter()
+        .position(|&i| i == ws.active_tab)
+        .unwrap_or(0);
+    let display_view = compute_strip_view(
         &widths,
-        ws.active_tab,
+        active_display_pos,
         area,
         current_scroll,
         follow_active,
         mouse_chrome,
-    )
+    );
+    let mut tab_hit_areas = vec![Rect::default(); ws.tabs.len()];
+    for (display_pos, &storage_idx) in display_order.iter().enumerate() {
+        if let Some(rect) = display_view.tab_hit_areas.get(display_pos) {
+            tab_hit_areas[storage_idx] = *rect;
+        }
+    }
+    TabBarView {
+        scroll: display_view.scroll,
+        tab_hit_areas,
+        scroll_left_hit_area: display_view.scroll_left_hit_area,
+        scroll_right_hit_area: display_view.scroll_right_hit_area,
+        new_tab_hit_area: display_view.new_tab_hit_area,
+    }
 }
 
 /// The `<ID> <name>` label of one member-strip slot (#33): the 1-based

@@ -960,6 +960,7 @@ mod tests {
             server: "mba22".into(),
             project: Some("flock".into()),
             target: "main".into(),
+            sort_family_key: "flock".into(),
             remote: None,
         }
     }
