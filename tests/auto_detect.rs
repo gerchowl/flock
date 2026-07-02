@@ -108,7 +108,7 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -152,7 +152,7 @@ fn spawn_flock_auto(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     // No subcommand, no --no-session → auto-detect launch
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -195,7 +195,7 @@ fn spawn_flock_no_session(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("--no-session");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -245,7 +245,7 @@ fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) {
 }
 
 fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flock"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command.args(args);
     command.env("FLOCK_SOCKET_PATH", socket_path);
     command.output().unwrap()
@@ -499,7 +499,7 @@ fn cli_subcommands_work_through_server() {
         "workspace list output should contain 'result': {stdout}"
     );
 
-    // Test `flock pane list` through the server's API socket.
+    // Test `flk pane list` through the server's API socket.
     let output = run_cli(&api_socket, &["pane", "list"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -621,7 +621,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -776,7 +776,7 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
         .map(|workspaces| workspaces.len())
         .unwrap_or(0);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("FLOCK_SOCKET_PATH", &api_socket)

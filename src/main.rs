@@ -72,7 +72,7 @@ fn init_logging() {
     crate::logging::init_file_logging("flock.log");
 }
 
-/// `flock --default-config` output: the machine-true serde defaults, derived —
+/// `flk --default-config` output: the machine-true serde defaults, derived —
 /// never hand-maintained (it drifted whenever a field landed in `Config`
 /// without an edit here; round-trip-tested in `default_config_output_parses_
 /// back_to_default_config`). The annotated prose lives in
@@ -130,7 +130,7 @@ enum AttachLeg {
 /// destination, from a sidebar remote row) in the switch file; each recorded
 /// target chains into a fresh `--remote` leg.
 ///
-/// Every leg — local in-process and remote via the spawned `flock client`
+/// Every leg — local in-process and remote via the spawned `flk client`
 /// subprocess — funnels into `client::run_client_with_mode`, which retries
 /// attaches refused with the live-handoff notice (#38) and re-captures the
 /// host terminal theme per leg for the attach handshake (#47). A SwitchServer
@@ -356,7 +356,7 @@ fn main() -> io::Result<()> {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(2);
         }
     };
@@ -364,7 +364,7 @@ fn main() -> io::Result<()> {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(2);
         }
     };
@@ -379,7 +379,7 @@ fn main() -> io::Result<()> {
         })
     {
         eprintln!("error: --remote can only be used with the default launch command");
-        eprintln!("run 'flock --help' for usage");
+        eprintln!("run 'flk --help' for usage");
         std::process::exit(2);
     }
 
@@ -412,7 +412,7 @@ fn main() -> io::Result<()> {
             }
             Err(err) => {
                 eprintln!("{err}");
-                eprintln!("usage: flock update [--handoff]");
+                eprintln!("usage: flk update [--handoff]");
                 std::process::exit(2);
             }
         };
@@ -432,86 +432,86 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("flock — terminal workspace manager for AI coding agents");
         println!();
-        println!("Usage: flock [options]");
-        println!("       flock --session <name> [options]");
-        println!("       flock --remote <ssh-target> [--session <name>]");
-        println!("       flock session attach <name>");
-        println!("       flock update [--handoff]");
-        println!("       flock channel set <stable|preview>");
-        println!("       flock server stop");
-        println!("       flock server reload-config");
-        println!("       flock config <subcommand> ...");
-        println!("       flock channel <subcommand> ...");
-        println!("       flock workspace <subcommand> ...");
-        println!("       flock worktree <subcommand> ...");
-        println!("       flock tab <subcommand> ...");
-        println!("       flock notification <subcommand> ...");
-        println!("       flock agent <subcommand> ...");
-        println!("       flock pane <subcommand> ...");
-        println!("       flock wait <subcommand> ...");
-        println!("       flock session <subcommand> ...");
-        println!("       flock integration <subcommand> ...");
-        println!("       flock web [--bind <addr>] (requires the `web` feature)");
+        println!("Usage: flk [options]");
+        println!("       flk --session <name> [options]");
+        println!("       flk --remote <ssh-target> [--session <name>]");
+        println!("       flk session attach <name>");
+        println!("       flk update [--handoff]");
+        println!("       flk channel set <stable|preview>");
+        println!("       flk server stop");
+        println!("       flk server reload-config");
+        println!("       flk config <subcommand> ...");
+        println!("       flk channel <subcommand> ...");
+        println!("       flk workspace <subcommand> ...");
+        println!("       flk worktree <subcommand> ...");
+        println!("       flk tab <subcommand> ...");
+        println!("       flk notification <subcommand> ...");
+        println!("       flk agent <subcommand> ...");
+        println!("       flk pane <subcommand> ...");
+        println!("       flk wait <subcommand> ...");
+        println!("       flk session <subcommand> ...");
+        println!("       flk integration <subcommand> ...");
+        println!("       flk web [--bind <addr>] (requires the `web` feature)");
         println!();
         println!("Common commands:");
         for (command, description) in [
-            ("flock", "Launch or attach to the persistent session"),
+            ("flk", "Launch or attach to the persistent session"),
             (
-                "flock status [server|client]",
+                "flk status [server|client]",
                 "Show local client and running server status",
             ),
-            ("flock update", "Download and install the latest version"),
+            ("flk update", "Download and install the latest version"),
             (
-                "flock server stop",
+                "flk server stop",
                 "Stop the running server via the API socket",
             ),
             (
-                "flock channel set <stable|preview>",
+                "flk channel set <stable|preview>",
                 "Choose the stable or preview update channel",
             ),
             (
-                "flock server reload-config",
+                "flk server reload-config",
                 "Reload config.toml in the running server",
             ),
             (
-                "flock config reset-keys",
+                "flk config reset-keys",
                 "Back up config.toml and remove custom keybindings",
             ),
             (
-                "flock channel <subcommand>",
+                "flk channel <subcommand>",
                 "Manage the stable or preview update channel",
             ),
             (
-                "flock workspace <subcommand>",
+                "flk workspace <subcommand>",
                 "Workspace helpers over the socket API",
             ),
             (
-                "flock worktree <subcommand>",
+                "flk worktree <subcommand>",
                 "Git worktree helpers over the socket API",
             ),
-            ("flock tab <subcommand>", "Tab helpers over the socket API"),
+            ("flk tab <subcommand>", "Tab helpers over the socket API"),
             (
-                "flock notification <subcommand>",
+                "flk notification <subcommand>",
                 "Notification helpers over the socket API",
             ),
             (
-                "flock agent <subcommand>",
+                "flk agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
             ),
             (
-                "flock pane <subcommand>",
+                "flk pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
             (
-                "flock wait <subcommand>",
+                "flk wait <subcommand>",
                 "Blocking wait helpers over the socket API",
             ),
             (
-                "flock session <subcommand>",
+                "flk session <subcommand>",
                 "Manage named persistent sessions",
             ),
             (
-                "flock integration <subcommand>",
+                "flk integration <subcommand>",
                 "Manage built-in agent integrations",
             ),
         ] {
@@ -519,7 +519,7 @@ fn main() -> io::Result<()> {
         }
         println!();
         println!("Advanced commands:");
-        println!("  {:<32} Run as headless server", "flock server");
+        println!("  {:<32} Run as headless server", "flk server");
         println!();
         println!("Options:");
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
@@ -540,7 +540,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("flock {}", crate::build_info::version());
+        println!("flk {}", crate::build_info::version());
         return Ok(());
     }
 
@@ -565,7 +565,7 @@ fn main() -> io::Result<()> {
         let arg_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(1);
         }
         if !arg.starts_with('-')
@@ -587,7 +587,7 @@ fn main() -> io::Result<()> {
             .contains(&arg.as_str())
         {
             eprintln!("unknown command: {arg}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(1);
         }
     }
@@ -605,7 +605,7 @@ fn main() -> io::Result<()> {
     // Check if a server is running, spawn one if needed, then attach as client.
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
-            eprintln!("flock: {err}");
+            eprintln!("flk: {err}");
             std::process::exit(1);
         }
         return Ok(());
@@ -621,7 +621,7 @@ fn main() -> io::Result<()> {
     let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flock is already running");
+            eprintln!("error: flk is already running");
             eprintln!("socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn default_config_output_parses_back_to_default_config() {
-        // ADR-0002 phase (g): `flock --default-config` must print EXACTLY the
+        // ADR-0002 phase (g): `flk --default-config` must print EXACTLY the
         // serde defaults — the hand-maintained TOML shadow drifted whenever a
         // field landed in Config without an edit here. Round-trip guard: parse
         // the printed text and compare against Config::default() structurally.
@@ -785,7 +785,7 @@ mod tests {
     fn switch_failure_reason_is_a_single_trimmed_line() {
         let err = io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            "connection refused\nIs flock server running?",
+            "connection refused\nIs flk server running?",
         );
         assert_eq!(switch_failure_reason(&err), "connection refused");
 
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn cli_remote_leg_uses_interactive_context() {
-        // The explicit `flock --remote <target>` path retains its install
+        // The explicit `flk --remote <target>` path retains its install
         // / upgrade prompt -- the user typed the command at a shell, has a
         // real TTY, and no alt-screen is held. Verify the CLI parser
         // produces an interactive RemoteLaunch.
@@ -938,6 +938,6 @@ mod tests {
     fn nested_message_strings_no_longer_repeat_flock_prefix() {
         assert!(NESTED_FLOCK_MESSAGES
             .iter()
-            .all(|message| !message.starts_with("flock:")));
+            .all(|message| !message.starts_with("flock:") && !message.starts_with("flk:")));
     }
 }

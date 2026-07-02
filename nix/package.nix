@@ -18,10 +18,10 @@
   # ("0.6.8" / proto N). null keeps the plain upstream version string.
   buildChannel ? null,
   buildId ? null,
-  # Build the `web` cargo feature (the `flock web` xterm bridge, gerchowl/flock#131).
+  # Build the `web` cargo feature (the `flk web` xterm bridge, gerchowl/flock#131).
   # Off by default so the standard build stays lean (no axum/rust-embed); the
   # flake exposes a `flock-web` package with this on. The binary is still
-  # `bin/flock` — the feature only adds the `web` subcommand.
+  # `bin/flk` — the feature only adds the `web` subcommand.
   withWeb ? false,
 }:
 
@@ -124,7 +124,7 @@ rustPlatform.buildRustPackage {
     description = "Terminal workspace manager for AI coding agents";
     homepage = "https://flock.dev";
     license = lib.licenses.agpl3Plus;
-    mainProgram = "flock";
+    mainProgram = "flk";
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }

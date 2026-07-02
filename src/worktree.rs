@@ -222,7 +222,7 @@ pub(crate) fn checkout_is_dirty(checkout: &std::path::Path) -> Option<bool> {
 /// resolved state. Ordered safest → most aggressive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillTier {
-    /// Main checkout, clean, no running agent: close its flock pane/workspace
+    /// Main checkout, clean, no running agent: close its flk pane/workspace
     /// only — nothing is touched on disk.
     ClosePane,
     /// Linked worktree whose branch is merged: remove the checkout AND delete
@@ -279,7 +279,7 @@ pub fn classify_kill_tier(facts: KillFacts) -> KillTier {
 /// The concrete operation the sweep performs on a row this pass (#81).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillAction {
-    /// Close the flock pane/workspace; nothing on disk.
+    /// Close the flk pane/workspace; nothing on disk.
     ClosePane,
     /// `git worktree remove` then `git branch -D`. `dirty` ⇒ force-remove.
     KillBranch { dirty: bool },

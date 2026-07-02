@@ -1057,7 +1057,7 @@ pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
         outcome = "ok",
         api_socket = %api_socket.display(),
         client_socket = %client_socket.display(),
-        "flock server started"
+        "flk server started"
     );
 }
 
@@ -2080,7 +2080,7 @@ mod tests {
                 "host1",
                 Some(Path::new("/tmp/keepalive-cfg")),
                 &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
-                "exec \"$HOME/.local/bin/flock\" remote-client-bridge",
+                "exec \"$HOME/.local/bin/flk\" remote-client-bridge",
             );
         });
         assert!(out.contains("event=\"remote.bridge.started\""), "{out}");
@@ -2092,7 +2092,7 @@ mod tests {
         );
         assert!(out.contains("BatchMode=yes"), "{out}");
         assert!(
-            out.contains("exec \\\"$HOME/.local/bin/flock\\\" remote-client-bridge"),
+            out.contains("exec \\\"$HOME/.local/bin/flk\\\" remote-client-bridge"),
             "the full remote command must be visible at INFO: {out}"
         );
         assert!(out.contains("INFO"), "bridge start must be INFO: {out}");
@@ -2116,11 +2116,11 @@ mod tests {
     #[test]
     fn remote_binary_resolved_names_path_version_and_source() {
         let out = capture_logs(|| {
-            remote_binary_resolved("host1", "/usr/local/bin/flock", "flock 0.6.8", "path");
+            remote_binary_resolved("host1", "/usr/local/bin/flk", "flk 0.6.8", "path");
         });
         assert!(out.contains("event=\"remote.binary_resolved\""), "{out}");
-        assert!(out.contains("path=\"/usr/local/bin/flock\""), "{out}");
-        assert!(out.contains("version=\"flock 0.6.8\""), "{out}");
+        assert!(out.contains("path=\"/usr/local/bin/flk\""), "{out}");
+        assert!(out.contains("version=\"flk 0.6.8\""), "{out}");
         assert!(out.contains("source=\"path\""), "{out}");
         assert!(
             out.contains("INFO"),
@@ -2137,7 +2137,7 @@ mod tests {
         assert!(probe.contains("INFO"), "{probe}");
 
         let started = capture_logs(|| {
-            remote_install_started("host1", "local binary", "$HOME/.local/bin/flock")
+            remote_install_started("host1", "local binary", "$HOME/.local/bin/flk")
         });
         assert!(
             started.contains("event=\"remote.install.start\""),
@@ -2145,7 +2145,7 @@ mod tests {
         );
 
         let failed = capture_logs(|| {
-            remote_install_failed("host1", "$HOME/.local/bin/flock", "ssh exited with 1")
+            remote_install_failed("host1", "$HOME/.local/bin/flk", "ssh exited with 1")
         });
         assert!(
             failed.contains("event=\"remote.install.complete\""),
@@ -2457,9 +2457,9 @@ mod tests {
         assert!(ready.contains("path=/tmp/x.sock"), "{ready}");
         assert!(ready.contains("INFO"), "{ready}");
 
-        let spawn = capture_logs(|| server_daemon_spawning(Path::new("/usr/local/bin/flock")));
+        let spawn = capture_logs(|| server_daemon_spawning(Path::new("/usr/local/bin/flk")));
         assert!(spawn.contains("event=\"server.daemon.spawn\""), "{spawn}");
-        assert!(spawn.contains("exe=/usr/local/bin/flock"), "{spawn}");
+        assert!(spawn.contains("exe=/usr/local/bin/flk"), "{spawn}");
         assert!(spawn.contains("INFO"), "{spawn}");
 
         let detect = capture_logs(|| server_auto_detect_starting(Path::new("/tmp/x.sock")));

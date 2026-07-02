@@ -201,7 +201,7 @@ impl ClientState {
 
 /// Path of the launcher's switch file. Set by the outermost flock process;
 /// a client that receives SwitchServer writes the SSH target here and exits,
-/// and the launcher chains into `flock --remote <target>`.
+/// and the launcher chains into `flk --remote <target>`.
 pub const SWITCH_FILE_ENV_VAR: &str = "FLOCK_SWITCH_FILE";
 
 /// Env var the launcher sets on the leg it re-attaches after a FAILED server
@@ -468,10 +468,7 @@ impl std::fmt::Display for ClientError {
             ClientError::ConnectionFailed(err) => {
                 write!(f, "failed to connect to server: {err}")?;
                 let path = client_socket_path();
-                write!(
-                    f,
-                    "\nIs flock server running? Start it with `flock server`."
-                )?;
+                write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
             ClientError::HandshakeRejected { version, error } => {
@@ -1346,7 +1343,7 @@ fn install_protective_panic_hook() {
         // Non-fatal: `writeln!` returns Err on a dead stderr where `eprintln!`
         // would panic — that panic was the first half of the double-panic
         // abort. Best-effort diagnostic first so a working stderr still sees it.
-        let _ = writeln!(io::stderr(), "flock client panic: {info}");
+        let _ = writeln!(io::stderr(), "flk client panic: {info}");
         if let Some(original) = DEFAULT_PANIC_HOOK.get() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original(info)));
         }
@@ -2112,7 +2109,7 @@ async fn run_client_loop(
                                 reason: Some("switching".to_string()),
                             });
                         }
-                        // No launcher to chain into (e.g. bare `flock client`):
+                        // No launcher to chain into (e.g. bare `flk client`):
                         // stay attached and let the user switch manually.
                         let _ = writeln!(io::stderr(), "flock: server requested switch to {ssh_target}, but no launcher is present (FLOCK_SWITCH_FILE unset)");
                     }
@@ -4358,7 +4355,7 @@ mod tests {
             "should mention connection failure: {msg}"
         );
         assert!(
-            msg.contains("flock server"),
+            msg.contains("flk server"),
             "should suggest starting server: {msg}"
         );
     }
@@ -4412,7 +4409,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock` to reattach"),
+            msg.contains("Run `flk` to reattach"),
             "should suggest default reattach command: {msg}"
         );
     }
@@ -4427,7 +4424,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock session attach work` to reattach"),
+            msg.contains("Run `flk session attach work` to reattach"),
             "should suggest named session reattach command: {msg}"
         );
     }
@@ -4437,7 +4434,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "flock --remote host --session work",
+            "flk --remote host --session work",
         );
         let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
         let err = ClientError::ServerShutdown {
@@ -4445,7 +4442,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock --remote host --session work` to reattach"),
+            msg.contains("Run `flk --remote host --session work` to reattach"),
             "should prefer remote reattach command: {msg}"
         );
     }

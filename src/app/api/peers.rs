@@ -254,7 +254,7 @@ impl App {
                             "-o",
                             "ConnectTimeout=5",
                             &target,
-                            &format!("sh -lc 'flock workspace focus --workspace {id}'"),
+                            &format!("sh -lc 'flk workspace focus --workspace {id}'"),
                         ])
                         .stdin(std::process::Stdio::null())
                         .output_traced();

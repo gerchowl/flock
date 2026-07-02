@@ -39,10 +39,10 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
             return Ok(args.to_vec());
         }
         let Some(name) = args.get(3) else {
-            return Err("usage: flock session attach <name>".to_string());
+            return Err("usage: flk session attach <name>".to_string());
         };
         if args.len() != 4 {
-            return Err("usage: flock session attach <name>".to_string());
+            return Err("usage: flk session attach <name>".to_string());
         }
         apply_explicit_name(name)?;
         return Ok(cleaned);
@@ -99,8 +99,8 @@ pub fn active_name() -> Option<String> {
 
 pub fn local_attach_command() -> String {
     match active_name() {
-        Some(name) => format!("flock session attach {name}"),
-        None => "flock".to_string(),
+        Some(name) => format!("flk session attach {name}"),
+        None => "flk".to_string(),
     }
 }
 
@@ -110,8 +110,8 @@ pub fn local_stop_command() -> String {
 
 pub fn stop_command_for(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("flock session stop {name}"),
-        None => "flock server stop".to_string(),
+        Some(name) => format!("flk session stop {name}"),
+        None => "flk server stop".to_string(),
     }
 }
 
@@ -130,7 +130,7 @@ pub fn active_restart_after_update_guidance() -> String {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
             return restart_after_update_guidance(
                 &format!(
-                    "{}={} flock server stop",
+                    "{}={} flk server stop",
                     crate::api::SOCKET_PATH_ENV_VAR,
                     socket_path
                 ),
@@ -748,7 +748,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_attach_command(), "flock");
+        assert_eq!(local_attach_command(), "flk");
     }
 
     #[test]
@@ -756,7 +756,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_attach_command(), "flock session attach work");
+        assert_eq!(local_attach_command(), "flk session attach work");
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -766,7 +766,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
 
-        assert_eq!(local_stop_command(), "flock server stop");
+        assert_eq!(local_stop_command(), "flk server stop");
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -776,7 +776,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "work");
 
-        assert_eq!(local_stop_command(), "flock session stop work");
+        assert_eq!(local_stop_command(), "flk session stop work");
 
         std::env::remove_var(SESSION_ENV_VAR);
     }
@@ -785,10 +785,10 @@ mod tests {
     fn restart_after_update_guidance_names_stop_and_attach_commands() {
         assert_eq!(
             restart_after_update_guidance(
-                "flock session stop work",
-                Some("flock session attach work")
+                "flk session stop work",
+                Some("flk session attach work")
             ),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `flock session stop work`, then run `flock session attach work` again."
+            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `flk session stop work`, then run `flk session attach work` again."
         );
     }
 
@@ -801,7 +801,7 @@ mod tests {
 
         assert_eq!(
             active_restart_after_update_guidance(),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flock server stop`, then restart Flock with the same socket override."
+            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server stop`, then restart Flock with the same socket override."
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);

@@ -86,7 +86,7 @@ fn rect_fits_frame(rect: Rect, frame: &FrameData) -> bool {
 /// when the connection was accepted. Pairs with the client's `first_paint`
 /// (`side="client"`) so the attach gap splits into server-produce vs
 /// wire+decode time, and across hosts the two correlate by `client_id` through
-/// `flock peers logs`. Pure observability — visible at `FLOCK_LOG=flock=debug`.
+/// `flk peers logs`. Pure observability — visible at `FLOCK_LOG=flock=debug`.
 fn log_first_frame_sent(client_id: u64, client: &mut ClientConnection) {
     if client.first_frame_sent {
         return;
@@ -3390,7 +3390,7 @@ pub fn run_server() -> io::Result<()> {
     let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flock server is already running");
+            eprintln!("error: flk server is already running");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -3429,7 +3429,7 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: flock server is already running");
+                eprintln!("error: flk server is already running");
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(1);
             }
@@ -3548,7 +3548,7 @@ fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()
     reason = "headless server prints its socket paths on stderr for the launching process (and human operators) to parse when detaching"
 )]
 fn print_ready_message(api_socket: &Path, client_socket: &Path) {
-    eprintln!("flock server running; you can use any flock CLI command in another terminal.");
+    eprintln!("flk server running; you can use any flk CLI command in another terminal.");
     eprintln!("api socket: {}", api_socket.display());
     eprintln!("client socket: {}", client_socket.display());
     eprintln!(
@@ -3557,7 +3557,7 @@ fn print_ready_message(api_socket: &Path, client_socket: &Path) {
             .join("flock-server.log")
             .display()
     );
-    eprintln!("did you mean to open the Flock TUI? run `flock`; you do not need `flock server`.");
+    eprintln!("did you mean to open the Flock TUI? run `flk`; you do not need `flk server`.");
 }
 
 /// Initialize logging for the server process.
@@ -7162,7 +7162,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(changed);
@@ -7197,7 +7197,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(changed);
@@ -7214,7 +7214,7 @@ next_tab = ""
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(
                     message,
-                    "v9.9.9 available: detach, run `flock update`, then follow its restart guidance"
+                    "v9.9.9 available: detach, run `flk update`, then follow its restart guidance"
                 );
             }
             other => panic!("expected system toast notify, got {other:?}"),

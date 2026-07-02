@@ -154,7 +154,7 @@ pub struct App {
     pub(crate) config_reloaded_from_disk: bool,
     /// Live-reload channel for the peer-summary poll cadence (#96): the
     /// `peer-summary-tick` thread reads the latest `[gossip] poll_interval_secs`
-    /// each iteration, so `flock server reload-config` re-arms the loop.
+    /// each iteration, so `flk server reload-config` re-arms the loop.
     pub(crate) gossip_poll_interval_secs: Arc<AtomicU64>,
     /// Per-peer round-dispatch bookkeeping (#96): the overlap-safety guard
     /// that keeps a slow ProxyJump peer from stacking concurrent SSH polls.
@@ -301,7 +301,7 @@ impl App {
                 .expect("pr-state tick thread should spawn");
         }
         // #96: the peer-summary tick reads the LIVE cadence from an
-        // atomically-shared `[gossip] poll_interval_secs` so `flock server
+        // atomically-shared `[gossip] poll_interval_secs` so `flk server
         // reload-config` re-arms the loop without a restart. The round handler
         // (in api.rs) is the overlap-safety point — a slow SSH cannot pile up
         // even at very short intervals.
@@ -321,7 +321,7 @@ impl App {
                             return;
                         }
                         // Read live: apply_live_config publishes a new value
-                        // here on `flock server reload-config`, so the NEXT
+                        // here on `flk server reload-config`, so the NEXT
                         // sleep uses the fresh cadence.
                         let secs = interval_secs.load(Ordering::Relaxed).max(1);
                         std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -1293,7 +1293,7 @@ impl App {
         self.state.config.slots = config.slots.clone();
         self.state.config.peers = config.peers.clone();
         // #96: publish the live-reloaded gossip cadence to the poll-tick thread
-        // so `flock server reload-config` re-arms the loop without a restart.
+        // so `flk server reload-config` re-arms the loop without a restart.
         // Diagnostics ride along via collect_diagnostics; consumers clamp via
         // `poll_interval()` so an invalid `0` still produces a live cadence.
         diagnostics.extend(config.gossip.diagnostics());
@@ -3767,7 +3767,7 @@ sidebar_pane_gap = 99
             app.event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("9.9.{i}"),
-                    install_command: "flock update".into(),
+                    install_command: "flk update".into(),
                 })
                 .unwrap();
         }
@@ -4203,7 +4203,7 @@ last_pane = "prefix+tab"
 
     #[test]
     fn reload_config_rearms_gossip_poll_interval() {
-        // #96 acceptance: `flock server reload-config` picks up a changed
+        // #96 acceptance: `flk server reload-config` picks up a changed
         // [gossip] poll_interval_secs — the atomically-shared value the
         // peer-summary tick reads must be updated by apply_live_config.
         let _guard = config_env_lock().lock().unwrap();

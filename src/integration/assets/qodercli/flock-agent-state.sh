@@ -6,7 +6,7 @@
 # FLOCK_INTEGRATION_VERSION=1
 #
 # Reports qodercli agent state changes to flock. Registered as a Command hook
-# in ~/.qoder/settings.json by `flock integration install qodercli` and
+# in ~/.qoder/settings.json by `flk integration install qodercli` and
 # invoked by qodercli's hook system on lifecycle events.
 #
 # qodercli (per https://docs.qoder.com/zh/cli/hooks) sends a JSON payload on

@@ -2497,7 +2497,7 @@ impl AppState {
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,
-            update_install_command: "flock update".into(),
+            update_install_command: "flk update".into(),
             latest_release_notes_available: false,
             update_dismissed: false,
             config_diagnostic: None,
