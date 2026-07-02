@@ -1652,6 +1652,141 @@ pub(crate) fn pane_focus_forward_failed(err: &str, event: &str) {
     );
 }
 
+// --- worktree family (logging redesign PR-6) -------------------------------
+// Every git-worktree lifecycle step the flock TUI drives — dialog open, add
+// start/complete/fail, remove start/complete/fail, merge-gate resolution,
+// post-kill branch delete — passed its raw repo-root / checkout-path /
+// workspace-id / merge-gate through tracing macros with %expr / ?expr
+// fields. Fourteen sites total. The facade fns below own every path.display()
+// and every WorktreeMergeGate Debug shape so subsystem code stays raw-field
+// free.
+//
+// Level discipline:
+//   * lifecycle starts + successful completions + merge-gate resolution =
+//     INFO (the load-bearing "what did the worktree actor do" story)
+//   * add/remove failures + branch-delete failure = WARN (the checkout /
+//     branch was left in a state the user needs to notice, but the pane and
+//     the app keep running)
+
+pub(crate) fn worktree_dialog_opened(
+    ws_idx: usize,
+    repo_root: &str,
+    branch: &str,
+    checkout_path: &str,
+) {
+    tracing::info!(
+        event = "worktree.dialog.open",
+        subsystem = "worktree",
+        outcome = "ok",
+        ws_idx,
+        repo_root,
+        branch,
+        checkout_path,
+        "opening worktree dialog"
+    );
+}
+
+pub(crate) fn worktree_kill_merge_gate_resolved(workspace_id: &str, branch: &str, gate: &str) {
+    tracing::info!(
+        event = "worktree.kill.merge_gate",
+        subsystem = "worktree",
+        outcome = "resolved",
+        workspace_id,
+        branch,
+        gate,
+        "worktree kill merge gate resolved"
+    );
+}
+
+pub(crate) fn worktree_branch_deleted(branch: &str) {
+    tracing::info!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "ok",
+        branch,
+        "deleted local branch after worktree kill"
+    );
+}
+
+pub(crate) fn worktree_branch_delete_failed(branch: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "error",
+        branch,
+        err,
+        "branch delete failed"
+    );
+}
+
+pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "started",
+        repo_root,
+        branch,
+        checkout_path,
+        "starting git worktree add"
+    );
+}
+
+pub(crate) fn worktree_remove_started(workspace_id: &str, path: &str, force: bool) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "started",
+        workspace_id,
+        path,
+        force,
+        "starting git worktree remove"
+    );
+}
+
+pub(crate) fn worktree_add_completed(checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "ok",
+        checkout_path,
+        "git worktree add completed"
+    );
+}
+
+pub(crate) fn worktree_add_failed(checkout_path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "error",
+        checkout_path,
+        err,
+        "git worktree add failed"
+    );
+}
+
+pub(crate) fn worktree_remove_completed(workspace_id: &str, path: &str) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "ok",
+        workspace_id,
+        path,
+        "git worktree remove completed"
+    );
+}
+
+pub(crate) fn worktree_remove_failed(workspace_id: &str, path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "error",
+        workspace_id,
+        path,
+        err,
+        "git worktree remove failed"
+    );
+}
+
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
 // action / custom command / pane scroll), which was dropped as
@@ -3365,6 +3500,90 @@ mod tests {
         assert!(
             died.contains("ERROR"),
             "PaneDied send must be ERROR: {died}"
+        );
+    }
+
+    #[test]
+    fn worktree_lifecycle_events_split_by_level() {
+        let dialog =
+            capture_logs(|| worktree_dialog_opened(3, "/repo", "feature/x", "/wt/feature-x"));
+        assert!(
+            dialog.contains("event=\"worktree.dialog.open\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("ws_idx=3"), "{dialog}");
+        assert!(dialog.contains("repo_root=\"/repo\""), "{dialog}");
+        assert!(dialog.contains("branch=\"feature/x\""), "{dialog}");
+        assert!(
+            dialog.contains("checkout_path=\"/wt/feature-x\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("INFO"), "{dialog}");
+
+        let gate =
+            capture_logs(|| worktree_kill_merge_gate_resolved("ws-1", "feature/x", "NotMerged"));
+        assert!(
+            gate.contains("event=\"worktree.kill.merge_gate\""),
+            "{gate}"
+        );
+        assert!(gate.contains("gate=\"NotMerged\""), "{gate}");
+        assert!(
+            gate.contains("INFO"),
+            "merge-gate resolution is INFO: {gate}"
+        );
+
+        let deleted = capture_logs(|| worktree_branch_deleted("feature/x"));
+        assert!(deleted.contains("outcome=\"ok\""), "{deleted}");
+        assert!(deleted.contains("INFO"), "{deleted}");
+
+        let delete_fail =
+            capture_logs(|| worktree_branch_delete_failed("feature/x", "unmerged commits"));
+        assert!(delete_fail.contains("outcome=\"error\""), "{delete_fail}");
+        assert!(
+            delete_fail.contains("WARN"),
+            "branch delete fail is WARN: {delete_fail}"
+        );
+    }
+
+    #[test]
+    fn worktree_add_and_remove_lifecycle_shapes() {
+        let add_start =
+            capture_logs(|| worktree_add_started("/repo", "feature/x", "/wt/feature-x"));
+        assert!(add_start.contains("event=\"worktree.add\""), "{add_start}");
+        assert!(add_start.contains("outcome=\"started\""), "{add_start}");
+        assert!(add_start.contains("INFO"), "{add_start}");
+
+        let add_ok = capture_logs(|| worktree_add_completed("/wt/feature-x"));
+        assert!(add_ok.contains("outcome=\"ok\""), "{add_ok}");
+        assert!(add_ok.contains("INFO"), "{add_ok}");
+
+        let add_fail =
+            capture_logs(|| worktree_add_failed("/wt/feature-x", "fatal: no such branch"));
+        assert!(add_fail.contains("outcome=\"error\""), "{add_fail}");
+        assert!(
+            add_fail.contains("err=\"fatal: no such branch\""),
+            "{add_fail}"
+        );
+        assert!(add_fail.contains("WARN"), "add fail is WARN: {add_fail}");
+
+        let remove_start = capture_logs(|| worktree_remove_started("ws-1", "/wt/feature-x", true));
+        assert!(
+            remove_start.contains("event=\"worktree.remove\""),
+            "{remove_start}"
+        );
+        assert!(remove_start.contains("force=true"), "{remove_start}");
+        assert!(remove_start.contains("INFO"), "{remove_start}");
+
+        let remove_ok = capture_logs(|| worktree_remove_completed("ws-1", "/wt/feature-x"));
+        assert!(remove_ok.contains("outcome=\"ok\""), "{remove_ok}");
+        assert!(remove_ok.contains("INFO"), "{remove_ok}");
+
+        let remove_fail =
+            capture_logs(|| worktree_remove_failed("ws-1", "/wt/feature-x", "dirty worktree"));
+        assert!(remove_fail.contains("outcome=\"error\""), "{remove_fail}");
+        assert!(
+            remove_fail.contains("WARN"),
+            "remove fail is WARN: {remove_fail}"
         );
     }
 
