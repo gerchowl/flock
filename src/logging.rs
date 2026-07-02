@@ -1835,6 +1835,81 @@ pub(crate) fn session_history_parse_failed(err: &str) {
     );
 }
 
+// --- persist restore family (logging redesign PR-6) ------------------------
+// Session-restore paths log four distinct failure modes: a saved pane cwd
+// that no longer exists (falls back to HOME), a per-pane restore failure
+// (with a variant that also increments imported-pane failure counts), and
+// two tab-pruning failures (no panes at all, or empty after layout pruning).
+// Seven sites in persist/restore.rs — every one had raw ?tab / %err /
+// %cwd.display() fields. Debug-shaped tab labels (?snap.custom_name is an
+// Option<String>) are formatted at the call side; cwd is the user's saved
+// filesystem path (not a session-secret) and stays a display string.
+//
+// Level discipline preserved: per-pane restore failures are ERROR (the
+// pane's state is lost); tab-level pruning failures and cwd-missing
+// fallback are WARN (the tab or cwd falls back, but the session comes up).
+
+pub(crate) fn session_restore_pane_cwd_missing(cwd: &str) {
+    tracing::warn!(
+        event = "persist.restore.cwd",
+        subsystem = "persist",
+        outcome = "missing",
+        cwd,
+        "saved pane cwd does not exist, falling back to HOME"
+    );
+}
+
+pub(crate) fn session_restore_imported_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        variant = "imported",
+        tab,
+        pane_id,
+        err,
+        "failed to restore imported pane"
+    );
+}
+
+pub(crate) fn session_restore_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        tab,
+        pane_id,
+        err,
+        "failed to restore pane, skipping"
+    );
+}
+
+pub(crate) fn session_restore_tab_no_panes(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "no_panes",
+        tab,
+        "no panes could be restored for tab, dropping it"
+    );
+}
+
+pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "pruned_empty",
+        tab,
+        "restored tab lost all panes after pruning missing layout nodes"
+    );
+}
+
+// agent-resume family lands in the next commit alongside its callsite
+// migration in src/app/agent_resume.rs (dead-code -D warnings would fire
+// if the fns landed with no user).
+
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
 // action / custom command / pane scroll), which was dropped as
@@ -3660,6 +3735,53 @@ mod tests {
             "{hist_parse}"
         );
         assert!(hist_parse.contains("WARN"), "{hist_parse}");
+    }
+
+    #[test]
+    fn session_restore_pane_failures_are_error_tab_failures_are_warn() {
+        let cwd = capture_logs(|| session_restore_pane_cwd_missing("/home/removed"));
+        assert!(cwd.contains("event=\"persist.restore.cwd\""), "{cwd}");
+        assert!(cwd.contains("outcome=\"missing\""), "{cwd}");
+        assert!(cwd.contains("cwd=\"/home/removed\""), "{cwd}");
+        assert!(cwd.contains("WARN"), "cwd fallback is WARN: {cwd}");
+
+        let imported = capture_logs(|| {
+            session_restore_imported_pane_failed("Some(\"work\")", 7, "channel closed")
+        });
+        assert!(
+            imported.contains("event=\"persist.restore.pane\""),
+            "{imported}"
+        );
+        assert!(imported.contains("variant=\"imported\""), "{imported}");
+        assert!(imported.contains("pane_id=7"), "{imported}");
+        assert!(
+            imported.contains("ERROR"),
+            "imported failure is ERROR: {imported}"
+        );
+
+        let pane =
+            capture_logs(|| session_restore_pane_failed("Some(\"work\")", 7, "channel closed"));
+        assert!(pane.contains("event=\"persist.restore.pane\""), "{pane}");
+        assert!(
+            !pane.contains("variant="),
+            "non-imported has no variant field: {pane}"
+        );
+        assert!(
+            pane.contains("ERROR"),
+            "restore pane failure is ERROR: {pane}"
+        );
+
+        let no_panes = capture_logs(|| session_restore_tab_no_panes("Some(\"work\")"));
+        assert!(
+            no_panes.contains("event=\"persist.restore.tab\""),
+            "{no_panes}"
+        );
+        assert!(no_panes.contains("reason=\"no_panes\""), "{no_panes}");
+        assert!(no_panes.contains("WARN"), "{no_panes}");
+
+        let pruned = capture_logs(|| session_restore_tab_pruned_empty("Some(\"work\")"));
+        assert!(pruned.contains("reason=\"pruned_empty\""), "{pruned}");
+        assert!(pruned.contains("WARN"), "{pruned}");
     }
 
     #[test]
