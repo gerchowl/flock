@@ -116,19 +116,19 @@ fn failed_remote_connect_story_is_in_the_log_at_default_level() {
     // The platform probe answered linux/x86_64 — that MUST be in the log.
     let content = wait_for_log_contains(
         &log,
-        "event=\"remote.probe.result\"",
+        "\"event\":\"remote.probe.result\"",
         Duration::from_secs(5),
     );
-    assert!(content.contains("os=\"linux\""), "{content}");
-    assert!(content.contains("arch=\"x86_64\""), "{content}");
+    assert!(content.contains("\"os\":\"linux\""), "{content}");
+    assert!(content.contains("\"arch\":\"x86_64\""), "{content}");
     assert!(
-        content.contains("target=\"stub-target\""),
+        content.contains("\"target\":\"stub-target\""),
         "every remote event carries the target: {content}"
     );
     // And the story must include at least one remote.* non-ok outcome telling
     // us WHY the launch went nowhere (declined install / failed probe).
     assert!(
-        content.contains("subsystem=\"remote\""),
+        content.contains("\"subsystem\":\"remote\""),
         "remote events must be attributed: {content}"
     );
 

@@ -7,7 +7,9 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-const DEFAULT_RETAINED_LOG_FILES: usize = 0;
+// Keep previous generations on rotation: retained=0 DELETED the log at the
+// cap, and the failure being diagnosed usually lived in the tail just dropped.
+const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
@@ -22,11 +24,23 @@ pub(crate) fn init_file_logging(file_name: &str) {
     let filter =
         EnvFilter::try_from_env("FLOCK_LOG").unwrap_or_else(|_| EnvFilter::new("flock=info"));
 
+    // JSON lines on disk (logging redesign PR-2): structured fields survive as
+    // real fields instead of being flattened into message strings, and the
+    // parse back into LogLine is serde, not a hand-rolled text parser.
+    // flatten_event puts message/event/subsystem/... at the top level next to
+    // timestamp/level/target — one hop for the parser, jq-friendly on disk.
+    // Spans are off: nothing #[instrument]s yet, and the default timestamp
+    // precision matches the old text layer, preserving merge_log_records'
+    // lexicographic-sort contract across mixed-format tails.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(make_writer)
         .with_ansi(false)
         .with_target(true)
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
         .try_init();
 }
 
@@ -42,10 +56,12 @@ pub(crate) fn help_log_paths_summary() -> String {
 /// allowed to read — never an arbitrary path (#67).
 const SESSION_LOG_FILES: [&str; 3] = ["flock.log", "flock-server.log", "flock-client.log"];
 
-/// One parsed tracing line for the cross-host log view (#67). Mirrors the
-/// default `tracing_subscriber::fmt` layout: `<rfc3339-utc>  <LEVEL> <target>:
-/// <message>`. `source`/`host` are filled in as records are tagged with their
-/// origin file and (for merged fleet output) their node.
+/// One parsed tracing record for the cross-host log view (#67), decoded from
+/// the on-disk JSONL layer (or a legacy text line — see `parse_log_lines`).
+/// This struct is also the `peers logs` SSH wire type: adding fields needs the
+/// same `#[serde(default)]` treatment so mixed-version fleets keep parsing.
+/// `source`/`host` are filled in as records are tagged with their origin file
+/// and (for merged fleet output) their node.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogLine {
     pub ts: String,
@@ -58,15 +74,22 @@ pub struct LogLine {
     pub host: Option<String>,
 }
 
-/// Parse the text emitted by our `fmt` subscriber back into records. One event
-/// is one line; a line that doesn't start with `<timestamp> <LEVEL> ` is treated
-/// as a continuation of the previous record's message (a `\n` embedded in a
-/// field), so multi-line values are preserved rather than dropped. `source`
-/// tags every record with the file it came from.
+/// Parse a session log back into records — dual-format (logging redesign
+/// PR-2): a line starting with `{` is a JSONL record from the current json
+/// layer; a line starting with a timestamp is a legacy text record (rotated
+/// pre-JSONL generations, mid-upgrade fleet tails). Anything else — including
+/// a truncated JSON tail — folds into the previous record's message, so a
+/// partial write can't fabricate records or panic the parser. `source` tags
+/// every record with the file it came from.
 pub fn parse_log_lines(content: &str, source: Option<&str>) -> Vec<LogLine> {
     let mut records: Vec<LogLine> = Vec::new();
     for raw in content.lines() {
-        match parse_log_record(raw, source) {
+        let parsed = if raw.trim_start().starts_with('{') {
+            parse_json_log_record(raw, source)
+        } else {
+            parse_log_record(raw, source)
+        };
+        match parsed {
             Some(record) => records.push(record),
             None => {
                 if let Some(last) = records.last_mut() {
@@ -79,6 +102,29 @@ pub fn parse_log_lines(content: &str, source: Option<&str>) -> Vec<LogLine> {
         }
     }
     records
+}
+
+/// Parse one JSONL record as emitted by the json fmt layer (flattened event
+/// fields; timestamp/level/target/message at the top level). Tolerant of
+/// unknown fields so newer emitters stay readable by older parsers.
+fn parse_json_log_record(line: &str, source: Option<&str>) -> Option<LogLine> {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        timestamp: String,
+        level: String,
+        target: String,
+        #[serde(default)]
+        message: String,
+    }
+    let wire: Wire = serde_json::from_str(line).ok()?;
+    Some(LogLine {
+        ts: wire.timestamp,
+        level: wire.level,
+        target: wire.target,
+        message: wire.message,
+        source: source.map(str::to_string),
+        host: None,
+    })
 }
 
 /// Parse a single full-format line, or `None` if it isn't a fresh record.
@@ -1035,6 +1081,95 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "abc");
         assert!(!rotated_log_path(&path, 1).exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_log_lines_reads_jsonl_records() {
+        // PR-2 of the logging redesign: the on-disk format becomes JSON lines
+        // (flattened fields). The parser must map timestamp/level/target/message
+        // into LogLine so the `peers logs` envelope and human printer stay
+        // byte-identical.
+        let content = concat!(
+            r#"{"timestamp":"2026-06-29T09:33:48.618253Z","level":"INFO","target":"flock::app::api","message":"api request completed","event":"api.request.complete","subsystem":"api","outcome":"ok","request_id":"7"}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-29T09:33:49.001000Z","level":"WARN","target":"flock::peers","message":"poll failed","err":"timeout"}"#,
+            "\n",
+        );
+        let records = parse_log_lines(content, Some("flock-server.log"));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].ts, "2026-06-29T09:33:48.618253Z");
+        assert_eq!(records[0].level, "INFO");
+        assert_eq!(records[0].target, "flock::app::api");
+        assert_eq!(records[0].message, "api request completed");
+        assert_eq!(records[0].source.as_deref(), Some("flock-server.log"));
+        assert_eq!(records[1].level, "WARN");
+        assert_eq!(records[1].message, "poll failed");
+    }
+
+    #[test]
+    fn parse_log_lines_handles_mixed_text_and_json_lines() {
+        // A rotated pre-JSONL file or a mid-upgrade tail mixes both formats,
+        // so the parser sniffs per line and neither generation is dropped.
+        let content = concat!(
+            "2026-06-29T09:33:48.618253Z  INFO flock::app::api: legacy text record\n",
+            r#"{"timestamp":"2026-06-29T09:33:49.000000Z","level":"INFO","target":"flock::app","message":"json record"}"#,
+            "\n",
+        );
+        let records = parse_log_lines(content, None);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].message, "legacy text record");
+        assert_eq!(records[1].message, "json record");
+    }
+
+    #[test]
+    fn parse_log_lines_treats_invalid_json_line_as_orphan_continuation() {
+        // A truncated JSONL tail must fold into the prior record (same
+        // contract as text continuations), never panic or fabricate records.
+        let content = concat!(
+            r#"{"timestamp":"2026-06-29T09:33:48.618253Z","level":"INFO","target":"t","message":"whole"}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-29T09:33:49.0"#,
+            "\n",
+        );
+        let records = parse_log_lines(content, None);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].message.contains("whole"));
+        assert!(
+            records[0]
+                .message
+                .contains("{\"timestamp\":\"2026-06-29T09:33:49.0"),
+            "truncated tail folds into the prior message: {}",
+            records[0].message
+        );
+    }
+
+    #[test]
+    fn rotation_with_default_retention_keeps_previous_generation() {
+        // retained=0 meant rotation DELETED the log — the failure being
+        // diagnosed usually lived in the tail we just dropped. The default
+        // must keep at least one previous generation.
+        let path = temp_log_path("default-retention");
+        let dir = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+
+        let writer =
+            RotatingFileMakeWriter::new(dir.clone(), "flock.log", 8, DEFAULT_RETAINED_LOG_FILES)
+                .unwrap();
+        {
+            let mut guard = writer.make_writer();
+            guard.write_all(b"12345678").unwrap();
+            guard.write_all(b"abc").unwrap();
+            guard.flush().unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "abc");
+        assert_eq!(
+            fs::read_to_string(rotated_log_path(&path, 1)).unwrap(),
+            "12345678",
+            "the previous generation must survive rotation"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
