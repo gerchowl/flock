@@ -922,6 +922,51 @@ pub(crate) fn client_conn_read_failed(client_id: u64, err: &str) {
     );
 }
 
+// --- server family (logging redesign PR-4) ---------------------------------
+// Server lifecycle events — daemon spawn, socket bind, ready-poll, and
+// shutdown cleanup. The "did the server actually come up?" story must be
+// answerable from the tail without decoding raw fd errors.
+
+pub(crate) fn server_socket_check_failed(err: &str) {
+    tracing::warn!(
+        event = "server.socket.check",
+        subsystem = "server",
+        outcome = "error",
+        err,
+        "unexpected error checking server socket"
+    );
+}
+
+pub(crate) fn server_daemon_spawning(exe: &Path) {
+    tracing::info!(
+        event = "server.daemon.spawn",
+        subsystem = "server",
+        outcome = "started",
+        exe = %exe.display(),
+        "spawning server daemon"
+    );
+}
+
+pub(crate) fn server_socket_ready(path: &Path) {
+    tracing::info!(
+        event = "server.socket.ready",
+        subsystem = "server",
+        outcome = "ok",
+        path = %path.display(),
+        "server socket ready"
+    );
+}
+
+pub(crate) fn server_auto_detect_starting(path: &Path) {
+    tracing::info!(
+        event = "server.auto_detect.start",
+        subsystem = "server",
+        outcome = "started",
+        path = %path.display(),
+        "auto-detect launch starting"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -1500,5 +1545,33 @@ mod tests {
         assert!(r.contains("client_id=5"), "{r}");
         assert!(r.contains("err=\"framing\""), "{r}");
         assert!(r.contains("DEBUG"), "{r}");
+    }
+
+    // ------ logging redesign PR-4: server family (autodetect side) ---------
+
+    #[test]
+    fn server_socket_check_ready_and_daemon_are_shaped() {
+        let check = capture_logs(|| server_socket_check_failed("permission denied"));
+        assert!(check.contains("event=\"server.socket.check\""), "{check}");
+        assert!(check.contains("err=\"permission denied\""), "{check}");
+        assert!(check.contains("WARN"), "{check}");
+
+        let ready = capture_logs(|| server_socket_ready(Path::new("/tmp/x.sock")));
+        assert!(ready.contains("event=\"server.socket.ready\""), "{ready}");
+        assert!(ready.contains("path=/tmp/x.sock"), "{ready}");
+        assert!(ready.contains("INFO"), "{ready}");
+
+        let spawn = capture_logs(|| server_daemon_spawning(Path::new("/usr/local/bin/flock")));
+        assert!(spawn.contains("event=\"server.daemon.spawn\""), "{spawn}");
+        assert!(spawn.contains("exe=/usr/local/bin/flock"), "{spawn}");
+        assert!(spawn.contains("INFO"), "{spawn}");
+
+        let detect = capture_logs(|| server_auto_detect_starting(Path::new("/tmp/x.sock")));
+        assert!(
+            detect.contains("event=\"server.auto_detect.start\""),
+            "{detect}"
+        );
+        assert!(detect.contains("path=/tmp/x.sock"), "{detect}");
+        assert!(detect.contains("INFO"), "{detect}");
     }
 }
