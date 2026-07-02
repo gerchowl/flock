@@ -614,14 +614,10 @@ impl App {
             confirm_close: config.ui.confirm_close,
             confirm_close_whole_space: false,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
-            pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
-            switch_ascii_input_source_in_prefix: config
-                .experimental
-                .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
@@ -814,7 +810,7 @@ impl App {
             previous_mode == Mode::Prefix,
             self.state.mode == Mode::Prefix,
         ) {
-            (false, true) if self.state.switch_ascii_input_source_in_prefix => {
+            (false, true) if self.state.switch_ascii_input_source_in_prefix_enabled() => {
                 self.prefix_input_source.switch_to_ascii();
             }
             (true, false) => self.prefix_input_source.restore(),
@@ -1419,10 +1415,7 @@ impl App {
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
-            self.state.switch_ascii_input_source_in_prefix =
-                config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
-            self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();
             }
@@ -1751,7 +1744,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_switches_then_restores_when_enabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1773,7 +1769,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_is_noop_when_flag_disabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = false;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1793,7 +1792,10 @@ mod tests {
         // Simulates the already-ASCII / failed-switch case: switch reports no
         // change, and the later restore on leave must stay harmless.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::no_op();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1814,7 +1816,10 @@ mod tests {
         // `handle_key` itself — the sync must sit at the dispatch layer so any
         // event that exits prefix (here Esc) still restores the host source.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -2352,7 +2357,7 @@ mod tests {
             app.state.new_terminal_cwd,
             crate::config::NewTerminalCwdConfig::Home
         );
-        assert!(app.state.switch_ascii_input_source_in_prefix);
+        assert!(app.state.switch_ascii_input_source_in_prefix_enabled());
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -2790,12 +2795,12 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert!(!app.persist_pane_history);
-        assert!(!app.state.pane_history_persistence);
+        assert!(!app.state.pane_history_persistence_enabled());
 
         app.save_pane_history_persistence(true);
 
         assert!(app.persist_pane_history);
-        assert!(app.state.pane_history_persistence);
+        assert!(app.state.pane_history_persistence_enabled());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[experimental]"));
         assert!(content.contains("pane_history = true"));

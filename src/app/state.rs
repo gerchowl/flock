@@ -1907,7 +1907,6 @@ pub struct AppState {
     /// confirm for "Close group"; cleared on accept/cancel.
     pub confirm_close_whole_space: bool,
     pub prompt_new_tab_name: bool,
-    pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1917,11 +1916,6 @@ pub struct AppState {
     pub cjk_ime_agents: Vec<crate::detect::Agent>,
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
-    /// While prefix mode is active, switch the macOS host input source to an
-    /// ASCII-capable layout so prefix commands register as ASCII even when a
-    /// CJK IME is active. macOS only; a no-op elsewhere. See
-    /// `[experimental] switch_ascii_input_source_in_prefix`.
-    pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
@@ -2201,11 +2195,11 @@ impl AppState {
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
-        self.pane_history_persistence
+        self.config.experimental.pane_history
     }
 
     pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
-        self.switch_ascii_input_source_in_prefix
+        self.config.experimental.switch_ascii_input_source_in_prefix
     }
 
     pub(crate) fn integration_updates_available(&self) -> bool {
@@ -2497,12 +2491,10 @@ impl AppState {
             confirm_close: true,
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
-            pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
-            switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
@@ -2575,6 +2567,27 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn experiments_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): Experiments section reads state.config.experimental.
+        let mut state = AppState::test_new();
+        state.config.experimental.pane_history = true;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
+        assert!(ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+
+        state.config.experimental.pane_history = false;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
+        assert!(!ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(!ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+    }
 
     #[test]
     fn idle_settings_read_from_state_config_not_mirror_field() {

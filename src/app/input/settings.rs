@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn settings_experiments_toggles_pane_history() {
         let mut state = state_with_workspaces(&["test"]);
-        state.pane_history_persistence = false;
+        state.config.experimental.pane_history = false;
         open_settings_at(&mut state, SettingsSection::Experiments);
 
         let action = update_settings_state(
@@ -690,7 +690,10 @@ mod tests {
     #[test]
     fn settings_experiments_down_then_toggle_switches_ascii_input_source() {
         let mut state = state_with_workspaces(&["test"]);
-        state.switch_ascii_input_source_in_prefix = false;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
         open_settings_at(&mut state, SettingsSection::Experiments);
 
         update_settings_state(
@@ -933,7 +936,7 @@ mod tests {
     #[test]
     fn settings_mouse_click_toggles_pane_history() {
         let mut app = app_for_mouse_test();
-        app.state.pane_history_persistence = false;
+        app.state.config.experimental.pane_history = false;
         open_settings_at(&mut app.state, SettingsSection::Experiments);
 
         let area = app.state.settings_content_rect();
@@ -950,7 +953,10 @@ mod tests {
     #[test]
     fn settings_mouse_click_toggles_switch_ascii_input_source_row() {
         let mut app = app_for_mouse_test();
-        app.state.switch_ascii_input_source_in_prefix = false;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
         open_settings_at(&mut app.state, SettingsSection::Experiments);
 
         let area = app.state.settings_content_rect();
