@@ -108,6 +108,7 @@ async fn publish_state_changed_event(
     {
         warn!(
             pane = pane_id.raw(),
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             err = %e,
             "failed to deliver StateChanged event"
         );
@@ -896,6 +897,7 @@ fn shutdown_pane_processes(
     warn!(
         pane = pane_id.raw(),
         pid = child_pid,
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         pids = ?pids,
         "pane session still alive after forced shutdown"
     );
@@ -1045,6 +1047,7 @@ impl PaneRuntime {
         if let Err(err) = self.io.release_after_commit() {
             warn!(
                 pane = self.pane_id.raw(),
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 err = %err,
                 "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
             );
@@ -1063,6 +1066,7 @@ impl PaneRuntime {
         if let Err(err) = self.io.set_handoff_paused(paused) {
             warn!(
                 pane = self.pane_id.raw(),
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 err = %err,
                 paused,
                 "failed to update PTY actor handoff pause state"
@@ -1347,6 +1351,7 @@ impl PaneRuntime {
                     if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
                         warn!(
                             pane = pane_id.raw(),
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             err = %err,
                             "failed to queue OSC 52 clipboard write"
                         );
@@ -1420,6 +1425,7 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
 
         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
         // --- Child watcher task ---
@@ -1446,6 +1452,7 @@ impl PaneRuntime {
                 child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
                 }
             });
@@ -1480,6 +1487,7 @@ impl PaneRuntime {
                     if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
                         warn!(
                             pane = pane_id.raw(),
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             err = %err,
                             "failed to send OSC 52 clipboard write"
                         );
@@ -1683,17 +1691,22 @@ impl PaneRuntime {
                                 if let Some(process_name) = process_name {
                                     info!(
                                         pane = pane_id.raw(),
+                                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                                         previous_agent = ?previous_agent,
                                         ?agent,
+                                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                                         process = %process_name,
+                                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                                         pgid = ?process_group_id,
                                         "agent changed"
                                     );
                                 } else {
                                     info!(
                                         pane = pane_id.raw(),
+                                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                                         previous_agent = ?previous_agent,
                                         ?agent,
+                                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                                         pgid = ?process_group_id,
                                         "agent changed"
                                     );
@@ -2000,6 +2013,7 @@ impl PaneRuntime {
             return false;
         };
         if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, ?event, "failed to forward pane focus event");
         }
         true

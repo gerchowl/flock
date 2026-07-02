@@ -64,6 +64,7 @@ impl Config {
                         };
                     }
                     Err(err) => {
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         warn!(err = %err, "config parse error, using defaults");
                         return LoadedConfig {
                             config: Self::default(),
@@ -73,6 +74,7 @@ impl Config {
                     }
                 },
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(err = %err, "config read error, using defaults");
                     return LoadedConfig {
                         config: Self::default(),

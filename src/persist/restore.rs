@@ -485,6 +485,7 @@ fn restore_tab(
             saved_cwd
         } else {
             warn!(
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 cwd = %saved_cwd.display(),
                 "saved pane cwd does not exist, falling back to HOME"
             );
@@ -633,15 +634,19 @@ fn restore_tab(
                 if was_imported {
                     failed_imports += 1;
                     error!(
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         tab = ?snap.custom_name,
                         pane_id = id.raw(),
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         err = %e,
                         "failed to restore imported pane"
                     );
                 }
                 error!(
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     tab = ?snap.custom_name,
                     pane_id = id.raw(),
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     err = %e,
                     "failed to restore pane, skipping"
                 );
@@ -651,6 +656,7 @@ fn restore_tab(
 
     if panes.is_empty() {
         warn!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             tab = ?snap.custom_name,
             "no panes could be restored for tab, dropping it"
         );
@@ -660,6 +666,7 @@ fn restore_tab(
     let surviving: HashSet<PaneId> = panes.keys().copied().collect();
     let Some(node) = prune_restored_node(node, &surviving) else {
         warn!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             tab = ?snap.custom_name,
             "restored tab lost all panes after pruning missing layout nodes"
         );

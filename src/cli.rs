@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI dispatcher: usage/help/error text is the product surface"
+)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;

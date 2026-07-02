@@ -136,8 +136,10 @@ impl App {
 
         tracing::info!(
             ws_idx,
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             repo_root = %space.repo_root.display(),
             branch,
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             checkout_path = %checkout_path.display(),
             "opening worktree dialog"
         );
@@ -314,8 +316,10 @@ impl App {
             return;
         }
         tracing::info!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             workspace_id = %result.workspace_id,
             branch = result.branch.as_deref().unwrap_or("<detached>"),
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             gate = ?result.gate,
             "worktree kill merge gate resolved"
         );
@@ -657,9 +661,11 @@ impl App {
     ) {
         match result.result {
             Ok(()) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::info!(branch = %result.branch, "deleted local branch after worktree kill");
             }
             Err(message) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::warn!(branch = %result.branch, error = %message, "branch delete failed");
                 self.show_action_notice(format!(
                     "removed checkout, but failed to delete branch {}: {message}",
@@ -1023,8 +1029,11 @@ impl App {
             .parent()
             .map(std::path::Path::to_path_buf);
         tracing::info!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             repo_root = %create.source_repo_root.display(),
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             branch = %create.branch,
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             checkout_path = %create.checkout_path.display(),
             "starting git worktree add"
         );
@@ -1086,6 +1095,7 @@ impl App {
 
         let command =
             crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::info!(workspace_id = %remove.workspace_id, path = %remove.path.display(), force, "starting git worktree remove");
         let path = remove.path.clone();
         let workspace_id = remove.workspace_id.clone();
@@ -1111,6 +1121,7 @@ impl App {
 
         match result.result {
             Ok(()) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::info!(checkout_path = %create.checkout_path.display(), "git worktree add completed");
                 let path = create.checkout_path.clone();
                 let branch_name = create.branch.clone();
@@ -1185,6 +1196,7 @@ impl App {
                 self.render_notify.notify_one();
             }
             Err(message) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::warn!(checkout_path = %create.checkout_path.display(), error = %message, "git worktree add failed");
                 create.creating = false;
                 create.error = Some(message);
@@ -1203,6 +1215,7 @@ impl App {
 
         match result.result {
             Ok(()) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::info!(workspace_id = %result.workspace_id, path = %result.path.display(), "git worktree remove completed");
                 let removed_managed = self
                     .state
@@ -1263,6 +1276,7 @@ impl App {
                 self.render_notify.notify_one();
             }
             Err(message) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::warn!(workspace_id = %result.workspace_id, path = %result.path.display(), error = %message, "git worktree remove failed");
                 remove.removing = false;
                 if !remove.force_confirmation

@@ -99,23 +99,28 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
     match child.try_wait() {
         Ok(Some(status)) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             info!(pid, status = %status, "handoff import server exited during rollback");
             return;
         }
         Ok(None) => {}
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(pid, err = %err, "failed to inspect handoff import server before rollback");
         }
     }
 
     if let Err(err) = child.kill() {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         warn!(pid, err = %err, "failed to kill handoff import server during rollback");
     }
     match child.wait() {
         Ok(status) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             info!(pid, status = %status, "handoff import server reaped during rollback");
         }
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(pid, err = %err, "failed to reap handoff import server during rollback");
         }
     }
@@ -201,6 +206,7 @@ pub(crate) fn report_committed(stream: &mut UnixStream) -> io::Result<()> {
 #[cfg(unix)]
 pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
     if let Err(err) = stream.set_read_timeout(Some(OWNED_ACK_TIMEOUT)) {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         warn!(err = %err, "failed to set handoff ownership ack timeout");
         return;
     }
@@ -208,11 +214,13 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
         Ok(owned) if owned.trim_end() == "owned" => {}
         Ok(other) => {
             warn!(
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 response = %other.trim_end(),
                 "handoff import sent unexpected ownership ack after commit"
             );
         }
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "handoff import ownership ack was not received after commit");
         }
     }

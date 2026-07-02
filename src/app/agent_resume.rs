@@ -217,7 +217,9 @@ impl App {
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
             tracing::warn!(
                 pane = pane_id.raw(),
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 terminal = %terminal_id,
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 agent = %plan.agent,
                 "failed to start deferred agent resume with empty argv"
             );
@@ -240,8 +242,11 @@ impl App {
             Err(err) => {
                 tracing::warn!(
                     pane = pane_id.raw(),
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     terminal = %terminal_id,
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     agent = %plan.agent,
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     err = %err,
                     "failed to start shell for deferred agent resume"
                 );
@@ -257,8 +262,11 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
             tracing::warn!(
                 pane = pane_id.raw(),
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 terminal = %terminal_id,
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 agent = %plan.agent,
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 err = %err,
                 "failed to send deferred agent resume command to shell"
             );

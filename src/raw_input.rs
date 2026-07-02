@@ -140,6 +140,7 @@ impl RawInputFramer {
                     )));
                 }
                 extract_one_event(&chunk).map(|(event, _consumed)| {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     tracing::debug!(raw_bytes = ?chunk, event = ?event, "raw input event parsed");
                     event
                 })
@@ -217,6 +218,7 @@ impl RawInputByteFramer {
 
         if self.buffer.as_slice() == [ESC] {
             tracing::warn!(
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 bytes = ?self.buffer,
                 "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
             );
@@ -232,16 +234,19 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_utf8_char(&self.buffer) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             tracing::trace!(bytes = ?self.buffer, "waiting for UTF-8 continuation bytes");
             return chunks;
         }
 
         if self.buffer.first() == Some(&ESC) && starts_with_incomplete_utf8_char(&self.buffer[1..])
         {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             tracing::trace!(bytes = ?self.buffer, "waiting for escaped UTF-8 continuation bytes");
             return chunks;
         }
 
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
         self.buffer.clear();
         chunks
@@ -352,6 +357,7 @@ fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
         let Some((event, _consumed)) = extract_one_event(&bytes) else {
             continue;
         };
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::debug!(raw_bytes = ?bytes, event = ?event, "raw input event parsed");
         let _ = tx.blocking_send(event);
     }
@@ -478,6 +484,7 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             return Some((RawInputEvent::Key(key), seq_len));
         }
 
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::debug!(sequence = ?seq, "dropping unsupported escape sequence");
         return Some((RawInputEvent::Unsupported, seq_len));
     }

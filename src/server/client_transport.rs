@@ -168,6 +168,7 @@ pub(crate) fn handle_client_handshake(
             return Ok(());
         }
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             debug!(client_id, err = %err, "failed to read client hello");
             return Ok(());
         }
@@ -376,10 +377,12 @@ fn client_writer_loop(
 
 fn write_framed_bytes(stream: &mut UnixStream, data: &[u8]) -> bool {
     if let Err(err) = stream.write_all(data) {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         debug!(err = %err, "client write failed, closing writer");
         return false;
     }
     if let Err(err) = stream.flush() {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         debug!(err = %err, "client flush failed, closing writer");
         return false;
     }
@@ -413,6 +416,7 @@ fn client_read_loop(
                 break;
             }
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 debug!(client_id, err = %err, "client read error, closing");
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });

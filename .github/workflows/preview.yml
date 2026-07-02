@@ -1,3 +1,4 @@
+# guardrails-ok(ci-shim): host-bound: preview artifact build on platform runners
 name: Preview
 
 on:

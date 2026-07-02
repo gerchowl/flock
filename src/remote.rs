@@ -792,6 +792,10 @@ enum RemoteServerRestartReason {
     VersionMismatch,
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "remote-server readiness runs from the launcher shell before the TUI attaches — handoff failures and the fallback notice belong on the user's terminal, not in a not-yet-wired tracing sink"
+)]
 fn ensure_remote_server_ready(
     target: &str,
     remote_flock: &RemoteFlock,
@@ -869,6 +873,10 @@ fn protocol_mismatch_blurb(server_protocol: Option<u32>) -> String {
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "interactive confirmation before stopping a running remote server — prompt text and stderr flush must land on the launcher's terminal so the user can answer"
+)]
 fn confirm_remote_install_with_running_server(
     target: &str,
     remote_flock: &RemoteFlock,
@@ -1015,6 +1023,10 @@ fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatu
     })
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "interactive confirmation for restarting the remote server on protocol/version skew — prompt output must reach the user's stderr before tracing is wired up"
+)]
 fn confirm_remote_server_stop(
     target: &str,
     version: Option<&str>,
@@ -1104,6 +1116,10 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "surfaces the live-handoff success notice on the launcher's stderr so the user sees the reconnect happen"
+)]
 fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
     let command = format!(
         "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
@@ -1123,6 +1139,10 @@ fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::R
     Ok(())
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "surfaces the remote-server stop confirmation on the launcher's stderr so the user knows the restart window has opened"
+)]
 fn stop_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
     let command = format!("{} server stop", remote_flock.shell_path);
     let output = ssh_sh_output(target, &command)?;
@@ -1158,6 +1178,10 @@ fn version_label(version: Option<&str>) -> &str {
     version.unwrap_or("unknown")
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "installer warning about a $PATH shadow — user needs this on the launcher's stderr right after ssh install completes"
+)]
 fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
     let output = ssh_user_shell_output(target, "command -v flock")?;
     if output.status.success()
@@ -1323,6 +1347,10 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
     ))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "interactive confirmation prompt before installing the remote flock binary — must print to the launcher's stderr so the user can answer y/N"
+)]
 fn confirm_remote_install(
     target: &str,
     remote_flock: &RemoteFlock,
@@ -1530,6 +1558,10 @@ pub(crate) struct SshStdioBridge {
 }
 
 impl SshStdioBridge {
+    #[expect(
+        clippy::print_stderr,
+        reason = "bridge accept loop runs in a background thread with no tracing subscriber wired to the user's terminal — surface listener/accept failures on stderr so the launcher operator sees them"
+    )]
     fn start(
         target: String,
         remote_flock: RemoteFlock,
@@ -1545,6 +1577,7 @@ impl SshStdioBridge {
         let keepalive_ssh_config = if manage_ssh_config {
             write_keepalive_ssh_config()
                 .inspect_err(|err| {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     tracing::debug!(%err, "could not write ssh keepalive config; using plain ssh");
                 })
                 .ok()
@@ -2020,10 +2053,11 @@ mod tests {
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let socket = std::env::temp_dir().join(format!(
-            "flock-bridge-permissions-test-{}.sock",
-            std::process::id()
-        ));
+        // Bind under /tmp, not temp_dir(): TMPDIR under `nix develop` gains a
+        // nix-shell.XXXXXX segment that pushes the path past SUN_LEN (~104
+        // bytes on macOS) and the bind fails before permissions are checked.
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-bridge-perms-{}.sock", std::process::id()));
         let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",

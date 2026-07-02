@@ -311,6 +311,7 @@ impl HeadlessServer {
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         info!(path = %client_path.display(), "client protocol socket listening");
 
         // Set non-blocking on the listener so we can poll it from the event loop.
@@ -481,6 +482,7 @@ impl HeadlessServer {
 
             if let Some(cwd) = self.app.state.request_new_workspace_cwd.take() {
                 if let Err(err) = self.app.create_workspace_with_options(cwd, true) {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     error!(err = %err, "failed to create workspace at requested cwd");
                     self.app.state.mode = app::Mode::Navigate;
                 }
@@ -932,6 +934,7 @@ impl HeadlessServer {
             }
         };
         let child_pid = import_child.id();
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         info!(pid = child_pid, socket = %socket_path.display(), "spawned handoff import server");
 
         let mut fds = Vec::new();
@@ -1023,6 +1026,7 @@ impl HeadlessServer {
             if !pane_by_terminal.contains_key(&terminal_id) {
                 continue;
             }
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             debug!(terminal = %terminal_id, "preserving pane runtime for handoff");
             runtime.preserve_for_handoff();
         }
@@ -1332,6 +1336,7 @@ impl HeadlessServer {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.staged_clipboard_files.push(staged.path);
         }
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         info!(client_id, bytes = data.len(), path = %staged.paste_text, "staged client clipboard image");
         Ok(staged.paste_text)
     }
@@ -1345,6 +1350,7 @@ impl HeadlessServer {
             if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                 let payload = paste_payload_for_runtime(runtime, &path);
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
                 }
             }
@@ -1389,6 +1395,7 @@ impl HeadlessServer {
         if let Err(err) =
             apply_terminal_attach_scroll(runtime, source, direction, lines, column, row, modifiers)
         {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
         }
         true
@@ -1757,6 +1764,7 @@ impl HeadlessServer {
         let serialized = match Self::frame_server_message(&msg) {
             Ok(framed) => framed,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 warn!(err = %err, "failed to serialize message for clients");
                 return;
             }
@@ -1792,6 +1800,7 @@ impl HeadlessServer {
         let serialized = match Self::frame_server_message(&msg) {
             Ok(framed) => framed,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 warn!(client_id, err = %err, "failed to serialize message for client");
                 return false;
             }
@@ -1908,6 +1917,7 @@ impl HeadlessServer {
             self.promote_latest_remaining_client();
         }
 
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal attach client connected");
         self.terminal_attach_owners
             .insert(terminal_id.clone(), client_id);
@@ -2049,6 +2059,7 @@ impl HeadlessServer {
                 {
                     if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                         if let Err(err) = apply_terminal_attach_input(runtime, data) {
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             warn!(client_id, terminal_id = %terminal_id, err = %err);
                         }
                     }
@@ -2156,12 +2167,14 @@ impl HeadlessServer {
                 debug!(
                     client_id,
                     len = data.len(),
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     extension = %extension,
                     "client clipboard image received"
                 );
                 match self.write_client_clipboard_image(client_id, &extension, &data) {
                     Ok(path) => self.paste_client_clipboard_image_path(client_id, path),
                     Err(err) => {
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         warn!(client_id, err = %err, "failed to stage client clipboard image");
                         true
                     }
@@ -2404,6 +2417,7 @@ impl HeadlessServer {
             {
                 if let Some(toast) = &toast_after {
                     let msg_text = format!("{}: {}", toast.title, toast.context);
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     debug!(msg = %msg_text, "forwarding toast notification from API request");
                     self.send_to_foreground_client(ServerMessage::Notify {
                         kind: toast_notify_kind(self.app.state.toast_config.delivery)
@@ -2457,8 +2471,11 @@ impl HeadlessServer {
             debug!(
                 ws_idx,
                 pane_id = pane_id.raw(),
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 prev_state = ?prev_state,
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 new_state = ?new_state,
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 agent = ?agent,
                 "pane effective state changed during API request, checking notification"
             );
@@ -2521,6 +2538,7 @@ impl HeadlessServer {
                         crate::sound::Sound::Request => "agent attention",
                         crate::sound::Sound::AllClear => "attention clear",
                     };
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     debug!(sound = ?sound, "forwarding sound notification from API request");
                     self.send_to_foreground_client(ServerMessage::Notify {
                         kind: protocol::NotifyKind::Sound,
@@ -2543,6 +2561,7 @@ impl HeadlessServer {
         {
             Ok(framed) => framed,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 warn!(err = %err, "failed to serialize mouse capture mode for clients");
                 return;
             }
@@ -2749,6 +2768,7 @@ impl HeadlessServer {
                 return false;
             }
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 warn!(client_id, err = %err, "failed to serialize retained frame for client");
                 broken_clients.push(client_id);
                 crate::render_prof::event("retained_send_fallback.serialize_error");
@@ -2991,6 +3011,7 @@ impl HeadlessServer {
                     let framed = match Self::frame_server_message(text_only_prepared.message()) {
                         Ok(framed) => framed,
                         Err(err) => {
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             warn!(client_id, err = %err, "failed to serialize text-only frame for client");
                             broken_clients.push(client_id);
                             crate::render_prof::event("full_render.serialize_error");
@@ -3016,6 +3037,7 @@ impl HeadlessServer {
                     continue;
                 }
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(client_id, err = %err, "failed to serialize frame for client");
                     broken_clients.push(client_id);
                     crate::render_prof::event("full_render.serialize_error");
@@ -3067,6 +3089,7 @@ impl HeadlessServer {
             self.app.full_redraw_pending = false;
         }
         crate::render_prof::duration_since("full_render.total", full_started);
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
     }
 
@@ -3260,7 +3283,9 @@ impl HeadlessServer {
         {
             if err.kind() != io::ErrorKind::NotFound {
                 warn!(
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     path = %self.client_socket_path.display(),
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     err = %err,
                     "failed to remove client socket on shutdown"
                 );
@@ -3325,6 +3350,10 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Run the headless server. This is the entry point called from main.rs.
+#[expect(
+    clippy::print_stderr,
+    reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
+)]
 pub fn run_server() -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
@@ -3396,7 +3425,9 @@ pub fn run_server() -> io::Result<()> {
         };
 
         info!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             api_socket = %api::socket_path().display(),
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             client_socket = %client_socket_path().display(),
             "flock server started"
         );
@@ -3468,6 +3499,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "failed to report handoff ownership; continuing as owner");
         }
         info!("handoff import server started");
@@ -3506,6 +3538,10 @@ fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()
     Err(io::Error::other("live handoff is only supported on Unix"))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "headless server prints its socket paths on stderr for the launching process (and human operators) to parse when detaching"
+)]
 fn print_ready_message(api_socket: &Path, client_socket: &Path) {
     eprintln!("flock server running; you can use any flock CLI command in another terminal.");
     eprintln!("api socket: {}", api_socket.display());
@@ -3564,7 +3600,10 @@ mod tests {
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
 
-        let dir = std::env::temp_dir().join(format!(
+        // Bind under /tmp, not temp_dir(): TMPDIR under `nix develop` gains a
+        // nix-shell.XXXXXX segment that pushes the socket path past SUN_LEN
+        // (~104 bytes on macOS) and every test through this harness fails.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
             "hh-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

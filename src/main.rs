@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "pre-runtime + pre-TUI user messages on the process's own terminal"
+)]
 use std::io;
 
 use crossterm::event::{

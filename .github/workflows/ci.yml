@@ -1,3 +1,4 @@
+# guardrails-ok(ci-shim): host-bound: cargo-nextest with zig 0.15 + macos-15 SDK constraints; follow-up tracks folding into `nix flake check` (checks.gates already covers the gates)
 name: CI
 
 on:

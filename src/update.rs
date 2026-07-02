@@ -573,6 +573,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
                 "downloaded update checksum verification failed: {e}"
             ));
         }
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::info!(sha256 = %expected, "downloaded update checksum verified");
     }
 
@@ -910,6 +911,10 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
     Ok(options)
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "user-facing prompt on the controlling terminal during self-update — must reach stderr so the operator can approve stopping running sessions"
+)]
 fn prompt_to_stop_old_servers_before_update(
     plans: &[RunningServerUpdatePlan],
     release: &ReleaseInfo,
@@ -1024,6 +1029,10 @@ fn target_group_nouns(plans: &[&RunningServerUpdatePlan]) -> (&'static str, &'st
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "user-facing prompt on the controlling terminal during self-update — must reach stderr so the operator can approve stopping running sessions"
+)]
 fn prompt_to_complete_plain_update(
     decisions: &[RunningServerUpdateDecision],
     release: &ReleaseInfo,
@@ -1092,6 +1101,10 @@ fn mark_plain_update_stop_decisions(
         .collect()
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "prints the pre-update inventory of running sessions to the launcher's stderr so the user sees which targets will be touched"
+)]
 fn print_running_session_update_summary(
     plans: &[RunningServerUpdatePlan],
     release: &ReleaseInfo,
@@ -1165,6 +1178,10 @@ fn classify_failed_live_handoff_state_at(
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "post-failed-handoff prompt to the update operator on the controlling terminal — must reach stderr so the user can decide whether to stop the still-live old server"
+)]
 fn prompt_to_stop_old_server_after_failed_handoff(
     plan: &RunningServerUpdatePlan,
     release: &ReleaseInfo,
@@ -1213,6 +1230,10 @@ fn prompt_to_stop_old_server_after_failed_handoff(
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "recovery-path diagnostics for the self-update operator on the controlling terminal — explains what state the old server is in after a failed live handoff"
+)]
 fn recover_failed_live_handoff_for_update(
     plan: &RunningServerUpdatePlan,
     release: &ReleaseInfo,
@@ -1440,6 +1461,10 @@ fn wait_for_server_shutdown_at(socket_path: &Path, timeout: Duration) -> Result<
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "reports the running-server stop step to the update operator on the controlling terminal — tracing sinks aren't wired to their view here"
+)]
 fn stop_running_server_for_update(plan: &RunningServerUpdatePlan) -> Result<(), String> {
     eprintln!("stopping flock {} {}...", plan.target_noun(), plan.label());
     stop_server_via_api_at(plan.socket_path(), SERVER_STOP_RESPONSE_TIMEOUT)?;
@@ -1529,6 +1554,10 @@ fn apply_running_session_update_decisions(
     Ok(outcomes)
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "final self-update outcome summary — reconnect / stop / restart guidance goes on the launcher's stderr so the operator can act on it immediately"
+)]
 fn print_running_session_update_outcomes(
     outcomes: &[RunningSessionUpdateOutcome],
     release: &ReleaseInfo,
@@ -1842,6 +1871,10 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Manual self-update command (`flock update`).
+#[expect(
+    clippy::print_stderr,
+    reason = "user-facing progress on the controlling terminal during self-update — download / install / already-up-to-date lines belong on the operator's stderr"
+)]
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
     if is_homebrew_managed_install() {
@@ -1898,6 +1931,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         confirm_running_server_update_action(running_server_plans, &release, options)?;
 
     if let Some(commit) = &release.commit {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::info!(commit = %commit, build_id = ?release.build_id, "selected preview update build");
     }
     eprintln!("downloading {}...", release.label());

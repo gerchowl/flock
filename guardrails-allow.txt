@@ -1,0 +1,7 @@
+# no-hardcoded allowlist — one path PREFIX per line; matching files are exempt
+# wholesale. Reserved for categorical exemptions (generated code, vendored
+# trees) — intentional per-line values get inline `guardrails-ok` instead.
+#
+# Empty on purpose: the gate itself is not wired yet (658-value baseline, see
+# docs/DEBT.md) — it lands with the tunables-phase const_tunable!/config!
+# migration.

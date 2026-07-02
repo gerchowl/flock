@@ -545,6 +545,10 @@ fn should_terminate_runtime_dir(
     !runtime_dir_owner_alive(runtime_dir)
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "test watchdog runs in a background thread with no tracing subscriber attached — surface cleanup failures on stderr so they show up in cargo test output"
+)]
 fn start_global_watchdog() {
     thread::spawn(|| loop {
         thread::sleep(WATCHDOG_SCAN_INTERVAL);

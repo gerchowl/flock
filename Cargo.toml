@@ -17,6 +17,15 @@ include = ["src/**/*", "assets/sounds/*", "assets/web/**/*", "README.md", "LICEN
 name = "flock"
 path = "src/main.rs"
 
+# Compile-time print policing (pairs with the guardrails no-debug-leftovers text
+# gate): whole-module output surfaces carry `#![expect(...)]`, everything else is
+# per-fn — `#[expect]` is self-expiring, so a removed print surfaces as an
+# unfulfilled-expectation error instead of a stale allowlist entry.
+[lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
 [features]
 # `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
 # feature so axum/futures-util/rust-embed stay out of a default `flock` build.

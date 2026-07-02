@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "build script: eprintln! is the diagnostics channel (cargo:-directive println!s are lint-exempt)"
+)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
