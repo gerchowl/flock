@@ -38,7 +38,9 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
-crossterm = "0.29"
+# serde: KeyModifiers serializes inside RightClickPassthroughModifierConfig —
+# Config is Serialize end-to-end (KNOWN-keys drift guard; derived default config).
+crossterm = { version = "0.29", features = ["serde"] }
 ctrlc = { version = "3", features = ["termination"] }
 futures-util = { version = "0.3", optional = true }
 libc = "0.2"
