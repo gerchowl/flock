@@ -36,10 +36,9 @@ src/render_prof.rs:2
 src/platform/macos.rs:1
 src/config/io.rs:1
 src/app/mod.rs:1
-src/app/input/mod.rs:1
 src/app/actions.rs:1
 <!-- guardrails:derived:end -->
 
 <!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | cut -d: -f2 | paste -sd+ - | bc | xargs -I{} echo total: {} marker sites" -->
-total: 151 marker sites
+total: 150 marker sites
 <!-- guardrails:derived:end -->

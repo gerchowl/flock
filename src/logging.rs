@@ -1414,6 +1414,22 @@ pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
     );
 }
 
+// --- pane input family (logging redesign PR-5) -----------------------------
+// Mouse-driven pane interactions the app can't recover from cleanly. Opening
+// a URL is a WARN because the click had a visible target — the user expects
+// the browser to launch.
+
+pub(crate) fn pane_open_url_failed(url: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.open_url",
+        subsystem = "pane",
+        outcome = "error",
+        url,
+        err,
+        "failed to open pane URL"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -2342,5 +2358,14 @@ mod tests {
         assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
         assert!(out.contains("sequence="), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn pane_open_url_failed_is_warn_with_url_and_err() {
+        let out = capture_logs(|| pane_open_url_failed("https://example.test", "no browser"));
+        assert!(out.contains("event=\"pane.open_url\""), "{out}");
+        assert!(out.contains("url=\"https://example.test\""), "{out}");
+        assert!(out.contains("err=\"no browser\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
     }
 }
