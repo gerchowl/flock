@@ -1048,6 +1048,285 @@ pub(crate) fn handoff_owned_ack_read_failed(err: &str) {
     );
 }
 
+// --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
+
+pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
+    tracing::info!(
+        event = "server.start",
+        subsystem = "server",
+        outcome = "ok",
+        api_socket = %api_socket.display(),
+        client_socket = %client_socket.display(),
+        "flock server started"
+    );
+}
+
+pub(crate) fn server_client_socket_listening(path: &Path) {
+    tracing::info!(
+        event = "server.socket.listening",
+        subsystem = "server",
+        outcome = "ok",
+        path = %path.display(),
+        "client protocol socket listening"
+    );
+}
+
+pub(crate) fn server_client_socket_cleanup_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "server.socket.cleanup",
+        subsystem = "server",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "failed to remove client socket on shutdown"
+    );
+}
+
+// --- terminal_attach family (logging redesign PR-4) ------------------------
+// Direct-attach client connects to a specific terminal_id and drives it as if
+// it were a local pty. Per-input failures are WARN (recovered — the attach is
+// still alive) unless connection-level; connect is INFO (low-frequency
+// lifecycle).
+
+pub(crate) fn terminal_attach_connected(client_id: u64, terminal_id: &str, cols: u16, rows: u16) {
+    tracing::info!(
+        event = "terminal_attach.connected",
+        subsystem = "terminal_attach",
+        outcome = "ok",
+        client_id,
+        terminal_id,
+        cols,
+        rows,
+        "terminal attach client connected"
+    );
+}
+
+pub(crate) fn terminal_attach_input_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.input",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach input failed"
+    );
+}
+
+pub(crate) fn terminal_attach_paste_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.paste",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach clipboard image paste failed"
+    );
+}
+
+pub(crate) fn terminal_attach_scroll_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.scroll",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach scroll failed"
+    );
+}
+
+// --- clipboard family (logging redesign PR-4) ------------------------------
+// Client-forwarded clipboard images are staged to a disk file and then pasted
+// as a path token. Receive is DEBUG (per-input volume); stage completion is
+// INFO because the STAGED PATH is the answer to "where did the image go?".
+
+pub(crate) fn client_clipboard_image_received(client_id: u64, len: usize, extension: &str) {
+    tracing::debug!(
+        event = "clipboard.image.receive",
+        subsystem = "clipboard",
+        outcome = "ok",
+        client_id,
+        len,
+        extension,
+        "client clipboard image received"
+    );
+}
+
+pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: &str) {
+    tracing::info!(
+        event = "clipboard.image.stage",
+        subsystem = "clipboard",
+        outcome = "ok",
+        client_id,
+        bytes,
+        path,
+        "staged client clipboard image"
+    );
+}
+
+pub(crate) fn client_clipboard_image_stage_failed(client_id: u64, err: &str) {
+    tracing::warn!(
+        event = "clipboard.image.stage",
+        subsystem = "clipboard",
+        outcome = "error",
+        client_id,
+        err,
+        "failed to stage client clipboard image"
+    );
+}
+
+// --- frame_serialize family (logging redesign PR-4) ------------------------
+// Serialization is meant to be infallible — a WARN here means we dropped a
+// message and (for per-client) we're about to disconnect that client.
+// `kind` distinguishes the frame shape so the log tail explains which pipe
+// broke without hunting call sites: server_message / retained_frame /
+// text_only_frame / frame / mouse_capture_mode.
+
+pub(crate) fn frame_serialize_broadcast_failed(kind: &'static str, err: &str) {
+    let message = match kind {
+        "server_message" => "failed to serialize message for clients",
+        "mouse_capture_mode" => "failed to serialize mouse capture mode for clients",
+        _ => "failed to serialize broadcast frame for clients",
+    };
+    tracing::warn!(
+        event = "frame.serialize",
+        subsystem = "frame",
+        outcome = "error",
+        scope = "broadcast",
+        kind,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn frame_serialize_client_failed(client_id: u64, kind: &'static str, err: &str) {
+    let message = match kind {
+        "server_message" => "failed to serialize message for client",
+        "retained_frame" => "failed to serialize retained frame for client",
+        "text_only_frame" => "failed to serialize text-only frame for client",
+        _ => "failed to serialize frame for client",
+    };
+    tracing::warn!(
+        event = "frame.serialize",
+        subsystem = "frame",
+        outcome = "error",
+        scope = "client",
+        client_id,
+        kind,
+        err,
+        "{message}"
+    );
+}
+
+// --- workspace family (logging redesign PR-4) ------------------------------
+// Creating a workspace at a requested cwd is a user-visible failure — the
+// caller falls back to Navigate mode, but the tail needs the reason.
+
+pub(crate) fn workspace_create_at_cwd_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        err,
+        "failed to create workspace at requested cwd"
+    );
+}
+
+// --- handoff family (rest of the family, logging redesign PR-4) ------------
+
+pub(crate) fn handoff_import_spawned(pid: u32, socket: &Path) {
+    tracing::info!(
+        event = "handoff.import.spawn",
+        subsystem = "handoff",
+        outcome = "ok",
+        pid,
+        socket = %socket.display(),
+        "spawned handoff import server"
+    );
+}
+
+pub(crate) fn handoff_preserve_runtime(terminal_id: &str) {
+    tracing::debug!(
+        event = "handoff.preserve_runtime",
+        subsystem = "handoff",
+        outcome = "ok",
+        terminal_id,
+        "preserving pane runtime for handoff"
+    );
+}
+
+pub(crate) fn handoff_report_ownership_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.report",
+        subsystem = "handoff",
+        outcome = "error",
+        err,
+        "failed to report handoff ownership; continuing as owner"
+    );
+}
+
+// --- notification family (logging redesign PR-4) ---------------------------
+// Toast/sound notifications the SERVER forwards to the foreground client
+// (headless mode), plus the pane-state transition the toast may correlate to.
+// All DEBUG — high-frequency during interactive work, useful only when
+// debugging why a specific notification did / didn't fire.
+
+pub(crate) fn notification_toast_forwarded(message: &str) {
+    tracing::debug!(
+        event = "notification.toast.forward",
+        subsystem = "notification",
+        outcome = "ok",
+        msg = message,
+        "forwarding toast notification from API request"
+    );
+}
+
+pub(crate) fn notification_sound_forwarded(sound: &str) {
+    tracing::debug!(
+        event = "notification.sound.forward",
+        subsystem = "notification",
+        outcome = "ok",
+        sound,
+        "forwarding sound notification from API request"
+    );
+}
+
+pub(crate) fn pane_state_change_detected(
+    ws_idx: usize,
+    pane_id: u32,
+    prev_state: &str,
+    new_state: &str,
+    agent: &str,
+) {
+    tracing::debug!(
+        event = "pane.state.change",
+        subsystem = "notification",
+        outcome = "detected",
+        ws_idx,
+        pane_id,
+        prev_state,
+        new_state,
+        agent,
+        "pane effective state changed during API request, checking notification"
+    );
+}
+
+// --- render family (logging redesign PR-4) ---------------------------------
+
+pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: Option<u64>) {
+    tracing::debug!(
+        event = "render.virtual_frame",
+        subsystem = "render",
+        outcome = "ok",
+        cols,
+        rows,
+        foreground_client_id,
+        "rendered virtual frame(s)"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -1705,5 +1984,205 @@ mod tests {
         let read = capture_logs(|| handoff_owned_ack_read_failed("EPIPE"));
         assert!(read.contains("stage=\"read\""), "{read}");
         assert!(read.contains("WARN"), "{read}");
+    }
+
+    // ------ logging redesign PR-4: headless-family fns ---------------------
+
+    #[test]
+    fn server_started_names_both_sockets_at_info() {
+        let out = capture_logs(|| {
+            server_started(
+                Path::new("/tmp/flock-api.sock"),
+                Path::new("/tmp/flock.sock"),
+            );
+        });
+        assert!(out.contains("event=\"server.start\""), "{out}");
+        assert!(out.contains("subsystem=\"server\""), "{out}");
+        assert!(out.contains("api_socket=/tmp/flock-api.sock"), "{out}");
+        assert!(out.contains("client_socket=/tmp/flock.sock"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn server_client_socket_events_carry_path_and_correct_level() {
+        let listen = capture_logs(|| server_client_socket_listening(Path::new("/tmp/x.sock")));
+        assert!(
+            listen.contains("event=\"server.socket.listening\""),
+            "{listen}"
+        );
+        assert!(listen.contains("path=/tmp/x.sock"), "{listen}");
+        assert!(listen.contains("INFO"), "{listen}");
+
+        let cleanup = capture_logs(|| {
+            server_client_socket_cleanup_failed(Path::new("/tmp/x.sock"), "EACCES")
+        });
+        assert!(
+            cleanup.contains("event=\"server.socket.cleanup\""),
+            "{cleanup}"
+        );
+        assert!(cleanup.contains("path=/tmp/x.sock"), "{cleanup}");
+        assert!(cleanup.contains("err=\"EACCES\""), "{cleanup}");
+        assert!(cleanup.contains("WARN"), "{cleanup}");
+    }
+
+    #[test]
+    fn terminal_attach_connected_is_info_with_size_and_ids() {
+        let out = capture_logs(|| terminal_attach_connected(3, "term-1", 80, 24));
+        assert!(out.contains("event=\"terminal_attach.connected\""), "{out}");
+        assert!(out.contains("subsystem=\"terminal_attach\""), "{out}");
+        assert!(out.contains("client_id=3"), "{out}");
+        assert!(out.contains("terminal_id=\"term-1\""), "{out}");
+        assert!(out.contains("cols=80"), "{out}");
+        assert!(out.contains("rows=24"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn terminal_attach_input_paste_scroll_failures_are_warn() {
+        let inp = capture_logs(|| terminal_attach_input_failed(3, "term-1", "closed"));
+        assert!(inp.contains("event=\"terminal_attach.input\""), "{inp}");
+        assert!(inp.contains("err=\"closed\""), "{inp}");
+        assert!(inp.contains("WARN"), "{inp}");
+
+        let paste = capture_logs(|| terminal_attach_paste_failed(3, "term-1", "boom"));
+        assert!(paste.contains("event=\"terminal_attach.paste\""), "{paste}");
+        assert!(paste.contains("WARN"), "{paste}");
+
+        let scroll = capture_logs(|| terminal_attach_scroll_failed(3, "term-1", "boom"));
+        assert!(
+            scroll.contains("event=\"terminal_attach.scroll\""),
+            "{scroll}"
+        );
+        assert!(scroll.contains("WARN"), "{scroll}");
+    }
+
+    #[test]
+    fn clipboard_receive_stage_and_stage_failure_shapes() {
+        let recv = capture_logs(|| client_clipboard_image_received(7, 4096, "png"));
+        assert!(recv.contains("event=\"clipboard.image.receive\""), "{recv}");
+        assert!(recv.contains("extension=\"png\""), "{recv}");
+        assert!(recv.contains("len=4096"), "{recv}");
+        assert!(recv.contains("DEBUG"), "{recv}");
+
+        let staged =
+            capture_logs(|| client_clipboard_image_staged(7, 4096, "/tmp/flock-clip-7.png"));
+        assert!(
+            staged.contains("event=\"clipboard.image.stage\""),
+            "{staged}"
+        );
+        assert!(
+            staged.contains("path=\"/tmp/flock-clip-7.png\""),
+            "{staged}"
+        );
+        assert!(staged.contains("bytes=4096"), "{staged}");
+        assert!(staged.contains("INFO"), "{staged}");
+
+        let fail = capture_logs(|| client_clipboard_image_stage_failed(7, "ENOSPC"));
+        assert!(fail.contains("event=\"clipboard.image.stage\""), "{fail}");
+        assert!(fail.contains("outcome=\"error\""), "{fail}");
+        assert!(fail.contains("WARN"), "{fail}");
+    }
+
+    #[test]
+    fn frame_serialize_broadcast_and_client_carry_kind() {
+        let b =
+            capture_logs(|| frame_serialize_broadcast_failed("server_message", "encoding failed"));
+        assert!(b.contains("event=\"frame.serialize\""), "{b}");
+        assert!(b.contains("scope=\"broadcast\""), "{b}");
+        assert!(b.contains("kind=\"server_message\""), "{b}");
+        assert!(b.contains("WARN"), "{b}");
+
+        let mouse = capture_logs(|| {
+            frame_serialize_broadcast_failed("mouse_capture_mode", "encoding failed")
+        });
+        assert!(mouse.contains("kind=\"mouse_capture_mode\""), "{mouse}");
+
+        let c =
+            capture_logs(|| frame_serialize_client_failed(7, "retained_frame", "encoding failed"));
+        assert!(c.contains("scope=\"client\""), "{c}");
+        assert!(c.contains("client_id=7"), "{c}");
+        assert!(c.contains("kind=\"retained_frame\""), "{c}");
+        assert!(c.contains("WARN"), "{c}");
+    }
+
+    #[test]
+    fn workspace_create_at_cwd_failed_is_error() {
+        let out = capture_logs(|| workspace_create_at_cwd_failed("no such directory"));
+        assert!(out.contains("event=\"workspace.create\""), "{out}");
+        assert!(out.contains("err=\"no such directory\""), "{out}");
+        assert!(out.contains("ERROR"), "{out}");
+    }
+
+    #[test]
+    fn handoff_import_spawned_is_info_with_pid_and_socket() {
+        let out =
+            capture_logs(|| handoff_import_spawned(4711, Path::new("/tmp/flock-handoff-1.sock")));
+        assert!(out.contains("event=\"handoff.import.spawn\""), "{out}");
+        assert!(out.contains("pid=4711"), "{out}");
+        assert!(out.contains("socket=/tmp/flock-handoff-1.sock"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn handoff_preserve_runtime_names_terminal_at_debug() {
+        let out = capture_logs(|| handoff_preserve_runtime("term-1"));
+        assert!(out.contains("event=\"handoff.preserve_runtime\""), "{out}");
+        assert!(out.contains("terminal_id=\"term-1\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn handoff_report_ownership_failed_is_warn() {
+        let out = capture_logs(|| handoff_report_ownership_failed("EPIPE"));
+        assert!(out.contains("event=\"handoff.ownership.report\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn notification_toast_and_sound_forwarded_are_debug() {
+        let toast = capture_logs(|| notification_toast_forwarded("agent finished: hello"));
+        assert!(
+            toast.contains("event=\"notification.toast.forward\""),
+            "{toast}"
+        );
+        assert!(toast.contains("msg=\"agent finished: hello\""), "{toast}");
+        assert!(toast.contains("DEBUG"), "{toast}");
+
+        let sound = capture_logs(|| notification_sound_forwarded("Done"));
+        assert!(
+            sound.contains("event=\"notification.sound.forward\""),
+            "{sound}"
+        );
+        assert!(sound.contains("sound=\"Done\""), "{sound}");
+        assert!(sound.contains("DEBUG"), "{sound}");
+    }
+
+    #[test]
+    fn pane_state_change_detected_carries_all_ids() {
+        let out =
+            capture_logs(|| pane_state_change_detected(2, 17, "Idle", "NeedsAttention", "claude"));
+        assert!(out.contains("event=\"pane.state.change\""), "{out}");
+        assert!(out.contains("ws_idx=2"), "{out}");
+        assert!(out.contains("pane_id=17"), "{out}");
+        assert!(out.contains("prev_state=\"Idle\""), "{out}");
+        assert!(out.contains("new_state=\"NeedsAttention\""), "{out}");
+        assert!(out.contains("agent=\"claude\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn render_virtual_frame_debug_shape() {
+        let with = capture_logs(|| render_virtual_frame(80, 24, Some(5)));
+        assert!(with.contains("event=\"render.virtual_frame\""), "{with}");
+        assert!(with.contains("cols=80"), "{with}");
+        assert!(with.contains("rows=24"), "{with}");
+        assert!(with.contains("foreground_client_id=5"), "{with}");
+        assert!(with.contains("DEBUG"), "{with}");
+
+        let without = capture_logs(|| render_virtual_frame(80, 24, None));
+        assert!(
+            without.contains("event=\"render.virtual_frame\""),
+            "{without}"
+        );
     }
 }
