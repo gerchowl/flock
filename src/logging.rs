@@ -1906,9 +1906,52 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
-// agent-resume family lands in the next commit alongside its callsite
-// migration in src/app/agent_resume.rs (dead-code -D warnings would fire
-// if the fns landed with no user).
+// --- agent-resume family (logging redesign PR-6) ---------------------------
+// The three deferred agent-resume paths (empty argv, shell spawn failure,
+// send-command failure) all reach tracing with %terminal_id / %plan.agent /
+// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
+// other module carries the raw Display fmt. Level stays WARN — a failed
+// resume drops the pane back to its non-resumed state, which is surfaced
+// to the user via the terminal.
+
+pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
+    tracing::warn!(
+        event = "agent_resume.start",
+        subsystem = "agent_resume",
+        outcome = "error",
+        reason = "empty_argv",
+        pane,
+        terminal,
+        agent,
+        "failed to start deferred agent resume with empty argv"
+    );
+}
+
+pub(crate) fn agent_resume_shell_spawn_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.spawn",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to start shell for deferred agent resume"
+    );
+}
+
+pub(crate) fn agent_resume_send_command_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.send",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to send deferred agent resume command to shell"
+    );
+}
 
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
@@ -3782,6 +3825,28 @@ mod tests {
         let pruned = capture_logs(|| session_restore_tab_pruned_empty("Some(\"work\")"));
         assert!(pruned.contains("reason=\"pruned_empty\""), "{pruned}");
         assert!(pruned.contains("WARN"), "{pruned}");
+    }
+
+    #[test]
+    fn agent_resume_family_events_split_by_stage() {
+        let empty = capture_logs(|| agent_resume_empty_argv(7, "term-1", "claude"));
+        assert!(empty.contains("event=\"agent_resume.start\""), "{empty}");
+        assert!(empty.contains("reason=\"empty_argv\""), "{empty}");
+        assert!(empty.contains("terminal=\"term-1\""), "{empty}");
+        assert!(empty.contains("agent=\"claude\""), "{empty}");
+        assert!(empty.contains("WARN"), "{empty}");
+
+        let spawn =
+            capture_logs(|| agent_resume_shell_spawn_failed(7, "term-1", "claude", "EACCES"));
+        assert!(spawn.contains("event=\"agent_resume.spawn\""), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("WARN"), "{spawn}");
+
+        let send =
+            capture_logs(|| agent_resume_send_command_failed(7, "term-1", "claude", "EPIPE"));
+        assert!(send.contains("event=\"agent_resume.send\""), "{send}");
+        assert!(send.contains("err=\"EPIPE\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
     }
 
     #[test]
