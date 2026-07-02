@@ -31,6 +31,13 @@ repos:
         entry: guardrails-no-commented-code
         language: system
         pass_filenames: true
+      # Deterministic, no escape hatch by design: a conflicted merge CAN be
+      # committed (git records it and `git status` is clean afterwards).
+      - id: no-conflict-markers
+        name: "no merge conflict markers"
+        entry: guardrails-no-conflict-markers
+        language: system
+        pass_filenames: true
 
       # --- hard gates ----------------------------------------------------------
       - id: gitleaks
