@@ -26,7 +26,7 @@ mod worktrees;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,13 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// Live-reload channel for the peer-summary poll cadence (#96): the
+    /// `peer-summary-tick` thread reads the latest `[gossip] poll_interval_secs`
+    /// each iteration, so `flock server reload-config` re-arms the loop.
+    pub(crate) gossip_poll_interval_secs: Arc<AtomicU64>,
+    /// Per-peer round-dispatch bookkeeping (#96): the overlap-safety guard
+    /// that keeps a slow ProxyJump peer from stacking concurrent SSH polls.
+    pub(crate) peer_poll_tracker: crate::peers::PeerPollTracker,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -293,23 +300,31 @@ impl App {
                 })
                 .expect("pr-state tick thread should spawn");
         }
+        // #96: the peer-summary tick reads the LIVE cadence from an
+        // atomically-shared `[gossip] poll_interval_secs` so `flock server
+        // reload-config` re-arms the loop without a restart. The round handler
+        // (in api.rs) is the overlap-safety point — a slow SSH cannot pile up
+        // even at very short intervals.
+        let gossip_poll_interval_secs = Arc::new(AtomicU64::new(
+            config.gossip.poll_interval().as_secs().max(1),
+        ));
         {
-            // Peer-summary poll tick: the shared event handler snapshots the
-            // configured [[peers]] and spawns the SSH fetch workers.
             let peer_tick_tx = event_tx.clone();
+            let interval_secs = gossip_poll_interval_secs.clone();
+            let initial_delay = config.gossip.initial_delay();
             std::thread::Builder::new()
                 .name("peer-summary-tick".into())
                 .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(
-                        crate::peers::PEER_POLL_INITIAL_DELAY_SECS,
-                    ));
+                    std::thread::sleep(initial_delay);
                     loop {
                         if peer_tick_tx.blocking_send(AppEvent::PeerPollDue).is_err() {
                             return;
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            crate::peers::PEER_POLL_INTERVAL_SECS,
-                        ));
+                        // Read live: apply_live_config publishes a new value
+                        // here on `flock server reload-config`, so the NEXT
+                        // sleep uses the fresh cadence.
+                        let secs = interval_secs.load(Ordering::Relaxed).max(1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
                 })
                 .expect("peer-summary tick thread should spawn");
@@ -701,6 +716,8 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
+            gossip_poll_interval_secs,
+            peer_poll_tracker: crate::peers::PeerPollTracker::new(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }
@@ -1275,6 +1292,20 @@ impl App {
         self.state.config.remote = config.remote.clone();
         self.state.config.slots = config.slots.clone();
         self.state.config.peers = config.peers.clone();
+        // #96: publish the live-reloaded gossip cadence to the poll-tick thread
+        // so `flock server reload-config` re-arms the loop without a restart.
+        // Diagnostics ride along via collect_diagnostics; consumers clamp via
+        // `poll_interval()` so an invalid `0` still produces a live cadence.
+        diagnostics.extend(config.gossip.diagnostics());
+        self.state.config.gossip = config.gossip;
+        self.gossip_poll_interval_secs.store(
+            config.gossip.poll_interval().as_secs().max(1),
+            Ordering::Relaxed,
+        );
+        // Drop tracker entries for peers no longer configured; surviving peers
+        // keep their in-flight lock (matches the overlap guard's intent).
+        self.peer_poll_tracker
+            .retain_only(config.peers.iter().map(|p| p.name.as_str()));
 
         if !invalid_section("keys") {
             match config.live_keybinds() {
@@ -4168,5 +4199,73 @@ last_pane = "prefix+tab"
             &input[events[1].start..events[1].start + events[1].len],
             b"a"
         );
+    }
+
+    #[test]
+    fn reload_config_rearms_gossip_poll_interval() {
+        // #96 acceptance: `flock server reload-config` picks up a changed
+        // [gossip] poll_interval_secs — the atomically-shared value the
+        // peer-summary tick reads must be updated by apply_live_config.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-gossip");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let app = test_app();
+        // Startup default matches the shipped const, publisher-side.
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            crate::peers::PEER_POLL_INTERVAL_SECS,
+            "default publisher value matches the shipped const"
+        );
+        drop(app);
+
+        // Reload with a shorter cadence; publisher picks it up.
+        std::fs::write(&path, "[gossip]\npoll_interval_secs = 2\n").unwrap();
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            2,
+            "reload must re-arm the tick"
+        );
+        assert_eq!(app.state.config.gossip.poll_interval_secs, 2);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_clamps_invalid_gossip_interval() {
+        // A diagnosed poll_interval_secs=0 still yields a live cadence (>=1s)
+        // so the tick loop never busy-spins with a 0-second sleep.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-gossip-invalid");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        std::fs::write(&path, "[gossip]\npoll_interval_secs = 0\n").unwrap();
+
+        let mut app = test_app();
+        let report = app.reload_config();
+        // Partial: the diagnostics ride along, but the section still applies
+        // (the publisher clamp keeps the tick loop alive).
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            1,
+            "invalid 0 clamps to 1s in the publisher"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("[gossip] poll_interval_secs")),
+            "diagnostic surfaced: {:?}",
+            report.diagnostics
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

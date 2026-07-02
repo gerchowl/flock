@@ -7,6 +7,7 @@ use super::{env, model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
+    "gossip",
     "keys",
     "onboarding",
     "name",
@@ -434,6 +435,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.web = section,
+    );
+    load_live_section(
+        &table,
+        "gossip",
+        "gossip config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.gossip = section,
     );
     validate_peers(&mut config.peers, &mut diagnostics);
 
@@ -1206,5 +1215,28 @@ mouse_capture = false
         let (updated, removed) = remove_keybinding_config_sections(content);
         assert!(!removed);
         assert_eq!(updated, content);
+    }
+
+    #[test]
+    fn gossip_section_survives_live_reload() {
+        // #96: adding [gossip] must (a) survive load_live_config without a
+        // drift warning and (b) land the values into config.gossip. The
+        // drift-guard test above (every_config_top_level_field_is_known) is
+        // the compile-time guarantee; this is the wiring test.
+        let loaded = load_live_config_from_str(
+            r#"
+[gossip]
+poll_interval_secs = 2
+stale_after_secs = 30
+"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.config.gossip.poll_interval_secs, 2);
+        assert_eq!(loaded.config.gossip.stale_after_secs, 30);
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "a known section must not warn: {:?}",
+            loaded.diagnostics
+        );
     }
 }

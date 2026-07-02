@@ -414,6 +414,7 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub slots: SlotsConfig,
     pub web: WebSectionConfig,
+    pub gossip: GossipConfig,
     pub peers: Vec<PeerConfig>,
 }
 
@@ -604,6 +605,112 @@ pub struct WorktreesConfig {
     pub branch_pivot_message: String,
 }
 
+/// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
+/// federated servers-band summaries. Every field defaults to the value the
+/// hardcoded const on `src/peers.rs` shipped with, so an absent `[gossip]`
+/// section preserves behaviour exactly. Bounds are validated via
+/// `diagnostics()`; consumers clamp through `poll_interval()` /
+/// `stale_after()` / `slow_threshold_ms()` so a diagnosed-invalid value
+/// still yields a sane duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GossipConfig {
+    /// Seconds between poll rounds. Minimum 1s (per-round dispatch is bounded
+    /// by the round handler's overlap guard — a slow peer never stacks
+    /// concurrent polls).
+    pub poll_interval_secs: u64,
+    /// Delay before the first poll fires after startup. Purely startup-scoped;
+    /// has no effect on reload.
+    pub initial_delay_secs: u64,
+    /// A peer whose last successful poll is older than this renders as stale.
+    /// Must be at least `poll_interval_secs`, else a round could never refresh
+    /// a peer before it goes stale.
+    pub stale_after_secs: u64,
+    /// Latency (ms) above which a peer renders "slow" (yellow dot).
+    pub slow_threshold_ms: u64,
+}
+
+impl Default for GossipConfig {
+    // The consts on peers.rs are the ONE source of truth for the shipped
+    // defaults — GossipConfig::default() reads them so both the sim path (the
+    // fleet-snapshot rendering, which still calls is_stale()/reachability())
+    // and the configured path resolve to the same numbers when [gossip] is
+    // absent.
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: crate::peers::PEER_POLL_INTERVAL_SECS,
+            initial_delay_secs: crate::peers::PEER_POLL_INITIAL_DELAY_SECS,
+            stale_after_secs: crate::peers::PEER_STALE_AFTER_SECS,
+            slow_threshold_ms: crate::peers::PEER_SLOW_LATENCY_MS,
+        }
+    }
+}
+
+impl GossipConfig {
+    /// Effective poll interval, clamped to `>= 1s` so a diagnosed-invalid `0`
+    /// still yields a live duration (matches the diagnostics-first contract).
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_interval_secs.max(1))
+    }
+
+    /// Effective initial delay. Any value is accepted (0 = poll immediately).
+    pub fn initial_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.initial_delay_secs)
+    }
+
+    /// Effective staleness threshold, clamped to `>= poll_interval()` so a
+    /// slow-poll fleet never chases its own tail (a peer that just polled
+    /// would otherwise be flagged stale before the next round fires).
+    pub fn stale_after(&self) -> std::time::Duration {
+        let floor = self.poll_interval_secs.max(1);
+        std::time::Duration::from_secs(self.stale_after_secs.max(floor))
+    }
+
+    /// Effective slow-latency threshold in milliseconds. Clamped `>= 1` — a
+    /// zero threshold would flag every peer as slow, defeating the signal.
+    pub fn slow_threshold_ms(&self) -> u64 {
+        self.slow_threshold_ms.max(1)
+    }
+
+    /// Resolve the effective poll interval for one peer: the per-peer override
+    /// (`[[peers]] poll_interval_secs`) when set and `>= 1`, else the global
+    /// `[gossip] poll_interval`. The clamp mirrors `poll_interval()` so a
+    /// diagnosed-invalid override still produces a live duration.
+    pub fn effective_poll_interval(&self, peer: &PeerConfig) -> std::time::Duration {
+        match peer.poll_interval_secs {
+            Some(secs) if secs >= 1 => std::time::Duration::from_secs(secs),
+            _ => self.poll_interval(),
+        }
+    }
+
+    /// Config diagnostics surfaced via the standard `collect_diagnostics`
+    /// path (matches `IdleConfig::diagnostics`): lower-bound + relative
+    /// sanity checks. Consumers clamp so the running fleet stays live.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.poll_interval_secs < 1 {
+            out.push(format!(
+                "[gossip] poll_interval_secs ({}) is less than 1; using 1s so poll rounds keep firing",
+                self.poll_interval_secs
+            ));
+        }
+        if self.stale_after_secs < self.poll_interval_secs.max(1) {
+            out.push(format!(
+                "[gossip] stale_after_secs ({}) is less than poll_interval_secs ({}); rows would age out before the next poll",
+                self.stale_after_secs,
+                self.poll_interval_secs.max(1)
+            ));
+        }
+        if self.slow_threshold_ms < 1 {
+            out.push(format!(
+                "[gossip] slow_threshold_ms ({}) is less than 1; every peer would render slow",
+                self.slow_threshold_ms
+            ));
+        }
+        out
+    }
+}
+
 /// A federated peer Flock server. Declared as `[[peers]]` entries. Peers are
 /// polled over SSH for a lightweight workspace/agent summary; their rows fold
 /// into the sidebar's project groups and selecting one switches the client to
@@ -618,6 +725,12 @@ pub struct PeerConfig {
     /// Command run on the peer to fetch its summary. The default wraps the
     /// flock CLI in a login shell so profile-managed PATHs (nix, brew) apply.
     pub summary_command: String,
+    /// Optional per-peer override for the summary poll cadence (#96). Unset
+    /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
+    /// back too — the round handler's overlap guard is the safety net, not a
+    /// license to pile polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
 }
 
 impl Default for PeerConfig {
@@ -626,6 +739,7 @@ impl Default for PeerConfig {
             name: String::new(),
             ssh: String::new(),
             summary_command: default_peer_summary_command().to_string(),
+            poll_interval_secs: None,
         }
     }
 }
@@ -1835,5 +1949,176 @@ scrollback_lines = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    // ---- [gossip] — federated-peer poll cadence (#96) ----
+
+    #[test]
+    fn gossip_defaults_match_shipped_consts() {
+        // The consts on peers.rs are the ONE source of truth for the shipped
+        // defaults; GossipConfig::default() MUST match them so an absent
+        // [gossip] section preserves today's behaviour exactly.
+        let gossip = GossipConfig::default();
+        assert_eq!(
+            gossip.poll_interval_secs,
+            crate::peers::PEER_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            gossip.initial_delay_secs,
+            crate::peers::PEER_POLL_INITIAL_DELAY_SECS
+        );
+        assert_eq!(gossip.stale_after_secs, crate::peers::PEER_STALE_AFTER_SECS);
+        assert_eq!(gossip.slow_threshold_ms, crate::peers::PEER_SLOW_LATENCY_MS);
+        // Default Config has [gossip] resolvable — a full defaults round-trip
+        // through TOML would otherwise fail (the drift-guard leans on this).
+        assert_eq!(Config::default().gossip, gossip);
+    }
+
+    #[test]
+    fn gossip_parses_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 2
+initial_delay_secs = 0
+stale_after_secs = 30
+slow_threshold_ms = 250
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.gossip.poll_interval_secs, 2);
+        assert_eq!(config.gossip.initial_delay_secs, 0);
+        assert_eq!(config.gossip.stale_after_secs, 30);
+        assert_eq!(config.gossip.slow_threshold_ms, 250);
+        assert_eq!(
+            config.gossip.poll_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        // Sane config produces no diagnostics.
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn gossip_diagnostics_flag_low_interval_and_stale_race() {
+        // poll_interval_secs=0 trips the lower-bound diagnostic. Consumers still
+        // get a live duration (clamped to 1s) — the diagnostic is the surface.
+        let bad: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 0
+stale_after_secs = 0
+slow_threshold_ms = 0
+"#,
+        )
+        .unwrap();
+        let diags = bad.collect_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("poll_interval_secs") && d.contains("less than 1")),
+            "{diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("slow_threshold_ms") && d.contains("less than 1")),
+            "{diags:?}"
+        );
+        // Clamps: consumers get sane durations even for the diagnosed values.
+        assert_eq!(
+            bad.gossip.poll_interval(),
+            std::time::Duration::from_secs(1)
+        );
+        assert!(bad.gossip.slow_threshold_ms() >= 1);
+
+        // stale_after_secs < poll_interval_secs races: rows age before refresh.
+        let race: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 15
+stale_after_secs = 5
+"#,
+        )
+        .unwrap();
+        let diags = race.collect_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("stale_after_secs")
+                    && d.contains("less than poll_interval_secs")),
+            "{diags:?}"
+        );
+        // The clamp still keeps the fleet from staleness-flapping.
+        assert!(race.gossip.stale_after() >= race.gossip.poll_interval());
+    }
+
+    #[test]
+    fn peer_config_poll_interval_override_wins_over_gossip_default() {
+        // A slow ProxyJump peer wants a gentler cadence; a LAN peer wants
+        // ~2s. Resolution: per-peer override, else global default.
+        let gossip = GossipConfig::default();
+        let default_peer = PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&default_peer),
+            gossip.poll_interval(),
+            "unset override falls back to global"
+        );
+
+        let fast = PeerConfig {
+            name: "lan".into(),
+            poll_interval_secs: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&fast),
+            std::time::Duration::from_secs(2),
+            "per-peer 2s override wins"
+        );
+
+        // A per-peer 0 (invalid) falls back to the global — same clamp shape
+        // as the top-level poll_interval() helper.
+        let zero = PeerConfig {
+            name: "bad".into(),
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&zero),
+            gossip.poll_interval()
+        );
+
+        // `effective_poll_interval` is the pure "next poll delay for this
+        // peer" helper the round handler consults; being pure means the
+        // scheduler's cadence choice can be exercised without a thread.
+        assert_eq!(
+            gossip.effective_poll_interval(&fast),
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn peer_config_parses_per_peer_override_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 2
+
+[[peers]]
+name = "eth"
+ssh = "eth-jump"
+poll_interval_secs = 60
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.gossip.poll_interval_secs, 2);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].poll_interval_secs, Some(60));
+        assert_eq!(
+            config.gossip.effective_poll_interval(&config.peers[0]),
+            std::time::Duration::from_secs(60)
+        );
     }
 }

@@ -160,8 +160,21 @@ impl App {
         }
 
         if let AppEvent::PeerPollDue = ev {
-            // One worker per peer: a hung host must not delay the others.
+            // #96: one worker per peer, gated by the per-peer overlap guard —
+            // a slow ProxyJump peer whose previous SSH fetch is still running
+            // is SKIPPED this round instead of stacking a concurrent poll.
+            // Per-peer `poll_interval_secs` overrides the global cadence for
+            // slow links.
+            let now = std::time::Instant::now();
+            let gossip = self.state.config.gossip;
             for peer in self.state.peers.clone() {
+                let effective = gossip.effective_poll_interval(&peer);
+                if !self
+                    .peer_poll_tracker
+                    .should_poll_now(&peer.name, now, effective)
+                {
+                    continue;
+                }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
                     let fetch = crate::peers::fetch_peer_summary(&peer);
@@ -172,6 +185,10 @@ impl App {
         }
 
         if let AppEvent::PeerSummaryFetched(fetch) = ev {
+            // #96: release the in-flight lock BEFORE we early-return on an
+            // unknown peer — otherwise a peer removed mid-flight would be
+            // frozen out even if it's re-added by a later config reload.
+            self.peer_poll_tracker.mark_finished(&fetch.peer);
             let Some(summary) = self
                 .state
                 .peer_summaries
