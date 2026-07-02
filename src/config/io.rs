@@ -9,9 +9,11 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "experimental",
     "keys",
     "onboarding",
+    "name",
     "peers",
     "remote",
     "session",
+    "slots",
     "terminal",
     "theme",
     "ui",
@@ -399,6 +401,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.peers = section,
+    );
+    load_live_section(
+        &table,
+        "slots",
+        "slots config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.slots = section,
     );
     validate_peers(&mut config.peers, &mut diagnostics);
 
@@ -1060,6 +1070,44 @@ mouse_capture = false
                 .iter()
                 .any(|d| d.contains("config.local.toml")),
             "expected overlay diagnostic at startup, got {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn every_config_top_level_field_is_known() {
+        // Drift guard (ADR-0002 phase c): every top-level Config field must be
+        // in KNOWN_TOP_LEVEL_CONFIG_KEYS, or a DEFAULT config would trip the
+        // "unknown config section" diagnostic. This failed for `slots` and
+        // `name` when the list was hand-kept.
+        let table = toml::Value::try_from(Config::default()).unwrap();
+        let table = table.as_table().unwrap();
+        for key in table.keys() {
+            assert!(
+                KNOWN_TOP_LEVEL_CONFIG_KEYS.contains(&key.as_str()),
+                "Config field '{key}' is missing from KNOWN_TOP_LEVEL_CONFIG_KEYS \
+                 — add it there AND wire it into load_live_config_from_table"
+            );
+        }
+    }
+
+    #[test]
+    fn slots_section_survives_live_reload() {
+        // `[slots]` parsed at cold start but was silently DROPPED on live
+        // reload (not wired into load_live_config_from_table) and warned as an
+        // unknown section.
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-slots-live");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "[slots]\nenabled = true\nmax = 7\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
+        assert!(loaded.config.slots.enabled, "slots.enabled must survive");
+        assert_eq!(loaded.config.slots.max, 7, "slots.max must survive");
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "a known section must not warn: {:?}",
             loaded.diagnostics
         );
     }

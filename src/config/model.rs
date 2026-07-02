@@ -27,7 +27,7 @@ impl UpdateChannelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UpdateConfig {
     pub channel: UpdateChannelConfig,
@@ -94,7 +94,7 @@ impl PanelScopeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
 impl RightClickPassthroughModifierConfig {
@@ -147,7 +147,7 @@ fn parse_right_click_passthrough_modifier(value: &str) -> Option<Option<KeyModif
     (!modifiers.is_empty()).then_some(Some(modifiers))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToastConfig {
     pub delivery: ToastDelivery,
     pub delay_seconds: u64,
@@ -168,7 +168,7 @@ pub struct ClipboardToastConfig {
     pub position: ToastClipboardPosition,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub enum NewTerminalCwdConfig {
     #[default]
     Follow,
@@ -244,7 +244,7 @@ pub enum FileDropMode {
     Auto,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
@@ -255,7 +255,7 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
@@ -313,7 +313,7 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Friendly display name for THIS node (#42), shown on the local status
@@ -507,7 +507,7 @@ pub struct IndexedKeysConfig {
     pub agents: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorktreesConfig {
     /// Root directory under which Flock creates <repo>/<branch-slug> checkouts.
@@ -529,7 +529,7 @@ pub struct WorktreesConfig {
 /// polled over SSH for a lightweight workspace/agent summary; their rows fold
 /// into the sidebar's project groups and selecting one switches the client to
 /// that server.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PeerConfig {
     /// Short host badge shown on remote rows (e.g. "anvil"). Required.
@@ -648,7 +648,7 @@ impl IdleConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub sidebar_width: u16,
@@ -728,7 +728,7 @@ pub struct UiConfig {
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImeCursorShape {
     Block,
@@ -754,7 +754,7 @@ impl ImeCursorShape {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
@@ -762,7 +762,7 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     /// Add a keepalive fallback under the user's ssh config for the `--remote`
@@ -781,7 +781,7 @@ impl Default for RemoteConfig {
 /// Connection slots (#65): the multi-connection client warms one framed
 /// connection per fleet server in the background and flips between them in
 /// process on a switch, instead of exiting and relaunching an attach leg.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct SlotsConfig {
     /// Master switch for the slots client. Default false: the client keeps the
@@ -815,7 +815,7 @@ impl Default for SlotsConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Allow launching flock inside an existing flock pane. Default: false.

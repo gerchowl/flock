@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::detect::Agent;
 
 use super::io::resolve_config_relative_path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SoundConfig {
     pub enabled: bool,
@@ -25,7 +25,7 @@ pub struct SoundConfig {
     pub agents: AgentSoundOverrides,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentSoundOverrides {
     pub pi: AgentSoundSetting,
@@ -47,7 +47,7 @@ pub struct AgentSoundOverrides {
     pub qodercli: AgentSoundSetting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSoundSetting {
     #[default]
