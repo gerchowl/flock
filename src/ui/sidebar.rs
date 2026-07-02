@@ -44,6 +44,12 @@ pub(crate) struct AgentPanelEntry {
     pub server: String,
     pub project: Option<String>,
     pub target: String,
+    /// #102: the workspace's frozen `sort_family_key` (local rows) or a
+    /// stable fallback derived from the peer summary (remote rows). Used by
+    /// [`agent_panel_sort_key`] whenever `project` is None — pending-probe
+    /// rows keep their slot across probe resolution instead of jumping when
+    /// the resolved project key lands.
+    pub sort_family_key: String,
     /// `Some((peer, ws_idx))` for a REMOTE agent row — selecting it requests
     /// the same server switch the workspace row would. `None` for local panes.
     pub remote: Option<(crate::app::state::RemotePeerRef, usize)>,
@@ -227,6 +233,7 @@ fn agent_panel_entries_with_runtimes(
             };
             let project = ws.project_key().map(super::grammar::project_identity_label);
             let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+            let sort_family_key = ws.sort_family_key();
             // Current scope is local-by-definition (it follows the focused
             // local workspace); no remote rows fold in here.
             ws.pane_details(&app.terminals)
@@ -246,6 +253,7 @@ fn agent_panel_entries_with_runtimes(
                     server: local_server.clone(),
                     project: project.clone(),
                     target: target.clone(),
+                    sort_family_key: sort_family_key.clone(),
                     remote: None,
                 })
                 .collect()
@@ -260,6 +268,7 @@ fn agent_panel_entries_with_runtimes(
                     let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
                     let project = ws.project_key().map(super::grammar::project_identity_label);
                     let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+                    let sort_family_key = ws.sort_family_key();
                     let server = local_server.clone();
                     ws.pane_details(&app.terminals)
                         .into_iter()
@@ -278,6 +287,7 @@ fn agent_panel_entries_with_runtimes(
                             server: server.clone(),
                             project: project.clone(),
                             target: target.clone(),
+                            sort_family_key: sort_family_key.clone(),
                             remote: None,
                         })
                 })
@@ -320,11 +330,16 @@ fn agent_panel_entries_with_runtimes(
 /// the typical repo/branch alphabet.
 fn agent_panel_sort_key(entry: &AgentPanelEntry) -> (String, String, String) {
     (
+        // #102 pending-probe jump fix: fall back on the frozen
+        // `sort_family_key` (derived from immutable spawn state), not the
+        // display-name-derived `primary_label`, so a row keeps its slot when
+        // the git identity probe resolves. `sort_family_key` is already
+        // lowercased at construction.
         entry
             .project
             .clone()
-            .unwrap_or_else(|| entry.primary_label.clone())
-            .to_ascii_lowercase(),
+            .map(|project| project.to_ascii_lowercase())
+            .unwrap_or_else(|| entry.sort_family_key.clone()),
         entry.target.to_ascii_lowercase(),
         entry.server.to_ascii_lowercase(),
     )
@@ -356,6 +371,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                 continue;
             };
             let (state, seen) = super::status::remote_state(summary.status);
+            let sort_family_key = summary.workspace.to_ascii_lowercase();
             entries.push(AgentPanelEntry {
                 ws_idx,
                 tab_idx: 0,
@@ -375,6 +391,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                     .map(super::grammar::project_identity_label)
                     .or_else(|| summary.project_label.clone()),
                 target: super::grammar::remote_member_target(summary),
+                sort_family_key,
                 remote: Some((peer_ref.clone(), ws_idx)),
             });
         }
@@ -598,18 +615,21 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
     }
 }
 
-/// The spaces list, sectioned git-first by project (#33):
+/// The spaces list, one merged alphanumeric stream by lowercased project
+/// key (#102) — no trailing buckets:
 ///
 /// - Git workspaces group into project sections ([`AppState::project_section_keys`]):
 ///   the main checkout is the section's primary row, every other member
 ///   (linked worktrees AND plain same-repo checkouts) indents under it.
-///   Sections appear in workspace storage order of their first member.
+/// - Remote-only projects (federated peers with no matching local checkout)
+///   render as their own sections in the same stream, interleaved by the
+///   same lowercased key. Their leader row is unindented; members follow.
+/// - Resolved non-git workspaces (misc) interleave into the same stream
+///   under their frozen `sort_family_key`. No synthetic header row: like the
+///   project sections themselves, the section is its rows.
 /// - Workspaces whose git identity probe hasn't finished yet ("pending")
-///   hold their storage position as plain rows — they never flash into
-///   `misc` only to jump into a project section a sweep later.
-/// - Resolved non-git workspaces collect at the tail as the positional
-///   `misc` section (after remote-only project groups). No synthetic header
-///   row: like the project sections themselves, the section is its rows.
+///   hold their frozen `sort_family_key` slot (#102) — they never flash
+///   into misc, nor jump when the resolved project key lands.
 pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
     let section_keys = app.project_section_keys();
     let mut members_by_key = std::collections::HashMap::<&str, Vec<usize>>::new();
@@ -630,15 +650,17 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
     // Fleet-stable section order (#85): sections sort by their
     // machine-independent identity (project key, alphabetical), so the list
     // reads the same on every server. Members keep storage order within a
-    // section (stable sort by index); identity-less rows sort by name so
-    // pending probes hold a deterministic spot; misc still trails.
+    // section (stable sort by index); identity-less rows sort by the frozen
+    // `sort_family_key` (#102 pending-probe jump fix) so a pending row keeps
+    // its slot when the git probe resolves — the fallback is derived from
+    // the immutable `identity_cwd`, not the mutable display name.
     let sort_ids = app.project_section_sort_ids();
     let mut order: Vec<usize> = (0..app.workspaces.len()).collect();
     order.sort_by_cached_key(|&ws_idx| {
         (
             sort_ids[ws_idx]
                 .clone()
-                .unwrap_or_else(|| app.workspaces[ws_idx].display_name().to_ascii_lowercase()),
+                .unwrap_or_else(|| app.workspaces[ws_idx].sort_family_key()),
             ws_idx,
         )
     });

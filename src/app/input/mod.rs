@@ -477,7 +477,17 @@ fn state_with_workspaces(names: &[&str]) -> AppState {
     let mut state = AppState::test_new();
     state.workspaces = names
         .iter()
-        .map(|name| crate::workspace::Workspace::test_new(name))
+        .map(|name| {
+            let mut ws = crate::workspace::Workspace::test_new(name);
+            // Give each fixture workspace a unique `identity_cwd` matching
+            // its name so `sort_family_key` (frozen at spawn, basename-
+            // lowercased) discriminates rows — otherwise every test
+            // workspace collapses to the same current-dir basename and
+            // sort order depends only on ws_idx, hiding real ordering
+            // regressions and mirroring #102 pending-probe behaviour.
+            ws.identity_cwd = std::path::PathBuf::from(format!("/tmp/flock-test/{name}"));
+            ws
+        })
         .collect();
     if !state.workspaces.is_empty() {
         state.active = Some(0);

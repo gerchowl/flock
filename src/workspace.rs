@@ -922,6 +922,22 @@ impl Workspace {
             .map(|space| space.project_key.as_str())
     }
 
+    /// #102: a STABLE sort-family key frozen at spawn — the `identity_cwd`
+    /// basename lowercased. Used as the sort fallback while the git identity
+    /// probe hasn't yet resolved (before `cached_git_space` fills), so a
+    /// pending row keeps its slot in the spaces list across probe resolution
+    /// instead of jumping when the resolved project key replaces the
+    /// display-name fallback. `identity_cwd` is written once at construction
+    /// and never mutated afterwards, so the same call before and after the
+    /// probe returns the same string.
+    pub fn sort_family_key(&self) -> String {
+        self.identity_cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn refresh_git_ahead_behind(&mut self) {
         let cwd = self.resolved_identity_cwd();
@@ -1104,6 +1120,41 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #102: the pending-probe jump fix. `sort_family_key` is frozen at
+    /// spawn from `identity_cwd` — the SAME string before and after the git
+    /// identity probe finishes, so the fallback sort slot used by
+    /// `workspace_list_entries` does not shift under the workspace when
+    /// `cached_git_space` fills.
+    #[test]
+    fn sort_family_key_stays_stable_across_git_probe_resolution() {
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        ws.identity_cwd = std::path::PathBuf::from("/repo/gerchowl/Flock");
+        // Pending probe: `cached_git_space` is None, `git_identity_resolved`
+        // is false. This is the state where `project_section_sort_ids`
+        // yields None and the sort falls back to `sort_family_key`.
+        assert!(ws.git_identity_pending());
+        let before = ws.sort_family_key();
+        assert_eq!(before, "flock");
+
+        // Probe resolves: the workspace gains a full git identity with a
+        // very different project key (`github.com/gerchowl/flock`). Before
+        // #102, the fallback (`display_name().to_ascii_lowercase()`) is a
+        // string the probe never touched but that CAN drift with mutable
+        // state. The frozen key must not drift.
+        ws.cached_git_space = Some(GitSpaceMetadata {
+            key: "/repo/gerchowl/Flock/.git".into(),
+            checkout_key: "/repo/gerchowl/Flock".into(),
+            label: "Flock".into(),
+            repo_root: std::path::PathBuf::from("/repo/gerchowl/Flock"),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+        ws.git_identity_resolved = true;
+        assert!(!ws.git_identity_pending());
+        assert_eq!(ws.sort_family_key(), before);
+    }
 
     #[test]
     fn workspace_identity_follows_first_tab_root_pane_cwd() {
