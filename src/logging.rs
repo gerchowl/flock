@@ -1868,6 +1868,37 @@ pub(crate) fn client_system_notification_failed(err: &str) {
     );
 }
 
+// --- config family (logging redesign PR-6) ---------------------------------
+// Diagnostics collected during `Config::validated_keybinds` and `Config::load`
+// are all the same shape: one human-readable line describing which field was
+// invalid and how it was collapsed to a fallback. Fifteen keybinds sites
+// (parse errors, conflicts, reserved-keybind clashes, indexed-only ranges,
+// unsafe-direct printables) plus one config-load-defaults site all funnel
+// into these two facade fns so no other module carries a raw ?/% tracing
+// field for a config diagnostic. Level stays WARN — a diagnostic silently
+// disables a keybinding or falls back to defaults, and that's a user-visible
+// regression they'd want to notice in the log tail.
+
+pub(crate) fn config_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.diagnostic",
+        subsystem = "config",
+        outcome = "diagnostic",
+        diagnostic,
+        "config diagnostic"
+    );
+}
+
+pub(crate) fn config_load_defaults_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.load",
+        subsystem = "config",
+        outcome = "error",
+        diagnostic,
+        "config load error, using defaults"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -3084,5 +3115,33 @@ mod tests {
         let sys = capture_logs(|| client_system_notification_failed("EPIPE"));
         assert!(sys.contains("kind=\"system\""), "{sys}");
         assert!(sys.contains("WARN"), "{sys}");
+    }
+
+    #[test]
+    fn config_diagnostic_carries_the_diagnostic_at_warn() {
+        let out = capture_logs(|| {
+            config_diagnostic("invalid keybinding: keys.help = \"foo\"; disabling binding")
+        });
+        assert!(out.contains("event=\"config.diagnostic\""), "{out}");
+        assert!(out.contains("subsystem=\"config\""), "{out}");
+        assert!(out.contains("outcome=\"diagnostic\""), "{out}");
+        assert!(
+            out.contains("diagnostic=\"invalid keybinding: keys.help"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WARN"),
+            "config diagnostic must be WARN: {out}"
+        );
+    }
+
+    #[test]
+    fn config_load_defaults_diagnostic_is_warn_with_error_outcome() {
+        let out = capture_logs(|| config_load_defaults_diagnostic("bad toml at line 3"));
+        assert!(out.contains("event=\"config.load\""), "{out}");
+        assert!(out.contains("outcome=\"error\""), "{out}");
+        assert!(out.contains("diagnostic=\"bad toml at line 3\""), "{out}");
+        assert!(out.contains("config load error, using defaults"), "{out}");
+        assert!(out.contains("WARN"), "{out}");
     }
 }

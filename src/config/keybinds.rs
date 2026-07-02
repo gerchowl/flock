@@ -2,7 +2,6 @@
 use crossterm::event::KeyEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use super::Config;
 use crate::input::TerminalKey;
@@ -391,8 +390,7 @@ impl Config {
             (KeyCode::Char('b'), KeyModifiers::CONTROL),
         );
         if let Some(diag) = &prefix_diag {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(message = %diag, "config diagnostic");
+            crate::logging::config_diagnostic(diag);
         }
 
         let mut registry = BindingRegistry::new(prefix);
@@ -558,8 +556,7 @@ impl Config {
             if command.command.trim().is_empty() {
                 let diag =
                     format!("empty custom command: {command_field}; disabling custom command");
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
                 continue;
             }
@@ -647,8 +644,7 @@ fn parse_action_bindings_owned(
             }
             Some(ParsedBinding::Range(_)) if !allow_ranges => {
                 let diag = format!("range keybinding is only valid for indexed actions: {field} = {raw:?}; disabling binding");
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
             Some(ParsedBinding::Range(range)) => {
@@ -662,8 +658,7 @@ fn parse_action_bindings_owned(
             }
             None => {
                 let diag = format!("invalid keybinding: {field} = {raw:?}; disabling binding");
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
         }
@@ -693,14 +688,12 @@ fn parse_navigate_bindings(
             }
             Some(ParsedBinding::Range(_)) => {
                 let diag = format!("range keybinding is only valid for indexed actions: {field} = {raw:?}; disabling binding");
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
             None => {
                 let diag = format!("invalid keybinding: {field} = {raw:?}; disabling binding");
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
         }
@@ -728,8 +721,7 @@ fn parse_indexed_bindings(
                     "indexed keybinding must use 1..9: {field} = {:?}; disabling binding",
                     binding.label
                 );
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(message = %diag, "config diagnostic");
+                crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
                 None
             }
@@ -751,8 +743,7 @@ fn append_legacy_indexed_bindings(
         let diag = format!(
             "invalid indexed keybinding: {field} = {configured_label:?}; disabling binding"
         );
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return;
     };
@@ -788,8 +779,7 @@ fn reject_navigate_binding(
             "navigate keybinding must not include prefix: {field} = {:?}; disabling binding",
             binding.label
         );
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
@@ -799,16 +789,14 @@ fn reject_navigate_binding(
             "navigate keybinding cannot use esc: {field} = {:?}; disabling binding",
             binding.label
         );
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if let Some(first_field) = registry.conflict(binding) {
         let diag = format!("{}: kept {first_field}, disabled {field}", binding.label);
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
@@ -827,16 +815,14 @@ fn reject_binding(
             "reserved keybinding: {field} = {:?} uses keys.prefix as the prefix-mode key; pressing the prefix twice sends a literal prefix key, so this binding is disabled",
             binding.label
         );
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if let Some(first_field) = registry.conflict(binding) {
         let diag = format!("{}: kept {first_field}, disabled {field}", binding.label);
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
@@ -847,8 +833,7 @@ fn reject_binding(
             "unsafe direct keybinding: {field} = {:?} would intercept typing; use {:?} to require the prefix; disabling binding",
             binding.label, suggestion
         );
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(message = %diag, "config diagnostic");
+        crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
@@ -1097,8 +1082,7 @@ fn parse_key_combo_with_diagnostic(
         Some(binding) => (binding, None),
         None => {
             let diag = format!("invalid keybinding: {field} = {s:?}; using fallback");
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(message = %diag, "config diagnostic");
+            crate::logging::config_diagnostic(&diag);
             (fallback, Some(diag))
         }
     }
