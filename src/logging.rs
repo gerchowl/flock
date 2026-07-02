@@ -516,6 +516,165 @@ pub(crate) fn integration_action(
     );
 }
 
+// --- remote family (logging redesign PR-1) ---------------------------------
+// The failed-remote-connect story: every ssh probe, the resolved remote
+// binary, and the exact bridge command must be visible at the DEFAULT level —
+// they were invisible at ANY FLOCK_LOG level before this family existed.
+
+pub(crate) fn remote_bridge_started(
+    target: &str,
+    ssh_config_file: Option<&Path>,
+    ssh_opts: &[&str],
+    remote_command: &str,
+) {
+    tracing::info!(
+        event = "remote.bridge.started",
+        subsystem = "remote",
+        outcome = "started",
+        target,
+        ssh_config_file = ssh_config_file
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        ssh_opts = ssh_opts.join(","),
+        remote_command,
+        "ssh bridge starting"
+    );
+}
+
+pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
+    let status = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into());
+    if code == Some(0) {
+        tracing::debug!(
+            event = "remote.bridge.exited",
+            subsystem = "remote",
+            outcome = "ok",
+            target,
+            status,
+            "ssh bridge exited"
+        );
+    } else {
+        tracing::warn!(
+            event = "remote.bridge.exited",
+            subsystem = "remote",
+            outcome = "error",
+            target,
+            status,
+            "ssh bridge exited"
+        );
+    }
+}
+
+pub(crate) fn remote_bridge_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "remote.bridge.failed",
+        subsystem = "remote",
+        outcome = "error",
+        target,
+        err,
+        "ssh bridge connection failed"
+    );
+}
+
+pub(crate) fn remote_binary_resolved(
+    target: &str,
+    path: &str,
+    version: &str,
+    source: &'static str,
+) {
+    tracing::info!(
+        event = "remote.binary_resolved",
+        subsystem = "remote",
+        outcome = "ok",
+        target,
+        path,
+        version,
+        source,
+        "remote flock binary resolved"
+    );
+}
+
+pub(crate) fn remote_probe_result(target: &str, os: &str, arch: &str) {
+    tracing::info!(
+        event = "remote.probe.result",
+        subsystem = "remote",
+        outcome = "ok",
+        target,
+        os,
+        arch,
+        "remote platform probed"
+    );
+}
+
+pub(crate) fn remote_probe_failed(target: &str, stage: &'static str, err: &str) {
+    tracing::warn!(
+        event = "remote.probe.result",
+        subsystem = "remote",
+        outcome = "error",
+        target,
+        stage,
+        err,
+        "remote probe failed"
+    );
+}
+
+pub(crate) fn remote_install_started(target: &str, source_description: &str, dest: &str) {
+    tracing::info!(
+        event = "remote.install.start",
+        subsystem = "remote",
+        outcome = "started",
+        target,
+        source_description,
+        dest,
+        "remote install starting"
+    );
+}
+
+pub(crate) fn remote_install_completed(target: &str, dest: &str) {
+    tracing::info!(
+        event = "remote.install.complete",
+        subsystem = "remote",
+        outcome = "ok",
+        target,
+        dest,
+        "remote install complete"
+    );
+}
+
+pub(crate) fn remote_install_failed(target: &str, dest: &str, err: &str) {
+    tracing::error!(
+        event = "remote.install.complete",
+        subsystem = "remote",
+        outcome = "error",
+        target,
+        dest,
+        err,
+        "remote install failed"
+    );
+}
+
+pub(crate) fn remote_install_declined(target: &str, dest: &str) {
+    tracing::info!(
+        event = "remote.install.complete",
+        subsystem = "remote",
+        outcome = "declined",
+        target,
+        dest,
+        "remote install declined by user"
+    );
+}
+
+pub(crate) fn remote_ssh_keepalive_config_missing(err: &str) {
+    tracing::info!(
+        event = "remote.ssh_config",
+        subsystem = "remote",
+        outcome = "fallback",
+        err,
+        "could not write ssh keepalive config; using plain ssh"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -687,9 +846,126 @@ fn rotated_log_path(path: &Path, index: usize) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+/// Capture everything the facade emits on THIS thread as plain fmt text.
+/// Test-only, crate-wide: call-site modules assert their facade wiring with it.
+#[cfg(test)]
+pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    let sink = Sink::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = sink.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_bridge_started_logs_full_command_shape() {
+        let out = capture_logs(|| {
+            remote_bridge_started(
+                "host1",
+                Some(Path::new("/tmp/keepalive-cfg")),
+                &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
+                "exec \"$HOME/.local/bin/flock\" remote-client-bridge",
+            );
+        });
+        assert!(out.contains("event=\"remote.bridge.started\""), "{out}");
+        assert!(out.contains("subsystem=\"remote\""), "{out}");
+        assert!(out.contains("target=\"host1\""), "{out}");
+        assert!(
+            out.contains("ssh_config_file=\"/tmp/keepalive-cfg\""),
+            "{out}"
+        );
+        assert!(out.contains("BatchMode=yes"), "{out}");
+        assert!(
+            out.contains("exec \\\"$HOME/.local/bin/flock\\\" remote-client-bridge"),
+            "the full remote command must be visible at INFO: {out}"
+        );
+        assert!(out.contains("INFO"), "bridge start must be INFO: {out}");
+    }
+
+    #[test]
+    fn remote_bridge_exited_is_warn_on_nonzero_debug_on_zero() {
+        let ok = capture_logs(|| remote_bridge_exited("host1", Some(0)));
+        assert!(ok.contains("DEBUG"), "clean exit is debug noise: {ok}");
+        assert!(ok.contains("event=\"remote.bridge.exited\""), "{ok}");
+
+        let bad = capture_logs(|| remote_bridge_exited("host1", Some(3)));
+        assert!(bad.contains("WARN"), "failed exit must be WARN: {bad}");
+        assert!(bad.contains("status=\"3\""), "{bad}");
+
+        let signal = capture_logs(|| remote_bridge_exited("host1", None));
+        assert!(signal.contains("status=\"signal\""), "{signal}");
+        assert!(signal.contains("WARN"), "{signal}");
+    }
+
+    #[test]
+    fn remote_binary_resolved_names_path_version_and_source() {
+        let out = capture_logs(|| {
+            remote_binary_resolved("host1", "/usr/local/bin/flock", "flock 0.6.8", "path");
+        });
+        assert!(out.contains("event=\"remote.binary_resolved\""), "{out}");
+        assert!(out.contains("path=\"/usr/local/bin/flock\""), "{out}");
+        assert!(out.contains("version=\"flock 0.6.8\""), "{out}");
+        assert!(out.contains("source=\"path\""), "{out}");
+        assert!(
+            out.contains("INFO"),
+            "resolution is the wrong-path story — INFO: {out}"
+        );
+    }
+
+    #[test]
+    fn remote_probe_and_install_events_are_info_with_outcomes() {
+        let probe = capture_logs(|| remote_probe_result("host1", "linux", "x86_64"));
+        assert!(probe.contains("event=\"remote.probe.result\""), "{probe}");
+        assert!(probe.contains("os=\"linux\""), "{probe}");
+        assert!(probe.contains("arch=\"x86_64\""), "{probe}");
+        assert!(probe.contains("INFO"), "{probe}");
+
+        let started = capture_logs(|| {
+            remote_install_started("host1", "local binary", "$HOME/.local/bin/flock")
+        });
+        assert!(
+            started.contains("event=\"remote.install.start\""),
+            "{started}"
+        );
+
+        let failed = capture_logs(|| {
+            remote_install_failed("host1", "$HOME/.local/bin/flock", "ssh exited with 1")
+        });
+        assert!(
+            failed.contains("event=\"remote.install.complete\""),
+            "{failed}"
+        );
+        assert!(failed.contains("outcome=\"error\""), "{failed}");
+        assert!(failed.contains("ERROR"), "{failed}");
+    }
 
     fn temp_log_path(name: &str) -> PathBuf {
         let unique = format!(
