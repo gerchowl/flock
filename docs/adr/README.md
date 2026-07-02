@@ -11,6 +11,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | ADR | Title | Status |
 | --- | ----- | ------ |
 | [0001](0001-web-bridge-hosting-and-transport.md) | Web terminal bridge: hosting topology, transport, and gossip freshness | Accepted |
+| [0002](0002-twelve-factor-config.md) | Twelve-factor configuration: four layers, one write target, one live source | Proposed |
 
 ## Conventions
 
