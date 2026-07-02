@@ -262,6 +262,20 @@ impl App {
                     proxy_jump,
                 })
             }
+            PeerSwitchRequest::RelayedPeer { host_key } => {
+                let entry = self.state.relayed_fleet_cache.get(&host_key)?;
+                let ssh_target = entry.ssh_target.clone();
+                let label = entry.host.clone().unwrap_or_else(|| entry.name.clone());
+                let proxy_jump = entry.proxy_jump.clone();
+                let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
+                Some(PreparedServerSwitch {
+                    ssh_target,
+                    label,
+                    fleet,
+                    focus_workspace: None,
+                    proxy_jump,
+                })
+            }
             PeerSwitchRequest::OriginWorkspace { ws_idx } => {
                 // Land home (the spoke has no ssh route to the hub) with the
                 // selected origin workspace as the post-attach focus target.
