@@ -44,7 +44,13 @@ use serde::{Deserialize, Serialize};
 /// v21: `FleetPeer.protocol` (#58). The gossiped peer summary now carries the
 /// peer's wire protocol so a spoke can flag protocol skew in the sidebar, not
 /// just a semver mismatch. Additive field on a wire struct — deliberate bump.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// v22: `FleetPeer.origin_last_ok_secs` (#101 gossip v3, part 2). Staleness is
+/// now judged against the ORIGIN's report age — a FROZEN seconds-since-poll at
+/// capture time that does not accumulate the receiver's dwell clock. Kills the
+/// 60s-dwell ghost cliff on carried snapshot entries. Additive with
+/// `#[serde(default)]`; positional wire so a deliberate bump is required.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -156,6 +162,14 @@ pub struct FleetPeer {
     pub age_secs: Option<u64>,
     /// Last poll error the hub saw, if any.
     pub error: Option<String>,
+    /// Gossip v3 (#101 part 2): the ORIGIN's report age at capture, in seconds.
+    /// FROZEN semantic — the receiver does NOT accumulate its own dwell into
+    /// this value the way it does for `age_secs`; staleness is judged against
+    /// this field so a carried entry stays fresh as long as the origin's
+    /// assertion is fresh. Additive with `#[serde(default)]` so a v(N-1)
+    /// receiver falls back to the pre-v22 age-plus-dwell staleness path.
+    #[serde(default)]
+    pub origin_last_ok_secs: Option<u64>,
 }
 
 /// Bincode-safe mirror of `api::schema::PeerSystemSummary`. The schema type
@@ -1042,6 +1056,7 @@ mod tests {
                 }],
                 age_secs: Some(5),
                 error: None,
+                origin_last_ok_secs: Some(5),
             }],
             origin_summary: Some(Box::new(FleetPeer {
                 name: "mba22".to_owned(),
@@ -1070,6 +1085,7 @@ mod tests {
                 }],
                 age_secs: Some(0),
                 error: None,
+                origin_last_ok_secs: Some(0),
             })),
         }
     }
@@ -1619,7 +1635,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 21;
+    const PINNED_PROTOCOL_VERSION: u32 = 22;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1839,7 +1855,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x5b0104648107b9ea),
+            ("SwitchServer", 0x1c240aaca2be1b67),
         ];
 
         if actual.as_slice() != GOLDEN {

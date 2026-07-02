@@ -3825,6 +3825,7 @@ mod tests {
                 workspaces: Vec::new(),
                 age_secs: Some(4),
                 error: None,
+                origin_last_ok_secs: Some(4),
             }],
             origin_summary: None,
         };

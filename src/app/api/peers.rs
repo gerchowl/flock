@@ -35,18 +35,25 @@ impl App {
         self.state
             .peer_summaries
             .iter()
-            .map(|peer| RelayedFleetPeer {
-                name: peer.peer.clone(),
-                ssh_target: peer.ssh_target.clone(),
-                host: peer.host.clone(),
-                version: peer.version.clone(),
-                protocol: peer.protocol,
-                system: peer.system.clone(),
-                latency_ms: peer.latency_ms,
-                workspaces: peer.workspaces.clone(),
-                age_secs: peer.last_ok.map(|at| at.elapsed().as_secs()),
-                error: peer.error.clone(),
-                origin: origin.clone(),
+            .map(|peer| {
+                let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
+                RelayedFleetPeer {
+                    name: peer.peer.clone(),
+                    ssh_target: peer.ssh_target.clone(),
+                    host: peer.host.clone(),
+                    version: peer.version.clone(),
+                    protocol: peer.protocol,
+                    system: peer.system.clone(),
+                    latency_ms: peer.latency_ms,
+                    workspaces: peer.workspaces.clone(),
+                    age_secs,
+                    error: peer.error.clone(),
+                    origin: origin.clone(),
+                    // Gossip v3 (#101 part 2): we ARE the origin for our own
+                    // polled peers, so the origin's assertion is our
+                    // last-successful-poll age at emission time.
+                    origin_last_ok_secs: age_secs,
+                }
             })
             .collect()
     }
@@ -145,13 +152,16 @@ impl App {
                 .collect(),
             age_secs: Some(0),
             error: None,
+            // We ARE the origin for our own summary — stamped fresh at switch.
+            origin_last_ok_secs: Some(0),
         }
     }
 }
 
 /// Convert a relayed JSON peer entry into the bincode wire shape used by the
-/// down-gossip fleet snapshot (#101). New-in-#101 wire fields default cleanly
-/// so a v(N-1) receiver still parses this positional wire.
+/// down-gossip fleet snapshot (#101). Origin-honest freshness rides
+/// through unchanged so the receiver's staleness check reads the ORIGIN's
+/// assertion, not our dwell.
 fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer {
     crate::protocol::FleetPeer {
         name: entry.name.clone(),
@@ -164,6 +174,9 @@ fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer 
         workspaces: entry.workspaces.iter().cloned().map(Into::into).collect(),
         age_secs: entry.age_secs,
         error: entry.error.clone(),
+        // Prefer the explicit origin field; fall back to age_secs so a v(N-1)
+        // origin's implicit freshness assertion still rides the snapshot wire.
+        origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
     }
 }
 
@@ -508,6 +521,7 @@ mod tests {
             workspaces: Vec::new(),
             last_ok: Some(std::time::Instant::now()),
             error: None,
+            origin_last_ok_secs: None,
         }
     }
 
@@ -662,6 +676,7 @@ mod tests {
                 age_secs: Some(4),
                 error: None,
                 origin: "anvil".into(),
+                origin_last_ok_secs: Some(4),
             },
         );
 
@@ -712,6 +727,7 @@ mod tests {
                 age_secs: Some(3),
                 error: None,
                 origin: "anvil".into(),
+                origin_last_ok_secs: Some(3),
             },
         );
 
@@ -766,6 +782,7 @@ mod tests {
                         // This is us: an anvil that received our relay and
                         // echoed us as its own origin. Must be dropped.
                         origin: self_host.clone(),
+                        origin_last_ok_secs: Some(1),
                     }],
                 }),
             },

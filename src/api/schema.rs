@@ -1365,6 +1365,13 @@ pub struct RelayedFleetPeer {
     /// Short host name of the ORIGIN (the polling server). Loop prevention:
     /// receivers drop entries whose origin matches their own short host.
     pub origin: String,
+    /// Gossip v3 (#101 part 2): the origin's report age at relay-capture, in
+    /// seconds. FROZEN — the receiver uses it as-is for staleness judgement so
+    /// a carried entry stays fresh as long as the origin's assertion is fresh.
+    /// Additive with `#[serde(default)]` so a v(N-1) peer's relay entries
+    /// (never emitting this field) parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_last_ok_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -223,15 +223,22 @@ impl App {
                             // origin_summary path.
                             continue;
                         }
-                        // Freshest-wins: replace an older cached entry (by
-                        // age_secs) so a stale row cannot outlive a fresh one.
+                        // Freshest-wins: replace an older cached entry using
+                        // the origin's own assertion (`origin_last_ok_secs`,
+                        // #101 part 2) so cross-hub ties resolve honestly,
+                        // falling back to `age_secs` for a v(N-1) origin.
+                        let existing_freshness = |peer: &crate::api::schema::RelayedFleetPeer| {
+                            peer.origin_last_ok_secs.or(peer.age_secs)
+                        };
                         let insert = match self.state.relayed_fleet_cache.get(&host_key) {
-                            Some(existing) => match (existing.age_secs, entry.age_secs) {
-                                (Some(cur), Some(new)) => new <= cur,
-                                (None, Some(_)) => true,
-                                (Some(_), None) => false,
-                                (None, None) => true,
-                            },
+                            Some(existing) => {
+                                match (existing_freshness(existing), existing_freshness(&entry)) {
+                                    (Some(cur), Some(new)) => new <= cur,
+                                    (None, Some(_)) => true,
+                                    (Some(_), None) => false,
+                                    (None, None) => true,
+                                }
+                            }
                             None => true,
                         };
                         if insert {
