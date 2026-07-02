@@ -967,6 +967,87 @@ pub(crate) fn server_auto_detect_starting(path: &Path) {
     );
 }
 
+// --- handoff family: rollback + ownership ack (logging redesign PR-4) ------
+// Live handoff (#38) forks a fresh server and hands the current runtime to
+// it. The story the tail must answer: WHICH import server, WHICH phase, and
+// WHY did it stop? `phase` names the rollback step (exited/inspect/kill/
+// reaped/reap). Ownership-ack failures leave the OLD server as owner so the
+// clients don't get abandoned — WARN, not ERROR: recoverable degradation.
+
+pub(crate) fn handoff_import_rollback_exited(pid: u32, status: &str) {
+    tracing::info!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "ok",
+        phase = "exited",
+        pid,
+        status,
+        "handoff import server exited during rollback"
+    );
+}
+
+pub(crate) fn handoff_import_rollback_reaped(pid: u32, status: &str) {
+    tracing::info!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "ok",
+        phase = "reaped",
+        pid,
+        status,
+        "handoff import server reaped during rollback"
+    );
+}
+
+pub(crate) fn handoff_import_rollback_step_failed(pid: u32, phase: &'static str, err: &str) {
+    let message = match phase {
+        "inspect" => "failed to inspect handoff import server before rollback",
+        "kill" => "failed to kill handoff import server during rollback",
+        "reap" => "failed to reap handoff import server during rollback",
+        _ => "handoff import rollback step failed",
+    };
+    tracing::warn!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "error",
+        phase,
+        pid,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_setup_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "error",
+        stage = "timeout_setup",
+        err,
+        "failed to set handoff ownership ack timeout"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_unexpected(response: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "unexpected",
+        response,
+        "handoff import sent unexpected ownership ack after commit"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_read_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "error",
+        stage = "read",
+        err,
+        "handoff import ownership ack was not received after commit"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -1573,5 +1654,56 @@ mod tests {
         );
         assert!(detect.contains("path=/tmp/x.sock"), "{detect}");
         assert!(detect.contains("INFO"), "{detect}");
+    }
+
+    // ------ logging redesign PR-4: handoff rollback + ownership ack --------
+
+    #[test]
+    fn handoff_rollback_records_phase_and_status_or_err() {
+        let exited = capture_logs(|| handoff_import_rollback_exited(9, "exit code: 0"));
+        assert!(
+            exited.contains("event=\"handoff.import.rollback\""),
+            "{exited}"
+        );
+        assert!(exited.contains("phase=\"exited\""), "{exited}");
+        assert!(exited.contains("status=\"exit code: 0\""), "{exited}");
+        assert!(exited.contains("INFO"), "{exited}");
+
+        let reaped = capture_logs(|| handoff_import_rollback_reaped(9, "exit code: 0"));
+        assert!(reaped.contains("phase=\"reaped\""), "{reaped}");
+        assert!(reaped.contains("INFO"), "{reaped}");
+
+        let inspect = capture_logs(|| handoff_import_rollback_step_failed(9, "inspect", "ESRCH"));
+        assert!(inspect.contains("phase=\"inspect\""), "{inspect}");
+        assert!(inspect.contains("err=\"ESRCH\""), "{inspect}");
+        assert!(inspect.contains("WARN"), "{inspect}");
+
+        let kill = capture_logs(|| handoff_import_rollback_step_failed(9, "kill", "EPERM"));
+        assert!(kill.contains("phase=\"kill\""), "{kill}");
+        assert!(kill.contains("WARN"), "{kill}");
+
+        let reap = capture_logs(|| handoff_import_rollback_step_failed(9, "reap", "ECHILD"));
+        assert!(reap.contains("phase=\"reap\""), "{reap}");
+        assert!(reap.contains("WARN"), "{reap}");
+    }
+
+    #[test]
+    fn handoff_ownership_ack_family_stages() {
+        let setup = capture_logs(|| handoff_owned_ack_setup_failed("EINVAL"));
+        assert!(setup.contains("event=\"handoff.ownership.ack\""), "{setup}");
+        assert!(setup.contains("stage=\"timeout_setup\""), "{setup}");
+        assert!(setup.contains("WARN"), "{setup}");
+
+        let unexpected = capture_logs(|| handoff_owned_ack_unexpected("nope"));
+        assert!(
+            unexpected.contains("outcome=\"unexpected\""),
+            "{unexpected}"
+        );
+        assert!(unexpected.contains("response=\"nope\""), "{unexpected}");
+        assert!(unexpected.contains("WARN"), "{unexpected}");
+
+        let read = capture_logs(|| handoff_owned_ack_read_failed("EPIPE"));
+        assert!(read.contains("stage=\"read\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
     }
 }

@@ -16,7 +16,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use tracing::{info, warn};
+use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
@@ -99,29 +99,24 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
     match child.try_wait() {
         Ok(Some(status)) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            info!(pid, status = %status, "handoff import server exited during rollback");
+            crate::logging::handoff_import_rollback_exited(pid, &status.to_string());
             return;
         }
         Ok(None) => {}
         Err(err) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pid, err = %err, "failed to inspect handoff import server before rollback");
+            crate::logging::handoff_import_rollback_step_failed(pid, "inspect", &err.to_string());
         }
     }
 
     if let Err(err) = child.kill() {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(pid, err = %err, "failed to kill handoff import server during rollback");
+        crate::logging::handoff_import_rollback_step_failed(pid, "kill", &err.to_string());
     }
     match child.wait() {
         Ok(status) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            info!(pid, status = %status, "handoff import server reaped during rollback");
+            crate::logging::handoff_import_rollback_reaped(pid, &status.to_string());
         }
         Err(err) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pid, err = %err, "failed to reap handoff import server during rollback");
+            crate::logging::handoff_import_rollback_step_failed(pid, "reap", &err.to_string());
         }
     }
 }
@@ -206,22 +201,16 @@ pub(crate) fn report_committed(stream: &mut UnixStream) -> io::Result<()> {
 #[cfg(unix)]
 pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
     if let Err(err) = stream.set_read_timeout(Some(OWNED_ACK_TIMEOUT)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(err = %err, "failed to set handoff ownership ack timeout");
+        crate::logging::handoff_owned_ack_setup_failed(&err.to_string());
         return;
     }
     match read_line_unbuffered(&mut *stream) {
         Ok(owned) if owned.trim_end() == "owned" => {}
         Ok(other) => {
-            warn!(
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                response = %other.trim_end(),
-                "handoff import sent unexpected ownership ack after commit"
-            );
+            crate::logging::handoff_owned_ack_unexpected(other.trim_end());
         }
         Err(err) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(err = %err, "handoff import ownership ack was not received after commit");
+            crate::logging::handoff_owned_ack_read_failed(&err.to_string());
         }
     }
 }
