@@ -1777,6 +1777,14 @@ pub struct AppState {
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
+    /// Gossip v3 relay cache (#101): fleet entries this server received via
+    /// its config peers' `relayed_fleet`. Keyed on lowercased reported host
+    /// (fallback: ssh_target), so a host advertised by two hubs collapses to
+    /// one row with the freshest wins. Never re-relayed — the answering
+    /// server's own `peers.summary` only relays its OWN polled peers,
+    /// bounding hop count to one.
+    pub relayed_fleet_cache:
+        std::collections::HashMap<String, crate::api::schema::RelayedFleetPeer>,
     /// Fleet snapshot carried by the attached client's handshake
     /// (hub-and-spoke down-gossip): origin/home label + render-only peer
     /// rows. None when the client attached locally — no home row then.
@@ -2432,6 +2440,7 @@ impl AppState {
             branch_pivot_message: String::new(),
             peers: Vec::new(),
             peer_summaries: Vec::new(),
+            relayed_fleet_cache: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,

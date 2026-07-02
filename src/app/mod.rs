@@ -494,6 +494,7 @@ impl App {
                 .iter()
                 .map(crate::peers::PeerSummaryState::new)
                 .collect(),
+            relayed_fleet_cache: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,

@@ -318,6 +318,10 @@ pub struct PeerSummaryPayload {
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
     pub latency_ms: u64,
+    /// Gossip v3 relay: the peer's own polled peers, so the hub can render
+    /// two-hop fleet visibility. Empty when the peer is v(N-1) — additive
+    /// with a serde default keeps mixed-version fleets safe.
+    pub relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer>,
 }
 
 /// Result of one poll of one peer, sent back as an AppEvent.
@@ -544,6 +548,15 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .transpose()
         .map_err(|err| format!("summary workspaces parse error: {err}"))?
         .unwrap_or_default();
+    // Gossip v3 (#101): relayed_fleet is additive with a serde default so a
+    // v(N-1) peer that never emits the field parses cleanly.
+    let relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer> = result
+        .get("relayed_fleet")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| format!("summary relayed_fleet parse error: {err}"))?
+        .unwrap_or_default();
     Ok(PeerSummaryPayload {
         host,
         version,
@@ -551,6 +564,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         system,
         workspaces,
         latency_ms,
+        relayed_fleet,
     })
 }
 
@@ -728,6 +742,27 @@ Last login: whatever banner
         assert_eq!(payload.workspaces[0].status, AgentStatus::Blocked);
         assert_eq!(payload.workspaces[0].status_age_secs, Some(840));
         assert!(payload.workspaces[0].is_linked_worktree);
+    }
+
+    #[test]
+    fn parse_summary_response_reads_relayed_fleet() {
+        // Gossip v3 (#101): peers.summary carries relayed_fleet — one hop of
+        // the polling hub's own peers, so a spoke attaching to this hub sees
+        // the FULL fleet, not just this hub's direct rows.
+        let stdout = r#"{"id":"x","result":{"host":"hub","workspaces":[],"relayed_fleet":[{"name":"spoke2","ssh_target":"lars@spoke2","host":"spoke2","workspaces":[],"origin":"hub"}]}}"#;
+        let payload = parse_summary_response(stdout, 4).unwrap();
+        assert_eq!(payload.relayed_fleet.len(), 1);
+        assert_eq!(payload.relayed_fleet[0].name, "spoke2");
+        assert_eq!(payload.relayed_fleet[0].origin, "hub");
+    }
+
+    #[test]
+    fn parse_summary_response_treats_missing_relayed_fleet_as_empty() {
+        // Additive-with-default: a v(N-1) peer that never emits relayed_fleet
+        // parses cleanly and the merged cache stays empty.
+        let stdout = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        let payload = parse_summary_response(stdout, 5).unwrap();
+        assert!(payload.relayed_fleet.is_empty());
     }
 
     #[test]
