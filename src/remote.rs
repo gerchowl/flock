@@ -2053,10 +2053,11 @@ mod tests {
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let socket = std::env::temp_dir().join(format!(
-            "flock-bridge-permissions-test-{}.sock",
-            std::process::id()
-        ));
+        // Bind under /tmp, not temp_dir(): TMPDIR under `nix develop` gains a
+        // nix-shell.XXXXXX segment that pushes the path past SUN_LEN (~104
+        // bytes on macOS) and the bind fails before permissions are checked.
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-bridge-perms-{}.sock", std::process::id()));
         let remote_flock = RemoteFlock::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
