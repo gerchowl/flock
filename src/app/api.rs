@@ -223,15 +223,12 @@ impl App {
                     // Per-poll trace so a "peer row looks stale" report is
                     // diagnosable live (FLOCK_LOG=flock=debug + `flk peers
                     // logs`): shows exactly what each poll applied (#4, #67).
-                    tracing::debug!(
-                        target: "flock::peers",
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        peer = %summary.peer,
-                        host = summary.host.as_deref().unwrap_or(""),
-                        has_system = summary.system.is_some(),
-                        workspaces = summary.workspaces.len(),
-                        latency_ms = summary.latency_ms.unwrap_or_default(),
-                        "peer summary applied"
+                    crate::logging::peer_summary_applied(
+                        &summary.peer,
+                        summary.host.as_deref().unwrap_or(""),
+                        summary.system.is_some(),
+                        summary.workspaces.len(),
+                        summary.latency_ms.unwrap_or_default(),
                     );
                 }
                 Err(error) => summary.error = Some(error),
@@ -527,13 +524,7 @@ impl App {
         if matches!(report.status, crate::config::ConfigReloadStatus::Failed) {
             if let Ok(backup_content) = std::fs::read_to_string(&backup) {
                 if let Err(err) = std::fs::write(&target, backup_content) {
-                    tracing::warn!(
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        target = %target.display(),
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        err = %err,
-                        "config edit rollback write failed"
-                    );
+                    crate::logging::config_edit_rollback_write_failed(&target, &err.to_string());
                 }
             }
             // Re-apply the now-restored base so the running state is
@@ -595,13 +586,10 @@ impl App {
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                tracing::warn!(
-                    pane = pane_id.raw(),
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    terminal = %terminal_id,
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    err = %err,
-                    "failed to respawn shell after launch command exited"
+                crate::logging::pane_respawn_shell_failed(
+                    pane_id.raw(),
+                    &terminal_id.to_string(),
+                    &err.to_string(),
                 );
                 return false;
             }

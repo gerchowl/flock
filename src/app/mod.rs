@@ -906,8 +906,7 @@ impl App {
 
             if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
                 if let Err(err) = self.create_workspace_with_options(cwd, true) {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    tracing::error!(err = %err, "failed to create workspace at requested cwd");
+                    crate::logging::workspace_create_at_cwd_failed(&err.to_string());
                     self.state.mode = Mode::Navigate;
                 }
                 needs_render = true;

@@ -14,21 +14,23 @@ new code while the logging-redesign phase migrates the sites into named facade
 functions. This census tracks per-file marker counts so PRs can burn it down
 visibly.
 
+**Status (2026-07-02): migration complete.** The logging redesign (#87)
+landed the schema surface in `src/logging.rs` and burned the census down
+from 207 → 0 across PRs #104 / #106 / #108 / this-PR. Every runtime
+tracing site now flows through a named facade fn; the empty derived block
+below is the ratchet — if a future site slips a raw `?expr` / `%expr` in,
+the gate hard-fails and the census re-appears here for the next burn-down.
+
+The one remaining chunk of registered debt across the tree is the
+`no-hardcoded` gate's baseline (agent-detection braille-range literals,
+medallion block glyphs, agent-resume length caps, WCAG luminance
+coefficients); track those in a follow-up as we lift each cluster into
+a named constants module.
+
 <!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | sort -t: -k2 -rn" -->
-src/web/mod.rs:6
-src/pty/actor.rs:6
-src/app/api.rs:5
-src/api/server.rs:5
-src/kitty_graphics.rs:3
-src/app/creation.rs:3
-src/update.rs:2
-src/sound.rs:2
-src/render_prof.rs:2
-src/platform/macos.rs:1
-src/app/mod.rs:1
-src/app/actions.rs:1
+
 <!-- guardrails:derived:end -->
 
-<!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | cut -d: -f2 | paste -sd+ - | bc | xargs -I{} echo total: {} marker sites" -->
-total: 37 marker sites
+<!-- guardrails:derived cmd="git grep -c 'guardrails-ok(no-raw-trace-fields)' -- 'src/*.rs' 'src/**/*.rs' | grep -v ':0$' | cut -d: -f2 | paste -sd+ - | { read line; echo total: $((line + 0)) marker sites; }" -->
+total: 0 marker sites
 <!-- guardrails:derived:end -->
