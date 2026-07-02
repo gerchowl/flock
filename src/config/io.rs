@@ -48,46 +48,35 @@ pub fn state_dir() -> PathBuf {
 }
 
 impl Config {
+    /// Load the config for process start. ADR-0002 phase (b): a thin wrapper
+    /// over `load_live_config`, so cold start and live reload share ONE code
+    /// path, one precedence (base < overlay deep-merge), and one diagnostics
+    /// contract — previously the overlay only applied on reload, and a full
+    /// parse error dropped the WHOLE file to defaults where the live path
+    /// keeps every valid section.
     pub fn load() -> LoadedConfig {
-        let path = config_path();
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match toml::from_str::<Config>(&content) {
-                    Ok(config) => {
-                        let mut diagnostics =
-                            unknown_top_level_section_diagnostics_from_str(&content);
-                        diagnostics.extend(config.collect_diagnostics());
-                        return LoadedConfig {
-                            config,
-                            diagnostics,
-                            invalid_sections: Vec::new(),
-                        };
-                    }
-                    Err(err) => {
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        warn!(err = %err, "config parse error, using defaults");
-                        return LoadedConfig {
-                            config: Self::default(),
-                            diagnostics: vec![format!("config parse error: {err}; using defaults")],
-                            invalid_sections: Vec::new(),
-                        };
-                    }
-                },
-                Err(err) => {
+        match load_live_config() {
+            Ok(mut loaded) => {
+                // Field-level validation (keybinds, sound files, idle
+                // thresholds) belongs to the startup report; the live path
+                // leaves it to apply_live_config's own re-validation.
+                let field_diagnostics = loaded.config.collect_diagnostics();
+                loaded.diagnostics.extend(field_diagnostics);
+                loaded
+            }
+            Err(diagnostics) => {
+                // No running config exists at cold start, so the live path's
+                // keep-current contract collapses to defaults + diagnostics.
+                for diagnostic in &diagnostics {
                     // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    warn!(err = %err, "config read error, using defaults");
-                    return LoadedConfig {
-                        config: Self::default(),
-                        diagnostics: vec![format!("config read error: {err}; using defaults")],
-                        invalid_sections: Vec::new(),
-                    };
+                    warn!(diagnostic = %diagnostic, "config load error, using defaults");
+                }
+                LoadedConfig {
+                    config: Self::default(),
+                    diagnostics,
+                    invalid_sections: Vec::new(),
                 }
             }
-        }
-        LoadedConfig {
-            config: Self::default(),
-            diagnostics: Vec::new(),
-            invalid_sections: Vec::new(),
         }
     }
 }
@@ -441,15 +430,6 @@ fn validate_peers(
         }
         true
     });
-}
-
-fn unknown_top_level_section_diagnostics_from_str(content: &str) -> Vec<String> {
-    // toml 1.x: use the serde document parser (FromStr parses a single value,
-    // not a whole document).
-    toml::from_str::<toml::Value>(content)
-        .ok()
-        .and_then(|value| value.as_table().map(unknown_top_level_section_diagnostics))
-        .unwrap_or_default()
 }
 
 fn unknown_top_level_section_diagnostics(
@@ -1026,6 +1006,62 @@ mouse_capture = false
             None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
         }
         loaded
+    }
+
+    #[test]
+    fn startup_config_load_applies_overlay() {
+        // ADR-0002 phase (b): Config::load (cold start) previously read ONLY
+        // the base — a field set in config.local.toml worked after
+        // reload_config but not at startup. Startup and live reload must share
+        // one code path and one precedence.
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-startup-overlay");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();
+        std::fs::write(&overlay, "[ui]\nsidebar_row_gap = 9\n").unwrap();
+
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &base);
+        let loaded = Config::load();
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+
+        assert_eq!(
+            loaded.config.ui.sidebar_row_gap, 9,
+            "the overlay must win at COLD START, not only on live reload"
+        );
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn startup_config_load_reports_broken_overlay_but_keeps_base() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = unique_test_dir("flock-startup-overlay-bad");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 2\n").unwrap();
+        std::fs::write(&overlay, "this is not valid toml\n").unwrap();
+
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &base);
+        let loaded = Config::load();
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+
+        assert_eq!(loaded.config.ui.sidebar_row_gap, 2, "base survives");
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("config.local.toml")),
+            "expected overlay diagnostic at startup, got {:?}",
+            loaded.diagnostics
+        );
     }
 
     #[test]
