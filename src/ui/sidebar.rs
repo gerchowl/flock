@@ -999,11 +999,63 @@ pub(crate) fn remote_entry_label(
         .map(super::grammar::project_identity_label)
         .or_else(|| ws.project_label.clone())
         .unwrap_or_else(|| ws.workspace.clone());
+    let chip = remote_leader_same_repo_chip(app, ws.project_key.as_deref())
+        .map(|_| " \u{00b7} same repo?")
+        .unwrap_or_default();
     if remote_project_has_siblings(app, ws.project_key.as_deref(), peer_ref, ws_idx) {
-        project
+        format!("{project}{chip}")
     } else {
-        format!("{project} · {member}")
+        format!("{project}{chip} \u{00b7} {member}")
     }
+}
+
+/// #102 (d): the "same repo?" chip trigger. A remote-only leader row
+/// suffixes ` · same repo?` when a LOCAL project group exists whose
+/// display identity matches this remote's host + basename but whose
+/// full project key does NOT — i.e. the two projects APPEAR to be the
+/// same repo (same forge, same repo name) but their normalized keys
+/// diverged (GitHub rename, `insteadOf` misconfig, case-sensitive
+/// self-hosted forge with mixed-case checkout). The chip surfaces the
+/// mismatch honestly instead of the sidebar silently splitting them
+/// into two sections. Returns `Some(local_project_key)` when the chip
+/// should render, `None` otherwise.
+fn remote_leader_same_repo_chip<'a>(
+    app: &'a AppState,
+    remote_project_key: Option<&str>,
+) -> Option<&'a str> {
+    let remote_key = remote_project_key?;
+    let (remote_host, remote_basename) = split_host_basename(remote_key)?;
+    for ws in &app.workspaces {
+        let Some(local_key) = ws.project_key() else {
+            continue;
+        };
+        if local_key == remote_key {
+            // Keys already match — remote folds INTO the local block, no
+            // chip needed.
+            return None;
+        }
+        let Some((local_host, local_basename)) = split_host_basename(local_key) else {
+            continue;
+        };
+        if remote_host == local_host && remote_basename == local_basename {
+            return Some(local_key);
+        }
+    }
+    None
+}
+
+/// Split a project key into `(host, repo-basename)` for the chip
+/// heuristic. `github.com/gerchowl/flock` → `("github.com", "flock")`.
+/// `dir:foo` keys and single-segment keys return `None` — they have no
+/// host to compare against, so the chip cannot fire on them.
+fn split_host_basename(project_key: &str) -> Option<(&str, &str)> {
+    if project_key.starts_with("dir:") {
+        return None;
+    }
+    let mut segments = project_key.split('/').filter(|s| !s.is_empty());
+    let host = segments.next()?;
+    let basename = segments.next_back()?;
+    Some((host, basename))
 }
 
 /// Whether a remote-only project has MORE than the one row at `(peer_ref, ws_idx)` —
@@ -3937,6 +3989,92 @@ mod tests {
         assert_eq!(
             remote_entry_label(&app, &config_peer, 1, true),
             "sage:vm-dev"
+        );
+    }
+
+    /// #102 (d): the "same repo?" chip fires when a remote-only leader
+    /// shares host+basename with a local group but their full project
+    /// keys differ (GitHub rename case: local `gerchowl/dotfiles`,
+    /// remote `gerchowl/g-fleet`, both on `github.com`, both basename
+    /// `dotfiles` vs `g-fleet` — actually here basenames DIFFER, so
+    /// chip is silent). Trigger when basenames MATCH: local
+    /// `gerchowl/Flock` vs remote `gerchowl-forks/flock` on the SAME
+    /// forge — same basename, different owner path.
+    #[test]
+    fn same_repo_chip_fires_when_host_and_basename_match_but_keys_diverge() {
+        let mut app = crate::app::state::AppState::test_new();
+        // Local: `github.com/gerchowl/flock` — but the remote reports a
+        // DIFFERENT owner (or the local checkout still carries the pre-
+        // rename URL, or someone forked). Same host, same basename.
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "flock",
+                // Same host + basename but different owner → keys
+                // diverge, chip should fire.
+                Some("github.com/other-org/flock"),
+                Some("flock"),
+                None,
+            )],
+        )];
+
+        let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
+        let label = remote_entry_label(&app, &config_peer, 0, false);
+        assert!(
+            label.contains("same repo?"),
+            "expected chip in leader label, got {label:?}"
+        );
+
+        // Sanity: the chip is silent when the remote's project key
+        // MATCHES the local's — they fold together and there's nothing
+        // to explain.
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("main"),
+            )],
+        )];
+        // Now it's a matched-folded row (indented member of the local
+        // group), NOT a remote-only leader — no chip either way.
+        let entries = workspace_list_entries(&app);
+        let leader_label = entries
+            .iter()
+            .find_map(|entry| match entry {
+                WorkspaceListEntry::Remote {
+                    peer,
+                    ws_idx,
+                    indented,
+                } => Some(remote_entry_label(&app, peer, *ws_idx, *indented)),
+                _ => None,
+            })
+            .expect("at least one remote row");
+        assert!(
+            !leader_label.contains("same repo?"),
+            "matched key must not chip, got {leader_label:?}"
+        );
+
+        // Sanity: different basename → chip silent (the remote is just
+        // a different repo that happens to live on the same forge).
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "dotfiles",
+                Some("github.com/gerchowl/dotfiles"),
+                Some("dotfiles"),
+                None,
+            )],
+        )];
+        let dotfiles_label = remote_entry_label(&app, &config_peer, 0, false);
+        assert!(
+            !dotfiles_label.contains("same repo?"),
+            "different basename must not chip, got {dotfiles_label:?}"
         );
     }
 

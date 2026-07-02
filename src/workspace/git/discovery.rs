@@ -100,10 +100,85 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
 
 /// Machine-independent project key: normalized origin URL from the repo's
 /// git config, falling back to "dir:<label>" for origin-less repos.
+///
+/// #102 hardening:
+/// - Prefer `remote.origin.pushurl` when set (it's the fresher target,
+///   used for `git push`, and drifts ahead of `url` after a rename).
+/// - Apply `url.<base>.insteadOf` longest-prefix rewrites before
+///   normalization so `github:` shorthand and `git@corp:` mirrors fold
+///   under the same key as the canonical URL.
 pub fn project_key_for_common_dir(git_common_dir: &Path, label: &str) -> String {
-    read_git_config_subsection_value(&git_common_dir.join("config"), "remote", "origin", "url")
-        .map(|url| normalize_git_remote_url(&url))
+    let config_path = git_common_dir.join("config");
+    let origin_url = read_git_config_subsection_value(&config_path, "remote", "origin", "pushurl")
+        .or_else(|| read_git_config_subsection_value(&config_path, "remote", "origin", "url"));
+    origin_url
+        .map(|url| {
+            let rewrites = read_git_config_url_insteadof(&config_path);
+            let rewritten = apply_insteadof_longest_prefix(&url, &rewrites);
+            normalize_git_remote_url(&rewritten)
+        })
         .unwrap_or_else(|| format!("dir:{label}"))
+}
+
+/// Apply the longest-matching `url.<base>.insteadOf` rewrite from git
+/// config to a raw remote URL. Git's own semantics: when multiple
+/// `insteadOf` patterns match a URL as a prefix, the LONGEST pattern
+/// wins; the URL becomes `<base><rest-after-prefix>`.
+fn apply_insteadof_longest_prefix(url: &str, rewrites: &[(String, String)]) -> String {
+    let best = rewrites
+        .iter()
+        .filter(|(prefix, _)| url.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len());
+    match best {
+        Some((prefix, base)) => format!("{}{}", base, &url[prefix.len()..]),
+        None => url.to_string(),
+    }
+}
+
+/// Read every `[url "<base>"] insteadOf = <prefix>` mapping from the
+/// git config as `(prefix, base)` pairs. Multiple `insteadOf` values
+/// per base are allowed (a single base can absorb several prefixes).
+fn read_git_config_url_insteadof(config_path: &Path) -> Vec<(String, String)> {
+    let Ok(contents) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let mut rewrites = Vec::new();
+    let mut current_base: Option<String> = None;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+            let name = header.0.trim();
+            current_base = match name.split_once(char::is_whitespace) {
+                Some((base, rest)) if base.eq_ignore_ascii_case("url") => {
+                    // subsection is quoted: `"<value>"`.
+                    let subsection = rest
+                        .trim()
+                        .trim_start_matches('"')
+                        .trim_end_matches('"')
+                        .to_string();
+                    Some(subsection)
+                }
+                _ => None,
+            };
+            continue;
+        }
+        let Some(base) = current_base.as_deref() else {
+            continue;
+        };
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("insteadof") {
+            let prefix = strip_git_config_comment(value).trim().to_string();
+            if !prefix.is_empty() {
+                rewrites.push((prefix, base.to_string()));
+            }
+        }
+    }
+    rewrites
 }
 
 /// Normalize a git remote URL to a host/path identity that is stable across
@@ -140,11 +215,32 @@ fn normalize_git_host_path(host: &str, path: &str) -> String {
         .trim_matches('/')
         .trim_end_matches(".git")
         .trim_end_matches('/');
+    // #102: per-host path lowercasing for known case-insensitive forges.
+    // GitHub/GitLab.com/Bitbucket.org treat owner + repo names as
+    // case-insensitive at fetch time, so `Owner/Repo` and `owner/repo`
+    // are the same project — folding them into one key stops parallel
+    // sidebar sections. Self-hosted forges (GitLab CE at
+    // `gitlab.psi.ch`, Gitea, etc.) are case-SENSITIVE, so we keep
+    // their path case as-is — the existing GitLab.psi.ch test pins this
+    // behaviour.
+    let path = if host_is_case_insensitive(&host) {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_string()
+    };
     if path.is_empty() {
         host
     } else {
         format!("{host}/{path}")
     }
+}
+
+/// The narrow allowlist of forges whose owner/repo paths are
+/// case-insensitive: GitHub.com, Bitbucket.org, and GitLab.com (the
+/// hosted service — `gitlab.<company>` self-hosted instances stay
+/// case-sensitive; see the existing `gitlab.psi.ch` test).
+fn host_is_case_insensitive(host: &str) -> bool {
+    matches!(host, "github.com" | "gitlab.com" | "bitbucket.org")
 }
 
 pub(super) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
@@ -492,9 +588,15 @@ mod tests {
 
     #[test]
     fn normalize_git_remote_url_keeps_path_case_and_local_paths() {
+        // Self-hosted forge stays case-sensitive: `Group/MyRepo` and
+        // `group/myrepo` are two different projects there (#102 (a)).
         assert_eq!(
             normalize_git_remote_url("git@gitlab.psi.ch:Group/MyRepo.git"),
             "gitlab.psi.ch/Group/MyRepo"
+        );
+        assert_eq!(
+            normalize_git_remote_url("git@gitea.example.internal:Owner/Repo.git"),
+            "gitea.example.internal/Owner/Repo"
         );
         assert_eq!(
             normalize_git_remote_url("/srv/git/flock.git/"),
@@ -504,6 +606,76 @@ mod tests {
             normalize_git_remote_url("C:\\repos\\flock"),
             "C:\\repos\\flock"
         );
+    }
+
+    /// #102 (a): case-insensitive-forge path normalization. GitHub.com,
+    /// GitLab.com, and Bitbucket.org treat owner/repo names as
+    /// case-insensitive at fetch time, so a `gerchowl/Flock` remote and
+    /// a `gerchowl/flock` remote MUST fold to one project key.
+    #[test]
+    fn normalize_git_remote_url_lowercases_path_on_case_insensitive_hosts() {
+        for (url, expected) in [
+            (
+                "git@github.com:GerChowl/Flock.git",
+                "github.com/gerchowl/flock",
+            ),
+            (
+                "https://GitLab.com/GerChowl/Flock",
+                "gitlab.com/gerchowl/flock",
+            ),
+            (
+                "https://bitbucket.org/GerChowl/Flock.git",
+                "bitbucket.org/gerchowl/flock",
+            ),
+        ] {
+            assert_eq!(normalize_git_remote_url(url), expected, "url: {url}");
+        }
+    }
+
+    /// #102 (b): `url.<base>.insteadOf` rewrites apply BEFORE
+    /// normalization, longest-prefix wins. The GitHub-rename case: the
+    /// user set `url."https://github.com/gerchowl/g-fleet".insteadOf =
+    /// https://github.com/gerchowl/dotfiles` so old remotes still
+    /// resolve to the new project key.
+    #[test]
+    fn project_key_applies_url_insteadof_longest_prefix_before_normalization() {
+        let root = temp_test_dir("insteadof");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/gerchowl/dotfiles.git\n\
+             [url \"https://github.com/gerchowl/g-fleet\"]\n\tinsteadOf = https://github.com/gerchowl/dotfiles\n\
+             [url \"https://ignored.example/\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_key_for_common_dir(&git_dir, "dotfiles"),
+            "github.com/gerchowl/g-fleet",
+            "the longer insteadOf prefix wins"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// #102 (c): `remote.origin.pushurl` wins over `url` when both are
+    /// set — pushurl is the target `git push` uses and often drifts
+    /// ahead of `url` after a repo rename.
+    #[test]
+    fn project_key_prefers_pushurl_when_set() {
+        let root = temp_test_dir("pushurl");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/gerchowl/dotfiles.git\n\
+             \tpushurl = https://github.com/gerchowl/g-fleet.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_key_for_common_dir(&git_dir, "dotfiles"),
+            "github.com/gerchowl/g-fleet"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
