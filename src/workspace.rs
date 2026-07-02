@@ -906,7 +906,11 @@ impl Workspace {
 
     /// True while the workspace has no git identity AND no probe has
     /// finished — it may still turn out to be a git checkout. Distinct
-    /// from "resolved non-git", which files under `misc` (#33).
+    /// from "resolved non-git", which files under `misc` (#33). Kept as
+    /// an observable predicate for tests / diagnostics after #102 folded
+    /// pending and resolved-non-git rows into one merged-stream slot
+    /// keyed on the frozen `sort_family_key`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn git_identity_pending(&self) -> bool {
         !self.git_identity_resolved
             && self.worktree_space.is_none()
