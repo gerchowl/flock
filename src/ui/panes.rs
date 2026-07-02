@@ -311,9 +311,7 @@ pub(super) fn render_panes(
                 if let Some(title) = ws
                     .pane_state(info.id)
                     .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-                    .and_then(|terminal| {
-                        terminal.border_label(app.show_agent_labels_on_pane_borders)
-                    })
+                    .and_then(|terminal| terminal.border_label(app.agent_border_labels_enabled()))
                     .and_then(|label| pane_border_title(&label, info.rect.width))
                 {
                     block = block.title(Line::from(Span::styled(title, border_style)));

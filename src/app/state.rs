@@ -1907,7 +1907,6 @@ pub struct AppState {
     /// confirm for "Close group"; cleared on accept/cancel.
     pub confirm_close_whole_space: bool,
     pub prompt_new_tab_name: bool,
-    pub show_agent_labels_on_pane_borders: bool,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -2194,7 +2193,7 @@ impl AppState {
     }
 
     pub fn agent_border_labels_enabled(&self) -> bool {
-        self.show_agent_labels_on_pane_borders
+        self.config.ui.show_agent_labels_on_pane_borders
     }
 
     /// Whether dropped files are ferried to the agent (#79) — `auto`. The
@@ -2501,7 +2500,6 @@ impl AppState {
             confirm_close: true,
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
-            show_agent_labels_on_pane_borders: false,
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
@@ -2581,6 +2579,17 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn agent_border_labels_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): PaneLabels section reads state.config.ui.
+        let mut state = AppState::test_new();
+        state.config.ui.show_agent_labels_on_pane_borders = true;
+        assert!(state.agent_border_labels_enabled());
+
+        state.config.ui.show_agent_labels_on_pane_borders = false;
+        assert!(!state.agent_border_labels_enabled());
+    }
 
     #[test]
     fn toast_delivery_reads_from_state_config_not_mirror_field() {
