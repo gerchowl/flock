@@ -325,7 +325,7 @@ impl App {
     }
 
     fn agent_panel_has_animation(&self) -> bool {
-        match self.state.agent_panel_scope {
+        match self.state.agent_panel_scope() {
             crate::app::state::AgentPanelScope::CurrentWorkspace => self
                 .state
                 .active

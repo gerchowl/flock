@@ -226,9 +226,9 @@ impl App {
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
-        let previous_agent_panel_scope = self.state.agent_panel_scope;
-        let previous_servers_panel_scope = self.state.servers_panel_scope;
-        let previous_spaces_panel_scope = self.state.spaces_panel_scope;
+        let previous_agent_panel_scope = self.state.agent_panel_scope();
+        let previous_servers_panel_scope = self.state.servers_panel_scope();
+        let previous_spaces_panel_scope = self.state.spaces_panel_scope();
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
@@ -264,14 +264,14 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
-        if self.state.agent_panel_scope != previous_agent_panel_scope {
-            self.save_agent_panel_scope(self.state.agent_panel_scope);
+        if self.state.agent_panel_scope() != previous_agent_panel_scope {
+            self.save_agent_panel_scope(self.state.agent_panel_scope());
         }
-        if self.state.servers_panel_scope != previous_servers_panel_scope {
-            self.save_servers_panel_scope(self.state.servers_panel_scope);
+        if self.state.servers_panel_scope() != previous_servers_panel_scope {
+            self.save_servers_panel_scope(self.state.servers_panel_scope());
         }
-        if self.state.spaces_panel_scope != previous_spaces_panel_scope {
-            self.save_spaces_panel_scope(self.state.spaces_panel_scope);
+        if self.state.spaces_panel_scope() != previous_spaces_panel_scope {
+            self.save_spaces_panel_scope(self.state.spaces_panel_scope());
         }
 
         if let Some(content) = self.state.request_clipboard_write.take() {

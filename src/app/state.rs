@@ -1794,12 +1794,6 @@ pub struct AppState {
     /// Monotonic generation source for [`PeerCheckoutState`] — bumped per
     /// checkout so stale in-flight legs are discarded.
     pub peer_checkout_seq: u64,
-    /// Scope of the `servers` sidebar section: all server rows, or only the
-    /// current machine (plus the home row when attached remotely).
-    pub servers_panel_scope: PanelScope,
-    /// Scope of the `spaces` sidebar section: the full workspace list, or
-    /// only the focused workspace's space group.
-    pub spaces_panel_scope: PanelScope,
     /// Spaces list narrowed to one server (right-click a servers-band
     /// row). Never persisted — cleared via the same context menu or by
     /// toggling the spaces scope.
@@ -1893,7 +1887,6 @@ pub struct AppState {
     pub sidebar_collapsed: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
-    pub agent_panel_scope: AgentPanelScope,
     /// Capture mouse input for Flock's own mouse UI. When false, Flock only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
@@ -2071,9 +2064,9 @@ impl AppState {
     /// state, never persisted.
     pub(crate) fn panel_scopes(&self) -> PanelScopes {
         PanelScopes {
-            agent: self.agent_panel_scope,
-            servers: self.servers_panel_scope,
-            spaces: self.spaces_panel_scope,
+            agent: self.agent_panel_scope(),
+            servers: self.servers_panel_scope(),
+            spaces: self.spaces_panel_scope(),
         }
     }
 
@@ -2196,6 +2189,57 @@ impl AppState {
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
         self.config.experimental.pane_history
+    }
+
+    /// Agent-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn agent_panel_scope(&self) -> AgentPanelScope {
+        match self.config.ui.agent_panel_scope {
+            crate::config::PanelScopeConfig::Current => AgentPanelScope::CurrentWorkspace,
+            crate::config::PanelScopeConfig::All => AgentPanelScope::AllWorkspaces,
+        }
+    }
+
+    /// Servers-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn servers_panel_scope(&self) -> PanelScope {
+        match self.config.ui.servers_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Spaces-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn spaces_panel_scope(&self) -> PanelScope {
+        match self.config.ui.spaces_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Update the agent-panel scope in state.config so the accessor reflects
+    /// the new value immediately. The persisting save_* call still writes to
+    /// disk separately (ADR-0002 phase (f)).
+    pub fn set_agent_panel_scope(&mut self, scope: AgentPanelScope) {
+        self.config.ui.agent_panel_scope = match scope {
+            AgentPanelScope::CurrentWorkspace => crate::config::PanelScopeConfig::Current,
+            AgentPanelScope::AllWorkspaces => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_servers_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.servers_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_spaces_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.spaces_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
     }
 
     pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
@@ -2393,8 +2437,6 @@ impl AppState {
             request_peer_checkout: None,
             peer_checkout: None,
             peer_checkout_seq: 0,
-            servers_panel_scope: PanelScope::All,
-            spaces_panel_scope: PanelScope::All,
             server_filter: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
@@ -2482,7 +2524,6 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split: 0.5,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,
             right_click_passthrough_modifiers: None,
             right_click_passthrough: None,
@@ -2567,6 +2608,30 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn panel_scopes_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the sidebar's Agent/Servers/Spaces panel scope
+        // toggles read state.config.ui.<scope>_panel_scope.
+        let mut state = AppState::test_new();
+        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.servers_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.spaces_panel_scope = crate::config::PanelScopeConfig::Current;
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::CurrentWorkspace);
+        assert_eq!(state.servers_panel_scope(), PanelScope::Current);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::Current);
+
+        state.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        state.set_servers_panel_scope(PanelScope::All);
+        state.set_spaces_panel_scope(PanelScope::All);
+        assert_eq!(
+            state.config.ui.agent_panel_scope,
+            crate::config::PanelScopeConfig::All
+        );
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
+        assert_eq!(state.servers_panel_scope(), PanelScope::All);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::All);
+    }
 
     #[test]
     fn experiments_read_from_state_config_not_mirror_fields() {

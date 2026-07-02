@@ -1179,7 +1179,7 @@ impl AppState {
             crate::logging::workspace_focused(&workspace_id);
             self.mark_session_dirty();
             if matches!(
-                self.agent_panel_scope,
+                self.agent_panel_scope(),
                 crate::app::state::AgentPanelScope::CurrentWorkspace
             ) {
                 self.agent_panel_scroll = 0;
@@ -1223,7 +1223,7 @@ impl AppState {
         self.mark_session_dirty();
         if workspace_changed
             && matches!(
-                self.agent_panel_scope,
+                self.agent_panel_scope(),
                 crate::app::state::AgentPanelScope::CurrentWorkspace
             )
         {
@@ -4160,7 +4160,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4192,7 +4192,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4207,7 +4207,7 @@ mod tests {
     fn focus_agent_entry_succeeds_for_already_focused_agent() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, root);
 
         assert!(state.focus_agent_entry(0));
@@ -4230,7 +4230,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::CurrentWorkspace;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::CurrentWorkspace);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4255,7 +4255,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::CurrentWorkspace;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::CurrentWorkspace);
         for tab_idx in 0..state.workspaces[0].tabs.len() {
             let pane_id = state.workspaces[0].tabs[tab_idx].root_pane;
             mark_agent(&mut state, 0, tab_idx, pane_id);

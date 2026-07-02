@@ -217,7 +217,7 @@ fn agent_panel_entries_with_runtimes(
     };
 
     let local_server = super::grammar::local_server_name();
-    match app.agent_panel_scope {
+    match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
                 return Vec::new();
@@ -703,7 +703,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+    if matches!(app.spaces_panel_scope(), PanelScope::Current) {
         retain_focused_space_group(
             app,
             &section_keys,
@@ -735,7 +735,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
     // the focused row, so misc only renders when it IS the focused row.
     if !peer_filtered {
         for ws_idx in misc {
-            if matches!(app.spaces_panel_scope, PanelScope::Current)
+            if matches!(app.spaces_panel_scope(), PanelScope::Current)
                 && visible_group_idx != Some(ws_idx)
             {
                 continue;
@@ -913,7 +913,7 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
 
     // Spaces scope current pins the list to the focused project: remote-only
     // projects (no local block to splice into) stay hidden with the rest.
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+    if matches!(app.spaces_panel_scope(), PanelScope::Current) {
         return;
     }
 
@@ -1120,7 +1120,7 @@ fn server_slot_sort_key(
 /// hide.
 fn visible_server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
     let slots = server_band_slots(app);
-    match app.servers_panel_scope {
+    match app.servers_panel_scope() {
         PanelScope::All => slots,
         PanelScope::Current => slots
             .into_iter()
@@ -1763,11 +1763,11 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         )])),
         header_rect,
     );
-    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope);
+    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                panel_scope_toggle_label(app.servers_panel_scope),
+                panel_scope_toggle_label(app.servers_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -2377,11 +2377,11 @@ fn render_workspace_list(
             )),
             header_rect,
         );
-        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope);
+        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope());
         if toggle_rect != Rect::default() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    panel_scope_toggle_label(app.spaces_panel_scope),
+                    panel_scope_toggle_label(app.spaces_panel_scope()),
                     Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Right),
@@ -2801,11 +2801,11 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope);
+    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                agent_panel_toggle_label(app.agent_panel_scope),
+                agent_panel_toggle_label(app.agent_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -3034,7 +3034,7 @@ mod tests {
         assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
         // Scope current: only the self row renders, the band stays visible
         // (header keeps the toggle reachable).
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         assert_eq!(servers_section_height(&app), 1 + SERVER_ROW_LINES + 1);
     }
 
@@ -3079,7 +3079,7 @@ mod tests {
 
         // Scope current without a carried snapshot: only the self row stays,
         // which has no hit-area — the header (with its toggle) remains.
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert!(cards.is_empty());
@@ -3269,7 +3269,7 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
 
         // The way home must never hide: scope current keeps home + self.
         assert_eq!(
@@ -5311,7 +5311,7 @@ mod tests {
             .detected_agent = Some(Agent::Claude);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "one");
@@ -5354,7 +5354,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Pi);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let (events, _) = tokio::sync::mpsc::channel(4);
         let runtime = crate::terminal::TerminalRuntime::spawn(
@@ -5410,7 +5410,7 @@ mod tests {
             .set_agent_name("planner".into());
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "bridge");
@@ -5440,7 +5440,7 @@ mod tests {
             app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
             app.active = Some(0);
             app.selected = 0;
-            app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+            app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
             app.server_filter = None;
 
             let aaa = peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
@@ -5775,7 +5775,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Focused grouped workspace: the whole group block renders — header
         // plus members — and nothing else.
@@ -5807,7 +5807,7 @@ mod tests {
         );
 
         // Scope all: the full list (header + two members + the standalone).
-        app.spaces_panel_scope = PanelScope::All;
+        app.set_spaces_panel_scope(PanelScope::All);
         assert_eq!(workspace_list_entries(&app).len(), 4);
     }
 
@@ -5821,7 +5821,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
         app.collapsed_space_keys.insert("repo-key".into());
 
         // Collapse still folds members within the rendered group: header +
@@ -5880,7 +5880,7 @@ mod tests {
         )];
         app.mode = Mode::Terminal;
         app.active = Some(0);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // The focused project keeps its spliced remote rows; the second
         // local project and the remote-only trailing project both hide.
@@ -5910,7 +5910,7 @@ mod tests {
         ];
         app.mode = Mode::Navigate;
         app.selected = 0;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Selection moves through the visible (focused-group) entries only:
         // a large delta clamps to the last group member, never reaching the
@@ -5929,7 +5929,7 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         let area = Rect::new(0, 0, 30, 40);
         let mut terminal =

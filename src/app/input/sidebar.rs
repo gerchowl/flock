@@ -573,7 +573,7 @@ impl AppState {
             return Rect::default();
         }
         let header = Rect::new(area.x, area.y, area.width, 1);
-        let toggle = crate::ui::panel_scope_toggle_rect(header, self.spaces_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, self.spaces_panel_scope());
         // Need room for ` new` (4 chars) plus a one-column gap before the toggle.
         const LABEL_WIDTH: u16 = 4;
         const GAP: u16 = 1;
@@ -969,7 +969,7 @@ mod tests {
             app.state.sidebar_section_split,
             app.state.sidebar_pane_gap(),
         );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope);
+        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
@@ -977,7 +977,7 @@ mod tests {
         ));
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             AgentPanelScope::CurrentWorkspace
         );
         assert_eq!(app.state.agent_panel_scroll, 0);
@@ -994,7 +994,10 @@ mod tests {
             detail_area.x + 1,
             detail_area.y + 1,
         ));
-        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::AllWorkspaces);
+        assert_eq!(
+            app.state.agent_panel_scope(),
+            AgentPanelScope::AllWorkspaces
+        );
 
         // The divider row above the header is the section-split drag
         // handle, not the toggle.
@@ -1003,7 +1006,10 @@ mod tests {
             detail_area.x + 1,
             detail_area.y,
         ));
-        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::AllWorkspaces);
+        assert_eq!(
+            app.state.agent_panel_scope(),
+            AgentPanelScope::AllWorkspaces
+        );
     }
 
     #[test]
@@ -1031,18 +1037,18 @@ mod tests {
             header.x + 1,
             header.y,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::Current);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.servers_panel_scope, PanelScope::Current);
 
         // Clicking the right-aligned label keeps working and returns to all.
-        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.servers_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.servers_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::All);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::All);
 
         // The row below the header is a server row, not the toggle.
         app.handle_mouse(mouse(
@@ -1050,7 +1056,7 @@ mod tests {
             header.x + 1,
             header.y + 1,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::All);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::All);
     }
 
     #[test]
@@ -1065,14 +1071,14 @@ mod tests {
         let list_area = app.state.workspace_list_rect();
         assert_ne!(list_area, Rect::default());
         let header = Rect::new(list_area.x, list_area.y, list_area.width, 1);
-        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
 
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::Current);
         assert_eq!(app.state.workspace_scroll, 0);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.spaces_panel_scope, PanelScope::Current);
@@ -1084,7 +1090,7 @@ mod tests {
             header.x + 1,
             header.y,
         ));
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::All);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::All);
     }
 
     #[test]
@@ -1150,7 +1156,7 @@ mod tests {
             // same row, never overlapping it.
             let list_area = app.state.workspace_list_rect();
             let header = Rect::new(list_area.x, list_area.y, list_area.width, 1);
-            let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+            let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope());
             assert!(new_rect.x + new_rect.width <= toggle.x);
 
             app.handle_mouse(mouse(
@@ -1164,7 +1170,7 @@ mod tests {
                 "header `new` stages $HOME for both event loops in {tab_mode:?}",
             );
             // The scope toggle is not collaterally fired by the new-button click.
-            assert_eq!(app.state.spaces_panel_scope, PanelScope::All);
+            assert_eq!(app.state.spaces_panel_scope(), PanelScope::All);
         }
         // Restore HOME.
         match original_home {
@@ -1203,7 +1209,8 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state
+            .set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let detail_area = app.state.agent_panel_rect();
         // Single-row entries (#62): the second agent row is one row + gap below
