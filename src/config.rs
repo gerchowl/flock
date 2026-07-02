@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+mod env;
 mod io;
 mod keybinds;
 mod model;

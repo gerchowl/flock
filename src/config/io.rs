@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
+use super::{env, model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
@@ -187,38 +187,51 @@ fn load_with_overlay(
     overlay: Option<&str>,
     overlay_path: &Path,
 ) -> Result<LoadedConfig, Vec<String>> {
-    let mut merged = match base {
-        // A broken base keeps the current config (Err) — same as before.
-        Some(b) => parse_config_table(b)?,
-        None => toml::map::Map::new(),
-    };
+    // ADR-0002 phase (d): the generic FLOCK_<UPPER_SNAKE> env layer sits
+    // BELOW the file. Merge order below: env < base < overlay.
+    //
+    // ADR-0002 open question 1 documents the alternative (overlay < env,
+    // preserving the muscle memory that FLOCK_HOST_NAME/FLOCK_DISABLE_SOUND
+    // always win). To flip precedence, swap the ONE merge-order line
+    // marked `ADR-0002 open question 1` below — the env table would then
+    // be deep-merged INTO the base+overlay merge instead of starting the
+    // merge.
+    let mut env_diagnostics = Vec::new();
+    let mut merged = env::env_override_table(&mut env_diagnostics);
+
+    if let Some(b) = base {
+        let base_table = parse_config_table(b)?;
+        // ADR-0002 open question 1: base (file) beats env.
+        deep_merge_tables(&mut merged, base_table);
+    }
 
     let Some(overlay) = overlay else {
-        // No overlay: base-only, or defaults when neither is present.
-        return match base {
-            Some(_) => load_live_config_from_table(merged),
-            None => Ok(LoadedConfig {
-                config: Config::default(),
-                diagnostics: Vec::new(),
-                invalid_sections: Vec::new(),
-            }),
-        };
+        // No overlay: env+base or env+defaults. Env diagnostics ride along.
+        let mut loaded = load_live_config_from_table(merged)?;
+        loaded.diagnostics.splice(0..0, env_diagnostics);
+        return Ok(loaded);
     };
 
     match parse_config_table(overlay) {
         Ok(overlay_table) => {
+            // ADR-0002 open question 1: overlay beats base beats env.
             deep_merge_tables(&mut merged, overlay_table);
-            load_live_config_from_table(merged)
+            let mut loaded = load_live_config_from_table(merged)?;
+            loaded.diagnostics.splice(0..0, env_diagnostics);
+            Ok(loaded)
         }
         Err(diagnostics) => {
-            // The overlay itself is unparseable; fall back to base alone and
+            // The overlay itself is unparseable; fall back to env+base and
             // surface the overlay failure as a non-fatal diagnostic.
             let overlay_diag = format!(
                 "overlay at {} broke parse: {}; ignoring overlay",
                 overlay_path.display(),
                 diagnostics.join("; ")
             );
-            load_with_overlay_diagnostic(base, Some(overlay_diag))
+            let mut loaded = load_live_config_from_table(merged)?;
+            loaded.diagnostics.splice(0..0, env_diagnostics);
+            loaded.diagnostics.push(overlay_diag);
+            Ok(loaded)
         }
     }
 }
@@ -227,17 +240,19 @@ fn load_with_overlay_diagnostic(
     base: Option<&str>,
     overlay_diagnostic: Option<String>,
 ) -> Result<LoadedConfig, Vec<String>> {
-    let base = match base {
-        Some(b) => b,
-        None => {
-            return Ok(LoadedConfig {
-                config: Config::default(),
-                diagnostics: overlay_diagnostic.into_iter().collect(),
-                invalid_sections: Vec::new(),
-            });
-        }
-    };
-    let mut loaded = load_live_config_from_str(base)?;
+    // Route through load_with_overlay so the env layer applies uniformly. The
+    // caller ended up here because it couldn't even READ the overlay file —
+    // the overlay content is None; the diagnostic is threaded through.
+    let mut env_diagnostics = Vec::new();
+    let mut merged = env::env_override_table(&mut env_diagnostics);
+
+    if let Some(b) = base {
+        let base_table = parse_config_table(b)?;
+        deep_merge_tables(&mut merged, base_table);
+    }
+
+    let mut loaded = load_live_config_from_table(merged)?;
+    loaded.diagnostics.splice(0..0, env_diagnostics);
     if let Some(diag) = overlay_diagnostic {
         loaded.diagnostics.push(diag);
     }
@@ -285,6 +300,7 @@ fn deep_merge_tables(
     }
 }
 
+#[cfg(test)]
 fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
     load_live_config_from_table(parse_config_table(content)?)
 }

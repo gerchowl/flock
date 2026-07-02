@@ -277,19 +277,15 @@ pub(crate) fn short_host_name() -> String {
 }
 
 fn compute_short_host_name() -> String {
-    // Explicit override (also pins a short, deterministic host for the test
-    // suite, whose layout assertions otherwise break on CI runners with long
-    // generated hostnames like `fv-az…`).
-    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    // The `name` set in config.toml is this node's intended identity (#42), so
-    // it overrides gethostname()/LocalHostName — only the explicit env pin above
-    // wins. Read once (short_host_name caches), so a changed name takes effect
-    // on restart, matching how the OS host name is treated as fixed per-process.
+    // ADR-0002 phase (d): FLOCK_HOST_NAME is no longer read here — it's now a
+    // one-release deprecated alias that lands on Config.name via the generic
+    // FLOCK_<UPPER_SNAKE> env layer (src/config/env.rs), which sits BELOW the
+    // file. The test-suite host pin (short, deterministic host on CI runners
+    // with long `fv-az…` names) still works because `configured_node_name()`
+    // reads the same loaded config the env alias populates.
+    //
+    // Read once (short_host_name caches), so a changed name takes effect on
+    // restart, matching how the OS host name is treated as fixed per-process.
     if let Some(name) = configured_node_name() {
         return name;
     }
