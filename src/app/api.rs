@@ -221,7 +221,7 @@ impl App {
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
                     // Per-poll trace so a "peer row looks stale" report is
-                    // diagnosable live (FLOCK_LOG=flock=debug + `flock peers
+                    // diagnosable live (FLOCK_LOG=flock=debug + `flk peers
                     // logs`): shows exactly what each poll applied (#4, #67).
                     tracing::debug!(
                         target: "flock::peers",

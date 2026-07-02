@@ -1,7 +1,7 @@
 //! Self-update mechanism.
 //!
 //! Checks the hosted flock.dev update manifest for newer versions.
-//! Manual `flock update` downloads and installs the binary.
+//! Manual `flk update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
 //! JSON parsing uses serde_json (already in deps for persistence).
@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer};
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/flock.json";
-const FLOCK_UPDATE_COMMAND: &str = "flock update";
+const FLOCK_UPDATE_COMMAND: &str = "flk update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade flock";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade flock";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
@@ -754,7 +754,7 @@ fn plan_running_server_updates(
         )
         .map_err(|err| {
             format!(
-                "failed to read status for flock target {} at {}: {err}. stop it with `{}` and run `flock update` again",
+                "failed to read status for flock target {} at {}: {err}. stop it with `{}` and run `flk update` again",
                 target.label,
                 target.socket_path.display(),
                 target.stop_command
@@ -763,7 +763,7 @@ fn plan_running_server_updates(
             Some(server) => server,
             None if target.must_be_running => {
                 return Err(format!(
-                        "flock target {} looked running, but its status API did not respond at {}. stop it with `{}` and run `flock update` again",
+                        "flock target {} looked running, but its status API did not respond at {}. stop it with `{}` and run `flk update` again",
                     target.label,
                     target.socket_path.display(),
                     target.stop_command
@@ -771,7 +771,7 @@ fn plan_running_server_updates(
             }
             None if client_protocol_server_is_running_at(&target.client_socket_path) => {
                 return Err(format!(
-                    "flock target {} has a client socket, but its status API did not respond at {}. stop it with `{}` and run `flock update` again",
+                    "flock target {} has a client socket, but its status API did not respond at {}. stop it with `{}` and run `flk update` again",
                     target.label,
                     target.socket_path.display(),
                     target.stop_command
@@ -789,7 +789,7 @@ fn plan_running_server_updates(
 
     if plans.is_empty() && target_client_protocol_server_is_running()? {
         return Err(format!(
-            "a flock server is listening, but its status API is unavailable; try `{}`, or stop the old server process manually, then run `flock update` again",
+            "a flk server is listening, but its status API is unavailable; try `{}`, or stop the old server process manually, then run `flk update` again",
             crate::session::local_stop_command()
         ));
     }
@@ -828,7 +828,7 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
             name: None,
             label: socket_path.display().to_string(),
             stop_command: format!(
-                "{}={} flock server stop",
+                "{}={} flk server stop",
                 crate::api::SOCKET_PATH_ENV_VAR,
                 socket_path.display()
             ),
@@ -858,9 +858,9 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
                 Some(&session.name)
             }),
             attach_command: Some(if session.default {
-                "flock".to_string()
+                "flk".to_string()
             } else {
-                format!("flock session attach {}", session.name)
+                format!("flk session attach {}", session.name)
             }),
             label: session.name.clone(),
             client_socket_path: crate::session::client_socket_path_for(if session.default {
@@ -904,7 +904,7 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
         match arg.as_str() {
             "--handoff" => options.live_handoff = true,
             "--help" | "-h" => {
-                return Err("usage: flock update [--handoff]".to_string());
+                return Err("usage: flk update [--handoff]".to_string());
             }
             _ => return Err(format!("unknown update option: {arg}")),
         }
@@ -922,7 +922,7 @@ fn prompt_to_stop_old_servers_before_update(
 ) -> Result<bool, String> {
     if !io::stdin().is_terminal() {
         return Err(
-            "one or more Flock sessions must stop for this update. Stop running Flock sessions when ready, then run `flock update` again from an interactive terminal."
+            "one or more Flock sessions must stop for this update. Stop running Flock sessions when ready, then run `flk update` again from an interactive terminal."
                 .to_string(),
         );
     }
@@ -1196,7 +1196,7 @@ fn prompt_to_stop_old_server_after_failed_handoff(
     eprintln!("  server: v{}", version_label(status.version.as_deref()));
     eprintln!("  installed: {}", release.label());
     eprintln!(
-        "you can keep using the old server, or stop it now so the next `flock` start uses {}.",
+        "you can keep using the old server, or stop it now so the next `flk` start uses {}.",
         release.label()
     );
     eprintln!("stopping the old server will exit its pane processes.");
@@ -1266,13 +1266,13 @@ fn recover_failed_live_handoff_for_update(
         FailedHandoffServerState::NoServerResponding => {
             if let Some(command) = plan.attach_command() {
                 eprintln!(
-                    "no flock server is responding for session {}. the binary was updated; run `{command}` to start {}.",
+                    "no flk server is responding for session {}. the binary was updated; run `{command}` to start {}.",
                     plan.label(),
                     release.label()
                 );
             } else {
                 eprintln!(
-                    "no flock server is responding at {}. the binary was updated; restart with the same socket override to use {}.",
+                    "no flk server is responding at {}. the binary was updated; restart with the same socket override to use {}.",
                     plan.socket_path().display(),
                     release.label()
                 );
@@ -1668,7 +1668,7 @@ pub(crate) fn update_install_command() -> &'static str {
 pub(crate) fn update_install_instruction(install_command: &str) -> String {
     match install_command {
         FLOCK_UPDATE_COMMAND => {
-            "detach, run `flock update`, then follow its restart guidance".to_string()
+            "detach, run `flk update`, then follow its restart guidance".to_string()
         }
         HOMEBREW_UPDATE_COMMAND => {
             "detach, run `brew update && brew upgrade flock`, then restart this Flock session when ready".to_string()
@@ -1871,7 +1871,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Manual self-update command (`flock update`).
+/// Manual self-update command (`flk update`).
 #[expect(
     clippy::print_stderr,
     reason = "user-facing progress on the controlling terminal during self-update — download / install / already-up-to-date lines belong on the operator's stderr"
@@ -1912,7 +1912,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     }
 
     if running_inside_flock() {
-        return Err("run `flock update` outside flock after detaching from the session".into());
+        return Err("run `flk update` outside flock after detaching from the session".into());
     }
 
     eprintln!("checking {} channel for updates...", channel.as_str());
@@ -1946,7 +1946,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         && !prompt_to_complete_plain_update(&server_update_decisions, &release)?
     {
         eprintln!("Flock was not updated.");
-        eprintln!("Stop running Flock sessions when ready, then run `flock update` again.");
+        eprintln!("Stop running Flock sessions when ready, then run `flk update` again.");
         return Ok(current);
     }
     install_downloaded_update(downloaded_update)?;
@@ -2486,7 +2486,7 @@ mod tests {
     fn update_install_instruction_distinguishes_install_from_restart() {
         assert_eq!(
             update_install_instruction(FLOCK_UPDATE_COMMAND),
-            "detach, run `flock update`, then follow its restart guidance"
+            "detach, run `flk update`, then follow its restart guidance"
         );
         assert_eq!(
             update_install_instruction(HOMEBREW_UPDATE_COMMAND),
@@ -2619,8 +2619,8 @@ mod tests {
             target: RunningUpdateTarget {
                 name: Some("work".to_string()),
                 label: "work".to_string(),
-                stop_command: "flock session stop work".to_string(),
-                attach_command: Some("flock session attach work".to_string()),
+                stop_command: "flk session stop work".to_string(),
+                attach_command: Some("flk session attach work".to_string()),
                 socket_path: crate::session::api_socket_path_for(Some("work")),
                 client_socket_path: crate::session::client_socket_path_for(Some("work")),
                 must_be_running: true,
@@ -2755,7 +2755,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            err.contains("flock session stop work"),
+            err.contains("flk session stop work"),
             "unexpected error: {err}"
         );
     }
@@ -2831,8 +2831,8 @@ mod tests {
             target: RunningUpdateTarget {
                 name: Some("work".to_string()),
                 label: "work".to_string(),
-                stop_command: "flock session stop work".to_string(),
-                attach_command: Some("flock session attach work".to_string()),
+                stop_command: "flk session stop work".to_string(),
+                attach_command: Some("flk session attach work".to_string()),
                 socket_path: crate::session::api_socket_path_for(Some("work")),
                 client_socket_path: crate::session::client_socket_path_for(Some("work")),
                 must_be_running: true,

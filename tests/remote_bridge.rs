@@ -2,12 +2,12 @@
 //!
 //! The origin story: a failed remote connect left NOTHING in the logs at any
 //! FLOCK_LOG level — the ssh probes, the resolved remote binary path, and the
-//! bridge command were all invisible. These tests drive `flock --remote` against
+//! bridge command were all invisible. These tests drive `flk --remote` against
 //! a stub `ssh` on PATH and assert the launcher's flock.log now tells the story
 //! at the DEFAULT level.
 
 #![cfg(unix)]
-// This harness drives the compiled flock binary directly (Command::new(CARGO_BIN_EXE_flock))
+// This harness drives the compiled flk binary directly (Command::new(CARGO_BIN_EXE_flk))
 // — TracedCommand (logging redesign PR-3) is a source-code lint, not a test-scaffolding one.
 #![allow(clippy::disallowed_methods)]
 
@@ -28,7 +28,7 @@ fn unique_test_dir() -> PathBuf {
 }
 
 /// A stub `ssh` that answers the launcher's preflight probes like a real host
-/// with NO flock installed: uname succeeds (linux/x86_64), `command -v flock`
+/// with NO flk installed: uname succeeds (linux/x86_64), `command -v flk`
 /// fails, every `test -x` fails. Argv of every invocation is appended to
 /// `ssh-calls.log` for debugging.
 const STUB_SSH: &str = r#"#!/bin/sh
@@ -48,7 +48,7 @@ case "$*" in
         ;;
     esac
     ;;
-  *"command -v flock"*)
+  *"command -v flk"*)
     exit 1
     ;;
 esac
@@ -95,7 +95,7 @@ fn failed_remote_connect_story_is_in_the_log_at_default_level() {
     .unwrap();
 
     let orig_path = std::env::var("PATH").unwrap_or_default();
-    let status = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let status = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--remote")
         .arg("stub-target")
         .env("PATH", format!("{}:{orig_path}", stub_dir.display()))
@@ -108,11 +108,11 @@ fn failed_remote_connect_story_is_in_the_log_at_default_level() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("run flock --remote");
+        .expect("run flk --remote");
 
     assert!(
         !status.success(),
-        "stub host has no flock and install is declined — launch must fail"
+        "stub host has no flk and install is declined — launch must fail"
     );
 
     let log = config_home.join(app_dir_name()).join("flock.log");

@@ -118,11 +118,11 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
 
 fn tab_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_tab_id) = args.first() else {
-        eprintln!("usage: flock tab get <tab_id>");
+        eprintln!("usage: flk tab get <tab_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock tab get <tab_id>");
+        eprintln!("usage: flk tab get <tab_id>");
         return Ok(2);
     }
 
@@ -136,11 +136,11 @@ fn tab_get(args: &[String]) -> std::io::Result<i32> {
 
 fn tab_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_tab_id) = args.first() else {
-        eprintln!("usage: flock tab focus <tab_id>");
+        eprintln!("usage: flk tab focus <tab_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock tab focus <tab_id>");
+        eprintln!("usage: flk tab focus <tab_id>");
         return Ok(2);
     }
 
@@ -154,7 +154,7 @@ fn tab_focus(args: &[String]) -> std::io::Result<i32> {
 
 fn tab_rename(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock tab rename <tab_id> <label>");
+        eprintln!("usage: flk tab rename <tab_id> <label>");
         return Ok(2);
     }
 
@@ -169,11 +169,11 @@ fn tab_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn tab_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_tab_id) = args.first() else {
-        eprintln!("usage: flock tab close <tab_id>");
+        eprintln!("usage: flk tab close <tab_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock tab close <tab_id>");
+        eprintln!("usage: flk tab close <tab_id>");
         return Ok(2);
     }
 
@@ -186,13 +186,13 @@ fn tab_close(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_tab_help() {
-    eprintln!("flock tab commands:");
-    eprintln!("  flock tab list [--workspace <workspace_id>]");
+    eprintln!("flk tab commands:");
+    eprintln!("  flk tab list [--workspace <workspace_id>]");
     eprintln!(
-        "  flock tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]"
+        "  flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]"
     );
-    eprintln!("  flock tab get <tab_id>");
-    eprintln!("  flock tab focus <tab_id>");
-    eprintln!("  flock tab rename <tab_id> <label>");
-    eprintln!("  flock tab close <tab_id>");
+    eprintln!("  flk tab get <tab_id>");
+    eprintln!("  flk tab focus <tab_id>");
+    eprintln!("  flk tab rename <tab_id> <label>");
+    eprintln!("  flk tab close <tab_id>");
 }

@@ -62,7 +62,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     Ok(CommandOutcome::Handled(exit_code))
 }
 
-/// `flock web` dispatch. Routed entirely through `maybe_run` so the feature gate
+/// `flk web` dispatch. Routed entirely through `maybe_run` so the feature gate
 /// lives in exactly one place: a build without `--features web` still recognizes
 /// the subcommand and prints how to enable it, rather than "unknown command".
 fn run_web_command(args: &[String]) -> std::io::Result<i32> {
@@ -73,7 +73,7 @@ fn run_web_command(args: &[String]) -> std::io::Result<i32> {
     #[cfg(not(feature = "web"))]
     {
         let _ = args;
-        eprintln!("flock was built without the `web` feature.");
+        eprintln!("flk was built without the `web` feature.");
         eprintln!("rebuild with: cargo build --release --features web");
         Ok(2)
     }
@@ -100,7 +100,7 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
 
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
-        eprintln!("usage: flock channel set <stable|preview>");
+        eprintln!("usage: flk channel set <stable|preview>");
         return Ok(2);
     };
 
@@ -160,7 +160,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
-        eprintln!("Run `flock update` to retry.");
+        eprintln!("Run `flk update` to retry.");
         return Ok(1);
     }
 
@@ -201,9 +201,9 @@ fn channel_set_install_action(
 }
 
 fn print_channel_help() {
-    eprintln!("flock channel commands:");
-    eprintln!("  flock channel show                  print the configured update channel");
-    eprintln!("  flock channel set <stable|preview>  choose the update channel");
+    eprintln!("flk channel commands:");
+    eprintln!("  flk channel show                  print the configured update channel");
+    eprintln!("  flk channel set <stable|preview>  choose the update channel");
 }
 
 fn run_config_command(args: &[String]) -> std::io::Result<i32> {
@@ -228,14 +228,14 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
 
 fn config_edit(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock config edit");
+        eprintln!("usage: flk config edit");
         return Ok(2);
     }
 
     let target = match crate::app::config_io::resolve_write_target() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("flock config edit: could not resolve write target: {err}");
+            eprintln!("flk config edit: could not resolve write target: {err}");
             return Ok(1);
         }
     };
@@ -251,18 +251,18 @@ fn config_edit(args: &[String]) -> std::io::Result<i32> {
         .status_traced()?;
 
     if !status.success() {
-        eprintln!("flock config edit: editor exited non-zero, no reload triggered");
+        eprintln!("flk config edit: editor exited non-zero, no reload triggered");
         return Ok(status.code().unwrap_or(1));
     }
 
     println!("Edited: {}", target.display());
-    println!("To apply changes in the running server: flock server reload-config");
+    println!("To apply changes in the running server: flk server reload-config");
     Ok(0)
 }
 
 fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock config reset-keys");
+        eprintln!("usage: flk config reset-keys");
         return Ok(2);
     }
 
@@ -328,7 +328,7 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
         path.display()
     );
     println!("Built-in v2 keybindings will apply after Flock restarts or reloads config.");
-    println!("If a Flock server is running, run `flock server reload-config` to apply this now.");
+    println!("If a Flock server is running, run `flk server reload-config` to apply this now.");
     println!(
         "To restore: cp {} {}",
         backup_path.display(),
@@ -415,15 +415,15 @@ fn session_attach_help(args: &[String]) -> std::io::Result<i32> {
         args.first().map(String::as_str),
         Some("help" | "--help" | "-h")
     ) {
-        eprintln!("usage: flock session attach <name>");
+        eprintln!("usage: flk session attach <name>");
         return Ok(0);
     }
-    eprintln!("usage: flock session attach <name>");
+    eprintln!("usage: flk session attach <name>");
     Ok(2)
 }
 
 fn session_list(args: &[String]) -> std::io::Result<i32> {
-    let json = match parse_session_json_only(args, "usage: flock session list [--json]") {
+    let json = match parse_session_json_only(args, "usage: flk session list [--json]") {
         Ok(json) => json,
         Err(code) => return Ok(code),
     };
@@ -441,7 +441,7 @@ fn session_list(args: &[String]) -> std::io::Result<i32> {
 
 fn session_stop(args: &[String]) -> std::io::Result<i32> {
     let (name, json) =
-        match parse_session_name_and_json(args, "usage: flock session stop <name> [--json]") {
+        match parse_session_name_and_json(args, "usage: flk session stop <name> [--json]") {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -474,7 +474,7 @@ fn session_stop(args: &[String]) -> std::io::Result<i32> {
 
 fn session_delete(args: &[String]) -> std::io::Result<i32> {
     let (name, json) =
-        match parse_session_name_and_json(args, "usage: flock session delete <name> [--json]") {
+        match parse_session_name_and_json(args, "usage: flk session delete <name> [--json]") {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -501,7 +501,7 @@ fn session_delete(args: &[String]) -> std::io::Result<i32> {
 fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
     let (terminal_id, takeover) = match parse_attach_target(
         args,
-        "usage: flock terminal attach <terminal_id> [--takeover]",
+        "usage: flk terminal attach <terminal_id> [--takeover]",
     ) {
         Ok(parsed) => parsed,
         Err(code) => return Ok(code),
@@ -534,7 +534,7 @@ pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(Strin
 
 fn wait_output(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex]");
+        eprintln!("usage: flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex]");
         return Ok(2);
     };
 
@@ -630,7 +630,7 @@ fn wait_output(args: &[String]) -> std::io::Result<i32> {
 
 fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]");
+        eprintln!("usage: flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]");
         return Ok(2);
     };
 
@@ -905,31 +905,31 @@ fn print_session_error(code: &str, message: &str) {
 }
 
 fn print_config_help() {
-    eprintln!("flock config commands:");
-    eprintln!("  flock config edit        open the live config (or overlay) in $EDITOR");
-    eprintln!("  flock config reset-keys  back up config.toml and remove custom keybindings");
+    eprintln!("flk config commands:");
+    eprintln!("  flk config edit        open the live config (or overlay) in $EDITOR");
+    eprintln!("  flk config reset-keys  back up config.toml and remove custom keybindings");
 }
 
 fn print_terminal_help() {
-    eprintln!("flock terminal commands:");
-    eprintln!("  flock terminal attach <terminal_id> [--takeover]");
+    eprintln!("flk terminal commands:");
+    eprintln!("  flk terminal attach <terminal_id> [--takeover]");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");
 }
 
 fn print_wait_help() {
-    eprintln!("flock wait commands:");
-    eprintln!("  flock wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
+    eprintln!("flk wait commands:");
+    eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
     eprintln!(
-        "  flock wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]"
+        "  flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]"
     );
 }
 
 fn print_session_help() {
-    eprintln!("flock session commands:");
-    eprintln!("  flock session list [--json]");
-    eprintln!("  flock session attach <name>");
-    eprintln!("  flock session stop <name> [--json]");
-    eprintln!("  flock session delete <name> [--json]");
+    eprintln!("flk session commands:");
+    eprintln!("  flk session list [--json]");
+    eprintln!("  flk session attach <name>");
+    eprintln!("  flk session stop <name> [--json]");
+    eprintln!("  flk session delete <name> [--json]");
     eprintln!("  use 'default' as <name> to target the default session for stop");
 }
 

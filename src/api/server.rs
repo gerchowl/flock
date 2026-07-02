@@ -119,10 +119,7 @@ pub fn start_server_with_capabilities(
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
-        format!(
-            "flock is already running (socket busy at {})",
-            path.display()
-        )
+        format!("flk is already running (socket busy at {})", path.display())
     })
 }
 

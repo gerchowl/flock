@@ -1,15 +1,15 @@
-//! `flock web` — xterm.js <-> flock PTY bridge (feature = "web").
+//! `flk web` — xterm.js <-> flock PTY bridge (feature = "web").
 //!
 //! gerchowl/flock#131 — first-class, in-tree port of the #109 MVP. Architecture
 //! (per the spike verdict, parent #109):
 //!
-//!   browser (xterm.js) <--WS--> flock web <--PTY--> flock client (terminal-ansi)
+//!   browser (xterm.js) <--WS--> flk web <--PTY--> flk client (terminal-ansi)
 //!
 //! Each WebSocket spawns a flock **client** in a PTY with
 //! `FLOCK_RENDER_ENCODING=terminal-ansi`; flock's server pre-diffs to ANSI and
 //! the client is a stdout passthrough, so xterm.js writes the byte stream
 //! straight to its buffer — no JS painting, no rerender. On an always-on host
-//! (e.g. sage) the client attaches to the persistent `flock server` daemon, so
+//! (e.g. sage) the client attaches to the persistent `flk server` daemon, so
 //! the phone shares that node's live session AND its fleet gossip view.
 //!
 //! Security boundary (v1): this binds loopback only and is fronted by
@@ -58,7 +58,7 @@ const DEFAULT_MAX_SESSIONS: usize = CONFIG_DEFAULT_MAX_SESSIONS;
 #[folder = "assets/web/"]
 struct WebAssets;
 
-/// Parsed `flock web` configuration.
+/// Parsed `flk web` configuration.
 struct WebConfig {
     bind: SocketAddr,
     flock_bin: PathBuf,
@@ -116,7 +116,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
     // routable interface exposes it without the tailscale-serve auth boundary.
     if !cfg.bind.ip().is_loopback() && !cfg.allow_non_loopback {
         eprintln!(
-            "flock web: refusing to bind non-loopback address {}",
+            "flk web: refusing to bind non-loopback address {}",
             cfg.bind
         );
         eprintln!("  the web bridge is a full shell; front it with `tailscale serve` on loopback.");
@@ -132,7 +132,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
         match tailscale_funnel_status() {
             FunnelCheck::Active => {
                 eprintln!(
-                    "flock web: refusing to start — `tailscale funnel` is active on this node."
+                    "flk web: refusing to start — `tailscale funnel` is active on this node."
                 );
                 eprintln!(
                     "  funnel publishes to the PUBLIC internet; this bridge is a full shell."
@@ -145,7 +145,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
             FunnelCheck::Inactive => {}
             FunnelCheck::Unknown => {
                 eprintln!(
-                    "flock web: could not verify tailscale funnel state; ensure you front this \
+                    "flk web: could not verify tailscale funnel state; ensure you front this \
                      with `tailscale serve` (tailnet-only), NOT `tailscale funnel`."
                 );
             }
@@ -192,8 +192,8 @@ async fn serve(cfg: WebConfig) -> std::io::Result<i32> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("flock web listening on http://{}/", bind);
-    eprintln!("flock web: listening on http://{}/", bind);
+    info!("flk web listening on http://{}/", bind);
+    eprintln!("flk web: listening on http://{}/", bind);
     axum::serve(listener, app).await?;
     Ok(0)
 }
@@ -284,7 +284,7 @@ async fn ws_handler(
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "flock web: session limit reached",
+                "flk web: session limit reached",
             )
                 .into_response();
         }
@@ -366,8 +366,8 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
         cmd.arg(a);
     }
     // Start the spawned client from a clean flock environment. CommandBuilder
-    // seeds env from the current process; if `flock web` is run from inside a
-    // flock pane, the inherited `FLOCK_*` vars break the child: `FLOCK_ENV=1`
+    // seeds env from the current process; if `flk web` is run from inside a
+    // flk pane, the inherited `FLOCK_*` vars break the child: `FLOCK_ENV=1`
     // trips the nested-launch guard (`exit_if_nested_disabled`) so every
     // connection flash-exits, and the leg/handoff/switch/socket/pane vars make
     // it resume stale state or point at the launcher's socket instead of doing
@@ -648,19 +648,19 @@ enum ParseResult {
 }
 
 /// Resolve `flock_bin`: if the config leaves it empty, fall back to this
-/// executable, then to bare `flock` on PATH. The env layer already merged
+/// executable, then to bare `flk` on PATH. The env layer already merged
 /// `FLOCK_WEB_FLOCK_BIN` into `config.web.flock_bin` before we got here.
 fn resolve_flock_bin(configured: &Path) -> PathBuf {
     if !configured.as_os_str().is_empty() {
         return configured.to_path_buf();
     }
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flock"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flk"))
 }
 
 fn parse_args(args: &[String]) -> ParseResult {
     // Config carries the [web] section with env<file<overlay already merged in
     // (ADR-0002 phases b+d). CLI flags override on top. Diagnostics from the
-    // load are dropped: `flock web` is a short-lived process; the same config
+    // load are dropped: `flk web` is a short-lived process; the same config
     // reads happen at server startup where they surface via the normal
     // diagnostic path.
     let config = Config::load().config;
@@ -708,7 +708,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             "help" | "--help" | "-h" => return ParseResult::Help,
             "--bind" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --bind");
+                    eprintln!("flk web: missing value for --bind");
                     return ParseResult::Err(2);
                 };
                 bind_raw = v.clone();
@@ -716,7 +716,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--flock-bin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --flock-bin");
+                    eprintln!("flk web: missing value for --flock-bin");
                     return ParseResult::Err(2);
                 };
                 flock_bin = PathBuf::from(v);
@@ -724,7 +724,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--session" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --session");
+                    eprintln!("flk web: missing value for --session");
                     return ParseResult::Err(2);
                 };
                 session = Some(v.clone());
@@ -732,7 +732,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--allowed-origin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --allowed-origin");
+                    eprintln!("flk web: missing value for --allowed-origin");
                     return ParseResult::Err(2);
                 };
                 allowed_origins.push(v.clone());
@@ -740,7 +740,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--allowed-user" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --allowed-user");
+                    eprintln!("flk web: missing value for --allowed-user");
                     return ParseResult::Err(2);
                 };
                 allowed_users.push(v.clone());
@@ -748,13 +748,13 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--max-sessions" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --max-sessions");
+                    eprintln!("flk web: missing value for --max-sessions");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => max_sessions = n,
                     Err(_) => {
-                        eprintln!("flock web: invalid --max-sessions: {v}");
+                        eprintln!("flk web: invalid --max-sessions: {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -762,13 +762,13 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
             }
             "--idle-timeout" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --idle-timeout");
+                    eprintln!("flk web: missing value for --idle-timeout");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => idle_secs = n,
                     Err(_) => {
-                        eprintln!("flock web: invalid --idle-timeout (seconds): {v}");
+                        eprintln!("flk web: invalid --idle-timeout (seconds): {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -791,7 +791,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
                 break;
             }
             other => {
-                eprintln!("flock web: unknown option: {other}");
+                eprintln!("flk web: unknown option: {other}");
                 return ParseResult::Err(2);
             }
         }
@@ -800,7 +800,7 @@ fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
     let bind = match bind_raw.parse::<SocketAddr>() {
         Ok(addr) => addr,
         Err(_) => {
-            eprintln!("flock web: invalid bind address: {bind_raw}");
+            eprintln!("flk web: invalid bind address: {bind_raw}");
             return ParseResult::Err(2);
         }
     };
@@ -834,9 +834,9 @@ fn csv_env(name: &str) -> Vec<String> {
 }
 
 fn print_web_help() {
-    println!("flock web — serve a phone-friendly xterm.js terminal over a WebSocket");
+    println!("flk web — serve a phone-friendly xterm.js terminal over a WebSocket");
     println!();
-    println!("Usage: flock web [options] [-- <flock args>]");
+    println!("Usage: flk web [options] [-- <flock args>]");
     println!();
     println!("Front this with `tailscale serve` (tailnet-only). It is a full shell.");
     println!();
@@ -851,7 +851,7 @@ fn print_web_help() {
     println!("  --flock-bin <path>       flock binary to spawn per connection");
     println!("                           (default: this binary)");
     println!("                           config: [web] flock_bin — env: FLOCK_WEB_FLOCK_BIN");
-    println!("  --session <name>         flock session the bridge attaches to");
+    println!("  --session <name>         flk session the bridge attaches to");
     println!("                           config: [web] session — env: FLOCK_WEB_SESSION");
     println!("  --allowed-origin <o>     extra allowed WS Origin (repeatable)");
     println!(

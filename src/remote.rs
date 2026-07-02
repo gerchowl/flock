@@ -77,7 +77,7 @@ impl RemoteKeybindings {
 /// PROMPT the user (`--remote` from a shell) or must surface mismatches as
 /// errors that ride the switch-failure notice rail (#67).
 ///
-/// An explicit `flock --remote <target>` call has a real interactive TTY and
+/// An explicit `flk --remote <target>` call has a real interactive TTY and
 /// the user is making a one-shot decision to launch a remote leg — install /
 /// upgrade prompts are appropriate. A federation SWITCH leg is queued by the
 /// leg loop while a previous leg may still hold the alternate screen + raw
@@ -86,7 +86,7 @@ impl RemoteKeybindings {
 /// the terminal tab (the live bug on #115).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchContext {
-    /// The user typed `flock --remote <target>` at a shell. Prompt freely.
+    /// The user typed `flk --remote <target>` at a shell. Prompt freely.
     Cli,
     /// The leg loop is chaining into this remote leg after a SwitchServer
     /// from a previous leg. Any install / upgrade prompt must be replaced
@@ -230,9 +230,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // captured before `remote.target` is moved into the bridge.
     let active_ssh_target = remote.target.clone();
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
-    let program = std::env::args()
-        .next()
-        .unwrap_or_else(|| "flock".to_string());
+    let program = std::env::args().next().unwrap_or_else(|| "flk".to_string());
     let reattach_command = reattach_command(
         &program,
         &remote.target,
@@ -328,7 +326,7 @@ fn ensure_remote_server_running() -> io::Result<()> {
             return Ok(());
         }
         return Err(io::Error::other(
-            "remote flock server must restart before this bridge can attach; rerun `flock --remote` from an interactive terminal to approve stopping it",
+            "remote flk server must restart before this bridge can attach; rerun `flk --remote` from an interactive terminal to approve stopping it",
         ));
     }
 
@@ -391,7 +389,7 @@ struct RemoteFlock {
 
 impl RemoteFlock {
     fn for_platform(platform: RemotePlatform) -> Self {
-        let install_suffix = ".local/bin/flock".to_string();
+        let install_suffix = ".local/bin/flk".to_string();
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
             install_suffix,
@@ -670,7 +668,7 @@ fn remote_binary_on_path_any(
     target: &str,
     remote_flock: &RemoteFlock,
 ) -> io::Result<Option<RemoteFlock>> {
-    let output = ssh_user_shell_output(target, "command -v flock")?;
+    let output = ssh_user_shell_output(target, "command -v flk")?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -705,7 +703,7 @@ fn remote_binary_matches(target: &str, remote_flock: &RemoteFlock) -> io::Result
     let mut lines = stdout.lines();
     let version = lines.next().unwrap_or_default().trim();
     let status = lines.next().unwrap_or_default();
-    Ok(version == format!("flock {}", current_version())
+    Ok(version == format!("flk {}", current_version())
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false))
@@ -925,11 +923,11 @@ fn confirm_remote_install_with_running_server(
         Err(err) => {
             if !may_prompt {
                 return Err(io::Error::other(format!(
-                    "could not inspect the running remote flock server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
+                    "could not inspect the running remote flk server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
                 )));
             }
             eprintln!(
-                "could not inspect the running remote flock server on {target} before installing: {err}"
+                "could not inspect the running remote flk server on {target} before installing: {err}"
             );
             eprint!("continue installing the remote flock binary? [y/N] ");
             io::stderr().flush()?;
@@ -959,13 +957,13 @@ fn confirm_remote_install_with_running_server(
             return Ok(false);
         }
         return Err(io::Error::other(format!(
-            "remote flock server on {target} is running v{}; run from an interactive terminal to approve stopping it for the update",
+            "remote flk server on {target} is running v{}; run from an interactive terminal to approve stopping it for the update",
             version_label(version.as_deref())
         )));
     }
 
     if live_handoff_enabled && live_handoff {
-        eprintln!("remote flock server on {target} is currently running:");
+        eprintln!("remote flk server on {target} is currently running:");
         eprintln!("  server: v{}", version_label(version.as_deref()));
         eprintln!(
             "Flock will install {} and hand off live pane processes to the prepared server.",
@@ -974,7 +972,7 @@ fn confirm_remote_install_with_running_server(
         return Ok(false);
     }
 
-    eprintln!("remote flock server on {target} is currently running:");
+    eprintln!("remote flk server on {target} is currently running:");
     eprintln!("  server: v{}", version_label(version.as_deref()));
     eprintln!(
         "To complete the remote update, Flock must stop the running remote server after installing."
@@ -1073,27 +1071,27 @@ fn confirm_remote_server_stop(
     // keep running an incompatible remote server.
     if !context.allows_install_prompt() {
         return Err(io::Error::other(format!(
-            "remote flock server on {target} is running v{}; refusing to prompt for a stop during a federation switch — relaunching previous leg",
+            "remote flk server on {target} is running v{}; refusing to prompt for a stop during a federation switch — relaunching previous leg",
             version_label(version)
         )));
     }
     if !io::stdin().is_terminal() {
         if reason == RemoteServerRestartReason::ProtocolMismatch {
             return Err(io::Error::other(format!(
-                "cannot attach to remote flock server on {target}: {} run from an interactive terminal to approve stopping it.",
+                "cannot attach to remote flk server on {target}: {} run from an interactive terminal to approve stopping it.",
                 protocol_mismatch_blurb(protocol)
             )));
         }
 
         eprintln!(
-            "remote flock server on {target} is still running v{}; it will use {} after it restarts.",
+            "remote flk server on {target} is still running v{}; it will use {} after it restarts.",
             version_label(version),
             current_version()
         );
         return Ok(false);
     }
 
-    eprintln!("remote flock server on {target} is currently running:");
+    eprintln!("remote flk server on {target} is currently running:");
     eprintln!(
         "  server: v{} (wire protocol {})",
         version_label(version),
@@ -1141,7 +1139,7 @@ fn confirm_remote_server_stop(
     if reason == RemoteServerRestartReason::ProtocolMismatch {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "remote flock server stop cancelled",
+            "remote flk server stop cancelled",
         ));
     }
 
@@ -1165,9 +1163,7 @@ fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::R
         return Err(command_failed("remote server live handoff failed", &output));
     }
 
-    eprintln!(
-        "handed off the remote flock server on {target}; reconnecting to the prepared server."
-    );
+    eprintln!("handed off the remote flk server on {target}; reconnecting to the prepared server.");
     Ok(())
 }
 
@@ -1183,7 +1179,7 @@ fn stop_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()
     }
 
     wait_for_remote_server_shutdown(target, remote_flock)?;
-    eprintln!("stopped the remote flock server on {target}; it will restart when the remote client bridge attaches.");
+    eprintln!("stopped the remote flk server on {target}; it will restart when the remote client bridge attaches.");
     Ok(())
 }
 
@@ -1197,7 +1193,7 @@ fn wait_for_remote_server_shutdown(target: &str, remote_flock: &RemoteFlock) -> 
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "shutdown was requested, but the old remote flock server on {target} is still responding after {} seconds",
+                    "shutdown was requested, but the old remote flk server on {target} is still responding after {} seconds",
                     REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT.as_secs()
                 ),
             ));
@@ -1215,7 +1211,7 @@ fn version_label(version: Option<&str>) -> &str {
     reason = "installer warning about a $PATH shadow — user needs this on the launcher's stderr right after ssh install completes"
 )]
 fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
-    let output = ssh_user_shell_output(target, "command -v flock")?;
+    let output = ssh_user_shell_output(target, "command -v flk")?;
     if output.status.success()
         && remote_shell_resolves_managed_install(&String::from_utf8_lossy(&output.stdout))
     {
@@ -1223,7 +1219,7 @@ fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
     }
 
     eprintln!(
-        "flock: installed remote binary to ~/.local/bin/flock, but the remote shell does not resolve `flock` to that path"
+        "flock: installed remote binary to ~/.local/bin/flk, but the remote shell does not resolve `flk` to that path"
     );
     Ok(())
 }
@@ -1233,7 +1229,7 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
         .lines()
         .next()
         .map(str::trim)
-        .is_some_and(|path| path.ends_with("/.local/bin/flock"))
+        .is_some_and(|path| path.ends_with("/.local/bin/flk"))
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
@@ -1301,7 +1297,7 @@ fn preview_assets_for_build<'a>(
     }
     let build = manifest.builds.get(build_id).ok_or_else(|| {
         io::Error::other(format!(
-            "preview manifest no longer includes build {build_id}; run `flock update` locally or set {REMOTE_BINARY_ENV_VAR}=target/release/flock"
+            "preview manifest no longer includes build {build_id}; run `flk update` locally or set {REMOTE_BINARY_ENV_VAR}=target/release/flk"
         ))
     })?;
     Ok((build.protocol, &build.assets))
@@ -1320,7 +1316,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
         let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
         if protocol != CURRENT_PROTOCOL {
             return Err(io::Error::other(format!(
-                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flock or install a matching Flock on the remote host manually"
+                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flk or install a matching Flock on the remote host manually"
             )));
         }
         return assets.get(asset_key).map(remote_asset_info).ok_or_else(|| {
@@ -1343,7 +1339,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     if let Some(protocol) = release.protocol {
         if protocol != CURRENT_PROTOCOL {
             return Err(io::Error::other(format!(
-                "release manifest has flock {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flock or install a matching flock on the remote host manually"
+                "release manifest has flock {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/flk or install a matching flock on the remote host manually"
             )));
         }
     }
@@ -1547,7 +1543,7 @@ fn reattach_command(
     keybindings: RemoteKeybindings,
     live_handoff: bool,
 ) -> String {
-    let program = if program.is_empty() { "flock" } else { program };
+    let program = if program.is_empty() { "flk" } else { program };
     let mut command = format!("{} --remote {}", shell_quote(program), shell_quote(target));
     if keybindings != RemoteKeybindings::Local {
         command.push_str(" --remote-keybindings ");
@@ -1695,13 +1691,13 @@ impl Drop for SshStdioBridge {
 
 /// Single-round-trip remote-flock discovery for the cold-switch path.
 ///
-/// The legacy chain ran `uname`, `command -v flock`, and one or two
+/// The legacy chain ran `uname`, `command -v flk`, and one or two
 /// `--version`/`status` probes as *separate* ssh invocations — 3-4 sequential
 /// SSH handshakes before the bridge could even start, which on a slow link is
 /// the bulk of a cold switch's latency. This collapses all of it into one
 /// `/bin/sh -s` script whose tab-delimited output we parse locally, so a cold
 /// switch costs exactly one probe SSH command. The selection order (PATH binary,
-/// then the default `$HOME/.local/bin/flock`) matches the interactive
+/// then the default `$HOME/.local/bin/flk`) matches the interactive
 /// `prepare_remote_flock` path.
 fn probe_switch_remote_flock(target: &str) -> io::Result<RemoteFlock> {
     // `KEY\tVALUE` lines keep parsing robust against missing sections (an absent
@@ -1710,13 +1706,13 @@ fn probe_switch_remote_flock(target: &str) -> io::Result<RemoteFlock> {
     // values are passed as `%s` args so `%` in JSON can't corrupt the format.
     const PROBE_SCRIPT: &str = r#"printf 'OS\t%s\n' "$(uname -s)"
 printf 'ARCH\t%s\n' "$(uname -m)"
-P=$(command -v flock 2>/dev/null || true)
+P=$(command -v flk 2>/dev/null || true)
 printf 'PATH\t%s\n' "$P"
 if [ -n "$P" ] && [ -x "$P" ]; then
   printf 'PATHVER\t%s\n' "$("$P" --version 2>/dev/null | head -n1)"
   printf 'PATHSTATUS\t%s\n' "$("$P" status client --json 2>/dev/null | head -n1)"
 fi
-D="$HOME/.local/bin/flock"
+D="$HOME/.local/bin/flk"
 if [ -x "$D" ]; then
   printf 'DEFVER\t%s\n' "$("$D" --version 2>/dev/null | head -n1)"
   printf 'DEFSTATUS\t%s\n' "$("$D" status client --json 2>/dev/null | head -n1)"
@@ -1750,7 +1746,7 @@ fi
     }
 
     Err(io::Error::other(format!(
-        "no compatible flock {} on {target}; install via `flock --remote {target}` from an interactive terminal first",
+        "no compatible flk {} on {target}; install via `flk --remote {target}` from an interactive terminal first",
         current_version()
     )))
 }
@@ -1765,14 +1761,14 @@ fn parse_switch_probe(stdout: &str) -> std::collections::HashMap<String, String>
         .collect()
 }
 
-/// A probed binary is usable iff it reports the current `flock <version>` AND a
+/// A probed binary is usable iff it reports the current `flk <version>` AND a
 /// client status whose protocol matches ours — same gate as the legacy
 /// `remote_binary_matches`, just evaluated on already-captured output.
 fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bool {
     let (Some(version), Some(status)) = (version, status) else {
         return false;
     };
-    version.trim() == format!("flock {}", current_version())
+    version.trim() == format!("flk {}", current_version())
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false)
@@ -1781,7 +1777,7 @@ fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bo
 /// Build a client-side ssh-stdio bridge to `target` for a cold switch dial,
 /// NON-INTERACTIVELY. Used by the slots cold-switch path (#93): the user is
 /// already mid-switch under raw mode, so install prompts are impossible —
-/// the call must succeed using the PATH `flock` (or an explicit override) or
+/// the call must succeed using the PATH `flk` (or an explicit override) or
 /// fail. The returned bridge owns its listener thread and its local-forward
 /// socket file; dropping it tears the transport down (the existing `Drop`
 /// impl above). The launcher-driven `run_remote` keeps using
@@ -1797,7 +1793,7 @@ pub(crate) fn start_switch_bridge_noninteractive(
     let local_socket = local_forward_socket_path(target, &session_name);
 
     // Non-interactive remote-flock discovery in a SINGLE ssh round-trip: prefer
-    // the PATH binary; fall back to the default `~/.local/bin/flock` install
+    // the PATH binary; fall back to the default `~/.local/bin/flk` install
     // location. We deliberately do NOT call into the interactive install/upgrade
     // path — a cold switch under raw mode cannot prompt the user, and a
     // missing/incompatible remote binary must surface as a dial failure that the
@@ -2397,43 +2393,43 @@ mod tests {
     fn reattach_command_includes_remote_and_session() {
         assert_eq!(
             reattach_command(
-                "target/release/flock",
+                "target/release/flk",
                 "user@host",
                 "work",
                 RemoteKeybindings::Local,
                 false,
             ),
-            "target/release/flock --remote user@host --session work"
+            "target/release/flk --remote user@host --session work"
         );
         assert_eq!(
             reattach_command(
-                "flock",
+                "flk",
                 "host name",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Local,
                 false,
             ),
-            "flock --remote 'host name'"
+            "flk --remote 'host name'"
         );
         assert_eq!(
             reattach_command(
-                "flock",
+                "flk",
                 "host",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Server,
                 false,
             ),
-            "flock --remote host --remote-keybindings server"
+            "flk --remote host --remote-keybindings server"
         );
         assert_eq!(
             reattach_command(
-                "flock",
+                "flk",
                 "host",
                 crate::session::DEFAULT_SESSION_NAME,
                 RemoteKeybindings::Local,
                 true,
             ),
-            "flock --remote host --handoff"
+            "flk --remote host --handoff"
         );
     }
 
@@ -2445,7 +2441,7 @@ mod tests {
         });
         assert_eq!(
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
-            "exec \"$HOME/.local/bin/flock\" remote-client-bridge"
+            "exec \"$HOME/.local/bin/flk\" remote-client-bridge"
         );
     }
 
@@ -2455,12 +2451,12 @@ mod tests {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "/usr/bin/flock\n")
-            .expect("path binary");
+        let remote_flock =
+            remote_flock_from_path_discovery(&remote_flock, "/usr/bin/flk\n").expect("path binary");
 
         assert_eq!(
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
-            "exec /usr/bin/flock remote-client-bridge"
+            "exec /usr/bin/flk remote-client-bridge"
         );
     }
 
@@ -2470,13 +2466,12 @@ mod tests {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_flock =
-            remote_flock_from_path_discovery(&remote_flock, "/opt/flock bin/flock\n")
-                .expect("path binary");
+        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "/opt/flock bin/flk\n")
+            .expect("path binary");
 
         assert_eq!(
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
-            "exec '/opt/flock bin/flock' remote-client-bridge"
+            "exec '/opt/flock bin/flk' remote-client-bridge"
         );
     }
 
@@ -2487,12 +2482,12 @@ mod tests {
             arch: "aarch64",
         });
         let remote_flock =
-            remote_flock_from_path_discovery(&remote_flock, "/opt/homebrew/bin/flock\n")
+            remote_flock_from_path_discovery(&remote_flock, "/opt/homebrew/bin/flk\n")
                 .expect("path binary");
 
         assert_eq!(
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
-            "exec /opt/homebrew/bin/flock remote-client-bridge"
+            "exec /opt/homebrew/bin/flk remote-client-bridge"
         );
         assert_eq!(remote_flock.platform.asset_key(), "macos-aarch64");
     }
@@ -2504,12 +2499,12 @@ mod tests {
             arch: "x86_64",
         });
         let remote_flock =
-            remote_flock_from_path_discovery(&remote_flock, "/opt/flock's/bin/flock\n")
+            remote_flock_from_path_discovery(&remote_flock, "/opt/flock's/bin/flk\n")
                 .expect("path binary");
 
         assert_eq!(
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
-            "exec '/opt/flock'\\''s/bin/flock' remote-client-bridge"
+            "exec '/opt/flock'\\''s/bin/flk' remote-client-bridge"
         );
     }
 
@@ -2519,7 +2514,7 @@ mod tests {
             os: "linux",
             arch: "x86_64",
         });
-        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "bin/flock\n");
+        let remote_flock = remote_flock_from_path_discovery(&remote_flock, "bin/flk\n");
 
         assert!(remote_flock.is_none());
     }
@@ -2538,38 +2533,35 @@ mod tests {
     #[test]
     fn remote_shell_path_warning_accepts_managed_install() {
         assert!(remote_shell_resolves_managed_install(
-            "/home/can/.local/bin/flock\n"
+            "/home/can/.local/bin/flk\n"
         ));
         assert!(remote_shell_resolves_managed_install(
-            "/Users/can/.local/bin/flock\n"
+            "/Users/can/.local/bin/flk\n"
         ));
         assert!(!remote_shell_resolves_managed_install(
-            "/usr/local/bin/flock\n"
+            "/usr/local/bin/flk\n"
         ));
         assert!(!remote_shell_resolves_managed_install(""));
     }
 
     #[test]
     fn parse_switch_probe_reads_tab_delimited_fields() {
-        let stdout = "OS\tDarwin\nARCH\tarm64\nPATH\t/Users/can/.local/bin/flock\nPATHVER\tflock 0.6.0\nPATHSTATUS\t{\"protocol\":8}\n";
+        let stdout = "OS\tDarwin\nARCH\tarm64\nPATH\t/Users/can/.local/bin/flk\nPATHVER\tflk 0.6.0\nPATHSTATUS\t{\"protocol\":8}\n";
         let fields = parse_switch_probe(stdout);
         assert_eq!(fields.get("OS").map(String::as_str), Some("Darwin"));
         assert_eq!(fields.get("ARCH").map(String::as_str), Some("arm64"));
         assert_eq!(
             fields.get("PATH").map(String::as_str),
-            Some("/Users/can/.local/bin/flock")
+            Some("/Users/can/.local/bin/flk")
         );
-        assert_eq!(
-            fields.get("PATHVER").map(String::as_str),
-            Some("flock 0.6.0")
-        );
+        assert_eq!(fields.get("PATHVER").map(String::as_str), Some("flk 0.6.0"));
         // A missing section simply yields no entry — never a panic.
         assert!(!fields.contains_key("DEFVER"));
     }
 
     #[test]
     fn switch_probe_matches_requires_version_and_protocol() {
-        let good_version = format!("flock {}", current_version());
+        let good_version = format!("flk {}", current_version());
         let good_status = format!(r#"{{"protocol":{CURRENT_PROTOCOL}}}"#);
         assert!(switch_probe_matches(
             Some(&good_version),
@@ -2578,7 +2570,7 @@ mod tests {
 
         // Wrong version, stale protocol, and missing fields all reject.
         assert!(!switch_probe_matches(
-            Some(&"flock 0.0.1".to_string()),
+            Some(&"flk 0.0.1".to_string()),
             Some(&good_status)
         ));
         let stale_status = format!(r#"{{"protocol":{}}}"#, CURRENT_PROTOCOL + 1);
@@ -2981,7 +2973,7 @@ mod tests {
 
     #[test]
     fn launch_context_cli_allows_install_prompt() {
-        // The explicit `flock --remote <target>` path keeps its prompts:
+        // The explicit `flk --remote <target>` path keeps its prompts:
         // the user typed the command at a real shell and is making a
         // one-shot install/upgrade decision.
         assert!(LaunchContext::Cli.allows_install_prompt());

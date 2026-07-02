@@ -328,14 +328,14 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
-/// Default bind for `flock web` — loopback only, xterm.js port.
+/// Default bind for `flk web` — loopback only, xterm.js port.
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:7681";
 
-/// Default concurrent-session cap for `flock web` — a PTY-exhaustion backstop,
+/// Default concurrent-session cap for `flk web` — a PTY-exhaustion backstop,
 /// generous for a personal fleet. `0` disables the cap.
 pub const DEFAULT_WEB_MAX_SESSIONS: usize = 16;
 
-/// `flock web` configuration (ADR-0002 phase e). The web bridge previously
+/// `flk web` configuration (ADR-0002 phase e). The web bridge previously
 /// carried a parallel config universe (six `FLOCK_WEB_*` env reads + CLI
 /// flags, no file). This section folds every persistent knob into the real
 /// [`Config`], so the generic env layer, overlay deep-merge, and drift-proofing
@@ -347,7 +347,7 @@ pub const DEFAULT_WEB_MAX_SESSIONS: usize = 16;
 /// `FLOCK_<UPPER_SNAKE>` layer (ADR-0002 phase d). List-valued env vars
 /// (`FLOCK_WEB_ALLOWED_ORIGINS` / `FLOCK_WEB_ALLOWED_USERS`) keep CSV parsing
 /// as a documented web-only exception, applied only when the file leaves the
-/// list empty (see `flock web`'s arg parser).
+/// list empty (see `flk web`'s arg parser).
 ///
 /// CLI-only booleans (`--allow-non-loopback`, `--allow-funnel`,
 /// `--allow-any-origin`) are per-invocation overrides and are NOT modelled
@@ -359,7 +359,7 @@ pub struct WebSectionConfig {
     /// bad value surfaces via the arg parser's diagnostic. Empty falls back
     /// to [`DEFAULT_WEB_BIND`].
     pub bind: String,
-    /// Path to the `flock` binary to spawn per WS connection. Empty means
+    /// Path to the `flk` binary to spawn per WS connection. Empty means
     /// "the currently-running executable" (`current_exe()`).
     pub flock_bin: PathBuf,
     /// Session name forwarded to the spawned client as `--session <name>`.
@@ -723,7 +723,7 @@ pub struct PeerConfig {
     /// SSH destination used for polling and attach. Defaults to `name`.
     pub ssh: String,
     /// Command run on the peer to fetch its summary. The default wraps the
-    /// flock CLI in a login shell so profile-managed PATHs (nix, brew) apply.
+    /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
     pub summary_command: String,
     /// Optional per-peer override for the summary poll cadence (#96). Unset
     /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
@@ -745,7 +745,7 @@ impl Default for PeerConfig {
 }
 
 pub fn default_peer_summary_command() -> &'static str {
-    "sh -lc 'flock peers summary --json'"
+    "sh -lc 'flk peers summary --json'"
 }
 
 impl PeerConfig {

@@ -165,7 +165,7 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.cwd(cwd);
     cmd.env("XDG_CONFIG_HOME", config_home);
@@ -388,7 +388,7 @@ fn strip_focus_suffix(tail: &[u8]) -> &[u8] {
 #[test]
 fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -486,7 +486,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
 #[test]
 fn folded_remote_member_row_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -586,7 +586,7 @@ fn folded_remote_member_row_click_switches_server() {
 #[test]
 fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();

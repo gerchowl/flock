@@ -4118,7 +4118,7 @@ mod tests {
 
         let updates = state.handle_app_event(crate::events::AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(updates.is_empty());
@@ -4128,7 +4128,7 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `flock update`, then follow its restart guidance"
+            "detach, run `flk update`, then follow its restart guidance"
         );
     }
 
@@ -5328,7 +5328,7 @@ mod tests {
 
         let updates = state.handle_app_event(AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(updates.is_empty());
@@ -5340,7 +5340,7 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `flock update`, then follow its restart guidance"
+            "detach, run `flk update`, then follow its restart guidance"
         );
     }
 

@@ -27,7 +27,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
 
 fn server_stop(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock server stop");
+        eprintln!("usage: flk server stop");
         return Ok(2);
     }
 
@@ -36,7 +36,7 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock server reload-config");
+        eprintln!("usage: flk server reload-config");
         return Ok(2);
     }
 
@@ -49,7 +49,7 @@ fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
 fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     let Some(params) = parse_live_handoff_params(args) else {
         eprintln!(
-            "usage: flock server live-handoff [--import-exe <path>] [--expected-protocol <n>] [--expected-version <version>]"
+            "usage: flk server live-handoff [--import-exe <path>] [--expected-protocol <n>] [--expected-version <version>]"
         );
         return Ok(2);
     };
@@ -104,11 +104,11 @@ fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHandoffParams>
 }
 
 fn print_server_help() {
-    eprintln!("flock server commands:");
-    eprintln!("  flock server                run as headless server");
-    eprintln!("  flock server stop           stop the running server via the API socket");
-    eprintln!("  flock server live-handoff   hand off live panes to a new local server");
-    eprintln!("  flock server reload-config  reload config.toml in the running server");
+    eprintln!("flk server commands:");
+    eprintln!("  flk server                run as headless server");
+    eprintln!("  flk server stop           stop the running server via the API socket");
+    eprintln!("  flk server live-handoff   hand off live panes to a new local server");
+    eprintln!("  flk server reload-config  reload config.toml in the running server");
 }
 
 #[cfg(test)]
@@ -119,7 +119,7 @@ mod tests {
     fn live_handoff_params_parse_remote_update_fields() {
         let args = vec![
             "--import-exe".to_string(),
-            "/home/me/.local/bin/flock".to_string(),
+            "/home/me/.local/bin/flk".to_string(),
             "--expected-protocol=9".to_string(),
             "--expected-version".to_string(),
             "0.6.2".to_string(),
@@ -129,7 +129,7 @@ mod tests {
 
         assert_eq!(
             params.import_exe.as_deref(),
-            Some("/home/me/.local/bin/flock")
+            Some("/home/me/.local/bin/flk")
         );
         assert_eq!(params.expected_protocol, Some(9));
         assert_eq!(params.expected_version.as_deref(), Some("0.6.2"));

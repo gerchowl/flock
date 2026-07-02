@@ -123,7 +123,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
+        run: cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

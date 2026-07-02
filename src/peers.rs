@@ -30,7 +30,7 @@ pub const PEER_SLOW_LATENCY_MS: u64 = 150;
 /// the tracker to decide whether to spawn a fetch for each peer. Two guards:
 ///
 /// 1. **In-flight guard** — a peer whose previous poll has not completed
-///    (still-running SSH `flock peers summary`) is skipped this round. A slow
+///    (still-running SSH `flk peers summary`) is skipped this round. A slow
 ///    ProxyJump peer polled at a short cadence cannot stack concurrent SSH
 ///    invocations against itself, no matter what interval is set.
 /// 2. **Next-due guard** — a peer with a per-`[[peers]]` `poll_interval_secs`
@@ -375,12 +375,11 @@ pub fn run_checkout_prepare_command(
         return Err(format!("invalid workspace id: {workspace_id:?}"));
     }
     let push_flag = if push { " --push" } else { "" };
-    // The flock invocation is wrapped in a login shell so profile-managed PATHs
+    // The `flk` invocation is wrapped in a login shell so profile-managed PATHs
     // (nix, brew) apply — same shape as the default summary_command and the
     // prepare_peer_switch pre-focus call.
-    let remote = format!(
-        "sh -lc 'flock peers checkout-prepare --workspace {workspace_id}{push_flag} --json'"
-    );
+    let remote =
+        format!("sh -lc 'flk peers checkout-prepare --workspace {workspace_id}{push_flag} --json'");
     let stdout = run_peer_ssh(peer, &remote)?;
     parse_checkout_prepare_response(&stdout)
 }
@@ -425,7 +424,7 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
 }
 
 /// Fetch the tail of a peer's session logs over SSH for the cross-host log view
-/// (#67). Mirrors `run_checkout_prepare_command`: a login-shell `flock peers
+/// (#67). Mirrors `run_checkout_prepare_command`: a login-shell `flk peers
 /// logs --json` whose envelope we parse. `lines` is a bounded integer we format
 /// ourselves, so nothing user-controlled reaches the remote shell. Blocking; run
 /// off the UI thread.
@@ -433,7 +432,7 @@ pub fn run_logs_command(
     peer: &PeerConfig,
     lines: u32,
 ) -> Result<Vec<crate::logging::LogLine>, String> {
-    let remote = format!("sh -lc 'flock peers logs --json --lines {lines}'");
+    let remote = format!("sh -lc 'flk peers logs --json --lines {lines}'");
     let stdout = run_peer_ssh(peer, &remote)?;
     parse_logs_response(&stdout)
 }

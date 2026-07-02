@@ -71,7 +71,7 @@ pub(crate) fn derive_client_socket_from_api_socket(api_socket_path: &Path) -> Pa
 pub(crate) fn prepare_socket_path(path: &Path) -> io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
-            "flock server is already running (socket busy at {})",
+            "flk server is already running (socket busy at {})",
             path.display()
         )
     })

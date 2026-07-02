@@ -1,4 +1,4 @@
-//! Wire protocol for flock server/client communication.
+//! Wire protocol for flk server/client communication.
 //!
 //! Defines the message types, framing, version negotiation, and safety
 //! constraints for the binary protocol over Unix domain sockets.
@@ -605,7 +605,7 @@ pub enum ServerMessage {
     },
 
     /// A federated peer row was selected: the client should detach and
-    /// reattach to this SSH target (`flock --remote <ssh_target>`). The
+    /// reattach to this SSH target (`flk --remote <ssh_target>`). The
     /// client records the target for its launcher and exits like a detach.
     SwitchServer {
         /// SSH destination of the peer server, or [`HOME_SWITCH_TARGET`]
@@ -866,11 +866,11 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client protocol {client_version} is older than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock client (a running server keeps its old protocol until it is relaunched)"
+            "client protocol {client_version} is older than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flk client (a running server keeps its old protocol until it is relaunched)"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client protocol {client_version} is newer than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock server (a running server keeps its old protocol until it is relaunched)"
+            "client protocol {client_version} is newer than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flk server (a running server keeps its old protocol until it is relaunched)"
         ))
     }
 }

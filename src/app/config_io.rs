@@ -33,7 +33,7 @@ pub fn resolve_write_target() -> std::io::Result<PathBuf> {
         std::fs::write(
             &overlay,
             "# flock overlay -- deep-merged over config.toml: add new keys OR\n\
-             # override base-set scalars (overlay wins). See `flock config edit`.\n",
+             # override base-set scalars (overlay wins). See `flk config edit`.\n",
         )?;
     }
     Ok(overlay)
