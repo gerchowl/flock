@@ -21,8 +21,13 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
-    let filter =
-        EnvFilter::try_from_env("FLOCK_LOG").unwrap_or_else(|_| EnvFilter::new("flock=info"));
+    // Default filter covers both the crate's module_path (`flk`, the [[bin]]
+    // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
+    // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
+    // whose namespace stays `flock` as part of the logging identity. FLOCK_LOG
+    // overrides the whole directive if set.
+    let filter = EnvFilter::try_from_env("FLOCK_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("flk=info,flock=info"));
 
     // JSON lines on disk (logging redesign PR-2): structured fields survive as
     // real fields instead of being flattened into message strings, and the
