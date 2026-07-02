@@ -316,6 +316,7 @@ impl App {
 
         self.last_pane_click = None;
         if let Err(err) = crate::platform::open_url(&url) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             tracing::warn!(err = %err, url = %url, "failed to open pane URL");
         }
         true

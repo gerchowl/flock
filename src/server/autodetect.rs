@@ -74,6 +74,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
         }
         Err(err) => {
             // Other errors (permission denied, etc.) — assume not listening.
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "unexpected error checking server socket");
             false
         }
@@ -131,6 +132,7 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
         )
     })?;
 
+    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
     info!(exe = %exe.display(), "spawning server daemon");
 
     let mut command = build_server_daemon_command(exe);
@@ -180,6 +182,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 
     while std::time::Instant::now() < deadline {
         if is_server_listening_at(socket_path) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             info!(path = %socket_path.display(), "server socket ready");
             return Ok(());
         }
@@ -212,6 +215,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// 3. Run the thin client (which connects to the server)
 pub fn auto_detect_launch() -> io::Result<()> {
     let socket_path = client_socket_path();
+    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
     info!(path = %socket_path.display(), "auto-detect launch starting");
 
     if is_server_listening_at(&socket_path) {

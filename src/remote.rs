@@ -1577,6 +1577,7 @@ impl SshStdioBridge {
         let keepalive_ssh_config = if manage_ssh_config {
             write_keepalive_ssh_config()
                 .inspect_err(|err| {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     tracing::debug!(%err, "could not write ssh keepalive config; using plain ssh");
                 })
                 .ok()

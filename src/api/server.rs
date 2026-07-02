@@ -38,6 +38,7 @@ impl Drop for ServerHandle {
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
             }
         }
@@ -72,6 +73,7 @@ pub fn start_server_with_capabilities(
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
+    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
     info!(path = %path.display(), "api server listening");
 
     let running = Arc::new(AtomicBool::new(true));
@@ -92,11 +94,13 @@ pub fn start_server_with_capabilities(
                             &connection_running,
                             capabilities,
                         ) {
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             warn!(err = %err, "api connection failed");
                         }
                     });
                 }
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     error!(err = %err, "api listener accept failed");
                     break;
                 }
@@ -135,6 +139,7 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         debug!(err = %err, "api connection write timeout unavailable");
     }
 

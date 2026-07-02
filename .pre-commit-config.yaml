@@ -33,6 +33,16 @@ repos:
         entry: guardrails-no-commented-code
         language: system
         pass_filenames: true
+      # Raw ?/% Debug/Display field formatters splat arbitrary values into the
+      # audit trail — the reflexive way PII/secrets leak. Deliberate shaping is
+      # confined to the schema surface (src/logging.rs, the tracing facade).
+      # The 209 pre-existing sites carry guardrails-ok(no-raw-trace-fields)
+      # markers (scripts/mark_trace_fields.py); burn-down census: docs/DEBT.md.
+      - id: no-raw-trace-fields
+        name: "no raw ?/% fields in tracing macros — shape in logging.rs"
+        entry: env GUARDRAILS_TRACE_ALLOW_GLOBS=*/logging.rs guardrails-no-raw-trace-fields
+        language: system
+        pass_filenames: true
       # Deterministic, no escape hatch by design: a conflicted merge CAN be
       # committed (git records it and `git status` is clean afterwards).
       - id: no-conflict-markers

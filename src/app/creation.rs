@@ -61,6 +61,7 @@ impl App {
             .and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
         let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
         if let Err(e) = self.create_workspace_with_options(initial_cwd, true) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             error!(err = %e, "failed to create workspace");
             self.state.mode = Mode::Navigate;
         }
@@ -96,6 +97,7 @@ impl App {
                 }
             }
             Err(e) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 error!(err = %e, "failed to create tab");
             }
         }
@@ -138,6 +140,7 @@ impl App {
                 self.schedule_session_save();
             }
             Err(e) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 error!(err = %e, "failed to create sibling workspace");
             }
         }

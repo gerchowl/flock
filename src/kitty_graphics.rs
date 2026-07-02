@@ -171,6 +171,7 @@ pub(crate) fn encode_local_pane_graphics(
         cell_ok,
         cell_width_px = cell_size.width_px,
         cell_height_px = cell_size.height_px,
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         active = ?app.active,
         pane_infos_len = app.view.pane_infos.len(),
         "paint_local_pane_graphics entry"
@@ -272,6 +273,7 @@ fn encode_graphics_update(
     for placement in placements {
         let clipped = clipped_placement(placement);
         tracing::debug!(
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             pane_id = ?placement.pane_id,
             has_clipped = clipped.is_some(),
             grid_cols = placement.placement.render.grid_cols,
@@ -455,6 +457,7 @@ fn collect_visible_placements(
         let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             Some(rt) => rt,
             None => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 tracing::debug!(pane_id = ?info.id, "collect_visible_placements: runtime not found");
                 continue;
             }

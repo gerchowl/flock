@@ -208,6 +208,7 @@ impl App {
                     // logs`): shows exactly what each poll applied (#4, #67).
                     tracing::debug!(
                         target: "flock::peers",
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         peer = %summary.peer,
                         host = summary.host.as_deref().unwrap_or(""),
                         has_system = summary.system.is_some(),
@@ -510,7 +511,9 @@ impl App {
             if let Ok(backup_content) = std::fs::read_to_string(&backup) {
                 if let Err(err) = std::fs::write(&target, backup_content) {
                     tracing::warn!(
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         target = %target.display(),
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         err = %err,
                         "config edit rollback write failed"
                     );
@@ -577,7 +580,9 @@ impl App {
             Err(err) => {
                 tracing::warn!(
                     pane = pane_id.raw(),
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     terminal = %terminal_id,
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     err = %err,
                     "failed to respawn shell after launch command exited"
                 );

@@ -3108,6 +3108,7 @@ impl AppState {
             }
             if terminal.evict_session_ref(session_ref) {
                 tracing::info!(
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     terminal_id = ?terminal_id,
                     "evicted duplicate agent session ref"
                 );

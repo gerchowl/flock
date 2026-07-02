@@ -118,6 +118,7 @@ pub fn load() -> Option<SessionSnapshot> {
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "failed to read session file");
             return None;
         }
@@ -135,6 +136,7 @@ pub fn load() -> Option<SessionSnapshot> {
                     return None;
                 }
             }
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "failed to parse session file, ignoring");
             None
         }
@@ -149,6 +151,7 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(err) => {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "failed to read session history file");
             return None;
         }
@@ -166,6 +169,7 @@ pub fn load_history() -> Option<SessionHistorySnapshot> {
                     return None;
                 }
             }
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(err = %err, "failed to parse session history file, ignoring");
             None
         }

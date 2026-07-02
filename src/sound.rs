@@ -41,6 +41,7 @@ pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
             match play_file(&path) {
                 Ok(()) => return,
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(path = %path.display(), sound = ?sound, err = %err, "custom sound playback failed, falling back to built-in sound")
                 }
             }
@@ -53,6 +54,7 @@ pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
         };
 
         if let Err(err) = play_bytes(data) {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             warn!(sound = ?sound, err = %err, "sound playback failed");
         }
     });

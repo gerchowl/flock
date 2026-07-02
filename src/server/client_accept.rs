@@ -21,6 +21,7 @@ pub(crate) fn accept_pending_client_connections(
                 *next_client_id = next_client_id.saturating_add(1);
 
                 if let Err(err) = stream.set_nonblocking(true) {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(err = %err, "failed to set client stream nonblocking");
                     continue;
                 }
@@ -34,12 +35,14 @@ pub(crate) fn accept_pending_client_connections(
                         &server_event_tx,
                         &should_quit,
                     ) {
+                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                         debug!(client_id, err = %err, "client handshake failed");
                     }
                 });
             }
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 error!(err = %err, "client listener accept failed");
                 break;
             }
@@ -62,6 +65,7 @@ pub(crate) fn reject_pending_client_connections(listener: &UnixListener) -> io::
             Ok((stream, _addr)) => send_live_handoff_refusal(stream),
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 error!(err = %err, "client listener reject failed");
                 break;
             }
@@ -84,6 +88,7 @@ fn send_live_handoff_refusal(mut stream: std::os::unix::net::UnixStream) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
     if let Err(err) = crate::protocol::write_message(&mut stream, &welcome) {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         debug!(err = %err, "failed to send live-handoff refusal to pending client");
     }
 }

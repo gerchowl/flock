@@ -573,6 +573,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
                 "downloaded update checksum verification failed: {e}"
             ));
         }
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::info!(sha256 = %expected, "downloaded update checksum verified");
     }
 
@@ -1930,6 +1931,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         confirm_running_server_update_action(running_server_plans, &release, options)?;
 
     if let Some(commit) = &release.commit {
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         tracing::info!(commit = %commit, build_id = ?release.build_id, "selected preview update build");
     }
     eprintln!("downloading {}...", release.label());

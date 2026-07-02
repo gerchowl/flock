@@ -202,6 +202,7 @@ pub fn raise_server_nofile_limit() {
         Ok(Some((previous, target))) => {
             tracing::info!(previous, target, "raised server file descriptor soft limit")
         }
+        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
         Err(err) => tracing::warn!(err = %err, "failed to raise server file descriptor limit"),
     }
 }

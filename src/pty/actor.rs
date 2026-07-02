@@ -307,6 +307,7 @@ impl PtyIoActorHandle {
 
     fn wake_actor(&self) {
         if let Err(err) = self.wake.wake() {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             debug!(err = %err, "failed to wake PTY actor");
         }
     }
@@ -420,6 +421,7 @@ impl PtyIoActorRunner {
                 Ok(readiness) => {
                     if readiness.wake_ready {
                         if let Err(err) = fd::drain_wake_fd(self.wake_read_fd.as_raw_fd()) {
+                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                             debug!(pane = self.pane_id, err = %err, "PTY actor wake drain failed");
                             break;
                         }
@@ -436,6 +438,7 @@ impl PtyIoActorRunner {
                     }
                 }
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     debug!(pane = self.pane_id, err = %err, "PTY actor poll failed");
                     break;
                 }
@@ -607,6 +610,7 @@ impl PtyIoActorRunner {
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
             Err(err) => {
+                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                 debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
                 false
             }
@@ -643,6 +647,7 @@ impl PtyIoActorRunner {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
+                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
                     self.pending_writes.clear();
                     self.current_write_offset = 0;
@@ -711,6 +716,7 @@ impl PtyIoActorRunner {
 
     fn log_resize_result(&self, result: std::io::Result<()>) {
         if let Err(err) = result {
+            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
             debug!(pane = self.pane_id, err = %err, "PTY resize failed");
         }
     }
