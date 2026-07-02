@@ -590,8 +590,6 @@ impl App {
             sidebar_min_width,
             sidebar_max_width,
             mobile_width_threshold: config.ui.mobile_width_threshold,
-            sidebar_row_gap: crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap),
-            sidebar_pane_gap: crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap),
             prompt_float_lines: crate::config::validated_prompt_float_lines(
                 config.ui.prompt_float_lines,
             ),
@@ -1322,10 +1320,6 @@ impl App {
                 self.state.sidebar_min_width = config.ui.sidebar_min_width;
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;
-                self.state.sidebar_row_gap =
-                    crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap);
-                self.state.sidebar_pane_gap =
-                    crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap);
                 self.state.prompt_float_lines =
                     crate::config::validated_prompt_float_lines(config.ui.prompt_float_lines);
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
@@ -2462,7 +2456,7 @@ mod tests {
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::DEFAULT_SIDEBAR_PANE_GAP
         );
 
@@ -2476,7 +2470,7 @@ sidebar_pane_gap = 2
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_pane_gap, 2);
+        assert_eq!(app.state.sidebar_pane_gap(), 2);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(
@@ -2490,7 +2484,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::MAX_SIDEBAR_PANE_GAP
         );
 
@@ -2507,7 +2501,7 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::DEFAULT_SIDEBAR_ROW_GAP
         );
 
@@ -2515,7 +2509,7 @@ sidebar_pane_gap = 99
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_row_gap, 0);
+        assert_eq!(app.state.sidebar_row_gap(), 0);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(&path, "[ui]\nsidebar_row_gap = 9\n").unwrap();
@@ -2523,7 +2517,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::MAX_SIDEBAR_ROW_GAP
         );
 

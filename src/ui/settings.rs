@@ -515,8 +515,8 @@ mod tests {
     #[test]
     fn sidebar_section_renders_gap_steppers_with_current_values() {
         let mut app = AppState::test_new();
-        app.sidebar_row_gap = 1;
-        app.sidebar_pane_gap = 2;
+        app.config.ui.sidebar_row_gap = 1;
+        app.config.ui.sidebar_pane_gap = 2;
         app.settings.section = SettingsSection::Sidebar;
         app.settings.list.selected = 0;
         app.mode = Mode::Settings;

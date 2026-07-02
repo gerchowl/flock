@@ -582,7 +582,7 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     let body = workspace_list_body_rect(ws_area, false, app.sidebar_new_entry_visible());
@@ -1211,7 +1211,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1227,7 +1227,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 row_height.saturating_add(gap)
             }
@@ -1235,7 +1235,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1311,7 +1311,7 @@ fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap);
+    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap());
     let total_rows = agent_panel_entries(app).len();
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
@@ -1347,7 +1347,7 @@ pub(crate) fn compute_workspace_list_areas(
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     if ws_area == Rect::default() {
@@ -1381,7 +1381,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
@@ -1404,7 +1404,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
                     break;
@@ -1424,7 +1424,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
@@ -1496,7 +1496,8 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area, app.sidebar_pane_gap);
+    let (ws_area, divider_y, detail_area) =
+        collapsed_sidebar_sections(area, app.sidebar_pane_gap());
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, area, true, p);
         return;
@@ -1657,7 +1658,7 @@ pub(super) fn render_sidebar(
     }
 
     let (ws_area, detail_area) =
-        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
 
     let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(app));
     if servers_area != Rect::default() {
@@ -1689,7 +1690,7 @@ pub(crate) fn compute_server_section_areas(
     area: Rect,
 ) -> (Rect, Vec<crate::app::state::ServerCardArea>) {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -1723,7 +1724,7 @@ pub(crate) fn server_band_slot_at(
     row: u16,
 ) -> Option<Option<crate::app::state::PeerSwitchRequest>> {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -2747,7 +2748,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     }
     let p = &app.palette;
-    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
     if divider != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -2757,7 +2758,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
             divider,
         );
     }
-    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
     if row == Rect::default() {
         return;
     }
@@ -2883,7 +2884,7 @@ fn render_agent_detail(
         row_y += 1;
 
         if row_y < body_bottom {
-            row_y = row_y.saturating_add(app.sidebar_row_gap);
+            row_y = row_y.saturating_add(app.sidebar_row_gap());
         }
     }
 
@@ -3317,7 +3318,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
 
@@ -3369,19 +3370,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         // The menu is a standalone row pinned to the sidebar's last row…
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         assert_eq!(row.y, area.y + area.height - 1);
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // …separated above by the hairline divider idiom.
-        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
         for x in divider.x..divider.x + divider.width {
             assert_eq!(buffer[(x, divider.y)].symbol(), "─", "col {x}");
         }
 
         // The spaces footer hosts only `new` now — no mid-field menu.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let footer_text = buffer_row_text(buffer, ws_rect, ws_rect.y + ws_rect.height - 1);
         assert!(footer_text.contains("new"), "{footer_text:?}");
         assert!(!footer_text.contains("menu"), "{footer_text:?}");
@@ -3412,12 +3414,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!all_text.contains("new"), "{all_text}");
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // The spaces list reclaims the footer row.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let body_tabs = workspace_list_body_rect(ws_rect, false, true);
         let body_workspace = workspace_list_body_rect(ws_rect, false, false);
         assert_eq!(body_workspace.height, body_tabs.height + 1);
@@ -4272,7 +4275,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)
@@ -4489,7 +4492,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4552,7 +4555,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let long_rect = server_slot_rect(rows_area, 1).expect("long-name peer slot");
@@ -4604,7 +4607,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4647,7 +4650,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let self_rect = server_slot_rect(server_band_rows_area(servers_area), 0).expect("self");
         // Quadrant fallback with a single (muted) ring: a solid rectangle.
@@ -5600,7 +5603,7 @@ mod tests {
             "default gap is one blank row"
         );
 
-        app.sidebar_row_gap = 0;
+        app.config.ui.sidebar_row_gap = 0;
         let (cards, _, _) = compute_workspace_list_areas(&app, area);
         assert_eq!(
             cards[1].rect.y,
@@ -5937,7 +5940,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)

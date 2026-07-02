@@ -1302,8 +1302,8 @@ impl SidebarGapSetting {
 
     pub(crate) fn value(self, state: &AppState) -> u16 {
         match self {
-            Self::RowGap => state.sidebar_row_gap,
-            Self::PaneGap => state.sidebar_pane_gap,
+            Self::RowGap => state.sidebar_row_gap(),
+            Self::PaneGap => state.sidebar_pane_gap(),
         }
     }
 
@@ -1867,10 +1867,6 @@ pub struct AppState {
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
     pub mobile_width_threshold: u16,
-    /// Blank rows between sidebar list entries (workspaces and agents).
-    pub sidebar_row_gap: u16,
-    /// Blank columns on each side of the sidebar/pane divider.
-    pub sidebar_pane_gap: u16,
     /// Max height of the prompt section in the pane header. 0 = context only.
     pub prompt_float_lines: u16,
     /// Auto-collapse every sidebar worktree group except the focused one.
@@ -2159,6 +2155,18 @@ impl AppState {
 
     pub fn sound_enabled(&self) -> bool {
         self.config.ui.sound.enabled
+    }
+
+    /// Blank rows between sidebar list entries, clamped to the supported
+    /// range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_row_gap(&self) -> u16 {
+        crate::config::validated_sidebar_row_gap(self.config.ui.sidebar_row_gap)
+    }
+
+    /// Blank columns on each side of the sidebar/pane divider, clamped to
+    /// the supported range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_pane_gap(&self) -> u16 {
+        crate::config::validated_sidebar_pane_gap(self.config.ui.sidebar_pane_gap)
     }
 
     /// The live `SoundConfig` used by the notification playback path.
@@ -2466,8 +2474,6 @@ impl AppState {
             sidebar_min_width: 18,
             sidebar_max_width: 36,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
-            sidebar_row_gap: crate::config::DEFAULT_SIDEBAR_ROW_GAP,
-            sidebar_pane_gap: crate::config::DEFAULT_SIDEBAR_PANE_GAP,
             prompt_float_lines: crate::config::DEFAULT_PROMPT_FLOAT_LINES,
             auto_collapse_groups: false,
             tab_mode: crate::config::TabModeConfig::Tabs,
@@ -2571,6 +2577,26 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn sidebar_gaps_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the Sidebar section renders steppers off
+        // `state.config.ui.sidebar_row_gap` / `.sidebar_pane_gap` (validated).
+        let mut state = AppState::test_new();
+        state.config.ui.sidebar_row_gap = 2;
+        state.config.ui.sidebar_pane_gap = 3;
+        assert_eq!(state.sidebar_row_gap(), 2);
+        assert_eq!(state.sidebar_pane_gap(), 3);
+
+        // Out-of-range values clamp via the config validator.
+        state.config.ui.sidebar_row_gap = 99;
+        state.config.ui.sidebar_pane_gap = 99;
+        assert_eq!(state.sidebar_row_gap(), crate::config::MAX_SIDEBAR_ROW_GAP);
+        assert_eq!(
+            state.sidebar_pane_gap(),
+            crate::config::MAX_SIDEBAR_PANE_GAP
+        );
+    }
 
     #[test]
     fn sound_enabled_reads_from_state_config_not_mirror_field() {

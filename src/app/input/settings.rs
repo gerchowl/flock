@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(action, Some(SettingsAction::SaveSidebarRowGap(2)));
 
         // At the max the cycle wraps back to 0.
-        state.sidebar_row_gap = crate::config::MAX_SIDEBAR_ROW_GAP;
+        state.config.ui.sidebar_row_gap = crate::config::MAX_SIDEBAR_ROW_GAP;
         let action = update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
@@ -876,7 +876,7 @@ mod tests {
         );
         assert_eq!(action, Some(SettingsAction::SaveSidebarPaneGap(1)));
 
-        state.sidebar_pane_gap = crate::config::MAX_SIDEBAR_PANE_GAP;
+        state.config.ui.sidebar_pane_gap = crate::config::MAX_SIDEBAR_PANE_GAP;
         let action = update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),

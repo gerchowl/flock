@@ -21,7 +21,7 @@ impl AppState {
         crate::ui::workspace_list_rect(
             sidebar,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
             crate::ui::servers_section_height(self),
         )
     }
@@ -34,7 +34,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             sidebar,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         detail_area
     }
@@ -214,7 +214,7 @@ impl AppState {
         if self.sidebar_collapsed {
             return Rect::default();
         }
-        crate::ui::sidebar_menu_row_rect(self.view.sidebar_rect, self.sidebar_pane_gap)
+        crate::ui::sidebar_menu_row_rect(self.view.sidebar_rect, self.sidebar_pane_gap())
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
@@ -290,7 +290,7 @@ impl AppState {
         let width = divider_col
             .saturating_sub(sidebar.x)
             .saturating_add(1)
-            .saturating_sub(self.sidebar_pane_gap);
+            .saturating_sub(self.sidebar_pane_gap());
         self.sidebar_width = width.clamp(self.sidebar_min_width, self.sidebar_max_width);
         self.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
         self.mark_session_dirty();
@@ -303,7 +303,7 @@ impl AppState {
         let rect = crate::ui::sidebar_section_divider_rect(
             self.view.sidebar_rect,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         rect.width > 0
             && col >= rect.x
@@ -363,7 +363,7 @@ impl AppState {
         }
 
         let (ws_area, _, _) =
-            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap);
+            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap());
         if ws_area == Rect::default() || row < ws_area.y || row >= ws_area.y + ws_area.height {
             return None;
         }
@@ -399,7 +399,7 @@ impl AppState {
         }
 
         let (_, _, detail_area) =
-            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap);
+            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap());
         let detail_content_area = Rect::new(
             detail_area.x,
             detail_area.y,
@@ -491,7 +491,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             self.view.sidebar_rect,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         // Row 0 is the section divider; the ` agents` header sits below it.
         if detail_area.width == 0 || detail_area.height < 2 {
@@ -627,7 +627,7 @@ impl AppState {
             }
             row_y = row_y.saturating_add(1);
             if row_y < body.y + body.height {
-                row_y = row_y.saturating_add(self.sidebar_row_gap);
+                row_y = row_y.saturating_add(self.sidebar_row_gap());
             }
         }
         None
@@ -886,7 +886,7 @@ mod tests {
             detail_area,
             crate::ui::should_show_scrollbar(metrics),
         );
-        let second_row = body.y + 1 + app.state.sidebar_row_gap;
+        let second_row = body.y + 1 + app.state.sidebar_row_gap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             2,
@@ -951,7 +951,7 @@ mod tests {
         assert_eq!(app.state.agent_detail_target_at(body.y + 1), None);
 
         // Gap 0: rows pack, second entry starts at body.y + 1.
-        app.state.sidebar_row_gap = 0;
+        app.state.config.ui.sidebar_row_gap = 0;
         assert_eq!(app.state.agent_detail_target_at(body.y + 1), Some(second));
     }
 
@@ -967,7 +967,7 @@ mod tests {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
         let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope);
         app.handle_mouse(mouse(
@@ -1213,7 +1213,7 @@ mod tests {
             detail_area,
             crate::ui::should_show_scrollbar(metrics),
         );
-        let second_row = body.y + 1 + app.state.sidebar_row_gap;
+        let second_row = body.y + 1 + app.state.sidebar_row_gap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             body.x + 2,
@@ -1382,7 +1382,7 @@ mod tests {
 
         let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(
             app.state.view.sidebar_rect,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -2000,7 +2000,7 @@ mod tests {
         let divider = crate::ui::sidebar_section_divider_rect(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
 
         app.handle_mouse(mouse(
