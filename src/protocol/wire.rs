@@ -50,7 +50,13 @@ use serde::{Deserialize, Serialize};
 /// capture time that does not accumulate the receiver's dwell clock. Kills the
 /// 60s-dwell ghost cliff on carried snapshot entries. Additive with
 /// `#[serde(default)]`; positional wire so a deliberate bump is required.
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// v23: `FleetPeer.proxy_jump` and `SwitchServer.proxy_jump` (#101 gossip v3,
+/// part 3). Snapshot-derived rows carry the hub's SSH-reachable identity so
+/// the client's next-leg bridge dials `ssh -o ProxyJump=<hub> <target>`,
+/// reaching peers the launcher's box cannot dial directly. Additive with
+/// `#[serde(default)]`; positional wire so a deliberate bump is required.
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -170,6 +176,14 @@ pub struct FleetPeer {
     /// receiver falls back to the pre-v22 age-plus-dwell staleness path.
     #[serde(default)]
     pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for a client dialing
+    /// this peer from OUTSIDE the hub's LAN. The HUB stamps this as its own
+    /// short host name when it emits a snapshot; the client's next-leg
+    /// bridge appends `-o ProxyJump=<value>` to `ssh` so the dial reaches
+    /// peers the launcher's box cannot see directly. `None` for entries the
+    /// client can dial straight (its config peers, or the hub itself).
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
 }
 
 /// Bincode-safe mirror of `api::schema::PeerSystemSummary`. The schema type
@@ -636,6 +650,13 @@ pub enum ServerMessage {
         /// for plain switches.
         #[serde(default)]
         focus_workspace: Option<String>,
+        /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching
+        /// `ssh_target`. Set for snapshot-derived rows (peers only reachable
+        /// via THIS hub); `None` for config-owned peers the client already
+        /// has a direct route to. The launcher's ssh bridge appends `-o
+        /// ProxyJump=<value>` when set.
+        #[serde(default)]
+        proxy_jump: Option<String>,
     },
 }
 
@@ -1057,6 +1078,7 @@ mod tests {
                 age_secs: Some(5),
                 error: None,
                 origin_last_ok_secs: Some(5),
+                proxy_jump: Some("mba22".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
                 name: "mba22".to_owned(),
@@ -1086,6 +1108,7 @@ mod tests {
                 age_secs: Some(0),
                 error: None,
                 origin_last_ok_secs: Some(0),
+                proxy_jump: None,
             })),
         }
     }
@@ -1149,6 +1172,7 @@ mod tests {
             ssh_target: "lars@sage".to_owned(),
             fleet: Some(sample_fleet_snapshot()),
             focus_workspace: Some("ws_3".to_owned()),
+            proxy_jump: Some("hub".to_owned()),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
@@ -1635,7 +1659,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 22;
+    const PINNED_PROTOCOL_VERSION: u32 = 23;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1777,6 +1801,7 @@ mod tests {
                     // nested FleetSnapshot / FleetPeer wire shape (#58).
                     fleet: Some(sample_fleet_snapshot()),
                     focus_workspace: None,
+                    proxy_jump: None,
                 },
             ),
         ]
@@ -1855,7 +1880,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x1c240aaca2be1b67),
+            ("SwitchServer", 0x6d4496489f6d128f),
         ];
 
         if actual.as_slice() != GOLDEN {

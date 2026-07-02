@@ -251,6 +251,12 @@ pub struct RecordedSwitch {
     /// `workspace focus` against the local server post-attach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_workspace: Option<String>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for a snapshot-derived
+    /// target the launcher's box cannot dial directly. `None` for config peers
+    /// and home switches. Rides via `-o ProxyJump=<value>` on the next-leg
+    /// bridge dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
 }
 
 /// Set while this client is exiting to hand off to a pre-connected next leg
@@ -413,6 +419,7 @@ fn record_switch_target(
     ssh_target: &str,
     fleet: Option<&protocol::FleetSnapshot>,
     focus_workspace: Option<&str>,
+    proxy_jump: Option<&str>,
 ) -> bool {
     let Ok(path) = std::env::var(SWITCH_FILE_ENV_VAR) else {
         return false;
@@ -424,6 +431,7 @@ fn record_switch_target(
         target: ssh_target.to_string(),
         fleet: fleet.cloned(),
         focus_workspace: focus_workspace.map(str::to_string),
+        proxy_jump: proxy_jump.map(str::to_string),
     };
     let Ok(json) = serde_json::to_string(&payload) else {
         return false;
@@ -444,6 +452,7 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
         target,
         fleet: None,
         focus_workspace: None,
+        proxy_jump: None,
     })
 }
 
@@ -1977,6 +1986,7 @@ async fn run_client_loop(
                         ssh_target,
                         fleet,
                         focus_workspace,
+                        proxy_jump,
                     } => {
                         // #43: time the switch from request to first painted frame.
                         let switch_received = Instant::now();
@@ -2054,6 +2064,7 @@ async fn run_client_loop(
                                         geometry,
                                         negotiated_encoding,
                                         fleet.clone(),
+                                        proxy_jump.clone(),
                                         event_tx.clone(),
                                     );
                                     if let Some(p) = pending_switch.as_ref() {
@@ -2101,6 +2112,7 @@ async fn run_client_loop(
                             &ssh_target,
                             fleet.as_ref(),
                             focus_workspace.as_deref(),
+                            proxy_jump.as_deref(),
                         ) {
                             // Hold the alternate screen across the handoff so the
                             // host shell never flashes between legs (#63).
@@ -2929,7 +2941,15 @@ fn spawn_warm_bridge_dial(
     requested_encoding: RenderEncoding,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    spawn_switch_dial(gen, target, geometry, requested_encoding, None, event_tx);
+    spawn_switch_dial(
+        gen,
+        target,
+        geometry,
+        requested_encoding,
+        None,
+        None,
+        event_tx,
+    );
 }
 
 /// Spawn an on-demand SWITCH dial for a cold slot (#93). Targets with a live
@@ -2948,6 +2968,10 @@ fn spawn_switch_dial(
     // The hub's snapshot from the SwitchServer message -- carried into the
     // spoke's handshake so it renders the servers band / home row (#102).
     fleet: Option<protocol::FleetSnapshot>,
+    // Gossip v3 (#101 part 3): snapshot-derived rows carry the hub's
+    // ProxyJump identity so the cold-dial bridge reaches peers only
+    // routable via the hub. `None` for direct dials.
+    proxy_jump: Option<String>,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     std::thread::spawn(move || {
@@ -2988,9 +3012,11 @@ fn spawn_switch_dial(
                             io::Error::other("home slot has no socket path"),
                         )),
                         slots::SlotTarget::Ssh(t) => {
-                            let (bridge, sock) =
-                                crate::remote::start_switch_bridge_noninteractive(t)
-                                    .map_err(ClientError::ConnectionFailed)?;
+                            let (bridge, sock) = crate::remote::start_switch_bridge_noninteractive(
+                                t,
+                                proxy_jump.as_deref(),
+                            )
+                            .map_err(ClientError::ConnectionFailed)?;
                             // The bridge listener may need a moment to be ready
                             // (it binds synchronously, but ssh dial latency hides
                             // here on first connect). Retry briefly on connect
@@ -3817,6 +3843,7 @@ mod tests {
                 age_secs: Some(7),
                 error: None,
                 origin_last_ok_secs: Some(7),
+                proxy_jump: None,
             }],
             origin_summary: None,
         };
@@ -3824,6 +3851,7 @@ mod tests {
             target: "lars@sage".to_string(),
             fleet: Some(fleet),
             focus_workspace: None,
+            proxy_jump: None,
         };
         std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
         let taken = take_switch_target(&path).expect("switch recorded");
@@ -3836,6 +3864,7 @@ mod tests {
             target: protocol::HOME_SWITCH_TARGET.to_string(),
             fleet: None,
             focus_workspace: None,
+            proxy_jump: None,
         };
         std::fs::write(&path, serde_json::to_string(&home).unwrap()).unwrap();
         let taken = take_switch_target(&path).expect("home switch recorded");
@@ -4005,6 +4034,7 @@ mod tests {
             (90, 30, 8, 16),
             RenderEncoding::SemanticFrame,
             Some(hub.clone()),
+            None,
             event_tx,
         );
 

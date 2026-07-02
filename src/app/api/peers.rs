@@ -53,6 +53,10 @@ impl App {
                     // polled peers, so the origin's assertion is our
                     // last-successful-poll age at emission time.
                     origin_last_ok_secs: age_secs,
+                    // Gossip v3 (#101 part 3): we ARE the reachable identity
+                    // for peers we polled directly — a receiver dialing
+                    // these needs `-o ProxyJump=<us>` to reach them.
+                    proxy_jump: Some(origin.clone()),
                 }
             })
             .collect()
@@ -154,6 +158,9 @@ impl App {
             error: None,
             // We ARE the origin for our own summary — stamped fresh at switch.
             origin_last_ok_secs: Some(0),
+            // The client dials home directly via the reserved sentinel — no
+            // ProxyJump involved.
+            proxy_jump: None,
         }
     }
 }
@@ -177,6 +184,9 @@ fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer 
         // Prefer the explicit origin field; fall back to age_secs so a v(N-1)
         // origin's implicit freshness assertion still rides the snapshot wire.
         origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
+        // The polling peer stamped its own reachable identity — carry it
+        // through so the client's next-hop bridge can ProxyJump.
+        proxy_jump: entry.proxy_jump.clone(),
     }
 }
 
@@ -204,6 +214,11 @@ pub(crate) struct PreparedServerSwitch {
     /// home with that space focused. The launcher carries it through the
     /// switch file and fires `workspace focus` against the local server.
     pub(crate) focus_workspace: Option<String>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching
+    /// `ssh_target` — set only for snapshot-derived rows the launcher cannot
+    /// dial directly. `None` for a config peer the launcher already has a
+    /// route to. The bridge appends `-o ProxyJump=<value>` when set.
+    pub(crate) proxy_jump: Option<String>,
 }
 
 impl App {
@@ -224,18 +239,27 @@ impl App {
                     label,
                     fleet,
                     focus_workspace: None,
+                    // Config peer: launcher's box already has a direct SSH
+                    // route (that's the definition of a `[[peers]]` entry).
+                    proxy_jump: None,
                 })
             }
             PeerSwitchRequest::SnapshotPeer { entry_idx } => {
                 let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
                 let ssh_target = entry.ssh_target.clone();
                 let label = entry.display_name().to_string();
+                // Gossip v3 (#101 part 3): the snapshot entry was stamped by
+                // the hub that emitted it — use its ProxyJump identity so the
+                // client dials via that hub instead of trying `ssh_target`
+                // directly. `None` if the entry pre-dates v3.
+                let proxy_jump = entry.proxy_jump.clone();
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
                     label,
                     fleet,
                     focus_workspace: None,
+                    proxy_jump,
                 })
             }
             PeerSwitchRequest::OriginWorkspace { ws_idx } => {
@@ -251,6 +275,7 @@ impl App {
                     label,
                     fleet: None,
                     focus_workspace,
+                    proxy_jump: None,
                 })
             }
             PeerSwitchRequest::Home => {
@@ -260,6 +285,7 @@ impl App {
                     label: format!("{origin} (home)"),
                     fleet: None,
                     focus_workspace: None,
+                    proxy_jump: None,
                 })
             }
         }
@@ -276,12 +302,21 @@ impl App {
             Some(snapshot) => snapshot.to_wire(exclude_ssh_target),
             None => {
                 let origin = short_host_name();
+                // Gossip v3 (#101 part 3): stamp our own reachable identity
+                // on every peer we emit — the client's next-leg bridge uses
+                // it as `-o ProxyJump=<origin>` to reach peers only routable
+                // through this hub.
+                let stamp_proxy_jump = |mut peer: crate::protocol::FleetPeer| {
+                    peer.proxy_jump.get_or_insert_with(|| origin.clone());
+                    peer
+                };
                 let mut peers: Vec<crate::protocol::FleetPeer> = self
                     .state
                     .peer_summaries
                     .iter()
                     .filter(|peer| peer.ssh_target != exclude_ssh_target)
                     .map(crate::peers::peer_to_wire)
+                    .map(stamp_proxy_jump)
                     .collect();
                 // Gossip v3 (#101): merge relayed entries so a spoke attaching
                 // to this hub sees the FULL fleet, not just this hub's direct
@@ -316,7 +351,7 @@ impl App {
                     {
                         continue;
                     }
-                    peers.push(relayed_peer_to_wire(entry));
+                    peers.push(stamp_proxy_jump(relayed_peer_to_wire(entry)));
                 }
                 crate::protocol::FleetSnapshot {
                     origin,
@@ -522,6 +557,7 @@ mod tests {
             last_ok: Some(std::time::Instant::now()),
             error: None,
             origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -677,6 +713,7 @@ mod tests {
                 error: None,
                 origin: "anvil".into(),
                 origin_last_ok_secs: Some(4),
+                proxy_jump: Some("anvil".into()),
             },
         );
 
@@ -728,6 +765,7 @@ mod tests {
                 error: None,
                 origin: "anvil".into(),
                 origin_last_ok_secs: Some(3),
+                proxy_jump: Some("anvil".into()),
             },
         );
 
@@ -783,6 +821,7 @@ mod tests {
                         // echoed us as its own origin. Must be dropped.
                         origin: self_host.clone(),
                         origin_last_ok_secs: Some(1),
+                        proxy_jump: Some(self_host.clone()),
                     }],
                 }),
             },

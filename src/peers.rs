@@ -148,6 +148,11 @@ pub struct PeerSummaryState {
     /// polled config peers, where `last_ok` (a real Instant) carries the
     /// freshness and staleness falls back to the local-dwell path.
     pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
+    /// peer. Set by the hub on relay so a receiver dialing a snapshot row
+    /// routes through the hub instead of trying the target directly. `None`
+    /// for entries the receiver can dial straight (its own config peers).
+    pub proxy_jump: Option<String>,
 }
 
 impl PeerSummaryState {
@@ -164,6 +169,7 @@ impl PeerSummaryState {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -308,6 +314,7 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         origin_last_ok_secs: peer
             .origin_last_ok_secs
             .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
+        proxy_jump: peer.proxy_jump.clone(),
     }
 }
 
@@ -334,6 +341,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         // pre-v22 wires so an entry from an older peer still gets the
         // origin-honest staleness path instead of decaying against dwell.
         origin_last_ok_secs: peer.origin_last_ok_secs.or(peer.age_secs),
+        proxy_jump: peer.proxy_jump,
     }
 }
 
@@ -613,6 +621,7 @@ mod tests {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            proxy_jump: None,
         };
         let mut peers: Vec<PeerSummaryState> = (0..FLEET_SNAPSHOT_MAX_PEERS + 3)
             .map(|i| mk(&format!("p{i}")))
@@ -674,6 +683,7 @@ mod tests {
                 .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
             error: None,
             origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -1008,6 +1018,7 @@ Last login: banner noise
             age_secs: Some(5),
             error: None,
             origin_last_ok_secs: None,
+            proxy_jump: None,
         };
         let state = peer_from_wire(wire);
         assert_eq!(state.origin_last_ok_secs, Some(5));
@@ -1041,6 +1052,7 @@ Last login: banner noise
             error: None,
             origin: "anvil".into(),
             origin_last_ok_secs: Some(3),
+            proxy_jump: Some("anvil".into()),
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: RelayedFleetPeer = serde_json::from_str(&json).unwrap();

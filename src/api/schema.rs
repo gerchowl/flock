@@ -1372,6 +1372,11 @@ pub struct RelayedFleetPeer {
     /// (never emitting this field) parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
+    /// peer via THIS hub. Stamped by the hub on relay so a receiver's next
+    /// switch dial can route `ssh -o ProxyJump=<value>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

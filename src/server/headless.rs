@@ -538,6 +538,7 @@ impl HeadlessServer {
                             ssh_target: prepared.ssh_target,
                             fleet: prepared.fleet,
                             focus_workspace: prepared.focus_workspace,
+                            proxy_jump: prepared.proxy_jump,
                         });
                     }
                     // switch_home with no carried origin: already home.
@@ -3826,6 +3827,7 @@ mod tests {
                 age_secs: Some(4),
                 error: None,
                 origin_last_ok_secs: Some(4),
+                proxy_jump: None,
             }],
             origin_summary: None,
         };

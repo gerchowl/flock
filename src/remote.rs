@@ -118,6 +118,11 @@ pub(crate) struct RemoteLaunch {
     /// switch leg must fail-with-notice instead so it does not corrupt the
     /// held terminal (#115).
     pub(crate) context: LaunchContext,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching `target`.
+    /// Set when the launcher is dialing a snapshot-derived peer only
+    /// reachable via the hub that stamped it. `None` for CLI `--remote` legs
+    /// and config peers — the launcher's box has a direct route.
+    pub(crate) proxy_jump: Option<String>,
 }
 
 pub(crate) fn extract_remote_args(
@@ -197,6 +202,10 @@ pub(crate) fn extract_remote_args(
         // CLI `--remote <target>` from a real shell: install / upgrade
         // prompts are fine here.
         context: LaunchContext::Cli,
+        // CLI `--remote <target>`: launcher's box has a direct route by
+        // definition, no ProxyJump involved. Federation-switch legs (which
+        // may carry a proxy_jump) construct RemoteLaunch elsewhere.
+        proxy_jump: None,
     });
     if remote.is_none() && keybindings_seen {
         return Err("--remote-keybindings requires --remote".to_string());
@@ -259,6 +268,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         local_socket.clone(),
         session_name,
         manage_ssh_config,
+        remote.proxy_jump.clone(),
     )?;
 
     // Every remote leg carries a fleet snapshot: the one handed over by the
@@ -1590,6 +1600,10 @@ pub(crate) struct SshStdioBridge {
     keepalive_ssh_config: Option<PathBuf>,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Gossip v3 (#101 part 3): retained for the observability event so a
+    /// snapshot-derived leg's ProxyJump identity is visible in flock.log.
+    #[allow(dead_code)]
+    proxy_jump: Option<String>,
 }
 
 impl SshStdioBridge {
@@ -1603,6 +1617,7 @@ impl SshStdioBridge {
         local_socket: PathBuf,
         session_name: String,
         manage_ssh_config: bool,
+        proxy_jump: Option<String>,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
@@ -1627,11 +1642,13 @@ impl SshStdioBridge {
             keepalive_ssh_config.as_deref(),
             SSH_NONINTERACTIVE_OPTS,
             &remote_bridge_command(&remote_flock, &session_name),
+            proxy_jump.as_deref(),
         );
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_config = keepalive_ssh_config.clone();
+        let thread_proxy_jump = proxy_jump.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -1648,6 +1665,7 @@ impl SshStdioBridge {
                             &remote_flock,
                             &session_name,
                             thread_ssh_config.as_deref(),
+                            thread_proxy_jump.as_deref(),
                         ) {
                             crate::logging::remote_bridge_failed(&target, &err.to_string());
                             eprintln!("flock: remote bridge failed: {err}");
@@ -1669,6 +1687,7 @@ impl SshStdioBridge {
             keepalive_ssh_config,
             should_stop,
             thread: Some(thread),
+            proxy_jump,
         })
     }
 }
@@ -1787,6 +1806,7 @@ fn switch_probe_matches(version: Option<&String>, status: Option<&String>) -> bo
 /// the framed client socket through the bridge.
 pub(crate) fn start_switch_bridge_noninteractive(
     target: &str,
+    proxy_jump: Option<&str>,
 ) -> io::Result<(SshStdioBridge, PathBuf)> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
@@ -1811,6 +1831,7 @@ pub(crate) fn start_switch_bridge_noninteractive(
         local_socket.clone(),
         session_name,
         manage_ssh_config,
+        proxy_jump.map(str::to_string),
     )?;
     Ok((bridge, local_socket))
 }
@@ -1887,23 +1908,58 @@ fn write_keepalive_ssh_config() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Assemble the argv (minus the `ssh` program itself) the bridge dial will
+/// execute. Split out so unit tests can assert the presence and ordering of
+/// `-o ProxyJump=<hub>` for a snapshot-derived launch (#101 part 3) without
+/// spawning a real SSH child.
+fn bridge_dial_argv(
+    target: &str,
+    remote_flock: &RemoteFlock,
+    session_name: &str,
+    keepalive_ssh_config: Option<&Path>,
+    proxy_jump: Option<&str>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(ssh_config) = keepalive_ssh_config {
+        argv.push("-F".to_string());
+        argv.push(ssh_config.display().to_string());
+    }
+    // Gossip v3 (#101 part 3): snapshot-derived legs carry the hub's ProxyJump
+    // identity so the dial reaches peers the launcher's box cannot see
+    // directly. `-o ProxyJump=<hub>` sits BEFORE the noninteractive-opts pack
+    // so the two form one cohesive OpenSSH option run.
+    if let Some(jump) = proxy_jump.filter(|value| !value.is_empty()) {
+        argv.push("-o".to_string());
+        argv.push(format!("ProxyJump={jump}"));
+    }
+    argv.push("-T".to_string());
+    for opt in SSH_NONINTERACTIVE_OPTS {
+        argv.push((*opt).to_string());
+    }
+    argv.push(target.to_string());
+    argv.push(remote_bridge_command(remote_flock, session_name));
+    argv
+}
+
 fn bridge_connection(
     stream: UnixStream,
     target: &str,
     remote_flock: &RemoteFlock,
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
+    proxy_jump: Option<&str>,
 ) -> io::Result<()> {
     let mut command = TracedCommand::new("ssh", "remote");
-    // Use the generated keepalive ssh config when present; otherwise plain ssh.
-    if let Some(ssh_config) = keepalive_ssh_config {
-        command.arg("-F").arg(ssh_config);
+    let argv = bridge_dial_argv(
+        target,
+        remote_flock,
+        session_name,
+        keepalive_ssh_config,
+        proxy_jump,
+    );
+    for arg in &argv {
+        command.arg(arg);
     }
-    command
-        .arg("-T")
-        .args(SSH_NONINTERACTIVE_OPTS)
-        .arg(target)
-        .arg(remote_bridge_command(remote_flock, session_name));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2096,6 +2152,55 @@ mod tests {
     }
 
     #[test]
+    fn bridge_dial_argv_carries_proxy_jump_for_snapshot_derived_launch() {
+        // Gossip v3 (#101 part 3) RED: a snapshot-derived leg's ssh dial MUST
+        // include `-o ProxyJump=<hub>` so the launcher's box can reach peers
+        // routable only through that hub. A config-peer or CLI dial (no hub
+        // in the middle) has proxy_jump=None and no ProxyJump argv.
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let session = crate::session::DEFAULT_SESSION_NAME;
+
+        let with_jump = bridge_dial_argv("lars@spoke2", &remote_flock, session, None, Some("hub"));
+        assert!(
+            with_jump.contains(&"-o".to_string()),
+            "argv must include the -o flag: {with_jump:?}"
+        );
+        assert!(
+            with_jump.contains(&"ProxyJump=hub".to_string()),
+            "argv must carry ProxyJump=<hub>: {with_jump:?}"
+        );
+        // ProxyJump must land BEFORE the target arg so ssh consumes it as an
+        // option rather than as a command tail.
+        let proxy_pos = with_jump
+            .iter()
+            .position(|arg| arg == "ProxyJump=hub")
+            .expect("ProxyJump argv slot");
+        let target_pos = with_jump
+            .iter()
+            .position(|arg| arg == "lars@spoke2")
+            .expect("target argv slot");
+        assert!(
+            proxy_pos < target_pos,
+            "ProxyJump must precede the target: {with_jump:?}"
+        );
+
+        let without = bridge_dial_argv("lars@sage", &remote_flock, session, None, None);
+        assert!(
+            !without.iter().any(|arg| arg.starts_with("ProxyJump=")),
+            "no proxy_jump = no ProxyJump argv: {without:?}"
+        );
+        // Empty-string proxy_jump = None semantically; must not add `-o ProxyJump=`.
+        let empty = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(""));
+        assert!(
+            !empty.iter().any(|arg| arg.starts_with("ProxyJump")),
+            "empty proxy_jump must not emit ProxyJump: {empty:?}"
+        );
+    }
+
+    #[test]
     fn bridge_start_logs_full_ssh_command_shape_at_info() {
         // The failed-remote-connect story: the exact command we are about to
         // run over ssh must be visible in the log at DEFAULT level — this was
@@ -2113,6 +2218,7 @@ mod tests {
                 socket.clone(),
                 "default".to_string(),
                 false,
+                None,
             )
             .expect("start bridge listener");
             drop(bridge);
@@ -2151,6 +2257,7 @@ mod tests {
             socket.clone(),
             "default".to_string(),
             false,
+            None,
         )
         .expect("start bridge listener");
 
