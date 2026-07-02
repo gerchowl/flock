@@ -11,7 +11,7 @@ use tracing::warn;
 /// accent = "#f5c2e7"
 /// red = "#ff6188"
 /// ```
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Built-in theme name. Default: "catppuccin".
@@ -21,7 +21,7 @@ pub struct ThemeConfig {
 }
 
 /// Per-token color overrides. All fields optional — only set what you want to change.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CustomThemeColors {
     pub accent: Option<String>,

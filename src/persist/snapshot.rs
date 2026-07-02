@@ -809,8 +809,8 @@ mod tests {
     #[test]
     fn capture_round_trips_servers_and_spaces_panel_scopes() {
         let mut state = state_with_workspaces(&["one"]);
-        state.servers_panel_scope = PanelScope::Current;
-        state.spaces_panel_scope = PanelScope::Current;
+        state.set_servers_panel_scope(PanelScope::Current);
+        state.set_spaces_panel_scope(PanelScope::Current);
 
         let snap = capture_from_state(&state);
         assert_eq!(snap.servers_panel_scope, PanelScope::Current);
@@ -931,7 +931,7 @@ mod tests {
         let mut state = state_with_workspaces(&["one"]);
         state.sidebar_width = 31;
         state.sidebar_section_split = 0.4;
-        state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
         state.collapsed_space_keys.insert("repo-key".into());
 
         let snapshot = capture_from_state(&state);

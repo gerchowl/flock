@@ -204,7 +204,7 @@ fn compute_view_internal(
     // Symmetric breathing room around the sidebar/pane divider: the divider stays
     // the last column of `sidebar_area`, with `pane_gap` blank columns inside it
     // (between content and divider) and another `pane_gap` columns before the panes.
-    let pane_gap = app.sidebar_pane_gap;
+    let pane_gap = app.sidebar_pane_gap();
     let [sidebar_area, _divider_gap, main_area] = Layout::horizontal([
         Constraint::Length(sidebar_w + pane_gap),
         Constraint::Length(pane_gap),
@@ -307,7 +307,7 @@ fn compute_view_internal(
                 area,
                 toast,
                 app.config_diagnostic.is_some(),
-                toast.position.unwrap_or(app.toast_config.flock.position),
+                toast.position.unwrap_or(app.toast_config().flock.position),
             )
         })
         .unwrap_or_default();
@@ -555,7 +555,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 &app.palette,
             );
         } else {
-            let position = toast.position.unwrap_or(app.toast_config.flock.position);
+            let position = toast.position.unwrap_or(app.toast_config().flock.position);
             render_toast_notification(
                 frame,
                 frame.area(),
@@ -581,7 +581,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         } else {
             terminal_area
         };
-        let position = app.toast_config.clipboard.position;
+        let position = app.toast_config().clipboard.position;
         if let Some(toast_rect) = toast_rect {
             copy_feedback_offset = copy_feedback_offset_for_toast(
                 area,
@@ -824,7 +824,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         let (ws_area, _, _) =
-            collapsed_sidebar_sections(app.view.sidebar_rect, app.sidebar_pane_gap);
+            collapsed_sidebar_sections(app.view.sidebar_rect, app.sidebar_pane_gap());
         let active_row = ws_area.y + 1;
         let active_style = buffer[(ws_area.x, active_row)].style();
 

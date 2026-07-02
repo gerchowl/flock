@@ -692,7 +692,7 @@ impl AppState {
                     // peer's first workspace. The self row has no card, so
                     // clicking it is a no-op.
                     if self.on_servers_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.servers_panel_scope = self.servers_panel_scope.toggled();
+                        self.set_servers_panel_scope(self.servers_panel_scope().toggled());
                         self.mark_session_dirty();
                         return None;
                     }
@@ -724,7 +724,7 @@ impl AppState {
                     // the scope between the full workspace list and the
                     // focused space group.
                     if self.on_spaces_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.spaces_panel_scope = self.spaces_panel_scope.toggled();
+                        self.set_spaces_panel_scope(self.spaces_panel_scope().toggled());
                         // Toggling the scope also resets the per-server
                         // narrowing (#46): the toggle is the always-visible
                         // escape hatch out of a filtered list.
@@ -781,10 +781,11 @@ impl AppState {
                     }
 
                     if self.on_agent_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.agent_panel_scope = match self.agent_panel_scope {
+                        let next = match self.agent_panel_scope() {
                             AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
                             AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
                         };
+                        self.set_agent_panel_scope(next);
                         self.agent_panel_scroll = 0;
                         self.mark_session_dirty();
                         return None;
@@ -2478,7 +2479,7 @@ mod tests {
             list_rect.x + 2,
             list_rect.y,
         ));
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::Current);
         assert_eq!(app.state.server_filter, None);
     }
 
@@ -2946,7 +2947,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let target_terminal_id = app.state.workspaces[1]
             .panes
             .get(&target_pane)

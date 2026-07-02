@@ -212,20 +212,6 @@ fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
 }
 
-fn agent_panel_scope_from_config(scope: crate::config::PanelScopeConfig) -> state::AgentPanelScope {
-    match scope {
-        crate::config::PanelScopeConfig::Current => state::AgentPanelScope::CurrentWorkspace,
-        crate::config::PanelScopeConfig::All => state::AgentPanelScope::AllWorkspaces,
-    }
-}
-
-fn panel_scope_from_config(scope: crate::config::PanelScopeConfig) -> state::PanelScope {
-    match scope {
-        crate::config::PanelScopeConfig::Current => state::PanelScope::Current,
-        crate::config::PanelScopeConfig::All => state::PanelScope::All,
-    }
-}
-
 /// Parse the configured agent name list into a deduplicated set of `Agent`
 /// values. Unknown agent names are silently dropped so a typo cannot disable
 /// other valid entries.
@@ -338,7 +324,6 @@ impl App {
             workspaces,
             active,
             selected,
-            _restored_agent_panel_scope,
             sidebar_width,
             sidebar_width_source,
             sidebar_section_split,
@@ -348,7 +333,6 @@ impl App {
                 Vec::new(),
                 None,
                 0,
-                state::AgentPanelScope::CurrentWorkspace,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
@@ -381,7 +365,6 @@ impl App {
                     Vec::new(),
                     None,
                     0,
-                    snap.agent_panel_scope,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
                     if snap.sidebar_width.is_some() {
                         state::SidebarWidthSource::Persisted
@@ -399,7 +382,6 @@ impl App {
                     ws,
                     active,
                     selected,
-                    snap.agent_panel_scope,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
                     if snap.sidebar_width.is_some() {
                         state::SidebarWidthSource::Persisted
@@ -415,15 +397,12 @@ impl App {
                 Vec::new(),
                 None,
                 0,
-                state::AgentPanelScope::CurrentWorkspace,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
             )
         };
-
-        let agent_panel_scope = agent_panel_scope_from_config(config.ui.agent_panel_scope);
 
         // Validate sidebar bounds before they reach any `u16::clamp(min, max)`
         // call: `clamp` panics when `min > max`. On bad config, fall back to
@@ -505,8 +484,6 @@ impl App {
             request_peer_checkout: None,
             peer_checkout: None,
             peer_checkout_seq: 0,
-            servers_panel_scope: panel_scope_from_config(config.ui.servers_panel_scope),
-            spaces_panel_scope: panel_scope_from_config(config.ui.spaces_panel_scope),
             server_filter: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
@@ -590,8 +567,6 @@ impl App {
             sidebar_min_width,
             sidebar_max_width,
             mobile_width_threshold: config.ui.mobile_width_threshold,
-            sidebar_row_gap: crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap),
-            sidebar_pane_gap: crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap),
             prompt_float_lines: crate::config::validated_prompt_float_lines(
                 config.ui.prompt_float_lines,
             ),
@@ -607,34 +582,25 @@ impl App {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split,
-            agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
             right_click_passthrough: None,
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
-            file_drop: config.ui.file_drop,
             confirm_close_whole_space: false,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
-            show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
-            pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
-            switch_ascii_input_source_in_prefix: config
-                .experimental
-                .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
-            sound: config.ui.sound.clone(),
             local_sound_playback: true,
-            toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -644,7 +610,6 @@ impl App {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
-            idle: config.ui.idle,
             palette: resolve_palette(config),
             theme_name: config
                 .theme
@@ -663,6 +628,7 @@ impl App {
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: config.clone(),
         };
 
         state.terminals = restored_terminals;
@@ -776,9 +742,11 @@ impl App {
         app.state.selected = snapshot
             .selected
             .min(app.state.workspaces.len().saturating_sub(1));
-        app.state.agent_panel_scope = snapshot.agent_panel_scope;
-        app.state.servers_panel_scope = snapshot.servers_panel_scope;
-        app.state.spaces_panel_scope = snapshot.spaces_panel_scope;
+        app.state.set_agent_panel_scope(snapshot.agent_panel_scope);
+        app.state
+            .set_servers_panel_scope(snapshot.servers_panel_scope);
+        app.state
+            .set_spaces_panel_scope(snapshot.spaces_panel_scope);
         if let Some(width) = snapshot.sidebar_width {
             app.state.sidebar_width = width;
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
@@ -820,7 +788,7 @@ impl App {
             previous_mode == Mode::Prefix,
             self.state.mode == Mode::Prefix,
         ) {
-            (false, true) if self.state.switch_ascii_input_source_in_prefix => {
+            (false, true) if self.state.switch_ascii_input_source_in_prefix_enabled() => {
                 self.prefix_input_source.switch_to_ascii();
             }
             (true, false) => self.prefix_input_source.restore(),
@@ -951,7 +919,7 @@ impl App {
             if self.state.pending_attention_chime {
                 self.state.pending_attention_chime = false;
                 if self.state.sound_enabled() {
-                    crate::sound::play(crate::sound::Sound::AllClear, &self.state.sound);
+                    crate::sound::play(crate::sound::Sound::AllClear, self.state.sound_config());
                 }
             }
 
@@ -1272,6 +1240,42 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        // Snapshot fields that need to detect a change relative to the
+        // previous live config BEFORE any per-section replacement below.
+        let previous_sound = self.state.config.ui.sound.clone();
+
+        // Live source of truth for the settings pane (ADR-0002 phase (f)):
+        // re-populate `state.config` per valid section so accessors reflect
+        // the reloaded values. Invalid sections keep the previous config —
+        // consistent with the "keep-current-on-error" contract everywhere.
+        if !invalid_section("keys") {
+            self.state.config.keys = config.keys.clone();
+        }
+        if !invalid_section("experimental") {
+            self.state.config.experimental = config.experimental.clone();
+        }
+        if !invalid_section("advanced") {
+            self.state.config.advanced = config.advanced.clone();
+        }
+        if !invalid_section("terminal") {
+            self.state.config.terminal = config.terminal.clone();
+        }
+        if !invalid_section("worktrees") {
+            self.state.config.worktrees = config.worktrees.clone();
+        }
+        if !invalid_section("theme") {
+            self.state.config.theme = config.theme.clone();
+        }
+        // Sections without an explicit invalidation gate always follow the
+        // incoming config.
+        self.state.config.name = config.name.clone();
+        self.state.config.onboarding = config.onboarding;
+        self.state.config.session = config.session.clone();
+        self.state.config.update = config.update;
+        self.state.config.remote = config.remote.clone();
+        self.state.config.slots = config.slots.clone();
+        self.state.config.peers = config.peers.clone();
+
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
@@ -1307,6 +1311,10 @@ impl App {
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
 
+                // Copy the whole validated [ui] block into state.config so
+                // pane accessors read the live values (ADR-0002 phase (f)).
+                self.state.config.ui = config.ui.clone();
+
                 self.state.default_sidebar_width = config.ui.sidebar_width;
                 if self.state.sidebar_width_source == state::SidebarWidthSource::ConfigDefault {
                     self.state.sidebar_width = config.ui.sidebar_width;
@@ -1314,15 +1322,10 @@ impl App {
                 self.state.sidebar_min_width = config.ui.sidebar_min_width;
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;
-                self.state.sidebar_row_gap =
-                    crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap);
-                self.state.sidebar_pane_gap =
-                    crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap);
                 self.state.prompt_float_lines =
                     crate::config::validated_prompt_float_lines(config.ui.prompt_float_lines);
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
                 self.state.tab_mode = config.ui.tab_mode;
-                self.state.idle = config.ui.idle;
                 self.state.server_state_mark = config.ui.server_state_mark;
                 self.state.pane_header = config.ui.pane_header;
                 self.state.status_line = config.ui.status_line;
@@ -1360,24 +1363,13 @@ impl App {
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
-                self.state.file_drop = config.ui.file_drop;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
-                self.state.show_agent_labels_on_pane_borders =
-                    config.ui.show_agent_labels_on_pane_borders;
-                self.state.agent_panel_scope =
-                    agent_panel_scope_from_config(config.ui.agent_panel_scope);
                 self.state.agent_panel_scroll = 0;
-                self.state.servers_panel_scope =
-                    panel_scope_from_config(config.ui.servers_panel_scope);
-                self.state.spaces_panel_scope =
-                    panel_scope_from_config(config.ui.spaces_panel_scope);
                 self.state.workspace_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
-                if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
+                if !self.state.local_sound_playback && previous_sound != config.ui.sound {
                     self.state.request_client_config_reload = true;
                 }
-                self.state.sound = config.ui.sound.clone();
-                self.state.toast_config = config.ui.toast.clone();
             }
         }
 
@@ -1395,10 +1387,7 @@ impl App {
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
-            self.state.switch_ascii_input_source_in_prefix =
-                config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
-            self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();
             }
@@ -1727,7 +1716,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_switches_then_restores_when_enabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1749,7 +1741,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_is_noop_when_flag_disabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = false;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1769,7 +1764,10 @@ mod tests {
         // Simulates the already-ASCII / failed-switch case: switch reports no
         // change, and the later restore on leave must stay harmless.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::no_op();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1790,7 +1788,10 @@ mod tests {
         // `handle_key` itself — the sync must sit at the dispatch layer so any
         // event that exits prefix (here Esc) still restores the host source.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1911,7 +1912,7 @@ mod tests {
     #[test]
     fn clipboard_feedback_can_be_disabled() {
         let mut app = test_app();
-        app.state.toast_config.clipboard.enabled = false;
+        app.state.config.ui.toast.clipboard.enabled = false;
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
@@ -1924,7 +1925,7 @@ mod tests {
     #[test]
     fn notification_show_api_creates_flock_toast_with_position() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1960,7 +1961,7 @@ mod tests {
     #[test]
     fn notification_show_api_respects_off_delivery() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1989,7 +1990,7 @@ mod tests {
     #[test]
     fn notification_show_api_does_not_replace_existing_toast() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
@@ -2028,7 +2029,7 @@ mod tests {
     #[test]
     fn notification_show_api_is_rate_limited() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.mark_api_notification_shown(Instant::now());
 
         let response =
@@ -2058,7 +2059,7 @@ mod tests {
     #[test]
     fn notification_show_api_rejects_empty_title() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -2163,7 +2164,7 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
     }
@@ -2306,11 +2307,11 @@ mod tests {
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
         assert!(!app.state.redraw_on_focus_gained);
@@ -2328,7 +2329,7 @@ mod tests {
             app.state.new_terminal_cwd,
             crate::config::NewTerminalCwdConfig::Home
         );
-        assert!(app.state.switch_ascii_input_source_in_prefix);
+        assert!(app.state.switch_ascii_input_source_in_prefix_enabled());
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -2456,7 +2457,7 @@ mod tests {
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::DEFAULT_SIDEBAR_PANE_GAP
         );
 
@@ -2470,7 +2471,7 @@ sidebar_pane_gap = 2
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_pane_gap, 2);
+        assert_eq!(app.state.sidebar_pane_gap(), 2);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(
@@ -2484,7 +2485,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::MAX_SIDEBAR_PANE_GAP
         );
 
@@ -2501,7 +2502,7 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::DEFAULT_SIDEBAR_ROW_GAP
         );
 
@@ -2509,7 +2510,7 @@ sidebar_pane_gap = 99
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_row_gap, 0);
+        assert_eq!(app.state.sidebar_row_gap(), 0);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(&path, "[ui]\nsidebar_row_gap = 9\n").unwrap();
@@ -2517,7 +2518,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::MAX_SIDEBAR_ROW_GAP
         );
 
@@ -2613,7 +2614,7 @@ sidebar_pane_gap = 99
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2641,7 +2642,7 @@ sidebar_pane_gap = 99
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
@@ -2651,7 +2652,7 @@ sidebar_pane_gap = 99
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert!(app
@@ -2687,7 +2688,7 @@ sidebar_pane_gap = 99
         assert_eq!(app.state.shell_mode, original_shell_mode);
         assert_eq!(app.state.new_terminal_cwd, original_new_cwd);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2710,14 +2711,14 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Off
         );
 
         app.save_toast_delivery(crate::config::ToastDelivery::Terminal);
 
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2738,14 +2739,14 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::AllWorkspaces
         );
 
         app.save_agent_panel_scope(state::AgentPanelScope::CurrentWorkspace);
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2766,12 +2767,12 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert!(!app.persist_pane_history);
-        assert!(!app.state.pane_history_persistence);
+        assert!(!app.state.pane_history_persistence_enabled());
 
         app.save_pane_history_persistence(true);
 
         assert!(app.persist_pane_history);
-        assert!(app.state.pane_history_persistence);
+        assert!(app.state.pane_history_persistence_enabled());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[experimental]"));
         assert!(content.contains("pane_history = true"));
@@ -2792,7 +2793,7 @@ sidebar_pane_gap = 99
         let mut app = test_app();
         let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
         let original_keybinds = app.state.keybinds.new_workspace.clone();
-        let original_toast_delivery = app.state.toast_config.delivery;
+        let original_toast_delivery = app.state.toast_config().delivery;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
@@ -2801,7 +2802,7 @@ sidebar_pane_gap = 99
             original_prefix
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
-        assert_eq!(app.state.toast_config.delivery, original_toast_delivery);
+        assert_eq!(app.state.toast_config().delivery, original_toast_delivery);
         assert!(app
             .state
             .config_diagnostic

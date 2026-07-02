@@ -1,4 +1,4 @@
-use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::config::{Keybinds, NewTerminalCwdConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
@@ -1249,9 +1249,9 @@ impl IdleSetting {
 
     pub(crate) fn enabled(self, state: &AppState) -> bool {
         match self {
-            Self::Enable => state.idle.enable,
-            Self::Sheep => state.idle.sheep,
-            Self::Screensaver => state.idle.screensaver,
+            Self::Enable => state.config.ui.idle.enable,
+            Self::Sheep => state.config.ui.idle.sheep,
+            Self::Screensaver => state.config.ui.idle.screensaver,
         }
     }
 }
@@ -1302,8 +1302,8 @@ impl SidebarGapSetting {
 
     pub(crate) fn value(self, state: &AppState) -> u16 {
         match self {
-            Self::RowGap => state.sidebar_row_gap,
-            Self::PaneGap => state.sidebar_pane_gap,
+            Self::RowGap => state.sidebar_row_gap(),
+            Self::PaneGap => state.sidebar_pane_gap(),
         }
     }
 
@@ -1794,12 +1794,6 @@ pub struct AppState {
     /// Monotonic generation source for [`PeerCheckoutState`] — bumped per
     /// checkout so stale in-flight legs are discarded.
     pub peer_checkout_seq: u64,
-    /// Scope of the `servers` sidebar section: all server rows, or only the
-    /// current machine (plus the home row when attached remotely).
-    pub servers_panel_scope: PanelScope,
-    /// Scope of the `spaces` sidebar section: the full workspace list, or
-    /// only the focused workspace's space group.
-    pub spaces_panel_scope: PanelScope,
     /// Spaces list narrowed to one server (right-click a servers-band
     /// row). Never persisted — cleared via the same context menu or by
     /// toggling the spaces scope.
@@ -1867,10 +1861,6 @@ pub struct AppState {
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
     pub mobile_width_threshold: u16,
-    /// Blank rows between sidebar list entries (workspaces and agents).
-    pub sidebar_row_gap: u16,
-    /// Blank columns on each side of the sidebar/pane divider.
-    pub sidebar_pane_gap: u16,
     /// Max height of the prompt section in the pane header. 0 = context only.
     pub prompt_float_lines: u16,
     /// Auto-collapse every sidebar worktree group except the focused one.
@@ -1897,7 +1887,6 @@ pub struct AppState {
     pub sidebar_collapsed: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
-    pub agent_panel_scope: AgentPanelScope,
     /// Capture mouse input for Flock's own mouse UI. When false, Flock only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
@@ -1906,16 +1895,11 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
-    /// How a file dropped onto an agent pane is handled (#79): `never` or
-    /// `auto` (default). Surfaced as a settings toggle.
-    pub file_drop: crate::config::FileDropMode,
     /// The pending confirm-close is the whole-space affordance (#62): close
     /// every member, not just the selected workspace. Set when opening the
     /// confirm for "Close group"; cleared on accept/cancel.
     pub confirm_close_whole_space: bool,
     pub prompt_new_tab_name: bool,
-    pub show_agent_labels_on_pane_borders: bool,
-    pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1925,11 +1909,6 @@ pub struct AppState {
     pub cjk_ime_agents: Vec<crate::detect::Agent>,
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
-    /// While prefix mode is active, switch the macOS host input source to an
-    /// ASCII-capable layout so prefix commands register as ASCII even when a
-    /// CJK IME is active. macOS only; a no-op elsewhere. See
-    /// `[experimental] switch_ascii_input_source_in_prefix`.
-    pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
@@ -1937,9 +1916,7 @@ pub struct AppState {
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
-    pub sound: SoundConfig,
     pub local_sound_playback: bool,
-    pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
     /// Frame counter for spinner animations (wraps around).
     pub spinner_tick: u32,
@@ -1957,9 +1934,6 @@ pub struct AppState {
     pub sheep_wipe_until: Option<std::time::Instant>,
     /// Persistent state for the stage-2 sidebar screensaver simulation.
     pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
-    /// Idle-animation config (#16): opt-out toggles + thresholds for the sheep
-    /// and screensaver. Re-applied on config reload so it takes effect live.
-    pub idle: crate::config::IdleConfig,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1979,6 +1953,10 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// The live, validated `Config` — cold-start and live-reload write here so
+    /// the settings pane can render from the single source of truth instead of
+    /// hand-copied mirror fields (ADR-0002 phase (f)).
+    pub config: crate::config::Config,
 }
 
 impl AppState {
@@ -1992,10 +1970,10 @@ impl AppState {
     pub(crate) fn note_interaction(&mut self) {
         let now = std::time::Instant::now();
         let idle = now.duration_since(self.last_interaction);
-        if idle >= self.idle.idle_after() {
+        if idle >= self.config.ui.idle.idle_after() {
             self.sheep_flee_until = Some(now + crate::ui::sheep::FLEE_DURATION);
         }
-        if idle >= self.idle.screensaver_after() {
+        if idle >= self.config.ui.idle.screensaver_after() {
             self.sheep_wipe_until = Some(now + crate::ui::screensaver::WIPE_DURATION);
         }
         self.last_interaction = now;
@@ -2004,14 +1982,14 @@ impl AppState {
     /// The current idle-flock phase (None when the user is active, or when the
     /// sheep are disabled via `[ui.idle]`, #16).
     pub(crate) fn flock_phase(&self) -> Option<crate::ui::sheep::FlockPhase> {
-        if !self.idle.sheep_enabled() {
+        if !self.config.ui.idle.sheep_enabled() {
             return None;
         }
         crate::ui::sheep::flock_phase(
             self.last_interaction,
             self.sheep_flee_until,
             std::time::Instant::now(),
-            self.idle.idle_after(),
+            self.config.ui.idle.idle_after(),
         )
     }
 
@@ -2019,14 +1997,14 @@ impl AppState {
     /// idle threshold, once the wipe completes, or when disabled via
     /// `[ui.idle]`, #16).
     pub(crate) fn screensaver_phase(&self) -> Option<crate::ui::screensaver::ScreensaverPhase> {
-        if !self.idle.screensaver_enabled() {
+        if !self.config.ui.idle.screensaver_enabled() {
             return None;
         }
         crate::ui::screensaver::phase(
             self.last_interaction,
             self.sheep_wipe_until,
             std::time::Instant::now(),
-            self.idle.screensaver_after(),
+            self.config.ui.idle.screensaver_after(),
         )
     }
 
@@ -2086,9 +2064,9 @@ impl AppState {
     /// state, never persisted.
     pub(crate) fn panel_scopes(&self) -> PanelScopes {
         PanelScopes {
-            agent: self.agent_panel_scope,
-            servers: self.servers_panel_scope,
-            spaces: self.spaces_panel_scope,
+            agent: self.agent_panel_scope(),
+            servers: self.servers_panel_scope(),
+            spaces: self.spaces_panel_scope(),
         }
     }
 
@@ -2158,7 +2136,25 @@ impl AppState {
     }
 
     pub fn sound_enabled(&self) -> bool {
-        self.sound.enabled
+        self.config.ui.sound.enabled
+    }
+
+    /// Blank rows between sidebar list entries, clamped to the supported
+    /// range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_row_gap(&self) -> u16 {
+        crate::config::validated_sidebar_row_gap(self.config.ui.sidebar_row_gap)
+    }
+
+    /// Blank columns on each side of the sidebar/pane divider, clamped to
+    /// the supported range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_pane_gap(&self) -> u16 {
+        crate::config::validated_sidebar_pane_gap(self.config.ui.sidebar_pane_gap)
+    }
+
+    /// The live `SoundConfig` used by the notification playback path.
+    /// Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sound_config(&self) -> &crate::config::SoundConfig {
+        &self.config.ui.sound
     }
 
     /// Sidebar display alias for an agent label: config override first,
@@ -2171,25 +2167,83 @@ impl AppState {
     }
 
     pub fn toast_delivery(&self) -> ToastDelivery {
-        self.toast_config.delivery
+        self.config.ui.toast.delivery
+    }
+
+    /// The live `ToastConfig` — used by notification code that needs
+    /// clipboard/position details. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn toast_config(&self) -> &ToastConfig {
+        &self.config.ui.toast
     }
 
     pub fn agent_border_labels_enabled(&self) -> bool {
-        self.show_agent_labels_on_pane_borders
+        self.config.ui.show_agent_labels_on_pane_borders
     }
 
     /// Whether dropped files are ferried to the agent (#79) — `auto`. The
-    /// settings toggle reads/writes this; `never` is "off".
+    /// settings toggle reads/writes this; `never` is "off". Reads from the
+    /// live `Config` (ADR-0002 phase (f)).
     pub fn file_drop_enabled(&self) -> bool {
-        self.file_drop == crate::config::FileDropMode::Auto
+        self.config.ui.file_drop == crate::config::FileDropMode::Auto
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
-        self.pane_history_persistence
+        self.config.experimental.pane_history
+    }
+
+    /// Agent-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn agent_panel_scope(&self) -> AgentPanelScope {
+        match self.config.ui.agent_panel_scope {
+            crate::config::PanelScopeConfig::Current => AgentPanelScope::CurrentWorkspace,
+            crate::config::PanelScopeConfig::All => AgentPanelScope::AllWorkspaces,
+        }
+    }
+
+    /// Servers-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn servers_panel_scope(&self) -> PanelScope {
+        match self.config.ui.servers_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Spaces-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn spaces_panel_scope(&self) -> PanelScope {
+        match self.config.ui.spaces_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Update the agent-panel scope in state.config so the accessor reflects
+    /// the new value immediately. The persisting save_* call still writes to
+    /// disk separately (ADR-0002 phase (f)).
+    pub fn set_agent_panel_scope(&mut self, scope: AgentPanelScope) {
+        self.config.ui.agent_panel_scope = match scope {
+            AgentPanelScope::CurrentWorkspace => crate::config::PanelScopeConfig::Current,
+            AgentPanelScope::AllWorkspaces => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_servers_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.servers_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_spaces_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.spaces_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
     }
 
     pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
-        self.switch_ascii_input_source_in_prefix
+        self.config.experimental.switch_ascii_input_source_in_prefix
     }
 
     pub(crate) fn integration_updates_available(&self) -> bool {
@@ -2383,8 +2437,6 @@ impl AppState {
             request_peer_checkout: None,
             peer_checkout: None,
             peer_checkout_seq: 0,
-            servers_panel_scope: PanelScope::All,
-            spaces_panel_scope: PanelScope::All,
             server_filter: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
@@ -2459,8 +2511,6 @@ impl AppState {
             sidebar_min_width: 18,
             sidebar_max_width: 36,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
-            sidebar_row_gap: crate::config::DEFAULT_SIDEBAR_ROW_GAP,
-            sidebar_pane_gap: crate::config::DEFAULT_SIDEBAR_PANE_GAP,
             prompt_float_lines: crate::config::DEFAULT_PROMPT_FLOAT_LINES,
             auto_collapse_groups: false,
             tab_mode: crate::config::TabModeConfig::Tabs,
@@ -2474,35 +2524,25 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split: 0.5,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,
             right_click_passthrough_modifiers: None,
             right_click_passthrough: None,
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
-            file_drop: crate::config::FileDropMode::default(),
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
-            show_agent_labels_on_pane_borders: false,
-            pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
-            switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
-            sound: SoundConfig {
-                enabled: false,
-                ..SoundConfig::default()
-            },
             local_sound_playback: false,
-            toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -2512,7 +2552,6 @@ impl AppState {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
-            idle: crate::config::IdleConfig::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
@@ -2527,6 +2566,7 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: crate::config::Config::default(),
         }
     }
 
@@ -2570,6 +2610,132 @@ mod tests {
     use crossterm::event::KeyEvent;
 
     #[test]
+    fn panel_scopes_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the sidebar's Agent/Servers/Spaces panel scope
+        // toggles read state.config.ui.<scope>_panel_scope.
+        let mut state = AppState::test_new();
+        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.servers_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.spaces_panel_scope = crate::config::PanelScopeConfig::Current;
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::CurrentWorkspace);
+        assert_eq!(state.servers_panel_scope(), PanelScope::Current);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::Current);
+
+        state.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        state.set_servers_panel_scope(PanelScope::All);
+        state.set_spaces_panel_scope(PanelScope::All);
+        assert_eq!(
+            state.config.ui.agent_panel_scope,
+            crate::config::PanelScopeConfig::All
+        );
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
+        assert_eq!(state.servers_panel_scope(), PanelScope::All);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::All);
+    }
+
+    #[test]
+    fn experiments_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): Experiments section reads state.config.experimental.
+        let mut state = AppState::test_new();
+        state.config.experimental.pane_history = true;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
+        assert!(ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+
+        state.config.experimental.pane_history = false;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
+        assert!(!ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(!ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+    }
+
+    #[test]
+    fn idle_settings_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Idle section reads state.config.ui.idle.
+        let mut state = AppState::test_new();
+        state.config.ui.idle.enable = false;
+        state.config.ui.idle.sheep = false;
+        assert!(!IdleSetting::Enable.enabled(&state));
+        assert!(!IdleSetting::Sheep.enabled(&state));
+        state.config.ui.idle.enable = true;
+        state.config.ui.idle.sheep = true;
+        assert!(IdleSetting::Enable.enabled(&state));
+        assert!(IdleSetting::Sheep.enabled(&state));
+    }
+
+    #[test]
+    fn agent_border_labels_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): PaneLabels section reads state.config.ui.
+        let mut state = AppState::test_new();
+        state.config.ui.show_agent_labels_on_pane_borders = true;
+        assert!(state.agent_border_labels_enabled());
+
+        state.config.ui.show_agent_labels_on_pane_borders = false;
+        assert!(!state.agent_border_labels_enabled());
+    }
+
+    #[test]
+    fn toast_delivery_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Toast section reads state.config.ui.toast.
+        let mut state = AppState::test_new();
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::System;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::System);
+
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::Off);
+    }
+
+    #[test]
+    fn sidebar_gaps_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the Sidebar section renders steppers off
+        // `state.config.ui.sidebar_row_gap` / `.sidebar_pane_gap` (validated).
+        let mut state = AppState::test_new();
+        state.config.ui.sidebar_row_gap = 2;
+        state.config.ui.sidebar_pane_gap = 3;
+        assert_eq!(state.sidebar_row_gap(), 2);
+        assert_eq!(state.sidebar_pane_gap(), 3);
+
+        // Out-of-range values clamp via the config validator.
+        state.config.ui.sidebar_row_gap = 99;
+        state.config.ui.sidebar_pane_gap = 99;
+        assert_eq!(state.sidebar_row_gap(), crate::config::MAX_SIDEBAR_ROW_GAP);
+        assert_eq!(
+            state.sidebar_pane_gap(),
+            crate::config::MAX_SIDEBAR_PANE_GAP
+        );
+    }
+
+    #[test]
+    fn sound_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's Sound section is a shim
+        // over `state.config.ui.sound`, not the copied mirror.
+        let mut state = AppState::test_new();
+        state.config.ui.sound.enabled = true;
+        assert!(state.sound_enabled());
+
+        state.config.ui.sound.enabled = false;
+        assert!(!state.sound_enabled());
+    }
+
+    #[test]
+    fn file_drop_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's read path is a shim over
+        // `state.config`, not a hand-copied mirror. Set the config to `Never`
+        // WITHOUT touching any mirror; the accessor must reflect it.
+        let mut state = AppState::test_new();
+        state.config.ui.file_drop = crate::config::FileDropMode::Never;
+        assert!(!state.file_drop_enabled());
+
+        state.config.ui.file_drop = crate::config::FileDropMode::Auto;
+        assert!(state.file_drop_enabled());
+    }
+
+    #[test]
     fn idle_toggles_gate_flock_and_screensaver_phases() {
         let mut state = AppState::test_new();
         // Idle long enough to be well past both thresholds.
@@ -2581,13 +2747,13 @@ mod tests {
         assert!(state.screensaver_phase().is_some());
 
         // Sheep off, screensaver on.
-        state.idle.sheep = false;
+        state.config.ui.idle.sheep = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_some());
 
         // Master off → neither, regardless of sub-toggles.
-        state.idle.sheep = true;
-        state.idle.enable = false;
+        state.config.ui.idle.sheep = true;
+        state.config.ui.idle.enable = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_none());
     }

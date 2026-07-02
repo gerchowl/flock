@@ -217,7 +217,7 @@ fn agent_panel_entries_with_runtimes(
     };
 
     let local_server = super::grammar::local_server_name();
-    match app.agent_panel_scope {
+    match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
                 return Vec::new();
@@ -582,7 +582,7 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     let body = workspace_list_body_rect(ws_area, false, app.sidebar_new_entry_visible());
@@ -703,7 +703,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+    if matches!(app.spaces_panel_scope(), PanelScope::Current) {
         retain_focused_space_group(
             app,
             &section_keys,
@@ -735,7 +735,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
     // the focused row, so misc only renders when it IS the focused row.
     if !peer_filtered {
         for ws_idx in misc {
-            if matches!(app.spaces_panel_scope, PanelScope::Current)
+            if matches!(app.spaces_panel_scope(), PanelScope::Current)
                 && visible_group_idx != Some(ws_idx)
             {
                 continue;
@@ -913,7 +913,7 @@ fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
 
     // Spaces scope current pins the list to the focused project: remote-only
     // projects (no local block to splice into) stay hidden with the rest.
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
+    if matches!(app.spaces_panel_scope(), PanelScope::Current) {
         return;
     }
 
@@ -1120,7 +1120,7 @@ fn server_slot_sort_key(
 /// hide.
 fn visible_server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
     let slots = server_band_slots(app);
-    match app.servers_panel_scope {
+    match app.servers_panel_scope() {
         PanelScope::All => slots,
         PanelScope::Current => slots
             .into_iter()
@@ -1211,7 +1211,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1227,7 +1227,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 row_height.saturating_add(gap)
             }
@@ -1235,7 +1235,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1311,7 +1311,7 @@ fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap);
+    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap());
     let total_rows = agent_panel_entries(app).len();
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
@@ -1347,7 +1347,7 @@ pub(crate) fn compute_workspace_list_areas(
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     if ws_area == Rect::default() {
@@ -1381,7 +1381,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
@@ -1404,7 +1404,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
                     break;
@@ -1424,7 +1424,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
@@ -1496,7 +1496,8 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area, app.sidebar_pane_gap);
+    let (ws_area, divider_y, detail_area) =
+        collapsed_sidebar_sections(area, app.sidebar_pane_gap());
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, area, true, p);
         return;
@@ -1657,7 +1658,7 @@ pub(super) fn render_sidebar(
     }
 
     let (ws_area, detail_area) =
-        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
 
     let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(app));
     if servers_area != Rect::default() {
@@ -1689,7 +1690,7 @@ pub(crate) fn compute_server_section_areas(
     area: Rect,
 ) -> (Rect, Vec<crate::app::state::ServerCardArea>) {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -1723,7 +1724,7 @@ pub(crate) fn server_band_slot_at(
     row: u16,
 ) -> Option<Option<crate::app::state::PeerSwitchRequest>> {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -1762,11 +1763,11 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         )])),
         header_rect,
     );
-    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope);
+    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                panel_scope_toggle_label(app.servers_panel_scope),
+                panel_scope_toggle_label(app.servers_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -2376,11 +2377,11 @@ fn render_workspace_list(
             )),
             header_rect,
         );
-        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope);
+        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope());
         if toggle_rect != Rect::default() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    panel_scope_toggle_label(app.spaces_panel_scope),
+                    panel_scope_toggle_label(app.spaces_panel_scope()),
                     Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Right),
@@ -2747,7 +2748,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     }
     let p = &app.palette;
-    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
     if divider != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -2757,7 +2758,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
             divider,
         );
     }
-    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
     if row == Rect::default() {
         return;
     }
@@ -2800,11 +2801,11 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope);
+    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                agent_panel_toggle_label(app.agent_panel_scope),
+                agent_panel_toggle_label(app.agent_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -2883,7 +2884,7 @@ fn render_agent_detail(
         row_y += 1;
 
         if row_y < body_bottom {
-            row_y = row_y.saturating_add(app.sidebar_row_gap);
+            row_y = row_y.saturating_add(app.sidebar_row_gap());
         }
     }
 
@@ -3033,7 +3034,7 @@ mod tests {
         assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
         // Scope current: only the self row renders, the band stays visible
         // (header keeps the toggle reachable).
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         assert_eq!(servers_section_height(&app), 1 + SERVER_ROW_LINES + 1);
     }
 
@@ -3078,7 +3079,7 @@ mod tests {
 
         // Scope current without a carried snapshot: only the self row stays,
         // which has no hit-area — the header (with its toggle) remains.
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert!(cards.is_empty());
@@ -3268,7 +3269,7 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
 
         // The way home must never hide: scope current keeps home + self.
         assert_eq!(
@@ -3317,7 +3318,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
 
@@ -3369,19 +3370,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         // The menu is a standalone row pinned to the sidebar's last row…
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         assert_eq!(row.y, area.y + area.height - 1);
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // …separated above by the hairline divider idiom.
-        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
         for x in divider.x..divider.x + divider.width {
             assert_eq!(buffer[(x, divider.y)].symbol(), "─", "col {x}");
         }
 
         // The spaces footer hosts only `new` now — no mid-field menu.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let footer_text = buffer_row_text(buffer, ws_rect, ws_rect.y + ws_rect.height - 1);
         assert!(footer_text.contains("new"), "{footer_text:?}");
         assert!(!footer_text.contains("menu"), "{footer_text:?}");
@@ -3412,12 +3414,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!all_text.contains("new"), "{all_text}");
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // The spaces list reclaims the footer row.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let body_tabs = workspace_list_body_rect(ws_rect, false, true);
         let body_workspace = workspace_list_body_rect(ws_rect, false, false);
         assert_eq!(body_workspace.height, body_tabs.height + 1);
@@ -4272,7 +4275,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)
@@ -4489,7 +4492,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4552,7 +4555,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let long_rect = server_slot_rect(rows_area, 1).expect("long-name peer slot");
@@ -4604,7 +4607,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4647,7 +4650,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let self_rect = server_slot_rect(server_band_rows_area(servers_area), 0).expect("self");
         // Quadrant fallback with a single (muted) ring: a solid rectangle.
@@ -5308,7 +5311,7 @@ mod tests {
             .detected_agent = Some(Agent::Claude);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "one");
@@ -5351,7 +5354,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Pi);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let (events, _) = tokio::sync::mpsc::channel(4);
         let runtime = crate::terminal::TerminalRuntime::spawn(
@@ -5407,7 +5410,7 @@ mod tests {
             .set_agent_name("planner".into());
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "bridge");
@@ -5437,7 +5440,7 @@ mod tests {
             app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
             app.active = Some(0);
             app.selected = 0;
-            app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+            app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
             app.server_filter = None;
 
             let aaa = peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
@@ -5600,7 +5603,7 @@ mod tests {
             "default gap is one blank row"
         );
 
-        app.sidebar_row_gap = 0;
+        app.config.ui.sidebar_row_gap = 0;
         let (cards, _, _) = compute_workspace_list_areas(&app, area);
         assert_eq!(
             cards[1].rect.y,
@@ -5772,7 +5775,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Focused grouped workspace: the whole group block renders — header
         // plus members — and nothing else.
@@ -5804,7 +5807,7 @@ mod tests {
         );
 
         // Scope all: the full list (header + two members + the standalone).
-        app.spaces_panel_scope = PanelScope::All;
+        app.set_spaces_panel_scope(PanelScope::All);
         assert_eq!(workspace_list_entries(&app).len(), 4);
     }
 
@@ -5818,7 +5821,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
         app.collapsed_space_keys.insert("repo-key".into());
 
         // Collapse still folds members within the rendered group: header +
@@ -5877,7 +5880,7 @@ mod tests {
         )];
         app.mode = Mode::Terminal;
         app.active = Some(0);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // The focused project keeps its spliced remote rows; the second
         // local project and the remote-only trailing project both hide.
@@ -5907,7 +5910,7 @@ mod tests {
         ];
         app.mode = Mode::Navigate;
         app.selected = 0;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Selection moves through the visible (focused-group) entries only:
         // a large delta clamps to the last group member, never reaching the
@@ -5926,7 +5929,7 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         let area = Rect::new(0, 0, 30, 40);
         let mut terminal =
@@ -5937,7 +5940,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)
