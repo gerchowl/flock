@@ -752,6 +752,10 @@ pub(crate) fn integration_update_instructions(
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "user-facing notice on the launcher's stderr when installed shell integrations are out of date — tracing isn't attached here"
+)]
 pub(crate) fn print_outdated_update_notice() -> bool {
     let outdated = outdated_installed_integrations();
     if outdated.is_empty() {

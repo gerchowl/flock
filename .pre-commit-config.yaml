@@ -17,10 +17,12 @@ repos:
         entry: guardrails-no-fake-impl
         language: system
         pass_filenames: true
-      # Promoted to a hard gate: flock already has a tracing facade, and the only
-      # println/eprintln left are legitimate CLI/UX output, allowlisted below as
-      # output surfaces. A stray dbg!/print!/println! in app or library code is a
-      # real leftover and blocks. Escape any one line with `guardrails-ok`.
+      # Layered with clippy's print_stdout/print_stderr/dbg_macro denies
+      # (Cargo.toml [lints.clippy]): clippy is the PRECISE authority on .rs —
+      # fn-level, self-expiring #[expect] at each legit surface — while this
+      # text gate is the fast pre-commit tripwire and covers non-Rust files.
+      # The globs stay file-level because the text layer can't see #[expect];
+      # the files listed all still print legitimately (annotated per-fn).
       - id: no-debug-leftovers
         name: "no debug-print leftovers — use the tracing facade"
         entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/* guardrails-no-debug-leftovers

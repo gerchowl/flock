@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{
     Method, PaneClearHeaderFieldParams, PaneListParams, PaneMoveDestination, PaneMoveParams,
     PaneReadParams, PaneRenameParams, PaneReportAgentParams, PaneReportMetadataParams,

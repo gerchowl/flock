@@ -3325,6 +3325,10 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Run the headless server. This is the entry point called from main.rs.
+#[expect(
+    clippy::print_stderr,
+    reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
+)]
 pub fn run_server() -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
@@ -3506,6 +3510,10 @@ fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()
     Err(io::Error::other("live handoff is only supported on Unix"))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "headless server prints its socket paths on stderr for the launching process (and human operators) to parse when detaching"
+)]
 fn print_ready_message(api_socket: &Path, client_socket: &Path) {
     eprintln!("flock server running; you can use any flock CLI command in another terminal.");
     eprintln!("api socket: {}", api_socket.display());

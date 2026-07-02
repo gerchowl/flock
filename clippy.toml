@@ -1,1 +1,4 @@
 too-many-arguments-threshold = 11
+# print_stdout/print_stderr/dbg_macro (Cargo.toml [lints.clippy]) police shipped
+# code only — test prints are debugging aids, not product output.
+allow-print-in-tests = true
