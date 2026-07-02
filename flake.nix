@@ -56,10 +56,44 @@
         };
       });
 
-      checks = forAllSystems (system: {
-        flock = self.packages.${system}.default;
-        default = self.checks.${system}.flock;
-      });
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          flock = self.packages.${system}.default;
+          # The guardrails gate sweep, with the SAME env knobs as
+          # .pre-commit-config.yaml — `nix flake check` ≡ `prek run --all-files`
+          # for the gate layer; divergence means one of the two is misconfigured.
+          # The sandbox tree has no .git, so a throwaway index is fabricated for
+          # the gates' `git ls-files` / the DEBT.md census's `git grep`.
+          gates =
+            pkgs.runCommand "flock-guardrails-gates"
+              {
+                nativeBuildInputs = [
+                  guardrails.packages.${system}.default
+                  pkgs.gitMinimal
+                ];
+              }
+              ''
+                cp -r ${self} tree && chmod -R +w tree && cd tree \
+                  && export HOME="$TMPDIR" \
+                  && git init -q && git add -A \
+                  && guardrails-no-fake-impl . \
+                  && env GUARDRAILS_OUTPUT_GLOBS='*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/*' \
+                    guardrails-no-debug-leftovers . \
+                  && guardrails-no-commented-code . \
+                  && guardrails-no-conflict-markers . \
+                  && env GUARDRAILS_TRACE_ALLOW_GLOBS='*/logging.rs' guardrails-no-raw-trace-fields src \
+                  && guardrails-derived-docs . \
+                  && guardrails-adr-matrix \
+                  && env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim .github/workflows \
+                  && touch $out
+              '';
+          default = self.checks.${system}.flock;
+        }
+      );
 
       devShells = forAllSystems (
         system:
