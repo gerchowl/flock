@@ -630,7 +630,6 @@ impl App {
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
             local_sound_playback: true,
-            toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -1270,13 +1269,40 @@ impl App {
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
         // Snapshot fields that need to detect a change relative to the
-        // previous live config BEFORE we overwrite it below.
+        // previous live config BEFORE any per-section replacement below.
         let previous_sound = self.state.config.ui.sound.clone();
 
         // Live source of truth for the settings pane (ADR-0002 phase (f)):
-        // re-clone after every reload so accessors that read `state.config`
-        // reflect the new values without a per-knob mirror copy below.
-        self.state.config = config.clone();
+        // re-populate `state.config` per valid section so accessors reflect
+        // the reloaded values. Invalid sections keep the previous config —
+        // consistent with the "keep-current-on-error" contract everywhere.
+        if !invalid_section("keys") {
+            self.state.config.keys = config.keys.clone();
+        }
+        if !invalid_section("experimental") {
+            self.state.config.experimental = config.experimental.clone();
+        }
+        if !invalid_section("advanced") {
+            self.state.config.advanced = config.advanced.clone();
+        }
+        if !invalid_section("terminal") {
+            self.state.config.terminal = config.terminal.clone();
+        }
+        if !invalid_section("worktrees") {
+            self.state.config.worktrees = config.worktrees.clone();
+        }
+        if !invalid_section("theme") {
+            self.state.config.theme = config.theme.clone();
+        }
+        // Sections without an explicit invalidation gate always follow the
+        // incoming config.
+        self.state.config.name = config.name.clone();
+        self.state.config.onboarding = config.onboarding;
+        self.state.config.session = config.session.clone();
+        self.state.config.update = config.update;
+        self.state.config.remote = config.remote.clone();
+        self.state.config.slots = config.slots.clone();
+        self.state.config.peers = config.peers.clone();
 
         if !invalid_section("keys") {
             match config.live_keybinds() {
@@ -1312,6 +1338,10 @@ impl App {
                 ));
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
+
+                // Copy the whole validated [ui] block into state.config so
+                // pane accessors read the live values (ADR-0002 phase (f)).
+                self.state.config.ui = config.ui.clone();
 
                 self.state.default_sidebar_width = config.ui.sidebar_width;
                 if self.state.sidebar_width_source == state::SidebarWidthSource::ConfigDefault {
@@ -1377,7 +1407,6 @@ impl App {
                 if !self.state.local_sound_playback && previous_sound != config.ui.sound {
                     self.state.request_client_config_reload = true;
                 }
-                self.state.toast_config = config.ui.toast.clone();
             }
         }
 
@@ -1911,7 +1940,7 @@ mod tests {
     #[test]
     fn clipboard_feedback_can_be_disabled() {
         let mut app = test_app();
-        app.state.toast_config.clipboard.enabled = false;
+        app.state.config.ui.toast.clipboard.enabled = false;
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
@@ -1924,7 +1953,7 @@ mod tests {
     #[test]
     fn notification_show_api_creates_flock_toast_with_position() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1960,7 +1989,7 @@ mod tests {
     #[test]
     fn notification_show_api_respects_off_delivery() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1989,7 +2018,7 @@ mod tests {
     #[test]
     fn notification_show_api_does_not_replace_existing_toast() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
@@ -2028,7 +2057,7 @@ mod tests {
     #[test]
     fn notification_show_api_is_rate_limited() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.mark_api_notification_shown(Instant::now());
 
         let response =
@@ -2058,7 +2087,7 @@ mod tests {
     #[test]
     fn notification_show_api_rejects_empty_title() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -2306,7 +2335,7 @@ mod tests {
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert_eq!(
@@ -2613,7 +2642,7 @@ sidebar_pane_gap = 99
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2641,7 +2670,7 @@ sidebar_pane_gap = 99
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
@@ -2651,7 +2680,7 @@ sidebar_pane_gap = 99
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert!(app
@@ -2687,7 +2716,7 @@ sidebar_pane_gap = 99
         assert_eq!(app.state.shell_mode, original_shell_mode);
         assert_eq!(app.state.new_terminal_cwd, original_new_cwd);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2710,14 +2739,14 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Off
         );
 
         app.save_toast_delivery(crate::config::ToastDelivery::Terminal);
 
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2792,7 +2821,7 @@ sidebar_pane_gap = 99
         let mut app = test_app();
         let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
         let original_keybinds = app.state.keybinds.new_workspace.clone();
-        let original_toast_delivery = app.state.toast_config.delivery;
+        let original_toast_delivery = app.state.toast_config().delivery;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
@@ -2801,7 +2830,7 @@ sidebar_pane_gap = 99
             original_prefix
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
-        assert_eq!(app.state.toast_config.delivery, original_toast_delivery);
+        assert_eq!(app.state.toast_config().delivery, original_toast_delivery);
         assert!(app
             .state
             .config_diagnostic

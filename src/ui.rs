@@ -307,7 +307,7 @@ fn compute_view_internal(
                 area,
                 toast,
                 app.config_diagnostic.is_some(),
-                toast.position.unwrap_or(app.toast_config.flock.position),
+                toast.position.unwrap_or(app.toast_config().flock.position),
             )
         })
         .unwrap_or_default();
@@ -555,7 +555,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 &app.palette,
             );
         } else {
-            let position = toast.position.unwrap_or(app.toast_config.flock.position);
+            let position = toast.position.unwrap_or(app.toast_config().flock.position);
             render_toast_notification(
                 frame,
                 frame.area(),
@@ -581,7 +581,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
         } else {
             terminal_area
         };
-        let position = app.toast_config.clipboard.position;
+        let position = app.toast_config().clipboard.position;
         if let Some(toast_rect) = toast_rect {
             copy_feedback_offset = copy_feedback_offset_for_toast(
                 area,

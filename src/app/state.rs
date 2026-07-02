@@ -1931,7 +1931,6 @@ pub struct AppState {
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
     pub local_sound_playback: bool,
-    pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
     /// Frame counter for spinner animations (wraps around).
     pub spinner_tick: u32,
@@ -2185,7 +2184,13 @@ impl AppState {
     }
 
     pub fn toast_delivery(&self) -> ToastDelivery {
-        self.toast_config.delivery
+        self.config.ui.toast.delivery
+    }
+
+    /// The live `ToastConfig` — used by notification code that needs
+    /// clipboard/position details. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn toast_config(&self) -> &ToastConfig {
+        &self.config.ui.toast
     }
 
     pub fn agent_border_labels_enabled(&self) -> bool {
@@ -2510,7 +2515,6 @@ impl AppState {
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
             local_sound_playback: false,
-            toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -2577,6 +2581,17 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn toast_delivery_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Toast section reads state.config.ui.toast.
+        let mut state = AppState::test_new();
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::System;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::System);
+
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::Off);
+    }
 
     #[test]
     fn sidebar_gaps_read_from_state_config_not_mirror_fields() {
