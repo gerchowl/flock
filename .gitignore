@@ -16,6 +16,7 @@ __pycache__/
 !/docs/issues/**
 !/docs/PRs/
 !/docs/PRs/**
+!/docs/DEBT.md
 /.local/
 
 /.pi/todos
