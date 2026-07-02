@@ -105,7 +105,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("hca-{}-{nanos}", std::process::id()));
+        // /tmp, not temp_dir(): nix develop's TMPDIR segment blows SUN_LEN.
+        let dir =
+            std::path::PathBuf::from("/tmp").join(format!("hca-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("client.sock");
 

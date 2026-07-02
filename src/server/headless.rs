@@ -3600,7 +3600,10 @@ mod tests {
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
 
-        let dir = std::env::temp_dir().join(format!(
+        // Bind under /tmp, not temp_dir(): TMPDIR under `nix develop` gains a
+        // nix-shell.XXXXXX segment that pushes the socket path past SUN_LEN
+        // (~104 bytes on macOS) and every test through this harness fails.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
             "hh-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
