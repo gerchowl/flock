@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
-
 use super::{env, model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
@@ -72,8 +70,7 @@ impl Config {
                 // No running config exists at cold start, so the live path's
                 // keep-current contract collapses to defaults + diagnostics.
                 for diagnostic in &diagnostics {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    warn!(diagnostic = %diagnostic, "config load error, using defaults");
+                    crate::logging::config_load_defaults_diagnostic(diagnostic);
                 }
                 LoadedConfig {
                     config: Self::default(),

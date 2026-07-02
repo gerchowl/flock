@@ -215,13 +215,10 @@ impl App {
         }
 
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
-            tracing::warn!(
-                pane = pane_id.raw(),
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                terminal = %terminal_id,
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                agent = %plan.agent,
-                "failed to start deferred agent resume with empty argv"
+            crate::logging::agent_resume_empty_argv(
+                pane_id.raw(),
+                &terminal_id.to_string(),
+                &plan.agent,
             );
             return false;
         };
@@ -240,15 +237,11 @@ impl App {
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                tracing::warn!(
-                    pane = pane_id.raw(),
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    terminal = %terminal_id,
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    agent = %plan.agent,
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    err = %err,
-                    "failed to start shell for deferred agent resume"
+                crate::logging::agent_resume_shell_spawn_failed(
+                    pane_id.raw(),
+                    &terminal_id.to_string(),
+                    &plan.agent,
+                    &err.to_string(),
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.clear_agent_runtime_identity_after_respawn();
@@ -260,15 +253,11 @@ impl App {
         let mut input = resume_command;
         input.push('\r');
         if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
-            tracing::warn!(
-                pane = pane_id.raw(),
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                terminal = %terminal_id,
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                agent = %plan.agent,
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                err = %err,
-                "failed to send deferred agent resume command to shell"
+            crate::logging::agent_resume_send_command_failed(
+                pane_id.raw(),
+                &terminal_id.to_string(),
+                &plan.agent,
+                &err.to_string(),
             );
             runtime.shutdown();
             return false;

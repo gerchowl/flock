@@ -1500,6 +1500,459 @@ pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
     );
 }
 
+// --- pane runtime family (logging redesign PR-6) ---------------------------
+// Pane-runtime failures for state-change / handoff / OSC 52 / spawn paths.
+// Every raw ?field at these sites (child pids list, agent + previous-agent
+// Option<Agent>, focus event) is Debug-shaped at the call site so no other
+// module carries the `?expr` — the schema surface stays here.
+//
+// Level discipline is preserved verbatim from pre-facade code:
+//   * StateChanged deliver + OSC 52 queue/send + focus forward = WARN
+//   * forced-shutdown survivors + PTY handoff release/pause failures = WARN
+//   * spawn + PaneDied send failures = ERROR (pane can't come up / caller
+//     never learns it died)
+//   * agent-changed = INFO (rare, story-critical for detection debugging)
+
+pub(crate) fn pane_state_change_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.state_change.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to deliver StateChanged event"
+    );
+}
+
+pub(crate) fn pane_forced_shutdown_survivors(pane: u32, pid: u32, pids: &str) {
+    tracing::warn!(
+        event = "pane.session.shutdown",
+        subsystem = "pane",
+        outcome = "survivors",
+        pane,
+        pid,
+        pids,
+        "pane session still alive after forced shutdown"
+    );
+}
+
+pub(crate) fn pane_pty_release_after_handoff_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.release",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
+    );
+}
+
+pub(crate) fn pane_pty_handoff_pause_update_failed(pane: u32, paused: bool, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.handoff_pause",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        paused,
+        err,
+        "failed to update PTY actor handoff pause state"
+    );
+}
+
+pub(crate) fn pane_osc52_queue_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.queue",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to queue OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_osc52_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_spawn_error(pane: u32, err: &str, message: &'static str) {
+    tracing::error!(
+        event = "pane.spawn",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn pane_died_send_failed(pane: u32, err: &str) {
+    tracing::error!(
+        event = "pane.died.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send PaneDied event"
+    );
+}
+
+/// Agent-detection observed a transition (previous → current). `process` is
+/// only present on the process-probe branch; the two callers previously used
+/// two separate `info!` blocks with the same fields modulo the process one —
+/// one facade collapses both by taking `Option<&str>` and only emitting the
+/// field when present. All Debug shapes (`Option<Agent>`, foreground pgid)
+/// are formatted at the call side so subsystem code stays raw-field-free.
+pub(crate) fn pane_agent_changed(
+    pane: u32,
+    previous_agent: &str,
+    agent: &str,
+    process: Option<&str>,
+    pgid: &str,
+) {
+    match process {
+        Some(process) => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            process,
+            pgid,
+            "agent changed"
+        ),
+        None => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            pgid,
+            "agent changed"
+        ),
+    }
+}
+
+pub(crate) fn pane_focus_forward_failed(err: &str, event: &str) {
+    tracing::warn!(
+        event = "pane.focus.forward",
+        subsystem = "pane",
+        outcome = "error",
+        err,
+        focus_event = event,
+        "failed to forward pane focus event"
+    );
+}
+
+// --- worktree family (logging redesign PR-6) -------------------------------
+// Every git-worktree lifecycle step the flock TUI drives — dialog open, add
+// start/complete/fail, remove start/complete/fail, merge-gate resolution,
+// post-kill branch delete — passed its raw repo-root / checkout-path /
+// workspace-id / merge-gate through tracing macros with %expr / ?expr
+// fields. Fourteen sites total. The facade fns below own every path.display()
+// and every WorktreeMergeGate Debug shape so subsystem code stays raw-field
+// free.
+//
+// Level discipline:
+//   * lifecycle starts + successful completions + merge-gate resolution =
+//     INFO (the load-bearing "what did the worktree actor do" story)
+//   * add/remove failures + branch-delete failure = WARN (the checkout /
+//     branch was left in a state the user needs to notice, but the pane and
+//     the app keep running)
+
+pub(crate) fn worktree_dialog_opened(
+    ws_idx: usize,
+    repo_root: &str,
+    branch: &str,
+    checkout_path: &str,
+) {
+    tracing::info!(
+        event = "worktree.dialog.open",
+        subsystem = "worktree",
+        outcome = "ok",
+        ws_idx,
+        repo_root,
+        branch,
+        checkout_path,
+        "opening worktree dialog"
+    );
+}
+
+pub(crate) fn worktree_kill_merge_gate_resolved(workspace_id: &str, branch: &str, gate: &str) {
+    tracing::info!(
+        event = "worktree.kill.merge_gate",
+        subsystem = "worktree",
+        outcome = "resolved",
+        workspace_id,
+        branch,
+        gate,
+        "worktree kill merge gate resolved"
+    );
+}
+
+pub(crate) fn worktree_branch_deleted(branch: &str) {
+    tracing::info!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "ok",
+        branch,
+        "deleted local branch after worktree kill"
+    );
+}
+
+pub(crate) fn worktree_branch_delete_failed(branch: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "error",
+        branch,
+        err,
+        "branch delete failed"
+    );
+}
+
+pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "started",
+        repo_root,
+        branch,
+        checkout_path,
+        "starting git worktree add"
+    );
+}
+
+pub(crate) fn worktree_remove_started(workspace_id: &str, path: &str, force: bool) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "started",
+        workspace_id,
+        path,
+        force,
+        "starting git worktree remove"
+    );
+}
+
+pub(crate) fn worktree_add_completed(checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "ok",
+        checkout_path,
+        "git worktree add completed"
+    );
+}
+
+pub(crate) fn worktree_add_failed(checkout_path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "error",
+        checkout_path,
+        err,
+        "git worktree add failed"
+    );
+}
+
+pub(crate) fn worktree_remove_completed(workspace_id: &str, path: &str) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "ok",
+        workspace_id,
+        path,
+        "git worktree remove completed"
+    );
+}
+
+pub(crate) fn worktree_remove_failed(workspace_id: &str, path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "error",
+        workspace_id,
+        path,
+        err,
+        "git worktree remove failed"
+    );
+}
+
+// --- persist io family (logging redesign PR-6) -----------------------------
+// The session file (workspaces/tabs/panes snapshot) and its history sidecar
+// (recent tab titles + labels) both have the same failure surfaces on load:
+// read-file failure, followed by parse failure. Four sites (io.rs) all had
+// raw %err fields — the facade fns below take a shaped &str so persist/io.rs
+// carries no raw formatter. Level stays WARN — a read/parse failure drops
+// the persisted state to defaults, which is user-visible but not fatal.
+
+pub(crate) fn session_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session file"
+    );
+}
+
+pub(crate) fn session_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session file, ignoring"
+    );
+}
+
+pub(crate) fn session_history_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session history file"
+    );
+}
+
+pub(crate) fn session_history_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session history file, ignoring"
+    );
+}
+
+// --- persist restore family (logging redesign PR-6) ------------------------
+// Session-restore paths log four distinct failure modes: a saved pane cwd
+// that no longer exists (falls back to HOME), a per-pane restore failure
+// (with a variant that also increments imported-pane failure counts), and
+// two tab-pruning failures (no panes at all, or empty after layout pruning).
+// Seven sites in persist/restore.rs — every one had raw ?tab / %err /
+// %cwd.display() fields. Debug-shaped tab labels (?snap.custom_name is an
+// Option<String>) are formatted at the call side; cwd is the user's saved
+// filesystem path (not a session-secret) and stays a display string.
+//
+// Level discipline preserved: per-pane restore failures are ERROR (the
+// pane's state is lost); tab-level pruning failures and cwd-missing
+// fallback are WARN (the tab or cwd falls back, but the session comes up).
+
+pub(crate) fn session_restore_pane_cwd_missing(cwd: &str) {
+    tracing::warn!(
+        event = "persist.restore.cwd",
+        subsystem = "persist",
+        outcome = "missing",
+        cwd,
+        "saved pane cwd does not exist, falling back to HOME"
+    );
+}
+
+pub(crate) fn session_restore_imported_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        variant = "imported",
+        tab,
+        pane_id,
+        err,
+        "failed to restore imported pane"
+    );
+}
+
+pub(crate) fn session_restore_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        tab,
+        pane_id,
+        err,
+        "failed to restore pane, skipping"
+    );
+}
+
+pub(crate) fn session_restore_tab_no_panes(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "no_panes",
+        tab,
+        "no panes could be restored for tab, dropping it"
+    );
+}
+
+pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "pruned_empty",
+        tab,
+        "restored tab lost all panes after pruning missing layout nodes"
+    );
+}
+
+// --- agent-resume family (logging redesign PR-6) ---------------------------
+// The three deferred agent-resume paths (empty argv, shell spawn failure,
+// send-command failure) all reach tracing with %terminal_id / %plan.agent /
+// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
+// other module carries the raw Display fmt. Level stays WARN — a failed
+// resume drops the pane back to its non-resumed state, which is surfaced
+// to the user via the terminal.
+
+pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
+    tracing::warn!(
+        event = "agent_resume.start",
+        subsystem = "agent_resume",
+        outcome = "error",
+        reason = "empty_argv",
+        pane,
+        terminal,
+        agent,
+        "failed to start deferred agent resume with empty argv"
+    );
+}
+
+pub(crate) fn agent_resume_shell_spawn_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.spawn",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to start shell for deferred agent resume"
+    );
+}
+
+pub(crate) fn agent_resume_send_command_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.send",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to send deferred agent resume command to shell"
+    );
+}
+
 // --- terminal_key family (logging redesign PR-5) ---------------------------
 // Terminal-mode key decoding: which key was intercepted (for a navigate
 // action / custom command / pane scroll), which was dropped as
@@ -1865,6 +2318,37 @@ pub(crate) fn client_system_notification_failed(err: &str) {
         kind = "system",
         err,
         "failed to emit system notification"
+    );
+}
+
+// --- config family (logging redesign PR-6) ---------------------------------
+// Diagnostics collected during `Config::validated_keybinds` and `Config::load`
+// are all the same shape: one human-readable line describing which field was
+// invalid and how it was collapsed to a fallback. Fifteen keybinds sites
+// (parse errors, conflicts, reserved-keybind clashes, indexed-only ranges,
+// unsafe-direct printables) plus one config-load-defaults site all funnel
+// into these two facade fns so no other module carries a raw ?/% tracing
+// field for a config diagnostic. Level stays WARN — a diagnostic silently
+// disables a keybinding or falls back to defaults, and that's a user-visible
+// regression they'd want to notice in the log tail.
+
+pub(crate) fn config_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.diagnostic",
+        subsystem = "config",
+        outcome = "diagnostic",
+        diagnostic,
+        "config diagnostic"
+    );
+}
+
+pub(crate) fn config_load_defaults_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.load",
+        subsystem = "config",
+        outcome = "error",
+        diagnostic,
+        "config load error, using defaults"
     );
 }
 
@@ -3084,5 +3568,306 @@ mod tests {
         let sys = capture_logs(|| client_system_notification_failed("EPIPE"));
         assert!(sys.contains("kind=\"system\""), "{sys}");
         assert!(sys.contains("WARN"), "{sys}");
+    }
+
+    #[test]
+    fn config_diagnostic_carries_the_diagnostic_at_warn() {
+        let out = capture_logs(|| {
+            config_diagnostic("invalid keybinding: keys.help = \"foo\"; disabling binding")
+        });
+        assert!(out.contains("event=\"config.diagnostic\""), "{out}");
+        assert!(out.contains("subsystem=\"config\""), "{out}");
+        assert!(out.contains("outcome=\"diagnostic\""), "{out}");
+        assert!(
+            out.contains("diagnostic=\"invalid keybinding: keys.help"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WARN"),
+            "config diagnostic must be WARN: {out}"
+        );
+    }
+
+    #[test]
+    fn config_load_defaults_diagnostic_is_warn_with_error_outcome() {
+        let out = capture_logs(|| config_load_defaults_diagnostic("bad toml at line 3"));
+        assert!(out.contains("event=\"config.load\""), "{out}");
+        assert!(out.contains("outcome=\"error\""), "{out}");
+        assert!(out.contains("diagnostic=\"bad toml at line 3\""), "{out}");
+        assert!(out.contains("config load error, using defaults"), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_state_change_and_osc52_and_focus_failures_are_warn() {
+        let state = capture_logs(|| pane_state_change_send_failed(7, "channel full"));
+        assert!(
+            state.contains("event=\"pane.state_change.send\""),
+            "{state}"
+        );
+        assert!(state.contains("pane=7"), "{state}");
+        assert!(state.contains("err=\"channel full\""), "{state}");
+        assert!(state.contains("WARN"), "{state}");
+
+        let queue = capture_logs(|| pane_osc52_queue_failed(7, "channel full"));
+        assert!(queue.contains("event=\"pane.osc52.queue\""), "{queue}");
+        assert!(queue.contains("WARN"), "{queue}");
+
+        let send = capture_logs(|| pane_osc52_send_failed(7, "channel full"));
+        assert!(send.contains("event=\"pane.osc52.send\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
+
+        let focus = capture_logs(|| pane_focus_forward_failed("channel full", "FocusIn"));
+        assert!(focus.contains("event=\"pane.focus.forward\""), "{focus}");
+        assert!(focus.contains("focus_event=\"FocusIn\""), "{focus}");
+        assert!(focus.contains("WARN"), "{focus}");
+    }
+
+    #[test]
+    fn pane_forced_shutdown_survivors_lists_pids_at_warn() {
+        let out = capture_logs(|| pane_forced_shutdown_survivors(7, 4711, "[4711, 4720]"));
+        assert!(out.contains("event=\"pane.session.shutdown\""), "{out}");
+        assert!(out.contains("outcome=\"survivors\""), "{out}");
+        assert!(out.contains("pid=4711"), "{out}");
+        assert!(out.contains("pids=\"[4711, 4720]\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_pty_handoff_failures_carry_paused_flag_and_err() {
+        let release = capture_logs(|| pane_pty_release_after_handoff_failed(7, "ENOENT"));
+        assert!(release.contains("event=\"pane.pty.release\""), "{release}");
+        assert!(release.contains("WARN"), "{release}");
+        assert!(
+            release.contains("failed to release PTY actor after handoff commit"),
+            "{release}"
+        );
+
+        let pause = capture_logs(|| pane_pty_handoff_pause_update_failed(7, true, "EAGAIN"));
+        assert!(
+            pause.contains("event=\"pane.pty.handoff_pause\""),
+            "{pause}"
+        );
+        assert!(pause.contains("paused=true"), "{pause}");
+        assert!(pause.contains("err=\"EAGAIN\""), "{pause}");
+        assert!(pause.contains("WARN"), "{pause}");
+    }
+
+    #[test]
+    fn pane_spawn_and_died_failures_are_error() {
+        let spawn = capture_logs(|| pane_spawn_error(7, "EACCES", "failed to spawn shell"));
+        assert!(spawn.contains("event=\"pane.spawn\""), "{spawn}");
+        assert!(spawn.contains("failed to spawn shell"), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("ERROR"), "spawn must be ERROR: {spawn}");
+
+        let died = capture_logs(|| pane_died_send_failed(7, "channel closed"));
+        assert!(died.contains("event=\"pane.died.send\""), "{died}");
+        assert!(
+            died.contains("ERROR"),
+            "PaneDied send must be ERROR: {died}"
+        );
+    }
+
+    #[test]
+    fn worktree_lifecycle_events_split_by_level() {
+        let dialog =
+            capture_logs(|| worktree_dialog_opened(3, "/repo", "feature/x", "/wt/feature-x"));
+        assert!(
+            dialog.contains("event=\"worktree.dialog.open\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("ws_idx=3"), "{dialog}");
+        assert!(dialog.contains("repo_root=\"/repo\""), "{dialog}");
+        assert!(dialog.contains("branch=\"feature/x\""), "{dialog}");
+        assert!(
+            dialog.contains("checkout_path=\"/wt/feature-x\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("INFO"), "{dialog}");
+
+        let gate =
+            capture_logs(|| worktree_kill_merge_gate_resolved("ws-1", "feature/x", "NotMerged"));
+        assert!(
+            gate.contains("event=\"worktree.kill.merge_gate\""),
+            "{gate}"
+        );
+        assert!(gate.contains("gate=\"NotMerged\""), "{gate}");
+        assert!(
+            gate.contains("INFO"),
+            "merge-gate resolution is INFO: {gate}"
+        );
+
+        let deleted = capture_logs(|| worktree_branch_deleted("feature/x"));
+        assert!(deleted.contains("outcome=\"ok\""), "{deleted}");
+        assert!(deleted.contains("INFO"), "{deleted}");
+
+        let delete_fail =
+            capture_logs(|| worktree_branch_delete_failed("feature/x", "unmerged commits"));
+        assert!(delete_fail.contains("outcome=\"error\""), "{delete_fail}");
+        assert!(
+            delete_fail.contains("WARN"),
+            "branch delete fail is WARN: {delete_fail}"
+        );
+    }
+
+    #[test]
+    fn worktree_add_and_remove_lifecycle_shapes() {
+        let add_start =
+            capture_logs(|| worktree_add_started("/repo", "feature/x", "/wt/feature-x"));
+        assert!(add_start.contains("event=\"worktree.add\""), "{add_start}");
+        assert!(add_start.contains("outcome=\"started\""), "{add_start}");
+        assert!(add_start.contains("INFO"), "{add_start}");
+
+        let add_ok = capture_logs(|| worktree_add_completed("/wt/feature-x"));
+        assert!(add_ok.contains("outcome=\"ok\""), "{add_ok}");
+        assert!(add_ok.contains("INFO"), "{add_ok}");
+
+        let add_fail =
+            capture_logs(|| worktree_add_failed("/wt/feature-x", "fatal: no such branch"));
+        assert!(add_fail.contains("outcome=\"error\""), "{add_fail}");
+        assert!(
+            add_fail.contains("err=\"fatal: no such branch\""),
+            "{add_fail}"
+        );
+        assert!(add_fail.contains("WARN"), "add fail is WARN: {add_fail}");
+
+        let remove_start = capture_logs(|| worktree_remove_started("ws-1", "/wt/feature-x", true));
+        assert!(
+            remove_start.contains("event=\"worktree.remove\""),
+            "{remove_start}"
+        );
+        assert!(remove_start.contains("force=true"), "{remove_start}");
+        assert!(remove_start.contains("INFO"), "{remove_start}");
+
+        let remove_ok = capture_logs(|| worktree_remove_completed("ws-1", "/wt/feature-x"));
+        assert!(remove_ok.contains("outcome=\"ok\""), "{remove_ok}");
+        assert!(remove_ok.contains("INFO"), "{remove_ok}");
+
+        let remove_fail =
+            capture_logs(|| worktree_remove_failed("ws-1", "/wt/feature-x", "dirty worktree"));
+        assert!(remove_fail.contains("outcome=\"error\""), "{remove_fail}");
+        assert!(
+            remove_fail.contains("WARN"),
+            "remove fail is WARN: {remove_fail}"
+        );
+    }
+
+    #[test]
+    fn persist_read_and_parse_failures_are_warn_with_err() {
+        let read = capture_logs(|| session_read_failed("ENOENT"));
+        assert!(read.contains("event=\"persist.read\""), "{read}");
+        assert!(read.contains("err=\"ENOENT\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let parse = capture_logs(|| session_parse_failed("expected map at line 1"));
+        assert!(parse.contains("event=\"persist.parse\""), "{parse}");
+        assert!(parse.contains("failed to parse session file"), "{parse}");
+        assert!(parse.contains("WARN"), "{parse}");
+
+        let hist_read = capture_logs(|| session_history_read_failed("EPERM"));
+        assert!(
+            hist_read.contains("event=\"persist.history.read\""),
+            "{hist_read}"
+        );
+        assert!(hist_read.contains("WARN"), "{hist_read}");
+
+        let hist_parse = capture_logs(|| session_history_parse_failed("bad TOML"));
+        assert!(
+            hist_parse.contains("event=\"persist.history.parse\""),
+            "{hist_parse}"
+        );
+        assert!(hist_parse.contains("WARN"), "{hist_parse}");
+    }
+
+    #[test]
+    fn session_restore_pane_failures_are_error_tab_failures_are_warn() {
+        let cwd = capture_logs(|| session_restore_pane_cwd_missing("/home/removed"));
+        assert!(cwd.contains("event=\"persist.restore.cwd\""), "{cwd}");
+        assert!(cwd.contains("outcome=\"missing\""), "{cwd}");
+        assert!(cwd.contains("cwd=\"/home/removed\""), "{cwd}");
+        assert!(cwd.contains("WARN"), "cwd fallback is WARN: {cwd}");
+
+        let imported = capture_logs(|| {
+            session_restore_imported_pane_failed("Some(\"work\")", 7, "channel closed")
+        });
+        assert!(
+            imported.contains("event=\"persist.restore.pane\""),
+            "{imported}"
+        );
+        assert!(imported.contains("variant=\"imported\""), "{imported}");
+        assert!(imported.contains("pane_id=7"), "{imported}");
+        assert!(
+            imported.contains("ERROR"),
+            "imported failure is ERROR: {imported}"
+        );
+
+        let pane =
+            capture_logs(|| session_restore_pane_failed("Some(\"work\")", 7, "channel closed"));
+        assert!(pane.contains("event=\"persist.restore.pane\""), "{pane}");
+        assert!(
+            !pane.contains("variant="),
+            "non-imported has no variant field: {pane}"
+        );
+        assert!(
+            pane.contains("ERROR"),
+            "restore pane failure is ERROR: {pane}"
+        );
+
+        let no_panes = capture_logs(|| session_restore_tab_no_panes("Some(\"work\")"));
+        assert!(
+            no_panes.contains("event=\"persist.restore.tab\""),
+            "{no_panes}"
+        );
+        assert!(no_panes.contains("reason=\"no_panes\""), "{no_panes}");
+        assert!(no_panes.contains("WARN"), "{no_panes}");
+
+        let pruned = capture_logs(|| session_restore_tab_pruned_empty("Some(\"work\")"));
+        assert!(pruned.contains("reason=\"pruned_empty\""), "{pruned}");
+        assert!(pruned.contains("WARN"), "{pruned}");
+    }
+
+    #[test]
+    fn agent_resume_family_events_split_by_stage() {
+        let empty = capture_logs(|| agent_resume_empty_argv(7, "term-1", "claude"));
+        assert!(empty.contains("event=\"agent_resume.start\""), "{empty}");
+        assert!(empty.contains("reason=\"empty_argv\""), "{empty}");
+        assert!(empty.contains("terminal=\"term-1\""), "{empty}");
+        assert!(empty.contains("agent=\"claude\""), "{empty}");
+        assert!(empty.contains("WARN"), "{empty}");
+
+        let spawn =
+            capture_logs(|| agent_resume_shell_spawn_failed(7, "term-1", "claude", "EACCES"));
+        assert!(spawn.contains("event=\"agent_resume.spawn\""), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("WARN"), "{spawn}");
+
+        let send =
+            capture_logs(|| agent_resume_send_command_failed(7, "term-1", "claude", "EPIPE"));
+        assert!(send.contains("event=\"agent_resume.send\""), "{send}");
+        assert!(send.contains("err=\"EPIPE\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
+    }
+
+    #[test]
+    fn pane_agent_changed_omits_process_when_absent() {
+        let with = capture_logs(|| {
+            pane_agent_changed(7, "None", "Some(Claude)", Some("claude"), "Some(4711)")
+        });
+        assert!(with.contains("event=\"pane.agent.changed\""), "{with}");
+        assert!(with.contains("previous_agent=\"None\""), "{with}");
+        assert!(with.contains("agent=\"Some(Claude)\""), "{with}");
+        assert!(with.contains("process=\"claude\""), "{with}");
+        assert!(with.contains("pgid=\"Some(4711)\""), "{with}");
+        assert!(with.contains("INFO"), "{with}");
+
+        let without =
+            capture_logs(|| pane_agent_changed(7, "None", "Some(Claude)", None, "Some(4711)"));
+        assert!(
+            !without.contains("process="),
+            "process field must be omitted when absent: {without}"
+        );
+        assert!(without.contains("agent=\"Some(Claude)\""), "{without}");
+        assert!(without.contains("INFO"), "{without}");
     }
 }
