@@ -614,7 +614,6 @@ impl App {
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
-            file_drop: config.ui.file_drop,
             confirm_close_whole_space: false,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
@@ -663,6 +662,7 @@ impl App {
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: config.clone(),
         };
 
         state.terminals = restored_terminals;
@@ -1272,6 +1272,11 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        // Live source of truth for the settings pane (ADR-0002 phase (f)):
+        // re-clone after every reload so accessors that read `state.config`
+        // reflect the new values without a per-knob mirror copy below.
+        self.state.config = config.clone();
+
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
@@ -1360,7 +1365,6 @@ impl App {
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
-                self.state.file_drop = config.ui.file_drop;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;

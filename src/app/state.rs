@@ -1906,9 +1906,6 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
-    /// How a file dropped onto an agent pane is handled (#79): `never` or
-    /// `auto` (default). Surfaced as a settings toggle.
-    pub file_drop: crate::config::FileDropMode,
     /// The pending confirm-close is the whole-space affordance (#62): close
     /// every member, not just the selected workspace. Set when opening the
     /// confirm for "Close group"; cleared on accept/cancel.
@@ -1979,6 +1976,10 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// The live, validated `Config` — cold-start and live-reload write here so
+    /// the settings pane can render from the single source of truth instead of
+    /// hand-copied mirror fields (ADR-0002 phase (f)).
+    pub config: crate::config::Config,
 }
 
 impl AppState {
@@ -2179,9 +2180,10 @@ impl AppState {
     }
 
     /// Whether dropped files are ferried to the agent (#79) — `auto`. The
-    /// settings toggle reads/writes this; `never` is "off".
+    /// settings toggle reads/writes this; `never` is "off". Reads from the
+    /// live `Config` (ADR-0002 phase (f)).
     pub fn file_drop_enabled(&self) -> bool {
-        self.file_drop == crate::config::FileDropMode::Auto
+        self.config.ui.file_drop == crate::config::FileDropMode::Auto
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
@@ -2481,7 +2483,6 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
-            file_drop: crate::config::FileDropMode::default(),
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
@@ -2527,6 +2528,7 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: crate::config::Config::default(),
         }
     }
 
@@ -2568,6 +2570,19 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn file_drop_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's read path is a shim over
+        // `state.config`, not a hand-copied mirror. Set the config to `Never`
+        // WITHOUT touching any mirror; the accessor must reflect it.
+        let mut state = AppState::test_new();
+        state.config.ui.file_drop = crate::config::FileDropMode::Never;
+        assert!(!state.file_drop_enabled());
+
+        state.config.ui.file_drop = crate::config::FileDropMode::Auto;
+        assert!(state.file_drop_enabled());
+    }
 
     #[test]
     fn idle_toggles_gate_flock_and_screensaver_phases() {
