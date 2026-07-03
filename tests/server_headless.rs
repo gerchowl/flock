@@ -629,7 +629,7 @@ fn client_handshake_rejects_incompatible_version() {
     let (version, error) = client_handshake(&mut stream, 0, 80, 24)
         .expect("should read Welcome response even on rejection");
 
-    assert_eq!(version, 21, "server should report its version");
+    assert_eq!(version, 23, "server should report its version");
     assert!(
         error.is_some(),
         "version 0 should be rejected with an error"
