@@ -1890,8 +1890,7 @@ mod tests {
             std::env::vars_os()
                 .filter_map(|(k, _)| {
                     let ks = k.to_string_lossy();
-                    (ks.starts_with("FLOCK_") && ks != "FLOCK_CONFIG_PATH")
-                        .then(|| ks.into_owned())
+                    (ks.starts_with("FLOCK_") && ks != "FLOCK_CONFIG_PATH").then(|| ks.into_owned())
                 })
                 .collect()
         }
