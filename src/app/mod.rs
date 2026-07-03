@@ -1859,6 +1859,66 @@ mod tests {
         crate::config::test_config_env_lock()
     }
 
+    /// Acquire the config-env serialization lock AND neutralize ambient
+    /// `FLOCK_*` environment variables that the config env-layer consumes.
+    ///
+    /// Without this, an ambient alias exported by the surrounding shell (a dev
+    /// box, or a CI runner that happens to export `FLOCK_HOST_NAME`) makes
+    /// every `reload_config` return `Partial` — the env layer emits a stray
+    /// deprecation diagnostic that has nothing to do with the config under
+    /// test. That failure is invisible in isolation and shuffles across
+    /// tests/platforms on CI. Scrubbing (and restoring on drop) keeps these
+    /// tests hermetic against whatever the caller's environment carries.
+    ///
+    /// Held for the test's scope as a single `_guard` binding.
+    fn config_env_guard() -> (std::sync::MutexGuard<'static, ()>, FlockEnvScrub) {
+        let lock = config_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let scrub = FlockEnvScrub::new();
+        (lock, scrub)
+    }
+
+    /// RAII scrub of every `FLOCK_*` env var except `FLOCK_CONFIG_PATH` (which
+    /// the reload tests set explicitly). Removes them on construction, and on
+    /// drop clears anything the test added before restoring the original set —
+    /// so no `FLOCK_*` mutation leaks between serialized config-env tests.
+    struct FlockEnvScrub {
+        saved: Vec<(String, std::ffi::OsString)>,
+    }
+
+    impl FlockEnvScrub {
+        fn scrubbable() -> Vec<String> {
+            std::env::vars_os()
+                .filter_map(|(k, _)| {
+                    let ks = k.to_string_lossy();
+                    (ks.starts_with("FLOCK_") && ks != "FLOCK_CONFIG_PATH")
+                        .then(|| ks.into_owned())
+                })
+                .collect()
+        }
+
+        fn new() -> Self {
+            let saved: Vec<(String, std::ffi::OsString)> = Self::scrubbable()
+                .into_iter()
+                .filter_map(|k| std::env::var_os(&k).map(|v| (k, v)))
+                .collect();
+            for (k, _) in &saved {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for FlockEnvScrub {
+        fn drop(&mut self) {
+            for k in Self::scrubbable() {
+                std::env::remove_var(k);
+            }
+            for (k, v) in &self.saved {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         let unique = format!(
             "flock-{name}-{}-{}",
@@ -2213,7 +2273,7 @@ mod tests {
 
     #[test]
     fn startup_restores_preview_update_available_from_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-preview-update-available");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2231,7 +2291,7 @@ mod tests {
 
     #[test]
     fn startup_does_not_restore_update_available_from_older_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-stale-update-notes");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2248,7 +2308,7 @@ mod tests {
 
     #[test]
     fn startup_keeps_pending_release_notes_available_without_auto_opening() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2272,7 +2332,7 @@ mod tests {
 
     #[test]
     fn startup_still_auto_opens_unseen_product_announcement() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-product-announcement-auto-open");
         let state_home = path.parent().unwrap().join("state");
         let original_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
@@ -2316,7 +2376,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_live_state() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-success");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2329,12 +2389,7 @@ mod tests {
         let mut app = test_app();
         let report = app.reload_config();
 
-        assert_eq!(
-            report.status,
-            crate::config::ConfigReloadStatus::Applied,
-            "CLUSTERA diagnostics(updates_live_state): {:?}",
-            report.diagnostics
-        );
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
         assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
         assert!(app
@@ -2378,7 +2433,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_width_only_when_config_owned() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-width");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2409,7 +2464,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_bounds_and_reclamps() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-bounds");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2463,7 +2518,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_mobile_width_threshold() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-mobile-width-threshold");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2486,7 +2541,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_pane_gap() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-pane-gap");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2531,7 +2586,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_updates_sidebar_row_gap() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-row-gap");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2583,7 +2638,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_invalid_sidebar_bounds_keeps_previous_ui_and_returns_partial() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-sidebar-bounds");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2628,7 +2683,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_keeps_current_keybinds_on_invalid_binding_but_applies_other_sections() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-keybind");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2667,7 +2722,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_preserves_invalid_ui_section_but_applies_valid_keys() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-ui-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2703,7 +2758,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_preserves_invalid_terminal_section_but_applies_valid_ui() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-terminal-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2739,7 +2794,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn settings_save_toast_delivery_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("settings-save-toast-delivery");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2767,7 +2822,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn save_agent_panel_scope_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("save-agent-panel-scope");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2795,7 +2850,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn settings_save_pane_history_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("settings-save-pane-history");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2820,7 +2875,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[keys\nnew_workspace = \"g\"\n").unwrap();
@@ -3349,7 +3404,7 @@ sidebar_pane_gap = 99
 
     #[tokio::test]
     async fn pane_split_request_targets_pane_in_background_tab() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let original_shell = std::env::var_os("SHELL");
         std::env::set_var("SHELL", "/usr/bin/true");
 
@@ -3445,7 +3500,7 @@ sidebar_pane_gap = 99
 
     #[tokio::test]
     async fn pane_split_request_focuses_new_pane_when_requested() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let original_shell = std::env::var_os("SHELL");
         std::env::set_var("SHELL", "/usr/bin/true");
 
@@ -4211,7 +4266,7 @@ last_pane = "prefix+tab"
         // #96 acceptance: `flk server reload-config` picks up a changed
         // [gossip] poll_interval_secs — the atomically-shared value the
         // peer-summary tick reads must be updated by apply_live_config.
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-gossip");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -4229,12 +4284,7 @@ last_pane = "prefix+tab"
         std::fs::write(&path, "[gossip]\npoll_interval_secs = 2\n").unwrap();
         let mut app = test_app();
         let report = app.reload_config();
-        assert_eq!(
-            report.status,
-            crate::config::ConfigReloadStatus::Applied,
-            "CLUSTERA diagnostics(gossip): {:?}",
-            report.diagnostics
-        );
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
             app.gossip_poll_interval_secs.load(Ordering::Relaxed),
             2,
@@ -4250,7 +4300,7 @@ last_pane = "prefix+tab"
     fn reload_config_clamps_invalid_gossip_interval() {
         // A diagnosed poll_interval_secs=0 still yields a live cadence (>=1s)
         // so the tick loop never busy-spins with a 0-second sleep.
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-gossip-invalid");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
