@@ -208,6 +208,25 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
         .filter(|branch| !branch.is_empty())
 }
 
+/// A branch the worktree-kill flow must never auto-delete (#121). Three tiers,
+/// most authoritative first:
+///   1. The `main`/`master` floor — hardcoded and config-INDEPENDENT, so a repo
+///      with no config (or a failed default-branch probe) can never have these
+///      pruned.
+///   2. The repo's detected default branch (`origin/HEAD`, else main/master).
+///   3. `extra_protected` — the `[worktrees] protected_branches` repo policy,
+///      which EXTENDS the floor (long-lived `develop`, `release/*`, ...). It can
+///      only add protection, never remove tier 1.
+pub(crate) fn is_protected_branch(
+    branch: &str,
+    default_branch: Option<&str>,
+    extra_protected: &[String],
+) -> bool {
+    matches!(branch, "main" | "master")
+        || default_branch == Some(branch)
+        || extra_protected.iter().any(|b| b == branch)
+}
+
 /// Whether `checkout` has uncommitted or untracked changes. `None` when git
 /// can't be queried — callers treat unknown as "assume dirty" and skip rather
 /// than risk a destructive remove on a guess.
@@ -742,6 +761,13 @@ where
 /// produced positive evidence; -D because -d judges merges against the
 /// current HEAD, not the default branch.
 pub(crate) fn delete_local_branch(repo_root: &std::path::Path, branch: &str) -> Result<(), String> {
+    // Last-ditch floor (#121): the primary branch is never deletable by this
+    // path, whatever a caller decided. Higher tiers (detected default + config
+    // policy) are enforced upstream in `is_protected_branch`; this guarantees
+    // main/master survive even a future caller bug.
+    if matches!(branch, "main" | "master") {
+        return Err(format!("refusing to delete protected branch '{branch}'"));
+    }
     let root = repo_root.to_string_lossy().to_string();
     run_command_capture("git", &["-C", &root, "branch", "-D", branch], None).map(|_| ())
 }
@@ -1403,6 +1429,49 @@ prunable stale
         assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
         let _ = std::fs::remove_dir_all(&repo);
     }
+
+    #[test]
+    fn delete_local_branch_refuses_the_primary_branch() {
+        // #121 floor: main/master are never deletable by this path.
+        let repo = create_committed_repo("protect-main");
+        // Move OFF the primary branch and ensure `main` exists but is unchecked-
+        // out, so `git branch -D main` would otherwise SUCCEED — the vulnerable
+        // condition. (RED without the floor: this returned Ok and pruned main.)
+        run_git(&repo, &["checkout", "-b", "work"]);
+        run_git(&repo, &["branch", "-f", "main", "HEAD"]);
+        let err =
+            delete_local_branch(&repo, "main").expect_err("primary branch delete must be refused");
+        assert!(err.contains("main"), "message names the branch: {err}");
+        assert!(
+            run_command_capture(
+                "git",
+                &["-C", repo.to_str().unwrap(), "rev-parse", "main"],
+                None
+            )
+            .is_ok(),
+            "main must still exist after a refused delete"
+        );
+        // A non-primary branch still deletes.
+        run_git(&repo, &["branch", "feature/x"]);
+        delete_local_branch(&repo, "feature/x").expect("non-primary branch still deletes");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn is_protected_branch_covers_floor_default_and_config() {
+        // Tier 1: hardcoded floor, even with no default detected and no config.
+        assert!(is_protected_branch("main", None, &[]));
+        assert!(is_protected_branch("master", None, &[]));
+        // Tier 2: the repo's detected default branch.
+        assert!(is_protected_branch("trunk", Some("trunk"), &[]));
+        // Tier 3: config policy extends the set.
+        let extra = vec!["develop".to_string(), "release/1.x".to_string()];
+        assert!(is_protected_branch("develop", Some("main"), &extra));
+        assert!(is_protected_branch("release/1.x", None, &extra));
+        // An ordinary feature branch is never protected.
+        assert!(!is_protected_branch("feature/thing", Some("main"), &extra));
+    }
+
     #[test]
     fn github_repo_parses_ssh_and_https_remote_urls() {
         assert_eq!(

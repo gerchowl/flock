@@ -611,6 +611,11 @@ pub struct WorktreesConfig {
     /// Empty string disables injection. Claude only (the only agent whose
     /// resume takes a positional first prompt).
     pub branch_pivot_message: String,
+    /// Branch names the worktree-kill flow must never auto-delete, ON TOP of the
+    /// always-protected default branch (main/master/origin HEAD, guarded in code
+    /// regardless of config). A repo policy — long-lived `develop`, `release/*`.
+    /// Extends the hardcoded floor; can never unprotect it (#121).
+    pub protected_branches: Vec<String>,
 }
 
 /// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
@@ -1139,6 +1144,7 @@ impl Default for WorktreesConfig {
             directory: "~/.flock/worktrees".into(),
             adopt_external: true,
             branch_pivot_message: default_branch_pivot_message().to_string(),
+            protected_branches: Vec::new(),
         }
     }
 }
