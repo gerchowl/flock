@@ -600,7 +600,7 @@ fn client_handshake_succeeds() {
     let (version, error) =
         client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
 
-    assert_eq!(version, 21, "server should report protocol version 21");
+    assert_eq!(version, 23, "server should report protocol version 23");
     assert!(
         error.is_none(),
         "handshake should not have an error: {:?}",
@@ -657,7 +657,7 @@ fn client_handshake_clamps_small_terminal_size() {
     let (version, error) = client_handshake(&mut stream, 21, 0, 0)
         .expect("handshake with 0x0 should succeed (server clamps)");
 
-    assert_eq!(version, 21);
+    assert_eq!(version, 23);
     assert!(
         error.is_none(),
         "0x0 size should be accepted (clamped): {:?}",
@@ -689,7 +689,7 @@ fn client_handshake_with_host_theme_succeeds() {
         support::client_handshake_with_theme(&mut stream, 21, 80, 24, &theme_bytes)
             .expect("themed handshake should succeed");
 
-    assert_eq!(version, 21);
+    assert_eq!(version, 23);
     assert!(
         error.is_none(),
         "themed Hello should be accepted: {:?}",
@@ -751,7 +751,7 @@ fn no_hello_client_closed_within_five_seconds() {
         UnixStream::connect(&client_socket).expect("should connect after no-hello client");
     let (version, error) = client_handshake(&mut good_stream, 21, 80, 24)
         .expect("proper handshake should still work after no-hello client");
-    assert_eq!(version, 21);
+    assert_eq!(version, 23);
     assert!(error.is_none());
 
     // API should still work.
