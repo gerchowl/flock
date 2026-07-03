@@ -1673,7 +1673,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::sync::Mutex;
 
     fn raw_key(
         code: KeyCode,
@@ -1855,67 +1854,15 @@ mod tests {
         assert_eq!(restore_calls.get(), 1);
     }
 
-    fn config_env_lock() -> &'static Mutex<()> {
-        crate::config::test_config_env_lock()
-    }
-
-    /// Acquire the config-env serialization lock AND neutralize ambient
-    /// `FLOCK_*` environment variables that the config env-layer consumes.
-    ///
-    /// Without this, an ambient alias exported by the surrounding shell (a dev
-    /// box, or a CI runner that happens to export `FLOCK_HOST_NAME`) makes
-    /// every `reload_config` return `Partial` — the env layer emits a stray
-    /// deprecation diagnostic that has nothing to do with the config under
-    /// test. That failure is invisible in isolation and shuffles across
-    /// tests/platforms on CI. Scrubbing (and restoring on drop) keeps these
-    /// tests hermetic against whatever the caller's environment carries.
-    ///
-    /// Held for the test's scope as a single `_guard` binding.
-    fn config_env_guard() -> (std::sync::MutexGuard<'static, ()>, FlockEnvScrub) {
-        let lock = config_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let scrub = FlockEnvScrub::new();
-        (lock, scrub)
-    }
-
-    /// RAII scrub of every `FLOCK_*` env var except `FLOCK_CONFIG_PATH` (which
-    /// the reload tests set explicitly). Removes them on construction, and on
-    /// drop clears anything the test added before restoring the original set —
-    /// so no `FLOCK_*` mutation leaks between serialized config-env tests.
-    struct FlockEnvScrub {
-        saved: Vec<(String, std::ffi::OsString)>,
-    }
-
-    impl FlockEnvScrub {
-        fn scrubbable() -> Vec<String> {
-            std::env::vars_os()
-                .filter_map(|(k, _)| {
-                    let ks = k.to_string_lossy();
-                    (ks.starts_with("FLOCK_") && ks != "FLOCK_CONFIG_PATH").then(|| ks.into_owned())
-                })
-                .collect()
-        }
-
-        fn new() -> Self {
-            let saved: Vec<(String, std::ffi::OsString)> = Self::scrubbable()
-                .into_iter()
-                .filter_map(|k| std::env::var_os(&k).map(|v| (k, v)))
-                .collect();
-            for (k, _) in &saved {
-                std::env::remove_var(k);
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for FlockEnvScrub {
-        fn drop(&mut self) {
-            for k in Self::scrubbable() {
-                std::env::remove_var(k);
-            }
-            for (k, v) in &self.saved {
-                std::env::set_var(k, v);
-            }
-        }
+    /// Test-scope config-env guard: the serialization lock plus an ambient
+    /// `FLOCK_*` scrub so a stray alias (e.g. `FLOCK_HOST_NAME` on a dev box or
+    /// CI runner) can't poison the config under test. See
+    /// [`crate::config::test_config_env_guard`].
+    fn config_env_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
+        crate::config::test_config_env_guard()
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {

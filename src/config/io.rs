@@ -785,7 +785,7 @@ resume_agents_on_restore = true
         // The centrally-managed-box case (#42): the base config.toml is a
         // read-only symlink with no `name`, and the user sets it in the
         // writable config.local.toml overlay. It must take effect.
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-overlay-node-name");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -930,7 +930,7 @@ delivery = "flock"
 
     #[test]
     fn startup_config_load_warns_about_unknown_top_level_sections() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_guard();
         let path = std::env::temp_dir().join(format!(
             "flock-config-unknown-section-{}.toml",
             std::process::id()
@@ -1013,7 +1013,7 @@ mouse_capture = false
 
     #[test]
     fn overlay_introduces_new_section_when_base_omits_it() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-overlay-new");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -1055,7 +1055,7 @@ mouse_capture = false
         // the base — a field set in config.local.toml worked after
         // reload_config but not at startup. Startup and live reload must share
         // one code path and one precedence.
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-startup-overlay");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -1079,7 +1079,7 @@ mouse_capture = false
 
     #[test]
     fn startup_config_load_reports_broken_overlay_but_keeps_base() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-startup-overlay-bad");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -1127,7 +1127,7 @@ mouse_capture = false
         // `[slots]` parsed at cold start but was silently DROPPED on live
         // reload (not wired into load_live_config_from_table) and warned as an
         // unknown section.
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-slots-live");
         let base = dir.join("config.toml");
         std::fs::write(&base, "[slots]\nenabled = true\nmax = 7\n").unwrap();
@@ -1145,7 +1145,7 @@ mouse_capture = false
 
     #[test]
     fn overlay_overrides_base_set_scalar() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-overlay-override");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -1163,7 +1163,7 @@ mouse_capture = false
 
     #[test]
     fn unparseable_overlay_keeps_base_and_surfaces_diagnostic() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-overlay-bad");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
@@ -1187,7 +1187,7 @@ mouse_capture = false
 
     #[test]
     fn overlay_peers_append_to_base_peers() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _lock = crate::config::test_config_env_guard();
         let dir = unique_test_dir("flock-overlay-peers");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
