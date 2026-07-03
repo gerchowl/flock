@@ -2329,8 +2329,12 @@ mod tests {
         let mut app = test_app();
         let report = app.reload_config();
 
-        eprintln!("CLUSTERA_DIAGNOSTICS(updates_live_state): {:?}", report.diagnostics);
-        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            report.status,
+            crate::config::ConfigReloadStatus::Applied,
+            "CLUSTERA diagnostics(updates_live_state): {:?}",
+            report.diagnostics
+        );
         assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
         assert_eq!(app.state.prefix_mods, KeyModifiers::CONTROL);
         assert!(app
@@ -4225,8 +4229,12 @@ last_pane = "prefix+tab"
         std::fs::write(&path, "[gossip]\npoll_interval_secs = 2\n").unwrap();
         let mut app = test_app();
         let report = app.reload_config();
-        eprintln!("CLUSTERA_DIAGNOSTICS: {:?}", report.diagnostics);
-        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            report.status,
+            crate::config::ConfigReloadStatus::Applied,
+            "CLUSTERA diagnostics(gossip): {:?}",
+            report.diagnostics
+        );
         assert_eq!(
             app.gossip_poll_interval_secs.load(Ordering::Relaxed),
             2,
