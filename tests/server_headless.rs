@@ -598,7 +598,7 @@ fn client_handshake_succeeds() {
 
     // Send Hello with the current protocol version, 80 cols, 24 rows.
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
 
     assert_eq!(version, 23, "server should report protocol version 23");
     assert!(
@@ -654,7 +654,7 @@ fn client_handshake_clamps_small_terminal_size() {
     // Send Hello with 0x0 terminal size — should be clamped.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
 
-    let (version, error) = client_handshake(&mut stream, 21, 0, 0)
+    let (version, error) = client_handshake(&mut stream, 23, 0, 0)
         .expect("handshake with 0x0 should succeed (server clamps)");
 
     assert_eq!(version, 23);
@@ -686,7 +686,7 @@ fn client_handshake_with_host_theme_succeeds() {
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let theme_bytes = support::encode_host_theme_option((0xcc, 0xcc, 0xcc), (0x1e, 0x1e, 0x2e));
     let (version, error) =
-        support::client_handshake_with_theme(&mut stream, 21, 80, 24, &theme_bytes)
+        support::client_handshake_with_theme(&mut stream, 23, 80, 24, &theme_bytes)
             .expect("themed handshake should succeed");
 
     assert_eq!(version, 23);
@@ -749,7 +749,7 @@ fn no_hello_client_closed_within_five_seconds() {
     // Verify the server is still healthy — a proper client can still connect.
     let mut good_stream =
         UnixStream::connect(&client_socket).expect("should connect after no-hello client");
-    let (version, error) = client_handshake(&mut good_stream, 21, 80, 24)
+    let (version, error) = client_handshake(&mut good_stream, 23, 80, 24)
         .expect("proper handshake should still work after no-hello client");
     assert_eq!(version, 23);
     assert!(error.is_none());
