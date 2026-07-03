@@ -1,6 +1,6 @@
 # ADR 0002 — Twelve-factor configuration: four layers, one write target, one live source
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-02
 - Issues: #112 (overlay deep-merge — closed), #108 (natural editor v1a — closed
   in PR #111), follow-ups TBD (write-path unification, startup overlay parity,
@@ -138,15 +138,25 @@ later wins:**
   overlay wins) plus the drift-proofing test; the settings-pane refactor is
   mechanical and lands one section per PR.
 
-## Open questions (to resolve before Accepted)
+## Resolved questions (decided 2026-07-03, flipping to Accepted)
 
-1. Env precedence: recommended `env < file` (per-invocation poke vs source of
-   truth) — flips today's `FLOCK_HOST_NAME`/`FLOCK_DISABLE_SOUND` behavior.
-   Alternative: `overlay < env` preserves the muscle memory.
-2. `reset-keys` on read-only bases: shadow-via-overlay (recommended) vs
-   refuse-with-pointer.
-3. `AppState` holds `Config` owned (recommended) vs `Arc<Config>` if a hot
-   render path clones state.
+1. Env precedence: `env < file`, as implemented in phase (d). Env is a
+   per-invocation poke; the file is the source of truth. Consciously accepted:
+   file-set values now beat the deprecated FLOCK_HOST_NAME/FLOCK_DISABLE_SOUND
+   aliases.
+2. `reset-keys` on read-only bases: POINTER, not shadow — plus a fifth write
+   concept that supersedes the question: the **fleet-source write target**.
+   On managed hosts the base symlink's real source of truth is a file in the
+   fleet repo (e.g. ~/dotfiles/herdr/config.toml). A configured
+   `[advanced] fleet_config_source` path lets in-app edits land THERE as an
+   ordinary dirty working-tree edit — the next `just apply` carries it to
+   every host (the nix-ish flow: store immutable, repo owns edits, apply
+   deploys). For immediate local effect the same edit dual-writes the overlay;
+   the apply-built base then supersedes the overlay duplicate (reconciliation
+   may prune overlay keys that equal the base). `reset-keys` without a
+   configured source refuses with a pointer naming the source file.
+3. `AppState` holds `Config` owned — settled by evidence in phase (f): no hot
+   path clones AppState.
 
 ## References
 
