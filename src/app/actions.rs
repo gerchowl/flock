@@ -1640,6 +1640,73 @@ impl AppState {
         self.focus_attention_agent_in_direction(false, true)
     }
 
+    /// Defer-to-next attention cycle (#122): like `focus_attention_agent`, but
+    /// first flips the currently focused pane back to `seen=false` so it stays
+    /// on the attention queue after the cycle moves on. Lets you triage the
+    /// queue by "skipping but keeping flagged" — nothing falls off silently
+    /// until you actually deal with it.
+    pub(crate) fn focus_attention_agent_defer(&mut self) {
+        self.mark_focused_pane_unseen();
+        self.focus_attention_agent_in_direction(true, false);
+    }
+
+    /// Mark the SIDEBAR-SELECTED workspace's panes unseen — the inverse of the
+    /// visit-on-focus that clears the `●` attention indicator (#122). Idle
+    /// panes re-enter the derived attention queue; blocked panes were already
+    /// in it (unaffected). Toggle: if any pane is already unseen we treat the
+    /// workspace as "unread" and flip everything back to seen instead.
+    ///
+    /// Returns whether any pane's seen flag actually changed.
+    pub(crate) fn mark_selected_workspace_unread(&mut self) -> bool {
+        let ws_idx = self.selected;
+        let Some(ws) = self.workspaces.get_mut(ws_idx) else {
+            return false;
+        };
+        // Toggle direction: any unseen pane in the workspace means we're
+        // ALREADY flagged — the friendly toggle is to clear (mark seen).
+        // Otherwise arm the flag (mark unseen).
+        let any_unseen = ws
+            .tabs
+            .iter()
+            .any(|tab| tab.panes.values().any(|pane| !pane.seen));
+        let target = any_unseen;
+        let mut changed = false;
+        for tab in ws.tabs.iter_mut() {
+            for pane in tab.panes.values_mut() {
+                if pane.seen != target {
+                    pane.seen = target;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Flip the currently focused pane's `seen` flag to false. Powers the
+    /// defer-to-next cycle (#122): re-arm the attention indicator for the
+    /// current pane BEFORE the queue moves on.
+    fn mark_focused_pane_unseen(&mut self) -> bool {
+        let Some(ws_idx) = self.active else {
+            return false;
+        };
+        let Some(ws) = self.workspaces.get_mut(ws_idx) else {
+            return false;
+        };
+        let Some(pane_id) = ws.focused_pane_id() else {
+            return false;
+        };
+        for tab in ws.tabs.iter_mut() {
+            if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                if pane.seen {
+                    pane.seen = false;
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
     /// Workspace indices in the active workspace's repo family; the active
     /// workspace alone when it has no git identity.
     fn project_scope_indices(&self) -> Vec<usize> {
@@ -5774,5 +5841,117 @@ mod tests {
         assert_eq!(state.expanded_prompt_pane, None);
         // No-op when nothing is open.
         assert!(!state.scroll_prompt_history(3, 10));
+    }
+
+    // ---- attention: mark-unread + defer-to-next (#122) ---------------------
+
+    /// Aggregate the current attention queue as (ws_idx, pane_id) pairs — the
+    /// same shape used by `focus_attention_agent_in_direction`. Test-only
+    /// helper for the mark-unread/defer tests: derives from `pane_details`
+    /// with the `(Blocked) | (Idle & !seen)` filter.
+    fn attention_queue(state: &AppState) -> Vec<(usize, crate::layout::PaneId)> {
+        let mut out = Vec::new();
+        for (ws_idx, ws) in state.workspaces.iter().enumerate() {
+            for detail in ws.pane_details(&state.terminals) {
+                let attention = matches!(
+                    (detail.state, detail.seen),
+                    (AgentState::Blocked, _) | (AgentState::Idle, false)
+                );
+                if attention {
+                    out.push((ws_idx, detail.pane_id));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mark_selected_workspace_unread_re_adds_seen_idle_pane_to_attention_queue() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.selected = 1;
+
+        // Workspace b's pane is Idle+seen: not in the attention queue.
+        let pane_b = state.workspaces[1].tabs[0].root_pane;
+        let tid_b = state.workspaces[1].terminal_id(pane_b).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid_b)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        state.workspaces[1].panes.get_mut(&pane_b).unwrap().seen = true;
+
+        assert!(
+            !attention_queue(&state).contains(&(1, pane_b)),
+            "sanity: seen idle pane is NOT in the attention queue",
+        );
+
+        // Mark selected (workspace b) unread → its pane re-enters the queue.
+        let flipped = state.mark_selected_workspace_unread();
+        assert!(flipped, "should report that state changed");
+        assert!(
+            attention_queue(&state).contains(&(1, pane_b)),
+            "after mark-unread, the pane is back in the attention queue",
+        );
+        assert!(!state.workspaces[1].panes.get(&pane_b).unwrap().seen);
+    }
+
+    #[test]
+    fn mark_selected_workspace_unread_toggles_back_when_already_unseen() {
+        let mut state = app_with_workspaces(&["a"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.selected = 0;
+
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let tid = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        // Already unseen (in the attention queue).
+        state.workspaces[0].panes.get_mut(&pane).unwrap().seen = false;
+        assert!(attention_queue(&state).contains(&(0, pane)));
+
+        // Toggling flips it back to seen — pane drops out of the queue.
+        state.mark_selected_workspace_unread();
+        assert!(state.workspaces[0].panes.get(&pane).unwrap().seen);
+        assert!(!attention_queue(&state).contains(&(0, pane)));
+    }
+
+    #[test]
+    fn focus_attention_defer_leaves_current_pane_in_queue_and_moves_forward() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+
+        // Both workspaces have a blocked agent — both enter the attention
+        // queue. Plain focus_attention would mark the current one seen on
+        // focus (via aggregate-state changes); defer must preserve it.
+        let now = std::time::Instant::now();
+        for (ws, age) in [(0usize, 60u64), (1, 0)] {
+            let pane = state.workspaces[ws].tabs[0].root_pane;
+            let tid = state.workspaces[ws].terminal_id(pane).cloned().unwrap();
+            let terminal = state.terminals.get_mut(&tid).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(now - std::time::Duration::from_secs(age));
+        }
+
+        let pane_a = state.workspaces[0].tabs[0].root_pane;
+
+        // Defer from a → moves to b, keeps a in the queue.
+        state.focus_attention_agent_defer();
+        assert_eq!(
+            state.active,
+            Some(1),
+            "defer cycles forward like focus_attention"
+        );
+        assert!(
+            attention_queue(&state).contains(&(0, pane_a)),
+            "the deferred item stays flagged in the attention queue",
+        );
+        assert!(!state.workspaces[0].panes.get(&pane_a).unwrap().seen);
     }
 }
