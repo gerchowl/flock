@@ -21,6 +21,10 @@ pub struct WorktreeKillGateResult {
     pub path: std::path::PathBuf,
     pub branch: Option<String>,
     pub gate: crate::worktree::WorktreeMergeGate,
+    /// The branch is the repo's default (`origin/HEAD` target, else
+    /// `main`/`master`). Deleting it is never intended — the kill flow forces
+    /// checkout-only and keeps the branch regardless of the merge gate (#121).
+    pub is_default_branch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
