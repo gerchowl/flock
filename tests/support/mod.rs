@@ -701,7 +701,7 @@ fn current_checkout_root() -> &'static Path {
 }
 
 fn is_test_flock_binary(path: &Path) -> bool {
-    path.ends_with("target/debug/flock") && path.starts_with(current_checkout_root())
+    path.ends_with("target/debug/flk") && path.starts_with(current_checkout_root())
 }
 
 extern "C" fn run_atexit_cleanup() {
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_binary_matcher_accepts_current_checkout_debug_binary() {
-        let binary = current_checkout_root().join("target/debug/flock");
+        let binary = current_checkout_root().join("target/debug/flk");
         assert!(
             is_test_flock_binary(&binary),
             "current checkout debug binary should be considered test-owned"
