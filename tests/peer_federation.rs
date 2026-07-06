@@ -365,11 +365,22 @@ fn wait_for_switch_server(
     Err("timed out waiting for SwitchServer".into())
 }
 
-/// Splits the focus_workspace option (always the FINAL SwitchServer field)
-/// off a captured payload tail, returning just the fleet option bytes —
-/// what the launcher hands the next leg's Hello. None = one 0x00 byte;
-/// Some = 0x01 + len + utf8 id (ids are short; single-byte varint).
+/// Splits the trailing `Option<String>` fields off a captured SwitchServer
+/// payload tail, returning just the fleet option bytes — what the launcher
+/// hands the next leg's Hello. As of v23 (#101) there are TWO such fields
+/// after `fleet`: `focus_workspace` then `proxy_jump`. Both must be stripped
+/// — a stale one-field strip leaves the inner field's byte glued to the fleet
+/// option, so the reinjected Hello carries a stray trailing byte and the spoke
+/// rejects the handshake ("decoded N-1 bytes but payload length was N").
 fn strip_focus_suffix(tail: &[u8]) -> &[u8] {
+    // proxy_jump is last, focus_workspace precedes it.
+    strip_trailing_option(strip_trailing_option(tail))
+}
+
+/// Strips one trailing bincode `Option<String>` off `tail`.
+/// None = one 0x00 byte; Some = 0x01 + len + utf8 id (ids are short, so the
+/// length is a single-byte varint).
+fn strip_trailing_option(tail: &[u8]) -> &[u8] {
     if tail.last() == Some(&0) {
         return &tail[..tail.len() - 1];
     }

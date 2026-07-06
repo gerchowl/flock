@@ -265,6 +265,11 @@ fn spawn_flock_with_config(
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
+    // Ambient deprecated aliases (a shell/CI runner may export FLOCK_HOST_NAME)
+    // otherwise make the server's reload-config return `partial` on a stray
+    // deprecation diagnostic — keep the spawned server hermetic.
+    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env_remove("FLOCK_DISABLE_SOUND");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }

@@ -4512,7 +4512,7 @@ mod tests {
 
     #[test]
     fn reload_local_client_config_refreshes_redraw_on_focus_gained() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_guard();
         let path = std::env::temp_dir().join(format!(
             "flock-client-config-reload-{}-{}.toml",
             std::process::id(),

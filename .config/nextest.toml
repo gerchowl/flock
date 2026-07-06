@@ -23,7 +23,13 @@ serial-pty = { max-threads = 1 }
 [[profile.default.overrides]]
 # The federation hub/spoke and detach/reattach suites stand up multiple servers
 # + clients per test and race hardest under contention — serialize them.
-filter = 'binary(peer_federation) | binary(cross_area)'
+# live_handoff belongs here too: its live-handoff cases spawn a REPLACEMENT
+# server mid-test and poll for the new pid within 10s; under parallel CPU
+# contention on a small runner the replacement doesn't come up in time and the
+# poll fails with "replacement server did not appear" (#129, Linux-only). It
+# was previously only in the retry pool, but the contention outlasts all 3
+# attempts — serializing it gives the handoff a free core.
+filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff)'
 test-group = 'serial-pty'
 retries = 2
 
