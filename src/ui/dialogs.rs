@@ -393,6 +393,11 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
                 ),
                 Style::default().fg(app.palette.green),
             ),
+            Some(crate::worktree::WorktreeMergeGate::NotMerged) if remove.gate_timed_out => (
+                " ⏱ merge status unknown (timed out) — checkout only; the branch is kept."
+                    .to_string(),
+                Style::default().fg(app.palette.yellow),
+            ),
             Some(crate::worktree::WorktreeMergeGate::NotMerged) => (
                 " ✗ no merge evidence — checkout only; the branch is kept.".to_string(),
                 Style::default().fg(app.palette.peach),
