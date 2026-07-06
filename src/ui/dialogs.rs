@@ -399,6 +399,15 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             ),
         };
         frame.render_widget(Paragraph::new(gate_line).style(gate_style), rows[3]);
+    } else if remove.branch_protected {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " ⛨ branch {} is protected (default) — kept.",
+                remove.branch.as_deref().unwrap_or("?")
+            ))
+            .style(Style::default().fg(app.palette.blue)),
+            rows[3],
+        );
     } else {
         frame.render_widget(
             Paragraph::new(" The branch is not deleted. The Flock workspace will close.")
