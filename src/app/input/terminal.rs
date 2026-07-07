@@ -149,12 +149,31 @@ impl App {
             .map(|float| float.terminal_id.clone())
         {
             if self.state.keybinds.toggle_float.matches_direct_key(key) {
+                self.float_esc_at = None;
                 self.state.hide_active_float();
                 return None;
             }
             if self.state.is_prefix_key(key) {
                 self.state.mode = Mode::Prefix;
                 return None;
+            }
+            // Double-Esc dismisses the float (hide-not-kill) without ever
+            // stealing a *single* Esc from the app running inside it: the first
+            // Esc forwards + arms the window, a second Esc within it hides
+            // instead of forwarding (#116). Any other key breaks the sequence.
+            if key_event.code == KeyCode::Esc && key_event.modifiers.is_empty() {
+                let now = std::time::Instant::now();
+                let is_second_esc = self.float_esc_at.take().is_some_and(|at| {
+                    now.duration_since(at) <= crate::app::FLOAT_ESC_DOUBLE_WINDOW
+                });
+                if is_second_esc {
+                    self.state.hide_active_float();
+                    return None;
+                }
+                self.float_esc_at = Some(now);
+                // Fall through: forward this first Esc into the float.
+            } else {
+                self.float_esc_at = None;
             }
             // Shift+PageUp/Down/Home/End page the float's HOST scrollback —
             // the same deterministic keyboard escape hatch layout panes get
@@ -1446,6 +1465,112 @@ mod tests {
         assert!(
             app.state.visible_float_for_active_workspace().is_some(),
             "Esc must never dismiss the float"
+        );
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+        assert!(
+            app.float_esc_at.is_some(),
+            "a single Esc arms the double-Esc window"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_esc_hides_the_visible_float_without_killing_it() {
+        let (mut app, _pane_rx, mut float_rx, _) = app_with_visible_float();
+
+        // First Esc forwards into the float (the inner app still receives it)
+        // and arms the window.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+        assert!(app.state.visible_float_for_active_workspace().is_some());
+
+        // Second Esc within the window dismisses (hide-not-kill) and is NOT
+        // forwarded — it is consumed as the dismiss gesture (#116).
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(
+            app.state.visible_float_for_active_workspace().is_none(),
+            "double-Esc dismisses the float"
+        );
+        assert_eq!(app.state.floats.len(), 1, "dismiss hides, never kills");
+        assert!(
+            float_rx.try_recv().is_err(),
+            "the dismissing Esc is consumed, not forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_first_esc_forwards_again_instead_of_hiding() {
+        let (mut app, _pane_rx, mut float_rx, _) = app_with_visible_float();
+
+        // Arm, then let the window lapse.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+        app.float_esc_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+
+        // A stale first Esc must not dismiss — it forwards and re-arms fresh.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(
+            app.state.visible_float_for_active_workspace().is_some(),
+            "an expired first Esc must not dismiss the float"
+        );
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+        assert!(
+            app.float_esc_at.is_some(),
+            "the stale Esc re-arms a fresh window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_between_the_two_escs_breaks_the_double_esc() {
+        let (mut app, _pane_rx, mut float_rx, _) = app_with_visible_float();
+
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+
+        // Any other key resets the sequence…
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"x");
+        assert!(
+            app.float_esc_at.is_none(),
+            "a non-Esc key clears the pending window"
+        );
+
+        // …so the next Esc is a fresh first Esc: forwards, does not dismiss.
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.state.visible_float_for_active_workspace().is_some());
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+    }
+
+    #[tokio::test]
+    async fn toggle_hide_disarms_esc_so_a_reshown_float_keeps_its_first_esc() {
+        let (mut app, _pane_rx, mut float_rx, _) = app_with_visible_float();
+        app.state.keybinds.toggle_float = crate::config::ActionKeybinds::direct("ctrl+alt+f");
+
+        // Arm, then hide via the toggle (not a second Esc).
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(app.state.visible_float_for_active_workspace().is_none());
+        assert!(
+            app.float_esc_at.is_none(),
+            "toggle-hide disarms the stale window"
+        );
+
+        // Reshow; the first Esc after reshow must forward, never dismiss.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(app.state.visible_float_for_active_workspace().is_some());
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(
+            app.state.visible_float_for_active_workspace().is_some(),
+            "a reshown float must not dismiss on its first Esc"
         );
         assert_eq!(float_rx.try_recv().unwrap().as_ref(), b"\x1b");
     }

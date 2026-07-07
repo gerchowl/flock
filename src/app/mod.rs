@@ -42,6 +42,10 @@ const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
+/// Window within which a second `Esc` on a visible float dismisses it
+/// (hide-not-kill). The first `Esc` still forwards to the app inside the
+/// float, so a single `Esc` never gets stolen from vim/less/etc. (#116).
+const FLOAT_ESC_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
@@ -140,6 +144,9 @@ pub struct App {
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
+    /// Timestamp of the last bare `Esc` forwarded into a visible float; a
+    /// second `Esc` within `FLOAT_ESC_DOUBLE_WINDOW` dismisses it (#116).
+    pub(crate) float_esc_at: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) persist_pane_history: bool,
@@ -701,6 +708,7 @@ impl App {
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
+            float_esc_at: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
