@@ -1387,6 +1387,10 @@ impl AppState {
 
         let mut changed = false;
         for pane in tab.panes.values_mut() {
+            // Viewing the tab acknowledges its panes: supersede any deferred
+            // completion so the settle can't later re-light `●` / re-play the
+            // sound for something the user has already seen (#130).
+            pane.completion_pending = None;
             if !pane.seen {
                 pane.seen = true;
                 changed = true;
@@ -1681,6 +1685,9 @@ impl AppState {
         let mut changed = false;
         for tab in ws.tabs.iter_mut() {
             for pane in tab.panes.values_mut() {
+                // Explicit unread toggle supersedes any deferred completion so a
+                // pending settle can't later fight the user's chosen state (#130).
+                pane.completion_pending = None;
                 if pane.seen != target {
                     pane.seen = target;
                     changed = true;
@@ -1705,6 +1712,8 @@ impl AppState {
         };
         for tab in ws.tabs.iter_mut() {
             if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                // Explicit unread action supersedes a deferred completion (#130).
+                pane.completion_pending = None;
                 if pane.seen {
                     pane.seen = false;
                     return true;
@@ -3363,22 +3372,30 @@ impl AppState {
         now: std::time::Instant,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
     ) -> bool {
-        // Phase 1: which panes have a pending completion that has now dwelled in
-        // `Idle` past the settle. Immutable read of the terminal clocks; the
-        // still-`Idle` guard defends against any state change that bypassed the
-        // edge handler (which is what normally clears the pending marker).
+        // Phase 1: classify each pending completion. Immutable read of the
+        // terminal clocks.
+        //   • `ready`  — still Idle and dwelled past the settle → commit.
+        //   • `stale`  — terminal has left Idle (or vanished) via a path that
+        //                bypassed the edge handler (e.g. the respawn identity
+        //                reset in `clear_agent_runtime_identity_after_respawn`,
+        //                which sets state out-of-band). Drop the marker so it
+        //                can't linger; no re-arm, no notification.
         let mut ready: Vec<(usize, PaneId)> = Vec::new();
+        let mut stale: Vec<(usize, PaneId)> = Vec::new();
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             for tab in &ws.tabs {
                 for (pane_id, pane) in &tab.panes {
                     if pane.completion_pending.is_none() {
                         continue;
                     }
-                    let Some(terminal) = self.terminals.get(&pane.attached_terminal_id) else {
+                    let terminal = self.terminals.get(&pane.attached_terminal_id);
+                    if terminal.map(|terminal| terminal.state) != Some(AgentState::Idle) {
+                        stale.push((ws_idx, *pane_id));
                         continue;
-                    };
-                    let settled = terminal.state == AgentState::Idle
-                        && terminal.state_changed_at.is_some_and(|changed_at| {
+                    }
+                    let settled = terminal
+                        .and_then(|terminal| terminal.state_changed_at)
+                        .is_some_and(|changed_at| {
                             now.duration_since(changed_at) >= ATTENTION_SETTLE
                         });
                     if settled {
@@ -3388,7 +3405,18 @@ impl AppState {
             }
         }
 
+        for (ws_idx, pane_id) in stale {
+            if let Some(pane) = self.workspaces[ws_idx]
+                .tabs
+                .iter_mut()
+                .find_map(|tab| tab.panes.get_mut(&pane_id))
+            {
+                pane.completion_pending = None;
+            }
+        }
+
         if ready.is_empty() {
+            // Clearing stale markers is not a visible change, so no render.
             return false;
         }
 
@@ -5161,6 +5189,88 @@ mod tests {
             Some(ToastKind::Finished),
             "the completion toast fires once, at the settle commit"
         );
+    }
+
+    /// #130 (review): a user action on `seen` supersedes a deferred completion,
+    /// so the settle can't later re-light `●` / re-play the sound for something
+    /// already acknowledged. Here viewing the tab (`mark_active_tab_seen`).
+    #[test]
+    fn viewing_a_tab_supersedes_a_pending_completion() {
+        let mut state = app_with_workspaces(&["ws"]);
+        state.active = Some(0);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .completion_pending = Some(crate::pane::CompletionPending {
+            previous_state: AgentState::Working,
+            known_agent: Some(Agent::Pi),
+            agent_label: Some("pi".into()),
+        });
+
+        state.mark_active_tab_seen();
+
+        assert!(
+            state.workspaces[0].tabs[0]
+                .panes
+                .get(&pane_id)
+                .unwrap()
+                .completion_pending
+                .is_none(),
+            "viewing the tab must drop the pending completion"
+        );
+        // A later commit is then a no-op — no re-fire.
+        assert!(!state.commit_settled_completions(
+            std::time::Instant::now() + ATTENTION_SETTLE * 2,
+            &Default::default()
+        ));
+        assert!(state.toast.is_none());
+    }
+
+    /// #130 (review): a pending marker whose terminal left `Idle` via a path
+    /// that bypassed the edge handler (e.g. the respawn identity reset) is
+    /// dropped by the commit pass rather than firing a stale completion.
+    #[test]
+    fn commit_pass_drops_pending_marker_when_terminal_left_idle_out_of_band() {
+        let mut state = app_with_workspaces(&["active", "bg"]);
+        state.active = Some(0);
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[1]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.workspaces[1].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .completion_pending = Some(crate::pane::CompletionPending {
+            previous_state: AgentState::Working,
+            known_agent: Some(Agent::Pi),
+            agent_label: None,
+        });
+        // Force the terminal to a non-Idle state out-of-band + set its clock.
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.state = AgentState::Unknown;
+        terminal.state_changed_at = Some(std::time::Instant::now());
+
+        // Even well past the settle, the stale marker is dropped, not committed.
+        assert!(!state.commit_settled_completions(
+            std::time::Instant::now() + ATTENTION_SETTLE * 2,
+            &Default::default()
+        ));
+        assert!(
+            state.workspaces[1].tabs[0]
+                .panes
+                .get(&pane_id)
+                .unwrap()
+                .completion_pending
+                .is_none(),
+            "a marker whose terminal left Idle out-of-band must be cleared"
+        );
+        assert!(state.toast.is_none());
     }
 
     #[test]
