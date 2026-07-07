@@ -1439,15 +1439,6 @@ pub struct SettingsState {
 }
 
 pub(crate) enum DragTarget {
-    WorkspaceReorder {
-        source_ws_idx: usize,
-        insert_idx: Option<usize>,
-    },
-    TabReorder {
-        ws_idx: usize,
-        source_tab_idx: usize,
-        insert_idx: Option<usize>,
-    },
     WorkspaceListScrollbar {
         grab_row_offset: u16,
     },
@@ -1483,15 +1474,11 @@ pub(crate) struct DragState {
 
 pub(crate) struct WorkspacePressState {
     pub ws_idx: usize,
-    pub start_col: u16,
-    pub start_row: u16,
 }
 
 pub(crate) struct TabPressState {
     pub ws_idx: usize,
     pub tab_idx: usize,
-    pub start_col: u16,
-    pub start_row: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

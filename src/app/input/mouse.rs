@@ -22,7 +22,7 @@ use super::{
         modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
     },
     settings::SettingsAction,
-    ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
+    ScrollbarClickTarget,
 };
 
 impl AppState {
@@ -625,12 +625,7 @@ impl AppState {
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
                 {
-                    self.tab_press = Some(TabPressState {
-                        ws_idx,
-                        tab_idx,
-                        start_col: mouse.column,
-                        start_row: mouse.row,
-                    });
+                    self.tab_press = Some(TabPressState { ws_idx, tab_idx });
                     return None;
                 }
                 if self.on_new_tab_button(mouse.column, mouse.row) {
@@ -757,11 +752,7 @@ impl AppState {
                     }
 
                     if let Some(idx) = self.workspace_at_row(mouse.row) {
-                        self.workspace_press = Some(WorkspacePressState {
-                            ws_idx: idx,
-                            start_col: mouse.column,
-                            start_row: mouse.row,
-                        });
+                        self.workspace_press = Some(WorkspacePressState { ws_idx: idx });
                         return None;
                     }
 
@@ -889,61 +880,8 @@ impl AppState {
                     }
                 }
 
-                let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
-                let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
-                if self.drag.is_none() {
-                    if let Some(press) = &self.workspace_press {
-                        let delta_col = mouse.column.abs_diff(press.start_col);
-                        let delta_row = mouse.row.abs_diff(press.start_row);
-                        let can_reorder = self
-                            .workspaces
-                            .get(press.ws_idx)
-                            .is_some_and(|ws| ws.worktree_space().is_none());
-                        if can_reorder && delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
-                            self.drag = Some(DragState {
-                                target: DragTarget::WorkspaceReorder {
-                                    source_ws_idx: press.ws_idx,
-                                    insert_idx: workspace_drop_index,
-                                },
-                            });
-                        }
-                    } else if let Some(press) = &self.tab_press {
-                        let delta_col = mouse.column.abs_diff(press.start_col);
-                        let delta_row = mouse.row.abs_diff(press.start_row);
-                        // #33: the workspace-mode member strip has no tab
-                        // reorder — its order is the sidebar's section order.
-                        if delta_col.max(delta_row) >= TAB_DRAG_THRESHOLD
-                            && !self.tab_strip_shows_members()
-                        {
-                            self.drag = Some(DragState {
-                                target: DragTarget::TabReorder {
-                                    ws_idx: press.ws_idx,
-                                    source_tab_idx: press.tab_idx,
-                                    insert_idx: tab_drop_index,
-                                },
-                            });
-                        }
-                    }
-                }
-
-                if let Some(DragState {
-                    target: DragTarget::WorkspaceReorder { insert_idx, .. },
-                }) = &mut self.drag
-                {
-                    *insert_idx = workspace_drop_index;
-                } else if let Some(DragState {
-                    target:
-                        DragTarget::TabReorder {
-                            ws_idx, insert_idx, ..
-                        },
-                }) = &mut self.drag
-                {
-                    if self.active == Some(*ws_idx) {
-                        *insert_idx = tab_drop_index;
-                    }
-                } else if let Some(drag) = &self.drag {
+                if let Some(drag) = &self.drag {
                     match &drag.target {
-                        DragTarget::WorkspaceReorder { .. } | DragTarget::TabReorder { .. } => {}
                         DragTarget::WorkspaceListScrollbar { grab_row_offset } => {
                             if let Some(offset_from_bottom) =
                                 self.workspace_list_offset_for_drag_row(mouse.row, *grab_row_offset)
@@ -1045,28 +983,6 @@ impl AppState {
                 let workspace_press = self.workspace_press.take();
                 let tab_press = self.tab_press.take();
                 match self.drag.take() {
-                    Some(DragState {
-                        target:
-                            DragTarget::WorkspaceReorder {
-                                source_ws_idx,
-                                insert_idx: Some(insert_idx),
-                            },
-                    }) => {
-                        self.move_workspace(source_ws_idx, insert_idx);
-                    }
-                    Some(DragState {
-                        target:
-                            DragTarget::TabReorder {
-                                ws_idx,
-                                source_tab_idx,
-                                insert_idx: Some(insert_idx),
-                            },
-                    }) => {
-                        if self.active == Some(ws_idx) {
-                            self.move_tab(source_tab_idx, insert_idx);
-                            self.mode = Mode::Terminal;
-                        }
-                    }
                     Some(_) => {}
                     None => {
                         if let Some(press) = workspace_press {
@@ -1521,66 +1437,6 @@ impl AppState {
             && row < area.y + area.height
             && col >= area.x
             && col < area.x + area.width
-    }
-
-    pub(super) fn tab_drop_index_at(&self, col: u16, row: u16) -> Option<usize> {
-        if !self.on_tab_bar(col, row) {
-            return None;
-        }
-
-        let visible_tabs: Vec<_> = self
-            .view
-            .tab_hit_areas
-            .iter()
-            .enumerate()
-            .filter(|(_, rect)| rect.width > 0)
-            .collect();
-        let (first_idx, first_rect) = *visible_tabs.first()?;
-        let (last_idx, last_rect) = *visible_tabs.last()?;
-
-        if self.on_tab_scroll_left_button(col, row) {
-            return Some(0);
-        }
-        if self.on_tab_scroll_right_button(col, row) {
-            return self
-                .active
-                .and_then(|idx| self.workspaces.get(idx))
-                .map(|ws| ws.tabs.len());
-        }
-
-        let left_edge = if first_idx == 0 {
-            first_rect.x
-        } else {
-            self.view.tab_scroll_left_hit_area.x + self.view.tab_scroll_left_hit_area.width
-        };
-        let right_edge = if self
-            .active
-            .and_then(|idx| self.workspaces.get(idx))
-            .is_some_and(|ws| last_idx + 1 >= ws.tabs.len())
-        {
-            last_rect.x + last_rect.width
-        } else {
-            self.view.tab_scroll_right_hit_area.x.saturating_sub(1)
-        };
-
-        if col <= left_edge {
-            return Some(first_idx);
-        }
-        if col >= right_edge {
-            return Some(last_idx + 1);
-        }
-
-        for (idx, rect) in visible_tabs {
-            let midpoint = rect.x + rect.width / 2;
-            if col < midpoint {
-                return Some(idx);
-            }
-            if col < rect.x + rect.width {
-                return Some(idx + 1);
-            }
-        }
-
-        Some(last_idx + 1)
     }
 
     pub(super) fn on_new_tab_button(&self, col: u16, row: u16) -> bool {

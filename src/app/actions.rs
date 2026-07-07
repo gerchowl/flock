@@ -1529,42 +1529,6 @@ impl AppState {
         self.switch_workspace(prev);
     }
 
-    // #102 open question: since the spaces list now sorts on
-    // `sort_family_key` / project-key display, drag-reorder never sticks
-    // — the next render puts rows back in alphabetical order. Kept for
-    // now (drag targets still compile and mutate storage) pending the
-    // user's call on whether to remove it entirely.
-    pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) {
-        if source_idx >= self.workspaces.len() || insert_idx > self.workspaces.len() {
-            return;
-        }
-
-        self.mark_session_dirty();
-
-        let active_id = self.active.map(|idx| self.workspaces[idx].id.clone());
-        let selected_id = self
-            .workspaces
-            .get(self.selected)
-            .map(|workspace| workspace.id.clone());
-
-        let workspace = self.workspaces.remove(source_idx);
-        let target_idx = if source_idx < insert_idx {
-            insert_idx.saturating_sub(1)
-        } else {
-            insert_idx
-        }
-        .min(self.workspaces.len());
-        self.workspaces.insert(target_idx, workspace);
-
-        let resolved_active =
-            active_id.and_then(|id| self.workspaces.iter().position(|ws| ws.id == id));
-        self.set_active_workspace(resolved_active);
-        self.selected = selected_id
-            .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
-            .unwrap_or(0);
-        self.ensure_workspace_visible(self.selected);
-    }
-
     pub fn scroll_tabs_left(&mut self) {
         self.tab_scroll_follow_active = false;
         self.tab_scroll = self.tab_scroll.saturating_sub(1);
@@ -1575,20 +1539,6 @@ impl AppState {
         self.tab_scroll_follow_active = false;
         self.tab_scroll = self.tab_scroll.saturating_add(1);
         self.refresh_tab_bar_view();
-    }
-
-    // #102 open question: tabs render in `(display_name, tab.number)`
-    // sort order (see `Workspace::tab_display_order`), so a drag-reorder
-    // is transient — the next render re-sorts. Kept compiling pending
-    // the user's call on whether to remove.
-    pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) {
-        if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
-            if ws.move_tab(source_idx, insert_idx) {
-                self.mark_session_dirty();
-                self.tab_scroll_follow_active = true;
-                self.refresh_tab_bar_view();
-            }
-        }
     }
 
     pub fn next_tab(&mut self) {
@@ -4839,42 +4789,6 @@ mod tests {
         let mut state = app_with_workspaces(&["a"]);
         state.switch_workspace(5);
         assert_eq!(state.active, Some(0));
-    }
-
-    #[test]
-    fn move_workspace_reorders_without_changing_logical_selection() {
-        let mut state = app_with_workspaces(&["a", "b", "c"]);
-        let active_id = state.workspaces[1].id.clone();
-        let selected_id = state.workspaces[2].id.clone();
-        state.active = Some(1);
-        state.selected = 2;
-
-        state.move_workspace(1, 0);
-
-        let names: Vec<_> = state
-            .workspaces
-            .iter()
-            .map(|ws| ws.display_name())
-            .collect();
-        assert_eq!(names, vec!["b", "a", "c"]);
-        assert_eq!(state.active, Some(0));
-        assert_eq!(state.selected, 2);
-        assert_eq!(state.workspaces[state.active.unwrap()].id, active_id);
-        assert_eq!(state.workspaces[state.selected].id, selected_id);
-    }
-
-    #[test]
-    fn move_workspace_accepts_insert_at_end() {
-        let mut state = app_with_workspaces(&["a", "b", "c"]);
-
-        state.move_workspace(0, state.workspaces.len());
-
-        let names: Vec<_> = state
-            .workspaces
-            .iter()
-            .map(|ws| ws.display_name())
-            .collect();
-        assert_eq!(names, vec!["b", "c", "a"]);
     }
 
     #[test]

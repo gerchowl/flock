@@ -877,11 +877,10 @@ mod tests {
 
     #[test]
     fn capture_contract_tracks_workspace_order_active_and_selected() {
-        let mut state = state_with_workspaces(&["a", "b", "c"]);
+        let state = state_with_workspaces(&["a", "b", "c"]);
+        let mut state = state;
         state.active = Some(1);
         state.selected = 2;
-
-        state.move_workspace(1, 0);
 
         let snapshot = capture_from_state(&state);
         let ids: Vec<_> = state.workspaces.iter().map(|ws| ws.id.clone()).collect();
