@@ -79,6 +79,10 @@ impl AppState {
 
     /// Hide the active workspace's float (the shell keeps running).
     pub(crate) fn hide_active_float(&mut self) {
+        // Any float-hide (toggle, blur, double-Esc, reap) ends a pending
+        // double-Esc sequence so a re-shown float never dismisses on its first
+        // Esc (#116).
+        self.float_esc_at = None;
         let Some(ws_id) = self.active_workspace_id().map(str::to_string) else {
             return;
         };

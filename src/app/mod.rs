@@ -144,9 +144,6 @@ pub struct App {
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
-    /// Timestamp of the last bare `Esc` forwarded into a visible float; a
-    /// second `Esc` within `FLOAT_ESC_DOUBLE_WINDOW` dismisses it (#116).
-    pub(crate) float_esc_at: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) persist_pane_history: bool,
@@ -579,6 +576,7 @@ impl App {
             update_install_command,
             latest_release_notes_available,
             update_dismissed: false,
+            float_esc_at: None,
             config_diagnostic,
             toast: None,
             copy_feedback: None,
@@ -708,7 +706,6 @@ impl App {
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
-            float_esc_at: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,

@@ -1881,6 +1881,10 @@ pub struct AppState {
     pub update_install_command: String,
     pub latest_release_notes_available: bool,
     pub update_dismissed: bool,
+    /// Timestamp of the last bare `Esc` forwarded into a visible float; a second
+    /// `Esc` within `FLOAT_ESC_DOUBLE_WINDOW` dismisses it (#116). Lives on
+    /// `AppState` so every float-hide path (`hide_active_float`) disarms it.
+    pub(crate) float_esc_at: Option<std::time::Instant>,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
     pub copy_feedback: Option<CopyFeedback>,
@@ -2639,6 +2643,7 @@ impl AppState {
             update_install_command: "flk update".into(),
             latest_release_notes_available: false,
             update_dismissed: false,
+            float_esc_at: None,
             config_diagnostic: None,
             toast: None,
             copy_feedback: None,
