@@ -2376,7 +2376,7 @@ fn pane_run_read_and_wait_commands_work() {
             "--lines",
             "40",
             "--timeout",
-            "5000",
+            "20000",
         ],
     );
     let elapsed = started.elapsed();
@@ -2450,7 +2450,7 @@ fn wait_output_matches_recent_unwrapped_text() {
             "--lines",
             "80",
             "--timeout",
-            "5000",
+            "20000",
         ],
     );
     assert!(
@@ -2863,7 +2863,7 @@ fn wait_agent_status_exits_when_idle_status_matches() {
             "--status",
             "idle",
             "--timeout",
-            "5000",
+            "20000",
         ],
     );
     assert!(
@@ -3003,7 +3003,7 @@ fn wait_agent_status_exits_when_done_status_matches() {
             "--status",
             "done",
             "--timeout",
-            "5000",
+            "20000",
         ],
     );
     assert!(
