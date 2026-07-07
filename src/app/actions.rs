@@ -3235,6 +3235,9 @@ impl AppState {
         let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
+        // Only defer when a client is rendering the `●`; a headless server with
+        // no app client keeps completions edge-driven (#130).
+        let app_client_attached = self.app_client_attached;
         let pane = self.workspaces[ws_idx]
             .tabs
             .iter_mut()
@@ -3251,7 +3254,7 @@ impl AppState {
         // sound/toast once the Idle dwells past the settle. Active, focused
         // completions (`suppress` true) never show a `●`, so they keep firing
         // immediately below, as does every `→ Blocked` "needs attention" edge.
-        if is_background_completion && !suppress_active_tab_notifications {
+        if is_background_completion && !suppress_active_tab_notifications && app_client_attached {
             pane.completion_pending = Some(crate::pane::CompletionPending {
                 previous_state: change.previous_state,
                 known_agent: change.known_agent,

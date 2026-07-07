@@ -576,6 +576,7 @@ impl App {
             toast: None,
             copy_feedback: None,
             outer_terminal_focus: None,
+            app_client_attached: true,
             prefix_code,
             prefix_mods,
             default_sidebar_width: config.ui.sidebar_width,

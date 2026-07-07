@@ -1887,6 +1887,13 @@ pub struct AppState {
     /// Last reported focus state for the outer terminal hosting flock.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
+    /// Whether a rendering (TUI) client is present, so the attention-settle
+    /// deferral (#130) has a `●`/sound/toast to settle. False in a headless
+    /// server serving only API clients (e.g. `flk wait`): there is nothing to
+    /// flicker, so completions re-arm immediately and the `Done` status stays
+    /// event-driven instead of waiting on the settle tick. Interactive keeps
+    /// the default `true`.
+    pub(crate) app_client_attached: bool,
     // Config
     pub prefix_code: KeyCode,
     pub prefix_mods: KeyModifiers,
@@ -2643,6 +2650,7 @@ impl AppState {
             toast: None,
             copy_feedback: None,
             outer_terminal_focus: None,
+            app_client_attached: true,
             prefix_code: KeyCode::Char('b'),
             prefix_mods: KeyModifiers::CONTROL,
             default_sidebar_width: 26,
