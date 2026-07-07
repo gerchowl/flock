@@ -42,6 +42,10 @@ const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
+/// Window within which a second `Esc` on a visible float dismisses it
+/// (hide-not-kill). The first `Esc` still forwards to the app inside the
+/// float, so a single `Esc` never gets stolen from vim/less/etc. (#116).
+const FLOAT_ESC_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
@@ -572,6 +576,7 @@ impl App {
             update_install_command,
             latest_release_notes_available,
             update_dismissed: false,
+            float_esc_at: None,
             config_diagnostic,
             toast: None,
             copy_feedback: None,
