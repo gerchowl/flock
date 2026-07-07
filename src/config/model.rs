@@ -475,6 +475,14 @@ pub struct KeysConfig {
     pub focus_attention_project: BindingConfig,
     /// Project-scoped attention queue, backwards. Unset by default.
     pub focus_attention_project_previous: BindingConfig,
+    /// Defer-to-next attention cycle (#122): like `focus_attention`, but marks
+    /// the current pane back to `seen=false` before moving on — "skip but keep
+    /// flagged". Default: "ctrl+shift+a".
+    pub focus_attention_defer: BindingConfig,
+    /// Toggle the sidebar-selected workspace's `●` attention indicator (#122):
+    /// flips every pane's `seen` flag, re-arming (or clearing) the derived
+    /// attention queue. Default: "prefix+shift+u".
+    pub mark_workspace_unread: BindingConfig,
     /// Open an existing Git worktree from the selected workspace. Unset by default.
     pub open_worktree: BindingConfig,
     /// Delete the selected managed worktree checkout after confirmation. Unset by default.
@@ -1067,6 +1075,8 @@ impl Default for KeysConfig {
             focus_attention_previous: BindingConfig::empty(),
             focus_attention_project: BindingConfig::empty(),
             focus_attention_project_previous: BindingConfig::empty(),
+            focus_attention_defer: BindingConfig::one("ctrl+shift+a"),
+            mark_workspace_unread: BindingConfig::one("prefix+shift+u"),
             open_worktree: BindingConfig::empty(),
             remove_worktree: BindingConfig::empty(),
             rename_workspace: BindingConfig::one("prefix+shift+w"),
