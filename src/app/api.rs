@@ -1330,7 +1330,7 @@ mod tests {
         while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        app.terminal_runtimes.insert(terminal_id, runtime);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -1354,6 +1354,21 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
+
+        // #130: a background completion's toast is deferred to the settle commit.
+        let changed_at = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        app.state.commit_settled_completions(
+            changed_at
+                + crate::app::actions::ATTENTION_SETTLE
+                + std::time::Duration::from_millis(1),
+            &app.terminal_runtimes,
+        );
 
         assert_eq!(
             app.state.toast.as_ref().map(|toast| toast.context.as_str()),

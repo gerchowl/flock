@@ -3186,6 +3186,13 @@ impl HeadlessServer {
 
         changed |= self.app.clear_due_selection_highlight(now);
 
+        // #130: commit settled background completions server-side too, so the
+        // authoritative `seen` clients read never stays stuck pending.
+        changed |= self
+            .app
+            .state
+            .commit_settled_completions(now, &self.app.terminal_runtimes);
+
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
         }

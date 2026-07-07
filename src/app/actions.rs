@@ -28,6 +28,14 @@ fn is_background_completion_transition(prev_state: AgentState, new_state: AgentS
         && matches!(prev_state, AgentState::Working | AgentState::Blocked)
 }
 
+/// How long a background completion must dwell in `Idle` before it re-arms the
+/// attention `●` and fires its completion sound/toast (#130). Seeded to match
+/// the Claude-only `CLAUDE_WORKING_HOLD` (1200ms) so today's damping is
+/// preserved, but applied agent-agnostically on the attention re-arm rather than
+/// the displayed Working/Idle state — a pane that flaps back to Working inside
+/// this window never lights, killing the busy-workspace flicker.
+pub(crate) const ATTENTION_SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
+
 pub fn active_tab_suppresses_notifications(
     is_active_tab: bool,
     outer_terminal_focus: Option<bool>,
@@ -3223,18 +3231,83 @@ impl AppState {
             .iter_mut()
             .find_map(|tab| tab.panes.get_mut(&pane_id))?;
 
+        let is_background_completion =
+            is_background_completion_transition(change.previous_state, change.state);
+
+        // #130: hold the *flicker-prone* case — a background completion on a pane
+        // the user isn't actively focused on (the one that would light `●`) — for
+        // `ATTENTION_SETTLE` rather than lighting it at the edge. A pane that flaps
+        // back to Working inside the window cancels the pending marker and never
+        // flickers; `commit_settled_completions` replays the re-arm + completion
+        // sound/toast once the Idle dwells past the settle. Active, focused
+        // completions (`suppress` true) never show a `●`, so they keep firing
+        // immediately below, as does every `→ Blocked` "needs attention" edge.
+        if is_background_completion && !suppress_active_tab_notifications {
+            pane.completion_pending = Some(crate::pane::CompletionPending {
+                previous_state: change.previous_state,
+                known_agent: change.known_agent,
+                agent_label: change.agent_label.clone(),
+            });
+            return Some(pane.seen);
+        }
+
         if change.state != AgentState::Idle {
             pane.seen = true;
-        } else if is_background_completion_transition(change.previous_state, change.state) {
+            // Left Idle before the settle fired — drop any pending completion so
+            // the flap never re-arms.
+            pane.completion_pending = None;
+        } else if is_background_completion {
+            // Active, focused completion: acknowledge immediately (seen stays
+            // true); there is no `●` to flicker.
             pane.seen = suppress_active_tab_notifications;
         }
         let seen = pane.seen;
 
-        if self.local_sound_playback && self.sound_config().allows(change.known_agent) {
+        self.emit_pane_state_notifications(
+            ws_idx,
+            pane_id,
+            is_active_tab,
+            suppress_active_tab_notifications,
+            change.previous_state,
+            change.state,
+            change.known_agent,
+            change.agent_label.as_deref(),
+            // Edge path: the stale label is refined afterwards by the App-level
+            // `refresh_new_flock_toast_context_for_update`.
+            None,
+        );
+
+        Some(seen)
+    }
+
+    /// Play the completion/attention sound and raise the Flock toast for a pane
+    /// state transition. Factored so both the live edge (`apply_pane_state_change`)
+    /// and the deferred commit (`commit_settled_completions`, #130) fire the
+    /// identical notifications for a `previous_state → new_state` transition.
+    ///
+    /// `terminal_runtimes` resolves the toast's workspace label against the live
+    /// root-runtime cwd. The edge path passes `None` (its stale label is refined
+    /// afterwards by `refresh_new_flock_toast_context_for_update`); the deferred
+    /// commit path has no such follow-up, so it passes `Some` to build the live
+    /// label directly (#130).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_pane_state_notifications(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        is_active_tab: bool,
+        suppress_active_tab_notifications: bool,
+        previous_state: AgentState,
+        new_state: AgentState,
+        known_agent: Option<Agent>,
+        agent_label: Option<&str>,
+        terminal_runtimes: Option<&crate::terminal::TerminalRuntimeRegistry>,
+    ) {
+        if self.local_sound_playback && self.sound_config().allows(known_agent) {
             if let Some(sound) = notification_sound_for_state_change(
                 suppress_active_tab_notifications,
-                change.previous_state,
-                change.state,
+                previous_state,
+                new_state,
             ) {
                 crate::sound::play(sound, self.sound_config());
             }
@@ -3245,19 +3318,20 @@ impl AppState {
             crate::config::ToastDelivery::Flock
         ) {
             if let (Some(agent_label), Some(kind)) = (
-                change.agent_label.as_deref(),
-                notification_toast_for_state_change(
-                    is_active_tab,
-                    change.previous_state,
-                    change.state,
-                ),
+                agent_label,
+                notification_toast_for_state_change(is_active_tab, previous_state, new_state),
             ) {
                 let event_text = match kind {
                     ToastKind::NeedsAttention => "needs attention",
                     ToastKind::Finished => "finished",
                     ToastKind::UpdateInstalled => "updated",
                 };
-                let workspace_label = self.workspaces[ws_idx].display_name();
+                let workspace_label = match terminal_runtimes {
+                    Some(runtimes) => {
+                        self.workspaces[ws_idx].display_name_from(&self.terminals, runtimes)
+                    }
+                    None => self.workspaces[ws_idx].display_name(),
+                };
                 let context = notification_context(
                     &self.workspaces[ws_idx],
                     &workspace_label,
@@ -3276,8 +3350,84 @@ impl AppState {
                 });
             }
         }
+    }
 
-        Some(seen)
+    /// Per-frame commit pass for deferred background completions (#130). A pane
+    /// whose pending completion has dwelled in `Idle` for at least
+    /// `ATTENTION_SETTLE` re-arms `seen` and fires its completion sound/toast —
+    /// exactly what the `→ Idle` edge would have done, only now proven settled.
+    /// Panes that left Idle already cleared their pending marker at the edge, so
+    /// they never reach here. Returns whether anything committed (render dirty).
+    pub(crate) fn commit_settled_completions(
+        &mut self,
+        now: std::time::Instant,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> bool {
+        // Phase 1: which panes have a pending completion that has now dwelled in
+        // `Idle` past the settle. Immutable read of the terminal clocks; the
+        // still-`Idle` guard defends against any state change that bypassed the
+        // edge handler (which is what normally clears the pending marker).
+        let mut ready: Vec<(usize, PaneId)> = Vec::new();
+        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    if pane.completion_pending.is_none() {
+                        continue;
+                    }
+                    let Some(terminal) = self.terminals.get(&pane.attached_terminal_id) else {
+                        continue;
+                    };
+                    let settled = terminal.state == AgentState::Idle
+                        && terminal.state_changed_at.is_some_and(|changed_at| {
+                            now.duration_since(changed_at) >= ATTENTION_SETTLE
+                        });
+                    if settled {
+                        ready.push((ws_idx, *pane_id));
+                    }
+                }
+            }
+        }
+
+        if ready.is_empty() {
+            return false;
+        }
+
+        // Phase 2: commit the re-arm + replay the completion sound/toast exactly
+        // as the `→ Idle` edge would have. Split from phase 1 so the mutable pane
+        // access and `&mut self` notification calls don't alias the clock reads.
+        for (ws_idx, pane_id) in ready {
+            let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
+            let suppress_active_tab_notifications =
+                active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
+            let Some(pending) = self.workspaces[ws_idx]
+                .tabs
+                .iter_mut()
+                .find_map(|tab| tab.panes.get_mut(&pane_id))
+                .and_then(|pane| {
+                    // `seen = false` unless the pane's tab is active-and-focused.
+                    pane.seen = suppress_active_tab_notifications;
+                    pane.completion_pending.take()
+                })
+            else {
+                continue;
+            };
+
+            self.emit_pane_state_notifications(
+                ws_idx,
+                pane_id,
+                is_active_tab,
+                suppress_active_tab_notifications,
+                pending.previous_state,
+                AgentState::Idle,
+                pending.known_agent,
+                pending.agent_label.as_deref(),
+                // Deferred path: build the live-cwd label directly — no App-level
+                // refinement runs after the settle commit.
+                Some(terminal_runtimes),
+            );
+        }
+
+        true
     }
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
@@ -4921,8 +5071,96 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
+        // #130: the re-arm is deferred — the pane is not lit at the edge.
+        assert!(
+            state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen,
+            "a background completion must not light ● before the settle window"
+        );
+
+        // Once the Idle dwells past the settle, the commit pass re-arms `seen`.
+        let changed_at = state
+            .terminals
+            .get(&bg_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        state.commit_settled_completions(
+            changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
+            &Default::default(),
+        );
+
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
         assert!(!pane.seen);
+    }
+
+    /// #130 core: a busy non-Claude pane that flaps Working↔Idle inside the
+    /// settle window must not flicker the `●` (or spam the completion toast) —
+    /// it lights exactly once, and only once a completion dwells past the settle.
+    /// On the pre-fix code every micro-idle re-armed `seen=false` immediately.
+    #[test]
+    fn background_completion_flap_lights_and_toasts_once_after_settle() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        let flap = |state: &mut AppState, agent_state: AgentState| {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id: bg_pane_id,
+                // Pi is non-Claude, so the Claude-only working hold never engages —
+                // exactly the classification the flicker was reported under.
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                activity: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+        let is_seen = |state: &AppState| state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen;
+
+        // Working → Idle → Working → Idle, all within the settle window.
+        flap(&mut state, AgentState::Working);
+        flap(&mut state, AgentState::Idle);
+        assert!(is_seen(&state), "first micro-idle must not light ●");
+        assert!(state.toast.is_none(), "first micro-idle must not toast");
+        flap(&mut state, AgentState::Working);
+        assert!(is_seen(&state));
+        flap(&mut state, AgentState::Idle);
+        assert!(is_seen(&state), "second micro-idle must not light ● either");
+        assert!(state.toast.is_none(), "no toast until a completion settles");
+
+        // Before the settle elapses: still held, nothing committed.
+        let changed_at = state
+            .terminals
+            .get(&bg_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        assert!(!state
+            .commit_settled_completions(changed_at + ATTENTION_SETTLE / 2, &Default::default()));
+        assert!(is_seen(&state), "half a settle in is not yet a completion");
+        assert!(state.toast.is_none());
+
+        // Past the settle from the final Idle: a single `●` lights + one toast.
+        assert!(state.commit_settled_completions(
+            changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
+            &Default::default()
+        ));
+        assert!(!is_seen(&state), "settled completion lights ● exactly once");
+        assert_eq!(
+            state.toast.as_ref().map(|t| t.kind),
+            Some(ToastKind::Finished),
+            "the completion toast fires once, at the settle commit"
+        );
     }
 
     #[test]
@@ -5313,6 +5551,22 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
+
+        // #130: the completion toast is deferred to the settle commit.
+        assert!(
+            state.toast.is_none(),
+            "the finished toast must not fire before the settle window"
+        );
+        let changed_at = state
+            .terminals
+            .get(&bg_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        state.commit_settled_completions(
+            changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
+            &Default::default(),
+        );
 
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::Finished);

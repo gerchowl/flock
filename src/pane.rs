@@ -32,7 +32,7 @@ mod xtgettcap;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{TerminalDirtyPatch, TerminalDirtyPatchOutcome};
 pub use self::{
-    state::PaneState,
+    state::{CompletionPending, PaneState},
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
 };
 
