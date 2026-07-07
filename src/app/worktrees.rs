@@ -282,9 +282,6 @@ impl App {
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let branch = crate::worktree::checkout_branch_name(&checkout);
-            let is_default_branch = branch.as_deref().is_some_and(|b| {
-                crate::worktree::detect_default_branch(&repo_root).as_deref() == Some(b)
-            });
             let (gate, timed_out) = match branch.clone() {
                 Some(branch) => crate::worktree::branch_merge_gate_with_timeout(
                     repo_root.clone(),
@@ -299,7 +296,6 @@ impl App {
                     path: checkout,
                     branch,
                     gate,
-                    is_default_branch,
                     timed_out,
                 },
             ));
@@ -316,6 +312,26 @@ impl App {
             self.apply_kill_all_gate(result);
             return;
         }
+        // #121: is this the repo's default (or a configured protected) branch?
+        // Decide BEFORE borrowing `remove` mutably — needs `remove.repo_root`
+        // and `config`, both immutable borrows of `self.state`. `is_protected_
+        // branch` carries the main/master floor even if detection returns None.
+        let protected = match self.state.worktree_remove.as_ref() {
+            Some(remove)
+                if remove.workspace_id == result.workspace_id && remove.path == result.path =>
+            {
+                result.branch.as_deref().is_some_and(|branch| {
+                    let default = crate::worktree::detect_default_branch(&remove.repo_root);
+                    crate::worktree::is_protected_branch(
+                        branch,
+                        default.as_deref(),
+                        &self.state.config.worktrees.protected_branches,
+                    )
+                })
+            }
+            _ => false,
+        };
+
         let Some(remove) = &mut self.state.worktree_remove else {
             return;
         };
@@ -332,12 +348,14 @@ impl App {
         );
         remove.branch = result.branch;
         remove.merge_gate = Some(result.gate);
-        // Default-branch guard (#121): the merge gate treats the default branch
-        // as "merged" (it is trivially contained in every downstream remote
-        // ref), which would build `git branch -D <default>` — deleting local
-        // main/master. Force checkout-only and keep the branch, whatever the
-        // gate concluded. The checkout folder can still be removed.
-        if result.is_default_branch {
+        // A protected branch — the repo's default, the main/master floor, or a
+        // configured `protected_branches` entry (#121, `is_protected_branch`
+        // above) — is kept regardless of merge evidence: the gate treats the
+        // default branch as "merged" (trivially contained in every downstream
+        // remote ref), which would otherwise build `git branch -D <default>`.
+        // Force checkout-only and flag the dialog; the checkout folder can
+        // still be removed.
+        if protected {
             remove.delete_branch = false;
             remove.branch_protected = true;
         }
@@ -430,9 +448,6 @@ impl App {
             let branch = row.branch.clone();
             let event_tx = self.event_tx.clone();
             std::thread::spawn(move || {
-                let is_default_branch = branch.as_deref().is_some_and(|b| {
-                    crate::worktree::detect_default_branch(&repo_root).as_deref() == Some(b)
-                });
                 let (gate, timed_out) = match branch.clone() {
                     Some(branch) => crate::worktree::branch_merge_gate_with_timeout(
                         repo_root.clone(),
@@ -447,7 +462,6 @@ impl App {
                         path: checkout,
                         branch,
                         gate,
-                        is_default_branch,
                         timed_out,
                     },
                 ));
@@ -2022,7 +2036,6 @@ mod tests {
             gate: crate::worktree::WorktreeMergeGate::Merged {
                 evidence: "PR #7 merged".into(),
             },
-            is_default_branch: false,
             timed_out: false,
         });
 
@@ -2068,7 +2081,6 @@ mod tests {
             gate: crate::worktree::WorktreeMergeGate::Merged {
                 evidence: "contained in origin/latest".into(),
             },
-            is_default_branch: true,
             timed_out: false,
         });
 
@@ -2109,7 +2121,6 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
-            is_default_branch: false,
             timed_out: true,
         });
 

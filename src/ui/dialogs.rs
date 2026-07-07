@@ -380,7 +380,18 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             .style(Style::default().fg(app.palette.text)),
         rows[2],
     );
-    if remove.delete_branch {
+    if remove.branch_protected {
+        // #121: the "& branch" path landed on the default/protected branch.
+        // The checkout may still be removed; the branch is always kept.
+        frame.render_widget(
+            Paragraph::new(format!(
+                " ✓ {} is a protected branch — kept (checkout only).",
+                remove.branch.as_deref().unwrap_or("default")
+            ))
+            .style(Style::default().fg(app.palette.green)),
+            rows[3],
+        );
+    } else if remove.delete_branch {
         let (gate_line, gate_style) = match &remove.merge_gate {
             None => (
                 " checking merge status…".to_string(),
@@ -404,15 +415,6 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             ),
         };
         frame.render_widget(Paragraph::new(gate_line).style(gate_style), rows[3]);
-    } else if remove.branch_protected {
-        frame.render_widget(
-            Paragraph::new(format!(
-                " ⛨ branch {} is protected (default) — kept.",
-                remove.branch.as_deref().unwrap_or("?")
-            ))
-            .style(Style::default().fg(app.palette.blue)),
-            rows[3],
-        );
     } else {
         frame.render_widget(
             Paragraph::new(" The branch is not deleted. The Flock workspace will close.")
