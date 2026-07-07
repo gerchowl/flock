@@ -227,10 +227,15 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         // #130: commit any background completions that have now dwelled past the
-        // attention settle (re-arm `●` + fire the completion sound/toast).
-        changed |= self
+        // attention settle (re-arm `●` + fire the completion sound/toast) and
+        // broadcast each resulting Idle→Done status change to API subscribers.
+        let settled = self
             .state
             .commit_settled_completions(now, &self.terminal_runtimes);
+        for update in &settled {
+            self.emit_pane_state_update(update);
+        }
+        changed |= !settled.is_empty();
 
         self.start_git_status_refresh_if_due(now);
 

@@ -3187,11 +3187,17 @@ impl HeadlessServer {
         changed |= self.app.clear_due_selection_highlight(now);
 
         // #130: commit settled background completions server-side too, so the
-        // authoritative `seen` clients read never stays stuck pending.
-        changed |= self
+        // authoritative `seen` clients read never stays stuck pending, and
+        // broadcast each Idle→Done change so API subscribers (e.g. `wait
+        // agent-status --status done`) are notified at the settle.
+        let settled = self
             .app
             .state
             .commit_settled_completions(now, &self.app.terminal_runtimes);
+        for update in &settled {
+            self.app.emit_pane_state_update(update);
+        }
+        changed |= !settled.is_empty();
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);

@@ -3367,11 +3367,16 @@ impl AppState {
     /// exactly what the `→ Idle` edge would have done, only now proven settled.
     /// Panes that left Idle already cleared their pending marker at the edge, so
     /// they never reach here. Returns whether anything committed (render dirty).
+    /// Returns the committed `Idle → Done` (`Idle && !seen`) status transitions
+    /// so the App-level caller can broadcast each via `emit_pane_state_update` —
+    /// the deferring edge kept `seen` true, so this settle is the first moment
+    /// the pane actually reaches `Done`, and API subscribers (`wait
+    /// agent-status --status done`) must be told here or never.
     pub(crate) fn commit_settled_completions(
         &mut self,
         now: std::time::Instant,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
-    ) -> bool {
+    ) -> Vec<PaneStateUpdate> {
         // Phase 1: classify each pending completion. Immutable read of the
         // terminal clocks.
         //   • `ready`  — still Idle and dwelled past the settle → commit.
@@ -3417,45 +3422,81 @@ impl AppState {
 
         if ready.is_empty() {
             // Clearing stale markers is not a visible change, so no render.
-            return false;
+            return Vec::new();
         }
 
         // Phase 2: commit the re-arm + replay the completion sound/toast exactly
         // as the `→ Idle` edge would have. Split from phase 1 so the mutable pane
         // access and `&mut self` notification calls don't alias the clock reads.
+        let mut updates = Vec::new();
         for (ws_idx, pane_id) in ready {
             let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
             let suppress_active_tab_notifications =
                 active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
-            let Some(pending) = self.workspaces[ws_idx]
+            // Flip `seen` (false unless the pane's tab is active-and-focused) and
+            // take the marker, capturing the pre-commit `seen` and the terminal so
+            // we can broadcast the resulting Idle→Done transition below.
+            let Some((pending, previous_seen, terminal_id)) = self.workspaces[ws_idx]
                 .tabs
                 .iter_mut()
                 .find_map(|tab| tab.panes.get_mut(&pane_id))
                 .and_then(|pane| {
-                    // `seen = false` unless the pane's tab is active-and-focused.
+                    let previous_seen = pane.seen;
+                    let terminal_id = pane.attached_terminal_id.clone();
                     pane.seen = suppress_active_tab_notifications;
-                    pane.completion_pending.take()
+                    pane.completion_pending
+                        .take()
+                        .map(|pending| (pending, previous_seen, terminal_id))
                 })
             else {
                 continue;
             };
+
+            let previous_state = pending.previous_state;
+            let known_agent = pending.known_agent;
+            let agent_label = pending.agent_label.clone();
 
             self.emit_pane_state_notifications(
                 ws_idx,
                 pane_id,
                 is_active_tab,
                 suppress_active_tab_notifications,
-                pending.previous_state,
+                previous_state,
                 AgentState::Idle,
-                pending.known_agent,
-                pending.agent_label.as_deref(),
+                known_agent,
+                agent_label.as_deref(),
                 // Deferred path: build the live-cwd label directly — no App-level
                 // refinement runs after the settle commit.
                 Some(terminal_runtimes),
             );
+
+            // The pane only now reaches `Done` (Idle && !seen). Emit a
+            // status-change update so the App layer broadcasts it to API
+            // subscribers; the edge kept `seen` true and emitted only `Idle`.
+            // previous_* mirror the label/presentation so the update carries a
+            // pure Idle→Done delta (no spurious PaneAgentDetected).
+            let presentation = self
+                .terminals
+                .get(&terminal_id)
+                .map(crate::terminal::TerminalState::effective_presentation)
+                .unwrap_or_else(crate::terminal::EffectivePresentation::empty);
+            updates.push(PaneStateUpdate {
+                pane_id,
+                ws_idx,
+                previous_agent_label: agent_label.clone(),
+                previous_known_agent: known_agent,
+                previous_state: AgentState::Idle,
+                previous_seen,
+                previous_presentation: presentation.clone(),
+                agent_label,
+                known_agent,
+                state: AgentState::Idle,
+                seen: suppress_active_tab_notifications,
+                presentation,
+            });
         }
 
-        true
+        updates
     }
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
@@ -5173,16 +5214,19 @@ mod tests {
             .unwrap()
             .state_changed_at
             .unwrap();
-        assert!(!state
-            .commit_settled_completions(changed_at + ATTENTION_SETTLE / 2, &Default::default()));
+        assert!(state
+            .commit_settled_completions(changed_at + ATTENTION_SETTLE / 2, &Default::default())
+            .is_empty());
         assert!(is_seen(&state), "half a settle in is not yet a completion");
         assert!(state.toast.is_none());
 
         // Past the settle from the final Idle: a single `●` lights + one toast.
-        assert!(state.commit_settled_completions(
-            changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
-            &Default::default()
-        ));
+        assert!(!state
+            .commit_settled_completions(
+                changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
+                &Default::default()
+            )
+            .is_empty());
         assert!(!is_seen(&state), "settled completion lights ● exactly once");
         assert_eq!(
             state.toast.as_ref().map(|t| t.kind),
@@ -5221,10 +5265,12 @@ mod tests {
             "viewing the tab must drop the pending completion"
         );
         // A later commit is then a no-op — no re-fire.
-        assert!(!state.commit_settled_completions(
-            std::time::Instant::now() + ATTENTION_SETTLE * 2,
-            &Default::default()
-        ));
+        assert!(state
+            .commit_settled_completions(
+                std::time::Instant::now() + ATTENTION_SETTLE * 2,
+                &Default::default()
+            )
+            .is_empty());
         assert!(state.toast.is_none());
     }
 
@@ -5257,10 +5303,12 @@ mod tests {
         terminal.state_changed_at = Some(std::time::Instant::now());
 
         // Even well past the settle, the stale marker is dropped, not committed.
-        assert!(!state.commit_settled_completions(
-            std::time::Instant::now() + ATTENTION_SETTLE * 2,
-            &Default::default()
-        ));
+        assert!(state
+            .commit_settled_completions(
+                std::time::Instant::now() + ATTENTION_SETTLE * 2,
+                &Default::default()
+            )
+            .is_empty());
         assert!(
             state.workspaces[1].tabs[0]
                 .panes

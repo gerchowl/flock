@@ -49,7 +49,7 @@ pub struct EffectivePresentation {
 }
 
 impl EffectivePresentation {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             title: None,
             display_agent: None,
