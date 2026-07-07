@@ -165,7 +165,7 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.cwd(cwd);
     cmd.env("XDG_CONFIG_HOME", config_home);
@@ -365,11 +365,22 @@ fn wait_for_switch_server(
     Err("timed out waiting for SwitchServer".into())
 }
 
-/// Splits the focus_workspace option (always the FINAL SwitchServer field)
-/// off a captured payload tail, returning just the fleet option bytes —
-/// what the launcher hands the next leg's Hello. None = one 0x00 byte;
-/// Some = 0x01 + len + utf8 id (ids are short; single-byte varint).
+/// Splits the trailing `Option<String>` fields off a captured SwitchServer
+/// payload tail, returning just the fleet option bytes — what the launcher
+/// hands the next leg's Hello. As of v23 (#101) there are TWO such fields
+/// after `fleet`: `focus_workspace` then `proxy_jump`. Both must be stripped
+/// — a stale one-field strip leaves the inner field's byte glued to the fleet
+/// option, so the reinjected Hello carries a stray trailing byte and the spoke
+/// rejects the handshake ("decoded N-1 bytes but payload length was N").
 fn strip_focus_suffix(tail: &[u8]) -> &[u8] {
+    // proxy_jump is last, focus_workspace precedes it.
+    strip_trailing_option(strip_trailing_option(tail))
+}
+
+/// Strips one trailing bincode `Option<String>` off `tail`.
+/// None = one 0x00 byte; Some = 0x01 + len + utf8 id (ids are short, so the
+/// length is a single-byte varint).
+fn strip_trailing_option(tail: &[u8]) -> &[u8] {
     if tail.last() == Some(&0) {
         return &tail[..tail.len() - 1];
     }
@@ -388,7 +399,7 @@ fn strip_focus_suffix(tail: &[u8]) -> &[u8] {
 #[test]
 fn peer_summary_folds_into_sidebar_and_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -446,7 +457,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
 
     // --- Attach a protocol client to A and wait for the folded remote row.
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, 21, 90, 30).expect("handshake should complete");
+    let (_, error) = client_handshake(&mut stream, 23, 90, 30).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
 
     // The first poll fires ~3s after A starts; allow generous slack. The
@@ -486,7 +497,7 @@ fn peer_summary_folds_into_sidebar_and_click_switches_server() {
 #[test]
 fn folded_remote_member_row_click_switches_server() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -545,7 +556,7 @@ fn folded_remote_member_row_click_switches_server() {
     wait_for_file(&client_socket_a, Duration::from_secs(10));
 
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, 21, 90, 30).expect("handshake should complete");
+    let (_, error) = client_handshake(&mut stream, 23, 90, 30).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
 
     wait_for_frame_row(&mut stream, "servers", Duration::from_secs(45))
@@ -586,7 +597,7 @@ fn folded_remote_member_row_click_switches_server() {
 #[test]
 fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let base = unique_test_dir();
-    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flock"))
+    let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
         .parent()
         .unwrap()
         .to_path_buf();
@@ -648,7 +659,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     // below the fold and only a scrollbar shows. Taller frame keeps the
     // whole list on screen; the folding itself is covered by unit tests.
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, 21, 90, 45).expect("handshake should complete");
+    let (_, error) = client_handshake(&mut stream, 23, 90, 45).expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
     // Owner/repo identity on the remote-only project leader (#62/#27).
     let row = wait_for_frame_row(&mut stream, "peer-fed-home/proj", Duration::from_secs(45))
@@ -687,7 +698,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let mut stream_b =
         UnixStream::connect(&client_socket_b).expect("spoke client socket should connect");
     let fleet_only = strip_focus_suffix(&fleet_bytes);
-    let (_, error) = client_handshake_with_fleet(&mut stream_b, 21, 90, 45, fleet_only)
+    let (_, error) = client_handshake_with_fleet(&mut stream_b, 23, 90, 45, fleet_only)
         .expect("spoke handshake should complete");
     assert!(error.is_none(), "spoke handshake rejected: {error:?}");
 

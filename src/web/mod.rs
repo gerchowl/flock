@@ -1,15 +1,15 @@
-//! `flock web` — xterm.js <-> flock PTY bridge (feature = "web").
+//! `flk web` — xterm.js <-> flock PTY bridge (feature = "web").
 //!
 //! gerchowl/flock#131 — first-class, in-tree port of the #109 MVP. Architecture
 //! (per the spike verdict, parent #109):
 //!
-//!   browser (xterm.js) <--WS--> flock web <--PTY--> flock client (terminal-ansi)
+//!   browser (xterm.js) <--WS--> flk web <--PTY--> flk client (terminal-ansi)
 //!
 //! Each WebSocket spawns a flock **client** in a PTY with
 //! `FLOCK_RENDER_ENCODING=terminal-ansi`; flock's server pre-diffs to ANSI and
 //! the client is a stdout passthrough, so xterm.js writes the byte stream
 //! straight to its buffer — no JS painting, no rerender. On an always-on host
-//! (e.g. sage) the client attaches to the persistent `flock server` daemon, so
+//! (e.g. sage) the client attaches to the persistent `flk server` daemon, so
 //! the phone shares that node's live session AND its fleet gossip view.
 //!
 //! Security boundary (v1): this binds loopback only and is fronted by
@@ -20,10 +20,16 @@
 //!   3. same-origin check on the WS upgrade (CSWSH defence).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::config::model::{
+    DEFAULT_WEB_BIND as CONFIG_DEFAULT_BIND,
+    DEFAULT_WEB_MAX_SESSIONS as CONFIG_DEFAULT_MAX_SESSIONS,
+};
+use crate::config::Config;
 
 use axum::{
     extract::{
@@ -42,17 +48,17 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-const DEFAULT_BIND: &str = "127.0.0.1:7681";
+/// Local aliases for the defaults, now sourced from [`crate::config`] so the
+/// [`WebSectionConfig`] and this file agree on the same numbers (ADR-0002
+/// phase e).
+const DEFAULT_BIND: &str = CONFIG_DEFAULT_BIND;
+const DEFAULT_MAX_SESSIONS: usize = CONFIG_DEFAULT_MAX_SESSIONS;
 
 #[derive(RustEmbed)]
 #[folder = "assets/web/"]
 struct WebAssets;
 
-/// Default concurrent-session cap — a PTY-exhaustion backstop, generous for a
-/// personal fleet. `0` disables the cap.
-const DEFAULT_MAX_SESSIONS: usize = 16;
-
-/// Parsed `flock web` configuration.
+/// Parsed `flk web` configuration.
 struct WebConfig {
     bind: SocketAddr,
     flock_bin: PathBuf,
@@ -110,7 +116,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
     // routable interface exposes it without the tailscale-serve auth boundary.
     if !cfg.bind.ip().is_loopback() && !cfg.allow_non_loopback {
         eprintln!(
-            "flock web: refusing to bind non-loopback address {}",
+            "flk web: refusing to bind non-loopback address {}",
             cfg.bind
         );
         eprintln!("  the web bridge is a full shell; front it with `tailscale serve` on loopback.");
@@ -126,7 +132,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
         match tailscale_funnel_status() {
             FunnelCheck::Active => {
                 eprintln!(
-                    "flock web: refusing to start — `tailscale funnel` is active on this node."
+                    "flk web: refusing to start — `tailscale funnel` is active on this node."
                 );
                 eprintln!(
                     "  funnel publishes to the PUBLIC internet; this bridge is a full shell."
@@ -139,7 +145,7 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
             FunnelCheck::Inactive => {}
             FunnelCheck::Unknown => {
                 eprintln!(
-                    "flock web: could not verify tailscale funnel state; ensure you front this \
+                    "flk web: could not verify tailscale funnel state; ensure you front this \
                      with `tailscale serve` (tailnet-only), NOT `tailscale funnel`."
                 );
             }
@@ -186,8 +192,8 @@ async fn serve(cfg: WebConfig) -> std::io::Result<i32> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("flock web listening on http://{}/", bind);
-    eprintln!("flock web: listening on http://{}/", bind);
+    info!("flk web listening on http://{}/", bind);
+    eprintln!("flk web: listening on http://{}/", bind);
     axum::serve(listener, app).await?;
     Ok(0)
 }
@@ -251,8 +257,7 @@ async fn ws_handler(
         &state.allowed_origins,
         state.allow_any_origin,
     ) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(?origin, ?host, "rejecting cross-origin WS upgrade");
+        crate::logging::web_ws_origin_rejected(origin.as_deref(), host.as_deref());
         return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
     }
 
@@ -261,8 +266,7 @@ async fn ws_handler(
     // not enforced (loopback / tailnet membership stays the boundary).
     let user = header_str(&headers, "tailscale-user-login");
     if !identity_allowed(user.as_deref(), &state.allowed_users) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(?user, "rejecting WS upgrade: identity not in allow-list");
+        crate::logging::web_ws_identity_rejected(user.as_deref());
         return (StatusCode::FORBIDDEN, "identity not allowed").into_response();
     }
 
@@ -278,7 +282,7 @@ async fn ws_handler(
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "flock web: session limit reached",
+                "flk web: session limit reached",
             )
                 .into_response();
         }
@@ -308,8 +312,7 @@ async fn handle_socket(
     // Held for the connection lifetime; drops (releasing the slot) on return.
     let _guard = guard;
     if let Err(e) = pump(socket, state, idle).await {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(error = %e, "ws session ended with error");
+        crate::logging::web_ws_session_ended_error(&e.to_string());
     } else {
         info!("ws session ended cleanly");
     }
@@ -327,8 +330,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
                 // Tolerate resize-before-init from a racing client.
                 Ok(ClientMsg::Resize { cols, rows }) => break (cols.max(1), rows.max(1)),
                 Err(e) => {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    warn!(error = %e, "ignoring non-init control msg pre-init");
+                    crate::logging::web_ws_pre_init_parse_failed(&e.to_string());
                     continue;
                 }
             },
@@ -360,8 +362,8 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
         cmd.arg(a);
     }
     // Start the spawned client from a clean flock environment. CommandBuilder
-    // seeds env from the current process; if `flock web` is run from inside a
-    // flock pane, the inherited `FLOCK_*` vars break the child: `FLOCK_ENV=1`
+    // seeds env from the current process; if `flk web` is run from inside a
+    // flk pane, the inherited `FLOCK_*` vars break the child: `FLOCK_ENV=1`
     // trips the nested-launch guard (`exit_if_nested_disabled`) so every
     // connection flash-exits, and the leg/handoff/switch/socket/pane vars make
     // it resume stale state or point at the launcher's socket instead of doing
@@ -472,8 +474,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(error = %e, "pty resize");
+                crate::logging::web_pty_resize_failed(&e.to_string());
             } else {
                 debug!(cols, rows, "pty resized");
             }
@@ -524,8 +525,7 @@ fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender<V
                 }
             }
             Err(e) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(error = %e, "pty read ended");
+                crate::logging::web_pty_read_ended(&e.to_string());
                 break;
             }
         }
@@ -641,38 +641,60 @@ enum ParseResult {
     Err(i32),
 }
 
-fn default_flock_bin() -> PathBuf {
-    if let Ok(v) = std::env::var("FLOCK_WEB_FLOCK_BIN") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+/// Resolve `flock_bin`: if the config leaves it empty, fall back to this
+/// executable, then to bare `flk` on PATH. The env layer already merged
+/// `FLOCK_WEB_FLOCK_BIN` into `config.web.flock_bin` before we got here.
+fn resolve_flock_bin(configured: &Path) -> PathBuf {
+    if !configured.as_os_str().is_empty() {
+        return configured.to_path_buf();
     }
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flock"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flk"))
 }
 
 fn parse_args(args: &[String]) -> ParseResult {
-    let mut bind_raw = std::env::var("FLOCK_WEB_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    if bind_raw.is_empty() {
-        bind_raw = DEFAULT_BIND.to_string();
-    }
-    let mut flock_bin = default_flock_bin();
+    // Config carries the [web] section with env<file<overlay already merged in
+    // (ADR-0002 phases b+d). CLI flags override on top. Diagnostics from the
+    // load are dropped: `flk web` is a short-lived process; the same config
+    // reads happen at server startup where they surface via the normal
+    // diagnostic path.
+    let config = Config::load().config;
+    parse_args_with_config(args, &config)
+}
+
+fn parse_args_with_config(args: &[String], config: &Config) -> ParseResult {
+    let web = &config.web;
+    let mut bind_raw = if web.bind.is_empty() {
+        DEFAULT_BIND.to_string()
+    } else {
+        web.bind.clone()
+    };
+    let mut flock_bin = resolve_flock_bin(&web.flock_bin);
     let mut flock_args: Vec<String> = Vec::new();
-    let mut session: Option<String> = std::env::var("FLOCK_WEB_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let mut session: Option<String> = if web.session.is_empty() {
+        None
+    } else {
+        Some(web.session.clone())
+    };
     let mut allow_non_loopback = false;
     let mut allow_funnel = false;
     let mut allow_any_origin = false;
-    let mut allowed_origins = csv_env("FLOCK_WEB_ALLOWED_ORIGINS");
-    let mut allowed_users = csv_env("FLOCK_WEB_ALLOWED_USERS");
-    let mut max_sessions: usize = std::env::var("FLOCK_WEB_MAX_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_SESSIONS);
-    let mut idle_secs: u64 = std::env::var("FLOCK_WEB_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // ADR-0002 phase e: list-valued env vars keep CSV parsing as a documented
+    // web-only exception (the generic env layer is scalar-only and skips
+    // arrays). Precedence matches the ADR — env sits BELOW the file: the CSV
+    // env applies ONLY when the file leaves the list empty, so a `[web]
+    // allowed_origins = [...]` in config.toml wins.
+    let mut allowed_origins = if web.allowed_origins.is_empty() {
+        csv_env("FLOCK_WEB_ALLOWED_ORIGINS")
+    } else {
+        web.allowed_origins.clone()
+    };
+    let mut allowed_users = if web.allowed_users.is_empty() {
+        csv_env("FLOCK_WEB_ALLOWED_USERS")
+    } else {
+        web.allowed_users.clone()
+    };
+    let mut max_sessions: usize = web.max_sessions;
+    let mut idle_secs: u64 = web.idle_timeout_secs;
 
     let mut i = 0;
     while i < args.len() {
@@ -680,7 +702,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             "help" | "--help" | "-h" => return ParseResult::Help,
             "--bind" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --bind");
+                    eprintln!("flk web: missing value for --bind");
                     return ParseResult::Err(2);
                 };
                 bind_raw = v.clone();
@@ -688,7 +710,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--flock-bin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --flock-bin");
+                    eprintln!("flk web: missing value for --flock-bin");
                     return ParseResult::Err(2);
                 };
                 flock_bin = PathBuf::from(v);
@@ -696,7 +718,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--session" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --session");
+                    eprintln!("flk web: missing value for --session");
                     return ParseResult::Err(2);
                 };
                 session = Some(v.clone());
@@ -704,7 +726,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--allowed-origin" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --allowed-origin");
+                    eprintln!("flk web: missing value for --allowed-origin");
                     return ParseResult::Err(2);
                 };
                 allowed_origins.push(v.clone());
@@ -712,7 +734,7 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--allowed-user" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --allowed-user");
+                    eprintln!("flk web: missing value for --allowed-user");
                     return ParseResult::Err(2);
                 };
                 allowed_users.push(v.clone());
@@ -720,13 +742,13 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--max-sessions" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --max-sessions");
+                    eprintln!("flk web: missing value for --max-sessions");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => max_sessions = n,
                     Err(_) => {
-                        eprintln!("flock web: invalid --max-sessions: {v}");
+                        eprintln!("flk web: invalid --max-sessions: {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -734,13 +756,13 @@ fn parse_args(args: &[String]) -> ParseResult {
             }
             "--idle-timeout" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("flock web: missing value for --idle-timeout");
+                    eprintln!("flk web: missing value for --idle-timeout");
                     return ParseResult::Err(2);
                 };
                 match v.parse() {
                     Ok(n) => idle_secs = n,
                     Err(_) => {
-                        eprintln!("flock web: invalid --idle-timeout (seconds): {v}");
+                        eprintln!("flk web: invalid --idle-timeout (seconds): {v}");
                         return ParseResult::Err(2);
                     }
                 }
@@ -763,7 +785,7 @@ fn parse_args(args: &[String]) -> ParseResult {
                 break;
             }
             other => {
-                eprintln!("flock web: unknown option: {other}");
+                eprintln!("flk web: unknown option: {other}");
                 return ParseResult::Err(2);
             }
         }
@@ -772,7 +794,7 @@ fn parse_args(args: &[String]) -> ParseResult {
     let bind = match bind_raw.parse::<SocketAddr>() {
         Ok(addr) => addr,
         Err(_) => {
-            eprintln!("flock web: invalid bind address: {bind_raw}");
+            eprintln!("flk web: invalid bind address: {bind_raw}");
             return ParseResult::Err(2);
         }
     };
@@ -806,29 +828,42 @@ fn csv_env(name: &str) -> Vec<String> {
 }
 
 fn print_web_help() {
-    println!("flock web — serve a phone-friendly xterm.js terminal over a WebSocket");
+    println!("flk web — serve a phone-friendly xterm.js terminal over a WebSocket");
     println!();
-    println!("Usage: flock web [options] [-- <flock args>]");
+    println!("Usage: flk web [options] [-- <flock args>]");
     println!();
     println!("Front this with `tailscale serve` (tailnet-only). It is a full shell.");
     println!();
+    println!("Persistent options read from config.toml `[web]` (ADR-0002 phase e); CLI");
+    println!("flags override the config; the generic FLOCK_<UPPER_SNAKE> env layer");
+    println!("(ADR-0002 phase d) sits BELOW the file — FLOCK_WEB_* is a per-invocation");
+    println!("poke that a file value overrides.");
+    println!();
     println!("Options:");
     println!("  --bind <addr>            loopback addr to listen on (default {DEFAULT_BIND})");
-    println!("                           env: FLOCK_WEB_BIND");
+    println!("                           config: [web] bind — env: FLOCK_WEB_BIND");
     println!("  --flock-bin <path>       flock binary to spawn per connection");
-    println!("                           (default: this binary; env FLOCK_WEB_FLOCK_BIN)");
-    println!("  --session <name>         flock session the bridge attaches to");
-    println!("                           env: FLOCK_WEB_SESSION");
+    println!("                           (default: this binary)");
+    println!("                           config: [web] flock_bin — env: FLOCK_WEB_FLOCK_BIN");
+    println!("  --session <name>         flk session the bridge attaches to");
+    println!("                           config: [web] session — env: FLOCK_WEB_SESSION");
     println!("  --allowed-origin <o>     extra allowed WS Origin (repeatable)");
-    println!("                           env: FLOCK_WEB_ALLOWED_ORIGINS (comma-separated)");
-    println!("  --allowed-user <login>   tailscale identity allowed to connect (repeatable);");
-    println!("                           empty = not enforced. env: FLOCK_WEB_ALLOWED_USERS");
-    println!("  --max-sessions <n>       concurrent WS cap (0 = unlimited;");
     println!(
-        "                           default {DEFAULT_MAX_SESSIONS}). env: FLOCK_WEB_MAX_SESSIONS"
+        "                           config: [web] allowed_origins — env: FLOCK_WEB_ALLOWED_ORIGINS"
     );
-    println!("  --idle-timeout <secs>    close a WS idle this long (0 = off;");
-    println!("                           default 0). env: FLOCK_WEB_IDLE_TIMEOUT_SECS");
+    println!("                           (comma-separated; env applies only when the config");
+    println!("                           list is empty — file wins)");
+    println!("  --allowed-user <login>   tailscale identity allowed to connect (repeatable);");
+    println!("                           empty = not enforced.");
+    println!(
+        "                           config: [web] allowed_users — env: FLOCK_WEB_ALLOWED_USERS"
+    );
+    println!("  --max-sessions <n>       concurrent WS cap (0 = unlimited;");
+    println!("                           default {DEFAULT_MAX_SESSIONS}).");
+    println!("                           config: [web] max_sessions — env: FLOCK_WEB_MAX_SESSIONS");
+    println!("  --idle-timeout <secs>    close a WS idle this long (0 = off; default 0).");
+    println!("                           config: [web] idle_timeout_secs");
+    println!("                           env: FLOCK_WEB_IDLE_TIMEOUT_SECS");
     println!("  --allow-non-loopback     permit a routable --bind (you provide auth)");
     println!("  --allow-funnel           start even if `tailscale funnel` is active");
     println!("  --allow-any-origin       disable the same-origin WS check (unsafe)");
@@ -962,5 +997,193 @@ mod tests {
         assert!(WebAssets::get("vendor/xterm.min.js").is_some());
         assert!(WebAssets::get("vendor/xterm.min.css").is_some());
         assert!(WebAssets::get("vendor/addon-fit.min.js").is_some());
+    }
+
+    // ---- ADR-0002 phase (e) — [web] fold -----------------------------------
+
+    fn ok(result: ParseResult) -> WebConfig {
+        match result {
+            ParseResult::Ok(cfg) => cfg,
+            ParseResult::Help => panic!("expected Ok, got Help"),
+            ParseResult::Err(code) => panic!("expected Ok, got Err({code})"),
+        }
+    }
+
+    /// RAII env guard for the CSV env vars. `Drop` restores the prior state so
+    /// tests don't perturb each other. Every test that touches env holds
+    /// `test_config_env_lock` for serialization.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn poisoned_lock<'a>(m: &'a std::sync::Mutex<()>) -> std::sync::MutexGuard<'a, ()> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{label}-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn web_config_from_toml_section_takes_effect() {
+        // A `[web]` block in config.toml propagates through Config::load into
+        // parse_args's WebConfig — no CLI flag, no env — proving the fold.
+        let mut config = Config::default();
+        config.web.bind = "127.0.0.1:9999".to_string();
+        config.web.session = "phone".to_string();
+        config.web.max_sessions = 4;
+        config.web.idle_timeout_secs = 45;
+        config.web.allowed_origins = vec!["https://phone.example".to_string()];
+        config.web.allowed_users = vec!["lars@example.com".to_string()];
+
+        let cfg = ok(parse_args_with_config(&[], &config));
+
+        assert_eq!(cfg.bind, "127.0.0.1:9999".parse::<SocketAddr>().unwrap());
+        assert_eq!(cfg.session.as_deref(), Some("phone"));
+        assert_eq!(cfg.max_sessions, 4);
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(45)));
+        assert_eq!(cfg.allowed_origins, vec!["https://phone.example"]);
+        assert_eq!(cfg.allowed_users, vec!["lars@example.com"]);
+    }
+
+    #[test]
+    fn web_cli_flags_override_toml_section() {
+        // Precedence per ADR-0002: Config [web] < CLI flags. Each scalar
+        // rewrites; each list flag APPENDS to the config-provided list
+        // (mirrors the pre-fold "repeatable" flag semantics).
+        let mut config = Config::default();
+        config.web.bind = "127.0.0.1:9999".to_string();
+        config.web.session = "phone".to_string();
+        config.web.max_sessions = 4;
+        config.web.idle_timeout_secs = 45;
+        config.web.allowed_origins = vec!["https://phone.example".to_string()];
+
+        let args: Vec<String> = [
+            "--bind",
+            "127.0.0.1:5555",
+            "--session",
+            "laptop",
+            "--max-sessions",
+            "9",
+            "--idle-timeout",
+            "10",
+            "--allowed-origin",
+            "https://tablet.example",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let cfg = ok(parse_args_with_config(&args, &config));
+
+        assert_eq!(cfg.bind, "127.0.0.1:5555".parse::<SocketAddr>().unwrap());
+        assert_eq!(cfg.session.as_deref(), Some("laptop"));
+        assert_eq!(cfg.max_sessions, 9);
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(
+            cfg.allowed_origins,
+            vec!["https://phone.example", "https://tablet.example"]
+        );
+    }
+
+    #[test]
+    fn web_env_scalar_maps_via_generic_layer() {
+        // FLOCK_WEB_BIND is a scalar env var, and the generic
+        // FLOCK_<UPPER_SNAKE> layer (ADR-0002 phase d) maps it onto the
+        // web-bind config path on its own. With no config file present the
+        // env value reaches parse_args_with_config, and with a file that
+        // pins bind the file WINS (env sits below file). No custom env read
+        // in web mod is needed.
+        let _lock = poisoned_lock(crate::config::test_config_env_lock());
+        let _hn = EnvGuard::unset("FLOCK_HOST_NAME");
+        let _ds = EnvGuard::unset("FLOCK_DISABLE_SOUND");
+        let _ao = EnvGuard::unset("FLOCK_WEB_ALLOWED_ORIGINS");
+        let _au = EnvGuard::unset("FLOCK_WEB_ALLOWED_USERS");
+        let _bind = EnvGuard::set("FLOCK_WEB_BIND", "127.0.0.1:7000");
+
+        // Case 1: no file — env applies (over the default DEFAULT_BIND).
+        let dir = unique_test_dir("flock-web-env-nofile");
+        let missing = dir.join("config.toml");
+        let _cfg_path = EnvGuard::set(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            missing.to_str().unwrap(),
+        );
+        let config = Config::load().config;
+        let cfg = ok(parse_args_with_config(&[], &config));
+        assert_eq!(
+            cfg.bind,
+            "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+            "no file → FLOCK_WEB_BIND applies via the generic env layer"
+        );
+
+        // Case 2: file [web] bind set — file wins over env.
+        let dir = unique_test_dir("flock-web-env-withfile");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "[web]\nbind = \"127.0.0.1:6000\"\n").unwrap();
+        let _cfg_path = EnvGuard::set(crate::config::CONFIG_PATH_ENV_VAR, base.to_str().unwrap());
+        let config = Config::load().config;
+        let cfg = ok(parse_args_with_config(&[], &config));
+        assert_eq!(
+            cfg.bind,
+            "127.0.0.1:6000".parse::<SocketAddr>().unwrap(),
+            "file [web] bind must WIN over FLOCK_WEB_BIND (env < file)"
+        );
+    }
+
+    #[test]
+    fn web_csv_env_applies_only_when_file_list_empty() {
+        // Documented web-only exception: the list-valued env vars keep CSV
+        // parsing because the generic layer is scalar-only. Precedence still
+        // matches the ADR: env sits BELOW the file — the CSV env applies
+        // ONLY when the config's list is empty.
+        let _lock = poisoned_lock(crate::config::test_config_env_lock());
+        let _hn = EnvGuard::unset("FLOCK_HOST_NAME");
+        let _ds = EnvGuard::unset("FLOCK_DISABLE_SOUND");
+        let _ao = EnvGuard::set("FLOCK_WEB_ALLOWED_ORIGINS", "https://csv.example");
+
+        // Empty config list → CSV env fills it.
+        let config = Config::default();
+        let cfg = ok(parse_args_with_config(&[], &config));
+        assert_eq!(cfg.allowed_origins, vec!["https://csv.example"]);
+
+        // Non-empty config list → CSV env IGNORED (file wins).
+        let mut config = Config::default();
+        config.web.allowed_origins = vec!["https://file.example".to_string()];
+        let cfg = ok(parse_args_with_config(&[], &config));
+        assert_eq!(
+            cfg.allowed_origins,
+            vec!["https://file.example"],
+            "file list must win over FLOCK_WEB_ALLOWED_ORIGINS (env < file)"
+        );
     }
 }

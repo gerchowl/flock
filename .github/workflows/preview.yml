@@ -188,7 +188,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
           if [ "${{ runner.os }}" = "Linux" ]; then
             file ${{ matrix.name }} > BUILD_INFO.txt
             ldd ${{ matrix.name }} > LDD_INFO.txt 2>&1 || true

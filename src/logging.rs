@@ -21,8 +21,13 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
-    let filter =
-        EnvFilter::try_from_env("FLOCK_LOG").unwrap_or_else(|_| EnvFilter::new("flock=info"));
+    // Default filter covers both the crate's module_path (`flk`, the [[bin]]
+    // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
+    // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
+    // whose namespace stays `flock` as part of the logging identity. FLOCK_LOG
+    // overrides the whole directive if set.
+    let filter = EnvFilter::try_from_env("FLOCK_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("flk=info,flock=info"));
 
     // JSON lines on disk (logging redesign PR-2): structured fields survive as
     // real fields instead of being flattened into message strings, and the
@@ -572,6 +577,7 @@ pub(crate) fn remote_bridge_started(
     ssh_config_file: Option<&Path>,
     ssh_opts: &[&str],
     remote_command: &str,
+    proxy_jump: Option<&str>,
 ) {
     tracing::info!(
         event = "remote.bridge.started",
@@ -583,6 +589,10 @@ pub(crate) fn remote_bridge_started(
             .unwrap_or_default(),
         ssh_opts = ssh_opts.join(","),
         remote_command,
+        // Gossip v3 (#101 part 3): a snapshot-derived leg's ProxyJump
+        // identity rides the observability event so a failed multi-hop dial
+        // is diagnosable from flock.log at DEFAULT level.
+        proxy_jump = proxy_jump.unwrap_or_default(),
         "ssh bridge starting"
     );
 }
@@ -813,6 +823,2034 @@ pub(crate) fn remote_ssh_keepalive_config_missing(err: &str) {
     );
 }
 
+// --- client_conn family (logging redesign PR-4) ----------------------------
+// Every phase of a thin-client Unix-socket connection: nonblocking setup, the
+// listener accept/reject loop, the handshake read/write, and per-connection
+// read/write/flush failures once the session is running. A broken connection
+// is normal in fleet churn — DEBUG for benign disconnects, WARN for setup
+// misses, ERROR for the accept loop giving up (the server can no longer take
+// new clients).
+
+pub(crate) fn client_conn_nonblocking_failed(err: &str) {
+    tracing::warn!(
+        event = "client_conn.setup",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "nonblocking",
+        err,
+        "failed to set client stream nonblocking"
+    );
+}
+
+pub(crate) fn client_conn_accept_failed(err: &str) {
+    tracing::error!(
+        event = "client_conn.listener",
+        subsystem = "client_conn",
+        outcome = "error",
+        mode = "accept",
+        err,
+        "client listener accept failed"
+    );
+}
+
+pub(crate) fn client_conn_reject_failed(err: &str) {
+    tracing::error!(
+        event = "client_conn.listener",
+        subsystem = "client_conn",
+        outcome = "error",
+        mode = "reject",
+        err,
+        "client listener reject failed"
+    );
+}
+
+pub(crate) fn client_conn_refusal_send_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "handoff_refusal",
+        err,
+        "failed to send live-handoff refusal to pending client"
+    );
+}
+
+pub(crate) fn client_conn_handshake_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "handshake",
+        client_id,
+        err,
+        "client handshake failed"
+    );
+}
+
+pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.handshake",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "read_hello",
+        client_id,
+        err,
+        "failed to read client hello"
+    );
+}
+
+pub(crate) fn client_conn_write_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.write",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "write",
+        err,
+        "client write failed, closing writer"
+    );
+}
+
+pub(crate) fn client_conn_flush_failed(err: &str) {
+    tracing::debug!(
+        event = "client_conn.write",
+        subsystem = "client_conn",
+        outcome = "error",
+        stage = "flush",
+        err,
+        "client flush failed, closing writer"
+    );
+}
+
+pub(crate) fn client_conn_read_failed(client_id: u64, err: &str) {
+    tracing::debug!(
+        event = "client_conn.read",
+        subsystem = "client_conn",
+        outcome = "error",
+        client_id,
+        err,
+        "client read error, closing"
+    );
+}
+
+// --- server family (logging redesign PR-4) ---------------------------------
+// Server lifecycle events — daemon spawn, socket bind, ready-poll, and
+// shutdown cleanup. The "did the server actually come up?" story must be
+// answerable from the tail without decoding raw fd errors.
+
+pub(crate) fn server_socket_check_failed(err: &str) {
+    tracing::warn!(
+        event = "server.socket.check",
+        subsystem = "server",
+        outcome = "error",
+        err,
+        "unexpected error checking server socket"
+    );
+}
+
+pub(crate) fn server_daemon_spawning(exe: &Path) {
+    tracing::info!(
+        event = "server.daemon.spawn",
+        subsystem = "server",
+        outcome = "started",
+        exe = %exe.display(),
+        "spawning server daemon"
+    );
+}
+
+pub(crate) fn server_socket_ready(path: &Path) {
+    tracing::info!(
+        event = "server.socket.ready",
+        subsystem = "server",
+        outcome = "ok",
+        path = %path.display(),
+        "server socket ready"
+    );
+}
+
+pub(crate) fn server_auto_detect_starting(path: &Path) {
+    tracing::info!(
+        event = "server.auto_detect.start",
+        subsystem = "server",
+        outcome = "started",
+        path = %path.display(),
+        "auto-detect launch starting"
+    );
+}
+
+// --- handoff family: rollback + ownership ack (logging redesign PR-4) ------
+// Live handoff (#38) forks a fresh server and hands the current runtime to
+// it. The story the tail must answer: WHICH import server, WHICH phase, and
+// WHY did it stop? `phase` names the rollback step (exited/inspect/kill/
+// reaped/reap). Ownership-ack failures leave the OLD server as owner so the
+// clients don't get abandoned — WARN, not ERROR: recoverable degradation.
+
+pub(crate) fn handoff_import_rollback_exited(pid: u32, status: &str) {
+    tracing::info!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "ok",
+        phase = "exited",
+        pid,
+        status,
+        "handoff import server exited during rollback"
+    );
+}
+
+pub(crate) fn handoff_import_rollback_reaped(pid: u32, status: &str) {
+    tracing::info!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "ok",
+        phase = "reaped",
+        pid,
+        status,
+        "handoff import server reaped during rollback"
+    );
+}
+
+pub(crate) fn handoff_import_rollback_step_failed(pid: u32, phase: &'static str, err: &str) {
+    let message = match phase {
+        "inspect" => "failed to inspect handoff import server before rollback",
+        "kill" => "failed to kill handoff import server during rollback",
+        "reap" => "failed to reap handoff import server during rollback",
+        _ => "handoff import rollback step failed",
+    };
+    tracing::warn!(
+        event = "handoff.import.rollback",
+        subsystem = "handoff",
+        outcome = "error",
+        phase,
+        pid,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_setup_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "error",
+        stage = "timeout_setup",
+        err,
+        "failed to set handoff ownership ack timeout"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_unexpected(response: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "unexpected",
+        response,
+        "handoff import sent unexpected ownership ack after commit"
+    );
+}
+
+pub(crate) fn handoff_owned_ack_read_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.ack",
+        subsystem = "handoff",
+        outcome = "error",
+        stage = "read",
+        err,
+        "handoff import ownership ack was not received after commit"
+    );
+}
+
+// --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
+
+pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
+    tracing::info!(
+        event = "server.start",
+        subsystem = "server",
+        outcome = "ok",
+        api_socket = %api_socket.display(),
+        client_socket = %client_socket.display(),
+        "flk server started"
+    );
+}
+
+pub(crate) fn server_client_socket_listening(path: &Path) {
+    tracing::info!(
+        event = "server.socket.listening",
+        subsystem = "server",
+        outcome = "ok",
+        path = %path.display(),
+        "client protocol socket listening"
+    );
+}
+
+pub(crate) fn server_client_socket_cleanup_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "server.socket.cleanup",
+        subsystem = "server",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "failed to remove client socket on shutdown"
+    );
+}
+
+// --- terminal_attach family (logging redesign PR-4) ------------------------
+// Direct-attach client connects to a specific terminal_id and drives it as if
+// it were a local pty. Per-input failures are WARN (recovered — the attach is
+// still alive) unless connection-level; connect is INFO (low-frequency
+// lifecycle).
+
+pub(crate) fn terminal_attach_connected(client_id: u64, terminal_id: &str, cols: u16, rows: u16) {
+    tracing::info!(
+        event = "terminal_attach.connected",
+        subsystem = "terminal_attach",
+        outcome = "ok",
+        client_id,
+        terminal_id,
+        cols,
+        rows,
+        "terminal attach client connected"
+    );
+}
+
+pub(crate) fn terminal_attach_input_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.input",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach input failed"
+    );
+}
+
+pub(crate) fn terminal_attach_paste_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.paste",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach clipboard image paste failed"
+    );
+}
+
+pub(crate) fn terminal_attach_scroll_failed(client_id: u64, terminal_id: &str, err: &str) {
+    tracing::warn!(
+        event = "terminal_attach.scroll",
+        subsystem = "terminal_attach",
+        outcome = "error",
+        client_id,
+        terminal_id,
+        err,
+        "terminal attach scroll failed"
+    );
+}
+
+// --- clipboard family (logging redesign PR-4) ------------------------------
+// Client-forwarded clipboard images are staged to a disk file and then pasted
+// as a path token. Receive is DEBUG (per-input volume); stage completion is
+// INFO because the STAGED PATH is the answer to "where did the image go?".
+
+pub(crate) fn client_clipboard_image_received(client_id: u64, len: usize, extension: &str) {
+    tracing::debug!(
+        event = "clipboard.image.receive",
+        subsystem = "clipboard",
+        outcome = "ok",
+        client_id,
+        len,
+        extension,
+        "client clipboard image received"
+    );
+}
+
+pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: &str) {
+    tracing::info!(
+        event = "clipboard.image.stage",
+        subsystem = "clipboard",
+        outcome = "ok",
+        client_id,
+        bytes,
+        path,
+        "staged client clipboard image"
+    );
+}
+
+pub(crate) fn client_clipboard_image_stage_failed(client_id: u64, err: &str) {
+    tracing::warn!(
+        event = "clipboard.image.stage",
+        subsystem = "clipboard",
+        outcome = "error",
+        client_id,
+        err,
+        "failed to stage client clipboard image"
+    );
+}
+
+// --- frame_serialize family (logging redesign PR-4) ------------------------
+// Serialization is meant to be infallible — a WARN here means we dropped a
+// message and (for per-client) we're about to disconnect that client.
+// `kind` distinguishes the frame shape so the log tail explains which pipe
+// broke without hunting call sites: server_message / retained_frame /
+// text_only_frame / frame / mouse_capture_mode.
+
+pub(crate) fn frame_serialize_broadcast_failed(kind: &'static str, err: &str) {
+    let message = match kind {
+        "server_message" => "failed to serialize message for clients",
+        "mouse_capture_mode" => "failed to serialize mouse capture mode for clients",
+        _ => "failed to serialize broadcast frame for clients",
+    };
+    tracing::warn!(
+        event = "frame.serialize",
+        subsystem = "frame",
+        outcome = "error",
+        scope = "broadcast",
+        kind,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn frame_serialize_client_failed(client_id: u64, kind: &'static str, err: &str) {
+    let message = match kind {
+        "server_message" => "failed to serialize message for client",
+        "retained_frame" => "failed to serialize retained frame for client",
+        "text_only_frame" => "failed to serialize text-only frame for client",
+        _ => "failed to serialize frame for client",
+    };
+    tracing::warn!(
+        event = "frame.serialize",
+        subsystem = "frame",
+        outcome = "error",
+        scope = "client",
+        client_id,
+        kind,
+        err,
+        "{message}"
+    );
+}
+
+// --- workspace family (logging redesign PR-4) ------------------------------
+// Creating a workspace at a requested cwd is a user-visible failure — the
+// caller falls back to Navigate mode, but the tail needs the reason.
+
+pub(crate) fn workspace_create_at_cwd_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        err,
+        "failed to create workspace at requested cwd"
+    );
+}
+
+// --- handoff family (rest of the family, logging redesign PR-4) ------------
+
+pub(crate) fn handoff_import_spawned(pid: u32, socket: &Path) {
+    tracing::info!(
+        event = "handoff.import.spawn",
+        subsystem = "handoff",
+        outcome = "ok",
+        pid,
+        socket = %socket.display(),
+        "spawned handoff import server"
+    );
+}
+
+pub(crate) fn handoff_preserve_runtime(terminal_id: &str) {
+    tracing::debug!(
+        event = "handoff.preserve_runtime",
+        subsystem = "handoff",
+        outcome = "ok",
+        terminal_id,
+        "preserving pane runtime for handoff"
+    );
+}
+
+pub(crate) fn handoff_report_ownership_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.ownership.report",
+        subsystem = "handoff",
+        outcome = "error",
+        err,
+        "failed to report handoff ownership; continuing as owner"
+    );
+}
+
+// --- notification family (logging redesign PR-4) ---------------------------
+// Toast/sound notifications the SERVER forwards to the foreground client
+// (headless mode), plus the pane-state transition the toast may correlate to.
+// All DEBUG — high-frequency during interactive work, useful only when
+// debugging why a specific notification did / didn't fire.
+
+pub(crate) fn notification_toast_forwarded(message: &str) {
+    tracing::debug!(
+        event = "notification.toast.forward",
+        subsystem = "notification",
+        outcome = "ok",
+        msg = message,
+        "forwarding toast notification from API request"
+    );
+}
+
+pub(crate) fn notification_sound_forwarded(sound: &str) {
+    tracing::debug!(
+        event = "notification.sound.forward",
+        subsystem = "notification",
+        outcome = "ok",
+        sound,
+        "forwarding sound notification from API request"
+    );
+}
+
+pub(crate) fn pane_state_change_detected(
+    ws_idx: usize,
+    pane_id: u32,
+    prev_state: &str,
+    new_state: &str,
+    agent: &str,
+) {
+    tracing::debug!(
+        event = "pane.state.change",
+        subsystem = "notification",
+        outcome = "detected",
+        ws_idx,
+        pane_id,
+        prev_state,
+        new_state,
+        agent,
+        "pane effective state changed during API request, checking notification"
+    );
+}
+
+// --- render family (logging redesign PR-4) ---------------------------------
+
+pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: Option<u64>) {
+    tracing::debug!(
+        event = "render.virtual_frame",
+        subsystem = "render",
+        outcome = "ok",
+        cols,
+        rows,
+        foreground_client_id,
+        "rendered virtual frame(s)"
+    );
+}
+
+// --- raw_input family (logging redesign PR-5) ------------------------------
+// The stdin decoder is downstream of every keystroke the host terminal
+// produces, so its debug/warn tail runs hot. Byte payloads are Debug-formatted
+// but BOUNDED (see `bounded_bytes_debug`) so a runaway paste can't turn the log
+// into a memory hog. Levels mirror the pre-facade calls: unsupported/dropped
+// buffers are DEBUG (routine framing noise), the lone-escape flush is WARN
+// (may reach the pane as a spurious Esc), UTF-8-continuation waits are TRACE.
+
+const MAX_TRACE_BYTE_PREVIEW: usize = 64;
+
+/// Shape a byte slice for a tracing field so a runaway paste can't blow up
+/// the log. Long payloads are truncated with a "(+N more)" tail; the Debug
+/// form (`[0x1b, 0x5b, ...]`) survives.
+pub(crate) fn bounded_bytes_debug(bytes: &[u8]) -> String {
+    if bytes.len() <= MAX_TRACE_BYTE_PREVIEW {
+        format!("{:?}", bytes)
+    } else {
+        let head = &bytes[..MAX_TRACE_BYTE_PREVIEW];
+        format!(
+            "{:?} (+{} more)",
+            head,
+            bytes.len() - MAX_TRACE_BYTE_PREVIEW
+        )
+    }
+}
+
+pub(crate) fn raw_input_event_parsed(chunk: &[u8], event: &str) {
+    tracing::debug!(
+        event = "raw_input.parsed",
+        subsystem = "raw_input",
+        outcome = "ok",
+        raw_bytes = bounded_bytes_debug(chunk),
+        parsed = event,
+        "raw input event parsed"
+    );
+}
+
+pub(crate) fn raw_input_flushing_lone_escape(bytes: &[u8]) {
+    tracing::warn!(
+        event = "raw_input.flush",
+        subsystem = "raw_input",
+        outcome = "lone_escape",
+        bytes = bounded_bytes_debug(bytes),
+        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
+    );
+}
+
+pub(crate) fn raw_input_waiting_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_waiting_escaped_utf8_continuation(bytes: &[u8]) {
+    tracing::trace!(
+        event = "raw_input.wait",
+        subsystem = "raw_input",
+        outcome = "escaped_utf8_continuation",
+        bytes = bounded_bytes_debug(bytes),
+        "waiting for escaped UTF-8 continuation bytes"
+    );
+}
+
+pub(crate) fn raw_input_dropping_incomplete_buffer(bytes: &[u8]) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "incomplete",
+        bytes = bounded_bytes_debug(bytes),
+        "dropping incomplete raw input buffer after timeout"
+    );
+}
+
+pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
+    tracing::debug!(
+        event = "raw_input.drop",
+        subsystem = "raw_input",
+        outcome = "unsupported_escape",
+        sequence,
+        "dropping unsupported escape sequence"
+    );
+}
+
+// --- pane input family (logging redesign PR-5) -----------------------------
+// Mouse-driven pane interactions the app can't recover from cleanly. Opening
+// a URL is a WARN because the click had a visible target — the user expects
+// the browser to launch.
+
+pub(crate) fn pane_open_url_failed(url: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.open_url",
+        subsystem = "pane",
+        outcome = "error",
+        url,
+        err,
+        "failed to open pane URL"
+    );
+}
+
+// --- pane_mouse family (logging redesign PR-5) -----------------------------
+// Encoding + forwarding failures for mouse events routed into a pane
+// runtime. `kind` is Debug-shaped at the call site (MouseEventKind is a
+// crossterm enum whose payload — button / column-delta — matters); the
+// facade takes it as an already-shaped string so the raw ?field stays
+// confined to logging.rs. Every failure is WARN: the pane misses an event
+// but keeps running.
+
+pub(crate) fn pane_mouse_wheel_encode_failed(pane: u32, kind: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "encode_error",
+        pane,
+        kind,
+        "failed to encode mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_wheel_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.wheel",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward mouse wheel event"
+    );
+}
+
+pub(crate) fn pane_mouse_button_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.button",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse button event"
+    );
+}
+
+pub(crate) fn pane_mouse_motion_forward_failed(pane: u32, kind: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.motion",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        kind,
+        err,
+        "failed to forward mouse motion event"
+    );
+}
+
+pub(crate) fn pane_mouse_alternate_scroll_forward_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.mouse.alternate_scroll",
+        subsystem = "pane_mouse",
+        outcome = "forward_error",
+        pane,
+        err,
+        "failed to forward alternate-scroll key"
+    );
+}
+
+// --- pane runtime family (logging redesign PR-6) ---------------------------
+// Pane-runtime failures for state-change / handoff / OSC 52 / spawn paths.
+// Every raw ?field at these sites (child pids list, agent + previous-agent
+// Option<Agent>, focus event) is Debug-shaped at the call site so no other
+// module carries the `?expr` — the schema surface stays here.
+//
+// Level discipline is preserved verbatim from pre-facade code:
+//   * StateChanged deliver + OSC 52 queue/send + focus forward = WARN
+//   * forced-shutdown survivors + PTY handoff release/pause failures = WARN
+//   * spawn + PaneDied send failures = ERROR (pane can't come up / caller
+//     never learns it died)
+//   * agent-changed = INFO (rare, story-critical for detection debugging)
+
+pub(crate) fn pane_state_change_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.state_change.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to deliver StateChanged event"
+    );
+}
+
+pub(crate) fn pane_forced_shutdown_survivors(pane: u32, pid: u32, pids: &str) {
+    tracing::warn!(
+        event = "pane.session.shutdown",
+        subsystem = "pane",
+        outcome = "survivors",
+        pane,
+        pid,
+        pids,
+        "pane session still alive after forced shutdown"
+    );
+}
+
+pub(crate) fn pane_pty_release_after_handoff_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.release",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
+    );
+}
+
+pub(crate) fn pane_pty_handoff_pause_update_failed(pane: u32, paused: bool, err: &str) {
+    tracing::warn!(
+        event = "pane.pty.handoff_pause",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        paused,
+        err,
+        "failed to update PTY actor handoff pause state"
+    );
+}
+
+pub(crate) fn pane_osc52_queue_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.queue",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to queue OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_osc52_send_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pane.osc52.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send OSC 52 clipboard write"
+    );
+}
+
+pub(crate) fn pane_spawn_error(pane: u32, err: &str, message: &'static str) {
+    tracing::error!(
+        event = "pane.spawn",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "{message}"
+    );
+}
+
+pub(crate) fn pane_died_send_failed(pane: u32, err: &str) {
+    tracing::error!(
+        event = "pane.died.send",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        err,
+        "failed to send PaneDied event"
+    );
+}
+
+/// Agent-detection observed a transition (previous → current). `process` is
+/// only present on the process-probe branch; the two callers previously used
+/// two separate `info!` blocks with the same fields modulo the process one —
+/// one facade collapses both by taking `Option<&str>` and only emitting the
+/// field when present. All Debug shapes (`Option<Agent>`, foreground pgid)
+/// are formatted at the call side so subsystem code stays raw-field-free.
+pub(crate) fn pane_agent_changed(
+    pane: u32,
+    previous_agent: &str,
+    agent: &str,
+    process: Option<&str>,
+    pgid: &str,
+) {
+    match process {
+        Some(process) => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            process,
+            pgid,
+            "agent changed"
+        ),
+        None => tracing::info!(
+            event = "pane.agent.changed",
+            subsystem = "pane",
+            outcome = "ok",
+            pane,
+            previous_agent,
+            agent,
+            pgid,
+            "agent changed"
+        ),
+    }
+}
+
+pub(crate) fn pane_focus_forward_failed(err: &str, event: &str) {
+    tracing::warn!(
+        event = "pane.focus.forward",
+        subsystem = "pane",
+        outcome = "error",
+        err,
+        focus_event = event,
+        "failed to forward pane focus event"
+    );
+}
+
+// --- worktree family (logging redesign PR-6) -------------------------------
+// Every git-worktree lifecycle step the flock TUI drives — dialog open, add
+// start/complete/fail, remove start/complete/fail, merge-gate resolution,
+// post-kill branch delete — passed its raw repo-root / checkout-path /
+// workspace-id / merge-gate through tracing macros with %expr / ?expr
+// fields. Fourteen sites total. The facade fns below own every path.display()
+// and every WorktreeMergeGate Debug shape so subsystem code stays raw-field
+// free.
+//
+// Level discipline:
+//   * lifecycle starts + successful completions + merge-gate resolution =
+//     INFO (the load-bearing "what did the worktree actor do" story)
+//   * add/remove failures + branch-delete failure = WARN (the checkout /
+//     branch was left in a state the user needs to notice, but the pane and
+//     the app keep running)
+
+pub(crate) fn worktree_dialog_opened(
+    ws_idx: usize,
+    repo_root: &str,
+    branch: &str,
+    checkout_path: &str,
+) {
+    tracing::info!(
+        event = "worktree.dialog.open",
+        subsystem = "worktree",
+        outcome = "ok",
+        ws_idx,
+        repo_root,
+        branch,
+        checkout_path,
+        "opening worktree dialog"
+    );
+}
+
+pub(crate) fn worktree_kill_merge_gate_resolved(workspace_id: &str, branch: &str, gate: &str) {
+    tracing::info!(
+        event = "worktree.kill.merge_gate",
+        subsystem = "worktree",
+        outcome = "resolved",
+        workspace_id,
+        branch,
+        gate,
+        "worktree kill merge gate resolved"
+    );
+}
+
+pub(crate) fn worktree_branch_deleted(branch: &str) {
+    tracing::info!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "ok",
+        branch,
+        "deleted local branch after worktree kill"
+    );
+}
+
+pub(crate) fn worktree_branch_delete_failed(branch: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.branch.delete",
+        subsystem = "worktree",
+        outcome = "error",
+        branch,
+        err,
+        "branch delete failed"
+    );
+}
+
+pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "started",
+        repo_root,
+        branch,
+        checkout_path,
+        "starting git worktree add"
+    );
+}
+
+pub(crate) fn worktree_remove_started(workspace_id: &str, path: &str, force: bool) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "started",
+        workspace_id,
+        path,
+        force,
+        "starting git worktree remove"
+    );
+}
+
+pub(crate) fn worktree_add_completed(checkout_path: &str) {
+    tracing::info!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "ok",
+        checkout_path,
+        "git worktree add completed"
+    );
+}
+
+pub(crate) fn worktree_add_failed(checkout_path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "error",
+        checkout_path,
+        err,
+        "git worktree add failed"
+    );
+}
+
+pub(crate) fn worktree_remove_completed(workspace_id: &str, path: &str) {
+    tracing::info!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "ok",
+        workspace_id,
+        path,
+        "git worktree remove completed"
+    );
+}
+
+pub(crate) fn worktree_remove_failed(workspace_id: &str, path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "error",
+        workspace_id,
+        path,
+        err,
+        "git worktree remove failed"
+    );
+}
+
+// --- persist io family (logging redesign PR-6) -----------------------------
+// The session file (workspaces/tabs/panes snapshot) and its history sidecar
+// (recent tab titles + labels) both have the same failure surfaces on load:
+// read-file failure, followed by parse failure. Four sites (io.rs) all had
+// raw %err fields — the facade fns below take a shaped &str so persist/io.rs
+// carries no raw formatter. Level stays WARN — a read/parse failure drops
+// the persisted state to defaults, which is user-visible but not fatal.
+
+pub(crate) fn session_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session file"
+    );
+}
+
+pub(crate) fn session_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session file, ignoring"
+    );
+}
+
+pub(crate) fn session_history_read_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.read",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to read session history file"
+    );
+}
+
+pub(crate) fn session_history_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "persist.history.parse",
+        subsystem = "persist",
+        outcome = "error",
+        err,
+        "failed to parse session history file, ignoring"
+    );
+}
+
+// --- persist restore family (logging redesign PR-6) ------------------------
+// Session-restore paths log four distinct failure modes: a saved pane cwd
+// that no longer exists (falls back to HOME), a per-pane restore failure
+// (with a variant that also increments imported-pane failure counts), and
+// two tab-pruning failures (no panes at all, or empty after layout pruning).
+// Seven sites in persist/restore.rs — every one had raw ?tab / %err /
+// %cwd.display() fields. Debug-shaped tab labels (?snap.custom_name is an
+// Option<String>) are formatted at the call side; cwd is the user's saved
+// filesystem path (not a session-secret) and stays a display string.
+//
+// Level discipline preserved: per-pane restore failures are ERROR (the
+// pane's state is lost); tab-level pruning failures and cwd-missing
+// fallback are WARN (the tab or cwd falls back, but the session comes up).
+
+pub(crate) fn session_restore_pane_cwd_missing(cwd: &str) {
+    tracing::warn!(
+        event = "persist.restore.cwd",
+        subsystem = "persist",
+        outcome = "missing",
+        cwd,
+        "saved pane cwd does not exist, falling back to HOME"
+    );
+}
+
+pub(crate) fn session_restore_imported_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        variant = "imported",
+        tab,
+        pane_id,
+        err,
+        "failed to restore imported pane"
+    );
+}
+
+pub(crate) fn session_restore_pane_failed(tab: &str, pane_id: u32, err: &str) {
+    tracing::error!(
+        event = "persist.restore.pane",
+        subsystem = "persist",
+        outcome = "error",
+        tab,
+        pane_id,
+        err,
+        "failed to restore pane, skipping"
+    );
+}
+
+pub(crate) fn session_restore_tab_no_panes(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "no_panes",
+        tab,
+        "no panes could be restored for tab, dropping it"
+    );
+}
+
+pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
+    tracing::warn!(
+        event = "persist.restore.tab",
+        subsystem = "persist",
+        outcome = "dropped",
+        reason = "pruned_empty",
+        tab,
+        "restored tab lost all panes after pruning missing layout nodes"
+    );
+}
+
+// --- agent-resume family (logging redesign PR-6) ---------------------------
+// The three deferred agent-resume paths (empty argv, shell spawn failure,
+// send-command failure) all reach tracing with %terminal_id / %plan.agent /
+// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
+// other module carries the raw Display fmt. Level stays WARN — a failed
+// resume drops the pane back to its non-resumed state, which is surfaced
+// to the user via the terminal.
+
+pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
+    tracing::warn!(
+        event = "agent_resume.start",
+        subsystem = "agent_resume",
+        outcome = "error",
+        reason = "empty_argv",
+        pane,
+        terminal,
+        agent,
+        "failed to start deferred agent resume with empty argv"
+    );
+}
+
+pub(crate) fn agent_resume_shell_spawn_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.spawn",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to start shell for deferred agent resume"
+    );
+}
+
+pub(crate) fn agent_resume_send_command_failed(pane: u32, terminal: &str, agent: &str, err: &str) {
+    tracing::warn!(
+        event = "agent_resume.send",
+        subsystem = "agent_resume",
+        outcome = "error",
+        pane,
+        terminal,
+        agent,
+        err,
+        "failed to send deferred agent resume command to shell"
+    );
+}
+
+// --- terminal_key family (logging redesign PR-5) ---------------------------
+// Terminal-mode key decoding: which key was intercepted (for a navigate
+// action / custom command / pane scroll), which was dropped as
+// modifier-only, and which forwards were considered ambiguous (Esc / Alt
+// chords). `shape_key_event` is the single formatter for a crossterm
+// KeyEvent — the code / modifiers / kind / state tuple that every other
+// site would otherwise raw-Debug — and lives inside logging.rs so the gate
+// stays hard everywhere else. Level discipline mirrors pre-facade calls:
+// intercepts are DEBUG (routine but story-critical when a keybind misfires),
+// modifier-only drops are DEBUG, empty-encoding is WARN.
+
+/// Shape a crossterm KeyEvent for the tracing tail: the code / modifiers /
+/// kind / state tuple every terminal-key site cares about. Single formatter
+/// so a schema change lands in one place instead of eighteen.
+pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> String {
+    format!(
+        "code={:?} modifiers={:?} kind={:?} state={:?}",
+        event.code, event.modifiers, event.kind, event.state
+    )
+}
+
+pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, action: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "action",
+        key = shape_key_event(event),
+        action,
+        "intercepted terminal direct keybinding before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_intercept_command(event: &crossterm::event::KeyEvent, command: &str) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "command",
+        key = shape_key_event(event),
+        command,
+        "intercepted terminal direct custom command before forwarding to pane"
+    );
+}
+
+pub(crate) fn terminal_key_page_intercept(code: &crossterm::event::KeyCode, lines: usize) {
+    tracing::debug!(
+        event = "terminal_key.intercept",
+        subsystem = "terminal_key",
+        outcome = "page_scroll",
+        code = format!("{:?}", code),
+        lines,
+        "intercepted page key for pane scrollback"
+    );
+}
+
+pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEvent) {
+    tracing::debug!(
+        event = "terminal_key.drop",
+        subsystem = "terminal_key",
+        outcome = "modifier_only",
+        key = shape_key_event(event),
+        "dropping modifier-only terminal key event instead of forwarding it to pane"
+    );
+}
+
+pub(crate) fn terminal_key_forward_ambiguous(
+    event: &crossterm::event::KeyEvent,
+    protocol: &str,
+    encoded: &[u8],
+) {
+    tracing::debug!(
+        event = "terminal_key.forward",
+        subsystem = "terminal_key",
+        outcome = "ambiguous",
+        key = shape_key_event(event),
+        protocol,
+        encoded = bounded_bytes_debug(encoded),
+        "forwarding potentially-ambiguous terminal key to pane"
+    );
+}
+
+pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
+    tracing::warn!(
+        event = "terminal_key.encode",
+        subsystem = "terminal_key",
+        outcome = "empty",
+        key = shape_key_event(event),
+        "key produced empty encoding"
+    );
+}
+
+// --- client family (logging redesign PR-5) ---------------------------------
+// The thin client's connection + slot lifecycle. Setup and handshake events
+// are INFO (rare, load-bearing for "did we come up?"). Runtime failures on
+// the active slot (server read error, dropped-file bridge, notifications,
+// config reload) are WARN — the session survives but the user notices
+// something. Slot lifecycle chatter (warm/pause/stale/switch dial) is DEBUG
+// — high volume during fleet churn, useful only when debugging a slot flip
+// that didn't stick. `err` / `diagnostic` payloads are shape-converted to
+// `&str` at the call side; Debug-shaped payloads (encoding / theme /
+// diagnostics slice) are formatted at the site so the raw ?field stays
+// confined to logging.rs.
+
+pub(crate) fn client_fleet_snapshot_invalid(err: &str) {
+    tracing::warn!(
+        event = "client.fleet_snapshot",
+        subsystem = "client",
+        outcome = "invalid",
+        err,
+        "ignoring malformed fleet snapshot from launcher"
+    );
+}
+
+pub(crate) fn client_handshake_succeeded(version: u32, encoding: &str, handshake_ms: u64) {
+    tracing::info!(
+        event = "client.handshake",
+        subsystem = "client",
+        outcome = "ok",
+        version,
+        encoding,
+        handshake_ms,
+        "handshake succeeded"
+    );
+}
+
+pub(crate) fn client_host_theme_captured(theme: &str) {
+    tracing::info!(
+        event = "client.host_theme",
+        subsystem = "client",
+        outcome = "captured",
+        theme,
+        "captured host terminal theme for handshake"
+    );
+}
+
+pub(crate) fn client_connecting(path: &Path, message: &str) {
+    tracing::info!(
+        event = "client.connect",
+        subsystem = "client",
+        outcome = "started",
+        path = %path.display(),
+        "{message}"
+    );
+}
+
+pub(crate) fn client_render_encoding_active(encoding: &str) {
+    tracing::debug!(
+        event = "client.render_encoding",
+        subsystem = "client",
+        outcome = "active",
+        encoding,
+        "client render encoding active"
+    );
+}
+
+pub(crate) fn client_dropped_file_read_failed(err: &str) {
+    tracing::warn!(
+        event = "client.dropped_file",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "failed to read dropped local file; passing the paste through"
+    );
+}
+
+/// The attach subsystem's per-switch first-frame timing (#43). This one
+/// keeps the flock::attach target since the /attach: log is a stable UX
+/// story separate from `client.*` operational chatter.
+pub(crate) fn client_attach_switch_first_paint(to: &str, warm: bool, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage = "switch",
+        to,
+        warm,
+        elapsed_ms,
+        "attach: switch first frame painted"
+    );
+}
+
+pub(crate) fn client_slot_shutdown_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.shutdown",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot server shut down; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_message_dropped(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.message",
+        subsystem = "client_slot",
+        outcome = "dropped",
+        slot,
+        "dropping message from non-active slot"
+    );
+}
+
+pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.flip",
+        subsystem = "client_slot",
+        outcome = "error",
+        target,
+        err,
+        "slot flip failed; demoting"
+    );
+}
+
+pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
+    tracing::debug!(
+        event = "client.slot.disconnect",
+        subsystem = "client_slot",
+        outcome = "demoted",
+        slot,
+        "warm slot disconnected; demoted silently"
+    );
+}
+
+pub(crate) fn client_slot_switch_pause_failed(target: &str, err: &str) {
+    tracing::warn!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "switch-dial warmed slot but pause failed"
+    );
+}
+
+pub(crate) fn client_slot_prewarm_redundant(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "redundant",
+        target,
+        "slot already connected; dropping redundant pre-warm"
+    );
+}
+
+pub(crate) fn client_slot_warm_pause_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "pause_failed",
+        target,
+        err,
+        "failed to pause newly warmed slot"
+    );
+}
+
+pub(crate) fn client_slot_warmed_paused(target: &str) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "ok",
+        target,
+        "slot warmed and paused"
+    );
+}
+
+pub(crate) fn client_slot_warmed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.warm",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotWarmed; dropping stream"
+    );
+}
+
+pub(crate) fn client_slot_dial_failed_stale(target: &str, gen: u64) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "stale",
+        target,
+        gen,
+        "stale SlotDialFailed; dropping"
+    );
+}
+
+pub(crate) fn client_slot_warm_all_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "warm_all_failed",
+        target,
+        err,
+        "warm-all dial failed; slot stays cold"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_failed(target: &str, err: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_failed",
+        target,
+        err,
+        "switch dial failed"
+    );
+}
+
+pub(crate) fn client_slot_switch_dial_timed_out(target: &str) {
+    tracing::debug!(
+        event = "client.slot.dial",
+        subsystem = "client_slot",
+        outcome = "switch_timeout",
+        target,
+        "switch dial timed out"
+    );
+}
+
+pub(crate) fn client_server_read_error(err: &str) {
+    tracing::warn!(
+        event = "client.server_read",
+        subsystem = "client",
+        outcome = "error",
+        err,
+        "server read error"
+    );
+}
+
+pub(crate) fn client_config_sound_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "diagnostic",
+        diagnostic,
+        "local sound config diagnostic"
+    );
+}
+
+pub(crate) fn client_config_reload_failed(diagnostics: &str) {
+    tracing::warn!(
+        event = "client.config.reload",
+        subsystem = "client",
+        outcome = "error",
+        diagnostics,
+        "failed to reload local client config; keeping current client config"
+    );
+}
+
+pub(crate) fn client_terminal_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "terminal",
+        err,
+        "failed to emit terminal notification"
+    );
+}
+
+pub(crate) fn client_system_notification_failed(err: &str) {
+    tracing::warn!(
+        event = "client.notification",
+        subsystem = "client",
+        outcome = "error",
+        kind = "system",
+        err,
+        "failed to emit system notification"
+    );
+}
+
+// --- config family (logging redesign PR-6) ---------------------------------
+// Diagnostics collected during `Config::validated_keybinds` and `Config::load`
+// are all the same shape: one human-readable line describing which field was
+// invalid and how it was collapsed to a fallback. Fifteen keybinds sites
+// (parse errors, conflicts, reserved-keybind clashes, indexed-only ranges,
+// unsafe-direct printables) plus one config-load-defaults site all funnel
+// into these two facade fns so no other module carries a raw ?/% tracing
+// field for a config diagnostic. Level stays WARN — a diagnostic silently
+// disables a keybinding or falls back to defaults, and that's a user-visible
+// regression they'd want to notice in the log tail.
+
+pub(crate) fn config_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.diagnostic",
+        subsystem = "config",
+        outcome = "diagnostic",
+        diagnostic,
+        "config diagnostic"
+    );
+}
+
+pub(crate) fn config_load_defaults_diagnostic(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.load",
+        subsystem = "config",
+        outcome = "error",
+        diagnostic,
+        "config load error, using defaults"
+    );
+}
+
+// --- pty family (logging redesign PR-7) ------------------------------------
+// The PtyIoActor is the fd-poll/read/write/resize/wake loop behind every pane's
+// terminal. Its five failure surfaces (wake pipe, wake drain, poll, read,
+// write, resize) plus one no-pane variant all reached tracing through raw
+// `err = %err` fields. The facade below owns the schema — one event family
+// with `pane` present when known and absent for the shared wake-writer's
+// caller-less variant. Level discipline preserved verbatim from pre-facade:
+// wake/drain/poll/read/resize failures are DEBUG (the actor already unwinds
+// on its own, and the story shows up in the log tail without escalating),
+// write failures are WARN (the pending write is dropped and the caller's
+// keystrokes are lost).
+
+pub(crate) fn pty_wake_failed(err: &str) {
+    tracing::debug!(
+        event = "pty.wake",
+        subsystem = "pty",
+        outcome = "error",
+        err,
+        "failed to wake PTY actor"
+    );
+}
+
+pub(crate) fn pty_wake_drain_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.wake.drain",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor wake drain failed"
+    );
+}
+
+pub(crate) fn pty_poll_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.poll",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor poll failed"
+    );
+}
+
+pub(crate) fn pty_read_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.read",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor read failed"
+    );
+}
+
+pub(crate) fn pty_write_failed(pane: u32, err: &str) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY actor write failed"
+    );
+}
+
+pub(crate) fn pty_resize_failed(pane: u32, err: &str) {
+    tracing::debug!(
+        event = "pty.resize",
+        subsystem = "pty",
+        outcome = "error",
+        pane,
+        err,
+        "PTY resize failed"
+    );
+}
+
+// --- api server family (logging redesign PR-7) -----------------------------
+// The api unix-socket server (src/api/server.rs) reached tracing with raw
+// `%err` / `%path.display()` fields for four socket lifecycle sites (drop
+// remove, listen, accept, per-connection) plus one write-timeout diagnostic.
+// The facade below owns the schema; call sites carry no raw formatter. Level
+// discipline preserved: listen bind is INFO (the "did the api server come
+// up?" story), remove-on-drop / per-connection failures are WARN (the
+// listener stays up), accept-loop failure is ERROR (the server can no longer
+// take new clients), write-timeout unavailability is DEBUG (a pre-request
+// diagnostic that never affects the response path).
+
+pub(crate) fn api_socket_remove_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "api.socket.remove",
+        subsystem = "api",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "failed to remove api socket on shutdown"
+    );
+}
+
+pub(crate) fn api_server_listening(path: &Path) {
+    tracing::info!(
+        event = "api.server.listen",
+        subsystem = "api",
+        outcome = "ok",
+        path = %path.display(),
+        "api server listening"
+    );
+}
+
+pub(crate) fn api_connection_failed(err: &str) {
+    tracing::warn!(
+        event = "api.connection",
+        subsystem = "api",
+        outcome = "error",
+        err,
+        "api connection failed"
+    );
+}
+
+pub(crate) fn api_listener_accept_failed(err: &str) {
+    tracing::error!(
+        event = "api.listener.accept",
+        subsystem = "api",
+        outcome = "error",
+        err,
+        "api listener accept failed"
+    );
+}
+
+pub(crate) fn api_connection_write_timeout_unavailable(err: &str) {
+    tracing::debug!(
+        event = "api.connection.write_timeout",
+        subsystem = "api",
+        outcome = "unavailable",
+        err,
+        "api connection write timeout unavailable"
+    );
+}
+
+// --- app api / peers + config + respawn (logging redesign PR-7) ------------
+// Three `src/app/api.rs` sites: the peers-summary per-poll trace (still on
+// the flock::peers target so `flk peers logs` can filter on it), the
+// config-edit rollback write failure (target and err are both display-shaped
+// paths/errors), and the launch-shell respawn failure that names the pane +
+// terminal. TerminalId is Display-shaped at the call side so the facade
+// takes a plain `&str`. Level discipline preserved: peers-summary is DEBUG
+// (per-poll volume); rollback-write is WARN (backup restore couldn't land,
+// user is toasted separately); respawn is WARN (the pane exits into
+// Navigate but the app keeps running).
+
+pub(crate) fn peer_summary_applied(
+    peer: &str,
+    host: &str,
+    has_system: bool,
+    workspaces: usize,
+    latency_ms: u64,
+) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.summary.applied",
+        subsystem = "peers",
+        outcome = "ok",
+        peer,
+        host,
+        has_system,
+        workspaces,
+        latency_ms,
+        "peer summary applied"
+    );
+}
+
+pub(crate) fn config_edit_rollback_write_failed(target: &Path, err: &str) {
+    tracing::warn!(
+        event = "config.edit.rollback",
+        subsystem = "config",
+        outcome = "error",
+        target = %target.display(),
+        err,
+        "config edit rollback write failed"
+    );
+}
+
+pub(crate) fn pane_respawn_shell_failed(pane: u32, terminal: &str, err: &str) {
+    tracing::warn!(
+        event = "pane.respawn_shell",
+        subsystem = "pane",
+        outcome = "error",
+        pane,
+        terminal,
+        err,
+        "failed to respawn shell after launch command exited"
+    );
+}
+
+// --- web family (logging redesign PR-7) ------------------------------------
+// The `flk web` xterm.js <-> PTY bridge (feature = "web"). Six sites reach
+// tracing with raw `?origin` / `?user` / `%err` / `%e` fields; the facade
+// below owns the schema unconditionally (the fns are cheap wrappers on
+// `tracing::` macros; only the call sites live behind `cfg(feature = "web")`).
+// Level discipline preserved: security rejections (origin, identity) and
+// per-connection error termination are WARN (a phone's browser saw an
+// error the user needs to know about); PTY read EOF is DEBUG (routine — the
+// child exit is the primary story); pre-init framing errors and PTY resize
+// errors are WARN (the frame's dropped or the resize is lost, but the WS
+// keeps running).
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_origin_rejected(origin: Option<&str>, host: Option<&str>) {
+    tracing::warn!(
+        event = "web.ws.origin_rejected",
+        subsystem = "web",
+        outcome = "rejected",
+        origin = origin.unwrap_or("<absent>"),
+        host = host.unwrap_or("<absent>"),
+        "rejecting cross-origin WS upgrade"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_identity_rejected(user: Option<&str>) {
+    tracing::warn!(
+        event = "web.ws.identity_rejected",
+        subsystem = "web",
+        outcome = "rejected",
+        user = user.unwrap_or("<absent>"),
+        "rejecting WS upgrade: identity not in allow-list"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_session_ended_error(err: &str) {
+    tracing::warn!(
+        event = "web.ws.session",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "ws session ended with error"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_ws_pre_init_parse_failed(err: &str) {
+    tracing::warn!(
+        event = "web.ws.pre_init",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "ignoring non-init control msg pre-init"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_pty_resize_failed(err: &str) {
+    tracing::warn!(
+        event = "web.pty.resize",
+        subsystem = "web",
+        outcome = "error",
+        err,
+        "pty resize"
+    );
+}
+
+#[cfg(any(feature = "web", test))]
+pub(crate) fn web_pty_read_ended(err: &str) {
+    tracing::debug!(
+        event = "web.pty.read",
+        subsystem = "web",
+        outcome = "ended",
+        err,
+        "pty read ended"
+    );
+}
+
+// --- kitty_graphics family (logging redesign PR-7) -------------------------
+// Three debug-tail sites in `src/kitty_graphics.rs` that walk the pane-info
+// tree and log the entry/clip/runtime-not-found story. `active` is Debug of
+// `Option<usize>` (workspace index) and `pane_id` is Debug of PaneId (a
+// `struct PaneId(u32)`). Both are shaped at the call side so the raw `?`
+// formatter stays confined to logging.rs — `active` becomes a `&str` we
+// carry as-is (`Some(3)` / `None`) and `pane_id` becomes the underlying u32
+// (the PaneId(N) wrapper is dropped so the tail's `pane_id` column stays a
+// flat integer, matching every other facade fn that names a pane).
+
+pub(crate) fn kitty_paint_local_pane_graphics_entry(
+    mode_ok: bool,
+    cell_ok: bool,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    active: &str,
+    pane_infos_len: usize,
+) {
+    tracing::debug!(
+        event = "kitty.paint.entry",
+        subsystem = "kitty",
+        outcome = "ok",
+        mode_ok,
+        cell_ok,
+        cell_width_px,
+        cell_height_px,
+        active,
+        pane_infos_len,
+        "paint_local_pane_graphics entry"
+    );
+}
+
+pub(crate) fn kitty_clipped_placement_result(
+    pane_id: u32,
+    has_clipped: bool,
+    grid_cols: u32,
+    grid_rows: u32,
+    viewport_col: i32,
+    viewport_row: i32,
+    area_w: u16,
+    area_h: u16,
+) {
+    tracing::debug!(
+        event = "kitty.clipped_placement",
+        subsystem = "kitty",
+        outcome = "ok",
+        pane_id,
+        has_clipped,
+        grid_cols,
+        grid_rows,
+        viewport_col,
+        viewport_row,
+        area_w,
+        area_h,
+        "clipped_placement result"
+    );
+}
+
+pub(crate) fn kitty_collect_placements_runtime_missing(pane_id: u32) {
+    tracing::debug!(
+        event = "kitty.collect_placements",
+        subsystem = "kitty",
+        outcome = "runtime_missing",
+        pane_id,
+        "collect_visible_placements: runtime not found"
+    );
+}
+
+// --- workspace/tab creation family (logging redesign PR-7) -----------------
+// Three sibling sites in `src/app/creation.rs` — new workspace / new tab /
+// new sibling workspace — all reached tracing with `err = %e`. Every failure
+// is ERROR: the caller falls back to Navigate mode, but the tab/workspace
+// creation the user asked for did NOT happen and the tail must surface it
+// prominently.
+
+pub(crate) fn workspace_create_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        err,
+        "failed to create workspace"
+    );
+}
+
+pub(crate) fn tab_create_failed(err: &str) {
+    tracing::error!(
+        event = "tab.create",
+        subsystem = "tab",
+        outcome = "error",
+        err,
+        "failed to create tab"
+    );
+}
+
+pub(crate) fn sibling_workspace_create_failed(err: &str) {
+    tracing::error!(
+        event = "workspace.create",
+        subsystem = "workspace",
+        outcome = "error",
+        variant = "sibling",
+        err,
+        "failed to create sibling workspace"
+    );
+}
+
+// --- platform nofile family (logging redesign PR-7) ------------------------
+// macOS raises the server's file-descriptor soft limit at startup. Success is
+// INFO and already flows through named fields (no facade needed for the OK
+// path). Failure was the last raw `err = %err` in src/platform/macos.rs.
+// Level stays WARN — the server keeps running with the OS default
+// (`ulimit -n`) but a packed fleet may hit accept() ceilings sooner.
+
+// macOS-only: the sole caller is platform::macos (nofile raise is macOS-
+// specific). Gated so a Linux build doesn't flag it dead under `-D warnings`.
+#[cfg(target_os = "macos")]
+pub(crate) fn server_nofile_raise_failed(err: &str) {
+    tracing::warn!(
+        event = "platform.nofile.raise",
+        subsystem = "platform",
+        outcome = "error",
+        err,
+        "failed to raise server file descriptor limit"
+    );
+}
+
+// --- terminal session-ref eviction (logging redesign PR-7) -----------------
+// `App::evict_duplicate_session_refs` (src/app/actions.rs) logs each
+// terminal a stale session id was cleared from. Pre-facade the site used
+// `?terminal_id` (Debug of TerminalId, a `struct TerminalId(String)`) — the
+// wrapper is dropped at the call side so the tail carries a flat `terminal`
+// string. Level stays INFO: rare, but load-bearing for detection debugging.
+
+pub(crate) fn terminal_duplicate_session_ref_evicted(terminal: &str) {
+    tracing::info!(
+        event = "terminal.session_ref.evict",
+        subsystem = "terminal",
+        outcome = "ok",
+        terminal,
+        "evicted duplicate agent session ref"
+    );
+}
+
+// --- update family (logging redesign PR-7) ---------------------------------
+// Two long-lived `%expr` / `?expr` fields in the update flow: the sha256
+// verification confirmation after downloading a release, and the
+// preview-build selection trace that names the resolved commit + build_id.
+// The facade takes the Debug shape of `Option<String>` as a shaped `&str`
+// so the subsystem carries no raw `?field`.
+
+pub(crate) fn update_checksum_verified(sha256: &str) {
+    tracing::info!(
+        event = "update.checksum.verify",
+        subsystem = "update",
+        outcome = "ok",
+        sha256,
+        "downloaded update checksum verified"
+    );
+}
+
+pub(crate) fn update_preview_build_selected(commit: &str, build_id: &str) {
+    tracing::info!(
+        event = "update.preview_build.select",
+        subsystem = "update",
+        outcome = "ok",
+        commit,
+        build_id,
+        "selected preview update build"
+    );
+}
+
+// --- sound family (logging redesign PR-7) ----------------------------------
+// Notification-sound playback via afplay / linux mp3 players. Two failure
+// modes: a custom user-configured path failed (fall back to the built-in
+// sample) and the built-in playback failed (silent failure — the sound is
+// lost). `sound` is Debug of a copy-shaped Sound enum (`Done`/`Request`/
+// `AllClear`) — the variant name is stable so the facade takes it as a
+// shaped `&str`.
+
+pub(crate) fn sound_custom_playback_failed(path: &Path, sound: &str, err: &str) {
+    tracing::warn!(
+        event = "sound.playback",
+        subsystem = "sound",
+        outcome = "error",
+        variant = "custom",
+        path = %path.display(),
+        sound,
+        err,
+        "custom sound playback failed, falling back to built-in sound"
+    );
+}
+
+pub(crate) fn sound_playback_failed(sound: &str, err: &str) {
+    tracing::warn!(
+        event = "sound.playback",
+        subsystem = "sound",
+        outcome = "error",
+        sound,
+        err,
+        "sound playback failed"
+    );
+}
+
+// --- render profiler window (logging redesign PR-7) ------------------------
+// The opt-in FLOCK_RENDER_PROF sampler flushes one INFO line per window
+// aggregating counters + duration stats. Both fields were `%counters` /
+// `%durations` (Display of the pre-formatted comma-joined string). The
+// facade takes shaped `&str` so no other module carries a raw formatter.
+
+pub(crate) fn render_prof_window(window_ms: u64, counters: &str, durations: &str) {
+    tracing::info!(
+        event = "render.prof",
+        subsystem = "render",
+        outcome = "ok",
+        window_ms,
+        counters,
+        durations,
+        "render profiler window"
+    );
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
@@ -1030,7 +3068,8 @@ mod tests {
                 "host1",
                 Some(Path::new("/tmp/keepalive-cfg")),
                 &["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
-                "exec \"$HOME/.local/bin/flock\" remote-client-bridge",
+                "exec \"$HOME/.local/bin/flk\" remote-client-bridge",
+                None,
             );
         });
         assert!(out.contains("event=\"remote.bridge.started\""), "{out}");
@@ -1042,10 +3081,30 @@ mod tests {
         );
         assert!(out.contains("BatchMode=yes"), "{out}");
         assert!(
-            out.contains("exec \\\"$HOME/.local/bin/flock\\\" remote-client-bridge"),
+            out.contains("exec \\\"$HOME/.local/bin/flk\\\" remote-client-bridge"),
             "the full remote command must be visible at INFO: {out}"
         );
         assert!(out.contains("INFO"), "bridge start must be INFO: {out}");
+    }
+
+    #[test]
+    fn remote_bridge_started_logs_proxy_jump_when_set() {
+        // Gossip v3 (#101 part 3): a snapshot-derived leg's ProxyJump
+        // identity must ride the observability event so a failed multi-hop
+        // dial is diagnosable from flock.log at DEFAULT level.
+        let out = capture_logs(|| {
+            remote_bridge_started(
+                "spoke2",
+                None,
+                &["-o", "BatchMode=yes"],
+                "exec flk remote-client-bridge",
+                Some("hub"),
+            );
+        });
+        assert!(
+            out.contains("proxy_jump=\"hub\""),
+            "proxy_jump must appear: {out}"
+        );
     }
 
     #[test]
@@ -1066,11 +3125,11 @@ mod tests {
     #[test]
     fn remote_binary_resolved_names_path_version_and_source() {
         let out = capture_logs(|| {
-            remote_binary_resolved("host1", "/usr/local/bin/flock", "flock 0.6.8", "path");
+            remote_binary_resolved("host1", "/usr/local/bin/flk", "flk 0.6.8", "path");
         });
         assert!(out.contains("event=\"remote.binary_resolved\""), "{out}");
-        assert!(out.contains("path=\"/usr/local/bin/flock\""), "{out}");
-        assert!(out.contains("version=\"flock 0.6.8\""), "{out}");
+        assert!(out.contains("path=\"/usr/local/bin/flk\""), "{out}");
+        assert!(out.contains("version=\"flk 0.6.8\""), "{out}");
         assert!(out.contains("source=\"path\""), "{out}");
         assert!(
             out.contains("INFO"),
@@ -1087,7 +3146,7 @@ mod tests {
         assert!(probe.contains("INFO"), "{probe}");
 
         let started = capture_logs(|| {
-            remote_install_started("host1", "local binary", "$HOME/.local/bin/flock")
+            remote_install_started("host1", "local binary", "$HOME/.local/bin/flk")
         });
         assert!(
             started.contains("event=\"remote.install.start\""),
@@ -1095,7 +3154,7 @@ mod tests {
         );
 
         let failed = capture_logs(|| {
-            remote_install_failed("host1", "$HOME/.local/bin/flock", "ssh exited with 1")
+            remote_install_failed("host1", "$HOME/.local/bin/flk", "ssh exited with 1")
         });
         assert!(
             failed.contains("event=\"remote.install.complete\""),
@@ -1332,5 +3391,1288 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].ts, "2026-06-29T00:00:02Z");
         assert_eq!(merged[1].ts, "2026-06-29T00:00:03Z");
+    }
+
+    // ------ logging redesign PR-4: client_conn family ----------------------
+
+    #[test]
+    fn client_conn_setup_and_accept_events_split_by_level() {
+        let nb = capture_logs(|| client_conn_nonblocking_failed("EAGAIN"));
+        assert!(nb.contains("event=\"client_conn.setup\""), "{nb}");
+        assert!(nb.contains("stage=\"nonblocking\""), "{nb}");
+        assert!(nb.contains("err=\"EAGAIN\""), "{nb}");
+        assert!(nb.contains("WARN"), "{nb}");
+
+        let acc = capture_logs(|| client_conn_accept_failed("EBADF"));
+        assert!(acc.contains("event=\"client_conn.listener\""), "{acc}");
+        assert!(acc.contains("mode=\"accept\""), "{acc}");
+        assert!(acc.contains("ERROR"), "{acc}");
+
+        let rej = capture_logs(|| client_conn_reject_failed("EBADF"));
+        assert!(rej.contains("mode=\"reject\""), "{rej}");
+        assert!(rej.contains("ERROR"), "{rej}");
+    }
+
+    #[test]
+    fn client_conn_handshake_stages_carry_client_id_when_present() {
+        let refusal = capture_logs(|| client_conn_refusal_send_failed("EPIPE"));
+        assert!(
+            refusal.contains("event=\"client_conn.handshake\""),
+            "{refusal}"
+        );
+        assert!(refusal.contains("stage=\"handoff_refusal\""), "{refusal}");
+        assert!(refusal.contains("DEBUG"), "{refusal}");
+
+        let hs = capture_logs(|| client_conn_handshake_failed(7, "framing"));
+        assert!(hs.contains("stage=\"handshake\""), "{hs}");
+        assert!(hs.contains("client_id=7"), "{hs}");
+        assert!(hs.contains("DEBUG"), "{hs}");
+
+        let hello = capture_logs(|| client_conn_hello_read_failed(11, "eof"));
+        assert!(hello.contains("stage=\"read_hello\""), "{hello}");
+        assert!(hello.contains("client_id=11"), "{hello}");
+        assert!(hello.contains("DEBUG"), "{hello}");
+    }
+
+    #[test]
+    fn client_conn_write_flush_read_split_by_stage() {
+        let w = capture_logs(|| client_conn_write_failed("EPIPE"));
+        assert!(w.contains("event=\"client_conn.write\""), "{w}");
+        assert!(w.contains("stage=\"write\""), "{w}");
+        assert!(w.contains("DEBUG"), "{w}");
+
+        let f = capture_logs(|| client_conn_flush_failed("EPIPE"));
+        assert!(f.contains("event=\"client_conn.write\""), "{f}");
+        assert!(f.contains("stage=\"flush\""), "{f}");
+
+        let r = capture_logs(|| client_conn_read_failed(5, "framing"));
+        assert!(r.contains("event=\"client_conn.read\""), "{r}");
+        assert!(r.contains("client_id=5"), "{r}");
+        assert!(r.contains("err=\"framing\""), "{r}");
+        assert!(r.contains("DEBUG"), "{r}");
+    }
+
+    // ------ logging redesign PR-4: server family (autodetect side) ---------
+
+    #[test]
+    fn server_socket_check_ready_and_daemon_are_shaped() {
+        let check = capture_logs(|| server_socket_check_failed("permission denied"));
+        assert!(check.contains("event=\"server.socket.check\""), "{check}");
+        assert!(check.contains("err=\"permission denied\""), "{check}");
+        assert!(check.contains("WARN"), "{check}");
+
+        let ready = capture_logs(|| server_socket_ready(Path::new("/tmp/x.sock")));
+        assert!(ready.contains("event=\"server.socket.ready\""), "{ready}");
+        assert!(ready.contains("path=/tmp/x.sock"), "{ready}");
+        assert!(ready.contains("INFO"), "{ready}");
+
+        let spawn = capture_logs(|| server_daemon_spawning(Path::new("/usr/local/bin/flk")));
+        assert!(spawn.contains("event=\"server.daemon.spawn\""), "{spawn}");
+        assert!(spawn.contains("exe=/usr/local/bin/flk"), "{spawn}");
+        assert!(spawn.contains("INFO"), "{spawn}");
+
+        let detect = capture_logs(|| server_auto_detect_starting(Path::new("/tmp/x.sock")));
+        assert!(
+            detect.contains("event=\"server.auto_detect.start\""),
+            "{detect}"
+        );
+        assert!(detect.contains("path=/tmp/x.sock"), "{detect}");
+        assert!(detect.contains("INFO"), "{detect}");
+    }
+
+    // ------ logging redesign PR-4: handoff rollback + ownership ack --------
+
+    #[test]
+    fn handoff_rollback_records_phase_and_status_or_err() {
+        let exited = capture_logs(|| handoff_import_rollback_exited(9, "exit code: 0"));
+        assert!(
+            exited.contains("event=\"handoff.import.rollback\""),
+            "{exited}"
+        );
+        assert!(exited.contains("phase=\"exited\""), "{exited}");
+        assert!(exited.contains("status=\"exit code: 0\""), "{exited}");
+        assert!(exited.contains("INFO"), "{exited}");
+
+        let reaped = capture_logs(|| handoff_import_rollback_reaped(9, "exit code: 0"));
+        assert!(reaped.contains("phase=\"reaped\""), "{reaped}");
+        assert!(reaped.contains("INFO"), "{reaped}");
+
+        let inspect = capture_logs(|| handoff_import_rollback_step_failed(9, "inspect", "ESRCH"));
+        assert!(inspect.contains("phase=\"inspect\""), "{inspect}");
+        assert!(inspect.contains("err=\"ESRCH\""), "{inspect}");
+        assert!(inspect.contains("WARN"), "{inspect}");
+
+        let kill = capture_logs(|| handoff_import_rollback_step_failed(9, "kill", "EPERM"));
+        assert!(kill.contains("phase=\"kill\""), "{kill}");
+        assert!(kill.contains("WARN"), "{kill}");
+
+        let reap = capture_logs(|| handoff_import_rollback_step_failed(9, "reap", "ECHILD"));
+        assert!(reap.contains("phase=\"reap\""), "{reap}");
+        assert!(reap.contains("WARN"), "{reap}");
+    }
+
+    #[test]
+    fn handoff_ownership_ack_family_stages() {
+        let setup = capture_logs(|| handoff_owned_ack_setup_failed("EINVAL"));
+        assert!(setup.contains("event=\"handoff.ownership.ack\""), "{setup}");
+        assert!(setup.contains("stage=\"timeout_setup\""), "{setup}");
+        assert!(setup.contains("WARN"), "{setup}");
+
+        let unexpected = capture_logs(|| handoff_owned_ack_unexpected("nope"));
+        assert!(
+            unexpected.contains("outcome=\"unexpected\""),
+            "{unexpected}"
+        );
+        assert!(unexpected.contains("response=\"nope\""), "{unexpected}");
+        assert!(unexpected.contains("WARN"), "{unexpected}");
+
+        let read = capture_logs(|| handoff_owned_ack_read_failed("EPIPE"));
+        assert!(read.contains("stage=\"read\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+    }
+
+    // ------ logging redesign PR-4: headless-family fns ---------------------
+
+    #[test]
+    fn server_started_names_both_sockets_at_info() {
+        let out = capture_logs(|| {
+            server_started(
+                Path::new("/tmp/flock-api.sock"),
+                Path::new("/tmp/flock.sock"),
+            );
+        });
+        assert!(out.contains("event=\"server.start\""), "{out}");
+        assert!(out.contains("subsystem=\"server\""), "{out}");
+        assert!(out.contains("api_socket=/tmp/flock-api.sock"), "{out}");
+        assert!(out.contains("client_socket=/tmp/flock.sock"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn server_client_socket_events_carry_path_and_correct_level() {
+        let listen = capture_logs(|| server_client_socket_listening(Path::new("/tmp/x.sock")));
+        assert!(
+            listen.contains("event=\"server.socket.listening\""),
+            "{listen}"
+        );
+        assert!(listen.contains("path=/tmp/x.sock"), "{listen}");
+        assert!(listen.contains("INFO"), "{listen}");
+
+        let cleanup = capture_logs(|| {
+            server_client_socket_cleanup_failed(Path::new("/tmp/x.sock"), "EACCES")
+        });
+        assert!(
+            cleanup.contains("event=\"server.socket.cleanup\""),
+            "{cleanup}"
+        );
+        assert!(cleanup.contains("path=/tmp/x.sock"), "{cleanup}");
+        assert!(cleanup.contains("err=\"EACCES\""), "{cleanup}");
+        assert!(cleanup.contains("WARN"), "{cleanup}");
+    }
+
+    #[test]
+    fn terminal_attach_connected_is_info_with_size_and_ids() {
+        let out = capture_logs(|| terminal_attach_connected(3, "term-1", 80, 24));
+        assert!(out.contains("event=\"terminal_attach.connected\""), "{out}");
+        assert!(out.contains("subsystem=\"terminal_attach\""), "{out}");
+        assert!(out.contains("client_id=3"), "{out}");
+        assert!(out.contains("terminal_id=\"term-1\""), "{out}");
+        assert!(out.contains("cols=80"), "{out}");
+        assert!(out.contains("rows=24"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn terminal_attach_input_paste_scroll_failures_are_warn() {
+        let inp = capture_logs(|| terminal_attach_input_failed(3, "term-1", "closed"));
+        assert!(inp.contains("event=\"terminal_attach.input\""), "{inp}");
+        assert!(inp.contains("err=\"closed\""), "{inp}");
+        assert!(inp.contains("WARN"), "{inp}");
+
+        let paste = capture_logs(|| terminal_attach_paste_failed(3, "term-1", "boom"));
+        assert!(paste.contains("event=\"terminal_attach.paste\""), "{paste}");
+        assert!(paste.contains("WARN"), "{paste}");
+
+        let scroll = capture_logs(|| terminal_attach_scroll_failed(3, "term-1", "boom"));
+        assert!(
+            scroll.contains("event=\"terminal_attach.scroll\""),
+            "{scroll}"
+        );
+        assert!(scroll.contains("WARN"), "{scroll}");
+    }
+
+    #[test]
+    fn clipboard_receive_stage_and_stage_failure_shapes() {
+        let recv = capture_logs(|| client_clipboard_image_received(7, 4096, "png"));
+        assert!(recv.contains("event=\"clipboard.image.receive\""), "{recv}");
+        assert!(recv.contains("extension=\"png\""), "{recv}");
+        assert!(recv.contains("len=4096"), "{recv}");
+        assert!(recv.contains("DEBUG"), "{recv}");
+
+        let staged =
+            capture_logs(|| client_clipboard_image_staged(7, 4096, "/tmp/flock-clip-7.png"));
+        assert!(
+            staged.contains("event=\"clipboard.image.stage\""),
+            "{staged}"
+        );
+        assert!(
+            staged.contains("path=\"/tmp/flock-clip-7.png\""),
+            "{staged}"
+        );
+        assert!(staged.contains("bytes=4096"), "{staged}");
+        assert!(staged.contains("INFO"), "{staged}");
+
+        let fail = capture_logs(|| client_clipboard_image_stage_failed(7, "ENOSPC"));
+        assert!(fail.contains("event=\"clipboard.image.stage\""), "{fail}");
+        assert!(fail.contains("outcome=\"error\""), "{fail}");
+        assert!(fail.contains("WARN"), "{fail}");
+    }
+
+    #[test]
+    fn frame_serialize_broadcast_and_client_carry_kind() {
+        let b =
+            capture_logs(|| frame_serialize_broadcast_failed("server_message", "encoding failed"));
+        assert!(b.contains("event=\"frame.serialize\""), "{b}");
+        assert!(b.contains("scope=\"broadcast\""), "{b}");
+        assert!(b.contains("kind=\"server_message\""), "{b}");
+        assert!(b.contains("WARN"), "{b}");
+
+        let mouse = capture_logs(|| {
+            frame_serialize_broadcast_failed("mouse_capture_mode", "encoding failed")
+        });
+        assert!(mouse.contains("kind=\"mouse_capture_mode\""), "{mouse}");
+
+        let c =
+            capture_logs(|| frame_serialize_client_failed(7, "retained_frame", "encoding failed"));
+        assert!(c.contains("scope=\"client\""), "{c}");
+        assert!(c.contains("client_id=7"), "{c}");
+        assert!(c.contains("kind=\"retained_frame\""), "{c}");
+        assert!(c.contains("WARN"), "{c}");
+    }
+
+    #[test]
+    fn workspace_create_at_cwd_failed_is_error() {
+        let out = capture_logs(|| workspace_create_at_cwd_failed("no such directory"));
+        assert!(out.contains("event=\"workspace.create\""), "{out}");
+        assert!(out.contains("err=\"no such directory\""), "{out}");
+        assert!(out.contains("ERROR"), "{out}");
+    }
+
+    #[test]
+    fn handoff_import_spawned_is_info_with_pid_and_socket() {
+        let out =
+            capture_logs(|| handoff_import_spawned(4711, Path::new("/tmp/flock-handoff-1.sock")));
+        assert!(out.contains("event=\"handoff.import.spawn\""), "{out}");
+        assert!(out.contains("pid=4711"), "{out}");
+        assert!(out.contains("socket=/tmp/flock-handoff-1.sock"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn handoff_preserve_runtime_names_terminal_at_debug() {
+        let out = capture_logs(|| handoff_preserve_runtime("term-1"));
+        assert!(out.contains("event=\"handoff.preserve_runtime\""), "{out}");
+        assert!(out.contains("terminal_id=\"term-1\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn handoff_report_ownership_failed_is_warn() {
+        let out = capture_logs(|| handoff_report_ownership_failed("EPIPE"));
+        assert!(out.contains("event=\"handoff.ownership.report\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn notification_toast_and_sound_forwarded_are_debug() {
+        let toast = capture_logs(|| notification_toast_forwarded("agent finished: hello"));
+        assert!(
+            toast.contains("event=\"notification.toast.forward\""),
+            "{toast}"
+        );
+        assert!(toast.contains("msg=\"agent finished: hello\""), "{toast}");
+        assert!(toast.contains("DEBUG"), "{toast}");
+
+        let sound = capture_logs(|| notification_sound_forwarded("Done"));
+        assert!(
+            sound.contains("event=\"notification.sound.forward\""),
+            "{sound}"
+        );
+        assert!(sound.contains("sound=\"Done\""), "{sound}");
+        assert!(sound.contains("DEBUG"), "{sound}");
+    }
+
+    #[test]
+    fn pane_state_change_detected_carries_all_ids() {
+        let out =
+            capture_logs(|| pane_state_change_detected(2, 17, "Idle", "NeedsAttention", "claude"));
+        assert!(out.contains("event=\"pane.state.change\""), "{out}");
+        assert!(out.contains("ws_idx=2"), "{out}");
+        assert!(out.contains("pane_id=17"), "{out}");
+        assert!(out.contains("prev_state=\"Idle\""), "{out}");
+        assert!(out.contains("new_state=\"NeedsAttention\""), "{out}");
+        assert!(out.contains("agent=\"claude\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn render_virtual_frame_debug_shape() {
+        let with = capture_logs(|| render_virtual_frame(80, 24, Some(5)));
+        assert!(with.contains("event=\"render.virtual_frame\""), "{with}");
+        assert!(with.contains("cols=80"), "{with}");
+        assert!(with.contains("rows=24"), "{with}");
+        assert!(with.contains("foreground_client_id=5"), "{with}");
+        assert!(with.contains("DEBUG"), "{with}");
+
+        let without = capture_logs(|| render_virtual_frame(80, 24, None));
+        assert!(
+            without.contains("event=\"render.virtual_frame\""),
+            "{without}"
+        );
+    }
+
+    // ------ logging redesign PR-5: raw_input family ------------------------
+
+    #[test]
+    fn bounded_bytes_debug_truncates_long_payloads() {
+        let short = bounded_bytes_debug(&[1, 2, 3]);
+        assert_eq!(short, "[1, 2, 3]", "short payloads Debug as-is");
+        let long: Vec<u8> = (0..100).collect();
+        let shaped = bounded_bytes_debug(&long);
+        assert!(shaped.starts_with('['), "still Debug-shaped: {shaped}");
+        assert!(
+            shaped.contains("(+36 more)"),
+            "long payload truncated with count: {shaped}"
+        );
+        assert!(
+            !shaped.contains("99"),
+            "the tail is dropped so a runaway paste can't blow up the log: {shaped}"
+        );
+    }
+
+    #[test]
+    fn raw_input_event_parsed_is_debug_with_bounded_bytes() {
+        let out = capture_logs(|| raw_input_event_parsed(&[0x1b, 0x5b, 0x41], "Key(Up, empty)"));
+        assert!(out.contains("event=\"raw_input.parsed\""), "{out}");
+        assert!(out.contains("subsystem=\"raw_input\""), "{out}");
+        assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
+        assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_flushing_lone_escape_is_warn_with_bytes() {
+        let out = capture_logs(|| raw_input_flushing_lone_escape(&[0x1b]));
+        assert!(out.contains("event=\"raw_input.flush\""), "{out}");
+        assert!(out.contains("outcome=\"lone_escape\""), "{out}");
+        assert!(out.contains("bytes=\"[27]\""), "{out}");
+        assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+    }
+
+    #[test]
+    fn raw_input_waiting_events_are_trace() {
+        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(&[0xc3]));
+        assert!(utf8.contains("event=\"raw_input.wait\""), "{utf8}");
+        assert!(utf8.contains("outcome=\"utf8_continuation\""), "{utf8}");
+        assert!(utf8.contains("TRACE"), "{utf8}");
+
+        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(&[0x1b, 0xc3]));
+        assert!(
+            esc.contains("outcome=\"escaped_utf8_continuation\""),
+            "{esc}"
+        );
+        assert!(esc.contains("TRACE"), "{esc}");
+    }
+
+    #[test]
+    fn raw_input_dropping_incomplete_buffer_is_debug() {
+        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(&[0xff, 0xfe]));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"incomplete\""), "{out}");
+        assert!(out.contains("bytes=\"[255, 254]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn raw_input_unsupported_escape_is_debug_with_sequence() {
+        let out = capture_logs(|| raw_input_unsupported_escape("\x1b[?9999z"));
+        assert!(out.contains("event=\"raw_input.drop\""), "{out}");
+        assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
+        assert!(out.contains("sequence="), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn pane_open_url_failed_is_warn_with_url_and_err() {
+        let out = capture_logs(|| pane_open_url_failed("https://example.test", "no browser"));
+        assert!(out.contains("event=\"pane.open_url\""), "{out}");
+        assert!(out.contains("url=\"https://example.test\""), "{out}");
+        assert!(out.contains("err=\"no browser\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_mouse_wheel_encode_and_forward_failures_are_warn() {
+        let enc = capture_logs(|| pane_mouse_wheel_encode_failed(7, "ScrollDown"));
+        assert!(enc.contains("event=\"pane.mouse.wheel\""), "{enc}");
+        assert!(enc.contains("outcome=\"encode_error\""), "{enc}");
+        assert!(enc.contains("pane=7"), "{enc}");
+        assert!(enc.contains("kind=\"ScrollDown\""), "{enc}");
+        assert!(enc.contains("WARN"), "{enc}");
+
+        let fwd = capture_logs(|| pane_mouse_wheel_forward_failed(7, "closed"));
+        assert!(fwd.contains("event=\"pane.mouse.wheel\""), "{fwd}");
+        assert!(fwd.contains("outcome=\"forward_error\""), "{fwd}");
+        assert!(fwd.contains("err=\"closed\""), "{fwd}");
+        assert!(fwd.contains("WARN"), "{fwd}");
+    }
+
+    #[test]
+    fn pane_mouse_button_and_motion_and_alt_scroll_forward_failures() {
+        let b = capture_logs(|| pane_mouse_button_forward_failed(7, "Down(Left)", "closed"));
+        assert!(b.contains("event=\"pane.mouse.button\""), "{b}");
+        assert!(b.contains("kind=\"Down(Left)\""), "{b}");
+        assert!(b.contains("err=\"closed\""), "{b}");
+        assert!(b.contains("WARN"), "{b}");
+
+        let m = capture_logs(|| pane_mouse_motion_forward_failed(7, "Drag(Left)", "closed"));
+        assert!(m.contains("event=\"pane.mouse.motion\""), "{m}");
+        assert!(m.contains("kind=\"Drag(Left)\""), "{m}");
+        assert!(m.contains("WARN"), "{m}");
+
+        let a = capture_logs(|| pane_mouse_alternate_scroll_forward_failed(7, "closed"));
+        assert!(a.contains("event=\"pane.mouse.alternate_scroll\""), "{a}");
+        assert!(a.contains("WARN"), "{a}");
+    }
+
+    #[test]
+    fn shape_key_event_covers_all_four_fields() {
+        let ev = crossterm::event::KeyEvent::new_with_kind_and_state(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::empty(),
+        );
+        let shaped = shape_key_event(&ev);
+        assert!(shaped.contains("code="), "{shaped}");
+        assert!(shaped.contains("modifiers="), "{shaped}");
+        assert!(shaped.contains("kind="), "{shaped}");
+        assert!(shaped.contains("state="), "{shaped}");
+    }
+
+    #[test]
+    fn terminal_key_intercept_action_and_command_are_debug() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let a = capture_logs(|| terminal_key_intercept_action(&ev, "ToggleFloat"));
+        assert!(a.contains("event=\"terminal_key.intercept\""), "{a}");
+        assert!(a.contains("outcome=\"action\""), "{a}");
+        assert!(a.contains("action=\"ToggleFloat\""), "{a}");
+        assert!(a.contains("code="), "{a}");
+        assert!(a.contains("DEBUG"), "{a}");
+
+        let c = capture_logs(|| terminal_key_intercept_command(&ev, "edit config"));
+        assert!(c.contains("outcome=\"command\""), "{c}");
+        assert!(c.contains("command=\"edit config\""), "{c}");
+        assert!(c.contains("DEBUG"), "{c}");
+    }
+
+    #[test]
+    fn terminal_key_page_intercept_debug_shape() {
+        let out =
+            capture_logs(|| terminal_key_page_intercept(&crossterm::event::KeyCode::PageUp, 24));
+        assert!(out.contains("event=\"terminal_key.intercept\""), "{out}");
+        assert!(out.contains("outcome=\"page_scroll\""), "{out}");
+        assert!(out.contains("code=\"PageUp\""), "{out}");
+        assert!(out.contains("lines=24"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_modifier_only_dropped_debug_shape() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let out = capture_logs(|| terminal_key_modifier_only_dropped(&ev));
+        assert!(out.contains("event=\"terminal_key.drop\""), "{out}");
+        assert!(out.contains("outcome=\"modifier_only\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_forward_ambiguous_debug_with_protocol_and_encoded() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", &[0x1b]));
+        assert!(out.contains("event=\"terminal_key.forward\""), "{out}");
+        assert!(out.contains("outcome=\"ambiguous\""), "{out}");
+        assert!(out.contains("protocol=\"Legacy\""), "{out}");
+        assert!(out.contains("encoded=\"[27]\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn terminal_key_empty_encoding_is_warn() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let out = capture_logs(|| terminal_key_empty_encoding(&ev));
+        assert!(out.contains("event=\"terminal_key.encode\""), "{out}");
+        assert!(out.contains("outcome=\"empty\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    // ------ logging redesign PR-5: client family ---------------------------
+
+    #[test]
+    fn client_fleet_snapshot_invalid_is_warn() {
+        let out = capture_logs(|| client_fleet_snapshot_invalid("bad json"));
+        assert!(out.contains("event=\"client.fleet_snapshot\""), "{out}");
+        assert!(out.contains("outcome=\"invalid\""), "{out}");
+        assert!(out.contains("err=\"bad json\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_handshake_succeeded_is_info_with_all_fields() {
+        let out = capture_logs(|| client_handshake_succeeded(3, "SemanticFrame", 42));
+        assert!(out.contains("event=\"client.handshake\""), "{out}");
+        assert!(out.contains("version=3"), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("handshake_ms=42"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_host_theme_captured_is_info_with_shaped_theme() {
+        let out = capture_logs(|| client_host_theme_captured("TerminalTheme { fg: .. }"));
+        assert!(out.contains("event=\"client.host_theme\""), "{out}");
+        assert!(out.contains("theme="), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_connecting_is_info_with_path_and_message() {
+        let out = capture_logs(|| client_connecting(Path::new("/tmp/x.sock"), "connecting"));
+        assert!(out.contains("event=\"client.connect\""), "{out}");
+        assert!(out.contains("path=/tmp/x.sock"), "{out}");
+        assert!(out.contains("connecting"), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn client_render_encoding_active_is_debug() {
+        let out = capture_logs(|| client_render_encoding_active("SemanticFrame"));
+        assert!(out.contains("event=\"client.render_encoding\""), "{out}");
+        assert!(out.contains("encoding=\"SemanticFrame\""), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_dropped_file_read_failed_is_warn() {
+        let out = capture_logs(|| client_dropped_file_read_failed("ENOENT"));
+        assert!(out.contains("event=\"client.dropped_file\""), "{out}");
+        assert!(out.contains("err=\"ENOENT\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn client_attach_switch_first_paint_keeps_flock_attach_target() {
+        let out = capture_logs(|| client_attach_switch_first_paint("host1", true, 42));
+        assert!(out.contains("flock::attach"), "{out}");
+        assert!(out.contains("stage=\"switch\""), "{out}");
+        assert!(out.contains("to=\"host1\""), "{out}");
+        assert!(out.contains("warm=true"), "{out}");
+        assert!(out.contains("elapsed_ms=42"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn client_slot_lifecycle_events_are_debug_with_slot_or_target() {
+        let sd = capture_logs(|| client_slot_shutdown_demoted("host1"));
+        assert!(sd.contains("event=\"client.slot.shutdown\""), "{sd}");
+        assert!(sd.contains("outcome=\"demoted\""), "{sd}");
+        assert!(sd.contains("DEBUG"), "{sd}");
+
+        let md = capture_logs(|| client_slot_message_dropped("host1"));
+        assert!(md.contains("event=\"client.slot.message\""), "{md}");
+        assert!(md.contains("outcome=\"dropped\""), "{md}");
+        assert!(md.contains("DEBUG"), "{md}");
+
+        let dd = capture_logs(|| client_slot_disconnected_demoted("host1"));
+        assert!(dd.contains("event=\"client.slot.disconnect\""), "{dd}");
+        assert!(dd.contains("DEBUG"), "{dd}");
+    }
+
+    #[test]
+    fn client_slot_warm_pause_stale_shapes() {
+        let sfp = capture_logs(|| client_slot_switch_pause_failed("host1", "EAGAIN"));
+        assert!(sfp.contains("event=\"client.slot.warm\""), "{sfp}");
+        assert!(sfp.contains("outcome=\"pause_failed\""), "{sfp}");
+        assert!(sfp.contains("WARN"), "{sfp}");
+
+        let red = capture_logs(|| client_slot_prewarm_redundant("host1"));
+        assert!(red.contains("outcome=\"redundant\""), "{red}");
+        assert!(red.contains("DEBUG"), "{red}");
+
+        let wpf = capture_logs(|| client_slot_warm_pause_failed("host1", "EAGAIN"));
+        assert!(wpf.contains("outcome=\"pause_failed\""), "{wpf}");
+        assert!(wpf.contains("DEBUG"), "{wpf}");
+
+        let ok = capture_logs(|| client_slot_warmed_paused("host1"));
+        assert!(ok.contains("outcome=\"ok\""), "{ok}");
+        assert!(ok.contains("DEBUG"), "{ok}");
+
+        let stale_w = capture_logs(|| client_slot_warmed_stale("host1", 3));
+        assert!(stale_w.contains("event=\"client.slot.warm\""), "{stale_w}");
+        assert!(stale_w.contains("outcome=\"stale\""), "{stale_w}");
+        assert!(stale_w.contains("gen=3"), "{stale_w}");
+        assert!(stale_w.contains("DEBUG"), "{stale_w}");
+
+        let stale_d = capture_logs(|| client_slot_dial_failed_stale("host1", 3));
+        assert!(stale_d.contains("event=\"client.slot.dial\""), "{stale_d}");
+        assert!(stale_d.contains("outcome=\"stale\""), "{stale_d}");
+        assert!(stale_d.contains("DEBUG"), "{stale_d}");
+    }
+
+    #[test]
+    fn client_slot_dial_failure_shapes() {
+        let flip = capture_logs(|| client_slot_flip_failed("host1", "EPIPE"));
+        assert!(flip.contains("event=\"client.slot.flip\""), "{flip}");
+        assert!(flip.contains("err=\"EPIPE\""), "{flip}");
+        assert!(flip.contains("WARN"), "{flip}");
+
+        let warm = capture_logs(|| client_slot_warm_all_dial_failed("host1", "EPIPE"));
+        assert!(warm.contains("outcome=\"warm_all_failed\""), "{warm}");
+        assert!(warm.contains("DEBUG"), "{warm}");
+
+        let switch = capture_logs(|| client_slot_switch_dial_failed("host1", "EPIPE"));
+        assert!(switch.contains("outcome=\"switch_failed\""), "{switch}");
+        assert!(switch.contains("DEBUG"), "{switch}");
+
+        let timeout = capture_logs(|| client_slot_switch_dial_timed_out("host1"));
+        assert!(timeout.contains("outcome=\"switch_timeout\""), "{timeout}");
+        assert!(timeout.contains("DEBUG"), "{timeout}");
+    }
+
+    #[test]
+    fn client_server_read_and_config_and_notifications_are_warn() {
+        let read = capture_logs(|| client_server_read_error("EOF"));
+        assert!(read.contains("event=\"client.server_read\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let diag = capture_logs(|| client_config_sound_diagnostic("volume missing"));
+        assert!(diag.contains("event=\"client.config.reload\""), "{diag}");
+        assert!(diag.contains("outcome=\"diagnostic\""), "{diag}");
+        assert!(diag.contains("WARN"), "{diag}");
+
+        let reload = capture_logs(|| client_config_reload_failed("[Diag1, Diag2]"));
+        assert!(reload.contains("outcome=\"error\""), "{reload}");
+        assert!(
+            reload.contains("diagnostics=\"[Diag1, Diag2]\""),
+            "{reload}"
+        );
+        assert!(reload.contains("WARN"), "{reload}");
+
+        let term = capture_logs(|| client_terminal_notification_failed("EPIPE"));
+        assert!(term.contains("event=\"client.notification\""), "{term}");
+        assert!(term.contains("kind=\"terminal\""), "{term}");
+        assert!(term.contains("WARN"), "{term}");
+
+        let sys = capture_logs(|| client_system_notification_failed("EPIPE"));
+        assert!(sys.contains("kind=\"system\""), "{sys}");
+        assert!(sys.contains("WARN"), "{sys}");
+    }
+
+    #[test]
+    fn config_diagnostic_carries_the_diagnostic_at_warn() {
+        let out = capture_logs(|| {
+            config_diagnostic("invalid keybinding: keys.help = \"foo\"; disabling binding")
+        });
+        assert!(out.contains("event=\"config.diagnostic\""), "{out}");
+        assert!(out.contains("subsystem=\"config\""), "{out}");
+        assert!(out.contains("outcome=\"diagnostic\""), "{out}");
+        assert!(
+            out.contains("diagnostic=\"invalid keybinding: keys.help"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WARN"),
+            "config diagnostic must be WARN: {out}"
+        );
+    }
+
+    #[test]
+    fn config_load_defaults_diagnostic_is_warn_with_error_outcome() {
+        let out = capture_logs(|| config_load_defaults_diagnostic("bad toml at line 3"));
+        assert!(out.contains("event=\"config.load\""), "{out}");
+        assert!(out.contains("outcome=\"error\""), "{out}");
+        assert!(out.contains("diagnostic=\"bad toml at line 3\""), "{out}");
+        assert!(out.contains("config load error, using defaults"), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_state_change_and_osc52_and_focus_failures_are_warn() {
+        let state = capture_logs(|| pane_state_change_send_failed(7, "channel full"));
+        assert!(
+            state.contains("event=\"pane.state_change.send\""),
+            "{state}"
+        );
+        assert!(state.contains("pane=7"), "{state}");
+        assert!(state.contains("err=\"channel full\""), "{state}");
+        assert!(state.contains("WARN"), "{state}");
+
+        let queue = capture_logs(|| pane_osc52_queue_failed(7, "channel full"));
+        assert!(queue.contains("event=\"pane.osc52.queue\""), "{queue}");
+        assert!(queue.contains("WARN"), "{queue}");
+
+        let send = capture_logs(|| pane_osc52_send_failed(7, "channel full"));
+        assert!(send.contains("event=\"pane.osc52.send\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
+
+        let focus = capture_logs(|| pane_focus_forward_failed("channel full", "FocusIn"));
+        assert!(focus.contains("event=\"pane.focus.forward\""), "{focus}");
+        assert!(focus.contains("focus_event=\"FocusIn\""), "{focus}");
+        assert!(focus.contains("WARN"), "{focus}");
+    }
+
+    #[test]
+    fn pane_forced_shutdown_survivors_lists_pids_at_warn() {
+        let out = capture_logs(|| pane_forced_shutdown_survivors(7, 4711, "[4711, 4720]"));
+        assert!(out.contains("event=\"pane.session.shutdown\""), "{out}");
+        assert!(out.contains("outcome=\"survivors\""), "{out}");
+        assert!(out.contains("pid=4711"), "{out}");
+        assert!(out.contains("pids=\"[4711, 4720]\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_pty_handoff_failures_carry_paused_flag_and_err() {
+        let release = capture_logs(|| pane_pty_release_after_handoff_failed(7, "ENOENT"));
+        assert!(release.contains("event=\"pane.pty.release\""), "{release}");
+        assert!(release.contains("WARN"), "{release}");
+        assert!(
+            release.contains("failed to release PTY actor after handoff commit"),
+            "{release}"
+        );
+
+        let pause = capture_logs(|| pane_pty_handoff_pause_update_failed(7, true, "EAGAIN"));
+        assert!(
+            pause.contains("event=\"pane.pty.handoff_pause\""),
+            "{pause}"
+        );
+        assert!(pause.contains("paused=true"), "{pause}");
+        assert!(pause.contains("err=\"EAGAIN\""), "{pause}");
+        assert!(pause.contains("WARN"), "{pause}");
+    }
+
+    #[test]
+    fn pane_spawn_and_died_failures_are_error() {
+        let spawn = capture_logs(|| pane_spawn_error(7, "EACCES", "failed to spawn shell"));
+        assert!(spawn.contains("event=\"pane.spawn\""), "{spawn}");
+        assert!(spawn.contains("failed to spawn shell"), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("ERROR"), "spawn must be ERROR: {spawn}");
+
+        let died = capture_logs(|| pane_died_send_failed(7, "channel closed"));
+        assert!(died.contains("event=\"pane.died.send\""), "{died}");
+        assert!(
+            died.contains("ERROR"),
+            "PaneDied send must be ERROR: {died}"
+        );
+    }
+
+    #[test]
+    fn worktree_lifecycle_events_split_by_level() {
+        let dialog =
+            capture_logs(|| worktree_dialog_opened(3, "/repo", "feature/x", "/wt/feature-x"));
+        assert!(
+            dialog.contains("event=\"worktree.dialog.open\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("ws_idx=3"), "{dialog}");
+        assert!(dialog.contains("repo_root=\"/repo\""), "{dialog}");
+        assert!(dialog.contains("branch=\"feature/x\""), "{dialog}");
+        assert!(
+            dialog.contains("checkout_path=\"/wt/feature-x\""),
+            "{dialog}"
+        );
+        assert!(dialog.contains("INFO"), "{dialog}");
+
+        let gate =
+            capture_logs(|| worktree_kill_merge_gate_resolved("ws-1", "feature/x", "NotMerged"));
+        assert!(
+            gate.contains("event=\"worktree.kill.merge_gate\""),
+            "{gate}"
+        );
+        assert!(gate.contains("gate=\"NotMerged\""), "{gate}");
+        assert!(
+            gate.contains("INFO"),
+            "merge-gate resolution is INFO: {gate}"
+        );
+
+        let deleted = capture_logs(|| worktree_branch_deleted("feature/x"));
+        assert!(deleted.contains("outcome=\"ok\""), "{deleted}");
+        assert!(deleted.contains("INFO"), "{deleted}");
+
+        let delete_fail =
+            capture_logs(|| worktree_branch_delete_failed("feature/x", "unmerged commits"));
+        assert!(delete_fail.contains("outcome=\"error\""), "{delete_fail}");
+        assert!(
+            delete_fail.contains("WARN"),
+            "branch delete fail is WARN: {delete_fail}"
+        );
+    }
+
+    #[test]
+    fn worktree_add_and_remove_lifecycle_shapes() {
+        let add_start =
+            capture_logs(|| worktree_add_started("/repo", "feature/x", "/wt/feature-x"));
+        assert!(add_start.contains("event=\"worktree.add\""), "{add_start}");
+        assert!(add_start.contains("outcome=\"started\""), "{add_start}");
+        assert!(add_start.contains("INFO"), "{add_start}");
+
+        let add_ok = capture_logs(|| worktree_add_completed("/wt/feature-x"));
+        assert!(add_ok.contains("outcome=\"ok\""), "{add_ok}");
+        assert!(add_ok.contains("INFO"), "{add_ok}");
+
+        let add_fail =
+            capture_logs(|| worktree_add_failed("/wt/feature-x", "fatal: no such branch"));
+        assert!(add_fail.contains("outcome=\"error\""), "{add_fail}");
+        assert!(
+            add_fail.contains("err=\"fatal: no such branch\""),
+            "{add_fail}"
+        );
+        assert!(add_fail.contains("WARN"), "add fail is WARN: {add_fail}");
+
+        let remove_start = capture_logs(|| worktree_remove_started("ws-1", "/wt/feature-x", true));
+        assert!(
+            remove_start.contains("event=\"worktree.remove\""),
+            "{remove_start}"
+        );
+        assert!(remove_start.contains("force=true"), "{remove_start}");
+        assert!(remove_start.contains("INFO"), "{remove_start}");
+
+        let remove_ok = capture_logs(|| worktree_remove_completed("ws-1", "/wt/feature-x"));
+        assert!(remove_ok.contains("outcome=\"ok\""), "{remove_ok}");
+        assert!(remove_ok.contains("INFO"), "{remove_ok}");
+
+        let remove_fail =
+            capture_logs(|| worktree_remove_failed("ws-1", "/wt/feature-x", "dirty worktree"));
+        assert!(remove_fail.contains("outcome=\"error\""), "{remove_fail}");
+        assert!(
+            remove_fail.contains("WARN"),
+            "remove fail is WARN: {remove_fail}"
+        );
+    }
+
+    #[test]
+    fn persist_read_and_parse_failures_are_warn_with_err() {
+        let read = capture_logs(|| session_read_failed("ENOENT"));
+        assert!(read.contains("event=\"persist.read\""), "{read}");
+        assert!(read.contains("err=\"ENOENT\""), "{read}");
+        assert!(read.contains("WARN"), "{read}");
+
+        let parse = capture_logs(|| session_parse_failed("expected map at line 1"));
+        assert!(parse.contains("event=\"persist.parse\""), "{parse}");
+        assert!(parse.contains("failed to parse session file"), "{parse}");
+        assert!(parse.contains("WARN"), "{parse}");
+
+        let hist_read = capture_logs(|| session_history_read_failed("EPERM"));
+        assert!(
+            hist_read.contains("event=\"persist.history.read\""),
+            "{hist_read}"
+        );
+        assert!(hist_read.contains("WARN"), "{hist_read}");
+
+        let hist_parse = capture_logs(|| session_history_parse_failed("bad TOML"));
+        assert!(
+            hist_parse.contains("event=\"persist.history.parse\""),
+            "{hist_parse}"
+        );
+        assert!(hist_parse.contains("WARN"), "{hist_parse}");
+    }
+
+    #[test]
+    fn session_restore_pane_failures_are_error_tab_failures_are_warn() {
+        let cwd = capture_logs(|| session_restore_pane_cwd_missing("/home/removed"));
+        assert!(cwd.contains("event=\"persist.restore.cwd\""), "{cwd}");
+        assert!(cwd.contains("outcome=\"missing\""), "{cwd}");
+        assert!(cwd.contains("cwd=\"/home/removed\""), "{cwd}");
+        assert!(cwd.contains("WARN"), "cwd fallback is WARN: {cwd}");
+
+        let imported = capture_logs(|| {
+            session_restore_imported_pane_failed("Some(\"work\")", 7, "channel closed")
+        });
+        assert!(
+            imported.contains("event=\"persist.restore.pane\""),
+            "{imported}"
+        );
+        assert!(imported.contains("variant=\"imported\""), "{imported}");
+        assert!(imported.contains("pane_id=7"), "{imported}");
+        assert!(
+            imported.contains("ERROR"),
+            "imported failure is ERROR: {imported}"
+        );
+
+        let pane =
+            capture_logs(|| session_restore_pane_failed("Some(\"work\")", 7, "channel closed"));
+        assert!(pane.contains("event=\"persist.restore.pane\""), "{pane}");
+        assert!(
+            !pane.contains("variant="),
+            "non-imported has no variant field: {pane}"
+        );
+        assert!(
+            pane.contains("ERROR"),
+            "restore pane failure is ERROR: {pane}"
+        );
+
+        let no_panes = capture_logs(|| session_restore_tab_no_panes("Some(\"work\")"));
+        assert!(
+            no_panes.contains("event=\"persist.restore.tab\""),
+            "{no_panes}"
+        );
+        assert!(no_panes.contains("reason=\"no_panes\""), "{no_panes}");
+        assert!(no_panes.contains("WARN"), "{no_panes}");
+
+        let pruned = capture_logs(|| session_restore_tab_pruned_empty("Some(\"work\")"));
+        assert!(pruned.contains("reason=\"pruned_empty\""), "{pruned}");
+        assert!(pruned.contains("WARN"), "{pruned}");
+    }
+
+    #[test]
+    fn agent_resume_family_events_split_by_stage() {
+        let empty = capture_logs(|| agent_resume_empty_argv(7, "term-1", "claude"));
+        assert!(empty.contains("event=\"agent_resume.start\""), "{empty}");
+        assert!(empty.contains("reason=\"empty_argv\""), "{empty}");
+        assert!(empty.contains("terminal=\"term-1\""), "{empty}");
+        assert!(empty.contains("agent=\"claude\""), "{empty}");
+        assert!(empty.contains("WARN"), "{empty}");
+
+        let spawn =
+            capture_logs(|| agent_resume_shell_spawn_failed(7, "term-1", "claude", "EACCES"));
+        assert!(spawn.contains("event=\"agent_resume.spawn\""), "{spawn}");
+        assert!(spawn.contains("err=\"EACCES\""), "{spawn}");
+        assert!(spawn.contains("WARN"), "{spawn}");
+
+        let send =
+            capture_logs(|| agent_resume_send_command_failed(7, "term-1", "claude", "EPIPE"));
+        assert!(send.contains("event=\"agent_resume.send\""), "{send}");
+        assert!(send.contains("err=\"EPIPE\""), "{send}");
+        assert!(send.contains("WARN"), "{send}");
+    }
+
+    #[test]
+    fn pane_agent_changed_omits_process_when_absent() {
+        let with = capture_logs(|| {
+            pane_agent_changed(7, "None", "Some(Claude)", Some("claude"), "Some(4711)")
+        });
+        assert!(with.contains("event=\"pane.agent.changed\""), "{with}");
+        assert!(with.contains("previous_agent=\"None\""), "{with}");
+        assert!(with.contains("agent=\"Some(Claude)\""), "{with}");
+        assert!(with.contains("process=\"claude\""), "{with}");
+        assert!(with.contains("pgid=\"Some(4711)\""), "{with}");
+        assert!(with.contains("INFO"), "{with}");
+
+        let without =
+            capture_logs(|| pane_agent_changed(7, "None", "Some(Claude)", None, "Some(4711)"));
+        assert!(
+            !without.contains("process="),
+            "process field must be omitted when absent: {without}"
+        );
+        assert!(without.contains("agent=\"Some(Claude)\""), "{without}");
+        assert!(without.contains("INFO"), "{without}");
+    }
+
+    // ------ logging redesign PR-7: pty family ------------------------------
+
+    #[test]
+    fn pty_family_events_carry_pane_and_correct_levels() {
+        let wake = capture_logs(|| pty_wake_failed("EPIPE"));
+        assert!(wake.contains("event=\"pty.wake\""), "{wake}");
+        assert!(wake.contains("err=\"EPIPE\""), "{wake}");
+        assert!(wake.contains("DEBUG"), "{wake}");
+
+        let drain = capture_logs(|| pty_wake_drain_failed(7, "EBADF"));
+        assert!(drain.contains("event=\"pty.wake.drain\""), "{drain}");
+        assert!(drain.contains("pane=7"), "{drain}");
+        assert!(drain.contains("DEBUG"), "{drain}");
+
+        let poll = capture_logs(|| pty_poll_failed(7, "EINTR"));
+        assert!(poll.contains("event=\"pty.poll\""), "{poll}");
+        assert!(poll.contains("pane=7"), "{poll}");
+        assert!(poll.contains("DEBUG"), "{poll}");
+
+        let read = capture_logs(|| pty_read_failed(7, "EIO"));
+        assert!(read.contains("event=\"pty.read\""), "{read}");
+        assert!(read.contains("DEBUG"), "{read}");
+
+        let write = capture_logs(|| pty_write_failed(7, "EPIPE"));
+        assert!(write.contains("event=\"pty.write\""), "{write}");
+        assert!(write.contains("pane=7"), "{write}");
+        assert!(
+            write.contains("WARN"),
+            "PTY write failures must WARN — the caller's keystrokes were dropped: {write}"
+        );
+
+        let resize = capture_logs(|| pty_resize_failed(7, "EINVAL"));
+        assert!(resize.contains("event=\"pty.resize\""), "{resize}");
+        assert!(resize.contains("DEBUG"), "{resize}");
+    }
+
+    // ------ logging redesign PR-7: api server family -----------------------
+
+    #[test]
+    fn api_server_family_splits_by_level_and_shapes_path() {
+        let remove =
+            capture_logs(|| api_socket_remove_failed(Path::new("/tmp/flock-api.sock"), "EACCES"));
+        assert!(remove.contains("event=\"api.socket.remove\""), "{remove}");
+        assert!(remove.contains("path=/tmp/flock-api.sock"), "{remove}");
+        assert!(remove.contains("err=\"EACCES\""), "{remove}");
+        assert!(remove.contains("WARN"), "{remove}");
+
+        let listen = capture_logs(|| api_server_listening(Path::new("/tmp/flock-api.sock")));
+        assert!(listen.contains("event=\"api.server.listen\""), "{listen}");
+        assert!(listen.contains("path=/tmp/flock-api.sock"), "{listen}");
+        assert!(listen.contains("INFO"), "{listen}");
+
+        let conn = capture_logs(|| api_connection_failed("framing"));
+        assert!(conn.contains("event=\"api.connection\""), "{conn}");
+        assert!(conn.contains("err=\"framing\""), "{conn}");
+        assert!(conn.contains("WARN"), "{conn}");
+
+        let accept = capture_logs(|| api_listener_accept_failed("EBADF"));
+        assert!(accept.contains("event=\"api.listener.accept\""), "{accept}");
+        assert!(
+            accept.contains("ERROR"),
+            "accept-loop dying is ERROR — the server can no longer take new clients: {accept}"
+        );
+
+        let timeout = capture_logs(|| api_connection_write_timeout_unavailable("ENOTSOCK"));
+        assert!(
+            timeout.contains("event=\"api.connection.write_timeout\""),
+            "{timeout}"
+        );
+        assert!(timeout.contains("outcome=\"unavailable\""), "{timeout}");
+        assert!(timeout.contains("DEBUG"), "{timeout}");
+    }
+
+    // ------ logging redesign PR-7: app api family --------------------------
+
+    #[test]
+    fn peer_summary_applied_targets_flock_peers_at_debug() {
+        let out = capture_logs(|| peer_summary_applied("sage", "sage.local", true, 3, 42));
+        assert!(out.contains("event=\"peer.summary.applied\""), "{out}");
+        assert!(out.contains("peer=\"sage\""), "{out}");
+        assert!(out.contains("host=\"sage.local\""), "{out}");
+        assert!(out.contains("has_system=true"), "{out}");
+        assert!(out.contains("workspaces=3"), "{out}");
+        assert!(out.contains("latency_ms=42"), "{out}");
+        assert!(out.contains("DEBUG"), "{out}");
+        assert!(
+            out.contains("flock::peers"),
+            "peers summary must keep the flock::peers target: {out}"
+        );
+    }
+
+    #[test]
+    fn config_edit_rollback_write_failed_shapes_path_and_err() {
+        let out = capture_logs(|| {
+            config_edit_rollback_write_failed(Path::new("/home/u/config.toml"), "EACCES")
+        });
+        assert!(out.contains("event=\"config.edit.rollback\""), "{out}");
+        assert!(out.contains("target=/home/u/config.toml"), "{out}");
+        assert!(out.contains("err=\"EACCES\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn pane_respawn_shell_failed_is_warn_with_pane_and_terminal() {
+        let out = capture_logs(|| pane_respawn_shell_failed(7, "term-abc", "ENOENT"));
+        assert!(out.contains("event=\"pane.respawn_shell\""), "{out}");
+        assert!(out.contains("pane=7"), "{out}");
+        assert!(out.contains("terminal=\"term-abc\""), "{out}");
+        assert!(out.contains("err=\"ENOENT\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    // ------ logging redesign PR-7: web family ------------------------------
+
+    #[test]
+    fn web_ws_origin_rejected_names_both_headers() {
+        let with = capture_logs(|| {
+            web_ws_origin_rejected(Some("https://evil.example"), Some("flock.local"))
+        });
+        assert!(with.contains("event=\"web.ws.origin_rejected\""), "{with}");
+        assert!(with.contains("origin=\"https://evil.example\""), "{with}");
+        assert!(with.contains("host=\"flock.local\""), "{with}");
+        assert!(with.contains("WARN"), "{with}");
+
+        let absent = capture_logs(|| web_ws_origin_rejected(None, None));
+        assert!(absent.contains("origin=\"<absent>\""), "{absent}");
+        assert!(absent.contains("host=\"<absent>\""), "{absent}");
+    }
+
+    #[test]
+    fn web_ws_identity_rejected_and_session_and_resize_shapes() {
+        let ident = capture_logs(|| web_ws_identity_rejected(Some("bob@example")));
+        assert!(
+            ident.contains("event=\"web.ws.identity_rejected\""),
+            "{ident}"
+        );
+        assert!(ident.contains("user=\"bob@example\""), "{ident}");
+        assert!(ident.contains("WARN"), "{ident}");
+
+        let sess = capture_logs(|| web_ws_session_ended_error("closed"));
+        assert!(sess.contains("event=\"web.ws.session\""), "{sess}");
+        assert!(sess.contains("WARN"), "{sess}");
+
+        let init = capture_logs(|| web_ws_pre_init_parse_failed("bad json"));
+        assert!(init.contains("event=\"web.ws.pre_init\""), "{init}");
+        assert!(init.contains("WARN"), "{init}");
+
+        let resize = capture_logs(|| web_pty_resize_failed("EINVAL"));
+        assert!(resize.contains("event=\"web.pty.resize\""), "{resize}");
+        assert!(resize.contains("WARN"), "{resize}");
+
+        let read = capture_logs(|| web_pty_read_ended("EOF"));
+        assert!(read.contains("event=\"web.pty.read\""), "{read}");
+        assert!(read.contains("DEBUG"), "{read}");
+    }
+
+    // ------ logging redesign PR-7: kitty family ----------------------------
+
+    #[test]
+    fn kitty_family_events_carry_pane_and_geometry() {
+        let entry =
+            capture_logs(|| kitty_paint_local_pane_graphics_entry(true, true, 9, 18, "Some(0)", 3));
+        assert!(entry.contains("event=\"kitty.paint.entry\""), "{entry}");
+        assert!(entry.contains("active=\"Some(0)\""), "{entry}");
+        assert!(entry.contains("cell_width_px=9"), "{entry}");
+        assert!(entry.contains("DEBUG"), "{entry}");
+
+        let clip = capture_logs(|| kitty_clipped_placement_result(7, true, 40, 20, 0, 0, 80, 24));
+        assert!(clip.contains("event=\"kitty.clipped_placement\""), "{clip}");
+        assert!(clip.contains("pane_id=7"), "{clip}");
+        assert!(clip.contains("has_clipped=true"), "{clip}");
+        assert!(clip.contains("DEBUG"), "{clip}");
+
+        let missing = capture_logs(|| kitty_collect_placements_runtime_missing(7));
+        assert!(
+            missing.contains("event=\"kitty.collect_placements\""),
+            "{missing}"
+        );
+        assert!(missing.contains("outcome=\"runtime_missing\""), "{missing}");
+        assert!(missing.contains("pane_id=7"), "{missing}");
+    }
+
+    // ------ logging redesign PR-7: creation family -------------------------
+
+    #[test]
+    fn workspace_and_tab_and_sibling_create_failures_are_error() {
+        let ws = capture_logs(|| workspace_create_failed("no cwd"));
+        assert!(ws.contains("event=\"workspace.create\""), "{ws}");
+        assert!(ws.contains("err=\"no cwd\""), "{ws}");
+        assert!(ws.contains("ERROR"), "{ws}");
+        assert!(
+            !ws.contains("variant="),
+            "plain workspace has no variant field: {ws}"
+        );
+
+        let tab = capture_logs(|| tab_create_failed("no active ws"));
+        assert!(tab.contains("event=\"tab.create\""), "{tab}");
+        assert!(tab.contains("ERROR"), "{tab}");
+
+        let sib = capture_logs(|| sibling_workspace_create_failed("spawn failed"));
+        assert!(sib.contains("event=\"workspace.create\""), "{sib}");
+        assert!(sib.contains("variant=\"sibling\""), "{sib}");
+        assert!(sib.contains("ERROR"), "{sib}");
+    }
+
+    // ------ logging redesign PR-7: misc singletons -------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn server_nofile_raise_failed_is_warn() {
+        let out = capture_logs(|| server_nofile_raise_failed("EPERM"));
+        assert!(out.contains("event=\"platform.nofile.raise\""), "{out}");
+        assert!(out.contains("err=\"EPERM\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn terminal_duplicate_session_ref_evicted_is_info() {
+        let out = capture_logs(|| terminal_duplicate_session_ref_evicted("term-99"));
+        assert!(
+            out.contains("event=\"terminal.session_ref.evict\""),
+            "{out}"
+        );
+        assert!(out.contains("terminal=\"term-99\""), "{out}");
+        assert!(out.contains("INFO"), "{out}");
+    }
+
+    // ------ logging redesign PR-7: update/sound/render_prof ----------------
+
+    #[test]
+    fn update_checksum_and_preview_build_are_info() {
+        let sum = capture_logs(|| update_checksum_verified("deadbeef"));
+        assert!(sum.contains("event=\"update.checksum.verify\""), "{sum}");
+        assert!(sum.contains("sha256=\"deadbeef\""), "{sum}");
+        assert!(sum.contains("INFO"), "{sum}");
+
+        let sel = capture_logs(|| update_preview_build_selected("abc123", "Some(\"20260702\")"));
+        assert!(
+            sel.contains("event=\"update.preview_build.select\""),
+            "{sel}"
+        );
+        assert!(sel.contains("commit=\"abc123\""), "{sel}");
+        assert!(sel.contains("build_id=\"Some(\\\"20260702\\\")\""), "{sel}");
+        assert!(sel.contains("INFO"), "{sel}");
+    }
+
+    #[test]
+    fn sound_playback_failure_variants_are_warn() {
+        let custom = capture_logs(|| {
+            sound_custom_playback_failed(Path::new("/tmp/done.mp3"), "Done", "no player")
+        });
+        assert!(custom.contains("event=\"sound.playback\""), "{custom}");
+        assert!(custom.contains("variant=\"custom\""), "{custom}");
+        assert!(custom.contains("path=/tmp/done.mp3"), "{custom}");
+        assert!(custom.contains("sound=\"Done\""), "{custom}");
+        assert!(custom.contains("WARN"), "{custom}");
+
+        let plain = capture_logs(|| sound_playback_failed("Done", "no player"));
+        assert!(plain.contains("event=\"sound.playback\""), "{plain}");
+        assert!(
+            !plain.contains("variant="),
+            "built-in playback has no variant field: {plain}"
+        );
+        assert!(plain.contains("WARN"), "{plain}");
+    }
+
+    #[test]
+    fn render_prof_window_is_info_with_counters_and_durations() {
+        let out = capture_logs(|| {
+            render_prof_window(
+                1000,
+                "frames=42,ticks=100",
+                "paint=count:42 avg_us:100 max_us:250",
+            )
+        });
+        assert!(out.contains("event=\"render.prof\""), "{out}");
+        assert!(out.contains("window_ms=1000"), "{out}");
+        assert!(out.contains("frames=42,ticks=100"), "{out}");
+        assert!(
+            out.contains("paint=count:42 avg_us:100 max_us:250"),
+            "{out}"
+        );
+        assert!(out.contains("INFO"), "{out}");
     }
 }

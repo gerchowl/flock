@@ -1,4 +1,4 @@
-use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::config::{Keybinds, NewTerminalCwdConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
@@ -665,6 +665,10 @@ pub enum PeerSwitchRequest {
     ConfigPeer { peer_idx: usize, ws_idx: usize },
     /// A carried fleet-snapshot row: index into `fleet_snapshot.peers`.
     SnapshotPeer { entry_idx: usize },
+    /// A relayed-cache row (#101 gossip v3 part 4): keyed by lowercased host
+    /// into `state.relayed_fleet_cache`. Resolves the target and any stamped
+    /// ProxyJump identity from the cached entry.
+    RelayedPeer { host_key: String },
     /// A row from the origin (hub) server's OWN summary (#66): re-attach home
     /// via the reserved target, carrying the selected workspace as the
     /// post-attach focus target so the hub lands on that space.
@@ -686,16 +690,23 @@ pub struct ServerCardArea {
 }
 
 /// Which cache a federated remote row in the spaces list reads from: a
-/// config-owned peer (live-polled `peer_summaries`) or a carried
-/// fleet-snapshot entry (render-only, freshness just decays). Selecting a
-/// row maps back onto the matching [`PeerSwitchRequest`] variant so both
-/// reuse the same switch path as the servers band.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// config-owned peer (live-polled `peer_summaries`), a carried
+/// fleet-snapshot entry (render-only, freshness just decays), a relayed
+/// cache row (#101 gossip v3), or the origin summary. Selecting a row maps
+/// back onto the matching [`PeerSwitchRequest`] variant so both reuse the
+/// same switch path as the servers band.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemotePeerRef {
     /// Index into `state.peer_summaries`.
     Config { peer_idx: usize },
     /// Index into `state.fleet_snapshot.peers`.
     Snapshot { entry_idx: usize },
+    /// Lowercased-host key into `state.relayed_fleet_cache` (#101 gossip v3).
+    /// Constructed by a follow-up that materialises PeerSummaryState from the
+    /// relayed cache so it can render on the local sidebar. Reserved slot in
+    /// the ranked dedup today (`REMOTE_ROW_RANK_RELAYED`).
+    #[allow(dead_code)]
+    Relayed { host_key: String },
     /// The carried origin (hub) server's OWN summary (#66): its workspaces
     /// fold into the spaces list like any peer, but selecting one switches
     /// HOME with that workspace focused, never an ssh dial.
@@ -707,10 +718,18 @@ impl RemotePeerRef {
     /// carry the workspace index for the best-effort remote pre-focus;
     /// snapshot rows reuse the band's plain pass-through switch; origin rows
     /// land home with the workspace as the post-attach focus target.
-    pub(crate) fn switch_request(self, ws_idx: usize) -> PeerSwitchRequest {
+    pub(crate) fn switch_request(&self, ws_idx: usize) -> PeerSwitchRequest {
         match self {
-            Self::Config { peer_idx } => PeerSwitchRequest::ConfigPeer { peer_idx, ws_idx },
-            Self::Snapshot { entry_idx } => PeerSwitchRequest::SnapshotPeer { entry_idx },
+            Self::Config { peer_idx } => PeerSwitchRequest::ConfigPeer {
+                peer_idx: *peer_idx,
+                ws_idx,
+            },
+            Self::Snapshot { entry_idx } => PeerSwitchRequest::SnapshotPeer {
+                entry_idx: *entry_idx,
+            },
+            Self::Relayed { host_key } => PeerSwitchRequest::RelayedPeer {
+                host_key: host_key.clone(),
+            },
             Self::Origin => PeerSwitchRequest::OriginWorkspace { ws_idx },
         }
     }
@@ -825,6 +844,13 @@ pub struct WorktreeRemoveState {
     pub branch: Option<String>,
     /// None while the merge check is still running (kill flow only).
     pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
+    /// The branch resolved to the repo's default branch, so the kill flow
+    /// pinned it checkout-only and kept the branch (#121). Drives the dialog's
+    /// "protected (default)" line.
+    pub branch_protected: bool,
+    /// The merge gate timed out (#119): the checkout-only fallback is shown
+    /// with an "unknown (timed out)" note rather than "no merge evidence".
+    pub gate_timed_out: bool,
 }
 
 /// One worktree's row in the fleet-wide kill sweep (#81).
@@ -1249,9 +1275,9 @@ impl IdleSetting {
 
     pub(crate) fn enabled(self, state: &AppState) -> bool {
         match self {
-            Self::Enable => state.idle.enable,
-            Self::Sheep => state.idle.sheep,
-            Self::Screensaver => state.idle.screensaver,
+            Self::Enable => state.config.ui.idle.enable,
+            Self::Sheep => state.config.ui.idle.sheep,
+            Self::Screensaver => state.config.ui.idle.screensaver,
         }
     }
 }
@@ -1302,8 +1328,8 @@ impl SidebarGapSetting {
 
     pub(crate) fn value(self, state: &AppState) -> u16 {
         match self {
-            Self::RowGap => state.sidebar_row_gap,
-            Self::PaneGap => state.sidebar_pane_gap,
+            Self::RowGap => state.sidebar_row_gap(),
+            Self::PaneGap => state.sidebar_pane_gap(),
         }
     }
 
@@ -1777,6 +1803,14 @@ pub struct AppState {
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
+    /// Gossip v3 relay cache (#101): fleet entries this server received via
+    /// its config peers' `relayed_fleet`. Keyed on lowercased reported host
+    /// (fallback: ssh_target), so a host advertised by two hubs collapses to
+    /// one row with the freshest wins. Never re-relayed — the answering
+    /// server's own `peers.summary` only relays its OWN polled peers,
+    /// bounding hop count to one.
+    pub relayed_fleet_cache:
+        std::collections::HashMap<String, crate::api::schema::RelayedFleetPeer>,
     /// Fleet snapshot carried by the attached client's handshake
     /// (hub-and-spoke down-gossip): origin/home label + render-only peer
     /// rows. None when the client attached locally — no home row then.
@@ -1794,12 +1828,6 @@ pub struct AppState {
     /// Monotonic generation source for [`PeerCheckoutState`] — bumped per
     /// checkout so stale in-flight legs are discarded.
     pub peer_checkout_seq: u64,
-    /// Scope of the `servers` sidebar section: all server rows, or only the
-    /// current machine (plus the home row when attached remotely).
-    pub servers_panel_scope: PanelScope,
-    /// Scope of the `spaces` sidebar section: the full workspace list, or
-    /// only the focused workspace's space group.
-    pub spaces_panel_scope: PanelScope,
     /// Spaces list narrowed to one server (right-click a servers-band
     /// row). Never persisted — cleared via the same context menu or by
     /// toggling the spaces scope.
@@ -1867,10 +1895,6 @@ pub struct AppState {
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
     pub mobile_width_threshold: u16,
-    /// Blank rows between sidebar list entries (workspaces and agents).
-    pub sidebar_row_gap: u16,
-    /// Blank columns on each side of the sidebar/pane divider.
-    pub sidebar_pane_gap: u16,
     /// Max height of the prompt section in the pane header. 0 = context only.
     pub prompt_float_lines: u16,
     /// Auto-collapse every sidebar worktree group except the focused one.
@@ -1897,7 +1921,6 @@ pub struct AppState {
     pub sidebar_collapsed: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
-    pub agent_panel_scope: AgentPanelScope,
     /// Capture mouse input for Flock's own mouse UI. When false, Flock only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
@@ -1906,16 +1929,11 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
-    /// How a file dropped onto an agent pane is handled (#79): `never` or
-    /// `auto` (default). Surfaced as a settings toggle.
-    pub file_drop: crate::config::FileDropMode,
     /// The pending confirm-close is the whole-space affordance (#62): close
     /// every member, not just the selected workspace. Set when opening the
     /// confirm for "Close group"; cleared on accept/cancel.
     pub confirm_close_whole_space: bool,
     pub prompt_new_tab_name: bool,
-    pub show_agent_labels_on_pane_borders: bool,
-    pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1925,11 +1943,6 @@ pub struct AppState {
     pub cjk_ime_agents: Vec<crate::detect::Agent>,
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
-    /// While prefix mode is active, switch the macOS host input source to an
-    /// ASCII-capable layout so prefix commands register as ASCII even when a
-    /// CJK IME is active. macOS only; a no-op elsewhere. See
-    /// `[experimental] switch_ascii_input_source_in_prefix`.
-    pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
@@ -1937,9 +1950,7 @@ pub struct AppState {
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
-    pub sound: SoundConfig,
     pub local_sound_playback: bool,
-    pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
     /// Frame counter for spinner animations (wraps around).
     pub spinner_tick: u32,
@@ -1957,9 +1968,6 @@ pub struct AppState {
     pub sheep_wipe_until: Option<std::time::Instant>,
     /// Persistent state for the stage-2 sidebar screensaver simulation.
     pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
-    /// Idle-animation config (#16): opt-out toggles + thresholds for the sheep
-    /// and screensaver. Re-applied on config reload so it takes effect live.
-    pub idle: crate::config::IdleConfig,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1979,6 +1987,10 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// The live, validated `Config` — cold-start and live-reload write here so
+    /// the settings pane can render from the single source of truth instead of
+    /// hand-copied mirror fields (ADR-0002 phase (f)).
+    pub config: crate::config::Config,
 }
 
 impl AppState {
@@ -1992,10 +2004,10 @@ impl AppState {
     pub(crate) fn note_interaction(&mut self) {
         let now = std::time::Instant::now();
         let idle = now.duration_since(self.last_interaction);
-        if idle >= self.idle.idle_after() {
+        if idle >= self.config.ui.idle.idle_after() {
             self.sheep_flee_until = Some(now + crate::ui::sheep::FLEE_DURATION);
         }
-        if idle >= self.idle.screensaver_after() {
+        if idle >= self.config.ui.idle.screensaver_after() {
             self.sheep_wipe_until = Some(now + crate::ui::screensaver::WIPE_DURATION);
         }
         self.last_interaction = now;
@@ -2004,14 +2016,14 @@ impl AppState {
     /// The current idle-flock phase (None when the user is active, or when the
     /// sheep are disabled via `[ui.idle]`, #16).
     pub(crate) fn flock_phase(&self) -> Option<crate::ui::sheep::FlockPhase> {
-        if !self.idle.sheep_enabled() {
+        if !self.config.ui.idle.sheep_enabled() {
             return None;
         }
         crate::ui::sheep::flock_phase(
             self.last_interaction,
             self.sheep_flee_until,
             std::time::Instant::now(),
-            self.idle.idle_after(),
+            self.config.ui.idle.idle_after(),
         )
     }
 
@@ -2019,14 +2031,14 @@ impl AppState {
     /// idle threshold, once the wipe completes, or when disabled via
     /// `[ui.idle]`, #16).
     pub(crate) fn screensaver_phase(&self) -> Option<crate::ui::screensaver::ScreensaverPhase> {
-        if !self.idle.screensaver_enabled() {
+        if !self.config.ui.idle.screensaver_enabled() {
             return None;
         }
         crate::ui::screensaver::phase(
             self.last_interaction,
             self.sheep_wipe_until,
             std::time::Instant::now(),
-            self.idle.screensaver_after(),
+            self.config.ui.idle.screensaver_after(),
         )
     }
 
@@ -2086,61 +2098,165 @@ impl AppState {
     /// state, never persisted.
     pub(crate) fn panel_scopes(&self) -> PanelScopes {
         PanelScopes {
-            agent: self.agent_panel_scope,
-            servers: self.servers_panel_scope,
-            spaces: self.spaces_panel_scope,
+            agent: self.agent_panel_scope(),
+            servers: self.servers_panel_scope(),
+            spaces: self.spaces_panel_scope(),
         }
     }
 
-    /// Federated peers feeding the spaces list's remote rows: every config
-    /// peer (live-polled), then carried fleet-snapshot entries not shadowed
-    /// by a config peer — dedup by ssh target, the polled entry wins. A
-    /// spoke has no config peers, so its whole carried fleet folds in;
-    /// render-only either way, snapshot freshness just decays (#46).
+    // ---- Consolidated remote-row dedup (#101 gossip v3 part 4) ----
+
+    // Rank tiers for `remote_row_candidates` — LOWER wins. Kept as
+    // module-private constants so the reader sees the ordering in one place.
+
+    /// Federated peers feeding BOTH the servers band and the spaces list's
+    /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
+    /// lowercased reported host (fallback: ssh_target). Tie-break tier:
+    /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
+    /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
+    /// same-source ties the entry with the smaller `origin_last_ok_secs`
+    /// wins (fresher). Rendering surfaces read from the same source of
+    /// truth, so a two-hub fleet cannot produce duplicate rows or divergent
+    /// state across surfaces.
     pub(crate) fn remote_peers(&self) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
-        let mut peers: Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> = self
-            .peer_summaries
-            .iter()
-            .enumerate()
-            .map(|(peer_idx, peer)| (RemotePeerRef::Config { peer_idx }, peer))
-            .collect();
-        if let Some(snapshot) = self.fleet_snapshot.as_ref() {
-            // The hub's OWN workspaces (#66) fold first, ahead of carried
-            // peers — the home spaces are the most relevant on a spoke.
-            if let Some(origin) = snapshot.origin_summary.as_ref() {
-                peers.push((RemotePeerRef::Origin, origin));
+        // Single pass, insertion-order preserved: for each candidate in the
+        // enumeration order, record either the first sighting of its host
+        // key or REPLACE the previous winner in place when the new one has a
+        // strictly higher tier / freshness. This keeps the layout stable
+        // across renders — no hashmap-hop or `.sort()` shuffle.
+        let mut ordered: Vec<(
+            RemotePeerRef,
+            &crate::peers::PeerSummaryState,
+            u8,
+            Option<u64>,
+        )> = Vec::new();
+        let mut host_to_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for (rank, entry_ref, peer) in self.remote_row_candidates() {
+            let host_key = row_host_key(peer);
+            let freshness = row_freshness(peer);
+            if let Some(&idx) = host_to_idx.get(&host_key) {
+                let (_, _, cur_rank, cur_fresh) = ordered[idx];
+                // Lower rank number = higher tier (0 = ConfigPeer wins).
+                let replace = if rank != cur_rank {
+                    rank < cur_rank
+                } else {
+                    // Same source tier: freshest (smaller frozen origin
+                    // seconds) wins; a Some value beats None.
+                    match (cur_fresh, freshness) {
+                        (Some(cur), Some(new)) => new < cur,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    }
+                };
+                if replace {
+                    ordered[idx] = (entry_ref, peer, rank, freshness);
+                }
+            } else {
+                host_to_idx.insert(host_key, ordered.len());
+                ordered.push((entry_ref, peer, rank, freshness));
             }
-            peers.extend(
-                snapshot
-                    .peers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| {
-                        !self
-                            .peer_summaries
-                            .iter()
-                            .any(|config| config.ssh_target == entry.ssh_target)
-                    })
-                    .map(|(entry_idx, entry)| (RemotePeerRef::Snapshot { entry_idx }, entry)),
-            );
         }
-        peers
+
+        ordered
+            .into_iter()
+            .map(|(entry_ref, peer, _, _)| (entry_ref, peer))
+            .collect()
+    }
+
+    /// All candidate remote-row sources with their dedup rank (lower =
+    /// higher priority). Consumed by [`remote_peers`](Self::remote_peers)
+    /// and any other surface that must render the same deduped set.
+    fn remote_row_candidates(&self) -> Vec<(u8, RemotePeerRef, &crate::peers::PeerSummaryState)> {
+        let mut candidates: Vec<(u8, RemotePeerRef, &crate::peers::PeerSummaryState)> = Vec::new();
+        // Rank 0: locally polled — freshest live data, always wins ties.
+        candidates.extend(
+            self.peer_summaries
+                .iter()
+                .enumerate()
+                .map(|(peer_idx, peer)| {
+                    (
+                        REMOTE_ROW_RANK_CONFIG,
+                        RemotePeerRef::Config { peer_idx },
+                        peer,
+                    )
+                }),
+        );
+        // Rank 1 (relayed cache) is reserved for a follow-up: rendering
+        // requires a materialised `PeerSummaryState`, so relayed entries
+        // ride the outgoing snapshot path today but do not render on the
+        // LOCAL sidebar. The `RelayedPeer` switch variant and this rank slot
+        // exist so that future rendering is a pure additive change.
+        if let Some(snapshot) = self.fleet_snapshot.as_ref() {
+            // Rank 2: carried snapshot peers.
+            candidates.extend(snapshot.peers.iter().enumerate().map(|(entry_idx, entry)| {
+                (
+                    REMOTE_ROW_RANK_SNAPSHOT,
+                    RemotePeerRef::Snapshot { entry_idx },
+                    entry,
+                )
+            }));
+            // Rank 3: origin summary. The hub's own workspaces fold in
+            // ahead of carried peers (#66); loses to a same-host config
+            // peer or a snapshot row about the same host.
+            if let Some(origin) = snapshot.origin_summary.as_ref() {
+                candidates.push((REMOTE_ROW_RANK_ORIGIN, RemotePeerRef::Origin, origin));
+            }
+        }
+        candidates
     }
 
     /// Resolve a remote-row peer reference back to its cached summary.
     pub(crate) fn remote_peer(
         &self,
-        peer: RemotePeerRef,
+        peer: &RemotePeerRef,
     ) -> Option<&crate::peers::PeerSummaryState> {
         match peer {
-            RemotePeerRef::Config { peer_idx } => self.peer_summaries.get(peer_idx),
+            RemotePeerRef::Config { peer_idx } => self.peer_summaries.get(*peer_idx),
             RemotePeerRef::Snapshot { entry_idx } => {
-                self.fleet_snapshot.as_ref()?.peers.get(entry_idx)
+                self.fleet_snapshot.as_ref()?.peers.get(*entry_idx)
             }
+            RemotePeerRef::Relayed { .. } => None,
             RemotePeerRef::Origin => self.fleet_snapshot.as_ref()?.origin_summary.as_ref(),
         }
     }
+}
 
+/// Consolidated dedup ranks for remote rows (#101 gossip v3 part 4).
+/// LOWER wins — a locally-polled config peer beats a carried snapshot row.
+const REMOTE_ROW_RANK_CONFIG: u8 = 0;
+#[allow(dead_code)]
+const REMOTE_ROW_RANK_RELAYED: u8 = 1;
+const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
+const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
+
+/// Machine-independent host key: the peer's reported host (fallback: config
+/// name or ssh_target), lowercased. Used across surfaces so a host cannot
+/// dedupe under different keys on the band vs. the spaces list.
+fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
+    let fallback = if peer.peer.is_empty() {
+        peer.ssh_target.as_str()
+    } else {
+        peer.peer.as_str()
+    };
+    let raw = peer
+        .host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(fallback);
+    raw.to_ascii_lowercase()
+}
+
+/// Frozen origin freshness (#101 part 2): the origin's report age at capture
+/// in seconds. Smaller = fresher. `None` when this row has never been polled
+/// or was ingested without an origin assertion (v(N-1) wire).
+fn row_freshness(peer: &crate::peers::PeerSummaryState) -> Option<u64> {
+    peer.origin_last_ok_secs
+        .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs()))
+}
+
+impl AppState {
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
         // Lazy GC: drop aliases whose target pane no longer exists. Runs on
@@ -2158,7 +2274,25 @@ impl AppState {
     }
 
     pub fn sound_enabled(&self) -> bool {
-        self.sound.enabled
+        self.config.ui.sound.enabled
+    }
+
+    /// Blank rows between sidebar list entries, clamped to the supported
+    /// range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_row_gap(&self) -> u16 {
+        crate::config::validated_sidebar_row_gap(self.config.ui.sidebar_row_gap)
+    }
+
+    /// Blank columns on each side of the sidebar/pane divider, clamped to
+    /// the supported range. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sidebar_pane_gap(&self) -> u16 {
+        crate::config::validated_sidebar_pane_gap(self.config.ui.sidebar_pane_gap)
+    }
+
+    /// The live `SoundConfig` used by the notification playback path.
+    /// Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn sound_config(&self) -> &crate::config::SoundConfig {
+        &self.config.ui.sound
     }
 
     /// Sidebar display alias for an agent label: config override first,
@@ -2171,25 +2305,83 @@ impl AppState {
     }
 
     pub fn toast_delivery(&self) -> ToastDelivery {
-        self.toast_config.delivery
+        self.config.ui.toast.delivery
+    }
+
+    /// The live `ToastConfig` — used by notification code that needs
+    /// clipboard/position details. Reads from `state.config` (ADR-0002 phase (f)).
+    pub fn toast_config(&self) -> &ToastConfig {
+        &self.config.ui.toast
     }
 
     pub fn agent_border_labels_enabled(&self) -> bool {
-        self.show_agent_labels_on_pane_borders
+        self.config.ui.show_agent_labels_on_pane_borders
     }
 
     /// Whether dropped files are ferried to the agent (#79) — `auto`. The
-    /// settings toggle reads/writes this; `never` is "off".
+    /// settings toggle reads/writes this; `never` is "off". Reads from the
+    /// live `Config` (ADR-0002 phase (f)).
     pub fn file_drop_enabled(&self) -> bool {
-        self.file_drop == crate::config::FileDropMode::Auto
+        self.config.ui.file_drop == crate::config::FileDropMode::Auto
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
-        self.pane_history_persistence
+        self.config.experimental.pane_history
+    }
+
+    /// Agent-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn agent_panel_scope(&self) -> AgentPanelScope {
+        match self.config.ui.agent_panel_scope {
+            crate::config::PanelScopeConfig::Current => AgentPanelScope::CurrentWorkspace,
+            crate::config::PanelScopeConfig::All => AgentPanelScope::AllWorkspaces,
+        }
+    }
+
+    /// Servers-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn servers_panel_scope(&self) -> PanelScope {
+        match self.config.ui.servers_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Spaces-panel sidebar scope, converted from state.config.ui
+    /// (ADR-0002 phase (f)).
+    pub fn spaces_panel_scope(&self) -> PanelScope {
+        match self.config.ui.spaces_panel_scope {
+            crate::config::PanelScopeConfig::Current => PanelScope::Current,
+            crate::config::PanelScopeConfig::All => PanelScope::All,
+        }
+    }
+
+    /// Update the agent-panel scope in state.config so the accessor reflects
+    /// the new value immediately. The persisting save_* call still writes to
+    /// disk separately (ADR-0002 phase (f)).
+    pub fn set_agent_panel_scope(&mut self, scope: AgentPanelScope) {
+        self.config.ui.agent_panel_scope = match scope {
+            AgentPanelScope::CurrentWorkspace => crate::config::PanelScopeConfig::Current,
+            AgentPanelScope::AllWorkspaces => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_servers_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.servers_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
+    }
+
+    pub fn set_spaces_panel_scope(&mut self, scope: PanelScope) {
+        self.config.ui.spaces_panel_scope = match scope {
+            PanelScope::Current => crate::config::PanelScopeConfig::Current,
+            PanelScope::All => crate::config::PanelScopeConfig::All,
+        };
     }
 
     pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
-        self.switch_ascii_input_source_in_prefix
+        self.config.experimental.switch_ascii_input_source_in_prefix
     }
 
     pub(crate) fn integration_updates_available(&self) -> bool {
@@ -2378,13 +2570,12 @@ impl AppState {
             branch_pivot_message: String::new(),
             peers: Vec::new(),
             peer_summaries: Vec::new(),
+            relayed_fleet_cache: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,
             peer_checkout: None,
             peer_checkout_seq: 0,
-            servers_panel_scope: PanelScope::All,
-            spaces_panel_scope: PanelScope::All,
             server_filter: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
@@ -2445,7 +2636,7 @@ impl AppState {
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,
-            update_install_command: "flock update".into(),
+            update_install_command: "flk update".into(),
             latest_release_notes_available: false,
             update_dismissed: false,
             config_diagnostic: None,
@@ -2459,8 +2650,6 @@ impl AppState {
             sidebar_min_width: 18,
             sidebar_max_width: 36,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
-            sidebar_row_gap: crate::config::DEFAULT_SIDEBAR_ROW_GAP,
-            sidebar_pane_gap: crate::config::DEFAULT_SIDEBAR_PANE_GAP,
             prompt_float_lines: crate::config::DEFAULT_PROMPT_FLOAT_LINES,
             auto_collapse_groups: false,
             tab_mode: crate::config::TabModeConfig::Tabs,
@@ -2474,35 +2663,25 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split: 0.5,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,
             right_click_passthrough_modifiers: None,
             right_click_passthrough: None,
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
-            file_drop: crate::config::FileDropMode::default(),
             confirm_close_whole_space: false,
             prompt_new_tab_name: true,
-            show_agent_labels_on_pane_borders: false,
-            pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
-            switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
-            sound: SoundConfig {
-                enabled: false,
-                ..SoundConfig::default()
-            },
             local_sound_playback: false,
-            toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -2512,7 +2691,6 @@ impl AppState {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
-            idle: crate::config::IdleConfig::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
@@ -2527,6 +2705,7 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: crate::config::Config::default(),
         }
     }
 
@@ -2570,6 +2749,132 @@ mod tests {
     use crossterm::event::KeyEvent;
 
     #[test]
+    fn panel_scopes_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the sidebar's Agent/Servers/Spaces panel scope
+        // toggles read state.config.ui.<scope>_panel_scope.
+        let mut state = AppState::test_new();
+        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.servers_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.spaces_panel_scope = crate::config::PanelScopeConfig::Current;
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::CurrentWorkspace);
+        assert_eq!(state.servers_panel_scope(), PanelScope::Current);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::Current);
+
+        state.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        state.set_servers_panel_scope(PanelScope::All);
+        state.set_spaces_panel_scope(PanelScope::All);
+        assert_eq!(
+            state.config.ui.agent_panel_scope,
+            crate::config::PanelScopeConfig::All
+        );
+        assert_eq!(state.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
+        assert_eq!(state.servers_panel_scope(), PanelScope::All);
+        assert_eq!(state.spaces_panel_scope(), PanelScope::All);
+    }
+
+    #[test]
+    fn experiments_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): Experiments section reads state.config.experimental.
+        let mut state = AppState::test_new();
+        state.config.experimental.pane_history = true;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
+        assert!(ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+
+        state.config.experimental.pane_history = false;
+        state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
+        assert!(!ExperimentSetting::PaneHistory.enabled(&state));
+        assert!(!ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(&state));
+    }
+
+    #[test]
+    fn idle_settings_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Idle section reads state.config.ui.idle.
+        let mut state = AppState::test_new();
+        state.config.ui.idle.enable = false;
+        state.config.ui.idle.sheep = false;
+        assert!(!IdleSetting::Enable.enabled(&state));
+        assert!(!IdleSetting::Sheep.enabled(&state));
+        state.config.ui.idle.enable = true;
+        state.config.ui.idle.sheep = true;
+        assert!(IdleSetting::Enable.enabled(&state));
+        assert!(IdleSetting::Sheep.enabled(&state));
+    }
+
+    #[test]
+    fn agent_border_labels_read_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): PaneLabels section reads state.config.ui.
+        let mut state = AppState::test_new();
+        state.config.ui.show_agent_labels_on_pane_borders = true;
+        assert!(state.agent_border_labels_enabled());
+
+        state.config.ui.show_agent_labels_on_pane_borders = false;
+        assert!(!state.agent_border_labels_enabled());
+    }
+
+    #[test]
+    fn toast_delivery_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): Toast section reads state.config.ui.toast.
+        let mut state = AppState::test_new();
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::System;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::System);
+
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
+        assert_eq!(state.toast_delivery(), crate::config::ToastDelivery::Off);
+    }
+
+    #[test]
+    fn sidebar_gaps_read_from_state_config_not_mirror_fields() {
+        // ADR-0002 phase (f): the Sidebar section renders steppers off
+        // `state.config.ui.sidebar_row_gap` / `.sidebar_pane_gap` (validated).
+        let mut state = AppState::test_new();
+        state.config.ui.sidebar_row_gap = 2;
+        state.config.ui.sidebar_pane_gap = 3;
+        assert_eq!(state.sidebar_row_gap(), 2);
+        assert_eq!(state.sidebar_pane_gap(), 3);
+
+        // Out-of-range values clamp via the config validator.
+        state.config.ui.sidebar_row_gap = 99;
+        state.config.ui.sidebar_pane_gap = 99;
+        assert_eq!(state.sidebar_row_gap(), crate::config::MAX_SIDEBAR_ROW_GAP);
+        assert_eq!(
+            state.sidebar_pane_gap(),
+            crate::config::MAX_SIDEBAR_PANE_GAP
+        );
+    }
+
+    #[test]
+    fn sound_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's Sound section is a shim
+        // over `state.config.ui.sound`, not the copied mirror.
+        let mut state = AppState::test_new();
+        state.config.ui.sound.enabled = true;
+        assert!(state.sound_enabled());
+
+        state.config.ui.sound.enabled = false;
+        assert!(!state.sound_enabled());
+    }
+
+    #[test]
+    fn file_drop_enabled_reads_from_state_config_not_mirror_field() {
+        // ADR-0002 phase (f): the settings pane's read path is a shim over
+        // `state.config`, not a hand-copied mirror. Set the config to `Never`
+        // WITHOUT touching any mirror; the accessor must reflect it.
+        let mut state = AppState::test_new();
+        state.config.ui.file_drop = crate::config::FileDropMode::Never;
+        assert!(!state.file_drop_enabled());
+
+        state.config.ui.file_drop = crate::config::FileDropMode::Auto;
+        assert!(state.file_drop_enabled());
+    }
+
+    #[test]
     fn idle_toggles_gate_flock_and_screensaver_phases() {
         let mut state = AppState::test_new();
         // Idle long enough to be well past both thresholds.
@@ -2581,13 +2886,13 @@ mod tests {
         assert!(state.screensaver_phase().is_some());
 
         // Sheep off, screensaver on.
-        state.idle.sheep = false;
+        state.config.ui.idle.sheep = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_some());
 
         // Master off → neither, regardless of sub-toggles.
-        state.idle.sheep = true;
-        state.idle.enable = false;
+        state.config.ui.idle.sheep = true;
+        state.config.ui.idle.enable = false;
         assert!(state.flock_phase().is_none());
         assert!(state.screensaver_phase().is_none());
     }

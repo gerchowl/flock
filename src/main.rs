@@ -72,303 +72,21 @@ fn init_logging() {
     crate::logging::init_file_logging("flock.log");
 }
 
-const DEFAULT_CONFIG: &str = r##"# flock configuration
-# Place this file at ~/.config/flock/config.toml
-
-# Friendly display name for this node, shown on the status line / self row and
-# reported to peers. Overrides the OS hostname — handy on centrally-managed
-# boxes whose hostname is an opaque asset tag. Unset falls back to gethostname().
-# (Peers honor their own [[peers]].name; this sets a node's view of itself.)
-# name = "mba22"
-
-# Show first-run notification setup on startup.
-# Missing also shows onboarding; set false after you've chosen.
-# onboarding = true
-
-[theme]
-# Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
-#                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
-#                  vesper
-# name = "catppuccin"
-
-# Override individual color tokens on top of the base theme.
-# Accepts: hex (#rrggbb), named colors, rgb(r,g,b), or panel_bg = "reset"
-# [theme.custom]
-# panel_bg = "reset"
-# accent = "#f5c2e7"
-# red = "#ff6188"
-# green = "#a6e3a1"
-
-[terminal]
-# Executable used for new interactive panes.
-# Empty means $SHELL, then /bin/sh.
-# default_shell = ""
-
-# Startup mode for new interactive pane shells: "auto", "login", or "non_login".
-# "auto" uses login shells on macOS and keeps the current behavior elsewhere.
-# shell_mode = "auto"
-
-# CWD policy for new panes, tabs, and workspaces when no explicit --cwd is provided.
-# Use "follow" to inherit the source pane/workspace, "home" for $HOME,
-# "current" for Flock's process directory, or a fixed path such as "~/Projects".
-# new_cwd = "follow"
-
-[update]
-# Update channel used by background checks and `flock update`.
-# Use "stable" for normal releases or "preview" for opt-in preview builds.
-# channel = "stable"
-
-[keys]
-# Prefix key to enter prefix mode (default: "ctrl+b")
-# Examples: "ctrl+b", "f12", "esc", "-"
-# Action bindings use explicit syntax: "prefix+n" requires the prefix;
-# "ctrl+alt+n" is a direct terminal-mode shortcut.
-# Accepted key syntax: plain keys, ctrl/shift/alt/cmd/super modifiers, and special keys like enter/tab/esc/left/right/up/down.
-# Named punctuation such as minus, comma, ampersand, plus, and backtick is also accepted.
-# Most reliable direct bindings are ctrl+letter, function keys, and explicit modified chords.
-# alt+..., cmd/super, and punctuation-with-modifiers may depend on your terminal/tmux setup.
-# prefix = "ctrl+b"
-
-# Prefix-mode actions
-# help = "prefix+?"
-# settings = "prefix+s"
-# detach = "prefix+q"
-# switch_home = ""  # optional, unset by default; leap back to the launching host
-# reload_config = "prefix+shift+r"
-# open_notification_target = "prefix+o"
-# workspace_picker = "prefix+w"
-# goto = "prefix+g"
-# new_workspace = "prefix+shift+n"
-# new_worktree = "prefix+shift+g"
-# open_worktree = ""    # optional, unset by default
-# remove_worktree = ""  # optional, unset by default; opens confirmation
-# rename_workspace = "prefix+shift+w"
-# close_workspace = "prefix+shift+d"
-# previous_workspace = "" # optional, unset by default
-# next_workspace = ""     # optional, unset by default
-# previous_agent = ""     # optional, unset by default
-# next_agent = ""         # optional, unset by default
-# focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"
-# new_tab = "prefix+c"
-# rename_tab = "prefix+shift+t"
-# previous_tab = "prefix+p"
-# next_tab = "prefix+n"
-# switch_tab = "prefix+1..9"
-# switch_workspace = ""   # optional indexed binding, e.g. "prefix+shift+1..9"
-# switch_space = ""        # optional: jump to the Nth project section, e.g. "ctrl+1..9"
-# close_tab = "prefix+shift+x"
-# rename_pane = "prefix+shift+p"
-# edit_scrollback = "prefix+e"
-# edit_config = ""        # optional, unset by default; opens this file in $EDITOR
-# focus_pane_left = "prefix+h"
-# focus_pane_down = "prefix+j"
-# focus_pane_up = "prefix+k"
-# focus_pane_right = "prefix+l"
-# cycle_pane_next = "prefix+tab"
-# cycle_pane_previous = "prefix+shift+tab"
-# last_pane = ""          # optional, unset by default; bind e.g. "prefix+tab" for global back-and-forth
-# split_vertical = "prefix+v"
-# split_horizontal = "prefix+minus"
-# close_pane = "prefix+x"
-# zoom = "prefix+z"       # legacy alias: fullscreen
-# resize_mode = "prefix+r"
-# toggle_sidebar = "prefix+b"
-
-# Navigate-mode movement. These local shortcuts win while navigate mode is open.
-# They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
-# navigate_workspace_up = "up"
-# navigate_workspace_down = "down"
-# navigate_pane_left = "h"      # left arrow always focuses the pane to the left
-# navigate_pane_down = "j"
-# navigate_pane_up = "k"
-# navigate_pane_right = "l"     # right arrow always focuses the pane to the right
-
-# Custom commands use the same binding syntax.
-# type = "shell" runs detached in the background.
-# type = "pane" opens a temporary pane and closes it when the command exits.
-# [[keys.command]]
-# key = "prefix+alt+g"
-# type = "pane"
-# command = "lazygit"
-
-# Legacy indexed shortcut config is still parsed for compatibility.
-# Prefer switch_tab, switch_workspace, and focus_agent for new configs.
-# [keys.indexed]
-# tabs = ""       # e.g. "ctrl" makes ctrl+1..9 switch tabs directly
-# workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces directly
-# agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows directly
-
-# [worktrees]
-# directory = "~/.flock/worktrees"
-
-[ui]
-# Sidebar width (auto-scaled based on workspace names, this sets the default)
-# sidebar_width = 26
-
-# Minimum sidebar width when expanded (columns)
-# sidebar_min_width = 18
-
-# Maximum sidebar width when expanded (columns)
-# sidebar_max_width = 36
-
-# Terminal width at or below which Flock uses the mobile single-column layout.
-# Increase this for foldables, tablets, or wide phone terminals.
-# mobile_width_threshold = 64
-
-# Capture mouse input for Flock's mouse UI.
-# Set false to let the terminal handle normal clicks, such as Cmd-clicking URLs.
-# Pane apps like lazygit and btop can still receive mouse when they request it.
-# mouse_capture = true
-
-# Optional modifier that forwards right-click hold/drag gestures to pane apps instead of opening Flock's pane menu.
-# Empty/off disables this. Shift is intentionally unsupported because terminals commonly reserve Shift+mouse.
-# right_click_passthrough_modifier = ""
-
-# Force a full redraw when the outer terminal regains focus.
-# Set false to reduce visible flashing when switching back to Flock.
-# Trade-off: rare host terminal surface corruption may persist until the next full redraw.
-# redraw_on_focus_gained = true
-
-# Pane scrollback lines to scroll per mouse wheel notch.
-# mouse_scroll_lines = 3
-
-# Ask for confirmation before closing a workspace
-# confirm_close = true
-
-# How a file dropped onto an agent pane is handled (#79). A drag-drop ferries
-# the file's bytes to the (possibly remote) server so the agent gets a path it
-# can read. "auto" (default) does this; "never" disables it (the local path
-# passes through as text).
-# file_drop = "auto"
-
-# Ask for a tab name before creating a new tab.
-# Set false to create tabs immediately with generated names.
-# prompt_new_tab_name = true
-
-# Show detected/reported agent labels in split pane borders when no manual pane name is set.
-# show_agent_labels_on_pane_borders = false
-
-# Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
-# agent_panel_scope = "all"
-
-# Servers section scope: "all" shows every server row, "current" only this
-# machine (plus the home row when attached remotely). Toggling it in the
-# sidebar saves this setting.
-# servers_panel_scope = "all"
-
-# Spaces section scope: "all" shows the full workspace list, "current" only
-# the focused workspace's space group. Toggling it in the sidebar saves this
-# setting.
-# spaces_panel_scope = "all"
-
-# Accent color for highlights, borders, and navigation UI.
-# Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
-# accent = "cyan"
-
-# Background notification popup delivery
-[ui.toast]
-# off = disable pop-up notifications
-# flock = show in-app toasts
-# terminal = ask the outer terminal to show a desktop notification
-# system = ask the OS notification service directly
-# delivery = "off"
-# delay_seconds = 1
-
-[ui.toast.flock]
-# position = "bottom-right"
-
-[ui.toast.clipboard]
-# enabled = true
-# position = "bottom-center"
-
-# Play sounds when agents change state in background workspaces
-[ui.sound]
-# enabled = true
-# Optional custom mp3 sound files. Relative paths are resolved from this config file's directory.
-# path = "sounds/notification.mp3"   # one mp3 file for all sound notifications
-# done_path = "sounds/done.mp3"      # overrides only finished notifications
-# request_path = "sounds/request.mp3" # overrides only needs-attention notifications
-
-# Per-agent overrides: default | on | off
-# By default, droid is muted.
-# [ui.sound.agents]
-# droid = "off"
-
-# Idle sidebar animations: stage-1 grazing sheep on the separator bars, then a
-# stage-2 full screensaver after a long idle. All on by default; each is
-# opt-out-able and the thresholds are tunable.
-[ui.idle]
-# Master switch for all idle animations.
-# enable = true
-# Stage-1 grazing sheep.
-# sheep = true
-# Stage-2 full-sidebar screensaver.
-# screensaver = true
-# Seconds idle before the sheep wander in.
-# idle_after_secs = 20
-# Seconds idle before the screensaver (must be >= idle_after_secs).
-# screensaver_after_secs = 1200
-
-[session]
-# Resume supported AI-agent panes into their native conversation sessions after
-# a Flock server restart. Requires official integrations that report session refs.
-# resume_agents_on_restore = true
-
-[remote]
-# Whether flock manages the ssh config used for the `flock --remote` bridge.
-# When true (default), flock runs the bridge ssh through a generated config that
-# includes your ~/.ssh/config first and adds ServerAliveInterval/
-# ServerAliveCountMax as a fallback (so any keepalive you set yourself still
-# wins) to survive idle network/NAT timeouts. Set false to run plain ssh against
-# your ssh config unchanged — this does not force keepalive off, it only stops
-# flock from adding its own.
-# manage_ssh_config = true
-
-[slots]
-# Connection slots (#65): a multi-connection client that holds one framed
-# connection per fleet server and FLIPS between them in process on a switch —
-# the terminal is never released, so warm switches are instant with no blip and
-# no relaunch. At start the client background-dials every configured peer (plus
-# the carried fleet snapshot on a spoke); home is always warm. Down servers
-# ghost as today and are gently re-dialed. When disabled (default), the client
-# keeps the exit-and-relaunch leg model.
-# enabled = false
-# Generous sanity cap on concurrently warmed slots (incl. home + active).
-# max = 8
-
-[experimental]
-# Allow launching flock from inside a flock-managed pane.
-# allow_nested = false
-# Experimental local Kitty graphics rendering for attached clients.
-# Requires a Kitty graphics-compatible outer terminal.
-# kitty_graphics = false
-# Save recent pane screen history across full server restarts.
-pane_history = false
-# While prefix mode is active, temporarily switch the macOS host input
-# source to an ASCII-capable keyboard layout so prefix commands register
-# even when a CJK IME is active, then restore the previous input source
-# when prefix mode exits. macOS only; best-effort. Default: false.
-# switch_ascii_input_source_in_prefix = false
-# Expose the focused pane's cursor to the outer terminal so macOS input
-# methods keep tracking the candidate window when TUIs paint their own
-# cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
-# apps that hide it without painting a replacement (vim normal mode, etc.).
-# reveal_hidden_cursor_for_cjk_ime = false
-# Optional allow-list: only reveal for focused panes whose detected agent
-# matches one of these names. Empty means apply to any focused pane.
-# If the list contains no valid names, the reveal does not apply.
-# Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
-# kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder.
-# cjk_ime_agents = []
-# Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
-# Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
-# cjk_ime_cursor_shape = "steady_block"
-
-[advanced]
-# Maximum scrollback buffer size in bytes retained per pane terminal.
-# Matches Ghostty's default scrollback-limit behavior.
-# scrollback_limit_bytes = 10000000
-"##;
+/// `flk --default-config` output: the machine-true serde defaults, derived —
+/// never hand-maintained (it drifted whenever a field landed in `Config`
+/// without an edit here; round-trip-tested in `default_config_output_parses_
+/// back_to_default_config`). The annotated prose lives in
+/// docs/config-reference.md.
+fn default_config_toml() -> String {
+    let body =
+        toml::to_string_pretty(&config::Config::default()).expect("Config::default serializes");
+    format!(
+        "# flock configuration — annotated reference: docs/config-reference.md\n\
+         # File: ~/.config/flock/config.toml (or $FLOCK_CONFIG_PATH). Read-only\n\
+         # bases (nix/HM symlinks) take edits in config.local.toml (deep-merged,\n\
+         # overlay wins). Values below are the built-in defaults.\n\n{body}"
+    )
+}
 
 fn should_block_nested(config: &config::Config) -> bool {
     should_block_nested_for_env(config, std::env::var(FLOCK_ENV_VAR).ok().as_deref())
@@ -412,7 +130,7 @@ enum AttachLeg {
 /// destination, from a sidebar remote row) in the switch file; each recorded
 /// target chains into a fresh `--remote` leg.
 ///
-/// Every leg — local in-process and remote via the spawned `flock client`
+/// Every leg — local in-process and remote via the spawned `flk client`
 /// subprocess — funnels into `client::run_client_with_mode`, which retries
 /// attaches refused with the live-handoff notice (#38) and re-captures the
 /// host terminal theme per leg for the attach handshake (#47). A SwitchServer
@@ -551,6 +269,10 @@ fn decide_next_leg(
                 // the user lands back at the previous leg with a top-right
                 // failure notice (#67).
                 context: remote::LaunchContext::FederationSwitch,
+                // Gossip v3 (#101 part 3): a snapshot-derived switch target
+                // rides its stamped ProxyJump; a config peer / home target
+                // carries None here and dials directly.
+                proxy_jump: switch.proxy_jump,
             });
             LegStep::Switch {
                 previous: (current.clone(), switch_failure_label(&next)),
@@ -638,7 +360,7 @@ fn main() -> io::Result<()> {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(2);
         }
     };
@@ -646,7 +368,7 @@ fn main() -> io::Result<()> {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(2);
         }
     };
@@ -661,7 +383,7 @@ fn main() -> io::Result<()> {
         })
     {
         eprintln!("error: --remote can only be used with the default launch command");
-        eprintln!("run 'flock --help' for usage");
+        eprintln!("run 'flk --help' for usage");
         std::process::exit(2);
     }
 
@@ -694,7 +416,7 @@ fn main() -> io::Result<()> {
             }
             Err(err) => {
                 eprintln!("{err}");
-                eprintln!("usage: flock update [--handoff]");
+                eprintln!("usage: flk update [--handoff]");
                 std::process::exit(2);
             }
         };
@@ -714,86 +436,86 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("flock — terminal workspace manager for AI coding agents");
         println!();
-        println!("Usage: flock [options]");
-        println!("       flock --session <name> [options]");
-        println!("       flock --remote <ssh-target> [--session <name>]");
-        println!("       flock session attach <name>");
-        println!("       flock update [--handoff]");
-        println!("       flock channel set <stable|preview>");
-        println!("       flock server stop");
-        println!("       flock server reload-config");
-        println!("       flock config <subcommand> ...");
-        println!("       flock channel <subcommand> ...");
-        println!("       flock workspace <subcommand> ...");
-        println!("       flock worktree <subcommand> ...");
-        println!("       flock tab <subcommand> ...");
-        println!("       flock notification <subcommand> ...");
-        println!("       flock agent <subcommand> ...");
-        println!("       flock pane <subcommand> ...");
-        println!("       flock wait <subcommand> ...");
-        println!("       flock session <subcommand> ...");
-        println!("       flock integration <subcommand> ...");
-        println!("       flock web [--bind <addr>] (requires the `web` feature)");
+        println!("Usage: flk [options]");
+        println!("       flk --session <name> [options]");
+        println!("       flk --remote <ssh-target> [--session <name>]");
+        println!("       flk session attach <name>");
+        println!("       flk update [--handoff]");
+        println!("       flk channel set <stable|preview>");
+        println!("       flk server stop");
+        println!("       flk server reload-config");
+        println!("       flk config <subcommand> ...");
+        println!("       flk channel <subcommand> ...");
+        println!("       flk workspace <subcommand> ...");
+        println!("       flk worktree <subcommand> ...");
+        println!("       flk tab <subcommand> ...");
+        println!("       flk notification <subcommand> ...");
+        println!("       flk agent <subcommand> ...");
+        println!("       flk pane <subcommand> ...");
+        println!("       flk wait <subcommand> ...");
+        println!("       flk session <subcommand> ...");
+        println!("       flk integration <subcommand> ...");
+        println!("       flk web [--bind <addr>] (requires the `web` feature)");
         println!();
         println!("Common commands:");
         for (command, description) in [
-            ("flock", "Launch or attach to the persistent session"),
+            ("flk", "Launch or attach to the persistent session"),
             (
-                "flock status [server|client]",
+                "flk status [server|client]",
                 "Show local client and running server status",
             ),
-            ("flock update", "Download and install the latest version"),
+            ("flk update", "Download and install the latest version"),
             (
-                "flock server stop",
+                "flk server stop",
                 "Stop the running server via the API socket",
             ),
             (
-                "flock channel set <stable|preview>",
+                "flk channel set <stable|preview>",
                 "Choose the stable or preview update channel",
             ),
             (
-                "flock server reload-config",
+                "flk server reload-config",
                 "Reload config.toml in the running server",
             ),
             (
-                "flock config reset-keys",
+                "flk config reset-keys",
                 "Back up config.toml and remove custom keybindings",
             ),
             (
-                "flock channel <subcommand>",
+                "flk channel <subcommand>",
                 "Manage the stable or preview update channel",
             ),
             (
-                "flock workspace <subcommand>",
+                "flk workspace <subcommand>",
                 "Workspace helpers over the socket API",
             ),
             (
-                "flock worktree <subcommand>",
+                "flk worktree <subcommand>",
                 "Git worktree helpers over the socket API",
             ),
-            ("flock tab <subcommand>", "Tab helpers over the socket API"),
+            ("flk tab <subcommand>", "Tab helpers over the socket API"),
             (
-                "flock notification <subcommand>",
+                "flk notification <subcommand>",
                 "Notification helpers over the socket API",
             ),
             (
-                "flock agent <subcommand>",
+                "flk agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
             ),
             (
-                "flock pane <subcommand>",
+                "flk pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
             (
-                "flock wait <subcommand>",
+                "flk wait <subcommand>",
                 "Blocking wait helpers over the socket API",
             ),
             (
-                "flock session <subcommand>",
+                "flk session <subcommand>",
                 "Manage named persistent sessions",
             ),
             (
-                "flock integration <subcommand>",
+                "flk integration <subcommand>",
                 "Manage built-in agent integrations",
             ),
         ] {
@@ -801,7 +523,7 @@ fn main() -> io::Result<()> {
         }
         println!();
         println!("Advanced commands:");
-        println!("  {:<32} Run as headless server", "flock server");
+        println!("  {:<32} Run as headless server", "flk server");
         println!();
         println!("Options:");
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
@@ -822,12 +544,12 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("flock {}", crate::build_info::version());
+        println!("flk {}", crate::build_info::version());
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--default-config") {
-        print!("{DEFAULT_CONFIG}");
+        print!("{}", default_config_toml());
         return Ok(());
     }
 
@@ -847,7 +569,7 @@ fn main() -> io::Result<()> {
         let arg_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(1);
         }
         if !arg.starts_with('-')
@@ -869,7 +591,7 @@ fn main() -> io::Result<()> {
             .contains(&arg.as_str())
         {
             eprintln!("unknown command: {arg}");
-            eprintln!("run 'flock --help' for usage");
+            eprintln!("run 'flk --help' for usage");
             std::process::exit(1);
         }
     }
@@ -887,7 +609,7 @@ fn main() -> io::Result<()> {
     // Check if a server is running, spawn one if needed, then attach as client.
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
-            eprintln!("flock: {err}");
+            eprintln!("flk: {err}");
             std::process::exit(1);
         }
         return Ok(());
@@ -903,7 +625,7 @@ fn main() -> io::Result<()> {
     let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flock is already running");
+            eprintln!("error: flk is already running");
             eprintln!("socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -1019,6 +741,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_config_output_parses_back_to_default_config() {
+        // ADR-0002 phase (g): `flk --default-config` must print EXACTLY the
+        // serde defaults — the hand-maintained TOML shadow drifted whenever a
+        // field landed in Config without an edit here. Round-trip guard: parse
+        // the printed text and compare against Config::default() structurally.
+        let printed = default_config_toml();
+        let parsed: config::Config =
+            toml::from_str(&printed).expect("default config output must parse");
+        let parsed_table = toml::Value::try_from(&parsed).expect("serialize parsed");
+        let default_table =
+            toml::Value::try_from(config::Config::default()).expect("serialize default");
+        let (parsed_table, default_table) = (
+            parsed_table.as_table().expect("table"),
+            default_table.as_table().expect("table"),
+        );
+        for (key, default_value) in default_table {
+            assert_eq!(
+                parsed_table.get(key),
+                Some(default_value),
+                "--default-config output drifted from Config::default() at [{key}]"
+            );
+        }
+        assert_eq!(parsed_table.len(), default_table.len(), "extra keys");
+    }
+
+    #[test]
     fn nested_flock_blocks_when_env_is_set() {
         let config = config::Config::default();
         assert!(should_block_nested_for_env(&config, Some(FLOCK_ENV_VALUE)));
@@ -1033,6 +781,7 @@ mod tests {
             live_handoff: false,
             fleet: None,
             context: remote::LaunchContext::Cli,
+            proxy_jump: None,
         });
         assert_eq!(switch_failure_label(&leg), "lars@sage");
     }
@@ -1041,7 +790,7 @@ mod tests {
     fn switch_failure_reason_is_a_single_trimmed_line() {
         let err = io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            "connection refused\nIs flock server running?",
+            "connection refused\nIs flk server running?",
         );
         assert_eq!(switch_failure_reason(&err), "connection refused");
 
@@ -1056,6 +805,7 @@ mod tests {
             live_handoff: false,
             fleet: None,
             context: remote::LaunchContext::FederationSwitch,
+            proxy_jump: None,
         })
     }
 
@@ -1065,6 +815,7 @@ mod tests {
             target: "lars@sage".to_string(),
             fleet: None,
             focus_workspace: None,
+            proxy_jump: None,
         });
         match decide_next_leg(&AttachLeg::Local, switch, Ok(()), None, false) {
             LegStep::Switch { next, previous } => {
@@ -1091,7 +842,7 @@ mod tests {
 
     #[test]
     fn cli_remote_leg_uses_interactive_context() {
-        // The explicit `flock --remote <target>` path retains its install
+        // The explicit `flk --remote <target>` path retains its install
         // / upgrade prompt -- the user typed the command at a shell, has a
         // real TTY, and no alt-screen is held. Verify the CLI parser
         // produces an interactive RemoteLaunch.
@@ -1194,6 +945,6 @@ mod tests {
     fn nested_message_strings_no_longer_repeat_flock_prefix() {
         assert!(NESTED_FLOCK_MESSAGES
             .iter()
-            .all(|message| !message.starts_with("flock:")));
+            .all(|message| !message.starts_with("flock:") && !message.starts_with("flk:")));
     }
 }

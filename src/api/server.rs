@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 #[cfg(test)]
 use std::fs;
@@ -38,8 +38,7 @@ impl Drop for ServerHandle {
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
+                crate::logging::api_socket_remove_failed(&self.path, &err.to_string());
             }
         }
     }
@@ -73,8 +72,7 @@ pub fn start_server_with_capabilities(
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    info!(path = %path.display(), "api server listening");
+    crate::logging::api_server_listening(&path);
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
@@ -94,14 +92,12 @@ pub fn start_server_with_capabilities(
                             &connection_running,
                             capabilities,
                         ) {
-                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                            warn!(err = %err, "api connection failed");
+                            crate::logging::api_connection_failed(&err.to_string());
                         }
                     });
                 }
                 Err(err) => {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    error!(err = %err, "api listener accept failed");
+                    crate::logging::api_listener_accept_failed(&err.to_string());
                     break;
                 }
             }
@@ -119,10 +115,7 @@ pub fn start_server_with_capabilities(
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
-        format!(
-            "flock is already running (socket busy at {})",
-            path.display()
-        )
+        format!("flk is already running (socket busy at {})", path.display())
     })
 }
 
@@ -139,8 +132,7 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        debug!(err = %err, "api connection write timeout unavailable");
+        crate::logging::api_connection_write_timeout_unavailable(&err.to_string());
     }
 
     let Some(line) = read_initial_request_line(&mut stream)? else {

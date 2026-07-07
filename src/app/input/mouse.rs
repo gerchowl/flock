@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
-use tracing::warn;
 
 use crate::{
     app::state::{
@@ -692,7 +691,7 @@ impl AppState {
                     // peer's first workspace. The self row has no card, so
                     // clicking it is a no-op.
                     if self.on_servers_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.servers_panel_scope = self.servers_panel_scope.toggled();
+                        self.set_servers_panel_scope(self.servers_panel_scope().toggled());
                         self.mark_session_dirty();
                         return None;
                     }
@@ -724,7 +723,7 @@ impl AppState {
                     // the scope between the full workspace list and the
                     // focused space group.
                     if self.on_spaces_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.spaces_panel_scope = self.spaces_panel_scope.toggled();
+                        self.set_spaces_panel_scope(self.spaces_panel_scope().toggled());
                         // Toggling the scope also resets the per-server
                         // narrowing (#46): the toggle is the always-visible
                         // escape hatch out of a filtered list.
@@ -781,10 +780,11 @@ impl AppState {
                     }
 
                     if self.on_agent_panel_scope_toggle(mouse.column, mouse.row) {
-                        self.agent_panel_scope = match self.agent_panel_scope {
+                        let next = match self.agent_panel_scope() {
                             AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
                             AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
                         };
+                        self.set_agent_panel_scope(next);
                         self.agent_panel_scroll = 0;
                         self.mark_session_dirty();
                         return None;
@@ -1971,13 +1971,14 @@ impl AppState {
         let column = mouse.column.saturating_sub(info.inner_rect.x);
         let row = mouse.row.saturating_sub(info.inner_rect.y);
         let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers) else {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
+            crate::logging::pane_mouse_wheel_encode_failed(
+                info.id.raw(),
+                &format!("{:?}", mouse.kind),
+            );
             return true;
         };
         if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+            crate::logging::pane_mouse_wheel_forward_failed(info.id.raw(), &err.to_string());
         }
         true
     }
@@ -2110,8 +2111,11 @@ fn forward_runtime_mouse_button(
     };
     rt.scroll_reset();
     if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
+        crate::logging::pane_mouse_button_forward_failed(
+            pane.raw(),
+            &format!("{:?}", mouse.kind),
+            &err.to_string(),
+        );
     }
     true
 }
@@ -2130,8 +2134,11 @@ fn forward_runtime_mouse_motion(
         return false;
     };
     if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        warn!(pane = pane.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
+        crate::logging::pane_mouse_motion_forward_failed(
+            pane.raw(),
+            &format!("{:?}", mouse.kind),
+            &err.to_string(),
+        );
     }
     true
 }
@@ -2152,13 +2159,14 @@ fn forward_runtime_wheel(
             rt.scroll_reset();
             let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
             else {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
+                crate::logging::pane_mouse_wheel_encode_failed(
+                    pane.raw(),
+                    &format!("{:?}", mouse.kind),
+                );
                 return true;
             };
             if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), err = %err, "failed to forward mouse wheel event");
+                crate::logging::pane_mouse_wheel_forward_failed(pane.raw(), &err.to_string());
             }
             true
         }
@@ -2168,8 +2176,10 @@ fn forward_runtime_wheel(
                 return true;
             };
             if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(pane = pane.raw(), err = %err, "failed to forward alternate-scroll key");
+                crate::logging::pane_mouse_alternate_scroll_forward_failed(
+                    pane.raw(),
+                    &err.to_string(),
+                );
             }
             true
         }
@@ -2478,7 +2488,7 @@ mod tests {
             list_rect.x + 2,
             list_rect.y,
         ));
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::Current);
         assert_eq!(app.state.server_filter, None);
     }
 
@@ -2946,7 +2956,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let target_terminal_id = app.state.workspaces[1]
             .panes
             .get(&target_pane)
@@ -3137,6 +3147,8 @@ mod tests {
             delete_branch: false,
             branch: None,
             merge_gate: None,
+            branch_protected: false,
+            gate_timed_out: false,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
@@ -3169,6 +3181,8 @@ mod tests {
             delete_branch: false,
             branch: None,
             merge_gate: None,
+            branch_protected: false,
+            gate_timed_out: false,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(

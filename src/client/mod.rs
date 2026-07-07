@@ -201,7 +201,7 @@ impl ClientState {
 
 /// Path of the launcher's switch file. Set by the outermost flock process;
 /// a client that receives SwitchServer writes the SSH target here and exits,
-/// and the launcher chains into `flock --remote <target>`.
+/// and the launcher chains into `flk --remote <target>`.
 pub const SWITCH_FILE_ENV_VAR: &str = "FLOCK_SWITCH_FILE";
 
 /// Env var the launcher sets on the leg it re-attaches after a FAILED server
@@ -251,6 +251,12 @@ pub struct RecordedSwitch {
     /// `workspace focus` against the local server post-attach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_workspace: Option<String>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for a snapshot-derived
+    /// target the launcher's box cannot dial directly. `None` for config peers
+    /// and home switches. Rides via `-o ProxyJump=<value>` on the next-leg
+    /// bridge dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
 }
 
 /// Set while this client is exiting to hand off to a pre-connected next leg
@@ -413,6 +419,7 @@ fn record_switch_target(
     ssh_target: &str,
     fleet: Option<&protocol::FleetSnapshot>,
     focus_workspace: Option<&str>,
+    proxy_jump: Option<&str>,
 ) -> bool {
     let Ok(path) = std::env::var(SWITCH_FILE_ENV_VAR) else {
         return false;
@@ -424,6 +431,7 @@ fn record_switch_target(
         target: ssh_target.to_string(),
         fleet: fleet.cloned(),
         focus_workspace: focus_workspace.map(str::to_string),
+        proxy_jump: proxy_jump.map(str::to_string),
     };
     let Ok(json) = serde_json::to_string(&payload) else {
         return false;
@@ -444,6 +452,7 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
         target,
         fleet: None,
         focus_workspace: None,
+        proxy_jump: None,
     })
 }
 
@@ -468,10 +477,7 @@ impl std::fmt::Display for ClientError {
             ClientError::ConnectionFailed(err) => {
                 write!(f, "failed to connect to server: {err}")?;
                 let path = client_socket_path();
-                write!(
-                    f,
-                    "\nIs flock server running? Start it with `flock server`."
-                )?;
+                write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
             ClientError::HandshakeRejected { version, error } => {
@@ -766,8 +772,7 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     match serde_json::from_str(&raw) {
         Ok(fleet) => Some(fleet),
         Err(err) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(err = %err, "ignoring malformed fleet snapshot from launcher");
+            crate::logging::client_fleet_snapshot_invalid(&err.to_string());
             None
         }
     }
@@ -867,8 +872,11 @@ fn do_handshake(
                 return Err(ClientError::HandshakeRejected { version, error });
             }
             let handshake_ms = handshake_t0.elapsed().as_millis() as u64;
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            info!(version, ?encoding, handshake_ms, "handshake succeeded");
+            crate::logging::client_handshake_succeeded(
+                version,
+                &format!("{:?}", encoding),
+                handshake_ms,
+            );
             Ok(encoding)
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
@@ -1015,8 +1023,7 @@ fn read_host_theme_replies() -> (Option<crate::terminal_theme::TerminalTheme>, V
     if theme.is_empty() {
         debug!("host terminal did not answer the default color query");
     } else {
-        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-        info!(?theme, "captured host terminal theme for handshake");
+        crate::logging::client_host_theme_captured(&format!("{:?}", theme));
     }
     ((!theme.is_empty()).then_some(theme), buf)
 }
@@ -1345,7 +1352,7 @@ fn install_protective_panic_hook() {
         // Non-fatal: `writeln!` returns Err on a dead stderr where `eprintln!`
         // would panic — that panic was the first half of the double-panic
         // abort. Best-effort diagnostic first so a working stderr still sees it.
-        let _ = writeln!(io::stderr(), "flock client panic: {info}");
+        let _ = writeln!(io::stderr(), "flk client panic: {info}");
         if let Some(original) = DEFAULT_PANIC_HOOK.get() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original(info)));
         }
@@ -1400,8 +1407,7 @@ fn run_client_with_mode(
 
     let socket_path = client_socket_path();
     crate::logging::startup("client");
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    info!(path = %socket_path.display(), "{log_message}");
+    crate::logging::client_connecting(&socket_path, log_message);
 
     // Capture the host terminal theme before the handshake so it rides the
     // Hello (#47). Direct terminal attaches mirror a single pane and never
@@ -1611,8 +1617,7 @@ async fn run_client_loop(
         mouse_scroll_lines,
         redraw_on_focus_gained,
     };
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    debug!(?negotiated_encoding, "client render encoding active");
+    crate::logging::client_render_encoding_active(&format!("{:?}", negotiated_encoding));
 
     // Channel for events from the resize and server reader threads. The
     // stdin reader outlives this session (handoff retries reuse it), so it
@@ -1872,11 +1877,9 @@ async fn run_client_loop(
                                 max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
                                 "dropped file too large to bridge; passing the paste through"
                             ),
-                            Err(err) => warn!(
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                err = %err,
-                                "failed to read dropped local file; passing the paste through"
-                            ),
+                            Err(err) => {
+                                crate::logging::client_dropped_file_read_failed(&err.to_string())
+                            }
                         }
                     }
                 }
@@ -1915,14 +1918,12 @@ async fn run_client_loop(
                         if let Some(manager) = slot_manager.as_mut() {
                             manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
                         }
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "warm slot server shut down; demoted silently");
+                        crate::logging::client_slot_shutdown_demoted(&slot_key);
                         continue;
                     }
                     slots::SlotRouting::Drop => {
                         // Stale frame or other non-active-slot traffic: drop.
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "dropping message from non-active slot");
+                        crate::logging::client_slot_message_dropped(&slot_key);
                         continue;
                     }
                 }
@@ -1953,15 +1954,10 @@ async fn run_client_loop(
                             );
                         }
                         if let Some((switch_t0, to, warm)) = switch_timing.take() {
-                            debug!(
-                                target: "flock::attach",
-                                side = "client",
-                                stage = "switch",
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                to = %to,
+                            crate::logging::client_attach_switch_first_paint(
+                                &to,
                                 warm,
-                                elapsed_ms = switch_t0.elapsed().as_millis() as u64,
-                                "attach: switch first frame painted"
+                                switch_t0.elapsed().as_millis() as u64,
                             );
                         }
                     }
@@ -1990,6 +1986,7 @@ async fn run_client_loop(
                         ssh_target,
                         fleet,
                         focus_workspace,
+                        proxy_jump,
                     } => {
                         // #43: time the switch from request to first painted frame.
                         let switch_received = Instant::now();
@@ -2067,6 +2064,7 @@ async fn run_client_loop(
                                         geometry,
                                         negotiated_encoding,
                                         fleet.clone(),
+                                        proxy_jump.clone(),
                                         event_tx.clone(),
                                     );
                                     if let Some(p) = pending_switch.as_ref() {
@@ -2075,8 +2073,10 @@ async fn run_client_loop(
                                     continue;
                                 }
                                 Err(err) => {
-                                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                    warn!(err = %err, target = %ssh_target, "slot flip failed; demoting");
+                                    crate::logging::client_slot_flip_failed(
+                                        &ssh_target,
+                                        &err.to_string(),
+                                    );
                                     manager.handle_dead(&target);
                                     // Surface in the popup as a switch failure
                                     // beat; the user sees the reason and the
@@ -2112,6 +2112,7 @@ async fn run_client_loop(
                             &ssh_target,
                             fleet.as_ref(),
                             focus_workspace.as_deref(),
+                            proxy_jump.as_deref(),
                         ) {
                             // Hold the alternate screen across the handoff so the
                             // host shell never flashes between legs (#63).
@@ -2120,7 +2121,7 @@ async fn run_client_loop(
                                 reason: Some("switching".to_string()),
                             });
                         }
-                        // No launcher to chain into (e.g. bare `flock client`):
+                        // No launcher to chain into (e.g. bare `flk client`):
                         // stay attached and let the user switch manually.
                         let _ = writeln!(io::stderr(), "flock: server requested switch to {ssh_target}, but no launcher is present (FLOCK_SWITCH_FILE unset)");
                     }
@@ -2171,8 +2172,7 @@ async fn run_client_loop(
                         if let Some(manager) = slot_manager.as_mut() {
                             manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
                         }
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        debug!(slot = %slot_key, "warm slot disconnected; demoted silently");
+                        crate::logging::client_slot_disconnected_demoted(&slot_key);
                         continue;
                     }
                 }
@@ -2216,8 +2216,10 @@ async fn run_client_loop(
                                 bridge,
                             };
                             if let Err(err) = manager.add_warm(conn) {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                warn!(target = %key, err = %err, "switch-dial warmed slot but pause failed");
+                                crate::logging::client_slot_switch_pause_failed(
+                                    &key,
+                                    &err.to_string(),
+                                );
                                 // Treat as failure-beat.
                                 if let Some(p) = pending_switch.as_mut() {
                                     p.outcome_beat = Some((
@@ -2279,8 +2281,7 @@ async fn run_client_loop(
                             // sweep won the race for this peer). Drop the
                             // redundant transport off-loop rather than orphaning
                             // the live one (#139).
-                            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                            debug!(target = %key, "slot already connected; dropping redundant pre-warm");
+                            crate::logging::client_slot_prewarm_redundant(&key);
                             std::thread::spawn(move || {
                                 drop(stream);
                                 drop(bridge);
@@ -2292,19 +2293,19 @@ async fn run_client_loop(
                                 bridge,
                             };
                             if let Err(err) = manager.add_warm(conn) {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                debug!(target = %key, err = %err, "failed to pause newly warmed slot");
+                                crate::logging::client_slot_warm_pause_failed(
+                                    &key,
+                                    &err.to_string(),
+                                );
                             } else {
-                                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                                debug!(target = %key, "slot warmed and paused");
+                                crate::logging::client_slot_warmed_paused(&key);
                             }
                         }
                     }
                 } else {
                     // Stale event: drop the stream + bridge. Plain drop closes
                     // the socket so the server sees a disconnect (#93).
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    debug!(target = %key, gen, "stale SlotWarmed; dropping stream");
+                    crate::logging::client_slot_warmed_stale(&key, gen);
                     // Detached drop: SshStdioBridge::drop joins its listener
                     // thread and can block on a live ssh child's teardown for
                     // seconds -- never on the loop thread.
@@ -2341,8 +2342,7 @@ async fn run_client_loop(
                             .mark_dial_failed(&slots::SlotTarget::from_key(&key), Instant::now());
                     }
                 } else {
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    debug!(target = %key, gen, "stale SlotDialFailed; dropping");
+                    crate::logging::client_slot_dial_failed_stale(&key, gen);
                 }
             }
             ClientLoopEvent::Timer => {
@@ -2914,8 +2914,7 @@ fn spawn_warm_dial(
                 bridge: None,
             },
             Err(err) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, err = %err, "warm-all dial failed; slot stays cold");
+                crate::logging::client_slot_warm_all_dial_failed(&key, &err.to_string());
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -2942,7 +2941,15 @@ fn spawn_warm_bridge_dial(
     requested_encoding: RenderEncoding,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    spawn_switch_dial(gen, target, geometry, requested_encoding, None, event_tx);
+    spawn_switch_dial(
+        gen,
+        target,
+        geometry,
+        requested_encoding,
+        None,
+        None,
+        event_tx,
+    );
 }
 
 /// Spawn an on-demand SWITCH dial for a cold slot (#93). Targets with a live
@@ -2961,6 +2968,10 @@ fn spawn_switch_dial(
     // The hub's snapshot from the SwitchServer message -- carried into the
     // spoke's handshake so it renders the servers band / home row (#102).
     fleet: Option<protocol::FleetSnapshot>,
+    // Gossip v3 (#101 part 3): snapshot-derived rows carry the hub's
+    // ProxyJump identity so the cold-dial bridge reaches peers only
+    // routable via the hub. `None` for direct dials.
+    proxy_jump: Option<String>,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     std::thread::spawn(move || {
@@ -3001,9 +3012,11 @@ fn spawn_switch_dial(
                             io::Error::other("home slot has no socket path"),
                         )),
                         slots::SlotTarget::Ssh(t) => {
-                            let (bridge, sock) =
-                                crate::remote::start_switch_bridge_noninteractive(t)
-                                    .map_err(ClientError::ConnectionFailed)?;
+                            let (bridge, sock) = crate::remote::start_switch_bridge_noninteractive(
+                                t,
+                                proxy_jump.as_deref(),
+                            )
+                            .map_err(ClientError::ConnectionFailed)?;
                             // The bridge listener may need a moment to be ready
                             // (it binds synchronously, but ssh dial latency hides
                             // here on first connect). Retry briefly on connect
@@ -3036,8 +3049,7 @@ fn spawn_switch_dial(
                 bridge,
             },
             Ok(Err(err)) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, err = %err, "switch dial failed");
+                crate::logging::client_slot_switch_dial_failed(&key, &err.to_string());
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -3045,8 +3057,7 @@ fn spawn_switch_dial(
                 }
             }
             Err(_) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                debug!(target = %key, "switch dial timed out");
+                crate::logging::client_slot_switch_dial_timed_out(&key);
                 ClientLoopEvent::SlotDialFailed {
                     gen,
                     key,
@@ -3161,8 +3172,7 @@ fn server_reader_thread(
                 continue;
             }
             Err(err) => {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "server read error");
+                crate::logging::client_server_read_error(&err.to_string());
                 let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(slot_key));
                 break;
             }
@@ -3190,16 +3200,14 @@ fn reload_local_client_config(
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(diagnostic = %diagnostic, "local sound config diagnostic");
+                crate::logging::client_config_sound_diagnostic(&diagnostic.to_string());
             }
             *sound_config = loaded.config.ui.sound;
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+            crate::logging::client_config_reload_failed(&format!("{:?}", diagnostics));
         }
     }
 }
@@ -3254,8 +3262,7 @@ fn handle_notify_with_notifiers(
                 None => crate::terminal_notify::split_message(message),
             };
             if let Err(err) = show_terminal_notification(title, body) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "failed to emit terminal notification");
+                crate::logging::client_terminal_notification_failed(&err.to_string());
             }
         }
         NotifyKind::SystemToast => {
@@ -3268,8 +3275,7 @@ fn handle_notify_with_notifiers(
                 None => crate::terminal_notify::split_message(message),
             };
             if let Err(err) = show_system_notification(title, body) {
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                warn!(err = %err, "failed to emit system notification");
+                crate::logging::client_system_notification_failed(&err.to_string());
             }
         }
     }
@@ -3836,6 +3842,8 @@ mod tests {
                 workspaces: Vec::new(),
                 age_secs: Some(7),
                 error: None,
+                origin_last_ok_secs: Some(7),
+                proxy_jump: None,
             }],
             origin_summary: None,
         };
@@ -3843,6 +3851,7 @@ mod tests {
             target: "lars@sage".to_string(),
             fleet: Some(fleet),
             focus_workspace: None,
+            proxy_jump: None,
         };
         std::fs::write(&path, serde_json::to_string(&recorded).unwrap()).unwrap();
         let taken = take_switch_target(&path).expect("switch recorded");
@@ -3855,6 +3864,7 @@ mod tests {
             target: protocol::HOME_SWITCH_TARGET.to_string(),
             fleet: None,
             focus_workspace: None,
+            proxy_jump: None,
         };
         std::fs::write(&path, serde_json::to_string(&home).unwrap()).unwrap();
         let taken = take_switch_target(&path).expect("home switch recorded");
@@ -4024,6 +4034,7 @@ mod tests {
             (90, 30, 8, 16),
             RenderEncoding::SemanticFrame,
             Some(hub.clone()),
+            None,
             event_tx,
         );
 
@@ -4375,7 +4386,7 @@ mod tests {
             "should mention connection failure: {msg}"
         );
         assert!(
-            msg.contains("flock server"),
+            msg.contains("flk server"),
             "should suggest starting server: {msg}"
         );
     }
@@ -4429,7 +4440,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock` to reattach"),
+            msg.contains("Run `flk` to reattach"),
             "should suggest default reattach command: {msg}"
         );
     }
@@ -4444,7 +4455,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock session attach work` to reattach"),
+            msg.contains("Run `flk session attach work` to reattach"),
             "should suggest named session reattach command: {msg}"
         );
     }
@@ -4454,7 +4465,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "flock --remote host --session work",
+            "flk --remote host --session work",
         );
         let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
         let err = ClientError::ServerShutdown {
@@ -4462,7 +4473,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `flock --remote host --session work` to reattach"),
+            msg.contains("Run `flk --remote host --session work` to reattach"),
             "should prefer remote reattach command: {msg}"
         );
     }
@@ -4501,7 +4512,7 @@ mod tests {
 
     #[test]
     fn reload_local_client_config_refreshes_redraw_on_focus_gained() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_guard();
         let path = std::env::temp_dir().join(format!(
             "flock-client-config-reload-{}-{}.toml",
             std::process::id(),

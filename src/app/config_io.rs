@@ -33,7 +33,7 @@ pub fn resolve_write_target() -> std::io::Result<PathBuf> {
         std::fs::write(
             &overlay,
             "# flock overlay -- deep-merged over config.toml: add new keys OR\n\
-             # override base-set scalars (overlay wins). See `flock config edit`.\n",
+             # override base-set scalars (overlay wins). See `flk config edit`.\n",
         )?;
     }
     Ok(overlay)
@@ -339,10 +339,11 @@ mod edit_config_tests {
         dir
     }
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+    fn lock_env() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
+        crate::config::test_config_env_guard()
     }
 
     #[tokio::test]
@@ -481,12 +482,13 @@ mod write_target_tests {
         dir
     }
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    fn lock_env() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
         // Tolerate a previous test's panic that left this lock poisoned --
         // the lock is here for serialization, not for state invariants.
-        crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        crate::config::test_config_env_guard()
     }
 
     #[test]

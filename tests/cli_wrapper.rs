@@ -162,7 +162,7 @@ fn spawn_named_server(
     )
     .unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flock"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command
         .args(["--session", session, "server"])
         .env("XDG_CONFIG_HOME", config_home)
@@ -189,7 +189,7 @@ fn run_named_cli_with_socket_override(
     args: &[&str],
     socket_override: Option<&Path>,
 ) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flock"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
@@ -257,7 +257,7 @@ fn spawn_flock_with_config(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -265,6 +265,11 @@ fn spawn_flock_with_config(
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
+    // Ambient deprecated aliases (a shell/CI runner may export FLOCK_HOST_NAME)
+    // otherwise make the server's reload-config return `partial` on a stray
+    // deprecation diagnostic — keep the spawned server hermetic.
+    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env_remove("FLOCK_DISABLE_SOUND");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -278,14 +283,14 @@ fn spawn_flock_with_config(
 }
 
 fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flock"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command.args(args);
     command.env("FLOCK_SOCKET_PATH", socket_path);
     command.output().unwrap()
 }
 
 fn run_cli_in_dir(socket_path: &Path, args: &[&str], current_dir: &Path) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flock"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command.args(args);
     command.current_dir(current_dir);
     command.env("FLOCK_SOCKET_PATH", socket_path);
@@ -1002,13 +1007,13 @@ fn help_commands_exit_successfully() {
     ];
 
     for args in help_cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+        let output = Command::new(env!("CARGO_BIN_EXE_flk"))
             .args(*args)
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "flock {} failed: status={:?} stdout={} stderr={}",
+            "flk {} failed: status={:?} stdout={} stderr={}",
             args.join(" "),
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
@@ -1019,7 +1024,7 @@ fn help_commands_exit_successfully() {
 
 #[test]
 fn root_help_hides_explicit_client_command() {
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--help")
         .output()
         .unwrap();
@@ -1027,7 +1032,7 @@ fn root_help_hides_explicit_client_command() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("flock client"),
+        !stdout.contains("flk client"),
         "root help should not advertise the internal client command: {stdout}"
     );
 }
@@ -1037,7 +1042,7 @@ fn explicit_client_command_respects_nested_guard() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("client")
         .env("FLOCK_ENV", "1")
         .env("XDG_CONFIG_HOME", &base)
@@ -1057,7 +1062,7 @@ fn explicit_client_command_respects_nested_guard() {
 
 #[test]
 fn removed_show_changelog_flag_fails_before_nested_guard() {
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--show-changelog")
         .env("FLOCK_ENV", "1")
         .output()
@@ -1277,7 +1282,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         "test setup should start without extension file"
     );
 
-    let workspace_list = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let workspace_list = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["workspace", "list"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1285,7 +1290,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
 
-    let integration_install = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let integration_install = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["integration", "install", "pi"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1297,7 +1302,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         "integration install should write local files without a server"
     );
 
-    let integration_status = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let integration_status = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["integration", "status"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1308,7 +1313,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
     assert!(status_stdout.contains("pi: current (v2)"));
     assert!(status_stdout.contains("claude: not installed"));
 
-    let integration_uninstall = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let integration_uninstall = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["integration", "uninstall", "pi"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1340,7 +1345,7 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
     register_runtime_dir(&runtime_dir);
     let missing_socket = runtime_dir.join("missing.sock");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["integration", "status", "--outdated-only"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1351,7 +1356,7 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("installed flock integrations need updating"));
-    assert!(stderr.contains("flock integration install pi"));
+    assert!(stderr.contains("flk integration install pi"));
 
     cleanup_test_base(&base);
 }
@@ -1366,7 +1371,7 @@ fn integration_status_rejects_unknown_flags() {
     register_runtime_dir(&runtime_dir);
     let missing_socket = runtime_dir.join("missing.sock");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["integration", "status", "--wat"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
@@ -1401,7 +1406,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 21"),
+        full_stdout.contains("  protocol: 23"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -1434,7 +1439,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 21"),
+        server_stdout.contains("protocol: 23"),
         "stdout: {server_stdout}"
     );
 
@@ -1446,7 +1451,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 21"),
+        client_stdout.contains("protocol: 23"),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -1456,7 +1461,7 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 21);
+    assert_eq!(full_json["client"]["protocol"], 23);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
@@ -1470,12 +1475,12 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 21);
+    assert_eq!(server_json["protocol"], 23);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 21);
+    assert_eq!(client_json["protocol"], 23);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
@@ -2020,7 +2025,7 @@ fn worktree_cli_rejects_local_argument_errors_before_socket_use() {
         assert_eq!(
             output.status.code(),
             Some(2),
-            "flock {} should fail as local parse error; stdout={} stderr={}",
+            "flk {} should fail as local parse error; stdout={} stderr={}",
             args.join(" "),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

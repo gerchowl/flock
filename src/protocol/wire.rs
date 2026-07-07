@@ -1,4 +1,4 @@
-//! Wire protocol for flock server/client communication.
+//! Wire protocol for flk server/client communication.
 //!
 //! Defines the message types, framing, version negotiation, and safety
 //! constraints for the binary protocol over Unix domain sockets.
@@ -44,7 +44,19 @@ use serde::{Deserialize, Serialize};
 /// v21: `FleetPeer.protocol` (#58). The gossiped peer summary now carries the
 /// peer's wire protocol so a spoke can flag protocol skew in the sidebar, not
 /// just a semver mismatch. Additive field on a wire struct — deliberate bump.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// v22: `FleetPeer.origin_last_ok_secs` (#101 gossip v3, part 2). Staleness is
+/// now judged against the ORIGIN's report age — a FROZEN seconds-since-poll at
+/// capture time that does not accumulate the receiver's dwell clock. Kills the
+/// 60s-dwell ghost cliff on carried snapshot entries. Additive with
+/// `#[serde(default)]`; positional wire so a deliberate bump is required.
+///
+/// v23: `FleetPeer.proxy_jump` and `SwitchServer.proxy_jump` (#101 gossip v3,
+/// part 3). Snapshot-derived rows carry the hub's SSH-reachable identity so
+/// the client's next-leg bridge dials `ssh -o ProxyJump=<hub> <target>`,
+/// reaching peers the launcher's box cannot dial directly. Additive with
+/// `#[serde(default)]`; positional wire so a deliberate bump is required.
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -156,6 +168,22 @@ pub struct FleetPeer {
     pub age_secs: Option<u64>,
     /// Last poll error the hub saw, if any.
     pub error: Option<String>,
+    /// Gossip v3 (#101 part 2): the ORIGIN's report age at capture, in seconds.
+    /// FROZEN semantic — the receiver does NOT accumulate its own dwell into
+    /// this value the way it does for `age_secs`; staleness is judged against
+    /// this field so a carried entry stays fresh as long as the origin's
+    /// assertion is fresh. Additive with `#[serde(default)]` so a v(N-1)
+    /// receiver falls back to the pre-v22 age-plus-dwell staleness path.
+    #[serde(default)]
+    pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for a client dialing
+    /// this peer from OUTSIDE the hub's LAN. The HUB stamps this as its own
+    /// short host name when it emits a snapshot; the client's next-leg
+    /// bridge appends `-o ProxyJump=<value>` to `ssh` so the dial reaches
+    /// peers the launcher's box cannot see directly. `None` for entries the
+    /// client can dial straight (its config peers, or the hub itself).
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
 }
 
 /// Bincode-safe mirror of `api::schema::PeerSystemSummary`. The schema type
@@ -605,7 +633,7 @@ pub enum ServerMessage {
     },
 
     /// A federated peer row was selected: the client should detach and
-    /// reattach to this SSH target (`flock --remote <ssh_target>`). The
+    /// reattach to this SSH target (`flk --remote <ssh_target>`). The
     /// client records the target for its launcher and exits like a detach.
     SwitchServer {
         /// SSH destination of the peer server, or [`HOME_SWITCH_TARGET`]
@@ -622,6 +650,13 @@ pub enum ServerMessage {
         /// for plain switches.
         #[serde(default)]
         focus_workspace: Option<String>,
+        /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching
+        /// `ssh_target`. Set for snapshot-derived rows (peers only reachable
+        /// via THIS hub); `None` for config-owned peers the client already
+        /// has a direct route to. The launcher's ssh bridge appends `-o
+        /// ProxyJump=<value>` when set.
+        #[serde(default)]
+        proxy_jump: Option<String>,
     },
 }
 
@@ -866,11 +901,11 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client protocol {client_version} is older than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock client (a running server keeps its old protocol until it is relaunched)"
+            "client protocol {client_version} is older than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flk client (a running server keeps its old protocol until it is relaunched)"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client protocol {client_version} is newer than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flock server (a running server keeps its old protocol until it is relaunched)"
+            "client protocol {client_version} is newer than this server's {PROTOCOL_VERSION}; flock needs both ends on the same build — update and relaunch the older flk server (a running server keeps its old protocol until it is relaunched)"
         ))
     }
 }
@@ -1042,6 +1077,8 @@ mod tests {
                 }],
                 age_secs: Some(5),
                 error: None,
+                origin_last_ok_secs: Some(5),
+                proxy_jump: Some("mba22".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
                 name: "mba22".to_owned(),
@@ -1070,6 +1107,8 @@ mod tests {
                 }],
                 age_secs: Some(0),
                 error: None,
+                origin_last_ok_secs: Some(0),
+                proxy_jump: None,
             })),
         }
     }
@@ -1133,6 +1172,7 @@ mod tests {
             ssh_target: "lars@sage".to_owned(),
             fleet: Some(sample_fleet_snapshot()),
             focus_workspace: Some("ws_3".to_owned()),
+            proxy_jump: Some("hub".to_owned()),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
@@ -1619,7 +1659,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 21;
+    const PINNED_PROTOCOL_VERSION: u32 = 23;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1761,6 +1801,7 @@ mod tests {
                     // nested FleetSnapshot / FleetPeer wire shape (#58).
                     fleet: Some(sample_fleet_snapshot()),
                     focus_workspace: None,
+                    proxy_jump: None,
                 },
             ),
         ]
@@ -1839,7 +1880,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x5b0104648107b9ea),
+            ("SwitchServer", 0x6d4496489f6d128f),
         ];
 
         if actual.as_slice() != GOLDEN {

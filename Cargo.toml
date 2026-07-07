@@ -11,10 +11,11 @@ keywords = ["terminal", "tui", "ai", "agents", "multiplexer"]
 categories = ["command-line-utilities"]
 include = ["src/**/*", "assets/sounds/*", "assets/web/**/*", "README.md", "LICENSE", "Cargo.toml"]
 
-# crates.io package is `flock-ai` (the plain `flock` name is taken), but the
-# command users invoke stays `flock`.
+# crates.io package is `flock-ai` (the plain `flock` name is taken); the
+# command users invoke is `flk` — chosen to avoid colliding with util-linux
+# `flock(1)` on Linux. Brand/product name stays `flock`. See ADR-0003.
 [[bin]]
-name = "flock"
+name = "flk"
 path = "src/main.rs"
 
 # Compile-time print policing (pairs with the guardrails no-debug-leftovers text

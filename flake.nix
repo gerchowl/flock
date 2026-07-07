@@ -33,7 +33,7 @@
             buildChannel = "fork";
             buildId = self.shortRev or self.dirtyShortRev or null;
           };
-          # Same binary plus the `web` feature (the `flock web` xterm bridge,
+          # Same binary plus the `web` feature (the `flk web` xterm bridge,
           # gerchowl/flock#131). Kept out of `default` so a stock build stays
           # lean; hosts that serve the web terminal pin this output.
           flock-web = pkgs.callPackage ./nix/package.nix {
@@ -51,7 +51,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/flock";
+          program = "${self.packages.${system}.default}/bin/flk";
           meta.description = "Run Flock";
         };
       });

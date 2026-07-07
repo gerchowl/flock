@@ -1,6 +1,6 @@
-//! Auto-detect launch behavior for the `flock` command.
+//! Auto-detect launch behavior for the `flk` command.
 //!
-//! When the user runs `flock` with no subcommand:
+//! When the user runs `flk` with no subcommand:
 //! 1. Check if a server is already listening on the client socket
 //! 2. If no server → spawn one as a background daemon → wait for socket readiness (up to 5s)
 //! 3. Attach as a thin client to the server
@@ -14,7 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use super::socket_paths::client_socket_path;
 use crate::process::TracedCommand;
@@ -33,7 +33,7 @@ const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 // Server detection
 // ---------------------------------------------------------------------------
 
-/// Checks whether a flock server is currently listening on the client socket.
+/// Checks whether a flk server is currently listening on the client socket.
 ///
 /// This works by attempting to connect to the client socket. If the connection
 /// succeeds, a server is running. If the socket file doesn't exist or the
@@ -45,7 +45,7 @@ pub fn is_server_listening() -> bool {
     is_server_listening_at(&client_socket_path())
 }
 
-/// Checks whether a flock server is listening at a specific socket path.
+/// Checks whether a flk server is listening at a specific socket path.
 fn is_server_listening_at(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
@@ -73,8 +73,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
         }
         Err(err) => {
             // Other errors (permission denied, etc.) — assume not listening.
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            warn!(err = %err, "unexpected error checking server socket");
+            crate::logging::server_socket_check_failed(&err.to_string());
             false
         }
     }
@@ -87,7 +86,7 @@ fn read_server_status() -> io::Result<Option<crate::api::RuntimeStatus>> {
 fn validate_running_server_compatibility() -> io::Result<()> {
     let Some(status) = read_server_status()? else {
         return Err(io::Error::other(format!(
-            "a flock server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
+            "a flk server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
             crate::session::active_restart_after_update_guidance()
         )));
     };
@@ -113,7 +112,7 @@ fn validate_running_server_compatibility() -> io::Result<()> {
 // Server spawning
 // ---------------------------------------------------------------------------
 
-/// Spawns the flock server as a background daemon process.
+/// Spawns the flk server as a background daemon process.
 ///
 /// The server process is fully detached:
 /// - Runs in its own session (setsid) so it survives the client exiting
@@ -131,13 +130,12 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
         )
     })?;
 
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    info!(exe = %exe.display(), "spawning server daemon");
+    crate::logging::server_daemon_spawning(&exe);
 
     let mut command = build_server_daemon_command(exe);
 
     let child = command.spawn_traced().map_err(|err: io::Error| {
-        io::Error::new(err.kind(), format!("failed to spawn flock server: {err}"))
+        io::Error::new(err.kind(), format!("failed to spawn flk server: {err}"))
     })?;
 
     let pid = child.id();
@@ -181,8 +179,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 
     while std::time::Instant::now() < deadline {
         if is_server_listening_at(socket_path) {
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            info!(path = %socket_path.display(), "server socket ready");
+            crate::logging::server_socket_ready(socket_path);
             return Ok(());
         }
         std::thread::sleep(SOCKET_POLL_INTERVAL);
@@ -205,7 +202,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// Performs auto-detect launch: check for server, spawn if needed, then
 /// attach as a thin client.
 ///
-/// This is the entry point called from `main.rs` when the user runs `flock`
+/// This is the entry point called from `main.rs` when the user runs `flk`
 /// without `--no-session` and without a subcommand.
 ///
 /// Flow:
@@ -214,8 +211,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// 3. Run the thin client (which connects to the server)
 pub fn auto_detect_launch() -> io::Result<()> {
     let socket_path = client_socket_path();
-    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-    info!(path = %socket_path.display(), "auto-detect launch starting");
+    crate::logging::server_auto_detect_starting(&socket_path);
 
     if is_server_listening_at(&socket_path) {
         validate_running_server_compatibility()?;
@@ -466,11 +462,11 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(
-            message.contains("Run `flock session stop work`"),
+            message.contains("Run `flk session stop work`"),
             "unexpected error: {message}"
         );
         assert!(
-            message.contains("then run `flock session attach work` again"),
+            message.contains("then run `flk session attach work` again"),
             "unexpected error: {message}"
         );
         std::env::remove_var("XDG_CONFIG_HOME");

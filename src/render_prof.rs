@@ -73,15 +73,7 @@ impl RenderProfiler {
             .collect::<Vec<_>>()
             .join(",");
 
-        tracing::info!(
-            event = "render.prof",
-            window_ms = elapsed.as_millis() as u64,
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            counters = %counters,
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            durations = %durations,
-            "render profiler window"
-        );
+        crate::logging::render_prof_window(elapsed.as_millis() as u64, &counters, &durations);
 
         self.window_started = Instant::now();
         self.counters.clear();

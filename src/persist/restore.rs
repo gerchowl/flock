@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
-use tracing::{error, warn};
 
 use crate::detect::AgentState;
 use crate::events::AppEvent;
@@ -484,11 +483,7 @@ fn restore_tab(
         let cwd = if saved_cwd.exists() {
             saved_cwd
         } else {
-            warn!(
-                // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                cwd = %saved_cwd.display(),
-                "saved pane cwd does not exist, falling back to HOME"
-            );
+            crate::logging::session_restore_pane_cwd_missing(&saved_cwd.display().to_string());
             let home = std::env::var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/"));
@@ -631,45 +626,28 @@ fn restore_tab(
                 if let Some(key) = startup.reserved_agent_session.as_deref() {
                     resumed_agent_sessions.remove(key);
                 }
+                let tab_shape = format!("{:?}", snap.custom_name);
                 if was_imported {
                     failed_imports += 1;
-                    error!(
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        tab = ?snap.custom_name,
-                        pane_id = id.raw(),
-                        // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                        err = %e,
-                        "failed to restore imported pane"
+                    crate::logging::session_restore_imported_pane_failed(
+                        &tab_shape,
+                        id.raw(),
+                        &e.to_string(),
                     );
                 }
-                error!(
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    tab = ?snap.custom_name,
-                    pane_id = id.raw(),
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    err = %e,
-                    "failed to restore pane, skipping"
-                );
+                crate::logging::session_restore_pane_failed(&tab_shape, id.raw(), &e.to_string());
             }
         }
     }
 
     if panes.is_empty() {
-        warn!(
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            tab = ?snap.custom_name,
-            "no panes could be restored for tab, dropping it"
-        );
+        crate::logging::session_restore_tab_no_panes(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
     }
 
     let surviving: HashSet<PaneId> = panes.keys().copied().collect();
     let Some(node) = prune_restored_node(node, &surviving) else {
-        warn!(
-            // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-            tab = ?snap.custom_name,
-            "restored tab lost all panes after pruning missing layout nodes"
-        );
+        crate::logging::session_restore_tab_pruned_empty(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
     };
     let pane_ids = collect_pane_ids(&node);

@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+mod env;
 mod io;
 mod keybinds;
-mod model;
+pub(crate) mod model;
 mod sound;
 mod theme;
 
@@ -20,9 +21,9 @@ pub use self::{
     model::{
         validated_prompt_float_lines, validated_sidebar_bounds, validated_sidebar_pane_gap,
         validated_sidebar_row_gap, Config, ConfigReloadReport, ConfigReloadStatus, FileDropMode,
-        IdleConfig, KeysConfig, NewTerminalCwdConfig, PanelScopeConfig, PeerConfig,
-        ServerStateMarkConfig, ShellModeConfig, TabModeConfig, ToastClipboardPosition, ToastConfig,
-        ToastDelivery, ToastFlockPosition, UpdateChannelConfig,
+        KeysConfig, NewTerminalCwdConfig, PanelScopeConfig, PeerConfig, ServerStateMarkConfig,
+        ShellModeConfig, TabModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastFlockPosition, UpdateChannelConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
@@ -52,6 +53,70 @@ pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Acquire the config-env serialization lock AND neutralize ambient `FLOCK_*`
+/// environment variables that the config env-layer consumes.
+///
+/// Without this, an ambient alias exported by the surrounding shell — a dev box
+/// or a CI runner that exports `FLOCK_HOST_NAME` — feeds the config env layer a
+/// stray value (and a deprecation diagnostic) that has nothing to do with the
+/// config under test: reloads come back `Partial`, overlay `name` gets
+/// overridden, `diagnostics.is_empty()` assertions trip. The failures are
+/// invisible in isolation on machines that don't export the var and shuffle
+/// across tests/platforms per CI run. Every config-env test holds this guard so
+/// its view of the environment is hermetic. Held for the test's scope.
+#[cfg(test)]
+pub(crate) fn test_config_env_guard() -> (std::sync::MutexGuard<'static, ()>, TestFlockEnvScrub) {
+    let lock = test_config_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let scrub = TestFlockEnvScrub::new();
+    (lock, scrub)
+}
+
+/// RAII scrub of every `FLOCK_*` env var except `FLOCK_CONFIG_PATH` (which the
+/// reload tests set explicitly). Removes them on construction, and on drop
+/// clears anything the test added before restoring the original set — so no
+/// `FLOCK_*` mutation leaks between serialized config-env tests.
+#[cfg(test)]
+pub(crate) struct TestFlockEnvScrub {
+    saved: Vec<(String, std::ffi::OsString)>,
+}
+
+#[cfg(test)]
+impl TestFlockEnvScrub {
+    fn scrubbable() -> Vec<String> {
+        std::env::vars_os()
+            .filter_map(|(k, _)| {
+                let ks = k.to_string_lossy();
+                (ks.starts_with("FLOCK_") && ks != "FLOCK_CONFIG_PATH").then(|| ks.into_owned())
+            })
+            .collect()
+    }
+
+    fn new() -> Self {
+        let saved: Vec<(String, std::ffi::OsString)> = Self::scrubbable()
+            .into_iter()
+            .filter_map(|k| std::env::var_os(&k).map(|v| (k, v)))
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestFlockEnvScrub {
+    fn drop(&mut self) {
+        for k in Self::scrubbable() {
+            std::env::remove_var(k);
+        }
+        for (k, v) in &self.saved {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 impl Config {
     pub fn should_show_onboarding(&self) -> bool {
         self.onboarding.unwrap_or(true)
@@ -73,6 +138,7 @@ impl Config {
             .chain(keybind_diags)
             .chain(self.ui.sound.diagnostics())
             .chain(self.ui.idle.diagnostics())
+            .chain(self.gossip.diagnostics())
             .collect()
     }
 

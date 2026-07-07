@@ -1090,12 +1090,14 @@ impl AppState {
         self.tab_mode == crate::config::TabModeConfig::Workspace && self.active.is_some()
     }
 
-    /// The member tab-strip content (#33): the active workspace's project
-    /// section in sidebar visual order — primary first, then the remaining
-    /// members in storage order. Local rows only (selecting a remote row is
-    /// a server switch, not a member switch) and collapse state is ignored:
-    /// the strip always shows the whole session. Sectionless workspaces
-    /// (pending probe, misc) get a single-member strip.
+    /// The member tab-strip content (#33 + #102 part 3): the active
+    /// workspace's project section — primary first, then the remaining
+    /// members sorted alphabetically by branch/label (with checkout-key
+    /// as tie-break for reproducibility). Local rows only (selecting a
+    /// remote row is a server switch, not a member switch); collapse
+    /// state is ignored — the strip always shows the whole session.
+    /// Sectionless workspaces (pending probe, misc) get a single-member
+    /// strip.
     pub(crate) fn workspace_strip_members(&self) -> Vec<usize> {
         let Some(active) = self.active.filter(|idx| *idx < self.workspaces.len()) else {
             return Vec::new();
@@ -1114,9 +1116,24 @@ impl AppState {
         else {
             return members;
         };
-        std::iter::once(primary)
-            .chain(members.into_iter().filter(|idx| *idx != primary))
-            .collect()
+        // Branch-alphabetical sort of the non-primary members. The
+        // branch is the member's most stable identity in a workspace
+        // strip; display name (with #62 grammar) collapses when the
+        // branch is missing. Ties fall back on ws_idx so drag reorder
+        // still has a deterministic starting order.
+        let mut rest: Vec<usize> = members.into_iter().filter(|idx| *idx != primary).collect();
+        rest.sort_by(|&a, &b| {
+            let ka = self.workspaces[a]
+                .branch()
+                .map(|b| b.to_ascii_lowercase())
+                .unwrap_or_else(|| self.workspaces[a].display_name().to_ascii_lowercase());
+            let kb = self.workspaces[b]
+                .branch()
+                .map(|b| b.to_ascii_lowercase())
+                .unwrap_or_else(|| self.workspaces[b].display_name().to_ascii_lowercase());
+            (ka, a).cmp(&(kb, b))
+        });
+        std::iter::once(primary).chain(rest).collect()
     }
 
     /// The primary row (main checkout) of the ACTIVE workspace's project
@@ -1179,7 +1196,7 @@ impl AppState {
             crate::logging::workspace_focused(&workspace_id);
             self.mark_session_dirty();
             if matches!(
-                self.agent_panel_scope,
+                self.agent_panel_scope(),
                 crate::app::state::AgentPanelScope::CurrentWorkspace
             ) {
                 self.agent_panel_scroll = 0;
@@ -1223,7 +1240,7 @@ impl AppState {
         self.mark_session_dirty();
         if workspace_changed
             && matches!(
-                self.agent_panel_scope,
+                self.agent_panel_scope(),
                 crate::app::state::AgentPanelScope::CurrentWorkspace
             )
         {
@@ -1500,6 +1517,11 @@ impl AppState {
         self.switch_workspace(prev);
     }
 
+    // #102 open question: since the spaces list now sorts on
+    // `sort_family_key` / project-key display, drag-reorder never sticks
+    // — the next render puts rows back in alphabetical order. Kept for
+    // now (drag targets still compile and mutate storage) pending the
+    // user's call on whether to remove it entirely.
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) {
         if source_idx >= self.workspaces.len() || insert_idx > self.workspaces.len() {
             return;
@@ -1543,6 +1565,10 @@ impl AppState {
         self.refresh_tab_bar_view();
     }
 
+    // #102 open question: tabs render in `(display_name, tab.number)`
+    // sort order (see `Workspace::tab_display_order`), so a drag-reorder
+    // is transient — the next render re-sorts. Kept compiling pending
+    // the user's call on whether to remove.
     pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) {
         if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
             if ws.move_tab(source_idx, insert_idx) {
@@ -1797,7 +1823,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             self.view.sidebar_rect,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         let metrics = crate::ui::agent_panel_scroll_metrics(self, detail_area);
         let visible = metrics.viewport_rows;
@@ -2818,7 +2844,7 @@ impl AppState {
                 self.latest_release_notes_available = true;
                 self.update_dismissed = true;
                 if matches!(
-                    self.toast_config.delivery,
+                    self.toast_config().delivery,
                     crate::config::ToastDelivery::Flock
                 ) {
                     self.toast = Some(ToastNotification {
@@ -3107,11 +3133,7 @@ impl AppState {
                 continue;
             }
             if terminal.evict_session_ref(session_ref) {
-                tracing::info!(
-                    // guardrails-ok(no-raw-trace-fields): migrate to the logging.rs facade (logging redesign)
-                    terminal_id = ?terminal_id,
-                    "evicted duplicate agent session ref"
-                );
+                crate::logging::terminal_duplicate_session_ref_evicted(&terminal_id.to_string());
                 changed = true;
             }
         }
@@ -3141,18 +3163,18 @@ impl AppState {
         }
         let seen = pane.seen;
 
-        if self.local_sound_playback && self.sound.allows(change.known_agent) {
+        if self.local_sound_playback && self.sound_config().allows(change.known_agent) {
             if let Some(sound) = notification_sound_for_state_change(
                 suppress_active_tab_notifications,
                 change.previous_state,
                 change.state,
             ) {
-                crate::sound::play(sound, &self.sound);
+                crate::sound::play(sound, self.sound_config());
             }
         }
 
         if matches!(
-            self.toast_config.delivery,
+            self.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         ) {
             if let (Some(agent_label), Some(kind)) = (
@@ -4114,11 +4136,11 @@ mod tests {
     #[test]
     fn update_ready_sets_explicit_upgrade_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let updates = state.handle_app_event(crate::events::AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(updates.is_empty());
@@ -4128,7 +4150,7 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `flock update`, then follow its restart guidance"
+            "detach, run `flk update`, then follow its restart guidance"
         );
     }
 
@@ -4160,7 +4182,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4192,7 +4214,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4207,7 +4229,7 @@ mod tests {
     fn focus_agent_entry_succeeds_for_already_focused_agent() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::AllWorkspaces);
         mark_agent(&mut state, 0, 0, root);
 
         assert!(state.focus_agent_entry(0));
@@ -4230,7 +4252,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::CurrentWorkspace;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::CurrentWorkspace);
         mark_agent(&mut state, 0, 0, first_root);
         mark_agent(&mut state, 0, 0, first_second);
         mark_agent(&mut state, 1, 0, second_root);
@@ -4255,7 +4277,7 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Terminal;
-        state.agent_panel_scope = crate::app::state::AgentPanelScope::CurrentWorkspace;
+        state.set_agent_panel_scope(crate::app::state::AgentPanelScope::CurrentWorkspace);
         for tab_idx in 0..state.workspaces[0].tabs.len() {
             let pane_id = state.workspaces[0].tabs[tab_idx].root_pane;
             mark_agent(&mut state, 0, tab_idx, pane_id);
@@ -4304,6 +4326,28 @@ mod tests {
         state.switch_workspace(1);
         state.collapsed_space_keys.insert("repo-key".into());
         assert_eq!(state.workspace_strip_members(), vec![0, 1, 2]);
+    }
+
+    /// #102 part 3: workspace-member strip renders primary first, then
+    /// the remaining members branch-alphabetically — NOT storage order.
+    /// Storage order here would be `[0, 1, 2, 3]` (main, then wt-one,
+    /// wt-two, wt-three) — but with branches `zeta`, `alpha`, `middle`
+    /// the strip must sort to `[0 (main), 2 (alpha), 3 (middle), 1 (zeta)]`.
+    #[test]
+    fn workspace_strip_members_sort_non_primary_by_branch_alphabetical() {
+        let mut state = app_with_workspaces(&["main", "wt-one", "wt-two", "wt-three"]);
+        mark_parent_worktree(&mut state, 0);
+        mark_linked_worktree(&mut state, 1);
+        mark_linked_worktree(&mut state, 2);
+        mark_linked_worktree(&mut state, 3);
+        state.workspaces[0].cached_git_branch = Some("main".into());
+        state.workspaces[1].cached_git_branch = Some("zeta".into());
+        state.workspaces[2].cached_git_branch = Some("alpha".into());
+        state.workspaces[3].cached_git_branch = Some("middle".into());
+        state.tab_mode = crate::config::TabModeConfig::Workspace;
+        state.switch_workspace(2);
+
+        assert_eq!(state.workspace_strip_members(), vec![0, 2, 3, 1]);
     }
 
     /// #33/#29 — in workspace tab-mode, switch_tab acts on the strip's
@@ -4955,7 +4999,7 @@ mod tests {
     fn background_waiting_sets_attention_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -4980,7 +5024,7 @@ mod tests {
     fn hook_reported_unknown_agent_sets_toast_title_from_label() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::HookStateReported {
@@ -5004,7 +5048,7 @@ mod tests {
     fn visible_blocker_overrides_hook_working_and_notifies() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
         let bg_terminal_id = state.workspaces[1]
             .panes
@@ -5057,7 +5101,7 @@ mod tests {
     fn reserved_native_state_report_does_not_override_screen_state() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         let terminal_id = state.workspaces[0]
             .panes
@@ -5181,7 +5225,7 @@ mod tests {
     fn background_idle_sets_finished_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
         let bg_terminal_id = state.workspaces[1]
             .panes
@@ -5216,7 +5260,7 @@ mod tests {
     fn background_toast_includes_tab_name_when_workspace_has_multiple_tabs() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         state.workspaces[1].tabs[0].set_custom_name("main".into());
         let second_tab = state.workspaces[1].test_add_tab(Some("logs"));
         state.ensure_test_terminals();
@@ -5244,7 +5288,7 @@ mod tests {
     fn background_tab_in_active_workspace_still_sets_toast() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         state.workspaces[0].tabs[0].set_custom_name("main".into());
         let second_tab = state.workspaces[0].test_add_tab(Some("logs"));
         state.ensure_test_terminals();
@@ -5272,7 +5316,7 @@ mod tests {
     fn active_workspace_active_tab_does_not_set_toast() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -5295,7 +5339,7 @@ mod tests {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
         state.outer_terminal_focus = Some(false);
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -5324,11 +5368,11 @@ mod tests {
     #[test]
     fn update_ready_sets_manual_update_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let updates = state.handle_app_event(AppEvent::UpdateReady {
             version: "0.5.0".into(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         });
 
         assert!(updates.is_empty());
@@ -5340,14 +5384,14 @@ mod tests {
         assert_eq!(toast.title, "v0.5.0 available");
         assert_eq!(
             toast.context,
-            "detach, run `flock update`, then follow its restart guidance"
+            "detach, run `flk update`, then follow its restart guidance"
         );
     }
 
     #[test]
     fn update_ready_uses_event_install_command_in_toast() {
         let mut state = AppState::test_new();
-        state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         state.handle_app_event(AppEvent::UpdateReady {
             version: "0.5.0".into(),
