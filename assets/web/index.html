@@ -11,8 +11,8 @@
   as binary WS frames; xterm.js writes them straight to the buffer. The flock
   client enables mouse reporting (DECSET 1000/1006) over that same stream, so
   xterm forwards mouse/wheel back through term.onData automatically; this page
-  adds touch→mouse mapping for phones (#130), an on-screen CLI key bar (#129),
-  and an auto-hiding status badge (#128).
+  adds touch→mouse mapping for phones, a top-pinned on-screen CLI key bar, and
+  an auto-hiding status badge. Web/mobile ergonomics are tracked in #132.
 
   Vendored offline (no CDN): xterm assets in ./vendor/, embedded in the flock
   binary, so the phone needs only the tailnet.
@@ -30,17 +30,26 @@
 </script>
 <link rel="stylesheet" href="vendor/xterm.min.css">
 <style>
-  :root { --keybar-h: 40px; }
+  :root { --keybar-h: 40px; --vvh: 100%; }
   html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; color: #c0caf5; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  /* Leave room for the key bar at the bottom (#129). */
-  #term { position: absolute; top: 0; left: 0; right: 0; bottom: var(--keybar-h); }
+  /* #132 — the key bar sits at the TOP. iOS Safari overlays the soft keyboard
+     on the bottom of the layout viewport without shrinking it, so a
+     bottom-pinned bar disappears behind the keyboard exactly when its keys
+     (Esc/Ctrl/arrows/prefix) are needed. Top placement keeps it always
+     visible. The terminal fills the space below, sized to the *visual*
+     viewport (--vvh, updated from visualViewport.height) so the active line
+     stays above the keyboard rather than behind it. */
+  #term {
+    position: fixed; top: var(--keybar-h); left: 0; right: 0;
+    height: calc(var(--vvh) - var(--keybar-h));
+  }
 
   /* #128 — status badge. Top-right, but auto-hides a couple seconds after
      'connected' so it stops covering flock's server/repo header; it returns
      for connecting/disconnected/error. */
   #status {
-    position: fixed; top: 8px; right: 12px; font-size: 11px;
+    position: fixed; top: calc(var(--keybar-h) + 8px); right: 12px; font-size: 11px;
     padding: 3px 8px; border-radius: 4px;
     background: rgba(0,0,0,0.55); z-index: 10;
     transition: opacity 0.6s ease; opacity: 0.85; pointer-events: none;
@@ -49,14 +58,15 @@
   #status.bad { color: #f7768e; }
   #status.hidden { opacity: 0; }
 
-  /* #129 — on-screen CLI key bar. The iOS soft keyboard has no Esc/Tab/Ctrl/
+  /* On-screen CLI key bar (#132). The iOS soft keyboard has no Esc/Tab/Ctrl/
      arrows/pipe and no way to send the flock prefix; this bar emits the right
-     bytes over the existing WS. */
+     bytes over the existing WS. Pinned to the top (see #term) so the keyboard
+     can't hide it. */
   #keybar {
-    position: fixed; left: 0; right: 0; bottom: 0; height: var(--keybar-h);
+    position: fixed; left: 0; right: 0; top: 0; height: var(--keybar-h);
     display: flex; gap: 4px; align-items: center;
     padding: 0 6px; box-sizing: border-box;
-    background: #16161e; border-top: 1px solid #2a2b3c;
+    background: #16161e; border-bottom: 1px solid #2a2b3c;
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
     z-index: 11;
   }
@@ -267,16 +277,28 @@
   });
 
   // ── resize plumbing ──────────────────────────────────────────────────
+  // #132: track the *visual* viewport height so #term shrinks to the area
+  // above the soft keyboard (iOS doesn't shrink the layout viewport when the
+  // keyboard opens). Falls back to innerHeight where visualViewport is absent.
+  function applyViewport() {
+    const vv = window.visualViewport;
+    const h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--vvh", h + "px");
+  }
   function doFit() {
+    applyViewport();
     try {
       fit.fit();
       const { cols, rows } = term;
       sendCtrl({ type: "resize", cols, rows });
     } catch (_) { /* ignore until ws is open */ }
   }
+  applyViewport();
   window.addEventListener("resize", doFit);
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", doFit);
+    // Keyboard show/hide also scrolls the visual viewport; keep #term synced.
+    window.visualViewport.addEventListener("scroll", applyViewport);
   }
 
   // Focus on tap (helps iOS show the soft keyboard).

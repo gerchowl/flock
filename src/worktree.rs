@@ -698,6 +698,46 @@ pub(crate) fn branch_merge_gate(
     WorktreeMergeGate::NotMerged
 }
 
+/// Upper bound on how long the kill dialog waits for the merge gate before it
+/// gives up (#119). `branch_merge_gate` shells out to `gh pr view` — a network
+/// call with no timeout of its own — so an offline/unauthenticated/slow `gh`
+/// would otherwise wedge the dialog on "checking merge status…" forever.
+pub(crate) const MERGE_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Run the merge gate with a hard wall-clock bound. Returns `(gate, timed_out)`:
+/// on timeout the gate degrades to the safe `NotMerged` (checkout-only, branch
+/// kept) and `timed_out` is `true` so the dialog can label it honestly. The
+/// worker keeps running in the background — a genuinely hung `gh` is orphaned
+/// rather than killed, which is fine: nothing reads its result and it exits on
+/// its own network timeout.
+pub(crate) fn branch_merge_gate_with_timeout(
+    repo_root: PathBuf,
+    checkout: PathBuf,
+    branch: String,
+) -> (WorktreeMergeGate, bool) {
+    resolve_gate_with_timeout(
+        move || branch_merge_gate(&repo_root, &checkout, &branch),
+        MERGE_GATE_TIMEOUT,
+    )
+}
+
+/// Bound any gate computation by `timeout`. Extracted from
+/// [`branch_merge_gate_with_timeout`] so the timeout policy is testable without
+/// shelling out to `gh`/git.
+fn resolve_gate_with_timeout<F>(work: F, timeout: std::time::Duration) -> (WorktreeMergeGate, bool)
+where
+    F: FnOnce() -> WorktreeMergeGate + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(gate) => (gate, false),
+        Err(_) => (WorktreeMergeGate::NotMerged, true),
+    }
+}
+
 /// `git branch -D <branch>` in `repo_root`. Only called once the merge gate
 /// produced positive evidence; -D because -d judges merges against the
 /// current HEAD, not the default branch.
@@ -1269,6 +1309,40 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_gate_with_timeout_returns_fast_result_untimed() {
+        let (gate, timed_out) = resolve_gate_with_timeout(
+            || WorktreeMergeGate::Merged {
+                evidence: "PR #1 merged".into(),
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: "PR #1 merged".into()
+            }
+        );
+        assert!(!timed_out, "a fast gate must not be marked timed out");
+    }
+
+    #[test]
+    fn resolve_gate_with_timeout_degrades_to_not_merged_on_timeout() {
+        // The work outlives the timeout (simulating a hung `gh pr view`): the
+        // gate must degrade to the safe NotMerged and flag the timeout.
+        let (gate, timed_out) = resolve_gate_with_timeout(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                WorktreeMergeGate::Merged {
+                    evidence: "too late".into(),
+                }
+            },
+            std::time::Duration::from_millis(30),
+        );
+        assert_eq!(gate, WorktreeMergeGate::NotMerged);
+        assert!(timed_out, "a gate slower than the bound must be timed out");
     }
 
     #[test]

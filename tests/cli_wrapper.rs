@@ -265,6 +265,11 @@ fn spawn_flock_with_config(
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
+    // Ambient deprecated aliases (a shell/CI runner may export FLOCK_HOST_NAME)
+    // otherwise make the server's reload-config return `partial` on a stray
+    // deprecation diagnostic — keep the spawned server hermetic.
+    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env_remove("FLOCK_DISABLE_SOUND");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -1401,7 +1406,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 21"),
+        full_stdout.contains("  protocol: 23"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -1434,7 +1439,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 21"),
+        server_stdout.contains("protocol: 23"),
         "stdout: {server_stdout}"
     );
 
@@ -1446,7 +1451,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 21"),
+        client_stdout.contains("protocol: 23"),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -1456,7 +1461,7 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 21);
+    assert_eq!(full_json["client"]["protocol"], 23);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
@@ -1470,12 +1475,12 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 21);
+    assert_eq!(server_json["protocol"], 23);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 21);
+    assert_eq!(client_json["protocol"], 23);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));

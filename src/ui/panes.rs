@@ -576,10 +576,14 @@ pub(super) fn render_prompt_history_panel(
         return;
     };
     let p = &app.palette;
+    // One panel surface, threaded through the fill, border, markers, and every
+    // line style — `panel_bg` with a `surface_dim` fallback so the dropdown
+    // reads with contrast instead of a near-black box (#115).
+    let bg_color = panel_background(p);
     let buf = frame.buffer_mut();
 
     // Solid background fill so it sits cleanly over the pane content.
-    let bg = Style::default().bg(p.surface_dim);
+    let bg = Style::default().bg(bg_color);
     for y in panel.y..panel.y + panel.height {
         for x in panel.x..panel.x + panel.width {
             buf[(x, y)].set_symbol(" ");
@@ -587,7 +591,7 @@ pub(super) fn render_prompt_history_panel(
         }
     }
 
-    let border_style = Style::default().fg(p.overlay0).bg(p.surface_dim);
+    let border_style = Style::default().fg(p.overlay0).bg(bg_color);
     let title = format!(" prompt history ({}) ", terminal.prompt_history.len());
     let title_truncated = truncate_label(&title, panel.width.saturating_sub(2) as usize);
     let block = Block::default()
@@ -627,7 +631,7 @@ pub(super) fn render_prompt_history_panel(
     // Subtle scroll indicators when there is more content above or below.
     let has_above = offset < max_offset;
     let has_below = offset > 0;
-    let marker_style = Style::default().fg(p.overlay0).bg(p.surface_dim);
+    let marker_style = Style::default().fg(p.overlay0).bg(bg_color);
     if has_above && inner.width >= 1 {
         let top_y = inner.y;
         buf[(panel.x + panel.width - 1, top_y)].set_symbol("\u{25b4}");
@@ -649,21 +653,18 @@ fn build_prompt_history_lines(
     // Three glanceable tones: prompt = dim subtext (the user's input is
     // history, not signal), reply = cool blue (the agent's prose), recap =
     // warm mauve accent (the disciplined one-line summary, the signal).
-    let prompt_style = Style::default()
-        .fg(palette.subtext0)
-        .bg(palette.surface_dim);
-    let recap_style = Style::default().fg(palette.mauve).bg(palette.surface_dim);
-    let reply_style = Style::default().fg(palette.blue).bg(palette.surface_dim);
-    let chrome_style = Style::default()
-        .fg(palette.overlay0)
-        .bg(palette.surface_dim);
+    // Shared panel surface (#115): `panel_bg` with a `surface_dim` fallback,
+    // matching the fill so line backgrounds don't read as a black box.
+    let bg_color = panel_background(&palette);
+    let prompt_style = Style::default().fg(palette.subtext0).bg(bg_color);
+    let recap_style = Style::default().fg(palette.mauve).bg(bg_color);
+    let reply_style = Style::default().fg(palette.blue).bg(bg_color);
+    let chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
     // For body lines that look like leaked harness markup
     // (`<task-notification>`, `<task-id>`, ...): keep the entry's tone but
     // dim it so chrome reads as chrome. Defense-in-depth — the hook also
     // filters task-notification blocks at the source.
-    let xml_chrome_style = Style::default()
-        .fg(palette.overlay0)
-        .bg(palette.surface_dim);
+    let xml_chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
     let width = width as usize;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -982,7 +983,7 @@ fn automatic_selection_style(
 
 fn automatic_selection_bg(p: &Palette, host_theme: crate::terminal_theme::TerminalTheme) -> Color {
     let Some(background) = host_theme.background.map(terminal_theme_to_rgb) else {
-        return selection_palette_background(p);
+        return panel_background(p);
     };
 
     let target = if relative_luminance(background) < 0.5 {
@@ -994,7 +995,11 @@ fn automatic_selection_bg(p: &Palette, host_theme: crate::terminal_theme::Termin
     Color::Rgb(selected.0, selected.1, selected.2)
 }
 
-fn selection_palette_background(p: &Palette) -> Color {
+/// The panel/overlay background: the theme's `panel_bg`, falling back to
+/// `surface_dim` only when the palette leaves it transparent (`Reset`). Shared
+/// by the selection tint and the prompt-history panel (#115) so both read with
+/// contrast on themes where `surface_dim` resolves near-black.
+fn panel_background(p: &Palette) -> Color {
     if p.panel_bg == Color::Reset {
         p.surface_dim
     } else {
@@ -1598,6 +1603,42 @@ mod tests {
         assert!(rect.height >= 4, "panel reserves at least border + content");
         // 70% of 30 = 21 rows, panel is bounded near that.
         assert!(rect.height <= 21);
+    }
+
+    #[test]
+    fn prompt_history_lines_paint_panel_bg_not_surface_dim() {
+        let mut app = AppState::test_new();
+        // Distinct, non-Reset panel_bg vs a near-black surface_dim — the bug
+        // painted every line on surface_dim, reading as a black box (#115).
+        app.palette.panel_bg = Color::Rgb(10, 20, 30);
+        app.palette.surface_dim = Color::Rgb(0, 0, 0);
+
+        let ws = crate::workspace::Workspace::test_new("main");
+        let pane_id = ws.focused_pane_id().unwrap();
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("hello".into());
+        app.terminals.insert(terminal_id.clone(), terminal);
+        app.workspaces = vec![ws];
+
+        let terminal_ref = app.terminals.get(&terminal_id).unwrap();
+        let lines = build_prompt_history_lines(terminal_ref, app.palette.clone(), 40);
+        assert!(!lines.is_empty(), "recorded prompt should render lines");
+
+        let mut saw_panel_bg = false;
+        for line in &lines {
+            for span in &line.spans {
+                assert_ne!(
+                    span.style.bg,
+                    Some(Color::Rgb(0, 0, 0)),
+                    "no line span may paint the near-black surface_dim"
+                );
+                if span.style.bg == Some(Color::Rgb(10, 20, 30)) {
+                    saw_panel_bg = true;
+                }
+            }
+        }
+        assert!(saw_panel_bg, "line spans must paint the panel_bg surface");
     }
 
     #[test]

@@ -652,6 +652,16 @@ mod tests {
         member(&mut app, 0, false);
         member(&mut app, 1, true);
         member(&mut app, 2, true);
+        // Pin equal branches so the strip's branch-alphabetical member sort
+        // ties and falls back to insertion (ws_idx) order. Without this the
+        // order is non-hermetic: `Workspace::test_new` seeds `cached_git_branch`
+        // from the ambient cwd's git branch, so a normal checkout (all three
+        // share the branch → tie → ws_idx order) and a detached-HEAD CI
+        // checkout (branch() is None → sort falls back to display_name →
+        // alphabetical) render the members in different orders.
+        for ws in &mut app.workspaces {
+            ws.cached_git_branch = Some("section".into());
+        }
         app.ensure_test_terminals();
         app.active = Some(0);
         app.selected = 0;

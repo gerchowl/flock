@@ -844,6 +844,13 @@ pub struct WorktreeRemoveState {
     pub branch: Option<String>,
     /// None while the merge check is still running (kill flow only).
     pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
+    /// The branch resolved to the repo's default branch, so the kill flow
+    /// pinned it checkout-only and kept the branch (#121). Drives the dialog's
+    /// "protected (default)" line.
+    pub branch_protected: bool,
+    /// The merge gate timed out (#119): the checkout-only fallback is shown
+    /// with an "unknown (timed out)" note rather than "no merge evidence".
+    pub gate_timed_out: bool,
 }
 
 /// One worktree's row in the fleet-wide kill sweep (#81).

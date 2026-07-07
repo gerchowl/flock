@@ -2743,6 +2743,9 @@ pub(crate) fn sibling_workspace_create_failed(err: &str) {
 // Level stays WARN — the server keeps running with the OS default
 // (`ulimit -n`) but a packed fleet may hit accept() ceilings sooner.
 
+// macOS-only: the sole caller is platform::macos (nofile raise is macOS-
+// specific). Gated so a Linux build doesn't flag it dead under `-D warnings`.
+#[cfg(target_os = "macos")]
 pub(crate) fn server_nofile_raise_failed(err: &str) {
     tracing::warn!(
         event = "platform.nofile.raise",
@@ -4595,6 +4598,7 @@ mod tests {
 
     // ------ logging redesign PR-7: misc singletons -------------------------
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn server_nofile_raise_failed_is_warn() {
         let out = capture_logs(|| server_nofile_raise_failed("EPERM"));
