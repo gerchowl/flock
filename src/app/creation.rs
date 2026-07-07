@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use tracing::error;
-
 use super::{
     api_helpers::{pane_agent_status, tab_attention_priority},
     App, Mode,
@@ -61,7 +59,7 @@ impl App {
             .and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
         let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
         if let Err(e) = self.create_workspace_with_options(initial_cwd, true) {
-            error!(err = %e, "failed to create workspace");
+            crate::logging::workspace_create_failed(&e.to_string());
             self.state.mode = Mode::Navigate;
         }
     }
@@ -96,7 +94,7 @@ impl App {
                 }
             }
             Err(e) => {
-                error!(err = %e, "failed to create tab");
+                crate::logging::tab_create_failed(&e.to_string());
             }
         }
     }
@@ -138,7 +136,7 @@ impl App {
                 self.schedule_session_save();
             }
             Err(e) => {
-                error!(err = %e, "failed to create sibling workspace");
+                crate::logging::sibling_workspace_create_failed(&e.to_string());
             }
         }
     }

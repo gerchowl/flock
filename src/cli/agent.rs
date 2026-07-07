@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{
     AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
     AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
@@ -32,12 +37,12 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
     if separator == args.len() - 1 {
@@ -117,7 +122,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock agent list");
+        eprintln!("usage: flk agent list");
         return Ok(2);
     }
 
@@ -129,11 +134,11 @@ fn agent_list(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: flock agent get <target>");
+        eprintln!("usage: flk agent get <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock agent get <target>");
+        eprintln!("usage: flk agent get <target>");
         return Ok(2);
     }
 
@@ -147,11 +152,11 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: flock agent focus <target>");
+        eprintln!("usage: flk agent focus <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock agent focus <target>");
+        eprintln!("usage: flk agent focus <target>");
         return Ok(2);
     }
 
@@ -165,7 +170,7 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_attach(args: &[String]) -> std::io::Result<i32> {
     let (target, takeover) =
-        match super::parse_attach_target(args, "usage: flock agent attach <target> [--takeover]") {
+        match super::parse_attach_target(args, "usage: flk agent attach <target> [--takeover]") {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -185,7 +190,9 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: flock agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+        eprintln!(
+            "usage: flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]"
+        );
         return Ok(2);
     };
 
@@ -212,7 +219,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                 index += 2;
             }
             "help" | "--help" | "-h" => {
-                eprintln!("usage: flock agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+                eprintln!("usage: flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
                 return Ok(0);
             }
             other => {
@@ -286,11 +293,11 @@ fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: flock agent rename <target> <name>|--clear");
+        eprintln!("usage: flk agent rename <target> <name>|--clear");
         return Ok(2);
     };
     if args.len() < 2 {
-        eprintln!("usage: flock agent rename <target> <name>|--clear");
+        eprintln!("usage: flk agent rename <target> <name>|--clear");
         return Ok(2);
     }
     let name = if args.len() == 2 && args[1] == "--clear" {
@@ -310,7 +317,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_send(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock agent send <target> <text>");
+        eprintln!("usage: flk agent send <target> <text>");
         return Ok(2);
     }
 
@@ -325,7 +332,7 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: flock agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
@@ -412,16 +419,16 @@ fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
 }
 
 fn print_agent_help() {
-    eprintln!("flock agent commands:");
-    eprintln!("  flock agent list");
-    eprintln!("  flock agent get <target>");
-    eprintln!("  flock agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  flock agent send <target> <text>");
-    eprintln!("  flock agent rename <target> <name>|--clear");
-    eprintln!("  flock agent focus <target>");
-    eprintln!("  flock agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
-    eprintln!("  flock agent attach <target> [--takeover]");
-    eprintln!("  flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("flk agent commands:");
+    eprintln!("  flk agent list");
+    eprintln!("  flk agent get <target>");
+    eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  flk agent send <target> <text>");
+    eprintln!("  flk agent rename <target> <name>|--clear");
+    eprintln!("  flk agent focus <target>");
+    eprintln!("  flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+    eprintln!("  flk agent attach <target> [--takeover]");
+    eprintln!("  flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"

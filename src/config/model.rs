@@ -1,4 +1,5 @@
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -27,7 +28,7 @@ impl UpdateChannelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UpdateConfig {
     pub channel: UpdateChannelConfig,
@@ -94,7 +95,7 @@ impl PanelScopeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
 impl RightClickPassthroughModifierConfig {
@@ -147,7 +148,7 @@ fn parse_right_click_passthrough_modifier(value: &str) -> Option<Option<KeyModif
     (!modifiers.is_empty()).then_some(Some(modifiers))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToastConfig {
     pub delivery: ToastDelivery,
     pub delay_seconds: u64,
@@ -175,6 +176,20 @@ pub enum NewTerminalCwdConfig {
     Home,
     Current,
     Path(String),
+}
+
+// Serialize mirrors the string forms Deserialize accepts, so the derived
+// default config round-trips (ADR-0002 phase g). A derived Serialize emitted
+// enum tagging ({"Path": …}) that the string-form Deserialize rejects.
+impl Serialize for NewTerminalCwdConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Follow => serializer.serialize_str("follow"),
+            Self::Home => serializer.serialize_str("home"),
+            Self::Current => serializer.serialize_str("current"),
+            Self::Path(path) => serializer.serialize_str(path),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for NewTerminalCwdConfig {
@@ -244,7 +259,7 @@ pub enum FileDropMode {
     Auto,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
@@ -255,7 +270,7 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
@@ -313,7 +328,70 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Default bind for `flk web` — loopback only, xterm.js port.
+pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:7681";
+
+/// Default concurrent-session cap for `flk web` — a PTY-exhaustion backstop,
+/// generous for a personal fleet. `0` disables the cap.
+pub const DEFAULT_WEB_MAX_SESSIONS: usize = 16;
+
+/// `flk web` configuration (ADR-0002 phase e). The web bridge previously
+/// carried a parallel config universe (six `FLOCK_WEB_*` env reads + CLI
+/// flags, no file). This section folds every persistent knob into the real
+/// [`Config`], so the generic env layer, overlay deep-merge, and drift-proofing
+/// all apply.
+///
+/// Precedence at runtime: `[web]` in config (with env<file<overlay merged in)
+/// < CLI flags. The scalar env reads (BIND / SESSION / FLOCK_BIN /
+/// MAX_SESSIONS / IDLE_TIMEOUT_SECS) are subsumed by the generic
+/// `FLOCK_<UPPER_SNAKE>` layer (ADR-0002 phase d). List-valued env vars
+/// (`FLOCK_WEB_ALLOWED_ORIGINS` / `FLOCK_WEB_ALLOWED_USERS`) keep CSV parsing
+/// as a documented web-only exception, applied only when the file leaves the
+/// list empty (see `flk web`'s arg parser).
+///
+/// CLI-only booleans (`--allow-non-loopback`, `--allow-funnel`,
+/// `--allow-any-origin`) are per-invocation overrides and are NOT modelled
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WebSectionConfig {
+    /// Listener socket address, e.g. `127.0.0.1:7681`. Parsed at runtime; a
+    /// bad value surfaces via the arg parser's diagnostic. Empty falls back
+    /// to [`DEFAULT_WEB_BIND`].
+    pub bind: String,
+    /// Path to the `flk` binary to spawn per WS connection. Empty means
+    /// "the currently-running executable" (`current_exe()`).
+    pub flock_bin: PathBuf,
+    /// Session name forwarded to the spawned client as `--session <name>`.
+    /// Empty means no `--session` flag.
+    pub session: String,
+    /// Extra allowed WS Origins for the CSWSH check (adds to same-origin).
+    pub allowed_origins: Vec<String>,
+    /// Tailscale identities (`Tailscale-User-Login`) allowed to connect.
+    /// Empty = identity not enforced (loopback / tailnet membership is the
+    /// boundary).
+    pub allowed_users: Vec<String>,
+    /// Concurrent WS sessions allowed (`0` = unlimited).
+    pub max_sessions: usize,
+    /// Close a WS after this long with no inbound frame (`0` = disabled).
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for WebSectionConfig {
+    fn default() -> Self {
+        Self {
+            bind: DEFAULT_WEB_BIND.to_string(),
+            flock_bin: PathBuf::new(),
+            session: String::new(),
+            allowed_origins: Vec::new(),
+            allowed_users: Vec::new(),
+            max_sessions: DEFAULT_WEB_MAX_SESSIONS,
+            idle_timeout_secs: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Friendly display name for THIS node (#42), shown on the local status
@@ -335,6 +413,8 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub slots: SlotsConfig,
+    pub web: WebSectionConfig,
+    pub gossip: GossipConfig,
     pub peers: Vec<PeerConfig>,
 }
 
@@ -507,7 +587,7 @@ pub struct IndexedKeysConfig {
     pub agents: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorktreesConfig {
     /// Root directory under which Flock creates <repo>/<branch-slug> checkouts.
@@ -525,11 +605,117 @@ pub struct WorktreesConfig {
     pub branch_pivot_message: String,
 }
 
+/// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
+/// federated servers-band summaries. Every field defaults to the value the
+/// hardcoded const on `src/peers.rs` shipped with, so an absent `[gossip]`
+/// section preserves behaviour exactly. Bounds are validated via
+/// `diagnostics()`; consumers clamp through `poll_interval()` /
+/// `stale_after()` / `slow_threshold_ms()` so a diagnosed-invalid value
+/// still yields a sane duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GossipConfig {
+    /// Seconds between poll rounds. Minimum 1s (per-round dispatch is bounded
+    /// by the round handler's overlap guard — a slow peer never stacks
+    /// concurrent polls).
+    pub poll_interval_secs: u64,
+    /// Delay before the first poll fires after startup. Purely startup-scoped;
+    /// has no effect on reload.
+    pub initial_delay_secs: u64,
+    /// A peer whose last successful poll is older than this renders as stale.
+    /// Must be at least `poll_interval_secs`, else a round could never refresh
+    /// a peer before it goes stale.
+    pub stale_after_secs: u64,
+    /// Latency (ms) above which a peer renders "slow" (yellow dot).
+    pub slow_threshold_ms: u64,
+}
+
+impl Default for GossipConfig {
+    // The consts on peers.rs are the ONE source of truth for the shipped
+    // defaults — GossipConfig::default() reads them so both the sim path (the
+    // fleet-snapshot rendering, which still calls is_stale()/reachability())
+    // and the configured path resolve to the same numbers when [gossip] is
+    // absent.
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: crate::peers::PEER_POLL_INTERVAL_SECS,
+            initial_delay_secs: crate::peers::PEER_POLL_INITIAL_DELAY_SECS,
+            stale_after_secs: crate::peers::PEER_STALE_AFTER_SECS,
+            slow_threshold_ms: crate::peers::PEER_SLOW_LATENCY_MS,
+        }
+    }
+}
+
+impl GossipConfig {
+    /// Effective poll interval, clamped to `>= 1s` so a diagnosed-invalid `0`
+    /// still yields a live duration (matches the diagnostics-first contract).
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_interval_secs.max(1))
+    }
+
+    /// Effective initial delay. Any value is accepted (0 = poll immediately).
+    pub fn initial_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.initial_delay_secs)
+    }
+
+    /// Effective staleness threshold, clamped to `>= poll_interval()` so a
+    /// slow-poll fleet never chases its own tail (a peer that just polled
+    /// would otherwise be flagged stale before the next round fires).
+    pub fn stale_after(&self) -> std::time::Duration {
+        let floor = self.poll_interval_secs.max(1);
+        std::time::Duration::from_secs(self.stale_after_secs.max(floor))
+    }
+
+    /// Effective slow-latency threshold in milliseconds. Clamped `>= 1` — a
+    /// zero threshold would flag every peer as slow, defeating the signal.
+    pub fn slow_threshold_ms(&self) -> u64 {
+        self.slow_threshold_ms.max(1)
+    }
+
+    /// Resolve the effective poll interval for one peer: the per-peer override
+    /// (`[[peers]] poll_interval_secs`) when set and `>= 1`, else the global
+    /// `[gossip] poll_interval`. The clamp mirrors `poll_interval()` so a
+    /// diagnosed-invalid override still produces a live duration.
+    pub fn effective_poll_interval(&self, peer: &PeerConfig) -> std::time::Duration {
+        match peer.poll_interval_secs {
+            Some(secs) if secs >= 1 => std::time::Duration::from_secs(secs),
+            _ => self.poll_interval(),
+        }
+    }
+
+    /// Config diagnostics surfaced via the standard `collect_diagnostics`
+    /// path (matches `IdleConfig::diagnostics`): lower-bound + relative
+    /// sanity checks. Consumers clamp so the running fleet stays live.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.poll_interval_secs < 1 {
+            out.push(format!(
+                "[gossip] poll_interval_secs ({}) is less than 1; using 1s so poll rounds keep firing",
+                self.poll_interval_secs
+            ));
+        }
+        if self.stale_after_secs < self.poll_interval_secs.max(1) {
+            out.push(format!(
+                "[gossip] stale_after_secs ({}) is less than poll_interval_secs ({}); rows would age out before the next poll",
+                self.stale_after_secs,
+                self.poll_interval_secs.max(1)
+            ));
+        }
+        if self.slow_threshold_ms < 1 {
+            out.push(format!(
+                "[gossip] slow_threshold_ms ({}) is less than 1; every peer would render slow",
+                self.slow_threshold_ms
+            ));
+        }
+        out
+    }
+}
+
 /// A federated peer Flock server. Declared as `[[peers]]` entries. Peers are
 /// polled over SSH for a lightweight workspace/agent summary; their rows fold
 /// into the sidebar's project groups and selecting one switches the client to
 /// that server.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PeerConfig {
     /// Short host badge shown on remote rows (e.g. "anvil"). Required.
@@ -537,8 +723,14 @@ pub struct PeerConfig {
     /// SSH destination used for polling and attach. Defaults to `name`.
     pub ssh: String,
     /// Command run on the peer to fetch its summary. The default wraps the
-    /// flock CLI in a login shell so profile-managed PATHs (nix, brew) apply.
+    /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
     pub summary_command: String,
+    /// Optional per-peer override for the summary poll cadence (#96). Unset
+    /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
+    /// back too — the round handler's overlap guard is the safety net, not a
+    /// license to pile polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
 }
 
 impl Default for PeerConfig {
@@ -547,12 +739,13 @@ impl Default for PeerConfig {
             name: String::new(),
             ssh: String::new(),
             summary_command: default_peer_summary_command().to_string(),
+            poll_interval_secs: None,
         }
     }
 }
 
 pub fn default_peer_summary_command() -> &'static str {
-    "sh -lc 'flock peers summary --json'"
+    "sh -lc 'flk peers summary --json'"
 }
 
 impl PeerConfig {
@@ -648,7 +841,7 @@ impl IdleConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub sidebar_width: u16,
@@ -728,7 +921,7 @@ pub struct UiConfig {
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImeCursorShape {
     Block,
@@ -754,7 +947,7 @@ impl ImeCursorShape {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
@@ -762,7 +955,7 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     /// Add a keepalive fallback under the user's ssh config for the `--remote`
@@ -781,7 +974,7 @@ impl Default for RemoteConfig {
 /// Connection slots (#65): the multi-connection client warms one framed
 /// connection per fleet server in the background and flips between them in
 /// process on a switch, instead of exiting and relaunching an attach leg.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct SlotsConfig {
     /// Master switch for the slots client. Default false: the client keeps the
@@ -815,7 +1008,7 @@ impl Default for SlotsConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Allow launching flock inside an existing flock pane. Default: false.
@@ -1756,5 +1949,176 @@ scrollback_lines = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    // ---- [gossip] — federated-peer poll cadence (#96) ----
+
+    #[test]
+    fn gossip_defaults_match_shipped_consts() {
+        // The consts on peers.rs are the ONE source of truth for the shipped
+        // defaults; GossipConfig::default() MUST match them so an absent
+        // [gossip] section preserves today's behaviour exactly.
+        let gossip = GossipConfig::default();
+        assert_eq!(
+            gossip.poll_interval_secs,
+            crate::peers::PEER_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            gossip.initial_delay_secs,
+            crate::peers::PEER_POLL_INITIAL_DELAY_SECS
+        );
+        assert_eq!(gossip.stale_after_secs, crate::peers::PEER_STALE_AFTER_SECS);
+        assert_eq!(gossip.slow_threshold_ms, crate::peers::PEER_SLOW_LATENCY_MS);
+        // Default Config has [gossip] resolvable — a full defaults round-trip
+        // through TOML would otherwise fail (the drift-guard leans on this).
+        assert_eq!(Config::default().gossip, gossip);
+    }
+
+    #[test]
+    fn gossip_parses_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 2
+initial_delay_secs = 0
+stale_after_secs = 30
+slow_threshold_ms = 250
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.gossip.poll_interval_secs, 2);
+        assert_eq!(config.gossip.initial_delay_secs, 0);
+        assert_eq!(config.gossip.stale_after_secs, 30);
+        assert_eq!(config.gossip.slow_threshold_ms, 250);
+        assert_eq!(
+            config.gossip.poll_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        // Sane config produces no diagnostics.
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn gossip_diagnostics_flag_low_interval_and_stale_race() {
+        // poll_interval_secs=0 trips the lower-bound diagnostic. Consumers still
+        // get a live duration (clamped to 1s) — the diagnostic is the surface.
+        let bad: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 0
+stale_after_secs = 0
+slow_threshold_ms = 0
+"#,
+        )
+        .unwrap();
+        let diags = bad.collect_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("poll_interval_secs") && d.contains("less than 1")),
+            "{diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("slow_threshold_ms") && d.contains("less than 1")),
+            "{diags:?}"
+        );
+        // Clamps: consumers get sane durations even for the diagnosed values.
+        assert_eq!(
+            bad.gossip.poll_interval(),
+            std::time::Duration::from_secs(1)
+        );
+        assert!(bad.gossip.slow_threshold_ms() >= 1);
+
+        // stale_after_secs < poll_interval_secs races: rows age before refresh.
+        let race: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 15
+stale_after_secs = 5
+"#,
+        )
+        .unwrap();
+        let diags = race.collect_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("stale_after_secs")
+                    && d.contains("less than poll_interval_secs")),
+            "{diags:?}"
+        );
+        // The clamp still keeps the fleet from staleness-flapping.
+        assert!(race.gossip.stale_after() >= race.gossip.poll_interval());
+    }
+
+    #[test]
+    fn peer_config_poll_interval_override_wins_over_gossip_default() {
+        // A slow ProxyJump peer wants a gentler cadence; a LAN peer wants
+        // ~2s. Resolution: per-peer override, else global default.
+        let gossip = GossipConfig::default();
+        let default_peer = PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&default_peer),
+            gossip.poll_interval(),
+            "unset override falls back to global"
+        );
+
+        let fast = PeerConfig {
+            name: "lan".into(),
+            poll_interval_secs: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&fast),
+            std::time::Duration::from_secs(2),
+            "per-peer 2s override wins"
+        );
+
+        // A per-peer 0 (invalid) falls back to the global — same clamp shape
+        // as the top-level poll_interval() helper.
+        let zero = PeerConfig {
+            name: "bad".into(),
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            gossip.effective_poll_interval(&zero),
+            gossip.poll_interval()
+        );
+
+        // `effective_poll_interval` is the pure "next poll delay for this
+        // peer" helper the round handler consults; being pure means the
+        // scheduler's cadence choice can be exercised without a thread.
+        assert_eq!(
+            gossip.effective_poll_interval(&fast),
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn peer_config_parses_per_peer_override_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[gossip]
+poll_interval_secs = 2
+
+[[peers]]
+name = "eth"
+ssh = "eth-jump"
+poll_interval_secs = 60
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.gossip.poll_interval_secs, 2);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].poll_interval_secs, Some(60));
+        assert_eq!(
+            config.gossip.effective_poll_interval(&config.peers[0]),
+            std::time::Duration::from_secs(60)
+        );
     }
 }

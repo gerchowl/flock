@@ -118,9 +118,9 @@ fn read_battery() -> (Option<u8>, Option<bool>) {
     if !cfg!(target_os = "macos") {
         return (None, None);
     }
-    let Ok(output) = std::process::Command::new("pmset")
+    let Ok(output) = crate::process::TracedCommand::new("pmset", "stats")
         .args(["-g", "batt"])
-        .output()
+        .output_traced()
     else {
         return (None, None);
     };
@@ -145,9 +145,9 @@ fn read_gpu_percent() -> Option<u8> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let output = std::process::Command::new("ioreg")
+    let output = crate::process::TracedCommand::new("ioreg", "stats")
         .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
-        .output()
+        .output_traced()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     parse_gpu_utilization(&text)

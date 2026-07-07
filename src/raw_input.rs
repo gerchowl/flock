@@ -140,7 +140,7 @@ impl RawInputFramer {
                     )));
                 }
                 extract_one_event(&chunk).map(|(event, _consumed)| {
-                    tracing::debug!(raw_bytes = ?chunk, event = ?event, "raw input event parsed");
+                    crate::logging::raw_input_event_parsed(&chunk, &format!("{:?}", event));
                     event
                 })
             })
@@ -216,10 +216,7 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.as_slice() == [ESC] {
-            tracing::warn!(
-                bytes = ?self.buffer,
-                "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
-            );
+            crate::logging::raw_input_flushing_lone_escape(&self.buffer);
             chunks.push(std::mem::take(&mut self.buffer));
             return chunks;
         }
@@ -232,17 +229,17 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_utf8_char(&self.buffer) {
-            tracing::trace!(bytes = ?self.buffer, "waiting for UTF-8 continuation bytes");
+            crate::logging::raw_input_waiting_utf8_continuation(&self.buffer);
             return chunks;
         }
 
         if self.buffer.first() == Some(&ESC) && starts_with_incomplete_utf8_char(&self.buffer[1..])
         {
-            tracing::trace!(bytes = ?self.buffer, "waiting for escaped UTF-8 continuation bytes");
+            crate::logging::raw_input_waiting_escaped_utf8_continuation(&self.buffer);
             return chunks;
         }
 
-        tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
+        crate::logging::raw_input_dropping_incomplete_buffer(&self.buffer);
         self.buffer.clear();
         chunks
     }
@@ -352,7 +349,7 @@ fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
         let Some((event, _consumed)) = extract_one_event(&bytes) else {
             continue;
         };
-        tracing::debug!(raw_bytes = ?bytes, event = ?event, "raw input event parsed");
+        crate::logging::raw_input_event_parsed(&bytes, &format!("{:?}", event));
         let _ = tx.blocking_send(event);
     }
 }
@@ -478,7 +475,7 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             return Some((RawInputEvent::Key(key), seq_len));
         }
 
-        tracing::debug!(sequence = ?seq, "dropping unsupported escape sequence");
+        crate::logging::raw_input_unsupported_escape(seq);
         return Some((RawInputEvent::Unsupported, seq_len));
     }
 

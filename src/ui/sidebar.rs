@@ -44,6 +44,12 @@ pub(crate) struct AgentPanelEntry {
     pub server: String,
     pub project: Option<String>,
     pub target: String,
+    /// #102: the workspace's frozen `sort_family_key` (local rows) or a
+    /// stable fallback derived from the peer summary (remote rows). Used by
+    /// [`agent_panel_sort_key`] whenever `project` is None — pending-probe
+    /// rows keep their slot across probe resolution instead of jumping when
+    /// the resolved project key lands.
+    pub sort_family_key: String,
     /// `Some((peer, ws_idx))` for a REMOTE agent row — selecting it requests
     /// the same server switch the workspace row would. `None` for local panes.
     pub remote: Option<(crate::app::state::RemotePeerRef, usize)>,
@@ -217,7 +223,7 @@ fn agent_panel_entries_with_runtimes(
     };
 
     let local_server = super::grammar::local_server_name();
-    match app.agent_panel_scope {
+    match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
                 return Vec::new();
@@ -227,6 +233,7 @@ fn agent_panel_entries_with_runtimes(
             };
             let project = ws.project_key().map(super::grammar::project_identity_label);
             let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+            let sort_family_key = ws.sort_family_key();
             // Current scope is local-by-definition (it follows the focused
             // local workspace); no remote rows fold in here.
             ws.pane_details(&app.terminals)
@@ -246,6 +253,7 @@ fn agent_panel_entries_with_runtimes(
                     server: local_server.clone(),
                     project: project.clone(),
                     target: target.clone(),
+                    sort_family_key: sort_family_key.clone(),
                     remote: None,
                 })
                 .collect()
@@ -260,6 +268,7 @@ fn agent_panel_entries_with_runtimes(
                     let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
                     let project = ws.project_key().map(super::grammar::project_identity_label);
                     let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
+                    let sort_family_key = ws.sort_family_key();
                     let server = local_server.clone();
                     ws.pane_details(&app.terminals)
                         .into_iter()
@@ -278,6 +287,7 @@ fn agent_panel_entries_with_runtimes(
                             server: server.clone(),
                             project: project.clone(),
                             target: target.clone(),
+                            sort_family_key: sort_family_key.clone(),
                             remote: None,
                         })
                 })
@@ -320,11 +330,16 @@ fn agent_panel_entries_with_runtimes(
 /// the typical repo/branch alphabet.
 fn agent_panel_sort_key(entry: &AgentPanelEntry) -> (String, String, String) {
     (
+        // #102 pending-probe jump fix: fall back on the frozen
+        // `sort_family_key` (derived from immutable spawn state), not the
+        // display-name-derived `primary_label`, so a row keeps its slot when
+        // the git identity probe resolves. `sort_family_key` is already
+        // lowercased at construction.
         entry
             .project
             .clone()
-            .unwrap_or_else(|| entry.primary_label.clone())
-            .to_ascii_lowercase(),
+            .map(|project| project.to_ascii_lowercase())
+            .unwrap_or_else(|| entry.sort_family_key.clone()),
         entry.target.to_ascii_lowercase(),
         entry.server.to_ascii_lowercase(),
     )
@@ -356,6 +371,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                 continue;
             };
             let (state, seen) = super::status::remote_state(summary.status);
+            let sort_family_key = summary.workspace.to_ascii_lowercase();
             entries.push(AgentPanelEntry {
                 ws_idx,
                 tab_idx: 0,
@@ -375,7 +391,8 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                     .map(super::grammar::project_identity_label)
                     .or_else(|| summary.project_label.clone()),
                 target: super::grammar::remote_member_target(summary),
-                remote: Some((peer_ref, ws_idx)),
+                sort_family_key,
+                remote: Some((peer_ref.clone(), ws_idx)),
             });
         }
     }
@@ -582,7 +599,7 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     let body = workspace_list_body_rect(ws_area, false, app.sidebar_new_entry_visible());
@@ -598,19 +615,29 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
     }
 }
 
-/// The spaces list, sectioned git-first by project (#33):
+/// The spaces list, one merged alphanumeric stream by lowercased project
+/// key (#102) — no trailing buckets:
 ///
 /// - Git workspaces group into project sections ([`AppState::project_section_keys`]):
 ///   the main checkout is the section's primary row, every other member
 ///   (linked worktrees AND plain same-repo checkouts) indents under it.
-///   Sections appear in workspace storage order of their first member.
+/// - Remote-only projects (federated peers with no matching local checkout)
+///   render as their own sections in the same stream, interleaved by the
+///   same lowercased key. Their leader row is unindented; members follow.
+/// - Resolved non-git workspaces (misc) interleave into the same stream
+///   under their frozen `sort_family_key`. No synthetic header row: like the
+///   project sections themselves, the section is its rows.
 /// - Workspaces whose git identity probe hasn't finished yet ("pending")
-///   hold their storage position as plain rows — they never flash into
-///   `misc` only to jump into a project section a sweep later.
-/// - Resolved non-git workspaces collect at the tail as the positional
-///   `misc` section (after remote-only project groups). No synthetic header
-///   row: like the project sections themselves, the section is its rows.
+///   hold their frozen `sort_family_key` slot (#102) — they never flash
+///   into misc, nor jump when the resolved project key lands.
 pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
+    // Peer filter Peer replaces the whole list before the merged-stream
+    // machinery runs — it's a totally different rendering, driven by one
+    // peer's summaries.
+    if let Some(crate::app::state::ServerFilter::Peer { ssh_target }) = app.server_filter.as_ref() {
+        return single_peer_entries(app, ssh_target);
+    }
+
     let section_keys = app.project_section_keys();
     let mut members_by_key = std::collections::HashMap::<&str, Vec<usize>>::new();
     for (ws_idx, key) in section_keys.iter().enumerate() {
@@ -627,65 +654,113 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
     };
     let active_group = visible_group_idx.and_then(|idx| section_keys.get(idx).cloned().flatten());
 
-    // Fleet-stable section order (#85): sections sort by their
-    // machine-independent identity (project key, alphabetical), so the list
-    // reads the same on every server. Members keep storage order within a
-    // section (stable sort by index); identity-less rows sort by name so
-    // pending probes hold a deterministic spot; misc still trails.
-    let sort_ids = app.project_section_sort_ids();
-    let mut order: Vec<usize> = (0..app.workspaces.len()).collect();
-    order.sort_by_cached_key(|&ws_idx| {
-        (
-            sort_ids[ws_idx]
-                .clone()
-                .unwrap_or_else(|| app.workspaces[ws_idx].display_name().to_ascii_lowercase()),
-            ws_idx,
-        )
-    });
+    // #102: one merged alphanumeric stream — no trailing buckets. Every
+    // section (local git project, remote-only project, misc non-git,
+    // pending probe) becomes a `SpaceBlock` with its own display-shaped
+    // sort key. Blocks sort together into a single alphabetical order,
+    // then flatten out into rows. Fleet-stable (#85): the sort key is a
+    // pure function of the project identity / frozen `sort_family_key`,
+    // so it converges across viewers.
+    struct SpaceBlock {
+        sort_key: String,
+        tie: (u8, usize),
+        entries: Vec<WorkspaceListEntry>,
+        /// Machine-independent project key (normalized origin URL) used to
+        /// splice matching remote rows in. `None` for pending / misc rows
+        /// (they can't match a remote — no shared identity).
+        project_key: Option<String>,
+        /// `true` when this block owns at least one local workspace row.
+        /// Scope=Current keeps ONLY the focused workspace's block, and it
+        /// treats remote-only blocks as never-focused.
+        is_local: bool,
+        /// Local ws indices whose focus keeps this block visible under
+        /// scope=Current. Empty for remote-only.
+        focus_ws_indices: Vec<usize>,
+        collapsed: bool,
+    }
 
-    let mut emitted_groups = std::collections::HashSet::<&str>::new();
-    let mut entries = Vec::new();
-    let mut misc = Vec::new();
-    for ws_idx in order {
+    let display_sort_key = |project_key: &str| -> String {
+        super::grammar::project_identity_label(project_key).to_ascii_lowercase()
+    };
+
+    let mut blocks: Vec<SpaceBlock> = Vec::new();
+    let mut emitted_groups = std::collections::HashSet::<String>::new();
+
+    // Emit local blocks in workspace-storage order so tie-breakers stay
+    // stable across renders. The final sort by `sort_key` then reorders
+    // them alphabetically.
+    for (ws_idx, section_key_slot) in section_keys.iter().enumerate() {
         let ws = &app.workspaces[ws_idx];
-        let Some(key) = section_keys[ws_idx].as_deref() else {
-            if ws.git_identity_pending() {
-                // Pending probe: hold position among the git sections.
-                entries.push(WorkspaceListEntry::Workspace {
+        let Some(key) = section_key_slot.as_deref() else {
+            // No git section for this workspace: either pending probe or
+            // resolved non-git ("misc"). Either way, it's a single-row
+            // block keyed by the frozen `sort_family_key`.
+            blocks.push(SpaceBlock {
+                sort_key: ws.sort_family_key(),
+                tie: (0, ws_idx),
+                entries: vec![WorkspaceListEntry::Workspace {
                     ws_idx,
                     indented: false,
-                });
-            } else {
-                misc.push(ws_idx);
-            }
+                }],
+                project_key: None,
+                is_local: true,
+                focus_ws_indices: vec![ws_idx],
+                collapsed: false,
+            });
             continue;
         };
+        // The block's `project_key` — the identity remote rows share and
+        // fold under — is the git-space project key from ANY member with
+        // a resolved cached git space. The `section_key` (from
+        // `project_section_keys`) may be a worktree-membership key that
+        // predates the git probe.
+        let block_project_key = |ws_idx: usize| -> Option<String> {
+            app.workspaces
+                .get(ws_idx)
+                .and_then(|w| w.project_key().map(|k| k.to_string()))
+        };
+
         if !grouped_keys.contains(key) {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
+            let project_key = block_project_key(ws_idx);
+            let sort_key = project_key
+                .as_deref()
+                .map(display_sort_key)
+                .unwrap_or_else(|| display_sort_key(key));
+            blocks.push(SpaceBlock {
+                sort_key,
+                tie: (0, ws_idx),
+                entries: vec![WorkspaceListEntry::Workspace {
+                    ws_idx,
+                    indented: false,
+                }],
+                project_key,
+                is_local: true,
+                focus_ws_indices: vec![ws_idx],
+                collapsed: false,
             });
             continue;
         }
 
-        if !emitted_groups.insert(key) {
+        if !emitted_groups.insert(key.to_string()) {
             continue;
         }
-
         let Some(members) = members_by_key.get(key) else {
             continue;
         };
+        let collapsed = app.collapsed_space_keys.contains(key);
         // #122: the project group is a synthetic header row; every checkout —
         // the main one included — renders as an equal member beneath it. The
         // header is non-selectable, so closing the main checkout (#62) never
         // disbands the space: the header survives on its remaining members.
-        entries.push(WorkspaceListEntry::Header {
+        let mut entries = vec![WorkspaceListEntry::Header {
             key: key.to_string(),
-        });
-        let collapsed = app.collapsed_space_keys.contains(key);
+        }];
         if collapsed {
-            // Collapsed: keep just the header, but surface the active member
-            // when this group is the focused one so selection stays visible.
+            // Collapsed: keep just the header, but surface the active
+            // member when this group is the focused one so selection
+            // stays visible. The active member is added at render time
+            // (below), because we can't know here whether this block
+            // will survive scope=Current filtering.
             if let Some(active_idx) =
                 visible_group_idx.filter(|_| active_group.as_deref() == Some(key))
             {
@@ -702,51 +777,120 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
                 });
             }
         }
+        let focus_ws_indices = members.clone();
+        let project_key = members.iter().find_map(|idx| block_project_key(*idx));
+        let sort_key = project_key
+            .as_deref()
+            .map(display_sort_key)
+            .unwrap_or_else(|| display_sort_key(key));
+        blocks.push(SpaceBlock {
+            sort_key,
+            tie: (0, *members.first().unwrap_or(&ws_idx)),
+            entries,
+            project_key,
+            is_local: true,
+            focus_ws_indices,
+            collapsed,
+        });
     }
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
-        retain_focused_space_group(
-            app,
-            &section_keys,
-            &mut entries,
-            visible_group_idx,
-            active_group.as_deref(),
-            &grouped_keys,
-        );
-    }
-    // The per-server filter (#46) has the final say, in this single source
-    // of the rendered list so hit-areas, scroll, and selection clamp stay
-    // consistent. `Local` keeps the local entries and folds no remote rows.
-    // `Peer` replaces the list with that one peer's rows. Without a filter
-    // every federated peer folds in as usual.
-    let peer_filtered = match app.server_filter.as_ref() {
-        Some(crate::app::state::ServerFilter::Local) => false,
-        Some(crate::app::state::ServerFilter::Peer { ssh_target }) => {
-            entries = single_peer_entries(app, ssh_target);
-            true
+
+    // Splice matched remote rows into their local block, and collect
+    // remote-only projects as their own blocks so they interleave into
+    // the same sorted stream. Peer filter Local drops all remotes.
+    let peer_filter_local = matches!(
+        app.server_filter.as_ref(),
+        Some(crate::app::state::ServerFilter::Local)
+    );
+    if !peer_filter_local {
+        use crate::app::state::RemotePeerRef;
+        let mut remotes_by_project =
+            std::collections::HashMap::<&str, Vec<(RemotePeerRef, usize)>>::new();
+        let mut project_order = Vec::<&str>::new();
+        for (peer_ref, peer) in app.remote_peers() {
+            for (ws_idx, ws) in peer.workspaces.iter().enumerate() {
+                let Some(project_key) = ws.project_key.as_deref() else {
+                    continue;
+                };
+                let rows = remotes_by_project.entry(project_key).or_insert_with(|| {
+                    project_order.push(project_key);
+                    Vec::new()
+                });
+                rows.push((peer_ref.clone(), ws_idx));
+            }
         }
-        None => {
-            fold_remote_entries(app, &mut entries);
-            false
-        }
-    };
-    // The trailing `misc` section: resolved non-git workspaces, after every
-    // git project (local AND remote-only) — git projects first, misc last.
-    // A peer filter replaces the whole list; scope current pins the list to
-    // the focused row, so misc only renders when it IS the focused row.
-    if !peer_filtered {
-        for ws_idx in misc {
-            if matches!(app.spaces_panel_scope, PanelScope::Current)
-                && visible_group_idx != Some(ws_idx)
-            {
+
+        // Splice matched remotes into their local block. A collapsed local
+        // block hides its remote rows with it.
+        for block in blocks.iter_mut() {
+            let Some(project_key) = block.project_key.as_deref() else {
+                continue;
+            };
+            if block.collapsed {
                 continue;
             }
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
+            let Some(rows) = remotes_by_project.get(project_key) else {
+                continue;
+            };
+            for (peer_ref, ws_idx) in rows {
+                block.entries.push(WorkspaceListEntry::Remote {
+                    peer: peer_ref.clone(),
+                    ws_idx: *ws_idx,
+                    indented: true,
+                });
+            }
+        }
+
+        // Remote-only projects: no local block owns their project_key. Emit
+        // one block per remote-only project, unindented leader + indented
+        // members. Tie-break `(1, peer_emission_order)` keeps two projects
+        // that share the same display sort key ordered deterministically.
+        let local_project_keys: std::collections::HashSet<String> = blocks
+            .iter()
+            .filter_map(|b| b.project_key.clone())
+            .collect();
+        for (order_idx, project_key) in project_order.into_iter().enumerate() {
+            if local_project_keys.contains(project_key) {
+                continue;
+            }
+            let rows = &remotes_by_project[project_key];
+            let entries: Vec<WorkspaceListEntry> = rows
+                .iter()
+                .enumerate()
+                .map(|(offset, (peer_ref, ws_idx))| WorkspaceListEntry::Remote {
+                    peer: peer_ref.clone(),
+                    ws_idx: *ws_idx,
+                    indented: offset > 0,
+                })
+                .collect();
+            blocks.push(SpaceBlock {
+                sort_key: display_sort_key(project_key),
+                tie: (1, order_idx),
+                entries,
+                project_key: Some(project_key.to_string()),
+                is_local: false,
+                focus_ws_indices: Vec::new(),
+                collapsed: false,
             });
         }
     }
-    entries
+
+    // Fleet-stable alphabetical merge (#85 + #102): every kind of section
+    // sorts together under one comparator. Ties (same display key) fall
+    // back on `(kind_rank, emission_order)`: locals before remote-onlys,
+    // then storage order within each.
+    blocks.sort_by(|a, b| (a.sort_key.as_str(), a.tie).cmp(&(b.sort_key.as_str(), b.tie)));
+
+    // Scope=Current keeps only the focused workspace's block. Remote-only
+    // blocks never satisfy the filter (they have no local focus).
+    if matches!(app.spaces_panel_scope(), PanelScope::Current) {
+        let focused = visible_group_idx;
+        blocks.retain(|block| match focused {
+            Some(idx) => block.is_local && block.focus_ws_indices.contains(&idx),
+            None => false,
+        });
+    }
+
+    blocks.into_iter().flat_map(|b| b.entries).collect()
 }
 
 /// Server filter `only <peer>`: the spaces list becomes that peer's remote
@@ -779,7 +923,7 @@ fn single_peer_entries(app: &AppState, ssh_target: &str) -> Vec<WorkspaceListEnt
     for (_, rows) in by_project {
         for (offset, ws_idx) in rows.into_iter().enumerate() {
             entries.push(WorkspaceListEntry::Remote {
-                peer: peer_ref,
+                peer: peer_ref.clone(),
                 ws_idx,
                 indented: offset > 0,
             });
@@ -788,45 +932,11 @@ fn single_peer_entries(app: &AppState, ssh_target: &str) -> Vec<WorkspaceListEnt
     entries
 }
 
-/// Spaces scope `current`: keep only the focused workspace's space-group
-/// block — or just the focused workspace itself when it is not part of a
-/// collapsible group. Filtering happens here, in the single source of the
-/// rendered list, so hit-areas, scroll, and keyboard selection all stay
-/// consistent with what is on screen. With no focused workspace the full
-/// list stays (nothing to pin to).
-fn retain_focused_space_group(
-    app: &AppState,
-    section_keys: &[Option<String>],
-    entries: &mut Vec<WorkspaceListEntry>,
-    focused_idx: Option<usize>,
-    active_group: Option<&str>,
-    grouped_keys: &std::collections::HashSet<String>,
-) {
-    let Some(focused_idx) = focused_idx.filter(|idx| *idx < app.workspaces.len()) else {
-        return;
-    };
-    let focused_key = active_group.filter(|key| grouped_keys.contains(*key));
-    entries.retain(|entry| match entry {
-        WorkspaceListEntry::Workspace { ws_idx, .. } => match focused_key {
-            Some(key) => section_keys
-                .get(*ws_idx)
-                .is_some_and(|section| section.as_deref() == Some(key)),
-            None => *ws_idx == focused_idx,
-        },
-        // Keep the focused group's header; drop other groups' headers.
-        WorkspaceListEntry::Header { key } => focused_key == Some(key.as_str()),
-        // Remote rows are folded in after this filter runs.
-        WorkspaceListEntry::Remote { .. } => false,
-    });
-}
-
-/// Fold federated peer workspaces into the spaces list: rows whose
-/// project_key matches a local checkout splice in (indented) after that
-/// project's block; remote-only projects trail the list grouped together.
 /// True when any remote (peer or carried-snapshot) workspace folds under the
-/// same project as `ws` -- such a local row HEADS children and must render
+/// same project as `ws` — such a local row HEADS children and must render
 /// the bare leader identity, never the solo `identity · locator` form
-/// (the #92 solo rule counts remote children too).
+/// (the #92 solo rule counts remote children too). The row-splicing itself
+/// happens inline inside [`workspace_list_entries`] (#102).
 fn project_has_remote_rows(app: &AppState, ws: &crate::workspace::Workspace) -> bool {
     let Some(local_key) = ws.git_space().map(|space| space.project_key.as_str()) else {
         return false;
@@ -836,101 +946,6 @@ fn project_has_remote_rows(app: &AppState, ws: &crate::workspace::Workspace) -> 
             .iter()
             .any(|remote| remote.project_key.as_deref() == Some(local_key))
     })
-}
-
-/// Remote rows of a collapsed local group stay hidden with it. Peers come
-/// from [`AppState::remote_peers`]: config-peer summaries first, then any
-/// carried fleet-snapshot entries a config peer does not shadow (#46).
-fn fold_remote_entries(app: &AppState, entries: &mut Vec<WorkspaceListEntry>) {
-    use crate::app::state::RemotePeerRef;
-    // project_key -> remote rows, in (peer order, summary order).
-    let mut remotes_by_project =
-        std::collections::HashMap::<&str, Vec<(RemotePeerRef, usize)>>::new();
-    let mut project_order = Vec::<&str>::new();
-    for (peer_ref, peer) in app.remote_peers() {
-        for (ws_idx, ws) in peer.workspaces.iter().enumerate() {
-            let Some(project_key) = ws.project_key.as_deref() else {
-                continue;
-            };
-            let rows = remotes_by_project.entry(project_key).or_insert_with(|| {
-                project_order.push(project_key);
-                Vec::new()
-            });
-            rows.push((peer_ref, ws_idx));
-        }
-    }
-    if remotes_by_project.is_empty() {
-        return;
-    }
-
-    // Last entry index of each local project's block, and whether that block
-    // is a collapsed project group (remote rows hide with it).
-    let section_keys = app.project_section_keys();
-    let mut block_end = std::collections::HashMap::<&str, usize>::new();
-    let mut collapsed_projects = std::collections::HashSet::<&str>::new();
-    for (entry_idx, entry) in entries.iter().enumerate() {
-        let WorkspaceListEntry::Workspace { ws_idx, .. } = entry else {
-            continue;
-        };
-        let Some(ws) = app.workspaces.get(*ws_idx) else {
-            continue;
-        };
-        let Some(project_key) = ws.project_key() else {
-            continue;
-        };
-        block_end.insert(project_key, entry_idx);
-        if section_keys
-            .get(*ws_idx)
-            .and_then(|section| section.as_deref())
-            .is_some_and(|section| app.collapsed_space_keys.contains(section))
-        {
-            collapsed_projects.insert(project_key);
-        }
-    }
-
-    // Splice matched projects back-to-front so earlier indices stay valid.
-    let mut matched = project_order
-        .iter()
-        .filter_map(|project_key| block_end.get(project_key).map(|end| (*end, *project_key)))
-        .collect::<Vec<_>>();
-    matched.sort_by_key(|(end, _)| std::cmp::Reverse(*end));
-    for (end, project_key) in matched {
-        if collapsed_projects.contains(project_key) {
-            continue;
-        }
-        let rows = &remotes_by_project[project_key];
-        for (offset, (peer_ref, ws_idx)) in rows.iter().enumerate() {
-            entries.insert(
-                end + 1 + offset,
-                WorkspaceListEntry::Remote {
-                    peer: *peer_ref,
-                    ws_idx: *ws_idx,
-                    indented: true,
-                },
-            );
-        }
-    }
-
-    // Spaces scope current pins the list to the focused project: remote-only
-    // projects (no local block to splice into) stay hidden with the rest.
-    if matches!(app.spaces_panel_scope, PanelScope::Current) {
-        return;
-    }
-
-    // Remote-only projects trail the list; the first row of each project is
-    // unindented and labels the project, the rest indent under it.
-    for project_key in project_order {
-        if block_end.contains_key(project_key) {
-            continue;
-        }
-        for (offset, (peer_ref, ws_idx)) in remotes_by_project[project_key].iter().enumerate() {
-            entries.push(WorkspaceListEntry::Remote {
-                peer: *peer_ref,
-                ws_idx: *ws_idx,
-                indented: offset > 0,
-            });
-        }
-    }
 }
 
 /// Display name of the active server filter for the spaces header, if one
@@ -957,7 +972,7 @@ fn server_filter_label(app: &AppState) -> Option<String> {
 /// peer's display label when it doesn't, the workspace name as a last resort.
 pub(crate) fn remote_entry_label(
     app: &AppState,
-    peer_ref: crate::app::state::RemotePeerRef,
+    peer_ref: &crate::app::state::RemotePeerRef,
     ws_idx: usize,
     indented: bool,
 ) -> String {
@@ -984,11 +999,63 @@ pub(crate) fn remote_entry_label(
         .map(super::grammar::project_identity_label)
         .or_else(|| ws.project_label.clone())
         .unwrap_or_else(|| ws.workspace.clone());
+    let chip = remote_leader_same_repo_chip(app, ws.project_key.as_deref())
+        .map(|_| " \u{00b7} same repo?")
+        .unwrap_or_default();
     if remote_project_has_siblings(app, ws.project_key.as_deref(), peer_ref, ws_idx) {
-        project
+        format!("{project}{chip}")
     } else {
-        format!("{project} · {member}")
+        format!("{project}{chip} \u{00b7} {member}")
     }
+}
+
+/// #102 (d): the "same repo?" chip trigger. A remote-only leader row
+/// suffixes ` · same repo?` when a LOCAL project group exists whose
+/// display identity matches this remote's host + basename but whose
+/// full project key does NOT — i.e. the two projects APPEAR to be the
+/// same repo (same forge, same repo name) but their normalized keys
+/// diverged (GitHub rename, `insteadOf` misconfig, case-sensitive
+/// self-hosted forge with mixed-case checkout). The chip surfaces the
+/// mismatch honestly instead of the sidebar silently splitting them
+/// into two sections. Returns `Some(local_project_key)` when the chip
+/// should render, `None` otherwise.
+fn remote_leader_same_repo_chip<'a>(
+    app: &'a AppState,
+    remote_project_key: Option<&str>,
+) -> Option<&'a str> {
+    let remote_key = remote_project_key?;
+    let (remote_host, remote_basename) = split_host_basename(remote_key)?;
+    for ws in &app.workspaces {
+        let Some(local_key) = ws.project_key() else {
+            continue;
+        };
+        if local_key == remote_key {
+            // Keys already match — remote folds INTO the local block, no
+            // chip needed.
+            return None;
+        }
+        let Some((local_host, local_basename)) = split_host_basename(local_key) else {
+            continue;
+        };
+        if remote_host == local_host && remote_basename == local_basename {
+            return Some(local_key);
+        }
+    }
+    None
+}
+
+/// Split a project key into `(host, repo-basename)` for the chip
+/// heuristic. `github.com/gerchowl/flock` → `("github.com", "flock")`.
+/// `dir:foo` keys and single-segment keys return `None` — they have no
+/// host to compare against, so the chip cannot fire on them.
+fn split_host_basename(project_key: &str) -> Option<(&str, &str)> {
+    if project_key.starts_with("dir:") {
+        return None;
+    }
+    let mut segments = project_key.split('/').filter(|s| !s.is_empty());
+    let host = segments.next()?;
+    let basename = segments.next_back()?;
+    Some((host, basename))
 }
 
 /// Whether a remote-only project has MORE than the one row at `(peer_ref, ws_idx)` —
@@ -998,7 +1065,7 @@ pub(crate) fn remote_entry_label(
 fn remote_project_has_siblings(
     app: &AppState,
     project_key: Option<&str>,
-    peer_ref: crate::app::state::RemotePeerRef,
+    peer_ref: &crate::app::state::RemotePeerRef,
     ws_idx: usize,
 ) -> bool {
     let Some(project_key) = project_key else {
@@ -1010,7 +1077,7 @@ fn remote_project_has_siblings(
             .enumerate()
             .any(|(other_idx, other_ws)| {
                 other_ws.project_key.as_deref() == Some(project_key)
-                    && !(other_ref == peer_ref && other_idx == ws_idx)
+                    && !(&other_ref == peer_ref && other_idx == ws_idx)
             })
     })
 }
@@ -1044,46 +1111,24 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
     }
     slots.push(None);
 
+    // Gossip v3 (#101 part 4): the band and the spaces list share ONE deduped
+    // remote-row list. Same key (lowercased reported host), same tier + freshness
+    // tie-break — so a two-hub fleet CANNOT produce a duplicate row here that
+    // the spaces list also shows, and both surfaces agree on which entry won.
     let mut peers: Vec<Option<PeerSwitchRequest>> = Vec::new();
-    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
-        peers.extend(
-            (0..snapshot.peers.len())
-                .map(|entry_idx| Some(PeerSwitchRequest::SnapshotPeer { entry_idx })),
-        );
+    for (peer_ref, _peer) in app.remote_peers() {
+        // Origin rows fold into the spaces list, never a band slot — the Home
+        // row above already stands for the origin server here.
+        if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
+            continue;
+        }
+        peers.push(Some(peer_ref.switch_request(0)));
     }
-    peers.extend((0..app.peer_summaries.len()).map(|peer_idx| {
-        Some(PeerSwitchRequest::ConfigPeer {
-            peer_idx,
-            ws_idx: 0,
-        })
-    }));
-    // Sort by machine identity, breaking ties so a locally-polled config peer
-    // sorts before a carried snapshot row for the SAME host (#40) — then dedup
-    // adjacent identical identities, keeping the first (the config peer). A host
-    // advertised both via a carried snapshot and the server's own `[[peers]]`
-    // (multi-hub fleets) must appear ONCE, not twice.
-    peers.sort_by_cached_key(|slot| {
-        (
-            server_slot_sort_key(app, slot),
-            server_slot_source_rank(slot),
-        )
-    });
-    let mut seen = std::collections::HashSet::new();
-    peers.retain(|slot| {
-        let key = server_slot_sort_key(app, slot);
-        key.is_empty() || seen.insert(key)
-    });
+    // Stable order across peers so band layout does not shuffle: sort by the
+    // shared host key (lowercased reported host).
+    peers.sort_by_cached_key(|slot| server_slot_sort_key(app, slot));
     slots.extend(peers);
     slots
-}
-
-/// Dedup tie-break: a locally-polled config peer (fresher) wins over a carried
-/// snapshot row for the same host (#40).
-fn server_slot_source_rank(slot: &Option<crate::app::state::PeerSwitchRequest>) -> u8 {
-    match slot {
-        Some(crate::app::state::PeerSwitchRequest::ConfigPeer { .. }) => 0,
-        _ => 1,
-    }
 }
 
 /// Machine-independent sort key for a peer band row: the host the peer reports
@@ -1120,7 +1165,7 @@ fn server_slot_sort_key(
 /// hide.
 fn visible_server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
     let slots = server_band_slots(app);
-    match app.servers_panel_scope {
+    match app.servers_panel_scope() {
         PanelScope::All => slots,
         PanelScope::Current => slots
             .into_iter()
@@ -1211,7 +1256,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1227,7 +1272,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 row_height.saturating_add(gap)
             }
@@ -1235,7 +1280,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 1u16.saturating_add(gap)
             }
@@ -1311,7 +1356,7 @@ fn agent_panel_visible_count(area: Rect, row_gap: u16) -> usize {
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap);
+    let viewport_rows = agent_panel_visible_count(area, app.sidebar_row_gap());
     let total_rows = agent_panel_entries(app).len();
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
@@ -1347,7 +1392,7 @@ pub(crate) fn compute_workspace_list_areas(
     let ws_area = workspace_list_rect(
         area,
         app.sidebar_section_split,
-        app.sidebar_pane_gap,
+        app.sidebar_pane_gap(),
         servers_section_height(app),
     );
     if ws_area == Rect::default() {
@@ -1381,7 +1426,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
@@ -1404,7 +1449,7 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
                     break;
@@ -1424,13 +1469,13 @@ pub(crate) fn compute_workspace_list_areas(
                 let gap = if *indented && next_entry_is_indented_workspace(&entries, entry_idx) {
                     0
                 } else {
-                    app.sidebar_row_gap
+                    app.sidebar_row_gap()
                 };
                 if row_y.saturating_add(1).saturating_add(gap) > body_bottom {
                     break;
                 }
                 remote_cards.push(crate::app::state::RemoteCardArea {
-                    peer: *peer,
+                    peer: peer.clone(),
                     ws_idx: *ws_idx,
                     rect: Rect::new(body.x, row_y, body.width, 1),
                     indented: *indented,
@@ -1496,7 +1541,8 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area, app.sidebar_pane_gap);
+    let (ws_area, divider_y, detail_area) =
+        collapsed_sidebar_sections(area, app.sidebar_pane_gap());
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, area, true, p);
         return;
@@ -1657,7 +1703,7 @@ pub(super) fn render_sidebar(
     }
 
     let (ws_area, detail_area) =
-        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+        expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
 
     let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(app));
     if servers_area != Rect::default() {
@@ -1689,7 +1735,7 @@ pub(crate) fn compute_server_section_areas(
     area: Rect,
 ) -> (Rect, Vec<crate::app::state::ServerCardArea>) {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -1723,7 +1769,7 @@ pub(crate) fn server_band_slot_at(
     row: u16,
 ) -> Option<Option<crate::app::state::PeerSwitchRequest>> {
     let (servers_area, _) = carve_servers_band(
-        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0),
+        workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0),
         servers_section_height(app),
     );
     if servers_area == Rect::default() || servers_area.height == 0 {
@@ -1744,10 +1790,19 @@ pub(crate) fn server_band_slot_at(
 
 fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
+    // #96: the header down-count is the ONE sidebar consumer that has
+    // AppState reach and therefore the live [gossip] thresholds. The shared
+    // peer/snapshot row builders below still use the const-default reachability
+    // methods — that's the documented seam left for #101 (staleness rework).
+    let stale_after_secs = app.config.gossip.stale_after();
+    let slow_threshold_ms = app.config.gossip.slow_threshold_ms();
     let down = app
         .peer_summaries
         .iter()
-        .filter(|peer| peer.reachability() == crate::peers::PeerReachability::Down)
+        .filter(|peer| {
+            peer.reachability_with(stale_after_secs.as_secs(), slow_threshold_ms)
+                == crate::peers::PeerReachability::Down
+        })
         .count();
     let header = if down > 0 {
         format!(" servers ({down} down)")
@@ -1762,11 +1817,11 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         )])),
         header_rect,
     );
-    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope);
+    let toggle_rect = panel_scope_toggle_rect(header_rect, app.servers_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                panel_scope_toggle_label(app.servers_panel_scope),
+                panel_scope_toggle_label(app.servers_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -1826,6 +1881,13 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                     continue;
                 };
                 peer_server_rows(peer, p)
+            }
+            Some(crate::app::state::PeerSwitchRequest::RelayedPeer { .. }) => {
+                // Rendering relayed cache rows on the LOCAL band is deferred
+                // (#101 gossip v3 part 4): the RelayedPeer switch variant
+                // exists for a follow-up that materialises PeerSummaryState
+                // from the relayed cache. Skip for now — no band row.
+                continue;
             }
             // Origin-workspace rows fold into the spaces list rather than the band —
             // the home row already stands for the origin server here.
@@ -2376,11 +2438,11 @@ fn render_workspace_list(
             )),
             header_rect,
         );
-        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope);
+        let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope());
         if toggle_rect != Rect::default() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    panel_scope_toggle_label(app.spaces_panel_scope),
+                    panel_scope_toggle_label(app.spaces_panel_scope()),
                     Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Right),
@@ -2607,7 +2669,7 @@ fn render_workspace_list(
     }
 
     for card in &app.view.remote_card_areas {
-        let Some(peer) = app.remote_peer(card.peer) else {
+        let Some(peer) = app.remote_peer(&card.peer) else {
             continue;
         };
         let Some(remote_ws) = peer.workspaces.get(card.ws_idx) else {
@@ -2618,7 +2680,7 @@ fn render_workspace_list(
         }
         let stale = peer.is_stale() || peer.error.is_some();
         let (icon, icon_style) = remote_agent_icon(remote_ws.status, app.spinner_tick, p);
-        let label = remote_entry_label(app, card.peer, card.ws_idx, card.indented);
+        let label = remote_entry_label(app, &card.peer, card.ws_idx, card.indented);
         let max_label =
             (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
@@ -2747,7 +2809,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     }
     let p = &app.palette;
-    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+    let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
     if divider != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -2757,7 +2819,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
             divider,
         );
     }
-    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+    let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
     if row == Rect::default() {
         return;
     }
@@ -2800,11 +2862,11 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope);
+    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope());
     if toggle_rect != Rect::default() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                agent_panel_toggle_label(app.agent_panel_scope),
+                agent_panel_toggle_label(app.agent_panel_scope()),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -2883,7 +2945,7 @@ fn render_agent_detail(
         row_y += 1;
 
         if row_y < body_bottom {
-            row_y = row_y.saturating_add(app.sidebar_row_gap);
+            row_y = row_y.saturating_add(app.sidebar_row_gap());
         }
     }
 
@@ -3033,7 +3095,7 @@ mod tests {
         assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
         // Scope current: only the self row renders, the band stays visible
         // (header keeps the toggle reachable).
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         assert_eq!(servers_section_height(&app), 1 + SERVER_ROW_LINES + 1);
     }
 
@@ -3078,7 +3140,7 @@ mod tests {
 
         // Scope current without a carried snapshot: only the self row stays,
         // which has no hit-area — the header (with its toggle) remains.
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
         assert!(cards.is_empty());
@@ -3216,6 +3278,100 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_dedup_makes_band_and_spaces_list_agree_on_same_host() {
+        // Gossip v3 (#101 part 4) RED: the band and the spaces list share a
+        // single deduped remote-row list (lowercased reported host as key).
+        // Two-source fixture: same host advertised via a carried snapshot AND
+        // a local config peer. Both surfaces must show ONE row about that
+        // host, and the LOCALLY-POLLED config peer must win the tie.
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("anvil-from-snap", "anvil")],
+        ));
+        app.peer_summaries = vec![peer_named_with_host("anvil-cfg", "anvil")];
+
+        // Servers band: one non-Home/non-Self entry, and it MUST be the
+        // config peer (rank 0 beats the snapshot rank 2).
+        let band_peers: Vec<crate::app::state::PeerSwitchRequest> = server_band_slots(&app)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                !matches!(
+                    slot,
+                    crate::app::state::PeerSwitchRequest::Home
+                        | crate::app::state::PeerSwitchRequest::OriginWorkspace { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            band_peers.len(),
+            1,
+            "band must show ONE row: {band_peers:?}"
+        );
+        assert!(
+            matches!(
+                band_peers[0],
+                crate::app::state::PeerSwitchRequest::ConfigPeer { .. }
+            ),
+            "locally polled config peer must win the dedup: {band_peers:?}"
+        );
+
+        // Spaces list source of truth: single row about `anvil`, and it is
+        // the config peer ref (not the snapshot one). Both surfaces agree.
+        let remote_rows: Vec<crate::app::state::RemotePeerRef> = app
+            .remote_peers()
+            .into_iter()
+            .map(|(peer_ref, _)| peer_ref)
+            .collect();
+        assert_eq!(
+            remote_rows.len(),
+            1,
+            "spaces list must show ONE row: {remote_rows:?}"
+        );
+        assert!(
+            matches!(
+                remote_rows[0],
+                crate::app::state::RemotePeerRef::Config { .. }
+            ),
+            "spaces list must agree with band: config peer wins: {remote_rows:?}"
+        );
+    }
+
+    #[test]
+    fn consolidated_dedup_snapshot_ties_break_by_frozen_origin_freshness() {
+        // Gossip v3 (#101 part 4) RED: same-source ties (two snapshot rows
+        // about the same host — a scenario possible once relays fold into
+        // fleet_snapshot) break on frozen origin freshness. The SMALLER
+        // origin_last_ok_secs (fresher origin assertion) wins.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut stale = peer_named_with_host("anvil", "anvil");
+        stale.origin_last_ok_secs = Some(45);
+        let mut fresh = peer_named_with_host("anvil", "anvil");
+        fresh.origin_last_ok_secs = Some(3);
+        let snapshot = crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: vec![stale, fresh],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        };
+        app.fleet_snapshot = Some(snapshot);
+
+        let remote_rows = app.remote_peers();
+        assert_eq!(
+            remote_rows.len(),
+            1,
+            "same-host duplicates must dedupe: {remote_rows:?}"
+        );
+        // The winner is the FRESHER of the two — origin_last_ok_secs = 3.
+        assert_eq!(
+            remote_rows[0].1.origin_last_ok_secs,
+            Some(3),
+            "fresher origin assertion must win same-source tie"
+        );
+    }
+
+    #[test]
     fn server_band_order_converges_across_viewers() {
         // Two viewers of the SAME three machines (anvil/ksb/sage) that each
         // learned them in a different order AND via a different source split
@@ -3268,7 +3424,7 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
-        app.servers_panel_scope = PanelScope::Current;
+        app.set_servers_panel_scope(PanelScope::Current);
 
         // The way home must never hide: scope current keeps home + self.
         assert_eq!(
@@ -3317,7 +3473,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
 
@@ -3369,19 +3525,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         // The menu is a standalone row pinned to the sidebar's last row…
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         assert_eq!(row.y, area.y + area.height - 1);
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // …separated above by the hairline divider idiom.
-        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap);
+        let divider = sidebar_menu_divider_rect(area, app.sidebar_pane_gap());
         for x in divider.x..divider.x + divider.width {
             assert_eq!(buffer[(x, divider.y)].symbol(), "─", "col {x}");
         }
 
         // The spaces footer hosts only `new` now — no mid-field menu.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let footer_text = buffer_row_text(buffer, ws_rect, ws_rect.y + ws_rect.height - 1);
         assert!(footer_text.contains("new"), "{footer_text:?}");
         assert!(!footer_text.contains("menu"), "{footer_text:?}");
@@ -3412,12 +3569,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!all_text.contains("new"), "{all_text}");
-        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap);
+        let row = sidebar_menu_row_rect(area, app.sidebar_pane_gap());
         let row_text = buffer_row_text(buffer, row, row.y);
         assert!(row_text.trim_start().starts_with("menu"), "{row_text:?}");
 
         // The spaces list reclaims the footer row.
-        let ws_rect = workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap, 0);
+        let ws_rect =
+            workspace_list_rect(area, app.sidebar_section_split, app.sidebar_pane_gap(), 0);
         let body_tabs = workspace_list_body_rect(ws_rect, false, true);
         let body_workspace = workspace_list_body_rect(ws_rect, false, false);
         assert_eq!(body_workspace.height, body_tabs.height + 1);
@@ -3710,6 +3868,7 @@ mod tests {
 
     fn workspace_with_project_key(name: &str, project_key: &str) -> Workspace {
         let mut ws = Workspace::test_new(name);
+        ws.identity_cwd = std::path::PathBuf::from(format!("/repo/{name}"));
         ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: format!("/repo/{name}/.git"),
             checkout_key: format!("/repo/{name}"),
@@ -3760,7 +3919,7 @@ mod tests {
         assert_eq!(
             remote_entry_label(
                 &app,
-                crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                &crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
                 0,
                 true
             ),
@@ -3768,8 +3927,12 @@ mod tests {
         );
     }
 
+    /// #102: remote-only projects interleave into the same merged
+    /// alphanumeric stream as locals — no trailing bucket. Here the
+    /// remote-only project (`gerchowl/dotfiles`) sorts BEFORE the local
+    /// (`gerchowl/flock`) purely on display-shaped key order.
     #[test]
-    fn remote_only_projects_trail_the_list_with_project_leader() {
+    fn remote_only_projects_interleave_by_display_key_order() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
             "flock",
@@ -3797,10 +3960,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false
-                },
+                // `gerchowl/dotfiles` sorts before `gerchowl/flock`, so the
+                // remote-only project renders FIRST — no trailing bucket.
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
                     ws_idx: 0,
@@ -3811,6 +3972,10 @@ mod tests {
                     ws_idx: 1,
                     indented: true
                 },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false
+                },
             ]
         );
         // A remote-only GROUP leader (it has sibling members) carries the
@@ -3818,12 +3983,98 @@ mod tests {
         // erase the project name. The indented members carry the member grammar.
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
-            remote_entry_label(&app, config_peer, 0, false),
+            remote_entry_label(&app, &config_peer, 0, false),
             "gerchowl/dotfiles"
         );
         assert_eq!(
-            remote_entry_label(&app, config_peer, 1, true),
+            remote_entry_label(&app, &config_peer, 1, true),
             "sage:vm-dev"
+        );
+    }
+
+    /// #102 (d): the "same repo?" chip fires when a remote-only leader
+    /// shares host+basename with a local group but their full project
+    /// keys differ (GitHub rename case: local `gerchowl/dotfiles`,
+    /// remote `gerchowl/g-fleet`, both on `github.com`, both basename
+    /// `dotfiles` vs `g-fleet` — actually here basenames DIFFER, so
+    /// chip is silent). Trigger when basenames MATCH: local
+    /// `gerchowl/Flock` vs remote `gerchowl-forks/flock` on the SAME
+    /// forge — same basename, different owner path.
+    #[test]
+    fn same_repo_chip_fires_when_host_and_basename_match_but_keys_diverge() {
+        let mut app = crate::app::state::AppState::test_new();
+        // Local: `github.com/gerchowl/flock` — but the remote reports a
+        // DIFFERENT owner (or the local checkout still carries the pre-
+        // rename URL, or someone forked). Same host, same basename.
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "flock",
+                // Same host + basename but different owner → keys
+                // diverge, chip should fire.
+                Some("github.com/other-org/flock"),
+                Some("flock"),
+                None,
+            )],
+        )];
+
+        let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
+        let label = remote_entry_label(&app, &config_peer, 0, false);
+        assert!(
+            label.contains("same repo?"),
+            "expected chip in leader label, got {label:?}"
+        );
+
+        // Sanity: the chip is silent when the remote's project key
+        // MATCHES the local's — they fold together and there's nothing
+        // to explain.
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("main"),
+            )],
+        )];
+        // Now it's a matched-folded row (indented member of the local
+        // group), NOT a remote-only leader — no chip either way.
+        let entries = workspace_list_entries(&app);
+        let leader_label = entries
+            .iter()
+            .find_map(|entry| match entry {
+                WorkspaceListEntry::Remote {
+                    peer,
+                    ws_idx,
+                    indented,
+                } => Some(remote_entry_label(&app, peer, *ws_idx, *indented)),
+                _ => None,
+            })
+            .expect("at least one remote row");
+        assert!(
+            !leader_label.contains("same repo?"),
+            "matched key must not chip, got {leader_label:?}"
+        );
+
+        // Sanity: different basename → chip silent (the remote is just
+        // a different repo that happens to live on the same forge).
+        app.peer_summaries = vec![peer_with_workspaces(
+            "sage",
+            vec![remote_summary(
+                "dotfiles",
+                Some("github.com/gerchowl/dotfiles"),
+                Some("dotfiles"),
+                None,
+            )],
+        )];
+        let dotfiles_label = remote_entry_label(&app, &config_peer, 0, false);
+        assert!(
+            !dotfiles_label.contains("same repo?"),
+            "different basename must not chip, got {dotfiles_label:?}"
         );
     }
 
@@ -3845,7 +4096,7 @@ mod tests {
         )];
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
-            remote_entry_label(&app, config_peer, 0, false),
+            remote_entry_label(&app, &config_peer, 0, false),
             "gerchowl/dotfiles · sage:main"
         );
     }
@@ -3934,10 +4185,17 @@ mod tests {
             )],
         ));
 
+        // #102 merged stream: `gerchowl/dotfiles` (remote-only) sorts
+        // BEFORE `gerchowl/flock` (local + matched remote).
         let entries = workspace_list_entries(&app);
         assert_eq!(
             entries,
             vec![
+                WorkspaceListEntry::Remote {
+                    peer: RemotePeerRef::Snapshot { entry_idx: 0 },
+                    ws_idx: 1,
+                    indented: false
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
                     indented: false
@@ -3947,16 +4205,11 @@ mod tests {
                     ws_idx: 0,
                     indented: true
                 },
-                WorkspaceListEntry::Remote {
-                    peer: RemotePeerRef::Snapshot { entry_idx: 0 },
-                    ws_idx: 1,
-                    indented: false
-                },
             ]
         );
         // Snapshot rows label like config-peer rows: carried host + branch.
         assert_eq!(
-            remote_entry_label(&app, RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
+            remote_entry_label(&app, &RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
             "anvil:fix/pty"
         );
 
@@ -4010,7 +4263,7 @@ mod tests {
         );
         // Labels by the origin host (#62 grammar): `mba22:<branch>`.
         assert_eq!(
-            remote_entry_label(&app, RemotePeerRef::Origin, 0, true),
+            remote_entry_label(&app, &RemotePeerRef::Origin, 0, true),
             "mba22:keyboard-shorcuts"
         );
         // Clicking it emits a home-bound switch with the workspace focus.
@@ -4059,11 +4312,15 @@ mod tests {
                 WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::Header { .. } => None,
             })
             .collect();
+        // #102 merged stream: `gerchowl/dotfiles` sorts before
+        // `gerchowl/flock`, so sage's dotfiles row lands FIRST — but the
+        // dedup contract still holds: the duplicated anvil renders once,
+        // from the polled config entry.
         assert_eq!(
             remote_peers,
             vec![
-                RemotePeerRef::Config { peer_idx: 0 },
                 RemotePeerRef::Snapshot { entry_idx: 1 },
+                RemotePeerRef::Config { peer_idx: 0 },
             ],
             "the duplicated anvil renders once, from the polled config entry"
         );
@@ -4162,12 +4419,12 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Remote {
-                    peer: sage,
+                    peer: sage.clone(),
                     ws_idx: 0,
                     indented: false
                 },
                 WorkspaceListEntry::Remote {
-                    peer: sage,
+                    peer: sage.clone(),
                     ws_idx: 2,
                     indented: true
                 },
@@ -4272,7 +4529,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)
@@ -4489,7 +4746,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4552,7 +4809,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let long_rect = server_slot_rect(rows_area, 1).expect("long-name peer slot");
@@ -4604,7 +4861,7 @@ mod tests {
         let p = &app.palette;
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
         let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
@@ -4647,7 +4904,7 @@ mod tests {
         let buffer = render_sidebar_to_buffer(&mut app, area);
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let self_rect = server_slot_rect(server_band_rows_area(servers_area), 0).expect("self");
         // Quadrant fallback with a single (muted) ring: a solid rectangle.
@@ -5308,7 +5565,7 @@ mod tests {
             .detected_agent = Some(Agent::Claude);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "one");
@@ -5351,7 +5608,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Pi);
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let (events, _) = tokio::sync::mpsc::channel(4);
         let runtime = crate::terminal::TerminalRuntime::spawn(
@@ -5407,7 +5664,7 @@ mod tests {
             .set_agent_name("planner".into());
         app.active = Some(0);
         app.selected = 0;
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "bridge");
@@ -5437,7 +5694,7 @@ mod tests {
             app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
             app.active = Some(0);
             app.selected = 0;
-            app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+            app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
             app.server_filter = None;
 
             let aaa = peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
@@ -5513,6 +5770,7 @@ mod tests {
         checkout_key: &str,
     ) -> crate::workspace::Workspace {
         let mut ws = crate::workspace::Workspace::test_new(name);
+        ws.identity_cwd = std::path::PathBuf::from(format!("/repo/{name}"));
         if let Some(key) = key {
             ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
                 key: key.into(),
@@ -5527,6 +5785,7 @@ mod tests {
 
     fn workspace_with_git_space(name: &str, key: &str) -> crate::workspace::Workspace {
         let mut ws = crate::workspace::Workspace::test_new(name);
+        ws.identity_cwd = std::path::PathBuf::from(format!("/repo/{name}"));
         ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: key.into(),
             checkout_key: format!("/repo/{name}"),
@@ -5600,7 +5859,7 @@ mod tests {
             "default gap is one blank row"
         );
 
-        app.sidebar_row_gap = 0;
+        app.config.ui.sidebar_row_gap = 0;
         let (cards, _, _) = compute_workspace_list_areas(&app, area);
         assert_eq!(
             cards[1].rect.y,
@@ -5772,7 +6031,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Focused grouped workspace: the whole group block renders — header
         // plus members — and nothing else.
@@ -5804,7 +6063,7 @@ mod tests {
         );
 
         // Scope all: the full list (header + two members + the standalone).
-        app.spaces_panel_scope = PanelScope::All;
+        app.set_spaces_panel_scope(PanelScope::All);
         assert_eq!(workspace_list_entries(&app).len(), 4);
     }
 
@@ -5818,7 +6077,7 @@ mod tests {
         ];
         app.mode = Mode::Terminal;
         app.active = Some(1);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
         app.collapsed_space_keys.insert("repo-key".into());
 
         // Collapse still folds members within the rendered group: header +
@@ -5877,7 +6136,7 @@ mod tests {
         )];
         app.mode = Mode::Terminal;
         app.active = Some(0);
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // The focused project keeps its spliced remote rows; the second
         // local project and the remote-only trailing project both hide.
@@ -5907,7 +6166,7 @@ mod tests {
         ];
         app.mode = Mode::Navigate;
         app.selected = 0;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         // Selection moves through the visible (focused-group) entries only:
         // a large delta clamps to the last group member, never reaching the
@@ -5926,7 +6185,7 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
-        app.spaces_panel_scope = PanelScope::Current;
+        app.set_spaces_panel_scope(PanelScope::Current);
 
         let area = Rect::new(0, 0, 30, 40);
         let mut terminal =
@@ -5937,7 +6196,7 @@ mod tests {
             .expect("sidebar should render");
 
         let (ws_area, _) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap);
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (_, list_area) = carve_servers_band(ws_area, servers_section_height(&app));
         let buffer = terminal.backend().buffer();
         let header_text: String = (list_area.x..list_area.x + list_area.width)
@@ -6064,12 +6323,15 @@ mod tests {
         );
     }
 
-    /// #33 — resolved non-git workspaces collect under the trailing `misc`
-    /// section: git projects first, misc last, regardless of storage order.
+    /// #102 — resolved non-git workspaces (misc) interleave into the same
+    /// alphanumeric stream as git projects, keyed by the frozen
+    /// `sort_family_key`. No trailing bucket: whichever sort key wins
+    /// alphabetically comes first.
     #[test]
-    fn resolved_non_git_workspaces_collect_in_trailing_misc_section() {
+    fn resolved_non_git_workspaces_interleave_into_merged_stream() {
         let mut app = AppState::test_new();
         let mut notes = Workspace::test_new("notes");
+        notes.identity_cwd = std::path::PathBuf::from("/misc/notes");
         notes.cached_git_branch = None;
         notes.git_identity_resolved = true;
         app.workspaces = vec![
@@ -6078,6 +6340,10 @@ mod tests {
             workspace_with_git_space("other", "elsewhere"),
         ];
 
+        // Sort keys: notes -> "notes" (frozen `sort_family_key`),
+        // ws_idx 1 ("one") carries project_key "dir:repo-key" -> "repo-key",
+        // ws_idx 2 ("other") carries project_key "dir:elsewhere" -> "elsewhere".
+        // Alphabetical: elsewhere < notes < repo-key.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
@@ -6086,81 +6352,87 @@ mod tests {
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
+                    ws_idx: 0,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
+                    ws_idx: 1,
                     indented: false,
                 },
             ]
         );
     }
 
-    /// #33 — a workspace whose git probe hasn't finished must NOT flash
-    /// into misc: it holds its storage position until the identity lands.
+    /// #33 + #102 — a pending-probe row and a resolved-non-git row both
+    /// use the frozen `sort_family_key`. Under the merged stream (#102)
+    /// the row does not jump on probe resolution — its slot is anchored
+    /// on `identity_cwd`, which the probe never touches.
     #[test]
     fn pending_git_identity_holds_position_not_misc() {
         let mut app = AppState::test_new();
         let mut pending = Workspace::test_new("fresh");
+        // Pick an identity_cwd whose basename sorts AFTER "repo-key" so a
+        // (broken) fallback to `display_name()` would place `fresh` first
+        // and this assertion would fail — anchoring the sort on
+        // `sort_family_key` is what makes it stable.
+        pending.identity_cwd = std::path::PathBuf::from("/tmp/zeta-pending");
         pending.cached_git_branch = None;
         assert!(pending.git_identity_pending());
         app.workspaces = vec![pending, workspace_with_git_space("one", "repo-key")];
 
-        assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-            ]
-        );
+        // Sort keys: pending -> "zeta-pending", one -> "repo-key".
+        // "repo-key" < "zeta-pending", so one first, pending second.
+        let expected = vec![
+            WorkspaceListEntry::Workspace {
+                ws_idx: 1,
+                indented: false,
+            },
+            WorkspaceListEntry::Workspace {
+                ws_idx: 0,
+                indented: false,
+            },
+        ];
+        assert_eq!(workspace_list_entries(&app), expected);
 
-        // The probe resolves non-git: the row moves to the trailing misc
-        // section.
+        // Probe resolves non-git: `sort_family_key` is UNCHANGED because
+        // `identity_cwd` did not change — the row does not move.
         app.workspaces[0].git_identity_resolved = true;
-        assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-            ]
-        );
+        assert_eq!(workspace_list_entries(&app), expected);
     }
 
-    /// #33 — remote-only project groups still count as git projects: they
-    /// trail the local sections but render BEFORE the misc section.
+    /// #102 — the merged alphanumeric stream: local, remote-only, and misc
+    /// all interleave under the same display-shaped sort key. The screenshot
+    /// case from the issue: `gerchowl/g-fleet · sage:main` (remote-only)
+    /// renders BETWEEN a local `flock` and a misc `notes`, not trailing
+    /// after both.
     #[test]
-    fn remote_only_projects_render_before_misc() {
+    fn merged_stream_interleaves_local_remote_only_and_misc() {
         let mut app = AppState::test_new();
         let mut notes = Workspace::test_new("notes");
+        notes.identity_cwd = std::path::PathBuf::from("/misc/notes");
         notes.cached_git_branch = None;
         notes.git_identity_resolved = true;
         app.workspaces = vec![
             notes,
             workspace_with_project_key("flock", "github.com/gerchowl/flock"),
+            workspace_with_project_key("ribes", "github.com/gerchowl/ribes"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "sage",
             vec![remote_summary(
-                "dotfiles",
-                Some("github.com/gerchowl/dotfiles"),
-                Some("dotfiles"),
+                "g-fleet",
+                Some("github.com/gerchowl/g-fleet"),
+                Some("g-fleet"),
                 None,
             )],
         )];
 
+        // Sort keys:
+        //   local flock    -> "gerchowl/flock"
+        //   local ribes    -> "gerchowl/ribes"
+        //   remote g-fleet -> "gerchowl/g-fleet"
+        //   misc notes     -> "notes"
+        // Alphabetical: flock < g-fleet < ribes < notes.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
@@ -6171,6 +6443,10 @@ mod tests {
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
                     ws_idx: 0,
+                    indented: false,
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 2,
                     indented: false,
                 },
                 WorkspaceListEntry::Workspace {

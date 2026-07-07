@@ -872,6 +872,13 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system: Option<PeerSystemSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
+        /// Gossip v3 (#101): the answering server's OWN polled peers, so the
+        /// polling hub can render two-hop fleet visibility (hub polls spoke2,
+        /// spoke1 attaches to hub, spoke1 sees spoke2). One-hop relay only —
+        /// the answering server never re-emits entries it received via relay.
+        /// Additive with a default so v(N-1) peers degrade gracefully.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relayed_fleet: Vec<RelayedFleetPeer>,
     },
     PeersCheckoutPrepared {
         /// The branch the spoke prepared (resolved from the workspace), so the
@@ -1319,6 +1326,57 @@ pub struct PeerWorkspaceSummary {
     /// Live status-line activity while Working (e.g. "Implementing the parser").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+}
+
+/// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
+///
+/// Provenance is explicit via [`origin`](Self::origin): the SHORT HOST NAME of
+/// the polling server that last talked to this peer. Loop prevention rides on
+/// this field — a receiver drops any relayed entry whose `origin` equals its
+/// own short host, and the answering server NEVER re-relays entries it received
+/// via relay (only its own polled peers). Result: entries travel exactly one
+/// hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayedFleetPeer {
+    /// Peer name (config-owned label on the origin's `[[peers]]`).
+    pub name: String,
+    /// SSH destination the ORIGIN uses to reach this peer.
+    pub ssh_target: String,
+    /// Hostname the peer reported about itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// flock version the peer reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Wire protocol the peer reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<PeerSystemSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub workspaces: Vec<PeerWorkspaceSummary>,
+    /// Seconds since the origin's last successful poll, at relay capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Short host name of the ORIGIN (the polling server). Loop prevention:
+    /// receivers drop entries whose origin matches their own short host.
+    pub origin: String,
+    /// Gossip v3 (#101 part 2): the origin's report age at relay-capture, in
+    /// seconds. FROZEN — the receiver uses it as-is for staleness judgement so
+    /// a carried entry stays fresh as long as the origin's assertion is fresh.
+    /// Additive with `#[serde(default)]` so a v(N-1) peer's relay entries
+    /// (never emitting this field) parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_last_ok_secs: Option<u64>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
+    /// peer via THIS hub. Stamped by the hub on relay so a receiver's next
+    /// switch dial can route `ssh -o ProxyJump=<value>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

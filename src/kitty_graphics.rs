@@ -166,14 +166,13 @@ pub(crate) fn encode_local_pane_graphics(
 ) -> Vec<u8> {
     let mode_ok = app.mode == Mode::Terminal;
     let cell_ok = cell_size.is_known();
-    tracing::debug!(
+    crate::logging::kitty_paint_local_pane_graphics_entry(
         mode_ok,
         cell_ok,
-        cell_width_px = cell_size.width_px,
-        cell_height_px = cell_size.height_px,
-        active = ?app.active,
-        pane_infos_len = app.view.pane_infos.len(),
-        "paint_local_pane_graphics entry"
+        cell_size.width_px,
+        cell_size.height_px,
+        &format!("{:?}", app.active),
+        app.view.pane_infos.len(),
     );
     if !mode_ok || !cell_ok {
         tracing::debug!(
@@ -271,16 +270,15 @@ fn encode_graphics_update(
     let mut current_placements = HashSet::new();
     for placement in placements {
         let clipped = clipped_placement(placement);
-        tracing::debug!(
-            pane_id = ?placement.pane_id,
-            has_clipped = clipped.is_some(),
-            grid_cols = placement.placement.render.grid_cols,
-            grid_rows = placement.placement.render.grid_rows,
-            viewport_col = placement.placement.render.viewport_col,
-            viewport_row = placement.placement.render.viewport_row,
-            area_w = placement.area.width,
-            area_h = placement.area.height,
-            "clipped_placement result"
+        crate::logging::kitty_clipped_placement_result(
+            placement.pane_id.raw(),
+            clipped.is_some(),
+            placement.placement.render.grid_cols,
+            placement.placement.render.grid_rows,
+            placement.placement.render.viewport_col,
+            placement.placement.render.viewport_row,
+            placement.area.width,
+            placement.area.height,
         );
         let Some((clipped, format_code)) = clipped else {
             continue;
@@ -455,7 +453,7 @@ fn collect_visible_placements(
         let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             Some(rt) => rt,
             None => {
-                tracing::debug!(pane_id = ?info.id, "collect_visible_placements: runtime not found");
+                crate::logging::kitty_collect_placements_runtime_missing(info.id.raw());
                 continue;
             }
         };

@@ -1,3 +1,4 @@
+# guardrails-ok(ci-shim): repo-automation: gh-api issue labeling, no build logic to shim
 name: Close pending-release issues
 
 on:

@@ -1,1 +1,16 @@
 too-many-arguments-threshold = 11
+# print_stdout/print_stderr/dbg_macro (Cargo.toml [lints.clippy]) police shipped
+# code only — test prints are debugging aids, not product output.
+allow-print-in-tests = true
+
+# Every external process flock spawns must flow through crate::process::TracedCommand
+# (logging redesign PR-3) so the "what did flock actually run?" question is
+# answerable from the log tail. TracedCommand is the ONE site that calls these
+# methods on Command directly (guarded there by #[allow(clippy::disallowed_methods)]
+# with a reason comment). Tests exempt themselves at the file/module level; see
+# the allow-print-in-tests posture above for the mirror rationale.
+disallowed-methods = [
+  { path = "std::process::Command::spawn", reason = "use crate::process::TracedCommand::spawn_traced — every subprocess is logged through one funnel (logging redesign PR-3)" },
+  { path = "std::process::Command::output", reason = "use crate::process::TracedCommand::output_traced — every subprocess is logged through one funnel (logging redesign PR-3)" },
+  { path = "std::process::Command::status", reason = "use crate::process::TracedCommand::status_traced — every subprocess is logged through one funnel (logging redesign PR-3)" },
+]

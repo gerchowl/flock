@@ -1,3 +1,4 @@
+# guardrails-ok(ci-shim): host-bound: cross-arch artifact bundling on platform runners (zig + macOS SDK), not reproducible under nix flake check
 name: Build artifacts (manual)
 
 on:
@@ -93,7 +94,7 @@ jobs:
 
       - name: Package artifact
         run: |
-          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
           file ${{ matrix.name }} > BUILD_INFO.txt
           ldd ${{ matrix.name }} 2>&1 | tee -a BUILD_INFO.txt
           grep -q "statically linked" BUILD_INFO.txt
@@ -161,7 +162,7 @@ jobs:
 
       - name: Package artifact
         run: |
-          cp target/${{ matrix.target }}/release/flock ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
           file ${{ matrix.name }} > BUILD_INFO.txt
           {
             echo "commit=$GITHUB_SHA"

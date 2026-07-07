@@ -33,10 +33,37 @@ pub fn resolve_write_target() -> std::io::Result<PathBuf> {
         std::fs::write(
             &overlay,
             "# flock overlay -- deep-merged over config.toml: add new keys OR\n\
-             # override base-set scalars (overlay wins). See `flock config edit`.\n",
+             # override base-set scalars (overlay wins). See `flk config edit`.\n",
         )?;
     }
     Ok(overlay)
+}
+
+/// Apply a textual config update to the correct write target (ADR-0002
+/// phase (a)): the base when it's a real writable file, else the overlay —
+/// the same routing the `$EDITOR` path uses. Returns the path written, or
+/// the ready-to-toast diagnostic message. The settings pane previously wrote
+/// `config_path()` directly and silently failed on HM/nix read-only symlinks.
+pub(super) fn write_config_update<F>(error_context: &str, update: F) -> Result<PathBuf, String>
+where
+    F: FnOnce(&str) -> String,
+{
+    let path = resolve_write_target().map_err(|err| {
+        crate::logging::config_write_failed(
+            &crate::config::config_path(),
+            error_context,
+            &err.to_string(),
+        );
+        format!("failed to save {error_context}: {err}")
+    })?;
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let new_content = update(&content);
+    std::fs::write(&path, new_content).map_err(|err| {
+        crate::logging::config_write_failed(&path, error_context, &err.to_string());
+        format!("failed to save {error_context}: {err}")
+    })?;
+    Ok(path)
 }
 
 impl App {
@@ -106,29 +133,15 @@ impl App {
             return false;
         }
 
-        let path = crate::config::config_path();
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                crate::logging::config_write_failed(&path, error_context, &err.to_string());
-                self.state.config_diagnostic =
-                    Some(format!("failed to save {error_context}: {err}"));
+        match write_config_update(error_context, update) {
+            Ok(_path) => true,
+            Err(message) => {
+                self.state.config_diagnostic = Some(message);
                 self.config_diagnostic_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                return false;
+                false
             }
         }
-
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let new_content = update(&content);
-        if let Err(err) = std::fs::write(&path, new_content) {
-            crate::logging::config_write_failed(&path, error_context, &err.to_string());
-            self.state.config_diagnostic = Some(format!("failed to save {error_context}: {err}"));
-            self.config_diagnostic_deadline =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-            return false;
-        }
-
-        true
     }
 
     pub(super) fn mark_onboarding_complete(&mut self) {
@@ -326,10 +339,11 @@ mod edit_config_tests {
         dir
     }
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+    fn lock_env() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
+        crate::config::test_config_env_guard()
     }
 
     #[tokio::test]
@@ -468,12 +482,13 @@ mod write_target_tests {
         dir
     }
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    fn lock_env() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
         // Tolerate a previous test's panic that left this lock poisoned --
         // the lock is here for serialization, not for state invariants.
-        crate::config::test_config_env_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        crate::config::test_config_env_guard()
     }
 
     #[test]
@@ -515,6 +530,75 @@ mod write_target_tests {
         // editor opens onto something explanatory.
         let content = std::fs::read_to_string(&target).unwrap();
         assert!(content.starts_with("# flock overlay"));
+    }
+
+    #[test]
+    fn settings_write_routes_to_overlay_when_base_is_symlink() {
+        // ADR-0002 phase (a): the settings pane's toggles silently failed on
+        // HM/nix hosts because update_config_file wrote config_path() directly
+        // instead of routing through resolve_write_target like the $EDITOR
+        // path. The write must land in the overlay; the read-only base must
+        // stay untouched; no diagnostic (= no "failed to save" toast).
+        let _lock = lock_env();
+        let dir = unique_dir("flock-settings-write-target");
+
+        let real_target = dir.join("config-real.toml");
+        std::fs::write(&real_target, "[ui]\nsidebar_row_gap = 1\n").unwrap();
+        let base = dir.join("config.toml");
+        std::os::unix::fs::symlink(&real_target, &base).unwrap();
+
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &base);
+
+        let result = write_config_update("sound setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.sound", "enabled", false)
+        });
+        let overlay = crate::config::config_overlay_path();
+
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+
+        let written = result.expect("write succeeds by routing to the overlay");
+        assert_eq!(written, overlay, "must write the overlay, not the base");
+        let overlay_content = std::fs::read_to_string(&overlay).unwrap();
+        assert!(overlay_content.contains("[ui.sound]"), "{overlay_content}");
+        assert!(
+            overlay_content.contains("enabled = false"),
+            "{overlay_content}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_target).unwrap(),
+            "[ui]\nsidebar_row_gap = 1\n",
+            "read-only base must stay untouched"
+        );
+    }
+
+    #[test]
+    fn settings_write_uses_base_when_base_is_real_file() {
+        let _lock = lock_env();
+        let dir = unique_dir("flock-settings-write-base");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
+
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &base);
+
+        let result = write_config_update("sound setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.sound", "enabled", true)
+        });
+
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+
+        let written = result.expect("write succeeds in place");
+        assert_eq!(written, base, "writable base is edited in place");
+        let content = std::fs::read_to_string(&base).unwrap();
+        assert!(content.contains("enabled = true"), "{content}");
+        assert!(content.contains("sidebar_row_gap = 1"), "{content}");
     }
 
     #[test]

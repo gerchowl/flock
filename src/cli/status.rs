@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use serde::Serialize;
 
 use crate::api;
@@ -35,10 +40,10 @@ fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
         None => Some((StatusScope::Full, false)),
         Some("--json") if args.len() == 1 => Some((StatusScope::Full, true)),
         Some("server") => {
-            parse_status_scope_args(args, StatusScope::Server, "flock status server [--json]")
+            parse_status_scope_args(args, StatusScope::Server, "flk status server [--json]")
         }
         Some("client") => {
-            parse_status_scope_args(args, StatusScope::Client, "flock status client [--json]")
+            parse_status_scope_args(args, StatusScope::Client, "flk status client [--json]")
         }
         Some("help" | "--help" | "-h") => {
             if args.len() > 1 {
@@ -322,8 +327,8 @@ fn current_exe_label() -> String {
 }
 
 fn print_status_help() {
-    eprintln!("flock status commands:");
-    eprintln!("  flock status [--json]         show local client and running server status");
-    eprintln!("  flock status server [--json]  show running server status");
-    eprintln!("  flock status client [--json]  show local client binary status");
+    eprintln!("flk status commands:");
+    eprintln!("  flk status [--json]         show local client and running server status");
+    eprintln!("  flk status server [--json]  show running server status");
+    eprintln!("  flk status client [--json]  show local client binary status");
 }

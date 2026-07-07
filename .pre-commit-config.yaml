@@ -7,7 +7,7 @@
 # is clean of real stubs and debug spew; the few flagged lines are legitimate CLI
 # output (allowlisted via GUARDRAILS_OUTPUT_GLOBS) or doc-comment prose/examples
 # (annotated `guardrails-ok`). Per-line escape hatch anywhere: `guardrails-ok`.
-default_install_hook_types: [pre-commit, commit-msg]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 repos:
   - repo: local
     hooks:
@@ -17,10 +17,12 @@ repos:
         entry: guardrails-no-fake-impl
         language: system
         pass_filenames: true
-      # Promoted to a hard gate: flock already has a tracing facade, and the only
-      # println/eprintln left are legitimate CLI/UX output, allowlisted below as
-      # output surfaces. A stray dbg!/print!/println! in app or library code is a
-      # real leftover and blocks. Escape any one line with `guardrails-ok`.
+      # Layered with clippy's print_stdout/print_stderr/dbg_macro denies
+      # (Cargo.toml [lints.clippy]): clippy is the PRECISE authority on .rs —
+      # fn-level, self-expiring #[expect] at each legit surface — while this
+      # text gate is the fast pre-commit tripwire and covers non-Rust files.
+      # The globs stay file-level because the text layer can't see #[expect];
+      # the files listed all still print legitimately (annotated per-fn).
       - id: no-debug-leftovers
         name: "no debug-print leftovers — use the tracing facade"
         entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/* guardrails-no-debug-leftovers
@@ -31,6 +33,39 @@ repos:
         entry: guardrails-no-commented-code
         language: system
         pass_filenames: true
+      # Raw ?/% Debug/Display field formatters splat arbitrary values into the
+      # audit trail — the reflexive way PII/secrets leak. Deliberate shaping is
+      # confined to the schema surface (src/logging.rs, the tracing facade).
+      # The 209 pre-existing sites carry guardrails-ok(no-raw-trace-fields)
+      # markers (scripts/mark_trace_fields.py); burn-down census: docs/DEBT.md.
+      - id: no-raw-trace-fields
+        name: "no raw ?/% fields in tracing macros — shape in logging.rs"
+        entry: env GUARDRAILS_TRACE_ALLOW_GLOBS=*/logging.rs guardrails-no-raw-trace-fields
+        language: system
+        pass_filenames: true
+      # Deterministic, no escape hatch by design: a conflicted merge CAN be
+      # committed (git records it and `git status` is clean afterwards).
+      - id: no-conflict-markers
+        name: "no merge conflict markers"
+        entry: guardrails-no-conflict-markers
+        language: system
+        pass_filenames: true
+
+      # Derived/generated doc regions must match their source-of-truth command
+      # (docs/DEBT.md census etc.). Drift → unified diff; `--fix` regenerates.
+      - id: derived-docs
+        name: "derived docs match their source of truth"
+        entry: guardrails-derived-docs
+        language: system
+        pass_filenames: true
+      # Every Accepted ADR (docs/adr/README.md index) must be cited as ADR-NNNN
+      # in FEATURE-MATRIX.md — decided designs can't silently outrun the matrix.
+      - id: adr-matrix
+        name: "every Accepted ADR cited in FEATURE-MATRIX.md"
+        entry: guardrails-adr-matrix
+        language: system
+        pass_filenames: false
+        files: (^docs/adr/|^FEATURE-MATRIX\.md$)
 
       # --- hard gates ----------------------------------------------------------
       - id: gitleaks
@@ -55,6 +90,29 @@ repos:
         entry: cargo deny check
         language: system
         files: (Cargo\.(toml|lock)|deny\.toml)$
+        pass_filenames: false
+
+      # CI must stay a shim over locally-runnable checks; new workflows with bare
+      # run: logic block unless annotated `guardrails-ok(ci-shim): <reason>`.
+      - id: ci-shim
+        name: "CI is a shim over `nix flake check`"
+        entry: env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: true
+
+      # --- pre-push (CI-deep; inert until the first criterion bench lands) ------
+      - id: perf-budget
+        name: "perf regressions vs perf-budgets.toml"
+        entry: guardrails-perf-budget
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+      - id: perf-record
+        name: "append bench medians to perf-history.csv"
+        entry: guardrails-perf-record
+        language: system
+        stages: [pre-push]
         pass_filenames: false
 
       # --- commit message ------------------------------------------------------

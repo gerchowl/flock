@@ -1,4 +1,6 @@
-use crate::api::schema::{PeerSystemSummary, PeerWorkspaceSummary, ResponseResult};
+use crate::api::schema::{
+    PeerSystemSummary, PeerWorkspaceSummary, RelayedFleetPeer, ResponseResult,
+};
 use crate::app::App;
 
 use super::responses::{encode_error, encode_success};
@@ -16,8 +18,48 @@ impl App {
                 protocol: Some(crate::protocol::PROTOCOL_VERSION),
                 system: self.state.system_stats.as_ref().map(system_summary),
                 workspaces: self.self_workspace_summaries(),
+                // Gossip v3 (#101): relay this server's OWN polled peers only —
+                // never the cache we received via relay ourselves. That bounds
+                // hop count to one and precludes gossip loops.
+                relayed_fleet: self.own_relayed_fleet(),
             },
         )
+    }
+
+    /// One-hop relay payload: THIS server's own polled peers as
+    /// [`RelayedFleetPeer`] entries, stamped with the answering server as
+    /// `origin`. Never includes `state.relayed_fleet_cache` — that would
+    /// re-relay entries that already travelled one hop.
+    fn own_relayed_fleet(&self) -> Vec<RelayedFleetPeer> {
+        let origin = short_host_name();
+        self.state
+            .peer_summaries
+            .iter()
+            .map(|peer| {
+                let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
+                RelayedFleetPeer {
+                    name: peer.peer.clone(),
+                    ssh_target: peer.ssh_target.clone(),
+                    host: peer.host.clone(),
+                    version: peer.version.clone(),
+                    protocol: peer.protocol,
+                    system: peer.system.clone(),
+                    latency_ms: peer.latency_ms,
+                    workspaces: peer.workspaces.clone(),
+                    age_secs,
+                    error: peer.error.clone(),
+                    origin: origin.clone(),
+                    // Gossip v3 (#101 part 2): we ARE the origin for our own
+                    // polled peers, so the origin's assertion is our
+                    // last-successful-poll age at emission time.
+                    origin_last_ok_secs: age_secs,
+                    // Gossip v3 (#101 part 3): we ARE the reachable identity
+                    // for peers we polled directly — a receiver dialing
+                    // these needs `-o ProxyJump=<us>` to reach them.
+                    proxy_jump: Some(origin.clone()),
+                }
+            })
+            .collect()
     }
 
     /// Prepare one of THIS server's workspaces for a cross-machine checkout
@@ -114,7 +156,37 @@ impl App {
                 .collect(),
             age_secs: Some(0),
             error: None,
+            // We ARE the origin for our own summary — stamped fresh at switch.
+            origin_last_ok_secs: Some(0),
+            // The client dials home directly via the reserved sentinel — no
+            // ProxyJump involved.
+            proxy_jump: None,
         }
+    }
+}
+
+/// Convert a relayed JSON peer entry into the bincode wire shape used by the
+/// down-gossip fleet snapshot (#101). Origin-honest freshness rides
+/// through unchanged so the receiver's staleness check reads the ORIGIN's
+/// assertion, not our dwell.
+fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer {
+    crate::protocol::FleetPeer {
+        name: entry.name.clone(),
+        ssh_target: entry.ssh_target.clone(),
+        host: entry.host.clone(),
+        version: entry.version.clone(),
+        protocol: entry.protocol,
+        system: entry.system.clone().map(Into::into),
+        latency_ms: entry.latency_ms,
+        workspaces: entry.workspaces.iter().cloned().map(Into::into).collect(),
+        age_secs: entry.age_secs,
+        error: entry.error.clone(),
+        // Prefer the explicit origin field; fall back to age_secs so a v(N-1)
+        // origin's implicit freshness assertion still rides the snapshot wire.
+        origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
+        // The polling peer stamped its own reachable identity — carry it
+        // through so the client's next-hop bridge can ProxyJump.
+        proxy_jump: entry.proxy_jump.clone(),
     }
 }
 
@@ -142,6 +214,11 @@ pub(crate) struct PreparedServerSwitch {
     /// home with that space focused. The launcher carries it through the
     /// switch file and fires `workspace focus` against the local server.
     pub(crate) focus_workspace: Option<String>,
+    /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching
+    /// `ssh_target` — set only for snapshot-derived rows the launcher cannot
+    /// dial directly. `None` for a config peer the launcher already has a
+    /// route to. The bridge appends `-o ProxyJump=<value>` when set.
+    pub(crate) proxy_jump: Option<String>,
 }
 
 impl App {
@@ -162,18 +239,41 @@ impl App {
                     label,
                     fleet,
                     focus_workspace: None,
+                    // Config peer: launcher's box already has a direct SSH
+                    // route (that's the definition of a `[[peers]]` entry).
+                    proxy_jump: None,
                 })
             }
             PeerSwitchRequest::SnapshotPeer { entry_idx } => {
                 let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
                 let ssh_target = entry.ssh_target.clone();
                 let label = entry.display_name().to_string();
+                // Gossip v3 (#101 part 3): the snapshot entry was stamped by
+                // the hub that emitted it — use its ProxyJump identity so the
+                // client dials via that hub instead of trying `ssh_target`
+                // directly. `None` if the entry pre-dates v3.
+                let proxy_jump = entry.proxy_jump.clone();
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
                     label,
                     fleet,
                     focus_workspace: None,
+                    proxy_jump,
+                })
+            }
+            PeerSwitchRequest::RelayedPeer { host_key } => {
+                let entry = self.state.relayed_fleet_cache.get(&host_key)?;
+                let ssh_target = entry.ssh_target.clone();
+                let label = entry.host.clone().unwrap_or_else(|| entry.name.clone());
+                let proxy_jump = entry.proxy_jump.clone();
+                let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
+                Some(PreparedServerSwitch {
+                    ssh_target,
+                    label,
+                    fleet,
+                    focus_workspace: None,
+                    proxy_jump,
                 })
             }
             PeerSwitchRequest::OriginWorkspace { ws_idx } => {
@@ -189,6 +289,7 @@ impl App {
                     label,
                     fleet: None,
                     focus_workspace,
+                    proxy_jump: None,
                 })
             }
             PeerSwitchRequest::Home => {
@@ -198,6 +299,7 @@ impl App {
                     label: format!("{origin} (home)"),
                     fleet: None,
                     focus_workspace: None,
+                    proxy_jump: None,
                 })
             }
         }
@@ -212,19 +314,67 @@ impl App {
     fn outgoing_fleet_snapshot(&self, exclude_ssh_target: &str) -> crate::protocol::FleetSnapshot {
         match self.state.fleet_snapshot.as_ref() {
             Some(snapshot) => snapshot.to_wire(exclude_ssh_target),
-            None => crate::protocol::FleetSnapshot {
-                origin: short_host_name(),
-                peers: self
+            None => {
+                let origin = short_host_name();
+                // Gossip v3 (#101 part 3): stamp our own reachable identity
+                // on every peer we emit — the client's next-leg bridge uses
+                // it as `-o ProxyJump=<origin>` to reach peers only routable
+                // through this hub.
+                let stamp_proxy_jump = |mut peer: crate::protocol::FleetPeer| {
+                    peer.proxy_jump.get_or_insert_with(|| origin.clone());
+                    peer
+                };
+                let mut peers: Vec<crate::protocol::FleetPeer> = self
                     .state
                     .peer_summaries
                     .iter()
                     .filter(|peer| peer.ssh_target != exclude_ssh_target)
                     .map(crate::peers::peer_to_wire)
-                    .collect(),
-                // The hub is not its own peer; embed its own workspaces so
-                // the spoke can see the way-home spaces, not just peers (#66).
-                origin_summary: Some(Box::new(self.origin_self_summary())),
-            },
+                    .map(stamp_proxy_jump)
+                    .collect();
+                // Gossip v3 (#101): merge relayed entries so a spoke attaching
+                // to this hub sees the FULL fleet, not just this hub's direct
+                // peers. Skip anything already covered by our own polled peers
+                // (they win — locally-polled is fresher) and the hop target
+                // (it becomes the self row on the receiving end).
+                let own_hosts: std::collections::HashSet<String> = peers
+                    .iter()
+                    .flat_map(|peer| {
+                        peer.host
+                            .as_deref()
+                            .filter(|host| !host.is_empty())
+                            .map(str::to_ascii_lowercase)
+                            .into_iter()
+                            .chain(std::iter::once(peer.ssh_target.to_ascii_lowercase()))
+                    })
+                    .collect();
+                let origin_lower = origin.to_ascii_lowercase();
+                let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
+                for entry in self.state.relayed_fleet_cache.values() {
+                    let host_lower = entry
+                        .host
+                        .as_deref()
+                        .filter(|host| !host.is_empty())
+                        .unwrap_or(&entry.ssh_target)
+                        .to_ascii_lowercase();
+                    if host_lower == origin_lower || host_lower == exclude_lower {
+                        continue;
+                    }
+                    if own_hosts.contains(&host_lower)
+                        || own_hosts.contains(&entry.ssh_target.to_ascii_lowercase())
+                    {
+                        continue;
+                    }
+                    peers.push(stamp_proxy_jump(relayed_peer_to_wire(entry)));
+                }
+                crate::protocol::FleetSnapshot {
+                    origin,
+                    peers,
+                    // The hub is not its own peer; embed its own workspaces so
+                    // the spoke can see the way-home spaces, not just peers (#66).
+                    origin_summary: Some(Box::new(self.origin_self_summary())),
+                }
+            }
         }
     }
 
@@ -247,17 +397,17 @@ impl App {
             if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 let target = ssh_target.clone();
                 std::thread::spawn(move || {
-                    let _ = std::process::Command::new("ssh")
+                    let _ = crate::process::TracedCommand::new("ssh", "peers")
                         .args([
                             "-o",
                             "BatchMode=yes",
                             "-o",
                             "ConnectTimeout=5",
                             &target,
-                            &format!("sh -lc 'flock workspace focus --workspace {id}'"),
+                            &format!("sh -lc 'flk workspace focus --workspace {id}'"),
                         ])
                         .stdin(std::process::Stdio::null())
-                        .output();
+                        .output_traced();
                 });
             }
             return Some((ssh_target, label));
@@ -277,19 +427,15 @@ pub(crate) fn short_host_name() -> String {
 }
 
 fn compute_short_host_name() -> String {
-    // Explicit override (also pins a short, deterministic host for the test
-    // suite, whose layout assertions otherwise break on CI runners with long
-    // generated hostnames like `fv-az…`).
-    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    // The `name` set in config.toml is this node's intended identity (#42), so
-    // it overrides gethostname()/LocalHostName — only the explicit env pin above
-    // wins. Read once (short_host_name caches), so a changed name takes effect
-    // on restart, matching how the OS host name is treated as fixed per-process.
+    // ADR-0002 phase (d): FLOCK_HOST_NAME is no longer read here — it's now a
+    // one-release deprecated alias that lands on Config.name via the generic
+    // FLOCK_<UPPER_SNAKE> env layer (src/config/env.rs), which sits BELOW the
+    // file. The test-suite host pin (short, deterministic host on CI runners
+    // with long `fv-az…` names) still works because `configured_node_name()`
+    // reads the same loaded config the env alias populates.
+    //
+    // Read once (short_host_name caches), so a changed name takes effect on
+    // restart, matching how the OS host name is treated as fixed per-process.
     if let Some(name) = configured_node_name() {
         return name;
     }
@@ -315,9 +461,9 @@ fn configured_node_name() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn macos_local_host_name() -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/scutil")
+    let out = crate::process::TracedCommand::new("/usr/sbin/scutil", "peers")
         .args(["--get", "LocalHostName"])
-        .output()
+        .output_traced()
         .ok()?;
     if !out.status.success() {
         return None;
@@ -424,6 +570,8 @@ mod tests {
             workspaces: Vec::new(),
             last_ok: Some(std::time::Instant::now()),
             error: None,
+            origin_last_ok_secs: None,
+            proxy_jump: None,
         }
     }
 
@@ -553,5 +701,150 @@ mod tests {
         assert!(app
             .prepare_switch_server(PeerSwitchRequest::SnapshotPeer { entry_idx: 99 })
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn outgoing_fleet_snapshot_from_hub_merges_relayed_cache_into_wire() {
+        // Gossip v3 (#101) part 1 (RED): hub polls anvil, anvil relays sage
+        // (sage lives one hop past anvil). anvil's spoke1 attaches to hub —
+        // hub's outgoing_fleet_snapshot must include sage in its `peers`
+        // vector so the FULL fleet is visible on spoke1. Without the relay
+        // merge this test fails (only anvil appears).
+        let mut app = test_app();
+        app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
+        app.state.relayed_fleet_cache.insert(
+            "sage".to_string(),
+            crate::api::schema::RelayedFleetPeer {
+                name: "sage".into(),
+                ssh_target: "lars@sage".into(),
+                host: Some("sage".into()),
+                version: Some("0.9.0".into()),
+                protocol: None,
+                system: None,
+                latency_ms: Some(12),
+                workspaces: Vec::new(),
+                age_secs: Some(4),
+                error: None,
+                origin: "anvil".into(),
+                origin_last_ok_secs: Some(4),
+                proxy_jump: Some("anvil".into()),
+            },
+        );
+
+        let prepared = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: 0,
+            })
+            .expect("hub stamps a snapshot on switch to anvil");
+        let fleet = prepared.fleet.expect("hub leap carries a snapshot");
+        // anvil is the hop target — dropped. sage rides through as a
+        // relayed row, so a spoke1 attaching to anvil sees the fleet.
+        let targets: Vec<&str> = fleet
+            .peers
+            .iter()
+            .map(|peer| peer.ssh_target.as_str())
+            .collect();
+        assert!(
+            targets.contains(&"lars@sage"),
+            "relayed peer must ride the wire: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&"lars@anvil"),
+            "hop target excluded: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_relayed_fleet_never_includes_relayed_cache_one_hop_only() {
+        // Loop prevention (#101 part 1): a hub's OWN peers.summary response
+        // only relays its DIRECTLY polled peers, never entries received via
+        // relay. Result: an entry travels exactly one hop, breaking the
+        // ping-pong you'd get if two hubs both re-relayed each other's rows.
+        let mut app = test_app();
+        app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
+        // Simulate anvil having relayed sage to us on a prior poll.
+        app.state.relayed_fleet_cache.insert(
+            "sage".to_string(),
+            crate::api::schema::RelayedFleetPeer {
+                name: "sage".into(),
+                ssh_target: "lars@sage".into(),
+                host: Some("sage".into()),
+                version: None,
+                protocol: None,
+                system: None,
+                latency_ms: None,
+                workspaces: Vec::new(),
+                age_secs: Some(3),
+                error: None,
+                origin: "anvil".into(),
+                origin_last_ok_secs: Some(3),
+                proxy_jump: Some("anvil".into()),
+            },
+        );
+
+        let entries = app.own_relayed_fleet();
+        // Only anvil (our own polled peer) — sage was received via relay and
+        // must NOT ride our outgoing summary.
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["anvil"],
+            "relayed cache must not re-relay: {names:?}"
+        );
+        assert_eq!(entries[0].origin, crate::app::short_host_name());
+    }
+
+    #[tokio::test]
+    async fn relay_merge_drops_entries_whose_origin_is_self() {
+        // Loop prevention (#101 part 1): if a peer relays entries whose
+        // origin is our OWN short host, we drop them. That's the only cycle
+        // the one-hop rule can't close on its own — a peer that received a
+        // relay from us and echoed it back on its next summary.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.peers = vec![crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        }];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let self_host = crate::app::short_host_name();
+
+        app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "anvil".into(),
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    host: "anvil".into(),
+                    version: None,
+                    protocol: None,
+                    system: None,
+                    latency_ms: 5,
+                    workspaces: Vec::new(),
+                    relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
+                        name: "loop-back".into(),
+                        ssh_target: "lars@loop".into(),
+                        host: Some("loop-back".into()),
+                        version: None,
+                        protocol: None,
+                        system: None,
+                        latency_ms: None,
+                        workspaces: Vec::new(),
+                        age_secs: Some(1),
+                        error: None,
+                        // This is us: an anvil that received our relay and
+                        // echoed us as its own origin. Must be dropped.
+                        origin: self_host.clone(),
+                        origin_last_ok_secs: Some(1),
+                        proxy_jump: Some(self_host.clone()),
+                    }],
+                }),
+            },
+        ));
+
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "an entry whose origin is self must never enter the cache: {:?}",
+            app.state.relayed_fleet_cache
+        );
     }
 }

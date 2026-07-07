@@ -1,5 +1,9 @@
 //! Integration tests for thin client mode.
 
+// TracedCommand (logging redesign PR-3) polices flock's shipped code — this
+// harness drives the compiled flock binary through raw Command; exempt.
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::fs;
@@ -92,7 +96,7 @@ fn spawn_client_process(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", config_home);
@@ -136,7 +140,7 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -275,8 +279,8 @@ fn client_connects_and_receives_frame() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21, "server should report protocol version 21");
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23, "server should report protocol version 23");
     assert!(
         error.is_none(),
         "handshake should not have error: {:?}",
@@ -307,8 +311,8 @@ fn pause_subscription_stops_frames_and_resume_redraws() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "handshake error: {error:?}");
 
     // Baseline: the active subscription streams frames.
@@ -374,8 +378,8 @@ fn resume_reasserts_geometry_so_panes_render_at_new_width() {
     // Dial-time width A = 80 (the size the warm slot's server first learned).
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "handshake error: {error:?}");
 
     let baseline = read_next_frame_payload(&mut stream, Duration::from_secs(10))
@@ -446,7 +450,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -468,8 +472,8 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     stream
@@ -517,8 +521,8 @@ fn client_input_forwarded_to_pane() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Send an Input message containing "echo hello\n".
@@ -571,8 +575,8 @@ fn client_resize_sends_message() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain the initial frame(s).
@@ -630,8 +634,8 @@ fn server_shutdown_sends_message_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Send SIGINT so the server takes the graceful shutdown path and
@@ -696,7 +700,7 @@ fn server_unreachable_shows_clear_error() {
     )
     .unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flock"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("client")
         .env("FLOCK_DISABLE_SOUND", "1")
         .env("XDG_CONFIG_HOME", &config_home)
@@ -717,7 +721,7 @@ fn server_unreachable_shows_clear_error() {
         "stderr should mention connection failure: {stderr}"
     );
     assert!(
-        stderr.contains("Is flock server running?"),
+        stderr.contains("Is flk server running?"),
         "stderr should include actionable guidance: {stderr}"
     );
     assert!(
@@ -869,8 +873,8 @@ fn client_receives_frame_after_pane_output() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
@@ -916,8 +920,8 @@ fn navigate_mode_keybind_dispatch_in_server() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frames.
@@ -1034,8 +1038,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -1110,7 +1114,7 @@ fn client_receives_notify_on_agent_state_change() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -1133,8 +1137,8 @@ fn client_receives_notify_on_agent_state_change() {
     // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
     let (version, error) =
-        client_handshake(&mut stream, 21, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 21);
+        client_handshake(&mut stream, 23, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 23);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -1309,7 +1313,7 @@ fn client_receives_notify_on_agent_state_change() {
 // ---------------------------------------------------------------------------
 
 /// A stand-in server that refuses every connecting client with the
-/// live-handoff notice, keeping the real `flock client` spinning in its #52
+/// live-handoff notice, keeping the real `flk client` spinning in its #52
 /// retry window. Returns a flag the caller can flip to stop the accept loop.
 fn spawn_refusing_server(client_socket: PathBuf) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     use std::os::unix::net::UnixListener;
@@ -1413,7 +1417,7 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flock"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", &config_home);

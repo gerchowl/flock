@@ -26,7 +26,7 @@ mod worktrees;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,13 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// Live-reload channel for the peer-summary poll cadence (#96): the
+    /// `peer-summary-tick` thread reads the latest `[gossip] poll_interval_secs`
+    /// each iteration, so `flk server reload-config` re-arms the loop.
+    pub(crate) gossip_poll_interval_secs: Arc<AtomicU64>,
+    /// Per-peer round-dispatch bookkeeping (#96): the overlap-safety guard
+    /// that keeps a slow ProxyJump peer from stacking concurrent SSH polls.
+    pub(crate) peer_poll_tracker: crate::peers::PeerPollTracker,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -210,20 +217,6 @@ fn repeat_key_identity(
 
 fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
-}
-
-fn agent_panel_scope_from_config(scope: crate::config::PanelScopeConfig) -> state::AgentPanelScope {
-    match scope {
-        crate::config::PanelScopeConfig::Current => state::AgentPanelScope::CurrentWorkspace,
-        crate::config::PanelScopeConfig::All => state::AgentPanelScope::AllWorkspaces,
-    }
-}
-
-fn panel_scope_from_config(scope: crate::config::PanelScopeConfig) -> state::PanelScope {
-    match scope {
-        crate::config::PanelScopeConfig::Current => state::PanelScope::Current,
-        crate::config::PanelScopeConfig::All => state::PanelScope::All,
-    }
 }
 
 /// Parse the configured agent name list into a deduplicated set of `Agent`
@@ -307,23 +300,31 @@ impl App {
                 })
                 .expect("pr-state tick thread should spawn");
         }
+        // #96: the peer-summary tick reads the LIVE cadence from an
+        // atomically-shared `[gossip] poll_interval_secs` so `flk server
+        // reload-config` re-arms the loop without a restart. The round handler
+        // (in api.rs) is the overlap-safety point — a slow SSH cannot pile up
+        // even at very short intervals.
+        let gossip_poll_interval_secs = Arc::new(AtomicU64::new(
+            config.gossip.poll_interval().as_secs().max(1),
+        ));
         {
-            // Peer-summary poll tick: the shared event handler snapshots the
-            // configured [[peers]] and spawns the SSH fetch workers.
             let peer_tick_tx = event_tx.clone();
+            let interval_secs = gossip_poll_interval_secs.clone();
+            let initial_delay = config.gossip.initial_delay();
             std::thread::Builder::new()
                 .name("peer-summary-tick".into())
                 .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(
-                        crate::peers::PEER_POLL_INITIAL_DELAY_SECS,
-                    ));
+                    std::thread::sleep(initial_delay);
                     loop {
                         if peer_tick_tx.blocking_send(AppEvent::PeerPollDue).is_err() {
                             return;
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            crate::peers::PEER_POLL_INTERVAL_SECS,
-                        ));
+                        // Read live: apply_live_config publishes a new value
+                        // here on `flk server reload-config`, so the NEXT
+                        // sleep uses the fresh cadence.
+                        let secs = interval_secs.load(Ordering::Relaxed).max(1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
                 })
                 .expect("peer-summary tick thread should spawn");
@@ -338,7 +339,6 @@ impl App {
             workspaces,
             active,
             selected,
-            _restored_agent_panel_scope,
             sidebar_width,
             sidebar_width_source,
             sidebar_section_split,
@@ -348,7 +348,6 @@ impl App {
                 Vec::new(),
                 None,
                 0,
-                state::AgentPanelScope::CurrentWorkspace,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
@@ -381,7 +380,6 @@ impl App {
                     Vec::new(),
                     None,
                     0,
-                    snap.agent_panel_scope,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
                     if snap.sidebar_width.is_some() {
                         state::SidebarWidthSource::Persisted
@@ -399,7 +397,6 @@ impl App {
                     ws,
                     active,
                     selected,
-                    snap.agent_panel_scope,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
                     if snap.sidebar_width.is_some() {
                         state::SidebarWidthSource::Persisted
@@ -415,15 +412,12 @@ impl App {
                 Vec::new(),
                 None,
                 0,
-                state::AgentPanelScope::CurrentWorkspace,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
             )
         };
-
-        let agent_panel_scope = agent_panel_scope_from_config(config.ui.agent_panel_scope);
 
         // Validate sidebar bounds before they reach any `u16::clamp(min, max)`
         // call: `clamp` panics when `min > max`. On bad config, fall back to
@@ -500,13 +494,12 @@ impl App {
                 .iter()
                 .map(crate::peers::PeerSummaryState::new)
                 .collect(),
+            relayed_fleet_cache: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,
             peer_checkout: None,
             peer_checkout_seq: 0,
-            servers_panel_scope: panel_scope_from_config(config.ui.servers_panel_scope),
-            spaces_panel_scope: panel_scope_from_config(config.ui.spaces_panel_scope),
             server_filter: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
@@ -590,8 +583,6 @@ impl App {
             sidebar_min_width,
             sidebar_max_width,
             mobile_width_threshold: config.ui.mobile_width_threshold,
-            sidebar_row_gap: crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap),
-            sidebar_pane_gap: crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap),
             prompt_float_lines: crate::config::validated_prompt_float_lines(
                 config.ui.prompt_float_lines,
             ),
@@ -607,34 +598,25 @@ impl App {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split,
-            agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
             right_click_passthrough: None,
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
-            file_drop: config.ui.file_drop,
             confirm_close_whole_space: false,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
-            show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
-            pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
-            switch_ascii_input_source_in_prefix: config
-                .experimental
-                .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
-            sound: config.ui.sound.clone(),
             local_sound_playback: true,
-            toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             spinner_tick: 0,
             last_interaction: std::time::Instant::now(),
@@ -644,7 +626,6 @@ impl App {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
-            idle: config.ui.idle,
             palette: resolve_palette(config),
             theme_name: config
                 .theme
@@ -663,6 +644,7 @@ impl App {
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            config: config.clone(),
         };
 
         state.terminals = restored_terminals;
@@ -735,6 +717,8 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
+            gossip_poll_interval_secs,
+            peer_poll_tracker: crate::peers::PeerPollTracker::new(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }
@@ -776,9 +760,11 @@ impl App {
         app.state.selected = snapshot
             .selected
             .min(app.state.workspaces.len().saturating_sub(1));
-        app.state.agent_panel_scope = snapshot.agent_panel_scope;
-        app.state.servers_panel_scope = snapshot.servers_panel_scope;
-        app.state.spaces_panel_scope = snapshot.spaces_panel_scope;
+        app.state.set_agent_panel_scope(snapshot.agent_panel_scope);
+        app.state
+            .set_servers_panel_scope(snapshot.servers_panel_scope);
+        app.state
+            .set_spaces_panel_scope(snapshot.spaces_panel_scope);
         if let Some(width) = snapshot.sidebar_width {
             app.state.sidebar_width = width;
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
@@ -820,7 +806,7 @@ impl App {
             previous_mode == Mode::Prefix,
             self.state.mode == Mode::Prefix,
         ) {
-            (false, true) if self.state.switch_ascii_input_source_in_prefix => {
+            (false, true) if self.state.switch_ascii_input_source_in_prefix_enabled() => {
                 self.prefix_input_source.switch_to_ascii();
             }
             (true, false) => self.prefix_input_source.restore(),
@@ -921,7 +907,7 @@ impl App {
 
             if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
                 if let Err(err) = self.create_workspace_with_options(cwd, true) {
-                    tracing::error!(err = %err, "failed to create workspace at requested cwd");
+                    crate::logging::workspace_create_at_cwd_failed(&err.to_string());
                     self.state.mode = Mode::Navigate;
                 }
                 needs_render = true;
@@ -950,7 +936,7 @@ impl App {
             if self.state.pending_attention_chime {
                 self.state.pending_attention_chime = false;
                 if self.state.sound_enabled() {
-                    crate::sound::play(crate::sound::Sound::AllClear, &self.state.sound);
+                    crate::sound::play(crate::sound::Sound::AllClear, self.state.sound_config());
                 }
             }
 
@@ -1271,6 +1257,56 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        // Snapshot fields that need to detect a change relative to the
+        // previous live config BEFORE any per-section replacement below.
+        let previous_sound = self.state.config.ui.sound.clone();
+
+        // Live source of truth for the settings pane (ADR-0002 phase (f)):
+        // re-populate `state.config` per valid section so accessors reflect
+        // the reloaded values. Invalid sections keep the previous config —
+        // consistent with the "keep-current-on-error" contract everywhere.
+        if !invalid_section("keys") {
+            self.state.config.keys = config.keys.clone();
+        }
+        if !invalid_section("experimental") {
+            self.state.config.experimental = config.experimental.clone();
+        }
+        if !invalid_section("advanced") {
+            self.state.config.advanced = config.advanced.clone();
+        }
+        if !invalid_section("terminal") {
+            self.state.config.terminal = config.terminal.clone();
+        }
+        if !invalid_section("worktrees") {
+            self.state.config.worktrees = config.worktrees.clone();
+        }
+        if !invalid_section("theme") {
+            self.state.config.theme = config.theme.clone();
+        }
+        // Sections without an explicit invalidation gate always follow the
+        // incoming config.
+        self.state.config.name = config.name.clone();
+        self.state.config.onboarding = config.onboarding;
+        self.state.config.session = config.session.clone();
+        self.state.config.update = config.update;
+        self.state.config.remote = config.remote.clone();
+        self.state.config.slots = config.slots.clone();
+        self.state.config.peers = config.peers.clone();
+        // #96: publish the live-reloaded gossip cadence to the poll-tick thread
+        // so `flk server reload-config` re-arms the loop without a restart.
+        // Diagnostics ride along via collect_diagnostics; consumers clamp via
+        // `poll_interval()` so an invalid `0` still produces a live cadence.
+        diagnostics.extend(config.gossip.diagnostics());
+        self.state.config.gossip = config.gossip;
+        self.gossip_poll_interval_secs.store(
+            config.gossip.poll_interval().as_secs().max(1),
+            Ordering::Relaxed,
+        );
+        // Drop tracker entries for peers no longer configured; surviving peers
+        // keep their in-flight lock (matches the overlap guard's intent).
+        self.peer_poll_tracker
+            .retain_only(config.peers.iter().map(|p| p.name.as_str()));
+
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
@@ -1306,6 +1342,10 @@ impl App {
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
 
+                // Copy the whole validated [ui] block into state.config so
+                // pane accessors read the live values (ADR-0002 phase (f)).
+                self.state.config.ui = config.ui.clone();
+
                 self.state.default_sidebar_width = config.ui.sidebar_width;
                 if self.state.sidebar_width_source == state::SidebarWidthSource::ConfigDefault {
                     self.state.sidebar_width = config.ui.sidebar_width;
@@ -1313,15 +1353,10 @@ impl App {
                 self.state.sidebar_min_width = config.ui.sidebar_min_width;
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;
-                self.state.sidebar_row_gap =
-                    crate::config::validated_sidebar_row_gap(config.ui.sidebar_row_gap);
-                self.state.sidebar_pane_gap =
-                    crate::config::validated_sidebar_pane_gap(config.ui.sidebar_pane_gap);
                 self.state.prompt_float_lines =
                     crate::config::validated_prompt_float_lines(config.ui.prompt_float_lines);
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
                 self.state.tab_mode = config.ui.tab_mode;
-                self.state.idle = config.ui.idle;
                 self.state.server_state_mark = config.ui.server_state_mark;
                 self.state.pane_header = config.ui.pane_header;
                 self.state.status_line = config.ui.status_line;
@@ -1359,24 +1394,13 @@ impl App {
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
-                self.state.file_drop = config.ui.file_drop;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
-                self.state.show_agent_labels_on_pane_borders =
-                    config.ui.show_agent_labels_on_pane_borders;
-                self.state.agent_panel_scope =
-                    agent_panel_scope_from_config(config.ui.agent_panel_scope);
                 self.state.agent_panel_scroll = 0;
-                self.state.servers_panel_scope =
-                    panel_scope_from_config(config.ui.servers_panel_scope);
-                self.state.spaces_panel_scope =
-                    panel_scope_from_config(config.ui.spaces_panel_scope);
                 self.state.workspace_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
-                if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
+                if !self.state.local_sound_playback && previous_sound != config.ui.sound {
                     self.state.request_client_config_reload = true;
                 }
-                self.state.sound = config.ui.sound.clone();
-                self.state.toast_config = config.ui.toast.clone();
             }
         }
 
@@ -1394,10 +1418,7 @@ impl App {
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
-            self.state.switch_ascii_input_source_in_prefix =
-                config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
-            self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();
             }
@@ -1652,7 +1673,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::sync::Mutex;
 
     fn raw_key(
         code: KeyCode,
@@ -1726,7 +1746,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_switches_then_restores_when_enabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1748,7 +1771,10 @@ mod tests {
     #[test]
     fn sync_prefix_input_source_is_noop_when_flag_disabled() {
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = false;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = false;
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1768,7 +1794,10 @@ mod tests {
         // Simulates the already-ASCII / failed-switch case: switch reports no
         // change, and the later restore on leave must stay harmless.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::no_op();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
@@ -1789,7 +1818,10 @@ mod tests {
         // `handle_key` itself — the sync must sit at the dispatch layer so any
         // event that exits prefix (here Esc) still restores the host source.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state
+            .config
+            .experimental
+            .switch_ascii_input_source_in_prefix = true;
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1822,8 +1854,15 @@ mod tests {
         assert_eq!(restore_calls.get(), 1);
     }
 
-    fn config_env_lock() -> &'static Mutex<()> {
-        crate::config::test_config_env_lock()
+    /// Test-scope config-env guard: the serialization lock plus an ambient
+    /// `FLOCK_*` scrub so a stray alias (e.g. `FLOCK_HOST_NAME` on a dev box or
+    /// CI runner) can't poison the config under test. See
+    /// [`crate::config::test_config_env_guard`].
+    fn config_env_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::config::TestFlockEnvScrub,
+    ) {
+        crate::config::test_config_env_guard()
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -1910,7 +1949,7 @@ mod tests {
     #[test]
     fn clipboard_feedback_can_be_disabled() {
         let mut app = test_app();
-        app.state.toast_config.clipboard.enabled = false;
+        app.state.config.ui.toast.clipboard.enabled = false;
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
@@ -1923,7 +1962,7 @@ mod tests {
     #[test]
     fn notification_show_api_creates_flock_toast_with_position() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1959,7 +1998,7 @@ mod tests {
     #[test]
     fn notification_show_api_respects_off_delivery() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Off;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -1988,7 +2027,7 @@ mod tests {
     #[test]
     fn notification_show_api_does_not_replace_existing_toast() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
@@ -2027,7 +2066,7 @@ mod tests {
     #[test]
     fn notification_show_api_is_rate_limited() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         app.mark_api_notification_shown(Instant::now());
 
         let response =
@@ -2057,7 +2096,7 @@ mod tests {
     #[test]
     fn notification_show_api_rejects_empty_title() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -2162,7 +2201,7 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
     }
@@ -2180,7 +2219,7 @@ mod tests {
 
     #[test]
     fn startup_restores_preview_update_available_from_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-preview-update-available");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2198,7 +2237,7 @@ mod tests {
 
     #[test]
     fn startup_does_not_restore_update_available_from_older_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-stale-update-notes");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2215,7 +2254,7 @@ mod tests {
 
     #[test]
     fn startup_keeps_pending_release_notes_available_without_auto_opening() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
@@ -2239,7 +2278,7 @@ mod tests {
 
     #[test]
     fn startup_still_auto_opens_unseen_product_announcement() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("startup-product-announcement-auto-open");
         let state_home = path.parent().unwrap().join("state");
         let original_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
@@ -2283,7 +2322,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_live_state() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-success");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2305,11 +2344,11 @@ mod tests {
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
         assert!(!app.state.redraw_on_focus_gained);
@@ -2327,7 +2366,7 @@ mod tests {
             app.state.new_terminal_cwd,
             crate::config::NewTerminalCwdConfig::Home
         );
-        assert!(app.state.switch_ascii_input_source_in_prefix);
+        assert!(app.state.switch_ascii_input_source_in_prefix_enabled());
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -2340,7 +2379,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_width_only_when_config_owned() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-width");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2371,7 +2410,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_bounds_and_reclamps() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-bounds");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2425,7 +2464,7 @@ mod tests {
 
     #[test]
     fn reload_config_updates_mobile_width_threshold() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-mobile-width-threshold");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2448,14 +2487,14 @@ mod tests {
 
     #[test]
     fn reload_config_updates_sidebar_pane_gap() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-pane-gap");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::DEFAULT_SIDEBAR_PANE_GAP
         );
 
@@ -2469,7 +2508,7 @@ sidebar_pane_gap = 2
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_pane_gap, 2);
+        assert_eq!(app.state.sidebar_pane_gap(), 2);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(
@@ -2483,7 +2522,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
             crate::config::MAX_SIDEBAR_PANE_GAP
         );
 
@@ -2493,14 +2532,14 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_updates_sidebar_row_gap() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-sidebar-row-gap");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::DEFAULT_SIDEBAR_ROW_GAP
         );
 
@@ -2508,7 +2547,7 @@ sidebar_pane_gap = 99
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert_eq!(app.state.sidebar_row_gap, 0);
+        assert_eq!(app.state.sidebar_row_gap(), 0);
 
         // Out-of-range values clamp instead of producing absurd layouts.
         std::fs::write(&path, "[ui]\nsidebar_row_gap = 9\n").unwrap();
@@ -2516,7 +2555,7 @@ sidebar_pane_gap = 99
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
-            app.state.sidebar_row_gap,
+            app.state.sidebar_row_gap(),
             crate::config::MAX_SIDEBAR_ROW_GAP
         );
 
@@ -2545,7 +2584,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_invalid_sidebar_bounds_keeps_previous_ui_and_returns_partial() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-sidebar-bounds");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2590,7 +2629,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_keeps_current_keybinds_on_invalid_binding_but_applies_other_sections() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-keybind");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2612,7 +2651,7 @@ sidebar_pane_gap = 99
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2629,7 +2668,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_preserves_invalid_ui_section_but_applies_valid_keys() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-ui-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2640,7 +2679,7 @@ sidebar_pane_gap = 99
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
@@ -2650,7 +2689,7 @@ sidebar_pane_gap = 99
             .new_workspace
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         );
         assert!(app
@@ -2665,7 +2704,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_preserves_invalid_terminal_section_but_applies_valid_ui() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-terminal-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2686,7 +2725,7 @@ sidebar_pane_gap = 99
         assert_eq!(app.state.shell_mode, original_shell_mode);
         assert_eq!(app.state.new_terminal_cwd, original_new_cwd);
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         assert!(app
@@ -2701,7 +2740,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn settings_save_toast_delivery_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("settings-save-toast-delivery");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2709,14 +2748,14 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Off
         );
 
         app.save_toast_delivery(crate::config::ToastDelivery::Terminal);
 
         assert_eq!(
-            app.state.toast_config.delivery,
+            app.state.toast_config().delivery,
             crate::config::ToastDelivery::Terminal
         );
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2729,7 +2768,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn save_agent_panel_scope_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("save-agent-panel-scope");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2737,14 +2776,14 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::AllWorkspaces
         );
 
         app.save_agent_panel_scope(state::AgentPanelScope::CurrentWorkspace);
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             state::AgentPanelScope::CurrentWorkspace
         );
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2757,7 +2796,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn settings_save_pane_history_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("settings-save-pane-history");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "onboarding = false\n").unwrap();
@@ -2765,12 +2804,12 @@ sidebar_pane_gap = 99
 
         let mut app = test_app();
         assert!(!app.persist_pane_history);
-        assert!(!app.state.pane_history_persistence);
+        assert!(!app.state.pane_history_persistence_enabled());
 
         app.save_pane_history_persistence(true);
 
         assert!(app.persist_pane_history);
-        assert!(app.state.pane_history_persistence);
+        assert!(app.state.pane_history_persistence_enabled());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[experimental]"));
         assert!(content.contains("pane_history = true"));
@@ -2782,7 +2821,7 @@ sidebar_pane_gap = 99
 
     #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[keys\nnew_workspace = \"g\"\n").unwrap();
@@ -2791,7 +2830,7 @@ sidebar_pane_gap = 99
         let mut app = test_app();
         let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
         let original_keybinds = app.state.keybinds.new_workspace.clone();
-        let original_toast_delivery = app.state.toast_config.delivery;
+        let original_toast_delivery = app.state.toast_config().delivery;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
@@ -2800,7 +2839,7 @@ sidebar_pane_gap = 99
             original_prefix
         );
         assert_eq!(app.state.keybinds.new_workspace, original_keybinds);
-        assert_eq!(app.state.toast_config.delivery, original_toast_delivery);
+        assert_eq!(app.state.toast_config().delivery, original_toast_delivery);
         assert!(app
             .state
             .config_diagnostic
@@ -3311,7 +3350,7 @@ sidebar_pane_gap = 99
 
     #[tokio::test]
     async fn pane_split_request_targets_pane_in_background_tab() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let original_shell = std::env::var_os("SHELL");
         std::env::set_var("SHELL", "/usr/bin/true");
 
@@ -3407,7 +3446,7 @@ sidebar_pane_gap = 99
 
     #[tokio::test]
     async fn pane_split_request_focuses_new_pane_when_requested() {
-        let _guard = config_env_lock().lock().unwrap();
+        let _guard = config_env_guard();
         let original_shell = std::env::var_os("SHELL");
         std::env::set_var("SHELL", "/usr/bin/true");
 
@@ -3734,7 +3773,7 @@ sidebar_pane_gap = 99
             app.event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("9.9.{i}"),
-                    install_command: "flock update".into(),
+                    install_command: "flk update".into(),
                 })
                 .unwrap();
         }
@@ -4166,5 +4205,73 @@ last_pane = "prefix+tab"
             &input[events[1].start..events[1].start + events[1].len],
             b"a"
         );
+    }
+
+    #[test]
+    fn reload_config_rearms_gossip_poll_interval() {
+        // #96 acceptance: `flk server reload-config` picks up a changed
+        // [gossip] poll_interval_secs — the atomically-shared value the
+        // peer-summary tick reads must be updated by apply_live_config.
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-config-gossip");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let app = test_app();
+        // Startup default matches the shipped const, publisher-side.
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            crate::peers::PEER_POLL_INTERVAL_SECS,
+            "default publisher value matches the shipped const"
+        );
+        drop(app);
+
+        // Reload with a shorter cadence; publisher picks it up.
+        std::fs::write(&path, "[gossip]\npoll_interval_secs = 2\n").unwrap();
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            2,
+            "reload must re-arm the tick"
+        );
+        assert_eq!(app.state.config.gossip.poll_interval_secs, 2);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_clamps_invalid_gossip_interval() {
+        // A diagnosed poll_interval_secs=0 still yields a live cadence (>=1s)
+        // so the tick loop never busy-spins with a 0-second sleep.
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-config-gossip-invalid");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        std::fs::write(&path, "[gossip]\npoll_interval_secs = 0\n").unwrap();
+
+        let mut app = test_app();
+        let report = app.reload_config();
+        // Partial: the diagnostics ride along, but the section still applies
+        // (the publisher clamp keeps the tick loop alive).
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            app.gossip_poll_interval_secs.load(Ordering::Relaxed),
+            1,
+            "invalid 0 clamps to 1s in the publisher"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("[gossip] poll_interval_secs")),
+            "diagnostic surfaced: {:?}",
+            report.diagnostics
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

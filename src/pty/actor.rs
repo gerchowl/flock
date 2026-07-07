@@ -307,7 +307,7 @@ impl PtyIoActorHandle {
 
     fn wake_actor(&self) {
         if let Err(err) = self.wake.wake() {
-            debug!(err = %err, "failed to wake PTY actor");
+            crate::logging::pty_wake_failed(&err.to_string());
         }
     }
 }
@@ -420,7 +420,7 @@ impl PtyIoActorRunner {
                 Ok(readiness) => {
                     if readiness.wake_ready {
                         if let Err(err) = fd::drain_wake_fd(self.wake_read_fd.as_raw_fd()) {
-                            debug!(pane = self.pane_id, err = %err, "PTY actor wake drain failed");
+                            crate::logging::pty_wake_drain_failed(self.pane_id, &err.to_string());
                             break;
                         }
                         continue;
@@ -436,7 +436,7 @@ impl PtyIoActorRunner {
                     }
                 }
                 Err(err) => {
-                    debug!(pane = self.pane_id, err = %err, "PTY actor poll failed");
+                    crate::logging::pty_poll_failed(self.pane_id, &err.to_string());
                     break;
                 }
             }
@@ -607,7 +607,7 @@ impl PtyIoActorRunner {
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
             Err(err) => {
-                debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
+                crate::logging::pty_read_failed(self.pane_id, &err.to_string());
                 false
             }
             Ok(n) => {
@@ -643,7 +643,7 @@ impl PtyIoActorRunner {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
-                    warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
+                    crate::logging::pty_write_failed(self.pane_id, &err.to_string());
                     self.pending_writes.clear();
                     self.current_write_offset = 0;
                     return;
@@ -711,7 +711,7 @@ impl PtyIoActorRunner {
 
     fn log_resize_result(&self, result: std::io::Result<()>) {
         if let Err(err) = result {
-            debug!(pane = self.pane_id, err = %err, "PTY resize failed");
+            crate::logging::pty_resize_failed(self.pane_id, &err.to_string());
         }
     }
 }

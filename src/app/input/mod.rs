@@ -226,9 +226,9 @@ impl App {
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
-        let previous_agent_panel_scope = self.state.agent_panel_scope;
-        let previous_servers_panel_scope = self.state.servers_panel_scope;
-        let previous_spaces_panel_scope = self.state.spaces_panel_scope;
+        let previous_agent_panel_scope = self.state.agent_panel_scope();
+        let previous_servers_panel_scope = self.state.servers_panel_scope();
+        let previous_spaces_panel_scope = self.state.spaces_panel_scope();
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
@@ -264,14 +264,14 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
-        if self.state.agent_panel_scope != previous_agent_panel_scope {
-            self.save_agent_panel_scope(self.state.agent_panel_scope);
+        if self.state.agent_panel_scope() != previous_agent_panel_scope {
+            self.save_agent_panel_scope(self.state.agent_panel_scope());
         }
-        if self.state.servers_panel_scope != previous_servers_panel_scope {
-            self.save_servers_panel_scope(self.state.servers_panel_scope);
+        if self.state.servers_panel_scope() != previous_servers_panel_scope {
+            self.save_servers_panel_scope(self.state.servers_panel_scope());
         }
-        if self.state.spaces_panel_scope != previous_spaces_panel_scope {
-            self.save_spaces_panel_scope(self.state.spaces_panel_scope);
+        if self.state.spaces_panel_scope() != previous_spaces_panel_scope {
+            self.save_spaces_panel_scope(self.state.spaces_panel_scope());
         }
 
         if let Some(content) = self.state.request_clipboard_write.take() {
@@ -316,7 +316,7 @@ impl App {
 
         self.last_pane_click = None;
         if let Err(err) = crate::platform::open_url(&url) {
-            tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+            crate::logging::pane_open_url_failed(&url, &err.to_string());
         }
         true
     }
@@ -477,7 +477,17 @@ fn state_with_workspaces(names: &[&str]) -> AppState {
     let mut state = AppState::test_new();
     state.workspaces = names
         .iter()
-        .map(|name| crate::workspace::Workspace::test_new(name))
+        .map(|name| {
+            let mut ws = crate::workspace::Workspace::test_new(name);
+            // Give each fixture workspace a unique `identity_cwd` matching
+            // its name so `sort_family_key` (frozen at spawn, basename-
+            // lowercased) discriminates rows — otherwise every test
+            // workspace collapses to the same current-dir basename and
+            // sort order depends only on ws_idx, hiding real ordering
+            // regressions and mirroring #102 pending-probe behaviour.
+            ws.identity_cwd = std::path::PathBuf::from(format!("/tmp/flock-test/{name}"));
+            ws
+        })
         .collect();
     if !state.workspaces.is_empty() {
         state.active = Some(0);

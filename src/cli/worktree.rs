@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{
     Method, Request, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
     WorktreeRemoveParams,
@@ -57,7 +62,7 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         }
     }
     if workspace_id.is_some() && cwd.is_some() {
-        eprintln!("usage: flock worktree list [--workspace ID | --cwd PATH] [--json]");
+        eprintln!("usage: flk worktree list [--workspace ID | --cwd PATH] [--json]");
         return Ok(2);
     }
 
@@ -144,7 +149,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: flock worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
@@ -231,13 +236,13 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: flock worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
     if path.is_some() == branch.is_some() {
         eprintln!(
-            "usage: flock worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
@@ -283,7 +288,7 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
     }
 
     let Some(workspace_id) = workspace_id else {
-        eprintln!("usage: flock worktree remove --workspace ID [--force] [--json]");
+        eprintln!("usage: flk worktree remove --workspace ID [--force] [--json]");
         return Ok(2);
     };
 
@@ -338,7 +343,7 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 
     let Some(workspace_id) = workspace_id else {
         eprintln!(
-            "usage: flock worktree kill --workspace ID [--dry-run] [--force] [--keep-branch] [--json]"
+            "usage: flk worktree kill --workspace ID [--dry-run] [--force] [--keep-branch] [--json]"
         );
         return Ok(2);
     };
@@ -446,18 +451,16 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_worktree_help() {
-    eprintln!("flock worktree commands:");
-    eprintln!("  flock worktree list [--workspace ID | --cwd PATH] [--json]");
+    eprintln!("flk worktree commands:");
+    eprintln!("  flk worktree list [--workspace ID | --cwd PATH] [--json]");
     eprintln!(
-        "  flock worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
     );
     eprintln!(
-        "  flock worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
     );
-    eprintln!("  flock worktree remove --workspace ID [--force] [--json]");
-    eprintln!(
-        "  flock worktree kill --workspace ID [--dry-run] [--force] [--keep-branch] [--json]"
-    );
+    eprintln!("  flk worktree remove --workspace ID [--force] [--json]");
+    eprintln!("  flk worktree kill --workspace ID [--dry-run] [--force] [--keep-branch] [--json]");
 }
 
 fn normalize_path_arg(value: &str) -> std::io::Result<String> {

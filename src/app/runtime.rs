@@ -313,6 +313,8 @@ impl App {
             // isn't woken for an animation that will never render.
             self.next_animation_tick = self
                 .state
+                .config
+                .ui
                 .idle
                 .next_idle_wake_after()
                 .and_then(|after| self.state.last_interaction.checked_add(after))
@@ -323,7 +325,7 @@ impl App {
     }
 
     fn agent_panel_has_animation(&self) -> bool {
-        match self.state.agent_panel_scope {
+        match self.state.agent_panel_scope() {
             crate::app::state::AgentPanelScope::CurrentWorkspace => self
                 .state
                 .active
@@ -637,6 +639,7 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::app::state;

@@ -1,0 +1,28 @@
+# guardrails perf budgets — checked-in baselines the `perf-budget` gate enforces.
+#
+# Workflow: run your benches (`cargo criterion`), then `guardrails-perf-budget`. It reads each
+# benchmark's measured median from target/criterion and compares it here. Per the methodology in
+# guardrails docs/CONVENTIONS.md: GATE big regressions on value-path metrics, NUDGE the rest.
+#
+# Keys are criterion benchmark ids (their target/criterion/<id> path). budget_ns is the median
+# ceiling; tolerance is the fractional headroom before flagging (default below).
+
+default_tolerance = 0.20   # 20% headroom — "gate big regressions", not measurement noise
+
+# [bench."parser/parse_frame"]
+# budget_ns = 1500
+# mode = "gate"            # gate = block on regression; nudge = warn only
+#
+# [bench."ui/render_sidebar"]
+# budget_ns = 8000
+# mode = "nudge"
+# tolerance = 0.10         # optional per-budget override
+
+# Bespoke (non-criterion) harnesses — GPU fps ceilings, MB/s throughput, … — write a flat JSON map
+# (GUARDRAILS_PERF_RESULTS, default perf-results.json): {"bench_id": value}. Use the unit-agnostic
+# `budget` key, and `direction = "higher"` for higher-is-better metrics (budget = floor):
+#
+# [bench."gpu/particle_ceiling"]
+# budget = 1000000
+# direction = "higher"
+# mode = "gate"

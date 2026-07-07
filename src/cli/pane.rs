@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{
     Method, PaneClearHeaderFieldParams, PaneListParams, PaneMoveDestination, PaneMoveParams,
     PaneReadParams, PaneRenameParams, PaneReportAgentParams, PaneReportMetadataParams,
@@ -69,11 +74,11 @@ fn pane_list(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane get <pane_id>");
+        eprintln!("usage: flk pane get <pane_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock pane get <pane_id>");
+        eprintln!("usage: flk pane get <pane_id>");
         return Ok(2);
     }
 
@@ -87,11 +92,11 @@ fn pane_get(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
         return Ok(2);
     };
     if args.len() < 2 {
-        eprintln!("usage: flock pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
         return Ok(2);
     }
     let label = if args.len() == 2 && args[1] == "--clear" {
@@ -111,7 +116,7 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
@@ -189,7 +194,7 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
 fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!(
-            "usage: flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+            "usage: flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
         );
         return Ok(2);
     };
@@ -410,7 +415,7 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
 }
 
 fn pane_move_usage() -> String {
-    "usage: flock pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flock pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flock pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+    "usage: flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
         .into()
 }
 
@@ -426,11 +431,11 @@ fn parse_move_split_direction(value: &str) -> Result<SplitDirection, String> {
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane close <pane_id>");
+        eprintln!("usage: flk pane close <pane_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock pane close <pane_id>");
+        eprintln!("usage: flk pane close <pane_id>");
         return Ok(2);
     }
 
@@ -444,7 +449,7 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock pane send-text <pane_id> <text>");
+        eprintln!("usage: flk pane send-text <pane_id> <text>");
         return Ok(2);
     }
 
@@ -455,7 +460,7 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock pane send-keys <pane_id> <key> [key ...]");
+        eprintln!("usage: flk pane send-keys <pane_id> <key> [key ...]");
         return Ok(2);
     }
 
@@ -466,7 +471,7 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock pane run <pane_id> <command>");
+        eprintln!("usage: flk pane run <pane_id> <command>");
         return Ok(2);
     }
 
@@ -481,7 +486,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+        eprintln!("usage: flk pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
         return Ok(2);
     };
 
@@ -600,7 +605,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flock pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
+        eprintln!("usage: flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
         return Ok(2);
     };
 
@@ -783,14 +788,14 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
 }
 
 const SET_FIELD_USAGE: &str =
-    "usage: flock pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]";
-const CLEAR_FIELD_USAGE: &str = "usage: flock pane clear-field <key> [--pane <pane_id>]";
+    "usage: flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]";
+const CLEAR_FIELD_USAGE: &str = "usage: flk pane clear-field <key> [--pane <pane_id>]";
 const REPORT_RECAP_USAGE: &str =
-    "usage: flock pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]";
+    "usage: flk pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]";
 const REPORT_REPLY_USAGE: &str =
-    "usage: flock pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]";
+    "usage: flk pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]";
 
-/// `flock pane report-recap`: append a recap entry to the calling pane's
+/// `flk pane report-recap`: append a recap entry to the calling pane's
 /// prompt-history scrollback (#96). The pane defaults to the calling pane,
 /// like the other report-* verbs.
 fn pane_report_recap(args: &[String]) -> std::io::Result<i32> {
@@ -883,7 +888,7 @@ fn pane_report_recap(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
-/// `flock pane report-reply`: append an assistant-reply entry to the calling
+/// `flk pane report-reply`: append an assistant-reply entry to the calling
 /// pane's prompt-history scrollback. Wired from the same Stop hook that fires
 /// `report-recap` — see `assets/claude/flock-agent-state.sh`.
 fn pane_report_reply(args: &[String]) -> std::io::Result<i32> {
@@ -1028,7 +1033,7 @@ fn parse_field_options(
     Ok((ttl_secs, pane_id.unwrap_or_else(calling_pane_id)))
 }
 
-/// `flock pane set-field <key> <value> [--ttl <secs>]`: promote a
+/// `flk pane set-field <key> <value> [--ttl <secs>]`: promote a
 /// session-specific field (container, progress, custom KV) into the calling
 /// pane's header. Capped at 6 fields per pane, key <= 16 chars, value <= 48.
 fn pane_set_field(args: &[String]) -> std::io::Result<i32> {
@@ -1049,7 +1054,7 @@ fn pane_set_field(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
-/// `flock pane clear-field <key>`: remove a promoted header field from the
+/// `flk pane clear-field <key>`: remove a promoted header field from the
 /// calling pane. Idempotent.
 fn pane_clear_field(args: &[String]) -> std::io::Result<i32> {
     let Some(key) = args.first() else {
@@ -1070,46 +1075,46 @@ fn pane_clear_field(args: &[String]) -> std::io::Result<i32> {
 fn pane_help_text() -> String {
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(out, "flock pane commands:");
-    let _ = writeln!(out, "  flock pane list [--workspace <workspace_id>]");
-    let _ = writeln!(out, "  flock pane get <pane_id>");
-    let _ = writeln!(out, "  flock pane rename <pane_id> <label>|--clear");
-    let _ = writeln!(out, "  flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    let _ = writeln!(out, "flk pane commands:");
+    let _ = writeln!(out, "  flk pane list [--workspace <workspace_id>]");
+    let _ = writeln!(out, "  flk pane get <pane_id>");
+    let _ = writeln!(out, "  flk pane rename <pane_id> <label>|--clear");
+    let _ = writeln!(out, "  flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
-        "  flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+        "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flock pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
+        "  flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flock pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
+        "  flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flock pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+        "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
-    let _ = writeln!(out, "  flock pane close <pane_id>");
-    let _ = writeln!(out, "  flock pane send-text <pane_id> <text>");
-    let _ = writeln!(out, "  flock pane send-keys <pane_id> <key> [key ...]");
-    let _ = writeln!(out, "  flock pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-    let _ = writeln!(out, "  flock pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
+    let _ = writeln!(out, "  flk pane close <pane_id>");
+    let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
+    let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
+    let _ = writeln!(out, "  flk pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+    let _ = writeln!(out, "  flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
     let _ = writeln!(
         out,
-        "  flock pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]"
-    );
-    let _ = writeln!(
-        out,
-        "  flock pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]"
+        "  flk pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]"
     );
     let _ = writeln!(
         out,
-        "  flock pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
+        "  flk pane report-reply --source ID --agent LABEL --reply TEXT [--seq N] [--pane <pane_id>]"
     );
-    let _ = writeln!(out, "  flock pane clear-field <key> [--pane <pane_id>]");
-    let _ = writeln!(out, "  flock pane run <pane_id> <command>");
+    let _ = writeln!(
+        out,
+        "  flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
+    );
+    let _ = writeln!(out, "  flk pane clear-field <key> [--pane <pane_id>]");
+    let _ = writeln!(out, "  flk pane run <pane_id> <command>");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -1163,11 +1168,11 @@ mod tests {
     fn pane_help_lists_report_recap_and_history_explanation() {
         let help = pane_help_text();
         assert!(
-            help.contains("flock pane report-recap --source ID --agent LABEL --recap TEXT"),
+            help.contains("flk pane report-recap --source ID --agent LABEL --recap TEXT"),
             "help should advertise the report-recap subcommand"
         );
         assert!(
-            help.contains("flock pane report-reply --source ID --agent LABEL --reply TEXT"),
+            help.contains("flk pane report-reply --source ID --agent LABEL --reply TEXT"),
             "help should advertise the report-reply subcommand"
         );
         assert!(

@@ -14,7 +14,7 @@ use ratatui::{layout::Rect, Frame};
 #[cfg(test)]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, Notify};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
@@ -106,11 +106,7 @@ async fn publish_state_changed_event(
         })
         .await
     {
-        warn!(
-            pane = pane_id.raw(),
-            err = %e,
-            "failed to deliver StateChanged event"
-        );
+        crate::logging::pane_state_change_send_failed(pane_id.raw(), &e.to_string());
     }
 }
 
@@ -893,12 +889,7 @@ fn shutdown_pane_processes(
         }
     }
 
-    warn!(
-        pane = pane_id.raw(),
-        pid = child_pid,
-        pids = ?pids,
-        "pane session still alive after forced shutdown"
-    );
+    crate::logging::pane_forced_shutdown_survivors(pane_id.raw(), child_pid, &format!("{pids:?}"));
 }
 
 #[cfg(unix)]
@@ -1043,10 +1034,9 @@ impl PaneRuntime {
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
         if let Err(err) = self.io.release_after_commit() {
-            warn!(
-                pane = self.pane_id.raw(),
-                err = %err,
-                "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
+            crate::logging::pane_pty_release_after_handoff_failed(
+                self.pane_id.raw(),
+                &err.to_string(),
             );
         }
         self.detect_handle.abort();
@@ -1061,11 +1051,10 @@ impl PaneRuntime {
     #[cfg(unix)]
     pub fn set_handoff_reader_paused(&self, paused: bool) {
         if let Err(err) = self.io.set_handoff_paused(paused) {
-            warn!(
-                pane = self.pane_id.raw(),
-                err = %err,
+            crate::logging::pane_pty_handoff_pause_update_failed(
+                self.pane_id.raw(),
                 paused,
-                "failed to update PTY actor handoff pause state"
+                &err.to_string(),
             );
         }
     }
@@ -1345,11 +1334,7 @@ impl PaneRuntime {
                 }
                 for content in result.clipboard_writes {
                     if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
-                        warn!(
-                            pane = pane_id.raw(),
-                            err = %err,
-                            "failed to queue OSC 52 clipboard write"
-                        );
+                        crate::logging::pane_osc52_queue_failed(pane_id.raw(), &err.to_string());
                     }
                 }
                 PtyReadResult {
@@ -1419,8 +1404,14 @@ impl PaneRuntime {
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
-            .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
+        let spawned =
+            crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(|err| {
+                crate::logging::pane_spawn_error(
+                    pane_id.raw(),
+                    &err.to_string(),
+                    spawn_error_message,
+                )
+            })?;
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
@@ -1446,7 +1437,7 @@ impl PaneRuntime {
                 child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
-                    error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                    crate::logging::pane_died_send_failed(pane_id.raw(), &e.to_string());
                 }
             });
         }
@@ -1478,11 +1469,7 @@ impl PaneRuntime {
                 }
                 for content in result.clipboard_writes {
                     if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
-                        warn!(
-                            pane = pane_id.raw(),
-                            err = %err,
-                            "failed to send OSC 52 clipboard write"
-                        );
+                        crate::logging::pane_osc52_send_failed(pane_id.raw(), &err.to_string());
                     }
                 }
                 PtyReadResult {
@@ -1680,24 +1667,14 @@ impl PaneRuntime {
                             }
                             if changed {
                                 agent = agent_presence.current_agent();
-                                if let Some(process_name) = process_name {
-                                    info!(
-                                        pane = pane_id.raw(),
-                                        previous_agent = ?previous_agent,
-                                        ?agent,
-                                        process = %process_name,
-                                        pgid = ?process_group_id,
-                                        "agent changed"
-                                    );
-                                } else {
-                                    info!(
-                                        pane = pane_id.raw(),
-                                        previous_agent = ?previous_agent,
-                                        ?agent,
-                                        pgid = ?process_group_id,
-                                        "agent changed"
-                                    );
-                                }
+                                let process_display = process_name.map(|p| p.to_string());
+                                crate::logging::pane_agent_changed(
+                                    pane_id.raw(),
+                                    &format!("{previous_agent:?}"),
+                                    &format!("{agent:?}"),
+                                    process_display.as_deref(),
+                                    &format!("{process_group_id:?}"),
+                                );
                                 agent_changed = true;
                             }
                         }
@@ -2000,7 +1977,7 @@ impl PaneRuntime {
             return false;
         };
         if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
-            warn!(err = %err, ?event, "failed to forward pane focus event");
+            crate::logging::pane_focus_forward_failed(&err.to_string(), &format!("{event:?}"));
         }
         true
     }
@@ -3061,7 +3038,7 @@ mod tests {
 
         tx.try_send(AppEvent::UpdateReady {
             version: "9.9.9".into(),
-            install_command: "flock update".into(),
+            install_command: "flk update".into(),
         })
         .unwrap();
 

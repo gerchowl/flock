@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyModifiers};
-use tracing::{debug, warn};
 
 use crate::{
     app::{App, Mode},
@@ -183,13 +182,7 @@ impl App {
         }
 
         if let Some(action) = super::terminal_direct_navigation_action(&self.state, key) {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                action = ?action,
-                "intercepted terminal direct keybinding before forwarding to pane"
-            );
+            crate::logging::terminal_key_intercept_action(&key_event, &format!("{:?}", action));
             match action {
                 super::navigate::NavigateAction::EditScrollback => {
                     self.launch_focused_scrollback_editor();
@@ -217,13 +210,7 @@ impl App {
             key,
             super::navigate::BindingDispatch::Direct,
         ) {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                command = %binding.label,
-                "intercepted terminal direct custom command before forwarding to pane"
-            );
+            crate::logging::terminal_key_intercept_command(&key_event, &binding.label);
             self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
             return None;
         }
@@ -252,12 +239,7 @@ impl App {
         }
 
         if is_modifier_only_key(&key_event.code) {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                "dropping modifier-only terminal key event instead of forwarding it to pane"
-            );
+            crate::logging::terminal_key_modifier_only_dropped(&key_event);
             return None;
         }
 
@@ -300,11 +282,7 @@ impl App {
                             self.state
                                 .scroll_pane_down(&self.terminal_runtimes, pane_id, lines);
                         }
-                        debug!(
-                            code = ?key_event.code,
-                            lines,
-                            "intercepted page key for pane scrollback"
-                        );
+                        crate::logging::terminal_key_page_intercept(&key_event.code, lines);
                         return None;
                     }
                 }
@@ -320,13 +298,10 @@ impl App {
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::ALT)
         {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                protocol = ?protocol,
-                encoded = ?bytes,
-                "forwarding potentially-ambiguous terminal key to pane"
+            crate::logging::terminal_key_forward_ambiguous(
+                &key_event,
+                &format!("{:?}", protocol),
+                &bytes,
             );
         }
 
@@ -345,7 +320,7 @@ impl App {
                         | KeyCode::Modifier(_)
                 )
             {
-                warn!(code = ?key_event.code, mods = ?key_event.modifiers, state = ?key_event.state, "key produced empty encoding");
+                crate::logging::terminal_key_empty_encoding(&key_event);
             }
             return None;
         }

@@ -21,7 +21,7 @@ impl AppState {
         crate::ui::workspace_list_rect(
             sidebar,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
             crate::ui::servers_section_height(self),
         )
     }
@@ -34,7 +34,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             sidebar,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         detail_area
     }
@@ -214,7 +214,7 @@ impl AppState {
         if self.sidebar_collapsed {
             return Rect::default();
         }
-        crate::ui::sidebar_menu_row_rect(self.view.sidebar_rect, self.sidebar_pane_gap)
+        crate::ui::sidebar_menu_row_rect(self.view.sidebar_rect, self.sidebar_pane_gap())
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
@@ -290,7 +290,7 @@ impl AppState {
         let width = divider_col
             .saturating_sub(sidebar.x)
             .saturating_add(1)
-            .saturating_sub(self.sidebar_pane_gap);
+            .saturating_sub(self.sidebar_pane_gap());
         self.sidebar_width = width.clamp(self.sidebar_min_width, self.sidebar_max_width);
         self.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
         self.mark_session_dirty();
@@ -303,7 +303,7 @@ impl AppState {
         let rect = crate::ui::sidebar_section_divider_rect(
             self.view.sidebar_rect,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         rect.width > 0
             && col >= rect.x
@@ -363,7 +363,7 @@ impl AppState {
         }
 
         let (ws_area, _, _) =
-            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap);
+            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap());
         if ws_area == Rect::default() || row < ws_area.y || row >= ws_area.y + ws_area.height {
             return None;
         }
@@ -399,7 +399,7 @@ impl AppState {
         }
 
         let (_, _, detail_area) =
-            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap);
+            crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect, self.sidebar_pane_gap());
         let detail_content_area = Rect::new(
             detail_area.x,
             detail_area.y,
@@ -491,7 +491,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             self.view.sidebar_rect,
             self.sidebar_section_split,
-            self.sidebar_pane_gap,
+            self.sidebar_pane_gap(),
         );
         // Row 0 is the section divider; the ` agents` header sits below it.
         if detail_area.width == 0 || detail_area.height < 2 {
@@ -524,10 +524,20 @@ impl AppState {
             None => return Some(ServerFilter::Local),
             Some(PeerSwitchRequest::Home) => return None,
             Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
-                self.remote_peer(crate::app::state::RemotePeerRef::Config { peer_idx })
+                self.remote_peer(&crate::app::state::RemotePeerRef::Config { peer_idx })
             }
             Some(PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
-                self.remote_peer(crate::app::state::RemotePeerRef::Snapshot { entry_idx })
+                self.remote_peer(&crate::app::state::RemotePeerRef::Snapshot { entry_idx })
+            }
+            Some(PeerSwitchRequest::RelayedPeer { host_key }) => {
+                // Resolve via the relayed cache: derive the ssh_target for the
+                // server-scope filter, then fall through.
+                return self
+                    .relayed_fleet_cache
+                    .get(&host_key)
+                    .map(|entry| ServerFilter::Peer {
+                        ssh_target: entry.ssh_target.clone(),
+                    });
             }
             // Origin-workspace rows are spaces-list folds, never band slots,
             // so there's no server filter to derive for one.
@@ -573,7 +583,7 @@ impl AppState {
             return Rect::default();
         }
         let header = Rect::new(area.x, area.y, area.width, 1);
-        let toggle = crate::ui::panel_scope_toggle_rect(header, self.spaces_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, self.spaces_panel_scope());
         // Need room for ` new` (4 chars) plus a one-column gap before the toggle.
         const LABEL_WIDTH: u16 = 4;
         const GAP: u16 = 1;
@@ -627,7 +637,7 @@ impl AppState {
             }
             row_y = row_y.saturating_add(1);
             if row_y < body.y + body.height {
-                row_y = row_y.saturating_add(self.sidebar_row_gap);
+                row_y = row_y.saturating_add(self.sidebar_row_gap());
             }
         }
         None
@@ -886,7 +896,7 @@ mod tests {
             detail_area,
             crate::ui::should_show_scrollbar(metrics),
         );
-        let second_row = body.y + 1 + app.state.sidebar_row_gap;
+        let second_row = body.y + 1 + app.state.sidebar_row_gap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             2,
@@ -951,7 +961,7 @@ mod tests {
         assert_eq!(app.state.agent_detail_target_at(body.y + 1), None);
 
         // Gap 0: rows pack, second entry starts at body.y + 1.
-        app.state.sidebar_row_gap = 0;
+        app.state.config.ui.sidebar_row_gap = 0;
         assert_eq!(app.state.agent_detail_target_at(body.y + 1), Some(second));
     }
 
@@ -967,9 +977,9 @@ mod tests {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope);
+        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
@@ -977,7 +987,7 @@ mod tests {
         ));
 
         assert_eq!(
-            app.state.agent_panel_scope,
+            app.state.agent_panel_scope(),
             AgentPanelScope::CurrentWorkspace
         );
         assert_eq!(app.state.agent_panel_scroll, 0);
@@ -994,7 +1004,10 @@ mod tests {
             detail_area.x + 1,
             detail_area.y + 1,
         ));
-        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::AllWorkspaces);
+        assert_eq!(
+            app.state.agent_panel_scope(),
+            AgentPanelScope::AllWorkspaces
+        );
 
         // The divider row above the header is the section-split drag
         // handle, not the toggle.
@@ -1003,7 +1016,10 @@ mod tests {
             detail_area.x + 1,
             detail_area.y,
         ));
-        assert_eq!(app.state.agent_panel_scope, AgentPanelScope::AllWorkspaces);
+        assert_eq!(
+            app.state.agent_panel_scope(),
+            AgentPanelScope::AllWorkspaces
+        );
     }
 
     #[test]
@@ -1031,18 +1047,18 @@ mod tests {
             header.x + 1,
             header.y,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::Current);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.servers_panel_scope, PanelScope::Current);
 
         // Clicking the right-aligned label keeps working and returns to all.
-        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.servers_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.servers_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::All);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::All);
 
         // The row below the header is a server row, not the toggle.
         app.handle_mouse(mouse(
@@ -1050,7 +1066,7 @@ mod tests {
             header.x + 1,
             header.y + 1,
         ));
-        assert_eq!(app.state.servers_panel_scope, PanelScope::All);
+        assert_eq!(app.state.servers_panel_scope(), PanelScope::All);
     }
 
     #[test]
@@ -1065,14 +1081,14 @@ mod tests {
         let list_area = app.state.workspace_list_rect();
         assert_ne!(list_area, Rect::default());
         let header = Rect::new(list_area.x, list_area.y, list_area.width, 1);
-        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+        let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope());
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
 
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::Current);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::Current);
         assert_eq!(app.state.workspace_scroll, 0);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.spaces_panel_scope, PanelScope::Current);
@@ -1084,7 +1100,7 @@ mod tests {
             header.x + 1,
             header.y,
         ));
-        assert_eq!(app.state.spaces_panel_scope, PanelScope::All);
+        assert_eq!(app.state.spaces_panel_scope(), PanelScope::All);
     }
 
     #[test]
@@ -1150,7 +1166,7 @@ mod tests {
             // same row, never overlapping it.
             let list_area = app.state.workspace_list_rect();
             let header = Rect::new(list_area.x, list_area.y, list_area.width, 1);
-            let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope);
+            let toggle = crate::ui::panel_scope_toggle_rect(header, app.state.spaces_panel_scope());
             assert!(new_rect.x + new_rect.width <= toggle.x);
 
             app.handle_mouse(mouse(
@@ -1164,7 +1180,7 @@ mod tests {
                 "header `new` stages $HOME for both event loops in {tab_mode:?}",
             );
             // The scope toggle is not collaterally fired by the new-button click.
-            assert_eq!(app.state.spaces_panel_scope, PanelScope::All);
+            assert_eq!(app.state.spaces_panel_scope(), PanelScope::All);
         }
         // Restore HOME.
         match original_home {
@@ -1203,7 +1219,8 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state
+            .set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
 
         let detail_area = app.state.agent_panel_rect();
         // Single-row entries (#62): the second agent row is one row + gap below
@@ -1213,7 +1230,7 @@ mod tests {
             detail_area,
             crate::ui::should_show_scrollbar(metrics),
         );
-        let second_row = body.y + 1 + app.state.sidebar_row_gap;
+        let second_row = body.y + 1 + app.state.sidebar_row_gap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             body.x + 2,
@@ -1382,7 +1399,7 @@ mod tests {
 
         let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(
             app.state.view.sidebar_rect,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -1673,25 +1690,41 @@ mod tests {
         app.state.tab_scroll_follow_active = false;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 65, 20));
 
-        let last_idx = app.state.workspaces[0].tabs.len() - 1;
-        let target = app.state.view.tab_hit_areas[last_idx];
+        // #102 part 3: tabs render in `(display_name, tab.number)` order,
+        // so "rightmost visible tab" is the storage-index with the largest
+        // x-coord in `tab_hit_areas`, not the storage-last index.
+        let rightmost_idx = app
+            .state
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.width > 0)
+            .max_by_key(|(_, rect)| rect.x)
+            .map(|(idx, _)| idx)
+            .expect("at least one tab is visible");
+        let target = app.state.view.tab_hit_areas[rightmost_idx];
         let clamped_scroll = app.state.tab_scroll;
-        assert!(target.width > 0, "last tab should already be visible");
+        assert!(target.width > 0, "rightmost tab should be visible");
 
+        // Click the leftmost column of the target rect — its width may
+        // have been truncated to 1 at max scroll (#102 permuted layout),
+        // in which case `target.x + 1` would spill onto the scroll-right
+        // button and no tab press would register.
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            target.x + 1,
+            target.x,
             target.y,
         ));
         app.handle_mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
-            target.x + 1,
+            target.x,
             target.y,
         ));
 
-        assert_eq!(app.state.workspaces[0].active_tab, last_idx);
+        assert_eq!(app.state.workspaces[0].active_tab, rightmost_idx);
         assert_eq!(app.state.tab_scroll, clamped_scroll);
-        assert!(app.state.view.tab_hit_areas[last_idx].width > 0);
+        assert!(app.state.view.tab_hit_areas[rightmost_idx].width > 0);
     }
 
     #[test]
@@ -2000,7 +2033,7 @@ mod tests {
         let divider = crate::ui::sidebar_section_divider_rect(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
-            app.state.sidebar_pane_gap,
+            app.state.sidebar_pane_gap(),
         );
 
         app.handle_mouse(mouse(

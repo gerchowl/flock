@@ -1,3 +1,14 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "build script: eprintln! is the diagnostics channel (cargo:-directive println!s are lint-exempt)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    // TracedCommand (logging redesign PR-3) is the funnel for the flock binary
+    // at runtime; a build script runs at cargo-build time (no crate::logging
+    // subscriber to feed) so raw Command is the right shape here.
+)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

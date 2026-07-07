@@ -202,7 +202,7 @@ pub fn raise_server_nofile_limit() {
         Ok(Some((previous, target))) => {
             tracing::info!(previous, target, "raised server file descriptor soft limit")
         }
-        Err(err) => tracing::warn!(err = %err, "failed to raise server file descriptor limit"),
+        Err(err) => crate::logging::server_nofile_raise_failed(&err.to_string()),
     }
 }
 
@@ -464,12 +464,12 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
 }
 
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    Command::new("open")
+    crate::process::TracedCommand::new("open", "platform")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn_traced()?;
     Ok(())
 }
 
@@ -484,13 +484,13 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
         path.display()
     );
 
-    let status = Command::new("osascript")
+    let status = crate::process::TracedCommand::new("osascript", "platform")
         .arg("-e")
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_traced()
         .ok()?;
 
     if !status.success() {
@@ -611,11 +611,9 @@ fn verified_terminal_bundle_identifier(
 
 fn bundle_identifier_available(bundle_id: &str, command: &mut impl FnMut(&str) -> Command) -> bool {
     let query = format!("kMDItemCFBundleIdentifier == '{bundle_id}'");
-    let output = command("mdfind")
-        .arg(query)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let mut cmd = command("mdfind");
+    cmd.arg(query).stdin(Stdio::null()).stderr(Stdio::null());
+    let output = crate::process::TracedCommand::from_command(cmd, "platform").output_traced();
 
     match output {
         Ok(output) if output.status.success() => !output.stdout.is_empty(),
@@ -657,27 +655,27 @@ fn terminal_bundle_identifier_from_env(
 }
 
 fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
-    let status = match command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
+        .stderr(Stdio::null());
+    let status =
+        match crate::process::TracedCommand::from_command(command, "platform").status_traced() {
+            Ok(status) => status,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
 
     Ok(status.success())
 }
 
 fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
-    let mut child = match Command::new(command.program)
+    let mut child = match crate::process::TracedCommand::new(command.program, "platform")
         .args(command.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_traced()
     {
         Ok(child) => child,
         Err(_) => return false,
@@ -902,6 +900,7 @@ pub fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {
     use super::*;
 

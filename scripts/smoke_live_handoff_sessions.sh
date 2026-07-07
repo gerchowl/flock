@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOCK_BIN="${FLOCK_BIN:-$ROOT/target/debug/flock}"
+FLOCK_BIN="${FLOCK_BIN:-$ROOT/target/debug/flk}"
 BASE="${BASE:-$(mktemp -d /tmp/flock-handoff-smoke.XXXXXX)}"
 CONFIG_HOME="$BASE/config"
 RUNTIME_DIR="$BASE/runtime"

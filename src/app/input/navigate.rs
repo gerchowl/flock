@@ -1,9 +1,11 @@
 use std::{
     fs, io,
     io::Write,
-    process::{Command, Stdio},
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::process::TracedCommand;
 
 use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -225,7 +227,7 @@ impl App {
         &self,
         binding: &crate::config::CustomCommandKeybind,
     ) -> std::io::Result<()> {
-        let mut command = Command::new("/bin/sh");
+        let mut command = TracedCommand::new("/bin/sh", "keybind");
         command
             .arg("-lc")
             .arg(&binding.command)
@@ -237,7 +239,7 @@ impl App {
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
-        command.spawn()?;
+        command.spawn_traced()?;
         Ok(())
     }
 

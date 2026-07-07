@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{EmptyParams, Method, PeersCheckoutPrepareParams, Request};
 
 pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
@@ -214,7 +219,7 @@ fn peers_checkout_prepare(args: &[String]) -> std::io::Result<i32> {
     }
 
     let Some(workspace_id) = workspace_id else {
-        eprintln!("usage: flock peers checkout-prepare --workspace <id> [--push] [--json]");
+        eprintln!("usage: flk peers checkout-prepare --workspace <id> [--push] [--json]");
         return Ok(2);
     };
 
@@ -225,9 +230,9 @@ fn peers_checkout_prepare(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_peers_help() {
-    eprintln!("usage: flock peers summary [--json]");
-    eprintln!("       flock peers checkout-prepare --workspace <id> [--push] [--json]");
-    eprintln!("       flock peers logs [--all] [--lines N] [--json]");
+    eprintln!("usage: flk peers summary [--json]");
+    eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
+    eprintln!("       flk peers logs [--all] [--lines N] [--json]");
 }
 
 #[cfg(test)]

@@ -1,3 +1,7 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
 use crate::api::schema::{
     EmptyParams, Method, Request, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
 };
@@ -28,7 +32,7 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_list(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: flock workspace list");
+        eprintln!("usage: flk workspace list");
         return Ok(2);
     }
 
@@ -85,11 +89,11 @@ fn workspace_create(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
-        eprintln!("usage: flock workspace get <workspace_id>");
+        eprintln!("usage: flk workspace get <workspace_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock workspace get <workspace_id>");
+        eprintln!("usage: flk workspace get <workspace_id>");
         return Ok(2);
     }
 
@@ -103,11 +107,11 @@ fn workspace_get(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
-        eprintln!("usage: flock workspace focus <workspace_id>");
+        eprintln!("usage: flk workspace focus <workspace_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock workspace focus <workspace_id>");
+        eprintln!("usage: flk workspace focus <workspace_id>");
         return Ok(2);
     }
 
@@ -121,7 +125,7 @@ fn workspace_focus(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_rename(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flock workspace rename <workspace_id> <label>");
+        eprintln!("usage: flk workspace rename <workspace_id> <label>");
         return Ok(2);
     }
 
@@ -136,11 +140,11 @@ fn workspace_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
-        eprintln!("usage: flock workspace close <workspace_id>");
+        eprintln!("usage: flk workspace close <workspace_id>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flock workspace close <workspace_id>");
+        eprintln!("usage: flk workspace close <workspace_id>");
         return Ok(2);
     }
 
@@ -153,11 +157,11 @@ fn workspace_close(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_workspace_help() {
-    eprintln!("flock workspace commands:");
-    eprintln!("  flock workspace list");
-    eprintln!("  flock workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]");
-    eprintln!("  flock workspace get <workspace_id>");
-    eprintln!("  flock workspace focus <workspace_id>");
-    eprintln!("  flock workspace rename <workspace_id> <label>");
-    eprintln!("  flock workspace close <workspace_id>");
+    eprintln!("flk workspace commands:");
+    eprintln!("  flk workspace list");
+    eprintln!("  flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]");
+    eprintln!("  flk workspace get <workspace_id>");
+    eprintln!("  flk workspace focus <workspace_id>");
+    eprintln!("  flk workspace rename <workspace_id> <label>");
+    eprintln!("  flk workspace close <workspace_id>");
 }

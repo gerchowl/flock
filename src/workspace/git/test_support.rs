@@ -1,3 +1,7 @@
+// The whole module is #[cfg(test)] — TracedCommand polices product code
+// (logging redesign PR-3), not test scaffolding.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

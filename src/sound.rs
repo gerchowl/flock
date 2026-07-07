@@ -5,12 +5,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tracing::warn;
+use crate::process::TracedCommand;
 
-const DISABLE_SOUND_ENV: &str = "FLOCK_DISABLE_SOUND";
+// FLOCK_DISABLE_SOUND used to be read here directly. ADR-0002 phase (d)
+// centralized env → config wiring: the alias now lands on ui.sound.enabled via
+// src/config/env.rs, and every play() call site already gates on
+// SoundConfig::enabled / SoundConfig::allows. NEXTEST stays as a test-runtime
+// opt-out (unrelated to config).
 
 static SOUND_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.mp3");
@@ -31,7 +35,7 @@ pub enum Sound {
 /// Play a notification sound in a background thread.
 /// Silently does nothing if no audio player is available.
 pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
-    if sound_playback_disabled_by_env() {
+    if nextest_disables_sound() {
         return;
     }
 
@@ -40,9 +44,11 @@ pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
         if let Some(path) = custom_path {
             match play_file(&path) {
                 Ok(()) => return,
-                Err(err) => {
-                    warn!(path = %path.display(), sound = ?sound, err = %err, "custom sound playback failed, falling back to built-in sound")
-                }
+                Err(err) => crate::logging::sound_custom_playback_failed(
+                    &path,
+                    &format!("{:?}", sound),
+                    &err,
+                ),
             }
         }
 
@@ -53,13 +59,13 @@ pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
         };
 
         if let Err(err) = play_bytes(data) {
-            warn!(sound = ?sound, err = %err, "sound playback failed");
+            crate::logging::sound_playback_failed(&format!("{:?}", sound), &err);
         }
     });
 }
 
-fn sound_playback_disabled_by_env() -> bool {
-    std::env::var_os(DISABLE_SOUND_ENV).is_some() || std::env::var_os("NEXTEST").is_some()
+fn nextest_disables_sound() -> bool {
+    std::env::var_os("NEXTEST").is_some()
 }
 
 fn play_file(path: &Path) -> Result<(), String> {
@@ -95,9 +101,9 @@ fn temp_sound_path() -> PathBuf {
 
 fn run_player(path: &Path) -> Result<Output, String> {
     if cfg!(target_os = "macos") {
-        Command::new("afplay")
+        TracedCommand::new("afplay", "sound")
             .arg(path)
-            .output()
+            .output_traced()
             .map_err(|e| format!("no audio player available: {e}"))
     } else {
         run_linux_player(path)
@@ -112,10 +118,10 @@ struct AudioPlayer {
 
 impl AudioPlayer {
     fn output(self, path: &Path) -> std::io::Result<Output> {
-        Command::new(self.program)
+        TracedCommand::new(self.program, "sound")
             .args(self.args)
             .arg(path)
-            .output()
+            .output_traced()
     }
 }
 

@@ -194,6 +194,7 @@ fn read_upstream_identity(info: &GitWorktreeInfo, branch: &str) -> Option<GitUps
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test-only helper: TracedCommand polices product code (logging redesign PR-3).
 pub(crate) fn git_ahead_behind(cwd: &Path) -> Option<(usize, usize)> {
     super::discovery::git_repo_root(cwd)?;
 
@@ -218,11 +219,11 @@ fn git_ahead_behind_between(
     upstream_oid: &str,
 ) -> Option<(usize, usize)> {
     let range = format!("{head_oid}...{upstream_oid}");
-    let output = std::process::Command::new("git")
+    let output = crate::process::TracedCommand::new("git", "git")
         .arg("-C")
         .arg(cwd)
         .args(["rev-list", "--left-right", "--count", &range])
-        .output()
+        .output_traced()
         .ok()?;
 
     if !output.status.success() {
@@ -241,6 +242,7 @@ fn parse_git_ahead_behind_output(stdout: &str) -> Option<(usize, usize)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::workspace::git::test_support::{run_git, temp_test_dir, write_fake_tracked_repo};

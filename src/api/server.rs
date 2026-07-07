@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 #[cfg(test)]
 use std::fs;
@@ -38,7 +38,7 @@ impl Drop for ServerHandle {
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
+                crate::logging::api_socket_remove_failed(&self.path, &err.to_string());
             }
         }
     }
@@ -72,7 +72,7 @@ pub fn start_server_with_capabilities(
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
-    info!(path = %path.display(), "api server listening");
+    crate::logging::api_server_listening(&path);
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
@@ -92,12 +92,12 @@ pub fn start_server_with_capabilities(
                             &connection_running,
                             capabilities,
                         ) {
-                            warn!(err = %err, "api connection failed");
+                            crate::logging::api_connection_failed(&err.to_string());
                         }
                     });
                 }
                 Err(err) => {
-                    error!(err = %err, "api listener accept failed");
+                    crate::logging::api_listener_accept_failed(&err.to_string());
                     break;
                 }
             }
@@ -115,10 +115,7 @@ pub fn start_server_with_capabilities(
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
-        format!(
-            "flock is already running (socket busy at {})",
-            path.display()
-        )
+        format!("flk is already running (socket busy at {})", path.display())
     })
 }
 
@@ -135,7 +132,7 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
-        debug!(err = %err, "api connection write timeout unavailable");
+        crate::logging::api_connection_write_timeout_unavailable(&err.to_string());
     }
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
@@ -715,7 +712,16 @@ mod tests {
 
     #[test]
     fn restrict_socket_permissions_sets_user_only_mode() {
-        let dir = unique_test_path("socket-perms");
+        // SUN_LEN caps unix-socket paths at ~104 bytes on macOS. unique_test_path
+        // honors TMPDIR, which under `nix develop` gains a nix-shell.XXXXXX
+        // segment (~62 bytes before our name) — the bind then fails with
+        // "path must be shorter than SUN_LEN". Bind under /tmp with a short
+        // unique name instead; only this test actually binds a socket there.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from("/tmp").join(format!("flock-sp-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
         let _listener = UnixListener::bind(&path).unwrap();

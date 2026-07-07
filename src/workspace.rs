@@ -906,7 +906,11 @@ impl Workspace {
 
     /// True while the workspace has no git identity AND no probe has
     /// finished — it may still turn out to be a git checkout. Distinct
-    /// from "resolved non-git", which files under `misc` (#33).
+    /// from "resolved non-git", which files under `misc` (#33). Kept as
+    /// an observable predicate for tests / diagnostics after #102 folded
+    /// pending and resolved-non-git rows into one merged-stream slot
+    /// keyed on the frozen `sort_family_key`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn git_identity_pending(&self) -> bool {
         !self.git_identity_resolved
             && self.worktree_space.is_none()
@@ -920,6 +924,45 @@ impl Workspace {
         self.cached_git_space
             .as_ref()
             .map(|space| space.project_key.as_str())
+    }
+
+    /// #102: a STABLE sort-family key frozen at spawn — the `identity_cwd`
+    /// basename lowercased. Used as the sort fallback while the git identity
+    /// probe hasn't yet resolved (before `cached_git_space` fills), so a
+    /// pending row keeps its slot in the spaces list across probe resolution
+    /// instead of jumping when the resolved project key replaces the
+    /// display-name fallback. `identity_cwd` is written once at construction
+    /// and never mutated afterwards, so the same call before and after the
+    /// probe returns the same string.
+    pub fn sort_family_key(&self) -> String {
+        self.identity_cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    /// #102: the tab bar's display order — storage indices sorted by
+    /// `(display_name.lowercased(), tab.number)`. Tabs mode renders in
+    /// this order (per issue #102 part 3); storage stays untouched so
+    /// `active_tab`, hit-area indices, and public tab numbers remain the
+    /// same references they were. The `tab.number` tie-break keeps two
+    /// tabs with the same display label (auto-numbered clones) in a
+    /// deterministic order.
+    pub fn tab_display_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by(|&a, &b| {
+            let ka = (
+                self.tabs[a].display_name().to_ascii_lowercase(),
+                self.tabs[a].number,
+            );
+            let kb = (
+                self.tabs[b].display_name().to_ascii_lowercase(),
+                self.tabs[b].number,
+            );
+            ka.cmp(&kb)
+        });
+        order
     }
 
     #[cfg(test)]
@@ -1104,6 +1147,62 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #102 part 3: tabs render in `(display_name, tab.number)` order, so
+    /// re-adding a tab labelled `alpha` after `zeta` puts it FIRST on
+    /// screen, not last as with the storage order.
+    #[test]
+    fn tab_display_order_sorts_by_label_then_number() {
+        let mut ws = Workspace::test_new("host");
+        // The default first tab is auto-numbered "1". Rename it to
+        // sort last.
+        ws.tabs[0].custom_name = Some("zeta".into());
+        ws.test_add_tab(Some("middle"));
+        ws.test_add_tab(Some("alpha"));
+
+        // Storage order: [zeta (num 1), middle (num 2), alpha (num 3)]
+        // Display order sorts by display_name then number: alpha, middle, zeta.
+        assert_eq!(
+            ws.tabs.iter().map(|t| t.display_name()).collect::<Vec<_>>(),
+            vec!["zeta", "middle", "alpha"]
+        );
+        assert_eq!(ws.tab_display_order(), vec![2, 1, 0]);
+    }
+
+    /// #102: the pending-probe jump fix. `sort_family_key` is frozen at
+    /// spawn from `identity_cwd` — the SAME string before and after the git
+    /// identity probe finishes, so the fallback sort slot used by
+    /// `workspace_list_entries` does not shift under the workspace when
+    /// `cached_git_space` fills.
+    #[test]
+    fn sort_family_key_stays_stable_across_git_probe_resolution() {
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        ws.identity_cwd = std::path::PathBuf::from("/repo/gerchowl/Flock");
+        // Pending probe: `cached_git_space` is None, `git_identity_resolved`
+        // is false. This is the state where `project_section_sort_ids`
+        // yields None and the sort falls back to `sort_family_key`.
+        assert!(ws.git_identity_pending());
+        let before = ws.sort_family_key();
+        assert_eq!(before, "flock");
+
+        // Probe resolves: the workspace gains a full git identity with a
+        // very different project key (`github.com/gerchowl/flock`). Before
+        // #102, the fallback (`display_name().to_ascii_lowercase()`) is a
+        // string the probe never touched but that CAN drift with mutable
+        // state. The frozen key must not drift.
+        ws.cached_git_space = Some(GitSpaceMetadata {
+            key: "/repo/gerchowl/Flock/.git".into(),
+            checkout_key: "/repo/gerchowl/Flock".into(),
+            label: "Flock".into(),
+            repo_root: std::path::PathBuf::from("/repo/gerchowl/Flock"),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+        ws.git_identity_resolved = true;
+        assert!(!ws.git_identity_pending());
+        assert_eq!(ws.sort_family_key(), before);
+    }
 
     #[test]
     fn workspace_identity_follows_first_tab_root_pane_cwd() {

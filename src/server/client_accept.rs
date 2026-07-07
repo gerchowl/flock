@@ -3,7 +3,6 @@ use std::os::unix::net::UnixListener;
 use std::sync::{atomic::AtomicBool, Arc};
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
 
 use crate::server::client_transport::{self, ServerEvent};
 
@@ -21,7 +20,7 @@ pub(crate) fn accept_pending_client_connections(
                 *next_client_id = next_client_id.saturating_add(1);
 
                 if let Err(err) = stream.set_nonblocking(true) {
-                    warn!(err = %err, "failed to set client stream nonblocking");
+                    crate::logging::client_conn_nonblocking_failed(&err.to_string());
                     continue;
                 }
 
@@ -34,13 +33,13 @@ pub(crate) fn accept_pending_client_connections(
                         &server_event_tx,
                         &should_quit,
                     ) {
-                        debug!(client_id, err = %err, "client handshake failed");
+                        crate::logging::client_conn_handshake_failed(client_id, &err.to_string());
                     }
                 });
             }
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => {
-                error!(err = %err, "client listener accept failed");
+                crate::logging::client_conn_accept_failed(&err.to_string());
                 break;
             }
         }
@@ -62,7 +61,7 @@ pub(crate) fn reject_pending_client_connections(listener: &UnixListener) -> io::
             Ok((stream, _addr)) => send_live_handoff_refusal(stream),
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => {
-                error!(err = %err, "client listener reject failed");
+                crate::logging::client_conn_reject_failed(&err.to_string());
                 break;
             }
         }
@@ -84,7 +83,7 @@ fn send_live_handoff_refusal(mut stream: std::os::unix::net::UnixStream) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
     if let Err(err) = crate::protocol::write_message(&mut stream, &welcome) {
-        debug!(err = %err, "failed to send live-handoff refusal to pending client");
+        crate::logging::client_conn_refusal_send_failed(&err.to_string());
     }
 }
 
@@ -100,7 +99,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("hca-{}-{nanos}", std::process::id()));
+        // /tmp, not temp_dir(): nix develop's TMPDIR segment blows SUN_LEN.
+        let dir =
+            std::path::PathBuf::from("/tmp").join(format!("hca-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket_path = dir.join("client.sock");
 

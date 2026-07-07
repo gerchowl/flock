@@ -160,8 +160,21 @@ impl App {
         }
 
         if let AppEvent::PeerPollDue = ev {
-            // One worker per peer: a hung host must not delay the others.
+            // #96: one worker per peer, gated by the per-peer overlap guard —
+            // a slow ProxyJump peer whose previous SSH fetch is still running
+            // is SKIPPED this round instead of stacking a concurrent poll.
+            // Per-peer `poll_interval_secs` overrides the global cadence for
+            // slow links.
+            let now = std::time::Instant::now();
+            let gossip = self.state.config.gossip;
             for peer in self.state.peers.clone() {
+                let effective = gossip.effective_poll_interval(&peer);
+                if !self
+                    .peer_poll_tracker
+                    .should_poll_now(&peer.name, now, effective)
+                {
+                    continue;
+                }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
                     let fetch = crate::peers::fetch_peer_summary(&peer);
@@ -172,6 +185,10 @@ impl App {
         }
 
         if let AppEvent::PeerSummaryFetched(fetch) = ev {
+            // #96: release the in-flight lock BEFORE we early-return on an
+            // unknown peer — otherwise a peer removed mid-flight would be
+            // frozen out even if it's re-added by a later config reload.
+            self.peer_poll_tracker.mark_finished(&fetch.peer);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -183,6 +200,51 @@ impl App {
             };
             match fetch.result {
                 Ok(payload) => {
+                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
+                    // into our cache BEFORE we mutate `summary`. Loop
+                    // prevention rides on the origin field: we drop entries
+                    // whose origin is us (the ONE full-cycle we could see —
+                    // hub A polls hub B, hub B relayed A's own peers back).
+                    let self_host = crate::app::api::peers::short_host_name();
+                    let self_host_lower = self_host.to_ascii_lowercase();
+                    for entry in payload.relayed_fleet {
+                        if entry.origin.eq_ignore_ascii_case(&self_host) {
+                            continue;
+                        }
+                        let host_key = entry
+                            .host
+                            .as_deref()
+                            .filter(|host| !host.is_empty())
+                            .unwrap_or(&entry.ssh_target)
+                            .to_ascii_lowercase();
+                        if host_key == self_host_lower {
+                            // Never store an entry about ourselves as a
+                            // relayed row — the self row lives on the
+                            // origin_summary path.
+                            continue;
+                        }
+                        // Freshest-wins: replace an older cached entry using
+                        // the origin's own assertion (`origin_last_ok_secs`,
+                        // #101 part 2) so cross-hub ties resolve honestly,
+                        // falling back to `age_secs` for a v(N-1) origin.
+                        let existing_freshness = |peer: &crate::api::schema::RelayedFleetPeer| {
+                            peer.origin_last_ok_secs.or(peer.age_secs)
+                        };
+                        let insert = match self.state.relayed_fleet_cache.get(&host_key) {
+                            Some(existing) => {
+                                match (existing_freshness(existing), existing_freshness(&entry)) {
+                                    (Some(cur), Some(new)) => new <= cur,
+                                    (None, Some(_)) => true,
+                                    (Some(_), None) => false,
+                                    (None, None) => true,
+                                }
+                            }
+                            None => true,
+                        };
+                        if insert {
+                            self.state.relayed_fleet_cache.insert(host_key, entry);
+                        }
+                    }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
@@ -204,16 +266,14 @@ impl App {
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
                     // Per-poll trace so a "peer row looks stale" report is
-                    // diagnosable live (FLOCK_LOG=flock=debug + `flock peers
+                    // diagnosable live (FLOCK_LOG=flock=debug + `flk peers
                     // logs`): shows exactly what each poll applied (#4, #67).
-                    tracing::debug!(
-                        target: "flock::peers",
-                        peer = %summary.peer,
-                        host = summary.host.as_deref().unwrap_or(""),
-                        has_system = summary.system.is_some(),
-                        workspaces = summary.workspaces.len(),
-                        latency_ms = summary.latency_ms.unwrap_or_default(),
-                        "peer summary applied"
+                    crate::logging::peer_summary_applied(
+                        &summary.peer,
+                        summary.host.as_deref().unwrap_or(""),
+                        summary.system.is_some(),
+                        summary.workspaces.len(),
+                        summary.latency_ms.unwrap_or_default(),
                     );
                 }
                 Err(error) => summary.error = Some(error),
@@ -340,11 +400,11 @@ impl App {
 
         if self.local_terminal_notifications
             && matches!(
-                self.state.toast_config.delivery,
+                self.state.toast_config().delivery,
                 crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
             )
         {
-            let notify = match self.state.toast_config.delivery {
+            let notify = match self.state.toast_config().delivery {
                 crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
                 crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
                 _ => unreachable!("toast delivery was checked above"),
@@ -418,7 +478,7 @@ impl App {
         previous_toast: &Option<crate::app::state::ToastNotification>,
     ) {
         if !matches!(
-            self.state.toast_config.delivery,
+            self.state.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         ) || self.state.toast == *previous_toast
         {
@@ -456,7 +516,7 @@ impl App {
     }
 
     pub(crate) fn show_clipboard_feedback(&mut self) {
-        if !self.state.toast_config.clipboard.enabled {
+        if !self.state.toast_config().clipboard.enabled {
             self.state.copy_feedback = None;
             self.copy_feedback_deadline = None;
             return;
@@ -509,11 +569,7 @@ impl App {
         if matches!(report.status, crate::config::ConfigReloadStatus::Failed) {
             if let Ok(backup_content) = std::fs::read_to_string(&backup) {
                 if let Err(err) = std::fs::write(&target, backup_content) {
-                    tracing::warn!(
-                        target = %target.display(),
-                        err = %err,
-                        "config edit rollback write failed"
-                    );
+                    crate::logging::config_edit_rollback_write_failed(&target, &err.to_string());
                 }
             }
             // Re-apply the now-restored base so the running state is
@@ -575,11 +631,10 @@ impl App {
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                tracing::warn!(
-                    pane = pane_id.raw(),
-                    terminal = %terminal_id,
-                    err = %err,
-                    "failed to respawn shell after launch command exited"
+                crate::logging::pane_respawn_shell_failed(
+                    pane_id.raw(),
+                    &terminal_id.to_string(),
+                    &err.to_string(),
                 );
                 return false;
             }
@@ -881,7 +936,7 @@ impl App {
             .as_deref()
             .and_then(|body| sanitized_notification_text(body, 240));
 
-        let reason = match self.state.toast_config.delivery {
+        let reason = match self.state.toast_config().delivery {
             crate::config::ToastDelivery::Off => NotificationShowReason::Disabled,
             crate::config::ToastDelivery::Flock => {
                 if self.state.toast.is_some() {
@@ -914,7 +969,7 @@ impl App {
                 } else if self.api_notification_rate_limited(Instant::now()) {
                     NotificationShowReason::RateLimited
                 } else {
-                    let notify = match self.state.toast_config.delivery {
+                    let notify = match self.state.toast_config().delivery {
                         crate::config::ToastDelivery::Terminal => {
                             crate::terminal_notify::show_notification
                         }
@@ -945,11 +1000,11 @@ impl App {
     }
 
     fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
-        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
+        if !self.state.local_sound_playback || !self.state.sound_config().allows(None) {
             return;
         }
         if let Some(sound) = sound.to_sound() {
-            crate::sound::play(sound, &self.state.sound);
+            crate::sound::play(sound, self.state.sound_config());
         }
     }
 
@@ -998,6 +1053,7 @@ fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> 
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
@@ -1049,6 +1105,7 @@ mod tests {
                         status_age_secs: Some(840),
                         activity: None,
                     }],
+                    relayed_fleet: Vec::new(),
                 }),
             },
         ));
@@ -1131,6 +1188,7 @@ mod tests {
                     system,
                     latency_ms: 10,
                     workspaces: ws,
+                    relayed_fleet: Vec::new(),
                 }),
             })
         };
@@ -1252,7 +1310,7 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Flock;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
 
         let (events, _) = tokio::sync::mpsc::channel(4);
         let runtime = crate::terminal::TerminalRuntime::spawn(
@@ -1381,7 +1439,7 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Terminal;
+        app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Terminal;
 
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,

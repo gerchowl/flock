@@ -188,12 +188,12 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
 }
 
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    Command::new("xdg-open")
+    crate::process::TracedCommand::new("xdg-open", "platform")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn_traced()?;
     Ok(())
 }
 
@@ -280,16 +280,16 @@ fn show_desktop_notification_with_command(
 }
 
 fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
-    let status = match command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
+        .stderr(Stdio::null());
+    let status =
+        match crate::process::TracedCommand::from_command(command, "platform").status_traced() {
+            Ok(status) => status,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
 
     Ok(status.success())
 }
@@ -311,11 +311,12 @@ fn read_clipboard_image_with_spawned_command_max(
     mut command: Command,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut child = crate::process::TracedCommand::from_command(command, "platform")
+        .spawn_traced()
         .ok()?;
     let stdout = child.stdout.take()?;
 
@@ -370,12 +371,12 @@ fn clipboard_commands() -> Vec<ClipboardCommand> {
 }
 
 fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
-    let mut child = match Command::new(command.program)
+    let mut child = match crate::process::TracedCommand::new(command.program, "platform")
         .args(command.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_traced()
     {
         Ok(child) => child,
         Err(_) => return false,
@@ -405,6 +406,7 @@ fn process_session_id(pid: u32) -> Option<i32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};

@@ -393,12 +393,26 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
                 ),
                 Style::default().fg(app.palette.green),
             ),
+            Some(crate::worktree::WorktreeMergeGate::NotMerged) if remove.gate_timed_out => (
+                " ⏱ merge status unknown (timed out) — checkout only; the branch is kept."
+                    .to_string(),
+                Style::default().fg(app.palette.yellow),
+            ),
             Some(crate::worktree::WorktreeMergeGate::NotMerged) => (
                 " ✗ no merge evidence — checkout only; the branch is kept.".to_string(),
                 Style::default().fg(app.palette.peach),
             ),
         };
         frame.render_widget(Paragraph::new(gate_line).style(gate_style), rows[3]);
+    } else if remove.branch_protected {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " ⛨ branch {} is protected (default) — kept.",
+                remove.branch.as_deref().unwrap_or("?")
+            ))
+            .style(Style::default().fg(app.palette.blue)),
+            rows[3],
+        );
     } else {
         frame.render_widget(
             Paragraph::new(" The branch is not deleted. The Flock workspace will close.")

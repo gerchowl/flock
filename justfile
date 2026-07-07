@@ -25,6 +25,13 @@ test:
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
+# Run every guardrails gate over the tree (same set `nix flake check` runs).
+# Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
+# the guardrails devShell, so prek isn't on their PATH — gate enforcement in CI
+# lives in nix.yml's `flake check` (checks.gates), locally in the git hooks.
+gates:
+    prek run --all-files
+
 # Run fast local lint checks
 lint:
     cargo fmt --check
@@ -43,8 +50,8 @@ check: ci
 # Normally automatic on `direnv`/`nix develop` entry; this is the manual path.
 install-hooks:
     git config --local --unset-all core.hooksPath 2>/dev/null || true
-    prek install --install-hooks -t pre-commit -t commit-msg
-    @echo "installed guardrails hooks via prek (pre-commit + commit-msg)"
+    prek install --install-hooks -t pre-commit -t commit-msg -t pre-push
+    @echo "installed guardrails hooks via prek (pre-commit + commit-msg + pre-push)"
 
 # Build release binary
 build:

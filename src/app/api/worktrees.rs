@@ -849,6 +849,7 @@ fn worktree_membership(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
     use crate::api::schema::{ErrorResponse, Request, SuccessResponse};
