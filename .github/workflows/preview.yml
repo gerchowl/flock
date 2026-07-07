@@ -36,7 +36,7 @@ jobs:
       base_version: ${{ steps.plan.outputs.base_version }}
       protocol: ${{ steps.plan.outputs.protocol }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -89,7 +89,7 @@ jobs:
 
       - name: Install Rust tools
         if: steps.plan.outputs.should_publish == 'true'
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
         with:
           tool: just,cargo-nextest
 
@@ -138,7 +138,7 @@ jobs:
       FLOCK_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
       FLOCK_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.commit }}
           persist-credentials: false
@@ -229,7 +229,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
