@@ -1330,7 +1330,7 @@ mod tests {
         while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        app.terminal_runtimes.insert(terminal_id, runtime);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -1355,6 +1355,21 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
+        // #130: a background completion's toast is deferred to the settle commit.
+        let changed_at = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        app.state.commit_settled_completions(
+            changed_at
+                + crate::app::actions::ATTENTION_SETTLE
+                + std::time::Duration::from_millis(1),
+            &app.terminal_runtimes,
+        );
+
         assert_eq!(
             app.state.toast.as_ref().map(|toast| toast.context.as_str()),
             Some("__flock_projects__ · 1")
@@ -1364,6 +1379,86 @@ mod tests {
             runtime.shutdown();
         }
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    /// #130 regression: a background completion's `Done` (Idle && !seen) status
+    /// is deferred with the `●`, so the settle commit — not the edge — is the
+    /// first moment the pane reaches `Done`. The commit must broadcast it, or an
+    /// API subscriber (`wait agent-status --status done`) blocks until timeout.
+    #[tokio::test]
+    async fn deferred_background_completion_broadcasts_done_at_settle() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let workspace = crate::workspace::Workspace::test_new("bg");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        // Unattended (no active tab): the completion is a *background* completion
+        // and so is deferred by #130.
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        for state in [AgentState::Working, AgentState::Idle] {
+            app.handle_internal_event(AppEvent::StateChanged {
+                pane_id: root,
+                agent: Some(Agent::Codex),
+                state,
+                activity: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        }
+
+        let reports_done = |app: &App| {
+            app.event_hub.events_after(0).iter().any(|(_, event)| {
+                matches!(
+                    &event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
+                        if *agent_status == crate::api::schema::AgentStatus::Done
+                )
+            })
+        };
+        // At the deferring edge the pane is Idle but `seen` is still true → it
+        // reports `Idle`, never `Done`.
+        assert!(
+            !reports_done(&app),
+            "the deferred edge must not report Done yet"
+        );
+
+        // Settle: commit + broadcast, exactly as the runtime/headless tick does.
+        let changed_at = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        let settled = app.state.commit_settled_completions(
+            changed_at
+                + crate::app::actions::ATTENTION_SETTLE
+                + std::time::Duration::from_millis(1),
+            &app.terminal_runtimes,
+        );
+        for update in &settled {
+            app.emit_pane_state_update(update);
+        }
+
+        assert!(
+            reports_done(&app),
+            "the settled completion must broadcast Done so `wait --status done` unblocks"
+        );
     }
 
     #[tokio::test]

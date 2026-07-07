@@ -396,6 +396,12 @@ impl HeadlessServer {
                 crate::render_prof::event("render.request.pty_dirty");
             }
 
+            // #130: the attention-settle deferral only makes sense while a client
+            // is rendering the `●`. With only API clients attached (e.g. `flk
+            // wait`), keep completions edge-driven so `Done` isn't gated behind
+            // the settle tick.
+            self.app.state.app_client_attached = self.has_app_client();
+
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
             if self.drain_internal_events_with_forwarding() {
@@ -3186,6 +3192,19 @@ impl HeadlessServer {
 
         changed |= self.app.clear_due_selection_highlight(now);
 
+        // #130: commit settled background completions server-side too, so the
+        // authoritative `seen` clients read never stays stuck pending, and
+        // broadcast each Idle→Done change so API subscribers (e.g. `wait
+        // agent-status --status done`) are notified at the settle.
+        let settled = self
+            .app
+            .state
+            .commit_settled_completions(now, &self.app.terminal_runtimes);
+        for update in &settled {
+            self.app.emit_pane_state_update(update);
+        }
+        changed |= !settled.is_empty();
+
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
         }
@@ -4721,6 +4740,57 @@ next_tab = ""
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    /// #130: with only API clients attached (no rendering `●`), a completion is
+    /// NOT deferred — it reports `Done` at the edge, event-driven, so `flk wait
+    /// agent-status --status done` unblocks promptly instead of waiting on (and
+    /// starving against) the settle tick.
+    #[test]
+    fn headless_completion_without_app_client_reports_done_at_the_edge() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("bg");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        // No app client renders the sidebar — the state the loop maintains for a
+        // server serving only `flk wait`.
+        server.app.state.app_client_attached = false;
+
+        for state in [
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Idle,
+        ] {
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Codex),
+                state,
+                activity: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        }
+
+        let done_in_hub = server
+            .app
+            .event_hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| {
+                matches!(
+                    &event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
+                        if *agent_status == crate::api::schema::AgentStatus::Done
+                )
+            });
+        assert!(
+            done_in_hub,
+            "without a rendering client, the completion must report Done at the edge \
+             (no settle tick run here)"
+        );
     }
 
     #[test]

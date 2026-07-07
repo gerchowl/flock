@@ -2981,6 +2981,20 @@ mod tests {
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
+        // #130: a background completion's toast is deferred to the settle commit.
+        let changed_at = app
+            .state
+            .terminals
+            .get(&target_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        app.state.commit_settled_completions(
+            changed_at
+                + crate::app::actions::ATTENTION_SETTLE
+                + std::time::Duration::from_millis(1),
+            &app.terminal_runtimes,
+        );
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
         let hit = app.state.view.toast_hit_area;
