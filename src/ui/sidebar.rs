@@ -1638,49 +1638,6 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
     render_sidebar_toggle(app, frame, area, true, p);
 }
 
-pub(crate) fn workspace_drop_indicator_row(
-    cards: &[crate::app::state::WorkspaceCardArea],
-    area: Rect,
-    insert_idx: usize,
-    has_footer: bool,
-) -> Option<u16> {
-    if area.height == 0 {
-        return None;
-    }
-    let list_bottom = (area.y + area.height).saturating_sub(u16::from(has_footer));
-
-    let first = cards.first()?;
-    if insert_idx == first.ws_idx {
-        return first.rect.y.checked_sub(1).filter(|y| *y < list_bottom);
-    }
-
-    if let Some(row) = cards
-        .last()
-        .filter(|card| insert_idx == card.ws_idx.saturating_add(1))
-        .map(|card| card.rect.y.saturating_add(card.rect.height))
-        .filter(|y| *y < list_bottom)
-    {
-        return Some(row);
-    }
-
-    if let Some(pos) = cards.iter().position(|card| card.ws_idx == insert_idx) {
-        // An indented target sits inside its group block (#85: visual order
-        // no longer tracks storage order) -- clamp to the slot above the
-        // group's leader so the indicator never lands inside a group.
-        let mut anchor = pos;
-        while anchor > 0 && cards[anchor].indented {
-            anchor -= 1;
-        }
-        return cards[anchor]
-            .rect
-            .y
-            .checked_sub(1)
-            .filter(|y| *y < list_bottom);
-    }
-
-    None
-}
-
 pub(super) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2399,25 +2356,7 @@ fn render_workspace_list(
     is_navigating: bool,
 ) {
     let p = &app.palette;
-    let dragged_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
-        Some(crate::app::state::DragTarget::WorkspaceReorder { source_ws_idx, .. }) => {
-            Some(*source_ws_idx)
-        }
-        _ => None,
-    };
     let has_footer = app.sidebar_new_entry_visible();
-    let insertion_row = match app.drag.as_ref().map(|drag| &drag.target) {
-        Some(crate::app::state::DragTarget::WorkspaceReorder {
-            insert_idx: Some(insert_idx),
-            ..
-        }) => workspace_drop_indicator_row(
-            &app.view.workspace_card_areas,
-            area,
-            *insert_idx,
-            has_footer,
-        ),
-        _ => None,
-    };
 
     let list_bottom = (area.y + area.height).saturating_sub(u16::from(has_footer));
     if area.height > 0 {
@@ -2514,19 +2453,12 @@ fn render_workspace_list(
         let row_height = card.rect.height;
         let selected = i == app.selected && is_navigating;
         let is_active = Some(i) == app.active;
-        let is_dragged = dragged_ws_idx == Some(i);
         let is_session_primary = !card.indented && !is_active && active_section_primary == Some(i);
-        let highlighted = selected || is_active || is_dragged || is_session_primary;
+        let highlighted = selected || is_active || is_session_primary;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
 
         if highlighted {
-            let bg = if selected {
-                p.surface0
-            } else if is_dragged {
-                p.surface1
-            } else {
-                p.surface_dim
-            };
+            let bg = if selected { p.surface0 } else { p.surface_dim };
             let buf = frame.buffer_mut();
             for y in row_y..row_y + row_height {
                 if y >= list_bottom {
@@ -2538,7 +2470,7 @@ fn render_workspace_list(
             }
         }
 
-        let name_style = if selected || is_active || is_dragged {
+        let name_style = if selected || is_active {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.subtext0)
@@ -2774,17 +2706,6 @@ fn render_workspace_list(
             Paragraph::new(clamp_line(Line::from(spans), header.rect.width)),
             header.rect,
         );
-    }
-
-    if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
-        let indicator_right = scrollbar_rect
-            .map(|rect| rect.x)
-            .unwrap_or(area.x + area.width);
-        let buf = frame.buffer_mut();
-        for x in area.x..indicator_right {
-            buf[(x, y)].set_symbol("─");
-            buf[(x, y)].set_style(Style::default().fg(p.accent));
-        }
     }
 
     if let Some(track) = scrollbar_rect {

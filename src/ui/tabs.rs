@@ -286,49 +286,6 @@ fn compute_strip_view(
     }
 }
 
-fn tab_drop_indicator_x(
-    app: &AppState,
-    ws: &crate::workspace::Workspace,
-    insert_idx: usize,
-) -> Option<u16> {
-    let mut visible_tabs = app
-        .view
-        .tab_hit_areas
-        .iter()
-        .enumerate()
-        .filter(|(_, rect)| rect.width > 0);
-    let first_visible = visible_tabs.clone().next()?;
-    let last_visible = visible_tabs.next_back().unwrap_or(first_visible);
-
-    if insert_idx == 0 {
-        return Some(if first_visible.0 == 0 {
-            first_visible.1.x
-        } else {
-            app.view.tab_scroll_left_hit_area.x + app.view.tab_scroll_left_hit_area.width
-        });
-    }
-
-    if let Some((_, rect)) = app
-        .view
-        .tab_hit_areas
-        .iter()
-        .enumerate()
-        .find(|(idx, rect)| *idx == insert_idx && rect.width > 0)
-    {
-        return Some(rect.x.saturating_sub(1));
-    }
-
-    if insert_idx >= ws.tabs.len() {
-        return Some(if last_visible.0 + 1 >= ws.tabs.len() {
-            last_visible.1.x + last_visible.1.width
-        } else {
-            app.view.tab_scroll_right_hit_area.x.saturating_sub(1)
-        });
-    }
-
-    None
-}
-
 pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -430,24 +387,6 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         let name = tab.display_name();
         let text = format!(" {:width$}", name, width = width.saturating_sub(1));
         frame.render_widget(Paragraph::new(text).style(style), rect);
-    }
-
-    if let Some(crate::app::state::DragState {
-        target:
-            crate::app::state::DragTarget::TabReorder {
-                ws_idx,
-                insert_idx: Some(insert_idx),
-                ..
-            },
-    }) = &app.drag
-    {
-        if *ws_idx == active_ws_idx {
-            if let Some(x) = tab_drop_indicator_x(app, ws, *insert_idx) {
-                frame.buffer_mut()[(x.min(area.x + area.width.saturating_sub(1)), area.y)]
-                    .set_symbol("│")
-                    .set_style(Style::default().fg(p.accent));
-            }
-        }
     }
 
     if app.mouse_capture && app.view.new_tab_hit_area.width > 0 {

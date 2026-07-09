@@ -20,9 +20,6 @@ enum WheelRouting {
     AlternateScroll,
 }
 
-const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
-const TAB_DRAG_THRESHOLD: u16 = 1;
-
 mod copy_mode;
 mod modal;
 mod mouse;
