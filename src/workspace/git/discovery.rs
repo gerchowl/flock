@@ -243,7 +243,7 @@ fn host_is_case_insensitive(host: &str) -> bool {
     matches!(host, "github.com" | "gitlab.com" | "bitbucket.org")
 }
 
-pub(super) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
