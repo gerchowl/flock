@@ -165,12 +165,37 @@ impl App {
     /// a fork of the session instead of starting a shell.
     pub(crate) fn open_branch_session_dialog(&mut self, ws_idx: usize) {
         let Some(plan) = self.focused_branch_plan(ws_idx) else {
-            self.show_action_notice("branch session: focused pane has no resumable agent session");
+            let notice = self.branch_unavailable_notice(ws_idx);
+            self.show_action_notice(notice);
             return;
         };
         self.open_new_linked_worktree_dialog(ws_idx, None);
         if let Some(create) = self.state.worktree_create.as_mut() {
             create.branch_plan = Some(plan);
+        }
+    }
+
+    /// Diagnostic notice for a branch-session attempt that found no resumable
+    /// plan. A pane running a *detected* agent that still has no session ref
+    /// almost always means the agent integration hook isn't installed on this
+    /// host (e.g. a read-only, nix-managed `~/.claude/settings.json` that never
+    /// got flock's hooks) — so the agent never reports its session id. Point at
+    /// `flk integration status` instead of the flat "no resumable agent
+    /// session", which sent a real debugging session down the wrong path.
+    fn branch_unavailable_notice(&self, ws_idx: usize) -> String {
+        let agent = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| Some((ws, ws.focused_pane_id()?)))
+            .and_then(|(ws, pane_id)| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.effective_agent_label());
+        match agent {
+            Some(agent) => format!(
+                "branch session: {agent} reports no resumable session here — check `flk integration status`"
+            ),
+            None => "branch session: focused pane has no resumable agent session".to_string(),
         }
     }
 
@@ -1938,6 +1963,47 @@ mod tests {
             vec!["claude", "--resume", "sess-1", "--fork-session"]
         );
     }
+
+    #[test]
+    fn branch_session_dialog_points_at_integration_when_agent_has_no_session_ref() {
+        // A detected agent with NO session ref (the classic "flock hook not
+        // installed on this host" case, e.g. a read-only nix-managed
+        // settings.json) must NOT get the flat "no resumable agent session"
+        // notice — it must name the agent and point at `flk integration status`.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("workspace should have a pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state should exist")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
+        // Agent is detected but never reported a session ref.
+        terminal.detected_agent = Some(crate::detect::Agent::Claude);
+        app.state.terminals.insert(terminal_id, terminal);
+
+        app.open_branch_session_dialog(0);
+
+        assert!(app.state.worktree_create.is_none());
+        assert_eq!(
+            app.state.action_notice.as_deref(),
+            Some("branch session: claude reports no resumable session here — check `flk integration status`")
+        );
+    }
+
     #[test]
     fn kill_worktree_confirmation_rejects_non_worktree_workspace() {
         let mut app = app_for_worktree_tests();
