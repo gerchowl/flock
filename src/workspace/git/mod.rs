@@ -14,5 +14,7 @@ pub use self::{
     status::{git_status_cache_key, git_status_snapshot_for_cwd, GitStatusCacheEntry},
 };
 
+pub(crate) use self::discovery::canonicalize_best_effort_path;
+
 #[cfg(test)]
 pub(super) use self::status::git_ahead_behind;

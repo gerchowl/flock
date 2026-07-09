@@ -864,6 +864,36 @@ impl Workspace {
         self.worktree_space.as_ref()
     }
 
+    /// Reconcile the cached worktree `checkout_path` against live git (#125).
+    /// After a `git worktree move`, the membership's stored `checkout_path`
+    /// goes stale — flock has no move API, so it only used to refresh on
+    /// server restart. The periodic git probe already re-derives the worktree's
+    /// own toplevel (`GitSpaceMetadata::repo_root` for a linked worktree), which
+    /// is authoritative; adopt it here. Compared canonicalized so a purely
+    /// cosmetic path difference doesn't churn `changed`/session-dirty every
+    /// tick. Returns whether the cached path actually moved.
+    pub(crate) fn reconcile_worktree_checkout_path(
+        &mut self,
+        live_space: &GitSpaceMetadata,
+    ) -> bool {
+        if !live_space.is_linked_worktree {
+            return false;
+        }
+        let Some(membership) = self.worktree_space.as_mut() else {
+            return false;
+        };
+        if !membership.is_linked_worktree {
+            return false;
+        }
+        if self::git::canonicalize_best_effort_path(&membership.checkout_path)
+            == self::git::canonicalize_best_effort_path(&live_space.repo_root)
+        {
+            return false;
+        }
+        membership.checkout_path = live_space.repo_root.clone();
+        true
+    }
+
     /// Whether this checkout is a linked git worktree (vs the repo's main
     /// checkout): explicit membership provenance first, then live git
     /// metadata. The main checkout is the project section's primary row (#33).
@@ -1122,6 +1152,71 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linked_membership(checkout_path: &str) -> WorktreeSpaceMembership {
+        WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: checkout_path.into(),
+            is_linked_worktree: true,
+        }
+    }
+
+    fn linked_space_meta(repo_root: &str) -> GitSpaceMetadata {
+        GitSpaceMetadata {
+            key: "/repo/flock/.git".into(),
+            checkout_key: repo_root.into(),
+            label: "flock".into(),
+            repo_root: repo_root.into(),
+            is_linked_worktree: true,
+            project_key: "github.com/gerchowl/flock".into(),
+        }
+    }
+
+    #[test]
+    fn reconcile_adopts_moved_worktree_checkout_path() {
+        // #125: a moved worktree — cached checkout_path stale, live git toplevel
+        // is the new path. Reconcile adopts it and reports the change.
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(linked_membership("/old/worktrees/feature"));
+        let live = linked_space_meta("/new/worktrees/feature");
+
+        assert!(ws.reconcile_worktree_checkout_path(&live));
+        assert_eq!(
+            ws.worktree_space.as_ref().unwrap().checkout_path,
+            std::path::PathBuf::from("/new/worktrees/feature")
+        );
+    }
+
+    #[test]
+    fn reconcile_is_a_noop_when_checkout_path_already_matches() {
+        // Steady state must not churn `changed`/session-dirty every tick.
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(linked_membership("/worktrees/feature"));
+        let live = linked_space_meta("/worktrees/feature");
+
+        assert!(!ws.reconcile_worktree_checkout_path(&live));
+    }
+
+    #[test]
+    fn reconcile_ignores_non_linked_workspaces() {
+        // A main checkout (not a linked worktree) has no move to track.
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = None;
+        let live = linked_space_meta("/new/path");
+        assert!(!ws.reconcile_worktree_checkout_path(&live));
+
+        // And a non-worktree live space never rewrites a membership.
+        ws.worktree_space = Some(linked_membership("/old/path"));
+        let mut main_space = linked_space_meta("/new/path");
+        main_space.is_linked_worktree = false;
+        assert!(!ws.reconcile_worktree_checkout_path(&main_space));
+        assert_eq!(
+            ws.worktree_space.as_ref().unwrap().checkout_path,
+            std::path::PathBuf::from("/old/path")
+        );
+    }
 
     /// #102 part 3: tabs render in `(display_name, tab.number)` order, so
     /// re-adding a tab labelled `alpha` after `zeta` puts it FIRST on

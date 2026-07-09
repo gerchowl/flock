@@ -2849,6 +2849,14 @@ impl AppState {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
+            if let Some(live_space) = result.space.as_ref() {
+                // #125: adopt a moved worktree's live toplevel into the cached
+                // membership checkout_path (git is authoritative; flock has no
+                // move API, so this is where the stale string gets refreshed).
+                if ws.reconcile_worktree_checkout_path(live_space) {
+                    changed = true;
+                }
+            }
             if ws.cached_git_space != result.space {
                 ws.cached_git_space = result.space;
                 changed = true;
