@@ -2348,6 +2348,19 @@ fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
     Line::from(out)
 }
 
+/// Compact keyhint for the spaces quick-jump ordinals (#114 part 2), derived
+/// from the first bound `switch_space` chord. The indexed bindings carry
+/// per-digit labels (`prefix+shift+1` … `prefix+shift+9`); collapse the trailing
+/// digit to `N` so the header reads `prefix+shift+N`. `None` when unbound, which
+/// is also when no ordinals render.
+fn spaces_jump_keyhint(app: &AppState) -> Option<String> {
+    let label = &app.keybinds.switch_space.first()?.label;
+    Some(match label.strip_suffix(|c: char| c.is_ascii_digit()) {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}N"),
+        _ => label.clone(),
+    })
+}
+
 fn render_workspace_list(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2367,14 +2380,22 @@ fn render_workspace_list(
             Some(server) => format!(" spaces · only {server}"),
             None => " spaces".to_string(),
         };
+        let mut header_spans = vec![Span::styled(
+            header_label,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        )];
+        // #114 part 2: keyhint for the quick-jump ordinals rendered on the
+        // section rows below — shown only when `switch_space` is actually bound
+        // (same gate as the ordinals), so the affordance and the numbers always
+        // agree and the unbound default stays uncluttered.
+        if let Some(hint) = spaces_jump_keyhint(app) {
+            header_spans.push(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(p.overlay0),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(clamp_line(
-                Line::from(vec![Span::styled(
-                    header_label,
-                    Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-                )]),
-                area.width,
-            )),
+            Paragraph::new(clamp_line(Line::from(header_spans), area.width)),
             header_rect,
         );
         let toggle_rect = panel_scope_toggle_rect(header_rect, app.spaces_panel_scope());
@@ -6127,6 +6148,63 @@ mod tests {
         assert!(
             header_text.trim_end().ends_with("current"),
             "{header_text:?}"
+        );
+    }
+
+    fn spaces_header_text(app: &AppState, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(app, &runtimes, frame, area))
+            .expect("sidebar should render");
+        let (ws_area, _) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
+        let (_, list_area) = carve_servers_band(ws_area, servers_section_height(app));
+        let buffer = terminal.backend().buffer();
+        (list_area.x..list_area.x + list_area.width)
+            .map(|x| buffer[(x, list_area.y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn spaces_header_shows_jump_keyhint_when_switch_space_bound() {
+        // #114 part 2: the header advertises the quick-jump chord (collapsed to
+        // `N`) exactly when `switch_space` is bound — the same gate as the row
+        // ordinals, so affordance and numbers agree.
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nswitch_space = \"prefix+shift+1..9\"\n").unwrap();
+        app.keybinds = config.keybinds();
+
+        let header_text = spaces_header_text(&app, 50);
+        assert!(
+            header_text.contains("prefix+shift+N"),
+            "expected jump keyhint in {header_text:?}"
+        );
+    }
+
+    #[test]
+    fn spaces_header_hides_jump_keyhint_when_unbound() {
+        // Default: switch_space unbound → no ordinals, so no keyhint either.
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        assert!(app.keybinds.switch_space.is_empty());
+
+        let header_text = spaces_header_text(&app, 50);
+        assert!(
+            !header_text.contains('N') || !header_text.contains('+'),
+            "unbound header must carry no chord keyhint: {header_text:?}"
         );
     }
 
