@@ -79,7 +79,7 @@ pub fn spawn_sampler(
                 });
 
                 let (mut rx, mut tx) = (0u64, 0u64);
-                for (_, data) in networks.iter() {
+                for data in networks.values() {
                     rx = rx.saturating_add(data.received());
                     tx = tx.saturating_add(data.transmitted());
                 }
