@@ -195,6 +195,20 @@ impl AppState {
         crate::ui::prompt_history_panel_rect(self, info, Some(terminal))
     }
 
+    /// Inner (content-only, no border) rect for the open prompt-history panel
+    /// over `info`. Shared between mouse routing and the panel's selection
+    /// extraction so drag hits and copy geometry agree.
+    pub(crate) fn prompt_history_panel_inner_rect_for(
+        &self,
+        info: &crate::layout::PaneInfo,
+    ) -> Option<ratatui::layout::Rect> {
+        let panel = self.prompt_history_panel_rect_for(info)?;
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(panel);
+        (inner.width > 0 && inner.height > 0).then_some(inner)
+    }
+
     /// Maximum scroll offset (lines from bottom) for the prompt-history panel
     /// over `info`: `total_rendered_lines - viewport`. Zero when everything
     /// fits.
@@ -2457,19 +2471,38 @@ impl AppState {
             _ => return,
         };
 
-        // A float selection lives outside the workspace pane tree, so resolve
-        // its runtime by the float's terminal id; otherwise it's a layout pane.
-        let float_terminal = self
-            .visible_float_for_active_workspace()
-            .filter(|float| float.pane_id == sel.pane_id)
-            .map(|float| float.terminal_id.clone());
-        let text = match float_terminal {
-            Some(terminal_id) => terminal_runtimes
-                .get(&terminal_id)
-                .and_then(|rt| rt.extract_selection(&sel)),
-            None => self
-                .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-                .and_then(|rt| rt.extract_selection(&sel)),
+        // Prompt-panel selections (#115 part 2) extract from the rebuilt
+        // rendered lines, not the PTY grid — the panel isn't a runtime
+        // surface. Resolve to the pane's TerminalState + PaneInfo and hand
+        // off to the panes helper that mirrors the renderer's geometry.
+        let text = if sel.source == crate::selection::SelectionSource::PromptPanel {
+            let info = self.pane_info_by_id(sel.pane_id).cloned();
+            let terminal_id = self
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.pane_state(sel.pane_id))
+                .map(|pane| pane.attached_terminal_id.clone());
+            match (info, terminal_id.and_then(|id| self.terminals.get(&id))) {
+                (Some(info), Some(terminal)) => {
+                    crate::ui::extract_prompt_panel_selection(self, &info, terminal, &sel)
+                }
+                _ => None,
+            }
+        } else {
+            // A float selection lives outside the workspace pane tree, so resolve
+            // its runtime by the float's terminal id; otherwise it's a layout pane.
+            let float_terminal = self
+                .visible_float_for_active_workspace()
+                .filter(|float| float.pane_id == sel.pane_id)
+                .map(|float| float.terminal_id.clone());
+            match float_terminal {
+                Some(terminal_id) => terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(|rt| rt.extract_selection(&sel)),
+                None => self
+                    .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
+                    .and_then(|rt| rt.extract_selection(&sel)),
+            }
         };
         if let Some(text) = text {
             if !text.is_empty() {

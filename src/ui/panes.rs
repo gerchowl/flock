@@ -628,10 +628,30 @@ pub(super) fn render_prompt_history_panel(
         }
     }
 
+    // Selection tint (#115 part 2): only for a PromptPanel-source selection
+    // over the same pane. A concurrent Pane-source selection (would only
+    // happen mid-drag before switching) must not paint here — its coords are
+    // in PTY grid space, not panel space.
+    let paint_panel_selection = app.selection.as_ref().is_some_and(|sel| {
+        sel.source == crate::selection::SelectionSource::PromptPanel && sel.pane_id == info.id
+    });
+    if paint_panel_selection {
+        render_selection_highlight(
+            &app.selection,
+            frame,
+            info.id,
+            inner,
+            None,
+            p,
+            app.host_terminal_theme,
+        );
+    }
+
     // Subtle scroll indicators when there is more content above or below.
     let has_above = offset < max_offset;
     let has_below = offset > 0;
     let marker_style = Style::default().fg(p.overlay0).bg(bg_color);
+    let buf = frame.buffer_mut();
     if has_above && inner.width >= 1 {
         let top_y = inner.y;
         buf[(panel.x + panel.width - 1, top_y)].set_symbol("\u{25b4}");
@@ -727,6 +747,108 @@ fn build_prompt_history_lines(
         }
     }
     lines
+}
+
+/// Concat span text in `line` into a plain-text row. Preserves char order.
+fn line_plain_text(line: &ratatui::text::Line<'_>) -> String {
+    let mut out = String::new();
+    for span in &line.spans {
+        out.push_str(&span.content);
+    }
+    out
+}
+
+/// Extract the text under a `PromptPanel`-source selection over `info`. Runs
+/// the same geometry + line-build path the renderer uses so the copied text
+/// mirrors what was highlighted, per-row-trimmed and \n-joined.
+///
+/// Returns `None` when the panel is closed, has no history, is out of bounds,
+/// or the selection resolves to no chars.
+pub(crate) fn extract_prompt_panel_selection(
+    app: &AppState,
+    info: &PaneInfo,
+    terminal: &crate::terminal::TerminalState,
+    selection: &crate::selection::Selection,
+) -> Option<String> {
+    if selection.source != crate::selection::SelectionSource::PromptPanel {
+        return None;
+    }
+    let panel = prompt_history_panel_rect(app, info, Some(terminal))?;
+    let inner = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(panel);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+    let total_lines = rendered.len() as u16;
+    let viewport = inner.height;
+    let max_offset = total_lines.saturating_sub(viewport);
+    let offset = app.prompt_history_scroll.min(max_offset);
+    let end = total_lines.saturating_sub(offset);
+    let start = end.saturating_sub(viewport);
+
+    let ((sr, sc), (er, ec)) = selection.ordered_cells();
+    // PromptPanel selections carry metrics=None, so absolute row == screen row
+    // within the panel inner rect. Clamp to the visible viewport.
+    let viewport_h = u32::from(viewport);
+    let first_row = sr.min(viewport_h.saturating_sub(1));
+    let last_row = er.min(viewport_h.saturating_sub(1));
+    if last_row < first_row {
+        return None;
+    }
+
+    let mut out = String::new();
+    let mut wrote_any = false;
+    for row in first_row..=last_row {
+        let line_idx = start as usize + row as usize;
+        let line_text = rendered
+            .get(line_idx)
+            .map(line_plain_text)
+            .unwrap_or_default();
+        // Column range for this row mirrors the pane-selection semantics: a
+        // single-line selection uses [sc, ec]; a multi-line selection covers
+        // [sc, end-of-line] on the first row, the whole line in the middle,
+        // and [0, ec] on the last row (both bounds inclusive).
+        let (start_col, end_col) = if sr == er {
+            (sc, ec)
+        } else if row == sr {
+            (sc, u16::MAX)
+        } else if row == er {
+            (0, ec)
+        } else {
+            (0, u16::MAX)
+        };
+        let slice = slice_by_display_cols(&line_text, start_col, end_col);
+        let trimmed = slice.trim_end();
+        if wrote_any {
+            out.push('\n');
+        }
+        out.push_str(trimmed);
+        wrote_any = true;
+    }
+    // Nothing selected at all → treat as no selection so copy is a no-op.
+    if out.trim().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Slice a rendered panel line by inclusive column range. Columns index into
+/// the char stream, so wide/zero-width characters are counted as one column —
+/// good enough for the ASCII-heavy prompt-history panel; a caveat for the
+/// full-CJK case that would need `unicode-width` to be exact.
+fn slice_by_display_cols(line: &str, start: u16, end: u16) -> String {
+    if end < start {
+        return String::new();
+    }
+    let start = usize::from(start);
+    let end_incl = usize::from(end);
+    line.chars()
+        .enumerate()
+        .filter_map(|(idx, ch)| (idx >= start && idx <= end_incl).then_some(ch))
+        .collect()
 }
 
 /// Length of the `※ recap:` (or `※ recap` without colon) prefix in `body`,
@@ -1685,5 +1807,113 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert!(above.iter().any(|line| line.contains("entry-")));
+    }
+
+    /// Build the (app, info, terminal_id) tuple for a prompt-panel scenario
+    /// with the given prompts recorded. Panel is opened over the pane.
+    fn open_prompt_panel_scenario(
+        prompts: &[&str],
+        pane_rect: Rect,
+    ) -> (AppState, PaneInfo, crate::terminal::TerminalId) {
+        let mut app = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("main");
+        let pane_id = ws.focused_pane_id().unwrap();
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        for prompt in prompts {
+            terminal.record_prompt((*prompt).to_string());
+        }
+        app.terminals.insert(terminal_id.clone(), terminal);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.expanded_prompt_pane = Some(pane_id);
+        let info = pane_info_for(pane_rect, pane_id);
+        (app, info, terminal_id)
+    }
+
+    #[test]
+    fn extract_prompt_panel_selection_ignores_pane_source_selections() {
+        let (app, info, terminal_id) =
+            open_prompt_panel_scenario(&["hello world"], Rect::new(0, 0, 40, 20));
+        let terminal = app.terminals.get(&terminal_id).unwrap();
+        // A PTY-source selection over the same pane must not be treated as a
+        // panel selection — the helper returns None so copy falls through to
+        // the runtime path.
+        let sel = crate::selection::Selection::range(info.id, 0, 0, 10, None);
+        assert!(extract_prompt_panel_selection(&app, &info, terminal, &sel).is_none());
+    }
+
+    #[test]
+    fn extract_prompt_panel_selection_single_row_returns_slice() {
+        let (app, info, terminal_id) =
+            open_prompt_panel_scenario(&["hello world"], Rect::new(0, 0, 40, 20));
+        let terminal = app.terminals.get(&terminal_id).unwrap();
+        // Find the row that renders the prompt's body — its rendered form is
+        // "  hello world" (two-space indent). Compute the panel geometry and
+        // the visible window to pick that row deterministically.
+        let panel = prompt_history_panel_rect(&app, &info, Some(terminal)).expect("panel geometry");
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(panel);
+        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        let end = rendered.len() as u16;
+        let start = end.saturating_sub(inner.height);
+        // Body line for the single entry is the last rendered row.
+        let body_screen_row = end - start - 1;
+        // The body row starts with two spaces then "hello world". Select
+        // columns [2, 12] inclusive -> "hello world".
+        let sel = crate::selection::Selection::range(info.id, body_screen_row, 2, 12, None)
+            .with_source(crate::selection::SelectionSource::PromptPanel);
+        let text = extract_prompt_panel_selection(&app, &info, terminal, &sel)
+            .expect("panel selection extracts");
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn extract_prompt_panel_selection_spans_multiple_rows() {
+        let (app, info, terminal_id) =
+            open_prompt_panel_scenario(&["alpha", "beta"], Rect::new(0, 0, 40, 20));
+        let terminal = app.terminals.get(&terminal_id).unwrap();
+        let panel = prompt_history_panel_rect(&app, &info, Some(terminal)).expect("panel geometry");
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(panel);
+        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        // We recorded two prompt entries: each entry contributes a chrome
+        // header row + one body row. So rendered.len() == 4. Panel is pinned
+        // to bottom (scroll=0), so the visible window's last row is the
+        // final body ("  beta") and the previous is that entry's chrome.
+        // Select from the previous entry's body row through the final body
+        // row: that captures "alpha" ... newline chrome ... "beta".
+        let end = rendered.len() as u16;
+        let start = end.saturating_sub(inner.height);
+        let last_body = end - start - 1;
+        // Look back to find the second-to-last body row (the "alpha" body).
+        // Rendering order is chrome, body, chrome, body — so alpha's body is
+        // at screen row `last_body - 2`.
+        let alpha_body = last_body.saturating_sub(2);
+        let sel = {
+            let mut s = crate::selection::Selection::anchor(info.id, alpha_body, 2, None)
+                .with_source(crate::selection::SelectionSource::PromptPanel);
+            // Extend cursor to the last body row's "beta" end col.
+            s.drag(
+                inner.x + 2 + 3, /* screen_col = inner.x + col */
+                inner.y + last_body,
+                inner,
+                None,
+            );
+            s
+        };
+        let text = extract_prompt_panel_selection(&app, &info, terminal, &sel)
+            .expect("panel selection extracts");
+        // Whichever chrome text sits between the two bodies is not our
+        // concern — assert that both body strings survived and are joined by
+        // newlines.
+        assert!(text.contains("alpha"), "got: {text:?}");
+        assert!(text.contains("beta"), "got: {text:?}");
+        assert!(
+            text.contains('\n'),
+            "multi-row selection joins with \\n: {text:?}"
+        );
     }
 }

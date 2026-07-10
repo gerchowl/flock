@@ -30,6 +30,20 @@ enum Phase {
     Done,
 }
 
+/// What surface a selection was anchored against.
+///
+/// `Pane` is the default: the selection tracks the PTY grid (with scroll
+/// metrics) and copy pulls text from the runtime. `PromptPanel` selections
+/// live over the ephemeral prompt-history dropdown (#115): rows/cols are
+/// relative to the panel inner rect, `metrics` is always `None`, and copy
+/// extracts from the rebuilt rendered lines instead of the PTY grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionSource {
+    #[default]
+    Pane,
+    PromptPanel,
+}
+
 /// A text selection within a terminal pane.
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -41,6 +55,8 @@ pub struct Selection {
     cursor: (u32, u16),
     /// Selection phase.
     phase: Phase,
+    /// Which surface this selection was anchored against.
+    pub source: SelectionSource,
 }
 
 impl Selection {
@@ -58,7 +74,16 @@ impl Selection {
             anchor,
             cursor: anchor,
             phase: Phase::Anchored,
+            source: SelectionSource::default(),
         }
+    }
+
+    /// Tag this selection with a non-default source. Callers keep the
+    /// unchanged `Pane`-anchoring path; new surfaces (e.g. the prompt-history
+    /// dropdown) call this after `anchor` to route drag + copy accordingly.
+    pub(crate) fn with_source(mut self, source: SelectionSource) -> Self {
+        self.source = source;
+        self
     }
 
     /// Create an active selection from an explicit viewport-row range.
@@ -75,6 +100,7 @@ impl Selection {
             anchor: (row, start_col),
             cursor: (row, end_col),
             phase: Phase::Dragging,
+            source: SelectionSource::default(),
         }
     }
 
@@ -94,6 +120,7 @@ impl Selection {
             anchor: (anchor_row, anchor_col),
             cursor: (cursor_row, cursor_col),
             phase: Phase::Dragging,
+            source: SelectionSource::default(),
         }
     }
 
@@ -343,6 +370,19 @@ mod tests {
         sel.cursor = (er, ec);
         sel.phase = Phase::Dragging;
         sel
+    }
+
+    #[test]
+    fn selection_source_defaults_to_pane() {
+        let sel = Selection::anchor(PaneId::from_raw(0), 0, 0, None);
+        assert_eq!(sel.source, SelectionSource::Pane);
+    }
+
+    #[test]
+    fn with_source_switches_to_prompt_panel() {
+        let sel = Selection::anchor(PaneId::from_raw(0), 0, 0, None)
+            .with_source(SelectionSource::PromptPanel);
+        assert_eq!(sel.source, SelectionSource::PromptPanel);
     }
 
     #[test]

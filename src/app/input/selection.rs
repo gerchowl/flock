@@ -39,6 +39,31 @@ impl AppState {
             return;
         };
 
+        // Prompt-panel selection (#115 part 2): live over the dropdown, not
+        // the PTY grid. Clamp to the panel inner rect and skip the PTY
+        // autoscroll bookkeeping entirely.
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.source == crate::selection::SelectionSource::PromptPanel)
+        {
+            if let Some(panel_inner) = self.prompt_history_panel_inner_rect_for(&info) {
+                let was_dragging = self.selection.as_ref().is_some_and(|s| s.is_dragging());
+                let anchor_differs = self.selection.as_ref().is_some_and(|s| {
+                    let (ar, ac) = s.anchor_screen_pos(panel_inner, None);
+                    ar != screen_row || ac != screen_col
+                });
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.drag(screen_col, screen_row, panel_inner, None);
+                    if (was_dragging || anchor_differs) && sel.is_just_click() {
+                        sel.force_dragging();
+                    }
+                }
+                self.selection_autoscroll = None;
+            }
+            return;
+        }
+
         let top = info.inner_rect.y;
         let bottom = info.inner_rect.y + info.inner_rect.height.saturating_sub(1);
 
