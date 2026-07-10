@@ -196,9 +196,11 @@ Indexed keybindings use `1..9` in normal keybinding fields:
 ```toml
 [keys]
 switch_tab = "prefix+1..9"
-switch_workspace = "prefix+shift+1..9"
+switch_space = "prefix+shift+1..9"
 focus_agent = "prefix+alt+1..9"
 ```
+
+`switch_space` jumps to the Nth project section of the spaces list (and lights up the section jump-ordinals). The former `switch_workspace` key (a flat jump to the Nth visible row) was renamed to `switch_space`; old configs that still set `switch_workspace` keep working — they fold into `switch_space` with a deprecation notice — but should migrate to the new name.
 
 The legacy `[keys.indexed]` table is still parsed for compatibility, but new configs should prefer the explicit action fields.
 

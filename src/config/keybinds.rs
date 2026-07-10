@@ -294,9 +294,10 @@ pub struct Keybinds {
     pub previous_tab: ActionKeybinds,
     pub next_tab: ActionKeybinds,
     pub switch_tab: Vec<IndexedKeybind>,
-    pub switch_workspace: Vec<IndexedKeybind>,
     /// Indexed jump to the Nth project SECTION of the spaces list (#62).
     /// No default binding (`BindingConfig::empty`); opt-in via `keys.switch_space`.
+    /// The former `keys.switch_workspace` (flat-row jump) was renamed to this
+    /// key (#114) — old configs fold in here with a deprecation diagnostic.
     pub switch_space: Vec<IndexedKeybind>,
     pub close_tab: ActionKeybinds,
     pub rename_pane: ActionKeybinds,
@@ -511,7 +512,6 @@ impl Config {
             previous_tab: action!("keys.previous_tab", &self.keys.previous_tab),
             next_tab: action!("keys.next_tab", &self.keys.next_tab),
             switch_tab: indexed!("keys.switch_tab", &self.keys.switch_tab),
-            switch_workspace: indexed!("keys.switch_workspace", &self.keys.switch_workspace),
             switch_space: indexed!("keys.switch_space", &self.keys.switch_space),
             close_tab: action!("keys.close_tab", &self.keys.close_tab),
             rename_pane: action!("keys.rename_pane", &self.keys.rename_pane),
@@ -544,8 +544,22 @@ impl Config {
             &mut registry,
             &mut diagnostics,
         );
+        // #114: `keys.switch_workspace` (flat-row jump) was renamed to
+        // `keys.switch_space` (the spaces-list section jump). Fold the
+        // deprecated key — and the older `keys.indexed.workspaces` alias —
+        // into `switch_space` so existing configs keep working (now with
+        // section-jump semantics, which is what lights up the jump ordinals),
+        // each with a diagnostic nudging the rename.
+        append_deprecated_indexed_bindings(
+            &mut keybinds.switch_space,
+            "keys.switch_workspace",
+            "keys.switch_space",
+            &self.keys.switch_workspace,
+            &mut registry,
+            &mut diagnostics,
+        );
         append_legacy_indexed_bindings(
-            &mut keybinds.switch_workspace,
+            &mut keybinds.switch_space,
             "keys.indexed.workspaces",
             &self.keys.indexed.workspaces,
             &mut registry,
@@ -737,6 +751,37 @@ fn parse_indexed_bindings(
             }
         })
         .collect()
+}
+
+/// Fold a deprecated indexed-keybind config key into its renamed replacement
+/// (#114: `keys.switch_workspace` → `keys.switch_space`). Parses the old key
+/// exactly like its replacement (same `1..9` range grammar + registry conflict
+/// handling) and appends the result onto `target`, emitting a one-line
+/// deprecation diagnostic when the old key is actually set. A no-op when unset,
+/// so configs that already use the new key pay nothing.
+fn append_deprecated_indexed_bindings(
+    target: &mut Vec<IndexedKeybind>,
+    deprecated_field: &'static str,
+    replacement_field: &str,
+    config: &BindingConfig,
+    registry: &mut BindingRegistry,
+    diagnostics: &mut Vec<String>,
+) {
+    if config.values().iter().all(|value| value.trim().is_empty()) {
+        return;
+    }
+    let diag = format!(
+        "deprecated keybinding: {deprecated_field} was renamed to {replacement_field}; \
+         folding into {replacement_field} (the spaces-list section jump)"
+    );
+    crate::logging::config_diagnostic(&diag);
+    diagnostics.push(diag);
+    target.extend(parse_indexed_bindings(
+        deprecated_field,
+        config,
+        registry,
+        diagnostics,
+    ));
 }
 
 fn append_legacy_indexed_bindings(
@@ -1780,7 +1825,11 @@ command = "echo no"
     }
 
     #[test]
-    fn prefixed_indexed_bindings_support_modifiers() {
+    fn deprecated_switch_workspace_folds_into_switch_space_with_diagnostic() {
+        // #114: `keys.switch_workspace` was renamed to `keys.switch_space`.
+        // The old key still parses (prefixed indexed bindings + modifiers) but
+        // lands on the `switch_space` list and emits a deprecation diagnostic —
+        // there is no longer a separate flat-row `switch_workspace`.
         let config: Config = toml::from_str(
             r#"
 [keys]
@@ -1788,13 +1837,17 @@ switch_workspace = "prefix+shift+1..9"
 "#,
         )
         .unwrap();
+        let diagnostics = config.collect_diagnostics();
         let kb = config.keybinds();
-        assert_eq!(kb.switch_workspace.len(), 9);
+        assert_eq!(kb.switch_space.len(), 9);
         assert_eq!(
-            kb.switch_workspace[0].trigger,
+            kb.switch_space[0].trigger,
             BindingTrigger::Prefix((KeyCode::Char('1'), KeyModifiers::SHIFT))
         );
-        assert_eq!(kb.switch_workspace[0].label, "prefix+shift+1");
+        assert_eq!(kb.switch_space[0].label, "prefix+shift+1");
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.contains("keys.switch_workspace was renamed to keys.switch_space")));
     }
 
     #[test]
