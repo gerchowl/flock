@@ -516,7 +516,6 @@ pub(crate) enum NavigateAction {
     RemoveWorktree,
     RenameWorkspace,
     CloseWorkspace,
-    SwitchWorkspace(usize),
     SwitchSpace(usize),
     SwitchTab(usize),
     FocusAgent(usize),
@@ -574,13 +573,6 @@ fn indexed_navigation_action(
         if trigger_matches(binding) {
             if let Some(idx) = binding.matched_index(key) {
                 return Some(NavigateAction::SwitchTab(idx));
-            }
-        }
-    }
-    for binding in &kb.switch_workspace {
-        if trigger_matches(binding) {
-            if let Some(idx) = binding.matched_index(key) {
-                return Some(NavigateAction::SwitchWorkspace(idx));
             }
         }
     }
@@ -812,12 +804,6 @@ pub(super) fn execute_navigate_action_in_context(
                     state.close_selected_workspace();
                     leave_navigate_mode(state);
                 }
-            }
-        }
-        NavigateAction::SwitchWorkspace(idx) => {
-            if let Some(ws_idx) = state.workspace_at_visible_position(idx) {
-                state.switch_workspace(ws_idx);
-                leave_navigate_mode(state);
             }
         }
         NavigateAction::SwitchSpace(idx) => {
@@ -1436,8 +1422,17 @@ mod tests {
     }
 
     #[test]
-    fn indexed_switch_workspace_keybind_follows_grouped_sidebar_visual_order() {
-        let mut state = state_with_workspaces(&["main", "normal", "issue"]);
+    fn deprecated_switch_workspace_keybind_now_drives_section_jump() {
+        // #114: `keys.switch_workspace` was renamed to `keys.switch_space`.
+        // A config that still binds the old key folds into `switch_space`, so
+        // the chord produces a SwitchSpace action (Nth SECTION), not the
+        // retired flat-row SwitchWorkspace. Sections: [0]=grouped repo (main
+        // idx0 + worktree idx2), [1]=standalone "solo". Old-key index 1 →
+        // second section → idx1.
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nswitch_workspace = \"prefix+shift+1..9\"\n").unwrap();
+        let mut state = state_with_workspaces(&["main", "solo", "issue"]);
+        state.keybinds = config.keybinds();
         let mut terminal_runtimes = TerminalRuntimeRegistry::new();
         mark_worktree_space_member(&mut state, 0, "repo-key");
         mark_worktree_space_member(&mut state, 2, "repo-key");
@@ -1445,16 +1440,42 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
 
+        // The deprecated chord resolves through the REAL key path to a section
+        // jump — not the retired flat-row action. `prefix+shift+2` → index 1.
+        let resolved = action_for_key(
+            &state,
+            TerminalKey::new(KeyCode::Char('2'), KeyModifiers::SHIFT),
+            BindingDispatch::Prefix,
+        );
+        assert_eq!(resolved, Some(NavigateAction::SwitchSpace(1)));
+
         execute_navigate_action_in_context(
             &mut state,
             &mut terminal_runtimes,
-            NavigateAction::SwitchWorkspace(1),
+            resolved.unwrap(),
             ActionContext::Prefix,
         );
 
-        // #85: "normal" sorts before "repo-key" -- visual slot 2 = group head.
-        assert_eq!(state.active, Some(0));
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.active, Some(1));
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn switch_space_and_deprecated_switch_workspace_same_chord_conflicts() {
+        // #114: binding BOTH the new key and the deprecated alias to the same
+        // chord must surface a registry conflict (kept new, disabled old) — a
+        // silent double-bind would be the regression.
+        let config: crate::config::Config = toml::from_str(
+            "[keys]\nswitch_space = \"prefix+shift+1..9\"\nswitch_workspace = \"prefix+shift+1..9\"\n",
+        )
+        .unwrap();
+        let diagnostics = config.collect_diagnostics();
+        let kb = config.keybinds();
+        // Only the new key's 9 bindings survive; the old key's are rejected.
+        assert_eq!(kb.switch_space.len(), 9);
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.contains("keys.switch_workspace") && d.contains("keys.switch_space")));
     }
 
     #[test]

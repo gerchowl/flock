@@ -1348,7 +1348,7 @@ mod tests {
             .any(|(key, label)| key == "unset" && label.as_ref() == "focus agent 1-9"));
         assert!(workspace_tab
             .iter()
-            .any(|(key, label)| key == "unset" && label.as_ref() == "switch workspace 1-9"));
+            .any(|(key, label)| key == "unset" && label.as_ref() == "switch space 1-9"));
         assert!(panes
             .iter()
             .any(|(key, label)| key == "prefix+h" && label.as_ref() == "focus pane left"));
