@@ -257,6 +257,10 @@ impl AppState {
             return self.handle_settings_mouse(mouse);
         }
 
+        // Prompt-history panel selection (#115 part 2): a drag anchored in the
+        // dropdown owns its release. Copy on Up (clear on a bare click) here,
+        // before the generic pane/sidebar routing below can consume the event
+        // without copying — the same early-ownership the float selection uses.
         let launcher_enabled = self.view.layout != ViewLayout::Mobile
             && !self.sidebar_collapsed
             && matches!(
@@ -815,6 +819,28 @@ impl AppState {
                     self.focus_pane(info.id);
                     if self.mode != Mode::Terminal {
                         self.mode = Mode::Terminal;
+                    }
+
+                    // Prompt-history panel: when the dropdown is open over
+                    // this pane and the click lands INSIDE its inner content
+                    // rect, anchor a PromptPanel selection (#115 part 2)
+                    // instead of forwarding the click to the PTY or
+                    // anchoring a pane selection.
+                    if self.expanded_prompt_pane == Some(info.id) {
+                        if let Some(panel_inner) = self.prompt_history_panel_inner_rect_for(&info) {
+                            if rect_contains(panel_inner, mouse.column, mouse.row) {
+                                let row = mouse.row - panel_inner.y;
+                                let col = mouse.column - panel_inner.x;
+                                self.selection = Some(
+                                    crate::selection::Selection::anchor(info.id, row, col, None)
+                                        .with_source(
+                                            crate::selection::SelectionSource::PromptPanel,
+                                        ),
+                                );
+                                self.selection_autoscroll = None;
+                                return None;
+                            }
+                        }
                     }
 
                     if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
@@ -4013,6 +4039,148 @@ mod tests {
             app.state.request_clipboard_write.is_none(),
             "a bare click copies nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn drag_over_prompt_history_panel_anchors_prompt_panel_selection() {
+        // #115 part 2: Down + Drag inside the open prompt-history dropdown
+        // must anchor a PromptPanel-source selection over the panel's inner
+        // rect, not the PTY grid.
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+
+        // Seed prompt-history entries so the panel can render.
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("hello world".into());
+        terminal.record_prompt("second".into());
+        app.state.terminals.insert(terminal_id.clone(), terminal);
+
+        let pane_infos = ws.tabs[0]
+            .layout
+            .panes(ratatui::layout::Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(
+            info.inner_rect.width,
+            info.inner_rect.height,
+        );
+        ws.tabs[0].runtimes.insert(pane_id, runtime);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.expanded_prompt_pane = Some(pane_id);
+
+        let panel_inner = app
+            .state
+            .prompt_history_panel_inner_rect_for(&info)
+            .expect("panel inner rect");
+        assert!(panel_inner.height >= 2, "seeded history renders >=2 rows");
+
+        // Down inside the panel inner rect anchors the selection.
+        let down_col = panel_inner.x + 2;
+        let down_row = panel_inner.y + panel_inner.height - 1;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        let sel = app
+            .state
+            .selection
+            .as_ref()
+            .expect("panel click anchors a selection");
+        assert_eq!(sel.source, crate::selection::SelectionSource::PromptPanel);
+        assert_eq!(sel.pane_id, pane_id);
+        assert!(sel.is_just_click());
+
+        // Drag over the panel extends the selection and marks it visible.
+        let drag_col = down_col + 3;
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            down_row,
+        ));
+        let sel = app.state.selection.as_ref().expect("drag keeps selection");
+        assert!(sel.is_dragging(), "drag transitions the phase");
+        assert_eq!(sel.source, crate::selection::SelectionSource::PromptPanel);
+    }
+
+    #[tokio::test]
+    async fn prompt_panel_drag_release_copies_extracted_text() {
+        // The Up event finalizes the drag and copy_selection extracts the
+        // rendered text from the panel, not the PTY runtime.
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("hello".into());
+        app.state.terminals.insert(terminal_id.clone(), terminal);
+
+        let pane_infos = ws.tabs[0]
+            .layout
+            .panes(ratatui::layout::Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(
+            info.inner_rect.width,
+            info.inner_rect.height,
+        );
+        ws.tabs[0].runtimes.insert(pane_id, runtime);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.expanded_prompt_pane = Some(pane_id);
+
+        let panel_inner = app
+            .state
+            .prompt_history_panel_inner_rect_for(&info)
+            .expect("panel inner rect");
+        // With one entry (chrome row + body row) the content is small enough
+        // to fit the whole viewport, and the renderer paints it starting at
+        // the top of the inner rect. The body row is inner.y + 1.
+        let body_screen_row = panel_inner.y + 1;
+        // "hello" starts at column 2 of the panel inner rect (two-space
+        // body indent). Select cols 2..=6.
+        let start_col = panel_inner.x + 2;
+        let end_col = panel_inner.x + 6;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start_col,
+            body_screen_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end_col,
+            body_screen_row,
+        ));
+        // The drag anchored + extended a PromptPanel selection through the real
+        // mouse path; finalize the copy. (The mouse-Up path also reaches
+        // copy_selection via the generic release handler, but the App wrapper
+        // drains request_clipboard_write into an event, so assert the copy
+        // directly here where the byte payload is observable.)
+        assert!(
+            app.state.selection.as_ref().is_some_and(|s| s.source
+                == crate::selection::SelectionSource::PromptPanel
+                && s.is_dragging()),
+            "drag leaves an active PromptPanel selection to copy"
+        );
+        app.state.copy_selection(&app.terminal_runtimes);
+        let clipboard = app
+            .state
+            .request_clipboard_write
+            .as_ref()
+            .expect("copy wrote clipboard");
+        let text = std::str::from_utf8(clipboard).expect("utf-8");
+        assert_eq!(text, "hello");
     }
 
     #[tokio::test]
