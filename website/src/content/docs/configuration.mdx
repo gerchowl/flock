@@ -252,14 +252,15 @@ Indexed keybindings use `1..9` in normal keybinding fields:
 ```toml
 [keys]
 switch_tab = "prefix+1..9"
-switch_workspace = "prefix+shift+1..9"
-switch_space = "ctrl+1..9"
+switch_space = "prefix+shift+1..9"
 focus_agent = "prefix+alt+1..9"
 ```
 
-`switch_tab` jumps to the Nth tab of the active workspace, `switch_workspace` to the Nth row of the spaces list, and `focus_agent` to the Nth agent in the agents panel.
+`switch_tab` jumps to the Nth tab of the active workspace, `switch_space` to the Nth project section of the spaces list, and `focus_agent` to the Nth agent in the agents panel.
 
-`switch_space` jumps to the Nth **project section** of the spaces list — a project's main checkout grouped with its worktree workspaces counts as one section, regardless of how many rows it spans. Selecting a section focuses the member you last had active there; otherwise it lands on the section's primary row (the local main checkout when present, else its first member). It is unset by default. When bound, each section row shows its 1-based index for discoverability. This pairs naturally with `switch_workspace`/`switch_tab` as a three-level quick-jump: space, then row, then tab.
+`switch_space` jumps to the Nth **project section** of the spaces list — a project's main checkout grouped with its worktree workspaces counts as one section, regardless of how many rows it spans. Selecting a section focuses the member you last had active there; otherwise it lands on the section's primary row (the local main checkout when present, else its first member). It is unset by default. When bound, each section row shows its 1-based index for discoverability. This pairs naturally with `switch_tab` as a two-level quick-jump: space, then tab.
+
+The former `switch_workspace` key (a flat jump to the Nth *visible row* of the spaces list) was renamed to `switch_space`. Configs that still set `switch_workspace` keep working — they fold into `switch_space`, with a deprecation notice, and now jump by **section** rather than by flat row — but should migrate to the new name.
 
 The legacy `[keys.indexed]` table is still parsed for compatibility, but new configs should prefer the explicit action fields.
 

@@ -558,6 +558,14 @@ impl Config {
             &mut registry,
             &mut diagnostics,
         );
+        if !self.keys.indexed.workspaces.trim().is_empty() {
+            let diag = "deprecated keybinding: keys.indexed.workspaces now folds into \
+                 keys.switch_space — the chord jumps by project SECTION, not by flat \
+                 spaces-list row"
+                .to_string();
+            crate::logging::config_diagnostic(&diag);
+            diagnostics.push(diag);
+        }
         append_legacy_indexed_bindings(
             &mut keybinds.switch_space,
             "keys.indexed.workspaces",
@@ -772,7 +780,8 @@ fn append_deprecated_indexed_bindings(
     }
     let diag = format!(
         "deprecated keybinding: {deprecated_field} was renamed to {replacement_field}; \
-         folding into {replacement_field} (the spaces-list section jump)"
+         folding into {replacement_field} — the chord now jumps by project SECTION, \
+         not by flat spaces-list row"
     );
     crate::logging::config_diagnostic(&diag);
     diagnostics.push(diag);

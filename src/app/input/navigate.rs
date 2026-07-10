@@ -1440,22 +1440,42 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
 
-        // The old key resolves onto the section-jump binding list.
-        assert!(state
-            .keybinds
-            .switch_space
-            .iter()
-            .any(|b| b.label.ends_with("+2")));
+        // The deprecated chord resolves through the REAL key path to a section
+        // jump — not the retired flat-row action. `prefix+shift+2` → index 1.
+        let resolved = action_for_key(
+            &state,
+            TerminalKey::new(KeyCode::Char('2'), KeyModifiers::SHIFT),
+            BindingDispatch::Prefix,
+        );
+        assert_eq!(resolved, Some(NavigateAction::SwitchSpace(1)));
 
         execute_navigate_action_in_context(
             &mut state,
             &mut terminal_runtimes,
-            NavigateAction::SwitchSpace(1),
+            resolved.unwrap(),
             ActionContext::Prefix,
         );
 
         assert_eq!(state.active, Some(1));
         assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn switch_space_and_deprecated_switch_workspace_same_chord_conflicts() {
+        // #114: binding BOTH the new key and the deprecated alias to the same
+        // chord must surface a registry conflict (kept new, disabled old) — a
+        // silent double-bind would be the regression.
+        let config: crate::config::Config = toml::from_str(
+            "[keys]\nswitch_space = \"prefix+shift+1..9\"\nswitch_workspace = \"prefix+shift+1..9\"\n",
+        )
+        .unwrap();
+        let diagnostics = config.collect_diagnostics();
+        let kb = config.keybinds();
+        // Only the new key's 9 bindings survive; the old key's are rejected.
+        assert_eq!(kb.switch_space.len(), 9);
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.contains("keys.switch_workspace") && d.contains("keys.switch_space")));
     }
 
     #[test]
