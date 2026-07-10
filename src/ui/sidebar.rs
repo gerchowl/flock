@@ -2353,12 +2353,28 @@ fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
 /// per-digit labels (`prefix+shift+1` … `prefix+shift+9`); collapse the trailing
 /// digit to `N` so the header reads `prefix+shift+N`. `None` when unbound, which
 /// is also when no ordinals render.
-fn spaces_jump_keyhint(app: &AppState) -> Option<String> {
-    let label = &app.keybinds.switch_space.first()?.label;
-    Some(match label.strip_suffix(|c: char| c.is_ascii_digit()) {
+/// Collapse an indexed keybind label (`prefix+shift+1`) to a compact keyhint
+/// (`prefix+shift+N`) by replacing a single trailing digit with `N`.
+fn collapse_index_label(label: &str) -> String {
+    match label.strip_suffix(|c: char| c.is_ascii_digit()) {
         Some(prefix) if !prefix.is_empty() => format!("{prefix}N"),
-        _ => label.clone(),
-    })
+        _ => label.to_string(),
+    }
+}
+
+fn spaces_jump_keyhint(app: &AppState) -> Option<String> {
+    Some(collapse_index_label(
+        &app.keybinds.switch_space.first()?.label,
+    ))
+}
+
+/// Keyhint for the agents-band quick-jump ordinals (#114 part 2 / #147), from
+/// the first bound `focus_agent` chord. `None` when unbound — the same gate as
+/// the ordinals, so the header affordance and the row numbers agree.
+fn agents_jump_keyhint(app: &AppState) -> Option<String> {
+    Some(collapse_index_label(
+        &app.keybinds.focus_agent.first()?.label,
+    ))
 }
 
 fn render_workspace_list(
@@ -2797,11 +2813,20 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
+    let mut agents_header_spans = vec![Span::styled(
+        " agents",
+        Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+    )];
+    // #147: keyhint for the row jump-ordinals below, shown only when
+    // `focus_agent` is bound (same gate as the ordinals).
+    if let Some(hint) = agents_jump_keyhint(app) {
+        agents_header_spans.push(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(p.overlay0),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        )])),
+        Paragraph::new(clamp_line(Line::from(agents_header_spans), area.width)),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
     let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_scope());
@@ -2824,12 +2849,20 @@ fn render_agent_detail(
         return;
     }
 
+    // #147: quick-jump ordinals on the agent rows mirror `focus_agent(idx)`,
+    // which indexes THIS list (`focus_agent_entry` → `agent_panel_entries`).
+    // Local rows come first (remote entries are appended), so a local row's
+    // absolute index is exactly the digit that jumps to it. Gated on the
+    // binding; only the addressable first 9; remote rows carry no number since
+    // `focus_agent_entry` can't focus them.
+    let agents_jump_bound = !app.keybinds.focus_agent.is_empty();
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
-    for detail in details.iter().skip(app.agent_panel_scroll) {
+    for (idx, detail) in details.iter().enumerate().skip(app.agent_panel_scroll) {
         if row_y >= body_bottom {
             break;
         }
+        let ordinal = (agents_jump_bound && detail.remote.is_none() && idx < 9).then(|| idx + 1);
 
         // Single-row grammar (#62): `<icon> <agent> <server> <proj> <target>`.
         // The status symbol carries the state — no status text, no activity /
@@ -2861,7 +2894,13 @@ fn render_agent_detail(
             .as_deref()
             .map(|a| app.agent_alias(a).to_string())
             .unwrap_or_default();
-        let prefix_cols = 4 + agent_code.chars().count() + usize::from(!agent_code.is_empty());
+        // When the jump binding is live, every row reserves a 2-col ordinal
+        // gutter so icons stay aligned: numbered rows show `N `, the rest ` `.
+        let jump_prefix = agents_jump_bound
+            .then(|| ordinal.map_or_else(|| "  ".to_string(), |n| format!("{n} ")));
+        let jump_cols = jump_prefix.as_ref().map_or(0, |s| s.chars().count());
+        let prefix_cols =
+            jump_cols + 4 + agent_code.chars().count() + usize::from(!agent_code.is_empty());
         let location_budget = (body.width as usize).saturating_sub(prefix_cols);
         let location = super::grammar::agent_location_label(
             &detail.server,
@@ -2870,11 +2909,18 @@ fn render_agent_detail(
             location_budget,
         );
 
-        let mut spans = vec![
+        let mut spans = Vec::new();
+        if let Some(prefix) = jump_prefix {
+            spans.push(Span::styled(
+                prefix,
+                Style::default().fg(if is_active { p.overlay1 } else { p.overlay0 }),
+            ));
+        }
+        spans.extend([
             Span::styled(" ", Style::default()),
             Span::styled(icon, icon_style),
             Span::styled(" ", Style::default()),
-        ];
+        ]);
         if !agent_code.is_empty() {
             spans.push(Span::styled(agent_code, agent_style));
             spans.push(Span::styled(" ", Style::default()));
@@ -5516,6 +5562,91 @@ mod tests {
         assert_eq!(entries[1].primary_label, "two");
         assert_eq!(entries[1].primary_tab_label.as_deref(), Some("logs"));
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn collapse_index_label_replaces_trailing_digit_with_n() {
+        assert_eq!(collapse_index_label("prefix+shift+1"), "prefix+shift+N");
+        assert_eq!(collapse_index_label("alt+9"), "alt+N");
+        // No trailing digit (or a bare digit): left as-is.
+        assert_eq!(collapse_index_label("prefix+a"), "prefix+a");
+        assert_eq!(collapse_index_label("1"), "1");
+    }
+
+    fn app_with_two_agents() -> AppState {
+        let mut app = AppState::test_new();
+        let first = Workspace::test_new("one");
+        let first_pane = first.tabs[0].root_pane;
+        let second = Workspace::test_new("two");
+        let second_pane = second.tabs[0].root_pane;
+        app.workspaces = vec![first, second];
+        app.ensure_test_terminals();
+        for (ws, pane) in [(0usize, first_pane), (1usize, second_pane)] {
+            let tid = app.workspaces[ws].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Claude);
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        app
+    }
+
+    fn agents_band_rows(app: &AppState) -> (String, String) {
+        let area = Rect::new(0, 0, 44, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(44, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(app, &runtimes, frame, area))
+            .expect("sidebar should render");
+        let (_, detail_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
+        let buffer = terminal.backend().buffer();
+        let read_row = |y: u16| -> String {
+            (detail_area.x..detail_area.x + detail_area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        let header = read_row(detail_area.y + 1);
+        let first_row = read_row(agent_panel_body_rect(detail_area, false).y);
+        (header, first_row)
+    }
+
+    #[test]
+    fn agents_band_numbers_rows_and_shows_keyhint_when_focus_agent_bound() {
+        // #147: with `focus_agent` bound, the header advertises the chord and
+        // each local row carries its 1-based jump ordinal (matching
+        // `focus_agent_entry`, which indexes this same list).
+        let mut app = app_with_two_agents();
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nfocus_agent = \"alt+1..9\"\n").unwrap();
+        app.keybinds = config.keybinds();
+
+        let (header, first_row) = agents_band_rows(&app);
+        assert!(header.contains("alt+N"), "header keyhint: {header:?}");
+        assert!(
+            first_row.trim_start().starts_with('1'),
+            "first agent row should be numbered 1: {first_row:?}"
+        );
+    }
+
+    #[test]
+    fn agents_band_omits_ordinals_when_focus_agent_unbound() {
+        // Default: unbound → no keyhint, no leading number.
+        let app = app_with_two_agents();
+        assert!(app.keybinds.focus_agent.is_empty());
+
+        let (header, first_row) = agents_band_rows(&app);
+        assert!(!header.contains("alt+N"), "unbound header: {header:?}");
+        assert!(
+            !first_row
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit()),
+            "unbound first row must not be numbered: {first_row:?}"
+        );
     }
 
     #[tokio::test]
