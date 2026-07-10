@@ -335,15 +335,24 @@ pub(super) fn render_panes(
                 }
             }
 
-            render_selection_highlight(
-                &app.selection,
-                frame,
-                info.id,
-                info.inner_rect,
-                rt.scroll_metrics(),
-                &app.palette,
-                app.host_terminal_theme,
-            );
+            // A PromptPanel selection paints in panel-relative space (handled
+            // by the panel renderer below); never let it paint over the PTY
+            // grid — its coords aren't PTY coords (#115).
+            let is_panel_selection = app
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.source == crate::selection::SelectionSource::PromptPanel);
+            if !is_panel_selection {
+                render_selection_highlight(
+                    &app.selection,
+                    frame,
+                    info.id,
+                    info.inner_rect,
+                    rt.scroll_metrics(),
+                    &app.palette,
+                    app.host_terminal_theme,
+                );
+            }
             render_copy_mode_cursor(app, frame, info);
             render_pane_header(app, ws, frame, info);
             // Bounded scrollback panel — draws OVER pane content when the
@@ -799,8 +808,7 @@ pub(crate) fn extract_prompt_panel_selection(
         return None;
     }
 
-    let mut out = String::new();
-    let mut wrote_any = false;
+    let mut rows: Vec<String> = Vec::new();
     for row in first_row..=last_row {
         let line_idx = start as usize + row as usize;
         let line_text = rendered
@@ -821,18 +829,18 @@ pub(crate) fn extract_prompt_panel_selection(
             (0, u16::MAX)
         };
         let slice = slice_by_display_cols(&line_text, start_col, end_col);
-        let trimmed = slice.trim_end();
-        if wrote_any {
-            out.push('\n');
-        }
-        out.push_str(trimmed);
-        wrote_any = true;
+        rows.push(slice.trim_end().to_string());
     }
-    // Nothing selected at all → treat as no selection so copy is a no-op.
-    if out.trim().is_empty() {
+    // Dragging past the last content row selects the panel's empty tail; drop
+    // those trailing blanks so they don't land on the clipboard as bare
+    // newlines. Interior blank lines (between real content) are preserved.
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    if rows.is_empty() {
         return None;
     }
-    Some(out)
+    Some(rows.join("\n"))
 }
 
 /// Slice a rendered panel line by inclusive column range. Columns index into
@@ -1915,5 +1923,28 @@ mod tests {
             text.contains('\n'),
             "multi-row selection joins with \\n: {text:?}"
         );
+    }
+
+    #[test]
+    fn extract_prompt_panel_selection_trims_trailing_empty_tail_rows() {
+        // Dragging from a body row down into the panel's empty tail (content
+        // shorter than the viewport) must not append bare newlines to the
+        // clipboard — the trailing blanks are dropped.
+        let (app, info, terminal_id) =
+            open_prompt_panel_scenario(&["hello"], Rect::new(0, 0, 40, 20));
+        let terminal = app.terminals.get(&terminal_id).unwrap();
+        let panel = prompt_history_panel_rect(&app, &info, Some(terminal)).expect("panel geometry");
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(panel);
+        // One entry → chrome row 0, body ("  hello") row 1, then empty rows.
+        assert!(inner.height > 2, "viewport must exceed the 2 content rows");
+        let mut sel = crate::selection::Selection::anchor(info.id, 1, 2, None)
+            .with_source(crate::selection::SelectionSource::PromptPanel);
+        // Drag down into the empty tail (last viewport row).
+        sel.drag(inner.x + 2, inner.y + inner.height - 1, inner, None);
+        let text = extract_prompt_panel_selection(&app, &info, terminal, &sel)
+            .expect("panel selection extracts");
+        assert_eq!(text, "hello", "trailing empty rows trimmed: {text:?}");
     }
 }
