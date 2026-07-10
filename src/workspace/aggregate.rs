@@ -101,8 +101,18 @@ impl Workspace {
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
     ) -> (AgentState, bool) {
+        // #137: the primary key (`StateClass`) alone is not a total order —
+        // within one class the panes can still differ in `seen` (e.g. two
+        // `Blocked` panes, one seen, one not). `max_by_key` over a `HashMap`
+        // then resolves that tie by iteration order, which any pane
+        // insert/remove reshuffles — flipping the returned `seen` bit (and the
+        // aggregate `●`) for a frame. Break the tie deterministically on
+        // `!seen`: an unseen pane of the winning class outranks a seen one, so
+        // the aggregate reports the attention-worthy state regardless of map
+        // order. `StateClass::of` maps each class from a single `AgentState`,
+        // so class + `seen` fully pins the returned tuple.
         self.pane_states(terminals)
-            .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
+            .max_by_key(|(state, seen)| (pane_attention_priority(*state, *seen), !*seen))
             .unwrap_or((AgentState::Unknown, true))
     }
 
@@ -196,6 +206,42 @@ mod tests {
 
         assert_eq!(state, AgentState::Idle);
         assert!(!seen);
+    }
+
+    #[test]
+    fn aggregate_state_tiebreak_prefers_unseen_regardless_of_pane_order() {
+        // #137: two panes tie on `StateClass::Blocked` but differ in `seen`.
+        // The aggregate must deterministically report the unseen one — and stay
+        // put when panes are inserted/removed (which reshuffles HashMap order).
+        let mut ws = Workspace::test_new("test");
+        let id2 = ws.test_split(Direction::Horizontal);
+        let root_id = ws.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != id2)
+            .copied()
+            .unwrap();
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Blocked;
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut second_terminal = terminal_for_pane(&ws, id2);
+        second_terminal.state = AgentState::Blocked;
+        terminals.insert(second_terminal.id.clone(), second_terminal);
+        // root is seen, the split is the unseen (attention-worthy) blocked pane.
+        ws.tabs[0].panes.get_mut(&root_id).unwrap().seen = true;
+        ws.tabs[0].panes.get_mut(&id2).unwrap().seen = false;
+
+        let before = ws.aggregate_state(&terminals);
+        assert_eq!(before, (AgentState::Blocked, false));
+
+        // Churn the pane map: add and remove a third pane so the buckets
+        // reshuffle, then re-aggregate. A hash-order-dependent tie-break would
+        // flip `seen` here; the deterministic one holds.
+        let id3 = ws.test_split(Direction::Vertical);
+        let _ = ws.tabs[0].close_pane(id3);
+
+        assert_eq!(ws.aggregate_state(&terminals), before);
     }
 
     #[test]
