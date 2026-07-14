@@ -25,7 +25,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 8;
+const CLAUDE_INTEGRATION_VERSION: u32 = 9;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -2966,55 +2966,43 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    /// Structural smoke test for the v7 Claude shim asset. Catches accidental
-    /// regressions (a refactor that drops the filter, the recap extraction,
-    /// or the decision:block nudge) without needing to spawn python3 at
-    /// test time. Pairs with the runtime path that the install test covers.
+    /// The Claude shim is a thin stub (#158): the protocol lives in Rust at
+    /// `flk hook claude` (covered by `cli::hook::tests`). This pins the stub
+    /// contract — delegation, version, PATH-independence, no-fail — so a
+    /// regression that reintroduces protocol logic (or drops the delegation)
+    /// is caught. The `derived docs match` guardrail keeps the version marker
+    /// and `CLAUDE_INTEGRATION_VERSION` in sync.
     #[test]
-    fn claude_hook_asset_has_v8_shape() {
+    fn claude_hook_asset_is_thin_stub() {
         let asset = CLAUDE_HOOK_ASSET;
-        // Version pin so a future change makes the test catch the
-        // out-of-sync constant before the install test reports the wrong
-        // version.
+        // Version pin, kept in lockstep with the const.
         assert!(
-            asset.contains("FLOCK_INTEGRATION_VERSION=8"),
-            "asset version pin missing"
+            asset.contains(&format!(
+                "FLOCK_INTEGRATION_VERSION={CLAUDE_INTEGRATION_VERSION}"
+            )),
+            "asset version pin out of sync with CLAUDE_INTEGRATION_VERSION"
         );
-        // Session-start source forwarding so the server can distinguish a
-        // real `/clear`/`/resume`/compaction from a nested `claude -p`
-        // startup that inherits the pane environment.
+        // Delegates the action + stdin to the single-source-of-truth binary.
         assert!(
-            asset.contains("session_start_source"),
-            "session_start_source forwarding missing"
+            asset.contains("hook claude \"${1:-}\""),
+            "stub must delegate to `flk hook claude <action>`"
         );
-        // Stop action wired through the case statement.
+        // Reaches flk via the stamped FLOCK_BIN, PATH-independent, with a
+        // `flk` fallback (#158) — the fix for the missing-hook-on-peers class.
         assert!(
-            asset.contains("session|prompt|stop"),
-            "stop action missing from case"
+            asset.contains("${FLOCK_BIN:-flk}"),
+            "stub must exec via FLOCK_BIN with a PATH fallback"
         );
-        // Task-notification + sibling system-reminder filter (the noise the
-        // user surfaced in the float).
+        // Never fails the parent agent.
+        assert!(asset.contains("exit 0"), "stub must always exit 0");
+        // The protocol moved to Rust — none of it should remain in the shim.
         assert!(
-            asset.contains("<task-notification>"),
-            "task-notification filter prefix missing"
+            !asset.contains("python"),
+            "thin stub must not embed a python interpreter"
         );
         assert!(
-            asset.contains("<system-reminder>"),
-            "system-reminder filter prefix missing"
-        );
-        // Recap sentinel character (KATAKANA REFERENCE MARK U+203B).
-        assert!(
-            asset.contains("\u{203b}"),
-            "recap sentinel char missing from shim"
-        );
-        // Three POST sites: prompt, reply, recap.
-        assert!(asset.contains("pane.report_prompt"));
-        assert!(asset.contains("pane.report_reply"));
-        assert!(asset.contains("pane.report_recap"));
-        // Self-healing nudge emits decision:block on missing recap.
-        assert!(
-            asset.contains("\"decision\": \"block\"") || asset.contains("'decision': 'block'"),
-            "decision:block nudge missing"
+            !asset.contains("pane.report_"),
+            "wire protocol must live in `flk hook`, not the shim"
         );
     }
 
@@ -3258,7 +3246,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 8);
+        assert_eq!(claude.expected_version, 9);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -3288,7 +3276,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 8);
+        assert_eq!(claude.expected_version, 9);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4087,9 +4075,10 @@ mod tests {
         assert!(PI_EXTENSION_ASSET.contains("agent_session_path: currentAgentSessionPath"));
         assert!(PI_EXTENSION_ASSET.contains("agent_session_id: currentAgentSessionId"));
         assert!(PI_EXTENSION_ASSET.contains("publishState(true)"));
-        assert!(CLAUDE_HOOK_ASSET.contains("agent_session_id"));
-        assert!(CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
-        assert!(!CLAUDE_HOOK_ASSET.contains("\"state\": action"));
+        // Claude is a thin stub now (#158): session-ref reporting lives in
+        // `flk hook claude` (cli::hook::tests). The stub only delegates.
+        assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
+        assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
         assert!(CODEX_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
         assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
