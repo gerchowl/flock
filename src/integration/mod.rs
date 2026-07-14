@@ -70,7 +70,7 @@ const COPILOT_INTEGRATION_VERSION: u32 = 1;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 4;
+const OPENCODE_INTEGRATION_VERSION: u32 = 5;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "flock-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
@@ -4093,10 +4093,11 @@ mod tests {
         assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
         assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
         assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
+        // Opencode is a thin plugin now (#158): it maps session events and
+        // delegates to `flk hook opencode session`; the report lives in Rust.
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
-        assert!(OPENCODE_PLUGIN_ASSET.contains("agent_session_id: sessionID"));
-        assert!(OPENCODE_PLUGIN_ASSET.contains("pane.report_agent_session"));
-        assert!(!OPENCODE_PLUGIN_ASSET.contains("reportState"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("hook\", \"opencode\", \"session"));
+        assert!(!OPENCODE_PLUGIN_ASSET.contains("pane.report_agent_session"));
         assert!(!OPENCODE_PLUGIN_ASSET.contains("pane.release_agent"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("session_id = _session_id(kwargs)"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("agent_session_id"));
