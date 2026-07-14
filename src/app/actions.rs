@@ -1041,11 +1041,64 @@ impl AppState {
     /// the base's project-section notion (origin-key folds plain same-repo
     /// checkouts + federated rows in), not the narrower worktree-membership key.
     pub(crate) fn collapsible_space_keys(&self) -> std::collections::HashSet<String> {
-        let keys = self.project_section_keys();
+        let section_keys = self.project_section_keys();
         let mut counts = std::collections::HashMap::<String, usize>::new();
-        for key in keys.into_iter().flatten() {
-            *counts.entry(key).or_insert(0) += 1;
+        // Section KEY -> machine-independent project key. The section key is a
+        // machine-local string (worktree-membership key, or the git-space key)
+        // — NOT the origin URL a peer reports. To fold federated peers into the
+        // count we must project each section onto the project identity remotes
+        // match on, mirroring the sidebar's own remote splice (see
+        // `ui::sidebar::workspace_list_entries`). Only sections with a resolved
+        // project key can take remote members.
+        let mut project_of_section = std::collections::HashMap::<String, String>::new();
+        for (ws_idx, key) in section_keys.iter().enumerate() {
+            let Some(key) = key.as_deref() else {
+                continue;
+            };
+            *counts.entry(key.to_string()).or_insert(0) += 1;
+            // A `dir:<name>` project key is a machine-local directory-name
+            // fallback, NOT a shared identity — two servers' `dir:foo` are
+            // unrelated repos. Mirror `project_section_keys()`'s `dir:` skip so
+            // a remote never folds on one and conflates distinct projects.
+            if let Some(project_key) = self.workspaces[ws_idx]
+                .project_key()
+                .filter(|key| !key.starts_with("dir:"))
+            {
+                project_of_section
+                    .entry(key.to_string())
+                    .or_insert_with(|| project_key.to_string());
+            }
         }
+
+        // #153: federated peers sharing a project count toward the >=2
+        // threshold, so a LONE local checkout of a project that also lives on
+        // other servers still groups — the single node stops rendering as a
+        // privileged unindented leader with the peers indented beneath it.
+        // Skipped under the `Local` server filter, which hides every remote
+        // row: a header over one lone visible row would be pure noise. The
+        // returned set stays in the section-key namespace — the other two
+        // consumers (`toggle_all_space_groups`, auto-collapse) key on it — so
+        // only the COUNT borrows the project-key projection, never the keys.
+        if !matches!(
+            self.server_filter,
+            Some(crate::app::state::ServerFilter::Local)
+        ) {
+            let peers = self.remote_peers();
+            let mut remote_counts = std::collections::HashMap::<&str, usize>::new();
+            for (_, peer) in &peers {
+                for ws in &peer.workspaces {
+                    if let Some(project_key) = ws.project_key.as_deref() {
+                        *remote_counts.entry(project_key).or_insert(0) += 1;
+                    }
+                }
+            }
+            for (section_key, project_key) in &project_of_section {
+                if let Some(remote) = remote_counts.get(project_key.as_str()) {
+                    *counts.entry(section_key.clone()).or_insert(0) += remote;
+                }
+            }
+        }
+
         counts
             .into_iter()
             .filter(|(_, count)| *count >= 2)
@@ -6088,6 +6141,121 @@ mod tests {
         let keys = state.collapsible_space_keys();
         assert_eq!(keys.len(), 1);
         assert!(keys.contains("repo-key"));
+    }
+
+    /// Build a peer carrying a single workspace on `project_key`, for folding
+    /// federated members into the collapse-grouping count (#153).
+    fn peer_with_project(name: &str, project_key: &str) -> crate::peers::PeerSummaryState {
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: name.into(),
+            ..Default::default()
+        });
+        peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+            id: format!("ws_{name}"),
+            workspace: "flock".into(),
+            project_key: Some(project_key.into()),
+            project_label: Some("flock".into()),
+            branch: Some("main".into()),
+            is_linked_worktree: false,
+            agent: Some("cc".into()),
+            status: crate::api::schema::AgentStatus::Working,
+            status_age_secs: Some(10),
+            activity: None,
+        }];
+        peer.last_ok = Some(std::time::Instant::now());
+        peer
+    }
+
+    #[test]
+    fn collapsible_space_keys_counts_matching_remote_peers() {
+        // #153: a LONE local checkout of a project that also lives on a peer
+        // server groups — the remote member tips it over the >=2 threshold, so
+        // the single node stops rendering as a privileged unindented leader.
+        // The local checkout heads a worktree space, so its SECTION key
+        // ("repo-key") differs from its origin PROJECT key — exercising the
+        // project-key projection (a naive section-key==project_key match would
+        // miss this, the exact target case).
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
+            is_linked_worktree: false,
+        });
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+
+        // Alone, one local checkout is not collapsible.
+        assert!(state.collapsible_space_keys().is_empty());
+
+        // A peer carrying the same project tips it over the threshold.
+        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        let keys = state.collapsible_space_keys();
+        assert_eq!(keys.len(), 1);
+        // The set stays in the section-key namespace (toggle_all / auto-collapse
+        // key on it), NOT the origin project key.
+        assert!(keys.contains("repo-key"));
+    }
+
+    #[test]
+    fn collapsible_space_keys_ignores_non_matching_remote_peers() {
+        // A peer on a DIFFERENT project must not tip a lone local checkout into
+        // a group — no false folding across unrelated origins.
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+        state.peer_summaries = vec![peer_with_project("anvil", "github.com/other/repo")];
+        assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn collapsible_space_keys_does_not_fold_remotes_on_dir_fallback() {
+        // A `dir:<name>` project key is a machine-local directory-name fallback,
+        // not a shared identity. A peer reporting the same `dir:foo` string is a
+        // coincidentally-named unrelated repo — it must NOT tip a lone local
+        // checkout into a group (matching project_section_keys()'s dir: skip).
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "foo".into(),
+            repo_root: "/repo/foo".into(),
+            is_linked_worktree: false,
+            project_key: "dir:foo".into(),
+        });
+        state.peer_summaries = vec![peer_with_project("anvil", "dir:foo")];
+        assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn collapsible_space_keys_skips_remote_fold_under_local_filter() {
+        // The `Local` server filter hides every remote row; a header over one
+        // lone visible local row would be noise, so remotes don't count.
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        state.server_filter = Some(crate::app::state::ServerFilter::Local);
+        assert!(state.collapsible_space_keys().is_empty());
     }
 
     #[test]

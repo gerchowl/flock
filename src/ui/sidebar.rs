@@ -3886,12 +3886,19 @@ mod tests {
         )];
 
         let entries = workspace_list_entries(&app);
+        // #153: local `flock` (1 checkout) + the matching `anvil` remote makes
+        // two members sharing the project, so it AGGREGATES under a synthetic
+        // header — the local node is an equal indented member, not a privileged
+        // unindented leader. Local `other` has no remote, so it stays solo.
         assert_eq!(
             entries,
             vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false
+                    indented: true
                 },
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
@@ -3912,6 +3919,45 @@ mod tests {
                 true
             ),
             "anvil:fix/pty"
+        );
+    }
+
+    #[test]
+    fn single_local_with_no_remote_stays_a_solo_leader() {
+        // The contrast to #153: one local checkout with NO federated peer on
+        // the same project renders as a bare unindented row — no header, no
+        // indentation. Aggregation is strictly for >=2 total members.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "other",
+                Some("github.com/gerchowl/other"),
+                Some("other"),
+                None,
+            )],
+        )];
+
+        // Full shape: the local project stays a bare solo leader (no header, no
+        // indent), and the unmatched remote-only project still renders as its
+        // own leader — neither folds into the other.
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                    ws_idx: 0,
+                    indented: false
+                },
+            ]
         );
     }
 
@@ -4174,7 +4220,8 @@ mod tests {
         ));
 
         // #102 merged stream: `gerchowl/dotfiles` (remote-only) sorts
-        // BEFORE `gerchowl/flock` (local + matched remote).
+        // BEFORE `gerchowl/flock` (local + matched remote). #153: the local
+        // flock + its snapshot remote aggregate under a header.
         let entries = workspace_list_entries(&app);
         assert_eq!(
             entries,
@@ -4184,9 +4231,12 @@ mod tests {
                     ws_idx: 1,
                     indented: false
                 },
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false
+                    indented: true
                 },
                 WorkspaceListEntry::Remote {
                     peer: RemotePeerRef::Snapshot { entry_idx: 0 },
@@ -4234,13 +4284,18 @@ mod tests {
         app.fleet_snapshot = Some(snapshot);
 
         let entries = workspace_list_entries(&app);
-        // The hub's own workspace folds under the matching local project.
+        // The hub's own workspace folds under the matching local project; with
+        // two members (1 local + the hub remote) the project aggregates under a
+        // header, the local checkout an equal indented member (#153).
         assert_eq!(
             entries,
             vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false
+                    indented: true
                 },
                 WorkspaceListEntry::Remote {
                     peer: RemotePeerRef::Origin,
@@ -5066,14 +5121,15 @@ mod tests {
         );
     }
 
-    /// #92: a SOLO local row (one local member, no remote folds, no group)
-    /// must carry the project identity — `<owner/repo> · <server>:<branch>` —
-    /// mirroring solo remotes (#81). The bare member grammar would erase the
-    /// Law 1 of the spaces grammar: a local row that HEADS remote folds is a
-    /// leader, not a solo -- bare identity, no `· server:branch` suffix
-    /// (the dompt regression: solo-form chosen by local grouping alone).
+    /// #153: a local checkout that shares its project with a federated peer is
+    /// no longer a bare "leader" with the peers hanging off it — the project
+    /// AGGREGATES under a synthetic header, the local checkout becomes an equal
+    /// indented member carrying the uniform `<server>:<branch>` locator, and
+    /// the project identity lives in the header row above. (The truly-solo
+    /// case — one local, no remote — still carries `<owner/repo> · server:branch`,
+    /// covered by `solo_local_row_renders_project_identity_then_server_branch`.)
     #[test]
-    fn local_row_with_remote_children_renders_bare_leader_identity() {
+    fn local_project_with_remote_children_aggregates_under_header() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = workspace_with_project_key("dompt", "github.com/nerd-machines/dompt");
         ws.custom_name = None;
@@ -5086,17 +5142,39 @@ mod tests {
         remote.project_key = Some("github.com/nerd-machines/dompt".into());
         app.peer_summaries = vec![peer_with_workspaces("sage", vec![remote])];
 
+        // Entry shape: header, local member (indented), remote member (indented).
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/nerd-machines/dompt".into()
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true
+                },
+                WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                    ws_idx: 0,
+                    indented: true
+                },
+            ]
+        );
+
         let area = Rect::new(0, 0, 60, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
         let card = app.view.workspace_card_areas[0];
-        let row = buffer_row_text(&buffer, card.rect, card.rect.y);
+        let member_row = buffer_row_text(&buffer, card.rect, card.rect.y);
+        // The local member now carries the `<server>:<branch>` locator, not the
+        // bare project identity — the identity moved to the header row above it.
         assert!(
-            row.contains("nerd-machines/dompt"),
-            "leader keeps the identity: {row:?}"
+            member_row.contains(":main"),
+            "aggregated local member carries the server:branch locator: {member_row:?}"
         );
+        let header_row = buffer_row_text(&buffer, card.rect, card.rect.y.saturating_sub(1));
         assert!(
-            !row.contains('\u{00b7}') && !row.contains(":main"),
-            "leader carries NO locator suffix when children fold under it: {row:?}"
+            header_row.contains("nerd-machines/dompt"),
+            "the project identity heads the group: {header_row:?}"
         );
     }
 
@@ -6212,13 +6290,19 @@ mod tests {
         app.set_spaces_panel_scope(PanelScope::Current);
 
         // The focused project keeps its spliced remote rows; the second
-        // local project and the remote-only trailing project both hide.
+        // local project and the remote-only trailing project both hide. #153:
+        // the focused project (1 local + matched remote) aggregates under a
+        // header, and scope=Current retains it — the header block is `is_local`
+        // with the focused ws in its `focus_ws_indices`.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
