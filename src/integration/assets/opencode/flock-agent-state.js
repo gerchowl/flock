@@ -22,6 +22,9 @@ function reportSession(sessionID) {
     const child = spawn(bin, ["hook", "opencode", "session"], {
       stdio: ["pipe", "ignore", "ignore"],
     });
+    // If the child exits before we finish writing, node surfaces EPIPE on
+    // stdin (and ENOENT/EACCES as a spawn `error`). Swallow both so a failed
+    // report never throws into the agent.
     child.on("error", () => {});
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify({ session_id: sessionID }));

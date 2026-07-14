@@ -31,8 +31,11 @@ use crate::api::schema::{
     PaneReportReplyParams, Request,
 };
 
-/// Fire-and-forget socket deadline. Matches the shims' 0.5s: a hung server
-/// must never wedge the agent's turn.
+/// Read/write deadline on the report socket, matching the shims' 0.5s: a
+/// server that accepts but stalls must never wedge the agent's turn. The
+/// `connect` leg is not covered (std `UnixStream` has no connect timeout), but
+/// the failure mode #158 cares about — no server listening — fails `connect`
+/// immediately with ENOENT/ECONNREFUSED, so it stays fire-and-forget.
 const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Harness-internal markers that arrive through the same prompt/reply pipe as
@@ -216,7 +219,10 @@ fn plan_prompt(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOu
 }
 
 fn plan_stop(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOutcome {
-    let is_subagent = input.get("agent_id").is_some_and(|v| !v.is_null());
+    // Parity with the shim's `bool(hook_input.get("agent_id"))`: a non-empty
+    // string agent_id marks a subagent. `str_field` already rejects empty
+    // strings, so an `agent_id: ""` is (correctly) not treated as a subagent.
+    let is_subagent = str_field(input, "agent_id").is_some();
     let last_assistant = str_field(input, "transcript_path")
         .and_then(|path| last_assistant_text(&path))
         .unwrap_or_default();
@@ -334,11 +340,17 @@ fn last_assistant_text(path: &str) -> Option<String> {
     None
 }
 
+/// Monotonic report sequence. Seeded from wall-clock nanos (so the server sees
+/// a sensible ordering across separate hook invocations) but bumped by a
+/// process-local counter so two reports emitted in the same invocation — the
+/// Stop path's reply then recap — can never collide.
 fn seq() -> u64 {
-    SystemTime::now()
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    nanos.wrapping_add(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -519,6 +531,33 @@ mod tests {
         let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1");
         assert!(out.stdout.is_none(), "subagent must not loop on a nudge");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn emit_against_a_dead_socket_is_fire_and_forget() {
+        // The socket edge must swallow a failed send: pointing at a socket path
+        // with no listener, emit() must return promptly, never panic or hang.
+        // (nextest runs each test in its own process, so the env set is safe.)
+        std::env::set_var(
+            "FLOCK_SOCKET_PATH",
+            "/nonexistent/flk-hook-fire-and-forget.sock",
+        );
+        let outcome = plan(
+            Agent::Claude,
+            Action::Session,
+            &json!({"session_id": "s"}),
+            "SessionStart",
+            "p_1",
+        );
+        assert_eq!(outcome.reports.len(), 1, "precondition: one report to send");
+        emit(outcome); // must not panic or block the caller
+        std::env::remove_var("FLOCK_SOCKET_PATH");
+    }
+
+    #[test]
+    fn seq_is_strictly_increasing_within_a_process() {
+        // reply then recap in one Stop invocation must not collide.
+        assert!(seq() < seq());
     }
 
     #[test]
