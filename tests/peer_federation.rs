@@ -506,9 +506,20 @@ fn folded_remote_member_row_click_switches_server() {
     // workspace folds under A's local project block as an indented member.
     let shared_origin = "git@github.com:peer-fed-test/shared.git";
 
-    // --- Server B: the peer, checkout of the shared repo.
+    // --- Server B: the peer, checkout of the shared repo. Put B on a DISTINCT
+    // branch so its folded remote member row is uniquely identifiable: since
+    // #153 the local checkout is ALSO an indented member under the project
+    // header (not an unindented leader), so both members would otherwise read
+    // the same `mba22:main` in this single-host harness. B on `peerwork` gives
+    // the remote row a `:peerwork` tail the local `:main` row can't collide on.
     let repo_b = base.join("shared-b");
     init_repo_with_origin(&repo_b, shared_origin);
+    let status = std::process::Command::new("git")
+        .args(["checkout", "-q", "-b", "peerwork"])
+        .current_dir(&repo_b)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git checkout -b failed for peer repo");
     let config_home_b = base.join("config-b");
     let runtime_b = base.join("runtime-b");
     let socket_b = base.join("flock-b.sock");
@@ -561,15 +572,14 @@ fn folded_remote_member_row_click_switches_server() {
 
     wait_for_frame_row(&mut stream, "servers", Duration::from_secs(45))
         .expect("servers section should appear once the peer is polled");
-    // The folded member row reads `   <icon> <host>:<branch>` — INDENTED under
-    // the local `shared` block as a group member (>= 2 leading spaces). Since
-    // the #62 uniform grammar the LOCAL head row also reads `host:branch`
-    // (` ○ mba22:main`), so we key on the deeper MEMBER indent, not just any
-    // leading whitespace, to land on the remote card. It appears once the
-    // peer's workspace summary lands (second poll). NOTE: in this single-host
-    // harness the peer reports the same `mba22` hostname as the local server,
-    // so we key on the indented `host:branch` shape, not the literal name.
-    let row = wait_for_indented_peer_row(&mut stream, ":main", Duration::from_secs(60))
+    // Since #153 the shared project AGGREGATES under a synthetic header: the
+    // local checkout and the peer both render as INDENTED members (>= 2 leading
+    // spaces) beneath it — the local is no longer an unindented leader. Both
+    // read `<host>:<branch>` (#62 uniform grammar) and, in this single-host
+    // harness, the same `mba22` host — so we key on B's DISTINCT `:peerwork`
+    // branch tail to land on the REMOTE member and not the local `:main` row.
+    // It appears once the peer's workspace summary lands (second poll).
+    let row = wait_for_indented_peer_row(&mut stream, ":peerwork", Duration::from_secs(60))
         .expect("peer workspace should fold into the local project block as an indented member");
 
     let col = 4u16;
