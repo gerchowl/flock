@@ -1042,7 +1042,14 @@ impl AppState {
                 continue;
             };
             *counts.entry(key.to_string()).or_insert(0) += 1;
-            if let Some(project_key) = self.workspaces[ws_idx].project_key() {
+            // A `dir:<name>` project key is a machine-local directory-name
+            // fallback, NOT a shared identity — two servers' `dir:foo` are
+            // unrelated repos. Mirror `project_section_keys()`'s `dir:` skip so
+            // a remote never folds on one and conflates distinct projects.
+            if let Some(project_key) = self.workspaces[ws_idx]
+                .project_key()
+                .filter(|key| !key.starts_with("dir:"))
+            {
                 project_of_section
                     .entry(key.to_string())
                     .or_insert_with(|| project_key.to_string());
@@ -6178,6 +6185,25 @@ mod tests {
             project_key: "github.com/gerchowl/flock".into(),
         });
         state.peer_summaries = vec![peer_with_project("anvil", "github.com/other/repo")];
+        assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn collapsible_space_keys_does_not_fold_remotes_on_dir_fallback() {
+        // A `dir:<name>` project key is a machine-local directory-name fallback,
+        // not a shared identity. A peer reporting the same `dir:foo` string is a
+        // coincidentally-named unrelated repo — it must NOT tip a lone local
+        // checkout into a group (matching project_section_keys()'s dir: skip).
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "foo".into(),
+            repo_root: "/repo/foo".into(),
+            is_linked_worktree: false,
+            project_key: "dir:foo".into(),
+        });
+        state.peer_summaries = vec![peer_with_project("anvil", "dir:foo")];
         assert!(state.collapsible_space_keys().is_empty());
     }
 

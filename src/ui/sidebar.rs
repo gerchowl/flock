@@ -3896,20 +3896,22 @@ mod tests {
             )],
         )];
 
-        let entries = workspace_list_entries(&app);
+        // Full shape: the local project stays a bare solo leader (no header, no
+        // indent), and the unmatched remote-only project still renders as its
+        // own leader — neither folds into the other.
         assert_eq!(
-            entries.first(),
-            Some(&WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false
-            }),
-            "a lone local project with no matching remote keeps the solo shape"
-        );
-        assert!(
-            !entries
-                .iter()
-                .any(|e| matches!(e, WorkspaceListEntry::Header { key } if key == "github.com/gerchowl/flock")),
-            "no synthetic header for a single unfederated local checkout"
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                    ws_idx: 0,
+                    indented: false
+                },
+            ]
         );
     }
 
