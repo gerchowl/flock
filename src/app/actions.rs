@@ -1106,6 +1106,27 @@ impl AppState {
             .collect()
     }
 
+    /// Drop collapse state for keys no longer backed by a live local project
+    /// section (#155). Without this, `collapsed_space_keys` is never pruned:
+    /// a worktree-membership section key is reused across checkouts of the same
+    /// repo, so a fresh checkout could silently inherit the collapse state of a
+    /// prior, since-closed one — and a dissolved group's stale key would
+    /// re-collapse a reformed group the user never re-collapsed. Reconciled
+    /// against `project_section_keys()` (filter-independent), so a still-present
+    /// single-checkout section keeps its key; only vanished sections are pruned.
+    pub(crate) fn reconcile_collapsed_space_keys(&mut self) {
+        if self.collapsed_space_keys.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<String> =
+            self.project_section_keys().into_iter().flatten().collect();
+        let before = self.collapsed_space_keys.len();
+        self.collapsed_space_keys.retain(|key| live.contains(key));
+        if self.collapsed_space_keys.len() != before {
+            self.mark_session_dirty();
+        }
+    }
+
     /// Collapse every sidebar worktree group at once; if all are already
     /// collapsed, expand them all instead.
     pub(crate) fn toggle_all_space_groups(&mut self) {
@@ -2112,6 +2133,10 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }
+        // A closed checkout may have been a section's last member — prune any
+        // now-orphaned collapse state so a future same-key checkout starts
+        // expanded (#155).
+        self.reconcile_collapsed_space_keys();
     }
 
     fn refresh_tab_bar_view(&mut self) {
@@ -6238,6 +6263,40 @@ mod tests {
         });
         state.peer_summaries = vec![peer_with_project("anvil", "dir:foo")];
         assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn reconcile_collapsed_space_keys_prunes_orphans_keeps_live() {
+        let mut state = app_with_workspaces(&["parent", "child"]);
+        mark_parent_worktree(&mut state, 0);
+        mark_linked_worktree(&mut state, 1);
+        state.collapsed_space_keys.insert("repo-key".into()); // live section
+        state.collapsed_space_keys.insert("ghost-key".into()); // no section
+        state.reconcile_collapsed_space_keys();
+        assert!(
+            state.collapsed_space_keys.contains("repo-key"),
+            "a still-present section keeps its collapse state"
+        );
+        assert!(
+            !state.collapsed_space_keys.contains("ghost-key"),
+            "collapse state for a vanished section is pruned"
+        );
+    }
+
+    #[test]
+    fn close_workspace_prunes_orphaned_collapse_state() {
+        // #155: closing a section's last member must not leave stale collapse
+        // state — a future checkout reusing the worktree-membership key would
+        // otherwise load silently collapsed.
+        let mut state = app_with_workspaces(&["parent", "child"]);
+        mark_parent_worktree(&mut state, 0);
+        mark_linked_worktree(&mut state, 1);
+        state.collapsed_space_keys.insert("repo-key".into());
+        state.close_workspace_indices(vec![0, 1]);
+        assert!(
+            !state.collapsed_space_keys.contains("repo-key"),
+            "collapse state pruned once the section's last member closes"
+        );
     }
 
     #[test]

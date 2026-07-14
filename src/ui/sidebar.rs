@@ -756,16 +756,20 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             key: key.to_string(),
         }];
         if collapsed {
-            // Collapsed: keep just the header, but surface the active
-            // member when this group is the focused one so selection
-            // stays visible. The active member is added at render time
-            // (below), because we can't know here whether this block
-            // will survive scope=Current filtering.
-            if let Some(active_idx) =
-                visible_group_idx.filter(|_| active_group.as_deref() == Some(key))
-            {
+            // Collapsed: keep just the header, but surface the active member
+            // when this group is the focused one so selection stays visible.
+            // ALSO always surface a group's SOLE local member (#155): a
+            // single-local aggregate (#153 — one local checkout + federated
+            // peers) must never hide its only checkout behind the collapsed
+            // header, or that local becomes keyboard-unreachable (headers and
+            // remote rows are skipped by `visible_workspace_order`). Collapsing
+            // such a group then only hides the peer rows, not your own row.
+            let surface_idx = visible_group_idx
+                .filter(|_| active_group.as_deref() == Some(key))
+                .or_else(|| (members.len() == 1).then(|| members[0]));
+            if let Some(idx) = surface_idx {
                 entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: active_idx,
+                    ws_idx: idx,
                     indented: true,
                 });
             }
@@ -3958,6 +3962,57 @@ mod tests {
                     indented: false
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn collapsed_single_local_aggregate_surfaces_its_sole_local() {
+        // #155: a collapsed single-local aggregate (#153) that is NOT the
+        // focused group must still surface its ONE local checkout, or that
+        // local becomes keyboard-unreachable (headers + remote rows are skipped
+        // by `visible_workspace_order`). Focus a DIFFERENT project so the flock
+        // aggregate is non-active.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_project_key("flock", "github.com/gerchowl/flock"),
+            workspace_with_project_key("other", "github.com/gerchowl/other"),
+        ];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        )];
+        app.ensure_test_terminals();
+        app.mode = crate::app::Mode::Terminal;
+        app.active = Some(1); // focus `other`, not the flock aggregate
+        app.collapsed_space_keys
+            .insert("github.com/gerchowl/flock".into());
+
+        let entries = workspace_list_entries(&app);
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true
+                }
+            )),
+            "collapsed non-focused single-local aggregate surfaces its sole local: {entries:?}"
+        );
+        // The collapsed group hides the peer row, but keeps the local reachable.
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, WorkspaceListEntry::Remote { .. })),
+            "collapse still hides the peer rows: {entries:?}"
+        );
+        assert!(
+            app.visible_workspace_order().contains(&0),
+            "the sole local stays in keyboard-nav order"
         );
     }
 
