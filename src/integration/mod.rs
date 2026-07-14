@@ -10,6 +10,12 @@ use serde_json::{json, Map, Value};
 use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
+/// Absolute path to the flock binary running this pane's server. Thin hook
+/// stubs exec `"$FLOCK_BIN" hook <agent> <action>` so they reach `flk hook`
+/// without depending on PATH inside the agent's shell (#158). Stamped at spawn
+/// from `current_exe()`, so it always matches the running flock — install and
+/// `integration manifest` (nix/off-host) alike, no baked-in path to drift.
+pub(crate) const FLOCK_BIN_ENV_VAR: &str = "FLOCK_BIN";
 const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
 const PI_INTEGRATION_VERSION: u32 = 2;
@@ -240,6 +246,10 @@ pub(crate) struct HermesUninstallResult {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
+    // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env(FLOCK_BIN_ENV_VAR, exe);
+    }
 }
 
 pub(crate) fn install_target(
@@ -2444,6 +2454,23 @@ mod tests {
         std::env::remove_var(COPILOT_HOME_ENV_VAR);
         std::env::remove_var(KIMI_CODE_HOME_ENV_VAR);
         std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    }
+
+    #[test]
+    fn apply_pane_env_stamps_flock_bin_to_current_exe() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let expected = std::env::current_exe().expect("current_exe in test");
+        assert_eq!(
+            cmd.get_env(FLOCK_BIN_ENV_VAR),
+            Some(expected.as_os_str()),
+            "FLOCK_BIN must point at the running flock binary so hook stubs \
+             reach `flk hook` without relying on PATH"
+        );
+        assert_eq!(
+            cmd.get_env(FLOCK_PANE_ID_ENV_VAR),
+            Some(std::ffi::OsStr::new("p_7"))
+        );
     }
 
     fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
