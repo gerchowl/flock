@@ -1083,9 +1083,21 @@ impl AppState {
             self.server_filter,
             Some(crate::app::state::ServerFilter::Local)
         ) {
+            // #156: only FRESH peers count. A peer whose summary has gone stale
+            // (offline past the gossip staleness cut — the same threshold the
+            // servers band uses) stops propping up an aggregate, so a project
+            // doesn't stay grouped on a peer that's been gone for hours. This
+            // also yields asymmetric hysteresis for free: a successful poll
+            // refreshes `last_ok` and re-aggregates immediately, while a peer
+            // going away only downgrades after the staleness window elapses —
+            // no per-render sticky timer needed, so this stays a pure function.
+            let stale_after = self.config.gossip.stale_after().as_secs();
             let peers = self.remote_peers();
             let mut remote_counts = std::collections::HashMap::<&str, usize>::new();
             for (_, peer) in &peers {
+                if peer.is_stale_with(stale_after) {
+                    continue;
+                }
                 for ws in &peer.workspaces {
                     if let Some(project_key) = ws.project_key.as_deref() {
                         *remote_counts.entry(project_key).or_insert(0) += 1;
@@ -6244,6 +6256,36 @@ mod tests {
         });
         state.peer_summaries = vec![peer_with_project("anvil", "github.com/other/repo")];
         assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn collapsible_space_keys_ignores_stale_remote_peers() {
+        // #156: a peer whose summary has gone stale (offline past the gossip
+        // staleness cut) must NOT prop up an aggregate — otherwise a project
+        // stays grouped on a peer that's been gone for hours. A fresh poll
+        // re-aggregates immediately; only sustained staleness downgrades.
+        let mut state = app_with_workspaces(&["solo"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "gitspace-key".into(),
+            checkout_key: "gitspace-key-co".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+
+        // A FRESH peer on the same project aggregates it.
+        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        assert_eq!(state.collapsible_space_keys().len(), 1);
+
+        // The same peer, now stale, stops counting → back to a lone checkout.
+        let mut stale = peer_with_project("anvil", "github.com/gerchowl/flock");
+        stale.origin_last_ok_secs = Some(10_000); // well past the 60s cut
+        state.peer_summaries = vec![stale];
+        assert!(
+            state.collapsible_space_keys().is_empty(),
+            "a stale peer must not keep the project aggregated"
+        );
     }
 
     #[test]
