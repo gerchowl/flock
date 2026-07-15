@@ -2,66 +2,35 @@
 // managed by flock; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=4
+// FLOCK_INTEGRATION_VERSION=5
+//
+// Thin plugin (#158). The wire protocol lives once in the flk binary at
+// `flk hook opencode <action>` (Rust, cli::hook). This plugin is just the
+// opencode-side adapter: it maps opencode's session lifecycle events to a
+// `session` action and hands the sessionID to flk over stdin. No socket code.
 
-import net from "node:net";
+import { spawn } from "node:child_process";
 
-const SOURCE = "flock:opencode";
-let reportSeq = Date.now() * 1000;
-
-function nextReportSeq() {
-  reportSeq += 1;
-  return reportSeq;
-}
-
-function sessionIDFromProperties(properties) {
-  return typeof properties?.sessionID === "string" && properties.sessionID
-    ? properties.sessionID
-    : undefined;
-}
-
+// Forward a session id to `flk hook opencode session`. Fire-and-forget: a
+// plugin must never block or fail the agent, so every error is swallowed.
 function reportSession(sessionID) {
   if (!sessionID) {
-    return Promise.resolve();
+    return;
   }
-  const paneId = process.env.FLOCK_PANE_ID;
-  const socketPath = process.env.FLOCK_SOCKET_PATH;
-
-  if (!paneId || !socketPath) {
-    return Promise.resolve();
-  }
-
-  const requestId = `${SOURCE}:${Date.now()}:${Math.floor(Math.random() * 1_000_000)
-    .toString()
-    .padStart(6, "0")}`;
-  const request = {
-    id: requestId,
-    method: "pane.report_agent_session",
-    params: {
-      pane_id: paneId,
-      source: SOURCE,
-      agent: "opencode",
-      seq: nextReportSeq(),
-      agent_session_id: sessionID,
-    },
-  };
-
-  return new Promise((resolve) => {
-    const client = net.createConnection(socketPath, () => {
-      client.write(`${JSON.stringify(request)}\n`);
+  const bin = process.env.FLOCK_BIN || "flk";
+  try {
+    const child = spawn(bin, ["hook", "opencode", "session"], {
+      stdio: ["pipe", "ignore", "ignore"],
     });
-
-    const finish = () => {
-      client.destroy();
-      resolve();
-    };
-
-    client.setTimeout(500, finish);
-    client.on("data", finish);
-    client.on("error", finish);
-    client.on("end", finish);
-    client.on("close", resolve);
-  });
+    // If the child exits before we finish writing, node surfaces EPIPE on
+    // stdin (and ENOENT/EACCES as a spawn `error`). Swallow both so a failed
+    // report never throws into the agent.
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ session_id: sessionID }));
+  } catch {
+    // spawn threw synchronously (e.g. bad bin) — no-op.
+  }
 }
 
 export const FlockAgentStatePlugin = async () => {
@@ -75,16 +44,16 @@ export const FlockAgentStatePlugin = async () => {
 
   return {
     event: async ({ event }) => {
-      const type = event?.type;
-      const properties = event?.properties ?? {};
-      const sessionID = sessionIDFromProperties(properties);
-
-      switch (type) {
+      switch (event?.type) {
         case "session.created":
         case "session.updated":
-        case "session.status":
-          await reportSession(sessionID);
+        case "session.status": {
+          const sessionID = event?.properties?.sessionID;
+          if (typeof sessionID === "string" && sessionID) {
+            reportSession(sessionID);
+          }
           break;
+        }
         default:
           break;
       }

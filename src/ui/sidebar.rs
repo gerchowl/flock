@@ -6118,10 +6118,16 @@ mod tests {
     #[test]
     fn workspace_scroll_offset_applies_to_group_children() {
         let mut app = AppState::test_new();
+        // The misc row's sort key is its `identity_cwd` basename
+        // (`sort_family_key`), which `Workspace::test_new` seeds from the
+        // process CWD — pin it so the display order (misc row then the
+        // collapsed group) doesn't depend on the checkout directory's name.
+        let mut notes = Workspace::test_new("notes");
+        notes.identity_cwd = std::path::PathBuf::from("/repo/notes");
         app.workspaces = vec![
             workspace_with_worktree_space("main", Some("repo-key"), "/repo/flock"),
             workspace_with_worktree_space("issue", Some("repo-key"), "/repo/flock-issue"),
-            Workspace::test_new("notes"),
+            notes,
         ];
         app.collapsed_space_keys.insert("repo-key".into());
         app.active = None;
@@ -6130,9 +6136,9 @@ mod tests {
 
         let (cards, _remote, headers) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 14));
 
-        // The display list is a leading pending row then the collapsed group
-        // header. Scrolling past the leading row reveals that header, with its
-        // members staying folded away.
+        // The display list is a leading misc row (`notes` sorts before
+        // `repo-key`) then the collapsed group header. Scrolling past the
+        // leading row reveals that header, with its members staying folded away.
         assert!(cards.is_empty());
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].key, app.project_section_key(0).unwrap());

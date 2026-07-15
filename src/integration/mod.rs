@@ -10,6 +10,12 @@ use serde_json::{json, Map, Value};
 use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
+/// Absolute path to the flock binary running this pane's server. Thin hook
+/// stubs exec `"$FLOCK_BIN" hook <agent> <action>` so they reach `flk hook`
+/// without depending on PATH inside the agent's shell (#158). Stamped at spawn
+/// from `current_exe()`, so it always matches the running flock — install and
+/// `integration manifest` (nix/off-host) alike, no baked-in path to drift.
+pub(crate) const FLOCK_BIN_ENV_VAR: &str = "FLOCK_BIN";
 const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
 const PI_INTEGRATION_VERSION: u32 = 2;
@@ -19,7 +25,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 8;
+const CLAUDE_INTEGRATION_VERSION: u32 = 9;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -64,7 +70,7 @@ const COPILOT_INTEGRATION_VERSION: u32 = 1;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 4;
+const OPENCODE_INTEGRATION_VERSION: u32 = 5;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "flock-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
@@ -240,6 +246,10 @@ pub(crate) struct HermesUninstallResult {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
+    // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env(FLOCK_BIN_ENV_VAR, exe);
+    }
 }
 
 pub(crate) fn install_target(
@@ -2446,6 +2456,23 @@ mod tests {
         std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
     }
 
+    #[test]
+    fn apply_pane_env_stamps_flock_bin_to_current_exe() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let expected = std::env::current_exe().expect("current_exe in test");
+        assert_eq!(
+            cmd.get_env(FLOCK_BIN_ENV_VAR),
+            Some(expected.as_os_str()),
+            "FLOCK_BIN must point at the running flock binary so hook stubs \
+             reach `flk hook` without relying on PATH"
+        );
+        assert_eq!(
+            cmd.get_env(FLOCK_PANE_ID_ENV_VAR),
+            Some(std::ffi::OsStr::new("p_7"))
+        );
+    }
+
     fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
         format!(
             "bash {} {action}",
@@ -2939,55 +2966,43 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    /// Structural smoke test for the v7 Claude shim asset. Catches accidental
-    /// regressions (a refactor that drops the filter, the recap extraction,
-    /// or the decision:block nudge) without needing to spawn python3 at
-    /// test time. Pairs with the runtime path that the install test covers.
+    /// The Claude shim is a thin stub (#158): the protocol lives in Rust at
+    /// `flk hook claude` (covered by `cli::hook::tests`). This pins the stub
+    /// contract — delegation, version, PATH-independence, no-fail — so a
+    /// regression that reintroduces protocol logic (or drops the delegation)
+    /// is caught. The `derived docs match` guardrail keeps the version marker
+    /// and `CLAUDE_INTEGRATION_VERSION` in sync.
     #[test]
-    fn claude_hook_asset_has_v8_shape() {
+    fn claude_hook_asset_is_thin_stub() {
         let asset = CLAUDE_HOOK_ASSET;
-        // Version pin so a future change makes the test catch the
-        // out-of-sync constant before the install test reports the wrong
-        // version.
+        // Version pin, kept in lockstep with the const.
         assert!(
-            asset.contains("FLOCK_INTEGRATION_VERSION=8"),
-            "asset version pin missing"
+            asset.contains(&format!(
+                "FLOCK_INTEGRATION_VERSION={CLAUDE_INTEGRATION_VERSION}"
+            )),
+            "asset version pin out of sync with CLAUDE_INTEGRATION_VERSION"
         );
-        // Session-start source forwarding so the server can distinguish a
-        // real `/clear`/`/resume`/compaction from a nested `claude -p`
-        // startup that inherits the pane environment.
+        // Delegates the action + stdin to the single-source-of-truth binary.
         assert!(
-            asset.contains("session_start_source"),
-            "session_start_source forwarding missing"
+            asset.contains("hook claude \"${1:-}\""),
+            "stub must delegate to `flk hook claude <action>`"
         );
-        // Stop action wired through the case statement.
+        // Reaches flk via the stamped FLOCK_BIN, PATH-independent, with a
+        // `flk` fallback (#158) — the fix for the missing-hook-on-peers class.
         assert!(
-            asset.contains("session|prompt|stop"),
-            "stop action missing from case"
+            asset.contains("${FLOCK_BIN:-flk}"),
+            "stub must exec via FLOCK_BIN with a PATH fallback"
         );
-        // Task-notification + sibling system-reminder filter (the noise the
-        // user surfaced in the float).
+        // Never fails the parent agent.
+        assert!(asset.contains("exit 0"), "stub must always exit 0");
+        // The protocol moved to Rust — none of it should remain in the shim.
         assert!(
-            asset.contains("<task-notification>"),
-            "task-notification filter prefix missing"
+            !asset.contains("python"),
+            "thin stub must not embed a python interpreter"
         );
         assert!(
-            asset.contains("<system-reminder>"),
-            "system-reminder filter prefix missing"
-        );
-        // Recap sentinel character (KATAKANA REFERENCE MARK U+203B).
-        assert!(
-            asset.contains("\u{203b}"),
-            "recap sentinel char missing from shim"
-        );
-        // Three POST sites: prompt, reply, recap.
-        assert!(asset.contains("pane.report_prompt"));
-        assert!(asset.contains("pane.report_reply"));
-        assert!(asset.contains("pane.report_recap"));
-        // Self-healing nudge emits decision:block on missing recap.
-        assert!(
-            asset.contains("\"decision\": \"block\"") || asset.contains("'decision': 'block'"),
-            "decision:block nudge missing"
+            !asset.contains("pane.report_"),
+            "wire protocol must live in `flk hook`, not the shim"
         );
     }
 
@@ -3231,7 +3246,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 8);
+        assert_eq!(claude.expected_version, 9);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -3261,7 +3276,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 8);
+        assert_eq!(claude.expected_version, 9);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4060,9 +4075,10 @@ mod tests {
         assert!(PI_EXTENSION_ASSET.contains("agent_session_path: currentAgentSessionPath"));
         assert!(PI_EXTENSION_ASSET.contains("agent_session_id: currentAgentSessionId"));
         assert!(PI_EXTENSION_ASSET.contains("publishState(true)"));
-        assert!(CLAUDE_HOOK_ASSET.contains("agent_session_id"));
-        assert!(CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
-        assert!(!CLAUDE_HOOK_ASSET.contains("\"state\": action"));
+        // Claude is a thin stub now (#158): session-ref reporting lives in
+        // `flk hook claude` (cli::hook::tests). The stub only delegates.
+        assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
+        assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
         assert!(CODEX_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
         assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
@@ -4077,10 +4093,11 @@ mod tests {
         assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
         assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
         assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
+        // Opencode is a thin plugin now (#158): it maps session events and
+        // delegates to `flk hook opencode session`; the report lives in Rust.
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
-        assert!(OPENCODE_PLUGIN_ASSET.contains("agent_session_id: sessionID"));
-        assert!(OPENCODE_PLUGIN_ASSET.contains("pane.report_agent_session"));
-        assert!(!OPENCODE_PLUGIN_ASSET.contains("reportState"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("hook\", \"opencode\", \"session"));
+        assert!(!OPENCODE_PLUGIN_ASSET.contains("pane.report_agent_session"));
         assert!(!OPENCODE_PLUGIN_ASSET.contains("pane.release_agent"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("session_id = _session_id(kwargs)"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("agent_session_id"));
