@@ -2020,7 +2020,7 @@ fn render_server_rows(frame: &mut Frame, rect: Rect, [title, health]: [Line<'sta
 /// unknown/garbage name (registry miss) renders as the blank slot — never the
 /// raw string, so a hostile or version-skewed peer can't inject into the band.
 fn server_icon_span(icon_name: Option<&str>, style: Style) -> Span<'static> {
-    match icon_name.and_then(crate::server_icons::glyph) {
+    match icon_name.and_then(crate::server_icons::resolve) {
         Some(glyph) => Span::styled(format!("{glyph} "), style),
         None => Span::styled("  ".to_string(), style),
     }
@@ -2687,8 +2687,11 @@ fn render_workspace_list(
         let stale = peer.is_stale() || peer.error.is_some();
         let (icon, icon_style) = remote_agent_icon(remote_ws.status, app.spinner_tick, p);
         let label = remote_entry_label(app, &card.peer, card.ws_idx, card.indented);
+        // #164 P2: the owning server's icon badges the folded remote row, tying
+        // the workspace to its machine. Fixed 2-cell slot so multiple remotes in
+        // a group line up; +2 to the label budget for it.
         let max_label =
-            (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
+            (card.rect.width as usize).saturating_sub(if card.indented { 7 } else { 5 });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
         // labels carry a `·` separator (and the origin rows from #66 are long),
         // so a byte slice could land mid-`·` and panic the whole render.
@@ -2705,10 +2708,13 @@ fn render_workspace_list(
             final_icon_style = final_icon_style.add_modifier(Modifier::DIM);
         }
         let indent = if card.indented { "   " } else { " " };
+        // The server icon inherits the label style, so it dims with a stale row.
+        let server_icon = server_icon_span(peer.icon.as_deref(), label_style);
         let line = Line::from(vec![
             Span::styled(indent, Style::default()),
             Span::styled(icon, final_icon_style),
             Span::styled(" ", Style::default()),
+            server_icon,
             Span::styled(label, label_style),
         ]);
         frame.render_widget(
@@ -3773,6 +3779,46 @@ mod tests {
         let name = spans_text(&peer_server_rows(&peer, &p).name);
         let glyph = crate::server_icons::glyph("anvil").unwrap();
         assert_eq!(name, format!("{glyph} anvil"));
+    }
+
+    #[test]
+    fn folded_remote_workspace_row_badges_the_owning_servers_icon() {
+        // #164 P2: a folded remote workspace row carries the OWNING server's
+        // icon glyph (resolved from its gossiped name), tying the row to its
+        // machine. Rendered between the agent icon and the `peer:branch` label.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        let mut peer = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        );
+        peer.icon = Some("anvil".into());
+        app.peer_summaries = vec![peer];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 40, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        let has_badge = (0..area.height).any(|y| {
+            let row: String = (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            row.contains(glyph) && row.contains("anvil")
+        });
+        assert!(
+            has_badge,
+            "folded remote row should show the server icon glyph"
+        );
     }
 
     #[test]

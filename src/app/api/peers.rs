@@ -480,7 +480,22 @@ pub(crate) fn configured_node_icon() -> Option<String> {
         .get_or_init(|| {
             let icon = crate::config::load_live_config().ok()?.config.icon?;
             let name = icon.trim();
-            crate::server_icons::is_known(name).then(|| name.to_string())
+            if name.is_empty() {
+                return None;
+            }
+            if crate::server_icons::is_renderable(name) {
+                // Gossip the value verbatim (a registry name or a raw glyph) —
+                // every receiver resolves it the same way we do.
+                return Some(name.to_string());
+            }
+            // A typo or an oversized/unsafe value: warn once (this init runs
+            // once), listing the known names so the fix is obvious; don't
+            // gossip garbage, render no icon.
+            crate::logging::unknown_server_icon(
+                name,
+                &crate::server_icons::known_names().join(", "),
+            );
+            None
         })
         .clone()
 }

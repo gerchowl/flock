@@ -3,11 +3,11 @@
 //!
 //! A node declares `icon = "laptop"` in its config; only that ASCII name ever
 //! crosses the wire (gossiped with the node's identity so every viewer renders
-//! the same glyph). The name → glyph mapping lives here, on the receiver, so:
-//!   - no raw/untrusted Unicode travels the wire (an unknown name renders no
-//!     icon — [`glyph`] returns `None`);
-//!   - the glyph is drawn from a font the RECEIVER controls (no cross-node font
-//!     drift), and a registry bump reaches every node on next release.
+//! the same glyph). The name → glyph mapping lives here, on the receiver, so no
+//! raw/untrusted Unicode travels the wire (an unknown name renders no icon —
+//! [`glyph`] returns `None`), the glyph is drawn from a font the RECEIVER
+//! controls (no cross-node font drift), and a registry bump reaches every node
+//! on next release.
 //!
 //! Codepoints are Material Design (`md-*`) / Font Awesome (`fa-*`) Nerd Font
 //! glyphs, taken from the canonical `ryanoasis/nerd-fonts` glyphnames set.
@@ -104,10 +104,130 @@ pub fn glyph(name: &str) -> Option<&'static str> {
     Some(glyph)
 }
 
-/// Whether a name resolves to a glyph — used to warn on an unknown `icon` in a
-/// node's OWN config (a typo), where a heads-up beats silent no-icon.
-pub fn is_known(name: &str) -> bool {
-    glyph(name).is_some()
+/// Resolve a config/gossiped `icon` value to the glyph to RENDER (#164), trying
+/// two paths in order: first a registry NAME (`"laptop"`) → its curated glyph;
+/// otherwise a RAW single-cell glyph escape hatch (#164 P2) — a value that isn't
+/// a known name but is itself exactly one display cell of printable, control-free
+/// text (a Nerd Font PUA glyph the registry doesn't cover).
+///
+/// Anything else — an unknown name, a multi-cell string, an emoji (width 2), a
+/// control/escape payload — resolves to `None`, so it renders as the blank slot
+/// and can never widen the fixed 2-cell budget or inject into the band. The
+/// width-1 gate is what both keeps the slot aligned AND excludes emoji, honoring
+/// the "flat icons, no emoji" rule even for the raw hatch.
+pub fn resolve(value: &str) -> Option<std::borrow::Cow<'static, str>> {
+    use std::borrow::Cow;
+    let trimmed = value.trim();
+    if let Some(glyph) = glyph(trimmed) {
+        return Some(Cow::Borrowed(glyph));
+    }
+    is_valid_raw_glyph(trimmed).then(|| Cow::Owned(trimmed.to_string()))
+}
+
+/// A raw value usable as an icon directly (the escape hatch): exactly one
+/// display cell wide (so it fits the slot AND isn't an emoji, which is width 2),
+/// no control/format chars, and a bounded codepoint count (a base glyph plus at
+/// most a variation selector — never a multi-glyph run).
+fn is_valid_raw_glyph(value: &str) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    !value.is_empty()
+        && value.width() == 1
+        && value.chars().count() <= 4
+        && !value.chars().any(char::is_control)
+}
+
+/// Whether a config/gossiped value yields a renderable icon (registry name OR a
+/// valid raw glyph) — used to gate self-emission and warn on a bad `icon`.
+pub fn is_renderable(value: &str) -> bool {
+    resolve(value).is_some()
+}
+
+/// The registry's known names, sorted — surfaced in the unknown-`icon` warning
+/// so a typo points the user at the vocabulary. (Aliases collapse to one entry
+/// per glyph is not attempted; the raw list is the most actionable.)
+pub fn known_names() -> &'static [&'static str] {
+    // Kept in sync with `glyph` by the `known_names_all_resolve` test.
+    &[
+        "alien",
+        "anchor",
+        "anvil",
+        "apple",
+        "atom",
+        "axe",
+        "bee",
+        "bell",
+        "bird",
+        "bolt",
+        "brain",
+        "bug",
+        "butterfly",
+        "cactus",
+        "cat",
+        "chip",
+        "cloud",
+        "cog",
+        "console",
+        "cross",
+        "crown",
+        "cube",
+        "database",
+        "desktop",
+        "diamond",
+        "disk",
+        "dog",
+        "duck",
+        "fire",
+        "fish",
+        "flag",
+        "flask",
+        "flower",
+        "frog",
+        "gear",
+        "ghost",
+        "hammer",
+        "heart",
+        "hexagon",
+        "home",
+        "hospital",
+        "ladybug",
+        "laptop",
+        "leaf",
+        "lightbulb",
+        "lightning",
+        "linux",
+        "mac",
+        "medical",
+        "memory",
+        "monitor",
+        "mushroom",
+        "nas",
+        "owl",
+        "penguin",
+        "phone",
+        "pi",
+        "pickaxe",
+        "plus",
+        "robot",
+        "rocket",
+        "router",
+        "screwdriver",
+        "server",
+        "shield",
+        "skull",
+        "snake",
+        "spider",
+        "star",
+        "tablet",
+        "terminal",
+        "toad",
+        "toolbox",
+        "tools",
+        "tree",
+        "turtle",
+        "ufo",
+        "windows",
+        "wrench",
+    ]
 }
 
 #[cfg(test)]
@@ -131,7 +251,7 @@ mod tests {
         assert_eq!(glyph("definitely-not-an-icon"), None);
         assert_eq!(glyph(""), None);
         assert_eq!(glyph("\u{1b}[31mred"), None); // escape-sequence payload → None
-        assert!(!is_known("nope"));
+        assert!(!is_renderable("nope"));
     }
 
     #[test]
@@ -140,5 +260,38 @@ mod tests {
         assert_eq!(glyph("gear"), glyph("cog"));
         assert_eq!(glyph("  laptop  "), glyph("laptop"));
         assert_eq!(glyph("LAPTOP"), glyph("laptop"), "case-insensitive");
+    }
+
+    #[test]
+    fn resolve_prefers_registry_then_raw_glyph_hatch() {
+        // A known name → its curated glyph.
+        assert_eq!(resolve("laptop").as_deref(), glyph("laptop"));
+        // A raw single-cell Nerd Font PUA glyph the registry lacks → passthrough.
+        assert_eq!(resolve("\u{f0400}").as_deref(), Some("\u{f0400}"));
+    }
+
+    #[test]
+    fn resolve_rejects_unsafe_or_oversized_raw_values() {
+        // Emoji is width 2 → rejected (keeps the slot aligned AND "no emoji").
+        assert_eq!(resolve("\u{1f4bb}"), None); // 💻
+                                                // Multi-glyph run, control chars, and escape payloads → None.
+        assert_eq!(resolve("ab"), None);
+        assert_eq!(resolve("\u{1b}[31m"), None);
+        assert_eq!(resolve("\n"), None);
+        assert_eq!(resolve(""), None);
+        assert!(!is_renderable("definitely-not-real"));
+        assert!(is_renderable("anvil"));
+    }
+
+    #[test]
+    fn known_names_all_resolve_and_stay_sorted() {
+        let names = known_names();
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "known_names must stay sorted + de-duplicated"
+        );
+        for name in names {
+            assert!(glyph(name).is_some(), "listed name {name} must resolve");
+        }
     }
 }

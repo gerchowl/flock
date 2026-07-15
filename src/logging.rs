@@ -2347,6 +2347,20 @@ pub(crate) fn config_diagnostic(diagnostic: &str) {
     );
 }
 
+/// The `icon` in this node's config resolves to neither a known registry name
+/// nor a valid raw glyph (#164) — warn once, listing a hint, so a typo doesn't
+/// silently render no icon.
+pub(crate) fn unknown_server_icon(icon: &str, hint: &str) {
+    tracing::warn!(
+        event = "config.server_icon_unknown",
+        subsystem = "config",
+        outcome = "diagnostic",
+        icon,
+        hint,
+        "config `icon` is not a known name or a valid single glyph; no icon shown"
+    );
+}
+
 pub(crate) fn config_load_defaults_diagnostic(diagnostic: &str) {
     tracing::warn!(
         event = "config.load",
@@ -4106,6 +4120,18 @@ mod tests {
             out.contains("WARN"),
             "config diagnostic must be WARN: {out}"
         );
+    }
+
+    #[test]
+    fn unknown_server_icon_warns_with_the_bad_value_and_a_hint() {
+        let out = capture_logs(|| unknown_server_icon("laptp", "set a known name"));
+        assert!(
+            out.contains("event=\"config.server_icon_unknown\""),
+            "{out}"
+        );
+        assert!(out.contains("icon=\"laptp\""), "{out}");
+        assert!(out.contains("hint=\"set a known name\""), "{out}");
+        assert!(out.contains("WARN"), "{out}");
     }
 
     #[test]
