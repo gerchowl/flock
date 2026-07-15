@@ -1524,6 +1524,11 @@ pub enum ContextMenuKind {
         /// The project-section key this header groups on.
         key: String,
         collapsed: bool,
+        /// `true` when the group has exactly ONE local checkout (#157) — a
+        /// single-local aggregate (#153) whose close-action only touches that
+        /// one local member, so the menu says "Close local checkout" rather
+        /// than the misleading "Close group".
+        sole_local: bool,
     },
     /// A federated peer's workspace row (#125): offers a cross-machine checkout
     /// of that workspace's branch into a local checkout of the same project.
@@ -1662,15 +1667,20 @@ impl ContextMenuState {
             } => vec!["Show only this server", "Show all servers"],
             ContextMenuKind::Server { .. } => vec!["Show only this server"],
             ContextMenuKind::SpaceHeader {
-                collapsed: true, ..
-            } => vec!["New worktree from default branch", "Expand", "Close group"],
-            ContextMenuKind::SpaceHeader {
-                collapsed: false, ..
-            } => vec![
-                "New worktree from default branch",
-                "Collapse",
-                "Close group",
-            ],
+                collapsed,
+                sole_local,
+                ..
+            } => {
+                let toggle = if collapsed { "Expand" } else { "Collapse" };
+                // A single-local aggregate closes only that one checkout — say
+                // so, since "Close group" reads as if it would take the peers too.
+                let close = if sole_local {
+                    "Close local checkout"
+                } else {
+                    "Close group"
+                };
+                vec!["New worktree from default branch", toggle, close]
+            }
             ContextMenuKind::PeerWorkspace { .. } => vec!["Check out here"],
         };
         if branchable_workspace {
@@ -2994,6 +3004,7 @@ mod tests {
             kind: ContextMenuKind::SpaceHeader {
                 key: "repo-key".into(),
                 collapsed: false,
+                sole_local: false,
             },
             x: 0,
             y: 0,
@@ -3012,6 +3023,7 @@ mod tests {
             kind: ContextMenuKind::SpaceHeader {
                 key: "repo-key".into(),
                 collapsed: true,
+                sole_local: false,
             },
             x: 0,
             y: 0,
@@ -3020,6 +3032,30 @@ mod tests {
         assert_eq!(
             collapsed.items(),
             vec!["New worktree from default branch", "Expand", "Close group"]
+        );
+    }
+
+    #[test]
+    fn space_header_context_menu_says_close_local_checkout_for_a_single_local_group() {
+        // #157: a single-local aggregate (#153 — one local checkout + federated
+        // peers) closes only that one checkout, so the label drops "group".
+        let sole = ContextMenuState {
+            kind: ContextMenuKind::SpaceHeader {
+                key: "repo-key".into(),
+                collapsed: false,
+                sole_local: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            sole.items(),
+            vec![
+                "New worktree from default branch",
+                "Collapse",
+                "Close local checkout"
+            ]
         );
     }
 

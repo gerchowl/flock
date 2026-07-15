@@ -677,7 +677,7 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
-        (ContextMenuKind::SpaceHeader { key, collapsed }, Some("Collapse" | "Expand")) => {
+        (ContextMenuKind::SpaceHeader { key, collapsed, .. }, Some("Collapse" | "Expand")) => {
             if collapsed {
                 state.collapsed_space_keys.remove(&key);
             } else {
@@ -686,7 +686,10 @@ pub(super) fn apply_context_menu_action(
             state.mark_session_dirty();
             leave_modal(state);
         }
-        (ContextMenuKind::SpaceHeader { key, .. }, Some("Close group")) => {
+        (
+            ContextMenuKind::SpaceHeader { key, .. },
+            Some("Close group" | "Close local checkout"),
+        ) => {
             if let Some(head_idx) = crate::ui::space_head_idx(state, &key) {
                 state.selected = head_idx;
                 if state.confirm_close {

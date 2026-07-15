@@ -1118,6 +1118,16 @@ impl AppState {
             .collect()
     }
 
+    /// How many LOCAL checkouts belong to a project section (#157). The header
+    /// close-action closes only local members, so a group with exactly one is
+    /// labelled "Close local checkout" rather than the misleading "Close group".
+    pub(crate) fn local_section_member_count(&self, key: &str) -> usize {
+        self.project_section_keys()
+            .into_iter()
+            .filter(|section| section.as_deref() == Some(key))
+            .count()
+    }
+
     /// Drop collapse state for keys no longer backed by a live local project
     /// section (#155). Without this, `collapsed_space_keys` is never pruned:
     /// a worktree-membership section key is reused across checkouts of the same
@@ -6305,6 +6315,18 @@ mod tests {
         });
         state.peer_summaries = vec![peer_with_project("anvil", "dir:foo")];
         assert!(state.collapsible_space_keys().is_empty());
+    }
+
+    #[test]
+    fn local_section_member_count_counts_only_local_members() {
+        // #157: one local checkout under `repo-key` → sole-local (label drops
+        // "group"); a second member → multi-local (keeps "Close group").
+        let mut state = app_with_workspaces(&["parent", "child"]);
+        mark_parent_worktree(&mut state, 0);
+        assert_eq!(state.local_section_member_count("repo-key"), 1);
+        mark_linked_worktree(&mut state, 1);
+        assert_eq!(state.local_section_member_count("repo-key"), 2);
+        assert_eq!(state.local_section_member_count("absent-key"), 0);
     }
 
     #[test]

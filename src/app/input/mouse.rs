@@ -1145,8 +1145,13 @@ impl AppState {
                 // section (new worktree from default branch, collapse, close).
                 if let Some(key) = self.space_header_at_row(mouse.row) {
                     let collapsed = self.collapsed_space_keys.contains(&key);
+                    let sole_local = self.local_section_member_count(&key) == 1;
                     self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::SpaceHeader { key, collapsed },
+                        kind: ContextMenuKind::SpaceHeader {
+                            key,
+                            collapsed,
+                            sole_local,
+                        },
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
