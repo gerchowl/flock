@@ -392,6 +392,42 @@ mod tests {
         }
     }
 
+    // --- run_hook_command guards (all trip before stdin is read) ---------
+
+    #[test]
+    fn missing_args_is_usage_error() {
+        assert_eq!(run_hook_command(&[]).unwrap(), 2);
+        assert_eq!(run_hook_command(&["claude".into()]).unwrap(), 2);
+    }
+
+    #[test]
+    fn outside_a_flock_pane_is_a_noop() {
+        // No FLOCK_ENV: the hook must do nothing (and not read stdin).
+        std::env::remove_var("FLOCK_ENV");
+        let args = ["claude".into(), "session".into()];
+        assert_eq!(run_hook_command(&args).unwrap(), 0);
+    }
+
+    #[test]
+    fn unknown_agent_or_action_is_a_noop() {
+        // Guards trip after the env check but before stdin, so a valid pane env
+        // with an unknown agent/action returns cleanly without blocking on read.
+        std::env::set_var("FLOCK_ENV", "1");
+        std::env::set_var("FLOCK_PANE_ID", "p_1");
+        std::env::set_var("FLOCK_SOCKET_PATH", "/nonexistent/flk-hook-guard.sock");
+        assert_eq!(
+            run_hook_command(&["kimi".into(), "session".into()]).unwrap(),
+            0
+        );
+        assert_eq!(
+            run_hook_command(&["claude".into(), "explode".into()]).unwrap(),
+            0
+        );
+        std::env::remove_var("FLOCK_ENV");
+        std::env::remove_var("FLOCK_PANE_ID");
+        std::env::remove_var("FLOCK_SOCKET_PATH");
+    }
+
     // --- session ---------------------------------------------------------
 
     #[test]
@@ -450,6 +486,16 @@ mod tests {
         assert_eq!(params.source, "flock:opencode");
         assert_eq!(params.agent, "opencode");
         assert_eq!(params.agent_session_id.as_deref(), Some("os-1"));
+        // Opencode never forwards session_start_source (claude-only).
+        assert_eq!(params.session_start_source, None);
+    }
+
+    #[test]
+    fn opencode_stop_is_a_noop() {
+        // Only claude carries a scrapable transcript + nudge protocol on Stop.
+        let input = json!({"hook_event_name": "Stop", "transcript_path": "/whatever"});
+        let out = plan(Agent::Opencode, Action::Stop, &input, "Stop", "p_1");
+        assert!(out.reports.is_empty() && out.stdout.is_none());
     }
 
     // --- prompt ----------------------------------------------------------
@@ -476,6 +522,23 @@ mod tests {
             );
             assert!(out.reports.is_empty(), "expected no report for {p:?}");
         }
+    }
+
+    #[test]
+    fn prompt_is_capped_at_the_wire_limit_by_codepoints() {
+        // 20_000 multi-byte chars → capped to 16_384 chars (not bytes).
+        let prompt = "é".repeat(20_000);
+        let out = plan(
+            Agent::Claude,
+            Action::Prompt,
+            &json!({ "prompt": prompt }),
+            "",
+            "p_1",
+        );
+        let Method::PaneReportPrompt(params) = &out.reports[0] else {
+            panic!()
+        };
+        assert_eq!(params.prompt.chars().count(), 16_384);
     }
 
     // --- stop ------------------------------------------------------------
