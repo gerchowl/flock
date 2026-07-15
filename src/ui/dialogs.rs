@@ -269,8 +269,20 @@ fn render_dialog_field_input(
 ) {
     frame.render_widget(Clear, rect);
     let cursor = if focused { "█" } else { " " };
+    // Scroll to the tail so the insertion point stays visible when the value
+    // outgrows the box (leading space + trailing cursor eat two cells). Real
+    // cursor positioning / mid-string editing is a later phase.
+    let visible = usize::from(rect.width.saturating_sub(2));
+    let shown = if value.chars().count() > visible {
+        value
+            .chars()
+            .skip(value.chars().count() - visible)
+            .collect::<String>()
+    } else {
+        value.to_string()
+    };
     frame.render_widget(
-        Paragraph::new(format!(" {value}{cursor}"))
+        Paragraph::new(format!(" {shown}{cursor}"))
             .style(Style::default().fg(palette.text).bg(palette.surface0)),
         rect,
     );
@@ -1241,6 +1253,28 @@ mod tests {
         assert!(
             rendered.contains("seed the fork here"),
             "seed value must show"
+        );
+    }
+
+    #[test]
+    fn long_seed_scrolls_to_keep_the_tail_visible() {
+        let mut app = AppState::test_new();
+        app.name_input = "feat/x".into();
+        let long = format!("HEADSTART{}TAILEND", "x".repeat(200));
+        app.worktree_create = Some(worktree_create_with(
+            Some(claude_fork_plan()),
+            &long,
+            WorktreeCreateFocus::Seed,
+        ));
+
+        let rendered = render_worktree_dialog(&app);
+        assert!(
+            rendered.contains("TAILEND"),
+            "the tail (cursor end) must stay visible"
+        );
+        assert!(
+            !rendered.contains("HEADSTART"),
+            "the head should scroll off once the value outgrows the box"
         );
     }
 

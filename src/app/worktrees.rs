@@ -2100,6 +2100,33 @@ mod tests {
         );
     }
 
+    /// Acceptance: an EDITED seed reaches the fork's argv, and an empty field
+    /// opts out. The confirm path is exactly `resolve_seed_prompt` ->
+    /// `append_pivot_message`; exercise that composition (a real PTY spawn is
+    /// out of scope for a unit test) with a user-edited value.
+    #[test]
+    fn edited_seed_is_injected_into_the_fork_argv_and_empty_opts_out() {
+        let session = crate::agent_resume::AgentSessionRef::id("s").expect("session id");
+        let mut plan = crate::agent_resume::branch_plan("flock:claude", "claude", &session)
+            .expect("claude fork plan");
+
+        // User edited the seed (kept the <branch> token); confirm resolves +
+        // injects it as the fork's opening positional prompt.
+        let pivot = resolve_seed_prompt("custom plan: land <branch>", "feat/login");
+        crate::agent_resume::append_pivot_message(&mut plan, &pivot);
+        assert_eq!(plan.argv.last().unwrap(), "custom plan: land feat/login");
+
+        // Cleared field => nothing appended (the opt-out).
+        let mut plan2 = crate::agent_resume::branch_plan("flock:claude", "claude", &session)
+            .expect("claude fork plan");
+        let before = plan2.argv.clone();
+        crate::agent_resume::append_pivot_message(
+            &mut plan2,
+            &resolve_seed_prompt("", "feat/login"),
+        );
+        assert_eq!(plan2.argv, before, "empty seed must inject nothing");
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
