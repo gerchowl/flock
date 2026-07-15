@@ -39,6 +39,14 @@ fn kill_all_row_label(
     label
 }
 
+/// Resolve the branch-session dialog's editable seed (#159) into the fork's
+/// opening prompt: substitute the `<branch>` token with the final branch name.
+/// An empty seed stays empty, so [`crate::agent_resume::append_pivot_message`]
+/// injects nothing — the user's opt-out.
+fn resolve_seed_prompt(seed: &str, branch: &str) -> String {
+    seed.replace("<branch>", branch.trim())
+}
+
 impl App {
     fn worktree_source_metadata(
         &self,
@@ -154,6 +162,8 @@ impl App {
             branch,
             base: base.unwrap_or_else(|| "HEAD".into()),
             checkout_path,
+            seed_prompt: String::new(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
         });
@@ -170,8 +180,14 @@ impl App {
             return;
         };
         self.open_new_linked_worktree_dialog(ws_idx, None);
+        // Pre-fill the editable seed with the pivot template (#159). The
+        // `<branch>` token is kept verbatim and resolved at confirm, so it
+        // tracks the branch name even if the user edits it. Empty config =>
+        // empty field => no seed, same as today.
+        let pivot_template = self.state.branch_pivot_message.clone();
         if let Some(create) = self.state.worktree_create.as_mut() {
             create.branch_plan = Some(plan);
+            create.seed_prompt = pivot_template;
         }
     }
 
@@ -834,25 +850,64 @@ impl App {
                 self.close_worktree_create_dialog();
             }
             KeyCode::Enter => self.start_worktree_add(),
+            KeyCode::Tab => self.toggle_worktree_create_focus(),
             KeyCode::Backspace => {
-                if self.state.name_input_replace_on_type {
-                    self.state.name_input.clear();
-                    self.state.name_input_replace_on_type = false;
+                if self.seed_field_focused() {
+                    // The pre-filled seed is real editable content, not a
+                    // placeholder — no replace-on-type wholesale clear.
+                    if let Some(create) = self.state.worktree_create.as_mut() {
+                        create.seed_prompt.pop();
+                    }
                 } else {
-                    self.state.name_input.pop();
+                    if self.state.name_input_replace_on_type {
+                        self.state.name_input.clear();
+                        self.state.name_input_replace_on_type = false;
+                    } else {
+                        self.state.name_input.pop();
+                    }
+                    self.sync_worktree_branch_from_input();
                 }
-                self.sync_worktree_branch_from_input();
             }
             KeyCode::Char(c) => {
-                if self.state.name_input_replace_on_type {
-                    self.state.name_input.clear();
-                    self.state.name_input_replace_on_type = false;
+                if self.seed_field_focused() {
+                    if let Some(create) = self.state.worktree_create.as_mut() {
+                        create.seed_prompt.push(c);
+                    }
+                } else {
+                    if self.state.name_input_replace_on_type {
+                        self.state.name_input.clear();
+                        self.state.name_input_replace_on_type = false;
+                    }
+                    self.state.name_input.push(c);
+                    self.sync_worktree_branch_from_input();
                 }
-                self.state.name_input.push(c);
-                self.sync_worktree_branch_from_input();
             }
             _ => {}
         }
+    }
+
+    /// The seed-prompt row only exists for a branch-session (branch_plan set),
+    /// so Tab only moves focus there; a plain new-worktree stays on the branch.
+    fn toggle_worktree_create_focus(&mut self) {
+        use crate::app::state::WorktreeCreateFocus;
+        if let Some(create) = self.state.worktree_create.as_mut() {
+            if create.branch_plan.is_none() {
+                return;
+            }
+            create.focus = match create.focus {
+                WorktreeCreateFocus::Branch => WorktreeCreateFocus::Seed,
+                WorktreeCreateFocus::Seed => WorktreeCreateFocus::Branch,
+            };
+        }
+    }
+
+    /// True when keystrokes should edit the seed prompt rather than the branch
+    /// name: the seed field exists (branch-session) AND holds focus.
+    fn seed_field_focused(&self) -> bool {
+        self.state.worktree_create.as_ref().is_some_and(|create| {
+            create.branch_plan.is_some()
+                && create.focus == crate::app::state::WorktreeCreateFocus::Seed
+        })
     }
 
     pub(crate) fn handle_worktree_open_key(&mut self, key: KeyEvent) {
@@ -1191,17 +1246,18 @@ impl App {
                 let repo_key = create.repo_key.clone();
                 let repo_name = create.repo_name.clone();
                 let source_repo_root = create.source_repo_root.clone();
+                let seed_prompt = create.seed_prompt.clone();
                 self.state.worktree_create = None;
                 self.state.name_input.clear();
                 self.state.name_input_replace_on_type = false;
                 let created = if let Some(mut plan) = branch_plan {
-                    // #106: inject the one-shot pivot prompt as the fork's
-                    // first turn, with <branch> resolved to the new branch
-                    // name. No-op for an empty config or a non-claude fork.
-                    let pivot = self
-                        .state
-                        .branch_pivot_message
-                        .replace("<branch>", branch_name.trim());
+                    // #106/#159: inject the one-shot pivot prompt as the fork's
+                    // first turn. The prompt is the dialog's editable seed
+                    // field (pre-filled from `branch_pivot_message`), with
+                    // `<branch>` resolved to the final branch name here so the
+                    // token tracks any edit to the branch. Empty seed or a
+                    // non-claude fork => no-op.
+                    let pivot = resolve_seed_prompt(&seed_prompt, &branch_name);
                     crate::agent_resume::append_pivot_message(&mut plan, &pivot);
                     let (rows, cols) = self.state.estimate_pane_size();
                     self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
@@ -1635,6 +1691,8 @@ mod tests {
             branch: "old".into(),
             base: "HEAD".into(),
             checkout_path: std::path::PathBuf::from("/old"),
+            seed_prompt: String::new(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: Some("old error".into()),
             creating: false,
         });
@@ -1670,6 +1728,8 @@ mod tests {
             branch: branch.into(),
             base: "HEAD".into(),
             checkout_path: checkout.clone(),
+            seed_prompt: String::new(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
         });
@@ -1734,6 +1794,8 @@ mod tests {
             branch: branch.into(),
             base: "HEAD".into(),
             checkout_path: checkout.clone(),
+            seed_prompt: String::new(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
         });
@@ -1962,6 +2024,175 @@ mod tests {
             plan.argv,
             vec!["claude", "--resume", "sess-1", "--fork-session"]
         );
+    }
+
+    /// #159: the branch-session dialog pre-fills the editable seed with the
+    /// pivot template (verbatim `<branch>` token, resolved at confirm) and
+    /// starts focus on the branch field.
+    fn app_with_persisted_claude_session() -> App {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-1").expect("session id"),
+        });
+        app.state.terminals.insert(terminal_id, terminal);
+        app
+    }
+
+    #[test]
+    fn branch_session_dialog_prefills_editable_seed_from_pivot_template() {
+        let mut app = app_with_persisted_claude_session();
+        app.state.branch_pivot_message = "pivot for <branch>, stay put".into();
+
+        app.open_branch_session_dialog(0);
+
+        let create = app.state.worktree_create.as_ref().expect("dialog open");
+        assert_eq!(create.seed_prompt, "pivot for <branch>, stay put");
+        assert_eq!(create.focus, crate::app::state::WorktreeCreateFocus::Branch);
+    }
+
+    #[test]
+    fn plain_new_worktree_dialog_has_no_seed() {
+        let mut app = app_with_persisted_claude_session();
+        app.state.branch_pivot_message = "should not leak into a plain worktree".into();
+
+        // The plain opener (no branch_plan) must leave the seed empty.
+        app.open_new_linked_worktree_dialog(0, None);
+
+        let create = app.state.worktree_create.as_ref().expect("dialog open");
+        assert!(create.branch_plan.is_none());
+        assert!(create.seed_prompt.is_empty());
+    }
+
+    #[test]
+    fn resolve_seed_prompt_substitutes_branch_and_keeps_empty_empty() {
+        // Empty stays empty → no seed injected (the opt-out).
+        assert_eq!(resolve_seed_prompt("", "issue/9"), "");
+        // `<branch>` resolves to the final (trimmed) branch name.
+        assert_eq!(
+            resolve_seed_prompt("work on <branch> now", "  feat/x  "),
+            "work on feat/x now"
+        );
+        // A custom prompt with no token passes through unchanged.
+        assert_eq!(
+            resolve_seed_prompt("just do the thing", "feat/x"),
+            "just do the thing"
+        );
+    }
+
+    /// Acceptance: an EDITED seed reaches the fork's argv, and an empty field
+    /// opts out. The confirm path is exactly `resolve_seed_prompt` ->
+    /// `append_pivot_message`; exercise that composition (a real PTY spawn is
+    /// out of scope for a unit test) with a user-edited value.
+    #[test]
+    fn edited_seed_is_injected_into_the_fork_argv_and_empty_opts_out() {
+        let session = crate::agent_resume::AgentSessionRef::id("s").expect("session id");
+        let mut plan = crate::agent_resume::branch_plan("flock:claude", "claude", &session)
+            .expect("claude fork plan");
+
+        // User edited the seed (kept the <branch> token); confirm resolves +
+        // injects it as the fork's opening positional prompt.
+        let pivot = resolve_seed_prompt("custom plan: land <branch>", "feat/login");
+        crate::agent_resume::append_pivot_message(&mut plan, &pivot);
+        assert_eq!(plan.argv.last().unwrap(), "custom plan: land feat/login");
+
+        // Cleared field => nothing appended (the opt-out).
+        let mut plan2 = crate::agent_resume::branch_plan("flock:claude", "claude", &session)
+            .expect("claude fork plan");
+        let before = plan2.argv.clone();
+        crate::agent_resume::append_pivot_message(
+            &mut plan2,
+            &resolve_seed_prompt("", "feat/login"),
+        );
+        assert_eq!(plan2.argv, before, "empty seed must inject nothing");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn tab_moves_focus_to_the_seed_field_and_typing_edits_it() {
+        use crate::app::state::WorktreeCreateFocus;
+        let mut app = app_with_persisted_claude_session();
+        app.state.branch_pivot_message = "seed <branch>".into();
+        app.open_branch_session_dialog(0);
+
+        // Branch field starts focused: typing edits name_input, not the seed.
+        app.handle_worktree_create_key(key(KeyCode::Char('x')));
+        assert_eq!(app.state.name_input, "x"); // replace-on-type cleared the slug
+        let seed_before = app
+            .state
+            .worktree_create
+            .as_ref()
+            .unwrap()
+            .seed_prompt
+            .clone();
+        assert_eq!(seed_before, "seed <branch>");
+
+        // Tab → seed field. Typing now appends to the seed, leaving branch alone.
+        app.handle_worktree_create_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().focus,
+            WorktreeCreateFocus::Seed
+        );
+        app.handle_worktree_create_key(key(KeyCode::Char('!')));
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().seed_prompt,
+            "seed <branch>!"
+        );
+        assert_eq!(app.state.name_input, "x"); // branch untouched
+
+        // Backspace on the seed deletes its last char (no wholesale clear).
+        app.handle_worktree_create_key(key(KeyCode::Backspace));
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().seed_prompt,
+            "seed <branch>"
+        );
+
+        // Tab back → branch field again.
+        app.handle_worktree_create_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().focus,
+            WorktreeCreateFocus::Branch
+        );
+    }
+
+    #[test]
+    fn tab_is_a_noop_without_a_seed_field() {
+        use crate::app::state::WorktreeCreateFocus;
+        let mut app = app_with_persisted_claude_session();
+        app.open_new_linked_worktree_dialog(0, None); // plain worktree, no seed
+
+        app.handle_worktree_create_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().focus,
+            WorktreeCreateFocus::Branch,
+            "a plain worktree has no seed row, so Tab must not move focus"
+        );
+        // And typing still edits the branch name.
+        app.handle_worktree_create_key(key(KeyCode::Char('z')));
+        assert!(app.state.name_input.ends_with('z'));
     }
 
     #[test]

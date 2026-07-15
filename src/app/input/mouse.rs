@@ -392,8 +392,12 @@ impl AppState {
                 }
 
                 if self.mode == Mode::NewLinkedWorktree {
+                    let has_seed = self
+                        .worktree_create
+                        .as_ref()
+                        .is_some_and(|create| create.branch_plan.is_some());
                     if let Some(inner) =
-                        crate::ui::new_linked_worktree_inner_rect(self.screen_rect())
+                        crate::ui::new_linked_worktree_inner_rect(self.screen_rect(), has_seed)
                     {
                         let (create, cancel) = crate::ui::new_linked_worktree_button_rects(inner);
                         match modal_action_from_buttons(

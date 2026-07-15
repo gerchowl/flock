@@ -814,8 +814,25 @@ pub struct WorktreeCreateState {
     /// instead (#123).
     pub base: String,
     pub checkout_path: std::path::PathBuf,
+    /// Editable seed prompt for the branch-session fork (#159): the forked
+    /// agent's one-shot first turn. Pre-filled from `branch_pivot_message` (the
+    /// `<branch>` token is kept verbatim and resolved at confirm), editable in
+    /// the dialog; empty means "no seed". Only meaningful when `branch_plan`
+    /// is set — a plain new-worktree ignores it.
+    pub seed_prompt: String,
+    /// Which text field the dialog's keystrokes edit. Only branches out to
+    /// `Seed` when `branch_plan` is set (a plain new-worktree has no seed row).
+    pub focus: WorktreeCreateFocus,
     pub error: Option<String>,
     pub creating: bool,
+}
+
+/// The focused text field in the new-worktree / branch-session dialog (#159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorktreeCreateFocus {
+    #[default]
+    Branch,
+    Seed,
 }
 
 /// A deferred new-linked-worktree request from input → app loop, carrying the
