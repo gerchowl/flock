@@ -257,35 +257,29 @@ fn render_dialog_field_label(
     );
 }
 
-/// A single-line text input box. The block cursor is shown only on the focused
-/// field, which is how the dialog signals which of branch / seed the keystrokes
-/// edit (#159).
+/// A single-line text input box backed by a [`LineEditor`] (#159). Renders the
+/// horizontally-scrolled window (a leading space, then up to `width-2` chars so
+/// a trailing cell is reserved for the cursor). Returns the screen position of
+/// the insertion point when `focused`, so the caller can place the *real*
+/// terminal cursor there — flk is a terminal emulator; the dialog gets a native
+/// blinking cursor instead of a painted block.
 fn render_dialog_field_input(
     frame: &mut Frame,
     rect: Rect,
-    value: &str,
+    editor: &crate::app::line_editor::LineEditor,
     focused: bool,
     palette: &crate::app::state::Palette,
-) {
+) -> Option<(u16, u16)> {
     frame.render_widget(Clear, rect);
-    let cursor = if focused { "█" } else { " " };
-    // Scroll to the tail so the insertion point stays visible when the value
-    // outgrows the box (leading space + trailing cursor eat two cells). Real
-    // cursor positioning / mid-string editing is a later phase.
-    let visible = usize::from(rect.width.saturating_sub(2));
-    let shown = if value.chars().count() > visible {
-        value
-            .chars()
-            .skip(value.chars().count() - visible)
-            .collect::<String>()
-    } else {
-        value.to_string()
-    };
+    let view_width = usize::from(rect.width.saturating_sub(2));
+    let (shown, cursor_col) = editor.view(view_width);
     frame.render_widget(
-        Paragraph::new(format!(" {shown}{cursor}"))
+        Paragraph::new(format!(" {shown}"))
             .style(Style::default().fg(palette.text).bg(palette.surface0)),
         rect,
     );
+    // +1 for the leading space; `view` guarantees cursor_col <= view_width.
+    focused.then(|| (rect.x + 1 + cursor_col as u16, rect.y))
 }
 
 pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -320,25 +314,27 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     };
     render_modal_header(frame, row(0), header, &app.palette);
 
+    let mut cursor_pos = None;
+
     render_dialog_field_label(frame, row(1), " branch", &app.palette);
-    render_dialog_field_input(
+    cursor_pos = cursor_pos.or(render_dialog_field_input(
         frame,
         row(2),
-        &app.name_input,
+        &create.branch_input,
         create.focus == WorktreeCreateFocus::Branch,
         &app.palette,
-    );
+    ));
 
     let mut next = 3;
     if has_seed {
         render_dialog_field_label(frame, row(3), " seed prompt · tab to switch", &app.palette);
-        render_dialog_field_input(
+        cursor_pos = cursor_pos.or(render_dialog_field_input(
             frame,
             row(4),
-            &create.seed_prompt,
+            &create.seed,
             create.focus == WorktreeCreateFocus::Seed,
             &app.palette,
-        );
+        ));
         next = 5;
     }
 
@@ -382,6 +378,13 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
             .bg(app.palette.surface0)
             .add_modifier(Modifier::BOLD),
     );
+
+    // Place the real terminal cursor at the focused field's insertion point.
+    // In this mode the focused pane suppresses its own cursor, so the dialog
+    // owns it — a native blinking cursor, not a painted block.
+    if let Some(pos) = cursor_pos {
+        frame.set_cursor_position(pos);
+    }
 }
 
 pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -1182,7 +1185,10 @@ mod tests {
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use super::confirm_close_overlay_text;
-    use super::{new_linked_worktree_popup_height, render_new_linked_worktree_overlay};
+    use super::{
+        new_linked_worktree_inner_rect, new_linked_worktree_popup_height,
+        render_new_linked_worktree_overlay,
+    };
     use crate::app::state::{WorktreeCreateFocus, WorktreeCreateState};
 
     fn worktree_create_with(
@@ -1190,6 +1196,7 @@ mod tests {
         seed_prompt: &str,
         focus: WorktreeCreateFocus,
     ) -> WorktreeCreateState {
+        use crate::app::line_editor::LineEditor;
         WorktreeCreateState {
             branch_plan,
             source_workspace_id: "w".into(),
@@ -1199,9 +1206,10 @@ mod tests {
             repo_key: "repo-key".into(),
             repo_name: "flock".into(),
             branch: "feat/x".into(),
+            branch_input: LineEditor::new("feat/x"),
             base: "HEAD".into(),
             checkout_path: "/wt/feat-x".into(),
-            seed_prompt: seed_prompt.into(),
+            seed: LineEditor::new(seed_prompt),
             focus,
             error: None,
             creating: false,
@@ -1240,7 +1248,6 @@ mod tests {
     #[test]
     fn branch_session_dialog_renders_the_editable_seed_row() {
         let mut app = AppState::test_new();
-        app.name_input = "feat/x".into();
         app.worktree_create = Some(worktree_create_with(
             Some(claude_fork_plan()),
             "seed the fork here",
@@ -1259,7 +1266,6 @@ mod tests {
     #[test]
     fn long_seed_scrolls_to_keep_the_tail_visible() {
         let mut app = AppState::test_new();
-        app.name_input = "feat/x".into();
         let long = format!("HEADSTART{}TAILEND", "x".repeat(200));
         app.worktree_create = Some(worktree_create_with(
             Some(claude_fork_plan()),
@@ -1279,9 +1285,34 @@ mod tests {
     }
 
     #[test]
+    fn focused_field_places_the_native_terminal_cursor_at_the_insertion_point() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut app = AppState::test_new();
+        app.worktree_create = Some(worktree_create_with(
+            Some(claude_fork_plan()),
+            "abc", // seed editor: cursor at end (3)
+            WorktreeCreateFocus::Seed,
+        ));
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_new_linked_worktree_overlay(&app, frame, area))
+            .expect("overlay renders");
+
+        let pos = terminal
+            .get_cursor_position()
+            .expect("a focused field must set the terminal cursor");
+        let inner = new_linked_worktree_inner_rect(area, true).unwrap();
+        // Seed input is row 4 of the inner rect; cursor sits after the leading
+        // space + the 3 chars "abc".
+        assert_eq!(pos.y, inner.y + 4, "cursor on the seed row");
+        assert_eq!(pos.x, inner.x + 1 + 3, "cursor after the seed text");
+    }
+
+    #[test]
     fn plain_worktree_dialog_omits_the_seed_row() {
         let mut app = AppState::test_new();
-        app.name_input = "feat/x".into();
         app.worktree_create = Some(worktree_create_with(None, "", WorktreeCreateFocus::Branch));
 
         let rendered = render_worktree_dialog(&app);

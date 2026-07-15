@@ -807,7 +807,12 @@ pub struct WorktreeCreateState {
     pub source_repo_root: std::path::PathBuf,
     pub repo_key: String,
     pub repo_name: String,
+    /// Canonical branch name, kept in sync with `branch_input` — the value the
+    /// checkout path and confirm use.
     pub branch: String,
+    /// The editable branch-name field (#159): a full line editor (cursor, mid-
+    /// string edits, word ops) rather than an append-only buffer.
+    pub branch_input: crate::app::line_editor::LineEditor,
     /// The git ref the new branch is based on. `"HEAD"` (the source checkout's
     /// current head — branch-from-here) is the default; the project header's
     /// "new worktree from default branch" passes the resolved default branch
@@ -819,7 +824,7 @@ pub struct WorktreeCreateState {
     /// `<branch>` token is kept verbatim and resolved at confirm), editable in
     /// the dialog; empty means "no seed". Only meaningful when `branch_plan`
     /// is set — a plain new-worktree ignores it.
-    pub seed_prompt: String,
+    pub seed: crate::app::line_editor::LineEditor,
     /// Which text field the dialog's keystrokes edit. Only branches out to
     /// `Seed` when `branch_plan` is set (a plain new-worktree has no seed row).
     pub focus: WorktreeCreateFocus,

@@ -149,8 +149,6 @@ impl App {
             &checkout_path.display().to_string(),
         );
         self.state.selected = ws_idx;
-        self.state.name_input = branch.clone();
-        self.state.name_input_replace_on_type = true;
         self.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
             source_workspace_id,
@@ -159,10 +157,11 @@ impl App {
             source_repo_root: space.repo_root,
             repo_key: space.key,
             repo_name,
+            branch_input: crate::app::line_editor::LineEditor::new(branch.clone()),
             branch,
             base: base.unwrap_or_else(|| "HEAD".into()),
             checkout_path,
-            seed_prompt: String::new(),
+            seed: crate::app::line_editor::LineEditor::default(),
             focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
@@ -187,7 +186,10 @@ impl App {
         let pivot_template = self.state.branch_pivot_message.clone();
         if let Some(create) = self.state.worktree_create.as_mut() {
             create.branch_plan = Some(plan);
-            create.seed_prompt = pivot_template;
+            // Fresh dialog => empty seed; guard so a re-open can't clobber edits.
+            if create.seed.is_empty() {
+                create.seed.set(pivot_template);
+            }
         }
     }
 
@@ -851,38 +853,65 @@ impl App {
             }
             KeyCode::Enter => self.start_worktree_add(),
             KeyCode::Tab => self.toggle_worktree_create_focus(),
+            _ => self.edit_focused_worktree_field(key),
+        }
+    }
+
+    /// Route an editing key to the focused line editor (branch or seed), with
+    /// readline-style bindings (#159): arrows / Home / End / ^A / ^E to move,
+    /// ^W word-delete, ^U delete-to-start, Delete forward. A branch edit
+    /// re-syncs the checkout path.
+    fn edit_focused_worktree_field(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let editing_branch = !self.seed_field_focused();
+        let Some(create) = self.state.worktree_create.as_mut() else {
+            return;
+        };
+        let editor = if editing_branch {
+            &mut create.branch_input
+        } else {
+            &mut create.seed
+        };
+
+        let mut mutated = false;
+        match key.code {
+            KeyCode::Char('a') if ctrl => editor.home(),
+            KeyCode::Char('e') if ctrl => editor.end(),
+            KeyCode::Char('u') if ctrl => {
+                editor.delete_to_start();
+                mutated = true;
+            }
+            KeyCode::Char('w') if ctrl => {
+                editor.delete_word_back();
+                mutated = true;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                editor.insert(c);
+                mutated = true;
+            }
+            KeyCode::Backspace if ctrl => {
+                editor.delete_word_back();
+                mutated = true;
+            }
             KeyCode::Backspace => {
-                if self.seed_field_focused() {
-                    // The pre-filled seed is real editable content, not a
-                    // placeholder — no replace-on-type wholesale clear.
-                    if let Some(create) = self.state.worktree_create.as_mut() {
-                        create.seed_prompt.pop();
-                    }
-                } else {
-                    if self.state.name_input_replace_on_type {
-                        self.state.name_input.clear();
-                        self.state.name_input_replace_on_type = false;
-                    } else {
-                        self.state.name_input.pop();
-                    }
-                    self.sync_worktree_branch_from_input();
-                }
+                editor.backspace();
+                mutated = true;
             }
-            KeyCode::Char(c) => {
-                if self.seed_field_focused() {
-                    if let Some(create) = self.state.worktree_create.as_mut() {
-                        create.seed_prompt.push(c);
-                    }
-                } else {
-                    if self.state.name_input_replace_on_type {
-                        self.state.name_input.clear();
-                        self.state.name_input_replace_on_type = false;
-                    }
-                    self.state.name_input.push(c);
-                    self.sync_worktree_branch_from_input();
-                }
+            KeyCode::Delete => {
+                editor.delete();
+                mutated = true;
             }
+            KeyCode::Left => editor.left(),
+            KeyCode::Right => editor.right(),
+            KeyCode::Home => editor.home(),
+            KeyCode::End => editor.end(),
             _ => {}
+        }
+
+        // Only a branch-name change moves the checkout path.
+        if mutated && editing_branch {
+            self.sync_worktree_branch_from_input();
         }
     }
 
@@ -1101,7 +1130,7 @@ impl App {
         let Some(create) = &mut self.state.worktree_create else {
             return;
         };
-        create.branch = self.state.name_input.clone();
+        create.branch = create.branch_input.value().to_string();
         create.checkout_path = crate::worktree::default_checkout_path(
             &self.state.worktree_directory,
             &create.repo_name,
@@ -1246,7 +1275,7 @@ impl App {
                 let repo_key = create.repo_key.clone();
                 let repo_name = create.repo_name.clone();
                 let source_repo_root = create.source_repo_root.clone();
-                let seed_prompt = create.seed_prompt.clone();
+                let seed_prompt = create.seed.value().to_string();
                 self.state.worktree_create = None;
                 self.state.name_input.clear();
                 self.state.name_input_replace_on_type = false;
@@ -1679,7 +1708,6 @@ mod tests {
     fn sync_worktree_branch_updates_derived_path() {
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = std::path::PathBuf::from("/w");
-        app.state.name_input = "issue/137".into();
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
             source_workspace_id: "source".into(),
@@ -1689,9 +1717,10 @@ mod tests {
             repo_key: "repo-key".into(),
             repo_name: "flock".into(),
             branch: "old".into(),
+            branch_input: crate::app::line_editor::LineEditor::new("issue/137"),
             base: "HEAD".into(),
             checkout_path: std::path::PathBuf::from("/old"),
-            seed_prompt: String::new(),
+            seed: crate::app::line_editor::LineEditor::default(),
             focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: Some("old error".into()),
             creating: false,
@@ -1716,7 +1745,6 @@ mod tests {
         let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
-        app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
             source_workspace_id: "source".into(),
@@ -1728,7 +1756,8 @@ mod tests {
             branch: branch.into(),
             base: "HEAD".into(),
             checkout_path: checkout.clone(),
-            seed_prompt: String::new(),
+            branch_input: crate::app::line_editor::LineEditor::new(branch),
+            seed: crate::app::line_editor::LineEditor::default(),
             focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
@@ -1782,7 +1811,6 @@ mod tests {
         let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
-        app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
             source_workspace_id: "source".into(),
@@ -1794,7 +1822,8 @@ mod tests {
             branch: branch.into(),
             base: "HEAD".into(),
             checkout_path: checkout.clone(),
-            seed_prompt: String::new(),
+            branch_input: crate::app::line_editor::LineEditor::new(branch),
+            seed: crate::app::line_editor::LineEditor::default(),
             focus: crate::app::state::WorktreeCreateFocus::Branch,
             error: None,
             creating: false,
@@ -2067,7 +2096,7 @@ mod tests {
         app.open_branch_session_dialog(0);
 
         let create = app.state.worktree_create.as_ref().expect("dialog open");
-        assert_eq!(create.seed_prompt, "pivot for <branch>, stay put");
+        assert_eq!(create.seed.value(), "pivot for <branch>, stay put");
         assert_eq!(create.focus, crate::app::state::WorktreeCreateFocus::Branch);
     }
 
@@ -2081,7 +2110,7 @@ mod tests {
 
         let create = app.state.worktree_create.as_ref().expect("dialog open");
         assert!(create.branch_plan.is_none());
-        assert!(create.seed_prompt.is_empty());
+        assert!(create.seed.is_empty());
     }
 
     #[test]
@@ -2131,6 +2160,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn tab_moves_focus_to_the_seed_field_and_typing_edits_it() {
         use crate::app::state::WorktreeCreateFocus;
@@ -2138,35 +2171,40 @@ mod tests {
         app.state.branch_pivot_message = "seed <branch>".into();
         app.open_branch_session_dialog(0);
 
-        // Branch field starts focused: typing edits name_input, not the seed.
-        app.handle_worktree_create_key(key(KeyCode::Char('x')));
-        assert_eq!(app.state.name_input, "x"); // replace-on-type cleared the slug
-        let seed_before = app
+        // Branch field starts focused: typing appends to the branch editor
+        // (cursor starts at the end of the pre-filled slug), not the seed.
+        let branch_before = app
             .state
             .worktree_create
             .as_ref()
             .unwrap()
-            .seed_prompt
-            .clone();
-        assert_eq!(seed_before, "seed <branch>");
+            .branch_input
+            .value()
+            .to_string();
+        app.handle_worktree_create_key(key(KeyCode::Char('x')));
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert_eq!(create.branch_input.value(), format!("{branch_before}x"));
+        assert_eq!(create.seed.value(), "seed <branch>", "seed untouched");
 
-        // Tab → seed field. Typing now appends to the seed, leaving branch alone.
+        // Tab → seed field. Typing appends to the seed, leaving branch alone.
         app.handle_worktree_create_key(key(KeyCode::Tab));
         assert_eq!(
             app.state.worktree_create.as_ref().unwrap().focus,
             WorktreeCreateFocus::Seed
         );
         app.handle_worktree_create_key(key(KeyCode::Char('!')));
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert_eq!(create.seed.value(), "seed <branch>!");
         assert_eq!(
-            app.state.worktree_create.as_ref().unwrap().seed_prompt,
-            "seed <branch>!"
+            create.branch_input.value(),
+            format!("{branch_before}x"),
+            "branch untouched"
         );
-        assert_eq!(app.state.name_input, "x"); // branch untouched
 
-        // Backspace on the seed deletes its last char (no wholesale clear).
+        // Backspace on the seed deletes its last char.
         app.handle_worktree_create_key(key(KeyCode::Backspace));
         assert_eq!(
-            app.state.worktree_create.as_ref().unwrap().seed_prompt,
+            app.state.worktree_create.as_ref().unwrap().seed.value(),
             "seed <branch>"
         );
 
@@ -2192,7 +2230,74 @@ mod tests {
         );
         // And typing still edits the branch name.
         app.handle_worktree_create_key(key(KeyCode::Char('z')));
-        assert!(app.state.name_input.ends_with('z'));
+        assert!(app
+            .state
+            .worktree_create
+            .as_ref()
+            .unwrap()
+            .branch_input
+            .value()
+            .ends_with('z'));
+    }
+
+    #[test]
+    fn dialog_supports_cursor_movement_and_word_delete() {
+        let mut app = app_with_persisted_claude_session();
+        app.state.branch_pivot_message = String::new(); // start with an empty seed
+        app.open_branch_session_dialog(0);
+        app.handle_worktree_create_key(key(KeyCode::Tab)); // focus the seed
+
+        for c in "land the feature".chars() {
+            app.handle_worktree_create_key(key(KeyCode::Char(c)));
+        }
+        let seed = |app: &App| {
+            app.state
+                .worktree_create
+                .as_ref()
+                .unwrap()
+                .seed
+                .value()
+                .to_string()
+        };
+        assert_eq!(seed(&app), "land the feature");
+
+        // ^W deletes the last word (with its trailing space eaten first).
+        app.handle_worktree_create_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(seed(&app), "land the ");
+
+        // Home moves to the start; insert prepends there (cursor now at 4).
+        app.handle_worktree_create_key(key(KeyCode::Home));
+        for c in "GO: ".chars() {
+            app.handle_worktree_create_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(seed(&app), "GO: land the ");
+
+        // Delete removes the char at the cursor ('l').
+        app.handle_worktree_create_key(key(KeyCode::Delete));
+        assert_eq!(seed(&app), "GO: and the ");
+
+        // ^U deletes from the cursor (still at 4) back to the start.
+        app.handle_worktree_create_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(seed(&app), "and the ");
+    }
+
+    #[test]
+    fn editing_the_branch_resyncs_the_checkout_path() {
+        let mut app = app_with_persisted_claude_session();
+        app.state.worktree_directory = std::path::PathBuf::from("/w");
+        app.open_new_linked_worktree_dialog(0, None);
+
+        // Replace the whole branch name via ^U then type a fresh one.
+        app.handle_worktree_create_key(ctrl(KeyCode::Char('u')));
+        for c in "feat/login".chars() {
+            app.handle_worktree_create_key(key(KeyCode::Char(c)));
+        }
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert_eq!(create.branch, "feat/login");
+        assert_eq!(
+            create.checkout_path,
+            std::path::PathBuf::from("/w/flock/feat-login")
+        );
     }
 
     #[test]
