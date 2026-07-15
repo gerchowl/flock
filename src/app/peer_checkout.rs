@@ -385,6 +385,7 @@ mod tests {
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         }
     }
 

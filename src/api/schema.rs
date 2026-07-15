@@ -867,6 +867,12 @@ pub enum ResponseResult {
         /// protocol skew, the mismatch that actually blocks `--remote`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol: Option<u32>,
+        /// Self-declared fleet icon NAME of the answering server (#164): a
+        /// semantic name (`"laptop"`) the RECEIVER maps to a flat Nerd Font
+        /// glyph, so every viewer renders the same server icon. Only an ASCII
+        /// name crosses the wire; unknown/absent → no icon. Additive/default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
         /// Machine health snapshot, piggybacked from the peer's existing
         /// status-line sampler (no extra sampling cost).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1377,6 +1383,11 @@ pub struct RelayedFleetPeer {
     /// switch dial can route `ssh -o ProxyJump=<value>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_jump: Option<String>,
+    /// The relayed peer's SELF-DECLARED fleet icon name (#164), carried through
+    /// the one-hop relay so a two-hop viewer sees the same glyph. Additive with
+    /// `#[serde(default)]` so a v(N-1) hub's relay entries parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

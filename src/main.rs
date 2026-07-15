@@ -55,6 +55,7 @@ mod remote;
 mod render_prof;
 mod selection;
 mod server;
+mod server_icons;
 mod session;
 mod sound;
 mod system_stats;

@@ -3847,6 +3847,7 @@ mod tests {
                 error: None,
                 origin_last_ok_secs: Some(4),
                 proxy_jump: None,
+                icon: None,
             }],
             origin_summary: None,
         };

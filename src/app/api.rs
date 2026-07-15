@@ -248,6 +248,9 @@ impl App {
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
+                    // #164: the peer's self-declared icon (None when unset or a
+                    // v(N-1) peer that never emits it).
+                    summary.icon = payload.icon;
                     // Retain the last-known health when a poll omits the system
                     // block, rather than blanking cpu/mem until the next good
                     // poll (#4). Note this is the OPPOSITE policy to `host` above
@@ -1106,6 +1109,7 @@ mod tests {
                         activity: None,
                     }],
                     relayed_fleet: Vec::new(),
+                    icon: None,
                 }),
             },
         ));
@@ -1189,6 +1193,7 @@ mod tests {
                     latency_ms: 10,
                     workspaces: ws,
                     relayed_fleet: Vec::new(),
+                    icon: None,
                 }),
             })
         };

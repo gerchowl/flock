@@ -16,6 +16,7 @@ impl App {
                 host: short_host_name(),
                 version: Some(crate::build_info::version()),
                 protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                icon: configured_node_icon(),
                 system: self.state.system_stats.as_ref().map(system_summary),
                 workspaces: self.self_workspace_summaries(),
                 // Gossip v3 (#101): relay this server's OWN polled peers only —
@@ -57,6 +58,9 @@ impl App {
                     // for peers we polled directly — a receiver dialing
                     // these needs `-o ProxyJump=<us>` to reach them.
                     proxy_jump: Some(origin.clone()),
+                    // #164: carry the polled peer's self-declared icon through
+                    // the one-hop relay so a two-hop viewer sees the same glyph.
+                    icon: peer.icon.clone(),
                 }
             })
             .collect()
@@ -161,6 +165,8 @@ impl App {
             // The client dials home directly via the reserved sentinel — no
             // ProxyJump involved.
             proxy_jump: None,
+            // #164: our OWN self-declared icon, so a spoke's home row shows it.
+            icon: configured_node_icon(),
         }
     }
 }
@@ -187,6 +193,8 @@ fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer 
         // The polling peer stamped its own reachable identity — carry it
         // through so the client's next-hop bridge can ProxyJump.
         proxy_jump: entry.proxy_jump.clone(),
+        // #164: carry the relayed peer's self-declared icon into the snapshot.
+        icon: entry.icon.clone(),
     }
 }
 
@@ -459,6 +467,24 @@ fn configured_node_name() -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// This node's SELF-DECLARED fleet icon NAME (#164) to gossip, overlay-aware
+/// like [`configured_node_name`]. Emitted ONLY when the configured `icon`
+/// resolves to a known registry glyph — an unknown/typo'd name yields `None`,
+/// so garbage never enters the wire (and a receiver would drop it anyway).
+/// Cached once (restart-to-apply), matching how `short_host_name` treats the
+/// self label — avoids a config parse on every peer poll.
+pub(crate) fn configured_node_icon() -> Option<String> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let icon = crate::config::load_live_config().ok()?.config.icon?;
+            let name = icon.trim();
+            crate::server_icons::is_known(name).then(|| name.to_string())
+        })
+        .clone()
+}
+
 #[cfg(target_os = "macos")]
 fn macos_local_host_name() -> Option<String> {
     let out = crate::process::TracedCommand::new("/usr/sbin/scutil", "peers")
@@ -572,6 +598,7 @@ mod tests {
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         }
     }
 
@@ -728,6 +755,7 @@ mod tests {
                 origin: "anvil".into(),
                 origin_last_ok_secs: Some(4),
                 proxy_jump: Some("anvil".into()),
+                icon: None,
             },
         );
 
@@ -780,6 +808,7 @@ mod tests {
                 origin: "anvil".into(),
                 origin_last_ok_secs: Some(3),
                 proxy_jump: Some("anvil".into()),
+                icon: None,
             },
         );
 
@@ -836,7 +865,9 @@ mod tests {
                         origin: self_host.clone(),
                         origin_last_ok_secs: Some(1),
                         proxy_jump: Some(self_host.clone()),
+                        icon: None,
                     }],
+                    icon: None,
                 }),
             },
         ));

@@ -401,6 +401,13 @@ pub struct Config {
     /// side already honors `[[peers]].name` (#63); this fixes a node's view of
     /// its OWN identity.
     pub name: String,
+    /// Self-declared fleet ICON for THIS node (#164): a named flat Nerd Font
+    /// glyph (`icon = "laptop"`) shown as a prefix in every viewer's servers
+    /// band — gossiped with the node's identity so it renders identically
+    /// fleet-wide (unlike the viewer-relative `[[peers]].name`). The name maps
+    /// to a glyph via a static registry on the RENDERING side, so only an ASCII
+    /// name crosses the wire; an unknown name renders no icon. `None` = no icon.
+    pub icon: Option<String>,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
