@@ -125,8 +125,19 @@ pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rec
     );
 }
 
-pub(crate) fn new_linked_worktree_inner_rect(area: Rect) -> Option<Rect> {
-    centered_popup_rect(area, 68, 10).map(|popup| {
+/// Popup height for the new-worktree dialog. The branch-session flow adds an
+/// editable seed-prompt row pair (#159), so it needs three extra lines; a plain
+/// new-worktree keeps the original compact size.
+pub(crate) fn new_linked_worktree_popup_height(has_seed: bool) -> u16 {
+    if has_seed {
+        13
+    } else {
+        10
+    }
+}
+
+pub(crate) fn new_linked_worktree_inner_rect(area: Rect, has_seed: bool) -> Option<Rect> {
+    centered_popup_rect(area, 68, new_linked_worktree_popup_height(has_seed)).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -234,76 +245,107 @@ pub(crate) fn open_existing_worktree_button_rects(inner: Rect) -> (Rect, Rect) {
     (rects[0], rects[1])
 }
 
+fn render_dialog_field_label(
+    frame: &mut Frame,
+    rect: Rect,
+    text: &str,
+    palette: &crate::app::state::Palette,
+) {
+    frame.render_widget(
+        Paragraph::new(text.to_string()).style(Style::default().fg(palette.overlay0)),
+        rect,
+    );
+}
+
+/// A single-line text input box. The block cursor is shown only on the focused
+/// field, which is how the dialog signals which of branch / seed the keystrokes
+/// edit (#159).
+fn render_dialog_field_input(
+    frame: &mut Frame,
+    rect: Rect,
+    value: &str,
+    focused: bool,
+    palette: &crate::app::state::Palette,
+) {
+    frame.render_widget(Clear, rect);
+    let cursor = if focused { "█" } else { " " };
+    frame.render_widget(
+        Paragraph::new(format!(" {value}{cursor}"))
+            .style(Style::default().fg(palette.text).bg(palette.surface0)),
+        rect,
+    );
+}
+
 pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    use crate::app::state::WorktreeCreateFocus;
     let Some(create) = app.worktree_create.as_ref() else {
         return;
     };
 
     super::dim_background(frame, area);
-    let Some(inner) = render_modal_shell(frame, area, 68, 10, &app.palette) else {
+    let has_seed = create.branch_plan.is_some();
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        68,
+        new_linked_worktree_popup_height(has_seed),
+        &app.palette,
+    ) else {
         return;
     };
     if inner.height < 7 {
         return;
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas::<8>(inner);
+    // Lay the labeled rows out top-down; the seed pair only exists in the
+    // branch-session flow. Buttons stay bottom-anchored via button_rects.
+    let row = |i: u16| Rect::new(inner.x, inner.y + i, inner.width, 1);
 
-    let header = if app
-        .worktree_create
-        .as_ref()
-        .is_some_and(|create| create.branch_plan.is_some())
-    {
+    let header = if has_seed {
         "branch session into new worktree"
     } else {
         "new worktree"
     };
-    render_modal_header(frame, rows[0], header, &app.palette);
+    render_modal_header(frame, row(0), header, &app.palette);
 
-    frame.render_widget(
-        Paragraph::new(" branch").style(Style::default().fg(app.palette.overlay0)),
-        rows[1],
+    render_dialog_field_label(frame, row(1), " branch", &app.palette);
+    render_dialog_field_input(
+        frame,
+        row(2),
+        &app.name_input,
+        create.focus == WorktreeCreateFocus::Branch,
+        &app.palette,
     );
-    let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
-    frame.render_widget(Clear, input_rect);
-    frame.render_widget(
-        Paragraph::new(format!(" {}█", app.name_input)).style(
-            Style::default()
-                .fg(app.palette.text)
-                .bg(app.palette.surface0),
-        ),
-        input_rect,
-    );
+
+    let mut next = 3;
+    if has_seed {
+        render_dialog_field_label(frame, row(3), " seed prompt · tab to switch", &app.palette);
+        render_dialog_field_input(
+            frame,
+            row(4),
+            &create.seed_prompt,
+            create.focus == WorktreeCreateFocus::Seed,
+            &app.palette,
+        );
+        next = 5;
+    }
 
     let checkout = create.checkout_path.display().to_string();
-    frame.render_widget(
-        Paragraph::new(" checkout").style(Style::default().fg(app.palette.overlay0)),
-        rows[3],
-    );
+    render_dialog_field_label(frame, row(next), " checkout", &app.palette);
     frame.render_widget(
         Paragraph::new(format!(" {checkout}")).style(Style::default().fg(app.palette.subtext0)),
-        rows[4],
+        row(next + 1),
     );
 
     if create.creating {
         frame.render_widget(
             Paragraph::new(" creating…").style(Style::default().fg(app.palette.overlay0)),
-            rows[5],
+            row(next + 2),
         );
     } else if let Some(error) = &create.error {
         frame.render_widget(
             Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
-            rows[5],
+            row(next + 2),
         );
     }
 
@@ -1125,8 +1167,96 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use crate::{app::AppState, workspace::Workspace};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use super::confirm_close_overlay_text;
+    use super::{new_linked_worktree_popup_height, render_new_linked_worktree_overlay};
+    use crate::app::state::{WorktreeCreateFocus, WorktreeCreateState};
+
+    fn worktree_create_with(
+        branch_plan: Option<crate::agent_resume::AgentResumePlan>,
+        seed_prompt: &str,
+        focus: WorktreeCreateFocus,
+    ) -> WorktreeCreateState {
+        WorktreeCreateState {
+            branch_plan,
+            source_workspace_id: "w".into(),
+            source_checkout_path: "/repo".into(),
+            source_existing_membership: None,
+            source_repo_root: "/repo".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "flock".into(),
+            branch: "feat/x".into(),
+            base: "HEAD".into(),
+            checkout_path: "/wt/feat-x".into(),
+            seed_prompt: seed_prompt.into(),
+            focus,
+            error: None,
+            creating: false,
+        }
+    }
+
+    fn claude_fork_plan() -> crate::agent_resume::AgentResumePlan {
+        crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--fork-session".into()],
+            dedupe_key: "k".into(),
+        }
+    }
+
+    fn render_worktree_dialog(app: &AppState) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_new_linked_worktree_overlay(app, frame, Rect::new(0, 0, 80, 24)))
+            .expect("worktree overlay should render");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn popup_height_grows_for_the_seed_row() {
+        assert_eq!(new_linked_worktree_popup_height(false), 10);
+        assert!(new_linked_worktree_popup_height(true) > new_linked_worktree_popup_height(false));
+    }
+
+    #[test]
+    fn branch_session_dialog_renders_the_editable_seed_row() {
+        let mut app = AppState::test_new();
+        app.name_input = "feat/x".into();
+        app.worktree_create = Some(worktree_create_with(
+            Some(claude_fork_plan()),
+            "seed the fork here",
+            WorktreeCreateFocus::Seed,
+        ));
+
+        let rendered = render_worktree_dialog(&app);
+        assert!(rendered.contains("branch session into new worktree"));
+        assert!(rendered.contains("seed prompt"), "seed label must show");
+        assert!(
+            rendered.contains("seed the fork here"),
+            "seed value must show"
+        );
+    }
+
+    #[test]
+    fn plain_worktree_dialog_omits_the_seed_row() {
+        let mut app = AppState::test_new();
+        app.name_input = "feat/x".into();
+        app.worktree_create = Some(worktree_create_with(None, "", WorktreeCreateFocus::Branch));
+
+        let rendered = render_worktree_dialog(&app);
+        assert!(rendered.contains("new worktree"));
+        assert!(
+            !rendered.contains("seed prompt"),
+            "a plain new-worktree has no seed row"
+        );
+    }
 
     #[test]
     fn cross_checkout_lines_carry_host_branch_and_warnings() {
