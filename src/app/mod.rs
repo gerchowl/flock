@@ -15,6 +15,7 @@ mod creation;
 pub(crate) mod float;
 mod ids;
 mod input;
+pub(crate) mod line_editor;
 mod peer_checkout;
 mod runtime;
 mod session;
