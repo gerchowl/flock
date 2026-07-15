@@ -417,9 +417,9 @@ impl AppState {
                                     .as_ref()
                                     .is_some_and(|create| create.creating) =>
                             {
+                                // The dialog's editors live in worktree_create
+                                // (#159); dropping it is the reset.
                                 self.worktree_create = None;
-                                self.name_input.clear();
-                                self.name_input_replace_on_type = false;
                                 leave_modal(self);
                             }
                             _ => {}

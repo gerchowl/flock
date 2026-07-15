@@ -285,4 +285,19 @@ mod tests {
         // Zero width is a clean empty view.
         assert_eq!(e.view(0), (String::new(), 0));
     }
+
+    #[test]
+    fn view_windows_a_mid_string_cursor_in_an_overflowing_value() {
+        let mut e = LineEditor::new("abcdefghi"); // 9 chars
+        e.home();
+        for _ in 0..5 {
+            e.right(); // cursor at index 5 (between 'e' and 'f')
+        }
+        let (shown, col) = e.view(4);
+        // Window ends at the cursor: last 4 chars up to and including index 5-1,
+        // cursor sits on the right edge.
+        assert_eq!(shown, "cdef");
+        assert_eq!(col, 3);
+        assert!(col < 4, "cursor column stays within the window width");
+    }
 }

@@ -1116,9 +1116,9 @@ impl App {
     }
 
     fn close_worktree_create_dialog(&mut self) {
+        // The dialog owns its editors in `worktree_create` (#159); dropping it
+        // is the whole reset — the shared `name_input` is untouched here.
         self.state.worktree_create = None;
-        self.state.name_input.clear();
-        self.state.name_input_replace_on_type = false;
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
         } else {
@@ -1154,7 +1154,6 @@ impl App {
         }
 
         create.branch = branch.clone();
-        self.state.name_input = branch.clone();
         create.checkout_path = crate::worktree::default_checkout_path(
             &self.state.worktree_directory,
             &create.repo_name,
@@ -1277,8 +1276,6 @@ impl App {
                 let source_repo_root = create.source_repo_root.clone();
                 let seed_prompt = create.seed.value().to_string();
                 self.state.worktree_create = None;
-                self.state.name_input.clear();
-                self.state.name_input_replace_on_type = false;
                 let created = if let Some(mut plan) = branch_plan {
                     // #106/#159: inject the one-shot pivot prompt as the fork's
                     // first turn. The prompt is the dialog's editable seed
@@ -2279,6 +2276,50 @@ mod tests {
         // ^U deletes from the cursor (still at 4) back to the start.
         app.handle_worktree_create_key(ctrl(KeyCode::Char('u')));
         assert_eq!(seed(&app), "and the ");
+    }
+
+    #[test]
+    fn dialog_editing_is_unicode_safe() {
+        let mut app = app_with_persisted_claude_session();
+        app.state.branch_pivot_message = String::new();
+        app.open_branch_session_dialog(0);
+        app.handle_worktree_create_key(key(KeyCode::Tab)); // seed
+        for c in "naïve".chars() {
+            app.handle_worktree_create_key(key(KeyCode::Char(c)));
+        }
+        // Left past 'e' and 'v', then insert before the multi-byte 'ï'... move to
+        // just after 'a' (3 lefts from end: e, v, then between ï and v).
+        app.handle_worktree_create_key(key(KeyCode::Left)); // before 'e'
+        app.handle_worktree_create_key(key(KeyCode::Backspace)); // remove 'v'
+        assert_eq!(
+            app.state.worktree_create.as_ref().unwrap().seed.value(),
+            "naïe"
+        );
+    }
+
+    #[test]
+    fn pure_cursor_movement_does_not_resync_or_clear_error() {
+        let mut app = app_with_persisted_claude_session();
+        app.open_new_linked_worktree_dialog(0, None);
+        // Stamp an error + a known checkout path, then move the cursor only.
+        if let Some(create) = app.state.worktree_create.as_mut() {
+            create.error = Some("kept".into());
+            create.checkout_path = std::path::PathBuf::from("/unchanged");
+        }
+        for code in [KeyCode::Left, KeyCode::Home, KeyCode::Right, KeyCode::End] {
+            app.handle_worktree_create_key(key(code));
+        }
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert_eq!(
+            create.error.as_deref(),
+            Some("kept"),
+            "movement must not clear the error"
+        );
+        assert_eq!(
+            create.checkout_path,
+            std::path::PathBuf::from("/unchanged"),
+            "movement must not recompute the checkout path"
+        );
     }
 
     #[test]
