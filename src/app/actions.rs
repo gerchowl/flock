@@ -328,7 +328,11 @@ impl AppState {
         // instead of raw storage order.
         for ws_idx in self.project_grouped_workspace_order() {
             let ws = &self.workspaces[ws_idx];
-            let workspace_label = ws.display_name_from(&self.terminals, &terminal_runtimes);
+            // Use the sidebar's label grammar (#62), not the bare cwd basename:
+            // every flat navigator row reads self-contained `owner/repo · host:branch`,
+            // matching what the sidebar shows for the same workspace.
+            let workspace_label =
+                crate::ui::grammar::solo_local_label(self, ws, &terminal_runtimes);
             let activity = workspace_activity_summary(ws, &self.terminals);
             let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
             let workspace_matches = match query_kind {
@@ -364,6 +368,69 @@ impl AppState {
             });
             if expanded {
                 rows.extend(child_rows);
+            }
+        }
+        // Fleet-wide: append every federated peer's workspaces (#navigator-fleet).
+        rows.extend(self.navigator_remote_rows(query_kind, &query));
+        rows
+    }
+
+    /// Fleet-wide rows: every federated peer's workspaces as self-contained,
+    /// workspace-level entries. Peer summaries carry no panes/tabs, so these
+    /// rows never expand. Honors `server_filter`: `Local` hides all remotes; a
+    /// `Peer` filter narrows to that one server.
+    fn navigator_remote_rows(
+        &self,
+        query_kind: NavigatorQueryKind,
+        query: &str,
+    ) -> Vec<NavigatorRow> {
+        use crate::app::state::{NavigatorTarget, ServerFilter};
+        let mut rows = Vec::new();
+        if matches!(self.server_filter.as_ref(), Some(ServerFilter::Local)) {
+            return rows;
+        }
+        let peer_ssh_filter = match self.server_filter.as_ref() {
+            Some(ServerFilter::Peer { ssh_target }) => Some(ssh_target.clone()),
+            _ => None,
+        };
+        for (peer_ref, peer) in self.remote_peers() {
+            if peer_ssh_filter
+                .as_ref()
+                .is_some_and(|ssh_target| &peer.ssh_target != ssh_target)
+            {
+                continue;
+            }
+            for (peer_ws_idx, summary) in peer.workspaces.iter().enumerate() {
+                let label = crate::ui::grammar::solo_remote_label(peer, summary);
+                let (status, seen) = crate::ui::status::remote_state(summary.status);
+                let activity = summary.activity.clone().unwrap_or_default();
+                let search_text = format!("{label} {activity}").to_lowercase();
+                let matches = match query_kind {
+                    NavigatorQueryKind::Empty => true,
+                    NavigatorQueryKind::State(filter) => {
+                        navigator_state_filter_matches(filter, status, seen)
+                    }
+                    NavigatorQueryKind::Text => navigator_matches(query, &search_text),
+                };
+                if !matches {
+                    continue;
+                }
+                rows.push(NavigatorRow {
+                    target: NavigatorTarget::RemoteWorkspace {
+                        peer: peer_ref.clone(),
+                        peer_ws_idx,
+                    },
+                    depth: 0,
+                    label,
+                    meta: activity,
+                    status,
+                    seen,
+                    is_current: false,
+                    is_workspace: true,
+                    is_tab: false,
+                    expanded: false,
+                    search_text,
+                });
             }
         }
         rows
@@ -653,6 +720,13 @@ impl AppState {
                     return true;
                 }
                 false
+            }
+            NavigatorTarget::RemoteWorkspace { peer, peer_ws_idx } => {
+                // Reuse the servers-band switch path (same as clicking a remote
+                // sidebar row): request the peer switch, close the navigator.
+                self.request_peer_switch = Some(peer.switch_request(peer_ws_idx));
+                self.mode = Mode::Terminal;
+                true
             }
         }
     }
@@ -3972,6 +4046,135 @@ mod tests {
         assert_eq!(state.active, Some(1));
         assert_eq!(state.workspaces[1].focused_pane_id(), Some(target));
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    /// A config peer named `sage` with one `gerchowl/flock` workspace on `main`,
+    /// as it would arrive from a `peers.summary` poll.
+    fn fleet_peer_flock_main() -> crate::peers::PeerSummaryState {
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "sage".into(),
+            ..Default::default()
+        });
+        peer.host = Some("sage".into());
+        peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+            id: "ws_1".into(),
+            workspace: "flock".into(),
+            project_key: Some("github.com/gerchowl/flock".into()),
+            project_label: Some("flock".into()),
+            branch: Some("main".into()),
+            is_linked_worktree: false,
+            agent: Some("cc".into()),
+            status: crate::api::schema::AgentStatus::Working,
+            status_age_secs: Some(3),
+            activity: None,
+        }];
+        peer.last_ok = Some(std::time::Instant::now());
+        peer
+    }
+
+    #[test]
+    fn navigator_includes_fleet_peer_workspaces_with_sidebar_grammar() {
+        let mut state = app_with_workspaces(&["scratch"]);
+        state.peer_summaries = vec![fleet_peer_flock_main()];
+        state.open_navigator();
+
+        let rows = state.navigator_rows();
+        let remote = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
+                )
+            })
+            .expect("fleet-wide navigator should surface the peer workspace");
+        // Same self-contained grammar the sidebar shows: `owner/repo · host:branch`.
+        assert_eq!(remote.label, "gerchowl/flock \u{00b7} sage:main");
+        assert_eq!(remote.status, AgentState::Working);
+    }
+
+    #[test]
+    fn accepting_remote_navigator_row_requests_peer_switch() {
+        let mut state = app_with_workspaces(&["scratch"]);
+        state.peer_summaries = vec![fleet_peer_flock_main()];
+        state.open_navigator();
+        state.navigator.selected = state
+            .navigator_rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.target,
+                    crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
+                )
+            })
+            .unwrap();
+
+        assert!(state.accept_navigator_selection());
+        assert!(matches!(
+            state.request_peer_switch,
+            Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: 0
+            })
+        ));
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn navigator_local_rows_use_sidebar_grammar_labels() {
+        let mut state = app_with_workspaces(&["flock"]);
+        state.workspaces[0].custom_name = None;
+        state.workspaces[0].cached_git_branch = Some("keyboard-shortcuts".into());
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/flock/.git".into(),
+            checkout_key: "/repo/flock".into(),
+            label: "flock".into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            is_linked_worktree: false,
+            project_key: "github.com/gerchowl/flock".into(),
+        });
+        state.open_navigator();
+
+        let rows = state.navigator_rows();
+        let ws_row = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    crate::app::state::NavigatorTarget::Workspace { .. }
+                )
+            })
+            .expect("a local workspace row");
+        let server = crate::ui::grammar::local_server_name();
+        // Sidebar grammar `owner/repo · host:branch`, then the pane-count suffix.
+        assert!(
+            ws_row.label.starts_with(&format!(
+                "gerchowl/flock \u{00b7} {server}:keyboard-shortcuts"
+            )),
+            "expected sidebar grammar, got {:?}",
+            ws_row.label
+        );
+        // ...never the old bare cwd basename.
+        assert!(
+            !ws_row.label.starts_with("flock ("),
+            "should not be the raw basename, got {:?}",
+            ws_row.label
+        );
+    }
+
+    #[test]
+    fn navigator_local_server_filter_hides_fleet_rows() {
+        let mut state = app_with_workspaces(&["scratch"]);
+        state.peer_summaries = vec![fleet_peer_flock_main()];
+        state.server_filter = Some(crate::app::state::ServerFilter::Local);
+        state.open_navigator();
+
+        assert!(!state.navigator_rows().iter().any(|row| {
+            matches!(
+                row.target,
+                crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
+            )
+        }));
     }
 
     #[test]
