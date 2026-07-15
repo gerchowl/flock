@@ -552,6 +552,10 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
         .env("FLOCK_ENV", "1")
         .env("FLOCK_SOCKET_PATH", &socket_path)
         .env("FLOCK_PANE_ID", "p_test")
+        // The claude shim is a thin stub that execs `"$FLOCK_BIN" hook claude`
+        // (#158). Point it at the freshly-built binary so the stub reaches the
+        // real hook body; harmless for the shims that don't use it.
+        .env("FLOCK_BIN", env!("CARGO_BIN_EXE_flk"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
