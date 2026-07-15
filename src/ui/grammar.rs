@@ -142,6 +142,30 @@ pub(crate) fn remote_member_target(summary: &crate::api::schema::PeerWorkspaceSu
         .to_string()
 }
 
+/// The self-contained label for a remote workspace shown as its OWN flat row
+/// (the fleet-wide navigator): `<owner/repo> · <host>:<target>` — project
+/// identity plus the full member locator, ALWAYS both. This is the remote twin
+/// of [`solo_local_label`]; unlike [`remote_entry_label`](crate::ui::sidebar)
+/// it never drops the member half, because the navigator is a flat list with no
+/// group-leader row to nest members beneath. When the peer reports no project
+/// identity, falls back to the bare `<host>:<target>` member label.
+pub(crate) fn solo_remote_label(
+    peer: &crate::peers::PeerSummaryState,
+    summary: &crate::api::schema::PeerWorkspaceSummary,
+) -> String {
+    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let member = member_label(host, &remote_member_target(summary));
+    match summary
+        .project_key
+        .as_deref()
+        .map(project_identity_label)
+        .or_else(|| summary.project_label.clone())
+    {
+        Some(project) => format!("{project} \u{00b7} {member}"),
+        None => member,
+    }
+}
+
 /// The agents-panel single-row location string (#62), matching the spaces
 /// grammar: `<server> <proj> <target>` (e.g. `mba22 flock keyboard-shorcuts`).
 /// Under width pressure the location truncates right-to-left: the branch/target
@@ -298,6 +322,53 @@ mod tests {
         let label = solo_local_label(&app, &app.workspaces[0], &runtimes);
         assert_eq!(label, "scratch");
         assert!(!label.contains(':'));
+    }
+
+    fn remote_summary(
+        project_key: Option<&str>,
+        branch: Option<&str>,
+    ) -> crate::api::schema::PeerWorkspaceSummary {
+        crate::api::schema::PeerWorkspaceSummary {
+            id: "ws_1".into(),
+            workspace: "flock".into(),
+            project_key: project_key.map(str::to_string),
+            project_label: project_key.map(|_| "flock".to_string()),
+            branch: branch.map(str::to_string),
+            is_linked_worktree: branch.is_some(),
+            agent: Some("cc".into()),
+            status: crate::api::schema::AgentStatus::Idle,
+            status_age_secs: None,
+            activity: None,
+        }
+    }
+
+    fn peer_named(host: &str) -> crate::peers::PeerSummaryState {
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: host.into(),
+            ..Default::default()
+        });
+        peer.host = Some(host.into());
+        peer
+    }
+
+    #[test]
+    fn solo_remote_label_combines_project_and_member() {
+        // The remote twin of solo_local_label: `owner/repo · host:branch`.
+        let peer = peer_named("sage");
+        let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
+        assert_eq!(
+            solo_remote_label(&peer, &summary),
+            "gerchowl/flock \u{00b7} sage:main"
+        );
+    }
+
+    #[test]
+    fn solo_remote_label_without_project_is_bare_member() {
+        // No project identity reported: fall back to `host:target`, never a
+        // dangling `· `.
+        let peer = peer_named("sage");
+        let summary = remote_summary(None, Some("wip"));
+        assert_eq!(solo_remote_label(&peer, &summary), "sage:wip");
     }
 
     #[test]

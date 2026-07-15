@@ -1129,6 +1129,13 @@ pub(crate) enum NavigatorTarget {
         tab_idx: usize,
         pane_id: PaneId,
     },
+    /// A federated peer's workspace (fleet-wide search). Selecting it emits the
+    /// same [`PeerSwitchRequest`] the servers band uses. Workspace-level only —
+    /// peer summaries carry no panes/tabs, so these rows never expand.
+    RemoteWorkspace {
+        peer: RemotePeerRef,
+        peer_ws_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

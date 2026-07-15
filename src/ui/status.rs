@@ -260,7 +260,7 @@ pub(super) fn agent_icon(
 /// the icon set is keyed on, so remote member rows render the SAME agent-style
 /// icon as local ones (#62). `Done` = an unseen idle (the green ✓), `Idle` = a
 /// settled seen idle.
-pub(super) fn remote_state(status: crate::api::schema::AgentStatus) -> (AgentState, bool) {
+pub(crate) fn remote_state(status: crate::api::schema::AgentStatus) -> (AgentState, bool) {
     use crate::api::schema::AgentStatus;
     match status {
         AgentStatus::Blocked => (AgentState::Blocked, true),

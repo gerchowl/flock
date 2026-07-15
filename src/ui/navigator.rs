@@ -42,6 +42,8 @@ fn render_search(app: &AppState, frame: &mut Frame, area: Rect) {
     } else {
         Style::default().fg(p.overlay0)
     };
+    // Counts PANES specifically (the "{n} panes" label). Fleet-wide peer rows
+    // are workspace-level switches, not panes, so they stay out of this tally.
     let count = app
         .workspaces
         .iter()
@@ -290,15 +292,43 @@ fn selected_detail(app: &AppState) -> String {
     let Some(row) = rows.get(app.navigator.selected) else {
         return String::new();
     };
-    match row.target {
-        NavigatorTarget::Workspace { ws_idx } => workspace_detail(app, ws_idx),
-        NavigatorTarget::Tab { ws_idx, tab_idx } => tab_detail(app, ws_idx, tab_idx),
+    match &row.target {
+        NavigatorTarget::Workspace { ws_idx } => workspace_detail(app, *ws_idx),
+        NavigatorTarget::Tab { ws_idx, tab_idx } => tab_detail(app, *ws_idx, *tab_idx),
         NavigatorTarget::Pane {
             ws_idx,
             tab_idx,
             pane_id,
-        } => pane_detail(app, ws_idx, tab_idx, pane_id),
+        } => pane_detail(app, *ws_idx, *tab_idx, *pane_id),
+        NavigatorTarget::RemoteWorkspace { peer, peer_ws_idx } => {
+            remote_workspace_detail(app, peer, *peer_ws_idx)
+        }
     }
+}
+
+fn remote_workspace_detail(
+    app: &AppState,
+    peer_ref: &crate::app::state::RemotePeerRef,
+    peer_ws_idx: usize,
+) -> String {
+    let Some(peer) = app.remote_peer(peer_ref) else {
+        return String::new();
+    };
+    let Some(summary) = peer.workspaces.get(peer_ws_idx) else {
+        return String::new();
+    };
+    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let mut parts = vec![
+        super::grammar::solo_remote_label(peer, summary),
+        format!("server {host}"),
+    ];
+    if let Some(agent) = summary.agent.as_deref().filter(|a| !a.is_empty()) {
+        parts.push(agent.to_string());
+    }
+    if let Some(activity) = summary.activity.as_deref().filter(|a| !a.is_empty()) {
+        parts.push(activity.to_string());
+    }
+    parts.join(" \u{00b7} ")
 }
 
 fn workspace_detail(app: &AppState, ws_idx: usize) -> String {
@@ -306,7 +336,7 @@ fn workspace_detail(app: &AppState, ws_idx: usize) -> String {
         return String::new();
     };
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-    let label = ws.display_name_from(&app.terminals, &terminal_runtimes);
+    let label = super::grammar::solo_local_label(app, ws, &terminal_runtimes);
     let pane_count = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>();
     let mut parts = vec![label, format!("{pane_count} panes")];
     if !rowless_workspace_activity(app, ws_idx).is_empty() {
@@ -324,7 +354,7 @@ fn tab_detail(app: &AppState, ws_idx: usize, tab_idx: usize) -> String {
     };
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let mut parts = vec![
-        ws.display_name_from(&app.terminals, &terminal_runtimes),
+        super::grammar::solo_local_label(app, ws, &terminal_runtimes),
         format!("tab: {}", tab.display_name()),
         format!("{} panes", tab.panes.len()),
     ];
@@ -353,7 +383,11 @@ fn pane_detail(
         return String::new();
     };
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-    let mut parts = vec![ws.display_name_from(&app.terminals, &terminal_runtimes)];
+    let mut parts = vec![super::grammar::solo_local_label(
+        app,
+        ws,
+        &terminal_runtimes,
+    )];
     if ws.tabs.len() > 1 {
         parts.push(format!("tab: {}", tab.display_name()));
     }
