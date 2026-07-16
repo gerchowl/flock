@@ -2012,15 +2012,32 @@ fn render_server_rows(frame: &mut Frame, rect: Rect, [title, health]: [Line<'sta
 /// the color; the status line keeps the percent) and net throughput (#41 —
 /// peers don't carry those), over the shared flush-left fixed-width metric
 /// line, all fed from the same local `SystemStats` sample the HUD shows.
+/// The fixed-width server-icon slot (#164): the LEADING span of a band row's
+/// name — `<glyph> ` when the server declared a KNOWN icon name, else two
+/// spaces. Always 2 display cells so hostnames stay column-aligned whether or
+/// not a server set an icon (and across medallion on/off). `style` is the row's
+/// own fg, so the icon inherits it and dims/strikes with a ghosted row. An
+/// unknown/garbage name (registry miss) renders as the blank slot — never the
+/// raw string, so a hostile or version-skewed peer can't inject into the band.
+fn server_icon_span(icon_name: Option<&str>, style: Style) -> Span<'static> {
+    match icon_name.and_then(crate::server_icons::resolve) {
+        Some(glyph) => Span::styled(format!("{glyph} "), style),
+        None => Span::styled("  ".to_string(), style),
+    }
+}
+
 fn self_server_rows(app: &AppState) -> ServerRowBuild {
     use super::status::{band_battery_style, battery_icon, format_net_io, push_band_metric};
     let p = &app.palette;
     // No self marker (user: redundant) — the current-row highlight fill and
     // band position already say "this is where you are".
-    let name = vec![Span::styled(
-        crate::app::short_host_name(),
-        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-    )];
+    let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
+    let name = vec![
+        // #164: our OWN self-declared icon, resolved locally (matches what we
+        // gossip so the self row and peers' view of us agree).
+        server_icon_span(crate::app::configured_node_icon().as_deref(), name_style),
+        Span::styled(crate::app::short_host_name(), name_style),
+    ];
 
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     let mut health: Vec<Span<'static>> = Vec::new();
@@ -2068,10 +2085,18 @@ fn home_server_rows(
 ) -> ServerRowBuild {
     // The way-home row renders like any server row (user: "I know my home")
     // — its pinned slot-0 position IS the label; no arrow, no suffix.
-    let name = vec![Span::styled(
-        snapshot.origin.clone(),
-        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-    )];
+    let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
+    let name = vec![
+        // #164: the origin's self-declared icon, carried in its summary.
+        server_icon_span(
+            snapshot
+                .origin_summary
+                .as_ref()
+                .and_then(|origin| origin.icon.as_deref()),
+            name_style,
+        ),
+        Span::styled(snapshot.origin.clone(), name_style),
+    ];
     // The carried origin summary (#66) makes the home row live like a peer
     // row: the hub's own machine health below, its workspace tally in the
     // count columns. Falls back to the bare snapshot-age line when no origin
@@ -2170,12 +2195,15 @@ fn peer_server_rows(
             Some(at) => format!("\u{f033a} {}", format_age(at.elapsed().as_secs())),
             None => "\u{f033a}".to_string(),
         };
-        let name = vec![Span::styled(
-            host,
-            Style::default()
-                .fg(p.overlay0)
-                .add_modifier(Modifier::ITALIC | Modifier::CROSSED_OUT),
-        )];
+        let ghost_style = Style::default()
+            .fg(p.overlay0)
+            .add_modifier(Modifier::ITALIC | Modifier::CROSSED_OUT);
+        // #164: the icon degrades with the row — a lit icon beside a struck-out
+        // host reads as a half-painted bug; identity dims as one unit.
+        let name = vec![
+            server_icon_span(peer.icon.as_deref(), ghost_style),
+            Span::styled(host, ghost_style),
+        ];
         let title_rest = vec![Span::styled(
             age,
             Style::default()
@@ -2207,7 +2235,12 @@ fn peer_server_rows(
         };
     }
 
-    let name = vec![Span::styled(host, Style::default().fg(p.subtext0))];
+    let name_style = Style::default().fg(p.subtext0);
+    let name = vec![
+        // #164: the peer's self-declared icon (gossiped name → glyph here).
+        server_icon_span(peer.icon.as_deref(), name_style),
+        Span::styled(host, name_style),
+    ];
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     if let Some(ms) = peer.latency_ms {
         let color = if ms > crate::peers::PEER_SLOW_LATENCY_MS {
@@ -2654,8 +2687,11 @@ fn render_workspace_list(
         let stale = peer.is_stale() || peer.error.is_some();
         let (icon, icon_style) = remote_agent_icon(remote_ws.status, app.spinner_tick, p);
         let label = remote_entry_label(app, &card.peer, card.ws_idx, card.indented);
+        // #164 P2: the owning server's icon badges the folded remote row, tying
+        // the workspace to its machine. Fixed 2-cell slot so multiple remotes in
+        // a group line up; +2 to the label budget for it.
         let max_label =
-            (card.rect.width as usize).saturating_sub(if card.indented { 5 } else { 3 });
+            (card.rect.width as usize).saturating_sub(if card.indented { 7 } else { 5 });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
         // labels carry a `·` separator (and the origin rows from #66 are long),
         // so a byte slice could land mid-`·` and panic the whole render.
@@ -2672,10 +2708,13 @@ fn render_workspace_list(
             final_icon_style = final_icon_style.add_modifier(Modifier::DIM);
         }
         let indent = if card.indented { "   " } else { " " };
+        // The server icon inherits the label style, so it dims with a stale row.
+        let server_icon = server_icon_span(peer.icon.as_deref(), label_style);
         let line = Line::from(vec![
             Span::styled(indent, Style::default()),
             Span::styled(icon, final_icon_style),
             Span::styled(" ", Style::default()),
+            server_icon,
             Span::styled(label, label_style),
         ]);
         frame.render_widget(
@@ -3586,7 +3625,8 @@ mod tests {
         let health = line_text(&row.health);
         // Ornaments kicked: the home row is just the origin name — its
         // pinned slot-0 position is the label.
-        assert!(name.starts_with("mba22"), "{name}");
+        // Behind the (blank) #164 icon slot; the origin name is the label.
+        assert!(name.contains("mba22"), "{name}");
         assert!(!name.contains('←') && !name.contains("home"), "{name}");
         // No counts on the home row; the age line is flush left.
         assert!(row.tally.is_none());
@@ -3632,7 +3672,9 @@ mod tests {
         let health = line_text(&row.health);
         // Ornaments kicked: the self row is just the host name — the
         // current-row highlight carries "you are here".
-        assert!(name.starts_with(&crate::app::short_host_name()), "{name}");
+        // Leads with the (blank, no icon configured) 2-cell slot (#164), then
+        // the host — no self marker beyond that.
+        assert!(name.contains(&crate::app::short_host_name()), "{name}");
         assert!(!name.contains('\u{2726}'), "{name}");
         // Battery and net trail the counts: the battery is GLYPH ONLY
         // (level = color, no percent text), then the net glyph with
@@ -3689,10 +3731,93 @@ mod tests {
         peer.latency_ms = Some(10);
 
         let name = spans_text(&peer_server_rows(&peer, &p).name);
-        assert_eq!(name, "anvil");
+        // The leading 2-cell icon slot (#164) is blank (no icon set) → the host
+        // follows two spaces.
+        assert_eq!(name, "  anvil");
         assert!(
             !name.contains("mac-studio"),
             "reported host must not win: {name}"
+        );
+    }
+
+    #[test]
+    fn server_icon_span_is_a_fixed_two_cell_slot() {
+        // #164: a known icon → glyph + space; None or an unknown/garbage name →
+        // two spaces. Always 2 display cells so hostnames stay column-aligned.
+        let style = Style::default();
+        let known = server_icon_span(Some("laptop"), style);
+        assert_eq!(known.content.chars().count(), 2, "glyph + trailing space");
+        assert_eq!(
+            known.content.chars().next(),
+            crate::server_icons::glyph("laptop").and_then(|g| g.chars().next())
+        );
+        assert_eq!(server_icon_span(None, style).content.as_ref(), "  ");
+        assert_eq!(
+            server_icon_span(Some("not-a-real-icon"), style)
+                .content
+                .as_ref(),
+            "  ",
+            "unknown/garbage name renders the blank slot, never the raw string"
+        );
+        // A hostile escape-sequence payload never reaches the screen.
+        assert_eq!(
+            server_icon_span(Some("\u{1b}[31m"), style).content.as_ref(),
+            "  "
+        );
+    }
+
+    #[test]
+    fn peer_server_rows_render_the_gossiped_icon_glyph() {
+        // #164: a peer that gossiped `icon = "anvil"` renders the mapped glyph
+        // ahead of its name; both viewers resolve the SAME glyph from the name.
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.host = Some("anvil".into());
+        peer.latency_ms = Some(10);
+        peer.icon = Some("anvil".into());
+
+        let name = spans_text(&peer_server_rows(&peer, &p).name);
+        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        assert_eq!(name, format!("{glyph} anvil"));
+    }
+
+    #[test]
+    fn folded_remote_workspace_row_badges_the_owning_servers_icon() {
+        // #164 P2: a folded remote workspace row carries the OWNING server's
+        // icon glyph (resolved from its gossiped name), tying the row to its
+        // machine. Rendered between the agent icon and the `peer:branch` label.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        let mut peer = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        );
+        peer.icon = Some("anvil".into());
+        app.peer_summaries = vec![peer];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 40, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        let has_badge = (0..area.height).any(|y| {
+            let row: String = (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            row.contains(glyph) && row.contains("anvil")
+        });
+        assert!(
+            has_badge,
+            "folded remote row should show the server icon glyph"
         );
     }
 
@@ -3720,9 +3845,9 @@ mod tests {
         let name = spans_text(&row.name);
         let rest = spans_text(&row.title_rest);
         let health = line_text(&row.health);
-        // Name first; the latency rides the trailing metrics after the
-        // count columns.
-        assert_eq!(name, "anvil");
+        // Name first (behind the blank #164 icon slot); the latency rides the
+        // trailing metrics after the count columns.
+        assert_eq!(name, "  anvil");
         assert!(rest.contains("34ms"), "{rest}");
         // The second line speaks the band's fixed-width glyph language
         // (cpu right-aligned width-3, no `·` separators, flush left); the
@@ -3810,7 +3935,8 @@ mod tests {
         // including the LAST-KNOWN stats, which stay visible.
         let name_text = spans_text(&row.name);
         let rest_text = spans_text(&row.title_rest);
-        assert!(name_text.starts_with("ksb"), "{name_text:?}");
+        // Behind the (blank) icon slot; the whole row incl. the slot dims.
+        assert!(name_text.contains("ksb"), "{name_text:?}");
         assert!(
             rest_text.contains('\u{f033a}'),
             "broken-link icon: {rest_text:?}"
@@ -4855,7 +4981,8 @@ mod tests {
         // name field pads to the band-wide max display width, so the count
         // columns sit at the same x on every row.
         let host = crate::app::short_host_name();
-        let name_width = spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
+        // +2: every row's name leads with the fixed 2-cell #164 icon slot.
+        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
         let counts_x = |rect: Rect| rect.x + name_width as u16 + 1;
         for rect in [self_rect, peer_rect] {
             let x = counts_x(rect);
@@ -4873,14 +5000,19 @@ mod tests {
                 "zero column is muted"
             );
         }
-        // Both rows lead with their names at the row's left edge.
+        // Both rows lead with the 2-cell icon slot (#164, blank here), then
+        // their names — the count columns still land at a shared x.
         assert!(
-            buffer_row_text(&buffer, self_rect, self_rect.y).starts_with(&host),
+            buffer_row_text(&buffer, self_rect, self_rect.y)
+                .trim_start()
+                .starts_with(&host),
             "{:?}",
             buffer_row_text(&buffer, self_rect, self_rect.y)
         );
         assert!(
-            buffer_row_text(&buffer, peer_rect, peer_rect.y).starts_with("anvil"),
+            buffer_row_text(&buffer, peer_rect, peer_rect.y)
+                .trim_start()
+                .starts_with("anvil"),
             "{:?}",
             buffer_row_text(&buffer, peer_rect, peer_rect.y)
         );
@@ -4912,8 +5044,13 @@ mod tests {
         let rows_area = server_band_rows_area(servers_area);
         let long_rect = server_slot_rect(rows_area, 1).expect("long-name peer slot");
         let short_rect = server_slot_rect(rows_area, 2).expect("short-name peer slot");
-        assert!(buffer_row_text(&buffer, long_rect, long_rect.y).starts_with("anvil-dev"));
-        assert!(buffer_row_text(&buffer, short_rect, short_rect.y).starts_with("k "));
+        // Behind the blank 2-cell #164 icon slot on every row.
+        assert!(buffer_row_text(&buffer, long_rect, long_rect.y)
+            .trim_start()
+            .starts_with("anvil-dev"));
+        assert!(buffer_row_text(&buffer, short_rect, short_rect.y)
+            .trim_start()
+            .starts_with("k "));
 
         // Neither peer name contains a digit, so the first digit cell IS
         // the first count column.
@@ -4967,7 +5104,8 @@ mod tests {
 
         // Counts sit after the padded name field on every row.
         let host = crate::app::short_host_name();
-        let name_width = spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
+        // +2: the fixed 2-cell #164 icon slot leads every name field.
+        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
         // Peer: ` 0 10  0` — the working column hits two digits.
         let peer_title: String = buffer_row_text(&buffer, peer_rect, peer_rect.y)
             .chars()

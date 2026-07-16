@@ -56,7 +56,13 @@ use serde::{Deserialize, Serialize};
 /// the client's next-leg bridge dials `ssh -o ProxyJump=<hub> <target>`,
 /// reaching peers the launcher's box cannot dial directly. Additive with
 /// `#[serde(default)]`; positional wire so a deliberate bump is required.
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// v24: `FleetPeer.icon` (#164). A node's SELF-DECLARED fleet icon name gossips
+/// with its identity so every viewer renders the same flat Nerd Font glyph in
+/// the servers band (fixing viewer-relative naming). Only an ASCII name travels
+/// — the receiver maps it to a glyph. Additive with `#[serde(default)]`;
+/// positional wire so a deliberate bump is required.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -184,6 +190,13 @@ pub struct FleetPeer {
     /// client can dial straight (its config peers, or the hub itself).
     #[serde(default)]
     pub proxy_jump: Option<String>,
+    /// The peer's SELF-DECLARED fleet icon NAME (#164): a semantic name
+    /// (`"laptop"`) the receiver maps to a flat Nerd Font glyph, so a server's
+    /// icon renders identically on every node. Only an ASCII name travels;
+    /// unknown/absent → no icon. Additive with `#[serde(default)]`; positional
+    /// bincode wire, so a deliberate `PROTOCOL_VERSION` bump ships with it.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 /// Bincode-safe mirror of `api::schema::PeerSystemSummary`. The schema type
@@ -1079,6 +1092,7 @@ mod tests {
                 error: None,
                 origin_last_ok_secs: Some(5),
                 proxy_jump: Some("mba22".to_owned()),
+                icon: Some("anvil".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
                 name: "mba22".to_owned(),
@@ -1109,6 +1123,7 @@ mod tests {
                 error: None,
                 origin_last_ok_secs: Some(0),
                 proxy_jump: None,
+                icon: Some("laptop".to_owned()),
             })),
         }
     }
@@ -1659,7 +1674,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 23;
+    const PINNED_PROTOCOL_VERSION: u32 = 24;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1880,7 +1895,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x6d4496489f6d128f),
+            ("SwitchServer", 0xf146670b2b5dc410),
         ];
 
         if actual.as_slice() != GOLDEN {

@@ -153,6 +153,11 @@ pub struct PeerSummaryState {
     /// routes through the hub instead of trying the target directly. `None`
     /// for entries the receiver can dial straight (its own config peers).
     pub proxy_jump: Option<String>,
+    /// The peer's SELF-DECLARED fleet icon NAME (#164): a semantic name the
+    /// RECEIVER maps to a flat Nerd Font glyph for the servers band, so a
+    /// server's icon renders identically fleet-wide. Set from the peer's own
+    /// `peers.summary`, carried through relay + snapshot. `None` = no icon.
+    pub icon: Option<String>,
 }
 
 impl PeerSummaryState {
@@ -170,6 +175,7 @@ impl PeerSummaryState {
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         }
     }
 
@@ -315,6 +321,7 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
             .origin_last_ok_secs
             .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
         proxy_jump: peer.proxy_jump.clone(),
+        icon: peer.icon.clone(),
     }
 }
 
@@ -342,6 +349,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         // origin-honest staleness path instead of decaying against dwell.
         origin_last_ok_secs: peer.origin_last_ok_secs.or(peer.age_secs),
         proxy_jump: peer.proxy_jump,
+        icon: peer.icon,
     }
 }
 
@@ -351,6 +359,8 @@ pub struct PeerSummaryPayload {
     pub host: String,
     pub version: Option<String>,
     pub protocol: Option<u32>,
+    /// The peer's self-declared fleet icon name (#164), if any.
+    pub icon: Option<String>,
     pub system: Option<crate::api::schema::PeerSystemSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
@@ -571,6 +581,12 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .get("protocol")
         .and_then(serde_json::Value::as_u64)
         .and_then(|p| u32::try_from(p).ok());
+    // #164: the peer's self-declared icon name. Additive/optional — a v(N-1)
+    // peer never emits it, parsing as None (no icon).
+    let icon = result
+        .get("icon")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let system = result
         .get("system")
         .filter(|system| !system.is_null())
@@ -598,6 +614,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         host,
         version,
         protocol,
+        icon,
         system,
         workspaces,
         latency_ms,
@@ -622,6 +639,7 @@ mod tests {
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         };
         let mut peers: Vec<PeerSummaryState> = (0..FLEET_SNAPSHOT_MAX_PEERS + 3)
             .map(|i| mk(&format!("p{i}")))
@@ -684,6 +702,7 @@ mod tests {
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         }
     }
 
@@ -719,6 +738,22 @@ mod tests {
         // Never-reached peers stay never-reached.
         let never = peer_from_wire(peer_to_wire(&summary_state("ksb", "lars@ksb", None)));
         assert!(never.last_ok.is_none());
+    }
+
+    #[test]
+    fn fleet_peer_wire_carries_icon_both_directions() {
+        // #164: the self-declared icon survives the bincode roundtrip present...
+        let mut state = summary_state("anvil", "lars@anvil", Some(5));
+        state.icon = Some("anvil".to_string());
+        assert_eq!(
+            peer_from_wire(peer_to_wire(&state)).icon.as_deref(),
+            Some("anvil")
+        );
+
+        // ...and absent (a v(N-1) peer never sets it) decodes to None.
+        let mut none = summary_state("sage", "lars@sage", Some(5));
+        none.icon = None;
+        assert_eq!(peer_from_wire(peer_to_wire(&none)).icon, None);
     }
 
     #[test]
@@ -804,6 +839,19 @@ Last login: whatever banner
         let stdout = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
         let payload = parse_summary_response(stdout, 5).unwrap();
         assert!(payload.relayed_fleet.is_empty());
+    }
+
+    #[test]
+    fn parse_summary_response_reads_icon_and_tolerates_absence() {
+        // #164: the self-declared icon name parses from the JSON envelope...
+        let with = r#"{"id":"x","result":{"host":"mba22","icon":"laptop","workspaces":[]}}"#;
+        assert_eq!(
+            parse_summary_response(with, 5).unwrap().icon.as_deref(),
+            Some("laptop")
+        );
+        // ...and a v(N-1) peer that never emits it parses as None.
+        let without = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        assert_eq!(parse_summary_response(without, 5).unwrap().icon, None);
     }
 
     #[test]
@@ -1019,6 +1067,7 @@ Last login: banner noise
             error: None,
             origin_last_ok_secs: None,
             proxy_jump: None,
+            icon: None,
         };
         let state = peer_from_wire(wire);
         assert_eq!(state.origin_last_ok_secs, Some(5));
@@ -1053,6 +1102,7 @@ Last login: banner noise
             origin: "anvil".into(),
             origin_last_ok_secs: Some(3),
             proxy_jump: Some("anvil".into()),
+            icon: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: RelayedFleetPeer = serde_json::from_str(&json).unwrap();
