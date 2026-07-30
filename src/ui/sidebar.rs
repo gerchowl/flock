@@ -202,6 +202,21 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
 }
 
+/// Map a 0-based LOCAL-only ordinal (the Nth `remote.is_none()` row in render
+/// order) to its absolute index in [`agent_panel_entries`]. Remote rows are
+/// interleaved by the sort (see #62), so absolute indices are non-contiguous
+/// — this helper is the single source of truth both the render (quick-jump
+/// digits on local rows) and [`focus_agent_entry`] use, so the digit shown on
+/// row N and the digit that focuses row N cannot drift.
+pub(crate) fn nth_local_agent_entry_index(app: &AppState, n: usize) -> Option<usize> {
+    agent_panel_entries(app)
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.remote.is_none())
+        .nth(n)
+        .map(|(idx, _)| idx)
+}
+
 pub(crate) fn agent_panel_entries_from(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2519,6 +2534,21 @@ fn render_workspace_list(
             }
         }
     }
+    // A section number renders as `"{n} "` (2 chars for n<10, 3 for n>=10) —
+    // see the header render at ~2746-2752 and the standalone card at
+    // ~2562-2568. Indented member rows use inline leading spaces to nest
+    // (Rects all start at body.x), so their pad MUST match the header's own
+    // prefix + one indent step, else numbered headers render their members
+    // LEFT of the header label (a base 3-space pad works only when the
+    // header carries no index). Compute the widest number the header will
+    // actually show and mirror it here.
+    let member_indent_extra = header_section_index
+        .values()
+        .chain(standalone_section_index.values())
+        .max()
+        .map(|max_n| format!("{max_n} ").chars().count())
+        .unwrap_or(0);
+    let indented_member_pad: String = " ".repeat(3 + member_indent_extra);
 
     for card in cards {
         let i = card.ws_idx;
@@ -2568,7 +2598,7 @@ fn render_workspace_list(
             line1.push(Span::styled(format!("{index} "), idx_style));
         }
         if card.indented {
-            line1.push(Span::styled("   ", Style::default()));
+            line1.push(Span::styled(indented_member_pad.clone(), Style::default()));
         } else if let Some((key, collapsed)) = workspace_parent_group_state(app, i) {
             let triangle = if collapsed { "▸" } else { "▾" };
             line1.push(Span::styled(triangle, Style::default().fg(p.accent)));
@@ -2690,8 +2720,11 @@ fn render_workspace_list(
         // #164 P2: the owning server's icon badges the folded remote row, tying
         // the workspace to its machine. Fixed 2-cell slot so multiple remotes in
         // a group line up; +2 to the label budget for it.
-        let max_label =
-            (card.rect.width as usize).saturating_sub(if card.indented { 7 } else { 5 });
+        let max_label = (card.rect.width as usize).saturating_sub(if card.indented {
+            7 + member_indent_extra
+        } else {
+            5
+        });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
         // labels carry a `·` separator (and the origin rows from #66 are long),
         // so a byte slice could land mid-`·` and panic the whole render.
@@ -2707,7 +2740,14 @@ fn render_workspace_list(
             label_style = label_style.add_modifier(Modifier::DIM);
             final_icon_style = final_icon_style.add_modifier(Modifier::DIM);
         }
-        let indent = if card.indented { "   " } else { " " };
+        // Indented remote members mirror the local-member pad so nested rows
+        // stay visually right-of their header even when the header carries a
+        // section-index prefix (see `indented_member_pad` above).
+        let indent: String = if card.indented {
+            indented_member_pad.clone()
+        } else {
+            " ".to_string()
+        };
         // The server icon inherits the label style, so it dims with a stale row.
         let server_icon = server_icon_span(peer.icon.as_deref(), label_style);
         let line = Line::from(vec![
@@ -2892,20 +2932,36 @@ fn render_agent_detail(
         return;
     }
 
-    // #147: quick-jump ordinals on the agent rows mirror `focus_agent(idx)`,
-    // which indexes THIS list (`focus_agent_entry` → `agent_panel_entries`).
-    // Local rows come first (remote entries are appended), so a local row's
-    // absolute index is exactly the digit that jumps to it. Gated on the
-    // binding; only the addressable first 9; remote rows carry no number since
-    // `focus_agent_entry` can't focus them.
+    // #147: quick-jump ordinals number LOCAL rows contiguously (1..=9 over
+    // `remote.is_none()` rows in render order). Remote rows are interleaved
+    // with locals by the panel sort (see `agent_panel_sort_key`, #62), so
+    // absolute indices are non-contiguous over locals — numbering by
+    // absolute index would leave local rows with gaps (1, 6, 8) and the
+    // skipped digits would map to unaddressable remotes. Route both the
+    // render number and the key action (see `focus_local_agent_entry`)
+    // through the same local-only mapping (`nth_local_agent_entry_index`)
+    // so they cannot drift. Precomputed over the FULL list so scroll
+    // doesn't shift the numbers.
     let agents_jump_bound = !app.keybinds.focus_agent.is_empty();
+    let mut local_ordinals: Vec<Option<usize>> = Vec::with_capacity(details.len());
+    {
+        let mut local_seen = 0usize;
+        for detail in details.iter() {
+            if detail.remote.is_none() {
+                local_seen += 1;
+                local_ordinals.push((agents_jump_bound && local_seen <= 9).then_some(local_seen));
+            } else {
+                local_ordinals.push(None);
+            }
+        }
+    }
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     for (idx, detail) in details.iter().enumerate().skip(app.agent_panel_scroll) {
         if row_y >= body_bottom {
             break;
         }
-        let ordinal = (agents_jump_bound && detail.remote.is_none() && idx < 9).then(|| idx + 1);
+        let ordinal = local_ordinals.get(idx).copied().flatten();
 
         // Single-row grammar (#62): `<icon> <agent> <server> <proj> <target>`.
         // The status symbol carries the state — no status text, no activity /
@@ -6062,6 +6118,48 @@ mod tests {
     }
 
     #[test]
+    fn nth_local_agent_entry_index_skips_interleaved_remotes() {
+        // With a local ("mmm") sorted BETWEEN two remotes ("aaa" / "zzz")
+        // — the same setup as the interleave test above — the local-only
+        // mapping must return the ABSOLUTE index of the local row (1, i.e.
+        // the middle row), not the local-only ordinal itself. This is the
+        // shared source of truth for both the render (which numbers local
+        // rows 1..=9) and `focus_local_agent_entry` (which maps a pressed
+        // digit back to the entry to focus). Without this mapping, digit 1
+        // would either land on the unaddressable remote at absolute index 0
+        // or on nothing.
+        let mut app = crate::app::state::AppState::test_new();
+        let local = Workspace::test_new("mmm");
+        let pane = local.tabs[0].root_pane;
+        app.workspaces = vec![local];
+        app.ensure_test_terminals();
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
+        app.active = Some(0);
+        app.selected = 0;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        app.server_filter = None;
+        app.peer_summaries = vec![
+            peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]),
+            peer_with_workspaces("sage", vec![remote_summary("zzz", None, None, None)]),
+        ];
+
+        let entries = agent_panel_entries(&app);
+        assert_eq!(entries.len(), 3, "aaa (remote), mmm (local), zzz (remote)");
+        assert!(entries[0].remote.is_some());
+        assert!(entries[1].remote.is_none());
+        assert!(entries[2].remote.is_some());
+
+        // The only local row is entry #1; the 0-th local-only ordinal maps
+        // to absolute index 1 (not 0, which is a remote). No 2nd local row,
+        // so digit 2 returns None.
+        assert_eq!(nth_local_agent_entry_index(&app, 0), Some(1));
+        assert_eq!(nth_local_agent_entry_index(&app, 1), None);
+    }
+
+    #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
         // The bottom two rows stay reserved for the pinned menu band; the
         // sections split the three rows above it.
@@ -6580,6 +6678,75 @@ mod tests {
         (list_area.x..list_area.x + list_area.width)
             .map(|x| buffer[(x, list_area.y)].symbol().to_string())
             .collect()
+    }
+
+    /// Column of the first non-space glyph on `row` within `rect` — a
+    /// pad-model row's "visual left edge" (its triangle or icon column),
+    /// which is what the reader anchors nesting on.
+    fn first_non_space_col(row: &str) -> usize {
+        row.chars().position(|c| c != ' ').unwrap_or(row.len())
+    }
+
+    #[test]
+    fn indented_members_render_right_of_header_when_switch_space_bound() {
+        // A section number renders as `"{n} "` on the header AND on standalone
+        // rows (#62), shifting the header's triangle+icon+label two columns
+        // right when `switch_space` is bound. Before this fix the indented
+        // member pad was a fixed 3 spaces regardless — so a numbered header's
+        // label landed farther right than its own members, inverting the
+        // visual nest. With the fix the member pad grows to match the header
+        // prefix + one indent step, so a member's leftmost glyph is always
+        // strictly right of its header's leftmost glyph.
+        let mut app = space_group_app();
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nswitch_space = \"prefix+shift+1..9\"\n").unwrap();
+        app.keybinds = config.keybinds();
+
+        let area = Rect::new(0, 0, 40, 20);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        assert!(!app.view.space_header_areas.is_empty());
+        let header = app.view.space_header_areas[0].clone();
+        assert_eq!(app.view.workspace_card_areas.len(), 2);
+        let member = app.view.workspace_card_areas[0];
+
+        let header_row = buffer_row_text(&buffer, header.rect, header.rect.y);
+        let member_row = buffer_row_text(&buffer, member.rect, member.rect.y);
+        // The header prefix begins with the numeric ordinal — sanity-check
+        // that this is the bound path.
+        assert!(
+            header_row.trim_start().starts_with('1'),
+            "header should carry ordinal 1: {header_row:?}"
+        );
+        let header_left = first_non_space_col(&header_row);
+        let member_left = first_non_space_col(&member_row);
+        assert!(
+            member_left > header_left,
+            "member glyph col ({member_left}) must be RIGHT of header glyph col \
+             ({header_left}) when switch_space is bound — header row: \
+             {header_row:?}; member row: {member_row:?}",
+        );
+    }
+
+    #[test]
+    fn indented_members_render_right_of_header_when_switch_space_unbound() {
+        // The unbound path was already correct (member label lands one col
+        // right of header label). This guards the invariant on both sides so
+        // a future header-prefix change can't silently regress it.
+        let mut app = space_group_app();
+        assert!(app.keybinds.switch_space.is_empty());
+
+        let area = Rect::new(0, 0, 40, 20);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let header = app.view.space_header_areas[0].clone();
+        let member = app.view.workspace_card_areas[0];
+        let header_row = buffer_row_text(&buffer, header.rect, header.rect.y);
+        let member_row = buffer_row_text(&buffer, member.rect, member.rect.y);
+        let header_left = first_non_space_col(&header_row);
+        let member_left = first_non_space_col(&member_row);
+        assert!(
+            member_left > header_left,
+            "member ({member_left}) must be right of header ({header_left})",
+        );
     }
 
     #[test]

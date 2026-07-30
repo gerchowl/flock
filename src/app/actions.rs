@@ -1885,7 +1885,8 @@ impl AppState {
 
     pub fn focus_agent_entry(&mut self, idx: usize) -> bool {
         let entries = crate::ui::agent_panel_entries(self);
-        let Some(target) = entries.get(idx) else {
+        let target = entries.get(idx).filter(|entry| entry.remote.is_none());
+        let Some(target) = target else {
             return false;
         };
         let ws_idx = target.ws_idx;
@@ -1902,6 +1903,19 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    /// Focus the Nth LOCAL row of the agents panel (0-based over
+    /// `remote.is_none()` rows in render order). Remote rows are interleaved
+    /// with locals by the panel sort, so the pressed digit and the number
+    /// rendered on the row would otherwise disagree — quick-jump routes here
+    /// so the mapping matches [`nth_local_agent_entry_index`], which the
+    /// render also uses to number local rows contiguously.
+    pub fn focus_local_agent_entry(&mut self, n: usize) -> bool {
+        let Some(idx) = crate::ui::nth_local_agent_entry_index(self, n) else {
+            return false;
+        };
+        self.focus_agent_entry(idx)
     }
 
     /// Cycle through AGENT panes across the given workspaces. The unit is

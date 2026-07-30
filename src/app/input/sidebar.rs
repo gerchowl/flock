@@ -1450,6 +1450,55 @@ mod tests {
     }
 
     #[test]
+    fn clicking_synthetic_group_header_toggles_collapse() {
+        // #122: the group's ▾/▸ triangle lives on the synthetic HEADER row (a
+        // non-selectable row that sits ABOVE the member rows). Before this fix
+        // left-click only hit-tested workspace_card_areas — the header's own
+        // rect was ignored — so clicking the visible triangle silently no-oped.
+        // The right-click path was already header-aware (#122 context menu), so
+        // this test wires the LEFT-click symmetry.
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
+        for (idx, checkout_path) in ["/repo/flock", "/repo/flock-issue"].into_iter().enumerate() {
+            app.state.workspaces[idx].worktree_space =
+                Some(crate::workspace::WorktreeSpaceMembership {
+                    key: "repo-key".into(),
+                    label: "flock".into(),
+                    repo_root: "/repo/flock".into(),
+                    checkout_path: checkout_path.into(),
+                    is_linked_worktree: idx > 0,
+                });
+        }
+        app.state.active = None;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        // A 2-member group produces a synthetic header row above the member
+        // rows — that header's rect is the click target for the triangle.
+        assert!(!app.state.view.space_header_areas.is_empty());
+        let header = app.state.view.space_header_areas[0].clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            header.rect.x,
+            header.rect.y,
+        ));
+        assert!(app.state.collapsed_space_keys.contains("repo-key"));
+        // Clicking the header must not steal focus or engage a workspace press.
+        assert_eq!(app.state.active, None);
+        assert!(app.state.workspace_press.is_none());
+
+        // Symmetric toggle: a second click expands the group again — the key
+        // used matches the right-click path so store/lookup stay consistent.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            header.rect.x,
+            header.rect.y,
+        ));
+        assert!(!app.state.collapsed_space_keys.contains("repo-key"));
+    }
+
+    #[test]
     fn clicking_worktree_parent_chevron_toggles_group_only() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
