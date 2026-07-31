@@ -292,8 +292,9 @@ impl App {
                     id,
                     "agent_fork_failed",
                     format!(
-                        "created worktree at {} but failed to start the forked agent: {}",
+                        "created worktree at {} but failed to start the forked agent ({}): {}",
                         checkout_path.display(),
+                        body.code,
                         body.message
                     ),
                 );
@@ -332,8 +333,10 @@ impl App {
             }
         }
         self.state.mark_session_dirty();
-        self.emit_workspace_open_events(ws_idx);
 
+        // Assemble the full response before emitting any event, so a
+        // (defensive, effectively unreachable) internal_error return can
+        // never leave half a fork on the event log.
         let parent_pane_id = self
             .public_pane_id(resolved.ws_idx, resolved.pane_id)
             .unwrap_or_else(|| params.target.clone());
@@ -361,6 +364,7 @@ impl App {
                 "forked workspace is missing worktree info",
             );
         };
+        self.emit_workspace_open_events(ws_idx);
         // #175 O2: the lineage edge + telemetry ride the verb itself, so the
         // fork-vs-message question is measurable from day one.
         self.emit_event(EventEnvelope {
@@ -1942,6 +1946,125 @@ mod tests {
         let remove =
             crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
         let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_empty_pivot_opts_out_of_seed() {
+        let repo = create_committed_repo("api-agent-fork-nopivot-repo");
+        let worktree_root = unique_temp_path("api-agent-fork-nopivot-root");
+        let bin_dir = stub_claude_on_path("api-agent-fork-nopivot-bin");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.branch_pivot_message = "configured template for <branch>".into();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/no-seed".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some(String::new()),
+                focus: false,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked {
+            argv,
+            seeded,
+            worktree,
+            ..
+        } = success.result
+        else {
+            panic!("expected agent_forked response");
+        };
+        assert!(!seeded, "empty pivot must opt out of the configured seed");
+        assert_eq!(
+            argv,
+            vec!["claude", "--resume", "sess-fork", "--fork-session"]
+        );
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_branches_from_a_linked_worktree_source() {
+        // #124 branch-from-here over the API: the target pane lives in a
+        // flock-managed linked worktree; the fork branches from that
+        // checkout's HEAD and the source keeps its linked membership.
+        let repo = create_committed_repo("api-agent-fork-linked-repo");
+        let linked = unique_temp_path("api-agent-fork-linked-child");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "task/linked-source",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let worktree_root = unique_temp_path("api-agent-fork-linked-root");
+        let bin_dir = stub_claude_on_path("api-agent-fork-linked-bin");
+        let mut app = app_with_parent(&linked);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: repo.join(".git").display().to_string(),
+            label: "flock-test".into(),
+            repo_root: repo.clone(),
+            checkout_path: linked.clone(),
+            is_linked_worktree: true,
+        });
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/from-linked".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some(String::new()),
+                focus: false,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked { worktree, .. } = success.result else {
+            panic!("expected agent_forked response: {response}");
+        };
+        assert_eq!(worktree.branch.as_deref(), Some("fork/from-linked"));
+        let source_space = app.state.workspaces[0]
+            .worktree_space()
+            .expect("source keeps membership");
+        assert!(
+            source_space.is_linked_worktree,
+            "branch-from-here must not demote the source to a parent"
+        );
+        let child_space = app.state.workspaces[1]
+            .worktree_space()
+            .expect("child membership");
+        assert!(child_space.is_linked_worktree);
+        assert_eq!(child_space.repo_root, repo);
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let remove_linked = crate::worktree::build_worktree_remove_command(&repo, &linked, true);
+        let _ = crate::worktree::run_worktree_command(&remove_linked);
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(bin_dir);
