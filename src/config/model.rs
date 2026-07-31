@@ -243,6 +243,22 @@ pub enum ServerStateMarkConfig {
     MedallionQuadrant,
 }
 
+/// How a server is IDENTIFIED in the servers band and spaces-list member rows
+/// (#164): `both` (default — the self-declared flat icon glyph followed by the
+/// hostname), `icon` (glyph only; falls back to the hostname when a node
+/// declares no icon), or `name` (hostname only, the pre-icon look). A
+/// VIEWER-LOCAL preference — it changes how YOU read the band, not what any node
+/// gossips. In `icon`/`both` a member row reads `<glyph> · <branch>` (vs the
+/// `<host>:<branch>` of `name`), the icon standing in for the server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerLabelConfig {
+    #[default]
+    Both,
+    Icon,
+    Name,
+}
+
 /// How flock handles a file dropped onto an agent pane (#79). A drag-drop
 /// arrives as a paste of the LOCAL path; flock ferries the file's BYTES to the
 /// (possibly remote) server so the agent gets a path it can actually read.
@@ -922,6 +938,10 @@ pub struct UiConfig {
     /// Servers-band leading state mark: "counts" (default), or
     /// "medallion_sextant" / "medallion_quadrant".
     pub server_state_mark: ServerStateMarkConfig,
+    /// How a server is identified in the band + spaces member rows (#164):
+    /// "both" (default: icon + hostname), "icon" (glyph only, hostname
+    /// fallback), or "name" (hostname only). Viewer-local.
+    pub server_label: ServerLabelConfig,
     /// How a file dropped onto an agent pane is handled (#79): "never" / "ask"
     /// (default) / "auto".
     pub file_drop: FileDropMode,
@@ -1182,6 +1202,7 @@ impl Default for UiConfig {
             servers_panel_scope: PanelScopeConfig::All,
             spaces_panel_scope: PanelScopeConfig::All,
             server_state_mark: ServerStateMarkConfig::default(),
+            server_label: ServerLabelConfig::default(),
             file_drop: FileDropMode::default(),
             agent_aliases: std::collections::HashMap::new(),
             accent: "cyan".into(),
