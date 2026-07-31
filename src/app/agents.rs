@@ -424,6 +424,8 @@ impl App {
             focused: pane.focused,
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
+            seen: pane.seen,
+            status_age_secs: pane.status_age_secs,
             revision: pane.revision,
         })
     }

@@ -1071,6 +1071,16 @@ pub struct AgentInfo {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    /// Whether the operator has seen the agent's latest completed turn
+    /// (#175 F3). `agent_status` already folds this bit (`done` is
+    /// idle+unseen); the raw value saves clients re-deriving it. Missing on
+    /// older servers ⇒ treated as seen.
+    #[serde(default = "default_true")]
+    pub seen: bool,
+    /// Seconds since the agent's semantic state last changed (#175 F3).
+    /// Absent when the pane never reported a state transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
     pub revision: u64,
 }
 
@@ -1100,6 +1110,13 @@ pub struct PaneInfo {
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Whether the operator has seen the pane's latest completed turn
+    /// (#175 F3). Missing on older servers ⇒ treated as seen.
+    #[serde(default = "default_true")]
+    pub seen: bool,
+    /// Seconds since the pane's semantic agent state last changed (#175 F3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
     pub revision: u64,
 }
 
@@ -1884,6 +1901,8 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    seen: true,
+                    status_age_secs: None,
                     revision: 0,
                 },
                 worktree: WorktreeInfo {
@@ -1935,6 +1954,8 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    seen: true,
+                    status_age_secs: None,
                     revision: 0,
                 },
             },
@@ -1945,6 +1966,46 @@ mod tests {
         assert!(json.contains("\"root_pane\""));
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    #[test]
+    fn pane_record_seen_and_status_age_round_trip_and_default() {
+        // #175 F3: the raw seen bit and status age ride the pane record.
+        let pane = PaneInfo {
+            pane_id: "w_1-1".into(),
+            terminal_id: "term_1".into(),
+            workspace_id: "w_1".into(),
+            tab_id: "w_1:1".into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: Some("claude".into()),
+            title: None,
+            display_agent: None,
+            agent_status: AgentStatus::Done,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            seen: false,
+            status_age_secs: Some(1800),
+            revision: 7,
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(json.contains("\"seen\":false"));
+        assert!(json.contains("\"status_age_secs\":1800"));
+        let restored: PaneInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, pane);
+
+        // Records from servers predating the fields parse with seen=true and
+        // no age — a missing bit must never look like an unseen turn.
+        let legacy: PaneInfo = serde_json::from_str(
+            r#"{"pane_id":"w_1-1","terminal_id":"term_1","workspace_id":"w_1",
+                "tab_id":"w_1:1","focused":false,"agent_status":"idle","revision":1}"#,
+        )
+        .unwrap();
+        assert!(legacy.seen);
+        assert_eq!(legacy.status_age_secs, None);
     }
 
     #[test]

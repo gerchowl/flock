@@ -346,6 +346,10 @@ impl App {
             custom_status: presentation.custom_status,
             state_labels: presentation.state_labels,
             agent_session: terminal_agent_session_info(terminal),
+            seen: pane.seen,
+            status_age_secs: terminal
+                .state_changed_at
+                .map(|changed| changed.elapsed().as_secs()),
             revision: terminal.revision,
         })
     }
