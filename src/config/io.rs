@@ -6,6 +6,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "gossip",
+    "icon",
     "keys",
     "onboarding",
     "name",
@@ -326,6 +327,20 @@ fn load_live_config_from_table(
             Err(err) => diagnostics.push(format!(
                 "invalid name setting: {err}; keeping current node name"
             )),
+        }
+    }
+
+    // #164 self-icon: a top-level scalar like `name`. Without this the gossip
+    // source (`configured_node_icon` → `load_live_config`) always saw None, so
+    // no node ever advertised an icon — the field parsed nowhere despite being
+    // in the model. Store the raw string verbatim; renderability is validated
+    // downstream (`server_icons::is_renderable`) before it enters the wire.
+    if let Some(value) = table.get("icon") {
+        match value.clone().try_into::<String>() {
+            Ok(icon) => config.icon = Some(icon),
+            Err(err) => {
+                diagnostics.push(format!("invalid icon setting: {err}; keeping current icon"))
+            }
         }
     }
 
@@ -778,6 +793,34 @@ resume_agents_on_restore = true
         assert_eq!(loaded.config.name, "mba22");
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_reads_top_level_icon() {
+        // Regression: #164 self-icon parsed nowhere, so the field stayed None
+        // and no node ever gossiped an icon.
+        let loaded = load_live_config_from_str("icon = \"laptop\"\n").unwrap();
+        assert_eq!(loaded.config.icon.as_deref(), Some("laptop"));
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn overlay_can_set_icon_when_base_omits_it() {
+        // The centrally-managed-box case (mirrors the node-name overlay test):
+        // config.toml is a read-only symlink, the icon lives in the writable
+        // config.local.toml overlay, and it must take effect.
+        let _lock = crate::config::test_config_env_guard();
+        let dir = unique_test_dir("flock-overlay-icon");
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
+        std::fs::write(&overlay, "icon = \"laptop\"\n").unwrap();
+
+        let loaded = load_live_config_with_base(&base);
+
+        assert_eq!(loaded.config.icon.as_deref(), Some("laptop"));
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]
