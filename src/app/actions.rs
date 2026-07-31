@@ -746,6 +746,15 @@ impl AppState {
             NavigatorTarget::RemoteWorkspace { peer, peer_ws_idx } => {
                 // Reuse the servers-band switch path (same as clicking a remote
                 // sidebar row): request the peer switch, close the navigator.
+                // `Relayed` peers can't source a navigator row today (they're
+                // never rendered — `remote_peer()` returns None for them), so
+                // their switch/detail paths are untested; guard the assumption
+                // so a future gossip-v3 relay wiring trips this instead of
+                // silently blanking the detail pane.
+                debug_assert!(
+                    !matches!(peer, crate::app::state::RemotePeerRef::Relayed { .. }),
+                    "navigator RemoteWorkspace should never hold a Relayed peer ref yet"
+                );
                 self.request_peer_switch = Some(peer.switch_request(peer_ws_idx));
                 self.mode = Mode::Terminal;
                 true
@@ -4502,6 +4511,100 @@ mod tests {
                 crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
             )
         }));
+    }
+
+    fn any_remote_row(state: &AppState) -> bool {
+        state.navigator_rows().iter().any(|row| {
+            matches!(
+                row.target,
+                crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
+            )
+        })
+    }
+
+    #[test]
+    fn navigator_text_query_matches_a_peer_label() {
+        // Fleet-wide search finds a remote workspace by its label text (the
+        // host / project / branch all feed the searchable string).
+        let mut state = app_with_workspaces(&["scratch"]);
+        state.peer_summaries = vec![fleet_peer_flock_main()]; // sage · gerchowl/flock:main
+        state.open_navigator();
+
+        state.navigator.query = "sage".into();
+        assert!(any_remote_row(&state), "host segment should match");
+        state.navigator.query = "gerchowl/flock".into();
+        assert!(any_remote_row(&state), "project segment should match");
+        state.navigator.query = "no-such-peer".into();
+        assert!(
+            !any_remote_row(&state),
+            "a non-matching query hides the peer row"
+        );
+    }
+
+    #[test]
+    fn navigator_peer_server_filter_narrows_to_one_server() {
+        let mut state = app_with_workspaces(&["scratch"]);
+        let mut anvil = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        });
+        anvil.host = Some("anvil".into());
+        anvil.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+            id: "ws_9".into(),
+            workspace: "proj".into(),
+            project_key: Some("github.com/gerchowl/proj".into()),
+            project_label: Some("proj".into()),
+            branch: Some("dev".into()),
+            is_linked_worktree: false,
+            agent: Some("cc".into()),
+            status: crate::api::schema::AgentStatus::Idle,
+            status_age_secs: None,
+            activity: None,
+        }];
+        anvil.last_ok = Some(std::time::Instant::now());
+        state.peer_summaries = vec![fleet_peer_flock_main(), anvil];
+        state.server_filter = Some(crate::app::state::ServerFilter::Peer {
+            ssh_target: "sage".into(),
+        });
+        state.open_navigator();
+
+        let remote_labels: Vec<String> = state
+            .navigator_rows()
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.target,
+                    crate::app::state::NavigatorTarget::RemoteWorkspace { .. }
+                )
+            })
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(
+            remote_labels.len(),
+            1,
+            "a Peer filter keeps only that server's rows: {remote_labels:?}"
+        );
+        assert!(
+            remote_labels[0].contains("sage") && !remote_labels[0].contains("anvil"),
+            "kept sage, dropped anvil: {remote_labels:?}"
+        );
+    }
+
+    #[test]
+    fn navigator_peer_with_no_workspaces_adds_no_rows() {
+        // A freshly-polled peer with an empty workspace list contributes no
+        // rows (and never panics on the empty enumerate).
+        let mut state = app_with_workspaces(&["scratch"]);
+        let mut empty = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "sage".into(),
+            ..Default::default()
+        });
+        empty.host = Some("sage".into());
+        empty.last_ok = Some(std::time::Instant::now());
+        state.peer_summaries = vec![empty];
+        state.open_navigator();
+
+        assert!(!any_remote_row(&state));
     }
 
     #[test]
