@@ -74,7 +74,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
@@ -98,6 +98,12 @@ Remove a linked checkout:
 
 ```json
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
+```
+
+`agent.fork` branches a pane's agent conversation into a new linked worktree: it resolves `target` with the same grammar as `agent.send`, creates a worktree (optional `branch`, `base`, `path`, `label`), and starts a pane resuming a fork of the session, optionally seeded with a `pivot` prompt (omitted ⇒ the configured template; empty string ⇒ no seed). Only Claude sessions can fork; other agents return `unsupported_for_agent` and panes without a stored session return `no_agent_session`. The `agent_forked` response carries `run_id`, `parent_pane_id`, the new `workspace`/`tab`/`root_pane`/`worktree` records, the spawned `argv`, and `seeded`. Each fork also emits an `agent_forked` event with the fork lineage (parent and child identifiers, repo key, branch, seeded).
+
+```json
+{"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
@@ -194,6 +200,8 @@ Session-only official integrations report native session references with `pane.r
 If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Flock can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
+
+Pane and agent records also carry `seen` (whether the operator has viewed the agent's latest completed turn — `agent_status` folds this bit into `done`) and `status_age_secs` (seconds since the semantic agent state last changed; omitted when no transition has been observed). Records from older servers parse as seen with no age.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Flock integration.
 

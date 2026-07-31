@@ -72,6 +72,8 @@ pub enum Method {
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
+    #[serde(rename = "agent.fork")]
+    AgentFork(AgentForkParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -336,6 +338,36 @@ pub struct AgentStartParams {
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+}
+
+/// Fork a pane's agent conversation into a new linked worktree (#175 F1):
+/// the socket twin of the TUI `branch_session` flow. The new workspace's
+/// root pane resumes a fork of the target's session (`--fork-session`),
+/// optionally seeded with a pivot prompt as its opening turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentForkParams {
+    /// Pane id, terminal id, or agent name — same grammar as `agent.send`.
+    pub target: String,
+    /// New branch name; a slug is generated when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Base ref for the new branch (default `HEAD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Absolute checkout path; derived from the worktree directory when
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Custom label for the new workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Pivot prompt injected as the fork's opening turn. Omitted ⇒ the
+    /// configured `worktrees.branch_pivot_message` template; empty string ⇒
+    /// no seed. `<branch>` resolves to the final branch name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<String>,
+    #[serde(default)]
+    pub focus: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,6 +851,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    AgentForked,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -947,6 +980,19 @@ pub enum ResponseResult {
         agent: AgentInfo,
         argv: Vec<String>,
     },
+    AgentForked {
+        /// Unique id for this fork, stamped on the lineage event (#175 O2).
+        run_id: String,
+        /// The pane whose session was forked, as a public pane id.
+        parent_pane_id: String,
+        workspace: WorkspaceInfo,
+        tab: TabInfo,
+        root_pane: PaneInfo,
+        worktree: WorktreeInfo,
+        argv: Vec<String>,
+        /// Whether a pivot prompt was injected as the fork's opening turn.
+        seeded: bool,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
@@ -1071,6 +1117,16 @@ pub struct AgentInfo {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    /// Whether the operator has seen the agent's latest completed turn
+    /// (#175 F3). `agent_status` already folds this bit (`done` is
+    /// idle+unseen); the raw value saves clients re-deriving it. Missing on
+    /// older servers ⇒ treated as seen.
+    #[serde(default = "default_true")]
+    pub seen: bool,
+    /// Seconds since the agent's semantic state last changed (#175 F3).
+    /// Absent when the pane never reported a state transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
     pub revision: u64,
 }
 
@@ -1100,6 +1156,13 @@ pub struct PaneInfo {
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Whether the operator has seen the pane's latest completed turn
+    /// (#175 F3). Missing on older servers ⇒ treated as seen.
+    #[serde(default = "default_true")]
+    pub seen: bool,
+    /// Seconds since the pane's semantic agent state last changed (#175 F3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
     pub revision: u64,
 }
 
@@ -1273,6 +1336,22 @@ pub enum EventData {
         custom_status: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
+    /// the epic's telemetry design). One event per `agent.fork`.
+    AgentForked {
+        run_id: String,
+        parent_pane_id: String,
+        parent_workspace_id: String,
+        /// The shared repo key (git common dir) both sides belong to.
+        parent_repo: String,
+        agent: String,
+        child_workspace_id: String,
+        child_pane_id: String,
+        child_worktree: String,
+        child_branch: String,
+        /// Whether a pivot prompt seeded the fork's opening turn.
+        seeded: bool,
     },
 }
 
@@ -1884,6 +1963,8 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    seen: true,
+                    status_age_secs: None,
                     revision: 0,
                 },
                 worktree: WorktreeInfo {
@@ -1935,6 +2016,8 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    seen: true,
+                    status_age_secs: None,
                     revision: 0,
                 },
             },
@@ -1945,6 +2028,46 @@ mod tests {
         assert!(json.contains("\"root_pane\""));
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    #[test]
+    fn pane_record_seen_and_status_age_round_trip_and_default() {
+        // #175 F3: the raw seen bit and status age ride the pane record.
+        let pane = PaneInfo {
+            pane_id: "w_1-1".into(),
+            terminal_id: "term_1".into(),
+            workspace_id: "w_1".into(),
+            tab_id: "w_1:1".into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: Some("claude".into()),
+            title: None,
+            display_agent: None,
+            agent_status: AgentStatus::Done,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            seen: false,
+            status_age_secs: Some(1800),
+            revision: 7,
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(json.contains("\"seen\":false"));
+        assert!(json.contains("\"status_age_secs\":1800"));
+        let restored: PaneInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, pane);
+
+        // Records from servers predating the fields parse with seen=true and
+        // no age — a missing bit must never look like an unseen turn.
+        let legacy: PaneInfo = serde_json::from_str(
+            r#"{"pane_id":"w_1-1","terminal_id":"term_1","workspace_id":"w_1",
+                "tab_id":"w_1:1","focused":false,"agent_status":"idle","revision":1}"#,
+        )
+        .unwrap();
+        assert!(legacy.seen);
+        assert_eq!(legacy.status_age_secs, None);
     }
 
     #[test]

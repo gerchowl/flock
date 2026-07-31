@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, ResponseResult, WorktreeCreateParams, WorktreeInfo,
-    WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams, WorktreeSourceInfo,
+    AgentForkParams, EventData, EventEnvelope, EventKind, ResponseResult, WorktreeCreateParams,
+    WorktreeInfo, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams, WorktreeSourceInfo,
 };
 use crate::app::App;
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 struct ApiFailure {
     code: &'static str,
@@ -159,6 +159,242 @@ impl App {
                     .root_pane_info(ws_idx, 0)
                     .expect("new worktree workspace should have an initial root pane"),
                 worktree,
+            },
+        )
+    }
+
+    /// `agent.fork` (#175 F1): fork the target pane's agent conversation into
+    /// a new linked worktree — the socket twin of the TUI `branch_session`
+    /// flow. Lives here (not in `agents.rs`) because everything after the
+    /// branch-plan step is the worktree-create machinery; the source
+    /// resolution mirrors the TUI's (#124 branch-from-here included) instead
+    /// of `resolve_worktree_source`, which refuses linked-worktree sources.
+    pub(super) fn handle_agent_fork(&mut self, id: String, params: AgentForkParams) -> String {
+        let resolved = match self.resolve_terminal_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let session = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|ws| ws.pane_state(resolved.pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .and_then(super::super::creation::terminal_agent_session_info);
+        let Some(info) = session else {
+            return encode_error(
+                id,
+                "no_agent_session",
+                format!(
+                    "agent target {} has no resumable session — check `flk integration status`",
+                    params.target
+                ),
+            );
+        };
+        let session_ref = crate::agent_resume::AgentSessionRef {
+            kind: info.kind,
+            value: info.value,
+        };
+        let mut plan =
+            match crate::agent_resume::branch_plan(&info.source, &info.agent, &session_ref) {
+                Ok(plan) => plan,
+                Err(crate::agent_resume::BranchUnsupported::ForkUnsupported { agent }) => {
+                    return encode_error(
+                        id,
+                        "unsupported_for_agent",
+                        format!(
+                            "{agent} cannot fork a conversation: only claude has a fork \
+                             affordance (--fork-session); a plain resume would double-attach \
+                             the session id"
+                        ),
+                    );
+                }
+                Err(crate::agent_resume::BranchUnsupported::NotResumable { source, agent }) => {
+                    return encode_error(
+                        id,
+                        "unsupported_for_agent",
+                        format!("{agent} ({source}) has no resume integration to fork from"),
+                    );
+                }
+            };
+
+        let branch = params
+            .branch
+            .unwrap_or_else(|| {
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0);
+                crate::worktree::generated_branch_slug(seed)
+            })
+            .trim()
+            .to_string();
+        if branch.is_empty() {
+            return encode_error(id, "invalid_request", "branch is required");
+        }
+        let base = params.base.unwrap_or_else(|| "HEAD".into());
+
+        let (existing_membership, space, source_checkout_path, source_workspace_id) =
+            match self.worktree_source_metadata(resolved.ws_idx) {
+                Ok(metadata) => metadata,
+                Err(message) => return encode_error(id, "not_git_worktree", message),
+            };
+        let checkout_path = match params.path {
+            Some(path) => match absolute_user_path(&path) {
+                Ok(path) => path,
+                Err(err) => return encode_error(id, err.code, err.message),
+            },
+            None => crate::worktree::default_checkout_path(
+                &self.state.worktree_directory,
+                &space.label,
+                &branch,
+            ),
+        };
+        if let Some(parent_dir) = checkout_path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent_dir) {
+                return encode_error(id, "worktree_create_failed", err.to_string());
+            }
+        }
+        let command = crate::worktree::build_worktree_add_new_branch_command(
+            &source_checkout_path,
+            &checkout_path,
+            &branch,
+            &base,
+        );
+        if let Err(err) = crate::worktree::run_worktree_command(&command) {
+            return encode_error(id, "worktree_create_failed", err);
+        }
+
+        // #106/#159 pivot: explicit param wins; omitted falls back to the
+        // configured template; empty string opts out.
+        let pivot_template = params
+            .pivot
+            .unwrap_or_else(|| self.state.branch_pivot_message.clone());
+        let pivot = pivot_template.replace("<branch>", branch.trim());
+        let argv_len_before = plan.argv.len();
+        crate::agent_resume::append_pivot_message(&mut plan, &pivot);
+        let seeded = plan.argv.len() > argv_len_before;
+
+        let (rows, cols) = self.state.estimate_pane_size();
+        let ws_idx = match self.spawn_agent_workspace(
+            checkout_path.clone(),
+            rows,
+            cols,
+            &plan.argv,
+            params.focus,
+        ) {
+            Ok((ws_idx, _, _)) => ws_idx,
+            Err(err) => {
+                let body = self.agent_start_error_body(err);
+                // P4: fail toward leaking — the created worktree stays on
+                // disk for the operator rather than being rolled back.
+                return encode_error(
+                    id,
+                    "agent_fork_failed",
+                    format!(
+                        "created worktree at {} but failed to start the forked agent ({}): {}",
+                        checkout_path.display(),
+                        body.code,
+                        body.message
+                    ),
+                );
+            }
+        };
+
+        // Membership stamping mirrors the TUI confirm path: the source keeps
+        // (or gains non-linked) membership; the child is a linked worktree of
+        // the shared repo root.
+        let source_membership =
+            existing_membership.unwrap_or_else(|| crate::workspace::WorktreeSpaceMembership {
+                key: space.key.clone(),
+                label: space.label.clone(),
+                repo_root: space.repo_root.clone(),
+                checkout_path: source_checkout_path,
+                is_linked_worktree: false,
+            });
+        if let Some(ws) = self
+            .state
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.id == source_workspace_id)
+        {
+            ws.worktree_space = Some(source_membership);
+        }
+        if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+            ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+                key: space.key.clone(),
+                label: space.label.clone(),
+                repo_root: space.repo_root.clone(),
+                checkout_path: checkout_path.clone(),
+                is_linked_worktree: true,
+            });
+            if let Some(label) = params.label {
+                ws.set_custom_name(label);
+            }
+        }
+        self.state.mark_session_dirty();
+
+        // Assemble the full response before emitting any event, so a
+        // (defensive, effectively unreachable) internal_error return can
+        // never leave half a fork on the event log.
+        let parent_pane_id = self
+            .public_pane_id(resolved.ws_idx, resolved.pane_id)
+            .unwrap_or_else(|| params.target.clone());
+        let Some(root_pane) = self.root_pane_info(ws_idx, 0) else {
+            return encode_error(
+                id,
+                "internal_error",
+                "forked workspace is missing its root pane",
+            );
+        };
+        // Unique by construction: the child's terminal id is unique per
+        // server run, and one fork creates exactly one child terminal.
+        let run_id = format!("fork:{}", root_pane.terminal_id);
+        let info_source = WorktreeSource {
+            workspace_idx: None,
+            source_checkout_path: space.repo_root.clone(),
+            source_repo_root: space.repo_root.clone(),
+            repo_key: space.key.clone(),
+            repo_name: space.label.clone(),
+        };
+        let Some(worktree) = self.worktree_info_for_checkout(&info_source, ws_idx) else {
+            return encode_error(
+                id,
+                "internal_error",
+                "forked workspace is missing worktree info",
+            );
+        };
+        self.emit_workspace_open_events(ws_idx);
+        // #175 O2: the lineage edge + telemetry ride the verb itself, so the
+        // fork-vs-message question is measurable from day one.
+        self.emit_event(EventEnvelope {
+            event: EventKind::AgentForked,
+            data: EventData::AgentForked {
+                run_id: run_id.clone(),
+                parent_pane_id: parent_pane_id.clone(),
+                parent_workspace_id: self.public_workspace_id(resolved.ws_idx),
+                parent_repo: space.key.clone(),
+                agent: info.agent.clone(),
+                child_workspace_id: self.public_workspace_id(ws_idx),
+                child_pane_id: root_pane.pane_id.clone(),
+                child_worktree: checkout_path.display().to_string(),
+                child_branch: branch.clone(),
+                seeded,
+            },
+        });
+        encode_success(
+            id,
+            ResponseResult::AgentForked {
+                run_id,
+                parent_pane_id,
+                workspace: self.workspace_info(ws_idx),
+                tab: self
+                    .tab_info(ws_idx, 0)
+                    .expect("forked workspace should have an initial tab"),
+                root_pane,
+                worktree,
+                argv: plan.argv,
+                seeded,
             },
         )
     }
@@ -900,7 +1136,11 @@ mod tests {
     }
 
     fn app_with_parent(repo: &Path) -> App {
-        let mut app = test_app();
+        app_with_parent_on(test_app(), repo)
+    }
+
+    fn app_with_parent_on(app: App, repo: &Path) -> App {
+        let mut app = app;
         let mut parent = Workspace::test_new("main");
         parent.identity_cwd = repo.to_path_buf();
         app.state.workspaces = vec![parent];
@@ -1549,6 +1789,351 @@ mod tests {
             )
         }));
 
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// Stamp a persisted agent session on the parent workspace's focused
+    /// pane so `agent.fork` has something to resolve, and return the pane's
+    /// terminal id (a valid `target`).
+    fn stamp_agent_session(app: &mut App, source: &str, agent: &str) -> String {
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("parent pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal");
+        let terminal_id = terminal_id.to_string();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: source.into(),
+            agent: agent.into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-fork").expect("session id"),
+        });
+        terminal_id
+    }
+
+    /// Put a stub `claude` executable on PATH so the forked pane's PTY spawn
+    /// succeeds without the real CLI. Safe: nextest runs each test in its own
+    /// process.
+    fn stub_claude_on_path(name: &str) -> PathBuf {
+        let bin_dir = unique_temp_path(name);
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("claude");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", bin_dir.display()));
+        bin_dir
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_creates_worktree_and_spawns_forked_pane() {
+        let repo = create_committed_repo("api-agent-fork-repo");
+        let worktree_root = unique_temp_path("api-agent-fork-root");
+        let bin_dir = stub_claude_on_path("api-agent-fork-bin");
+        let event_hub = crate::api::EventHub::default();
+        let mut app = app_with_parent_on(test_app_with_event_hub(event_hub.clone()), &repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target: target.clone(),
+                branch: Some("fork/alt-approach".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some("try the alternative on <branch>".into()),
+                focus: false,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked {
+            run_id,
+            parent_pane_id,
+            workspace,
+            tab,
+            root_pane,
+            worktree,
+            argv,
+            seeded,
+        } = success.result
+        else {
+            panic!("expected agent_forked response");
+        };
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--resume",
+                "sess-fork",
+                "--fork-session",
+                "try the alternative on fork/alt-approach",
+            ]
+        );
+        assert!(seeded);
+        assert_eq!(run_id, format!("fork:{}", root_pane.terminal_id));
+        let expected_parent = app.state.workspaces[0]
+            .focused_pane_id()
+            .and_then(|pane_id| app.public_pane_id(0, pane_id))
+            .expect("parent public pane id");
+        assert_eq!(parent_pane_id, expected_parent);
+        assert_eq!(tab.workspace_id, workspace.workspace_id);
+        assert_eq!(root_pane.workspace_id, workspace.workspace_id);
+        assert_eq!(worktree.branch.as_deref(), Some("fork/alt-approach"));
+        assert!(Path::new(&worktree.path).join("README.md").exists());
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(
+            !app.state.workspaces[0]
+                .worktree_space()
+                .unwrap()
+                .is_linked_worktree,
+            "source keeps parent membership"
+        );
+        assert!(
+            app.state.workspaces[1]
+                .worktree_space()
+                .unwrap()
+                .is_linked_worktree,
+            "child is a linked worktree"
+        );
+
+        // #175 O2: the lineage/telemetry event is emitted with the verb.
+        let events = event_hub.events_after(0);
+        let forked = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                EventData::AgentForked {
+                    run_id: event_run_id,
+                    parent_pane_id: event_parent,
+                    parent_repo,
+                    agent,
+                    child_branch,
+                    child_worktree,
+                    seeded: event_seeded,
+                    ..
+                } => Some((
+                    event_run_id.clone(),
+                    event_parent.clone(),
+                    parent_repo.clone(),
+                    agent.clone(),
+                    child_branch.clone(),
+                    child_worktree.clone(),
+                    *event_seeded,
+                )),
+                _ => None,
+            })
+            .expect("agent_forked event must be emitted");
+        assert_eq!(forked.0, run_id);
+        assert_eq!(forked.1, parent_pane_id);
+        assert!(!forked.2.is_empty(), "parent repo key present");
+        assert_eq!(forked.3, "claude");
+        assert_eq!(forked.4, "fork/alt-approach");
+        assert_eq!(forked.5, worktree.path);
+        assert!(forked.6, "pivot seeded");
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_empty_pivot_opts_out_of_seed() {
+        let repo = create_committed_repo("api-agent-fork-nopivot-repo");
+        let worktree_root = unique_temp_path("api-agent-fork-nopivot-root");
+        let bin_dir = stub_claude_on_path("api-agent-fork-nopivot-bin");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.branch_pivot_message = "configured template for <branch>".into();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/no-seed".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some(String::new()),
+                focus: false,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked {
+            argv,
+            seeded,
+            worktree,
+            ..
+        } = success.result
+        else {
+            panic!("expected agent_forked response");
+        };
+        assert!(!seeded, "empty pivot must opt out of the configured seed");
+        assert_eq!(
+            argv,
+            vec!["claude", "--resume", "sess-fork", "--fork-session"]
+        );
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_branches_from_a_linked_worktree_source() {
+        // #124 branch-from-here over the API: the target pane lives in a
+        // flock-managed linked worktree; the fork branches from that
+        // checkout's HEAD and the source keeps its linked membership.
+        let repo = create_committed_repo("api-agent-fork-linked-repo");
+        let linked = unique_temp_path("api-agent-fork-linked-child");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "task/linked-source",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let worktree_root = unique_temp_path("api-agent-fork-linked-root");
+        let bin_dir = stub_claude_on_path("api-agent-fork-linked-bin");
+        let mut app = app_with_parent(&linked);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: repo.join(".git").display().to_string(),
+            label: "flock-test".into(),
+            repo_root: repo.clone(),
+            checkout_path: linked.clone(),
+            is_linked_worktree: true,
+        });
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/from-linked".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some(String::new()),
+                focus: false,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked { worktree, .. } = success.result else {
+            panic!("expected agent_forked response: {response}");
+        };
+        assert_eq!(worktree.branch.as_deref(), Some("fork/from-linked"));
+        let source_space = app.state.workspaces[0]
+            .worktree_space()
+            .expect("source keeps membership");
+        assert!(
+            source_space.is_linked_worktree,
+            "branch-from-here must not demote the source to a parent"
+        );
+        let child_space = app.state.workspaces[1]
+            .worktree_space()
+            .expect("child membership");
+        assert!(child_space.is_linked_worktree);
+        assert_eq!(child_space.repo_root, repo);
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let remove_linked = crate::worktree::build_worktree_remove_command(&repo, &linked, true);
+        let _ = crate::worktree::run_worktree_command(&remove_linked);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_refuses_unsupported_agent_and_spawns_nothing() {
+        let repo = create_committed_repo("api-agent-fork-codex-repo");
+        let worktree_root = unique_temp_path("api-agent-fork-codex-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let target = stamp_agent_session(&mut app, "flock:codex", "codex");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/never".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: None,
+                focus: false,
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "unsupported_for_agent");
+        assert!(
+            error.error.message.contains("codex"),
+            "{}",
+            error.error.message
+        );
+        assert_eq!(app.state.workspaces.len(), 1, "nothing spawned");
+        assert!(
+            !worktree_root.exists(),
+            "no worktree may be created for a refused fork"
+        );
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_requires_a_resumable_session() {
+        let repo = create_committed_repo("api-agent-fork-nosession-repo");
+        let mut app = app_with_parent(&repo);
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("parent pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target: terminal_id.to_string(),
+                branch: None,
+                base: None,
+                path: None,
+                label: None,
+                pivot: None,
+                focus: false,
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "no_agent_session");
+        assert_eq!(app.state.workspaces.len(), 1);
         let _ = std::fs::remove_dir_all(repo);
     }
 }
