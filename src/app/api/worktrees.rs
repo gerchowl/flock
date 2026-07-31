@@ -361,6 +361,23 @@ impl App {
                 "forked workspace is missing worktree info",
             );
         };
+        // #175 O2: the lineage edge + telemetry ride the verb itself, so the
+        // fork-vs-message question is measurable from day one.
+        self.emit_event(EventEnvelope {
+            event: EventKind::AgentForked,
+            data: EventData::AgentForked {
+                run_id: run_id.clone(),
+                parent_pane_id: parent_pane_id.clone(),
+                parent_workspace_id: self.public_workspace_id(resolved.ws_idx),
+                parent_repo: space.key.clone(),
+                agent: info.agent.clone(),
+                child_workspace_id: self.public_workspace_id(ws_idx),
+                child_pane_id: root_pane.pane_id.clone(),
+                child_worktree: checkout_path.display().to_string(),
+                child_branch: branch.clone(),
+                seeded,
+            },
+        });
         encode_success(
             id,
             ResponseResult::AgentForked {
@@ -1115,7 +1132,11 @@ mod tests {
     }
 
     fn app_with_parent(repo: &Path) -> App {
-        let mut app = test_app();
+        app_with_parent_on(test_app(), repo)
+    }
+
+    fn app_with_parent_on(app: App, repo: &Path) -> App {
+        let mut app = app;
         let mut parent = Workspace::test_new("main");
         parent.identity_cwd = repo.to_path_buf();
         app.state.workspaces = vec![parent];
@@ -1815,7 +1836,8 @@ mod tests {
         let repo = create_committed_repo("api-agent-fork-repo");
         let worktree_root = unique_temp_path("api-agent-fork-root");
         let bin_dir = stub_claude_on_path("api-agent-fork-bin");
-        let mut app = app_with_parent(&repo);
+        let event_hub = crate::api::EventHub::default();
+        let mut app = app_with_parent_on(test_app_with_event_hub(event_hub.clone()), &repo);
         app.state.worktree_directory = worktree_root.clone();
         let target = stamp_agent_session(&mut app, "flock:claude", "claude");
 
@@ -1882,6 +1904,40 @@ mod tests {
                 .is_linked_worktree,
             "child is a linked worktree"
         );
+
+        // #175 O2: the lineage/telemetry event is emitted with the verb.
+        let events = event_hub.events_after(0);
+        let forked = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                EventData::AgentForked {
+                    run_id: event_run_id,
+                    parent_pane_id: event_parent,
+                    parent_repo,
+                    agent,
+                    child_branch,
+                    child_worktree,
+                    seeded: event_seeded,
+                    ..
+                } => Some((
+                    event_run_id.clone(),
+                    event_parent.clone(),
+                    parent_repo.clone(),
+                    agent.clone(),
+                    child_branch.clone(),
+                    child_worktree.clone(),
+                    *event_seeded,
+                )),
+                _ => None,
+            })
+            .expect("agent_forked event must be emitted");
+        assert_eq!(forked.0, run_id);
+        assert_eq!(forked.1, parent_pane_id);
+        assert!(!forked.2.is_empty(), "parent repo key present");
+        assert_eq!(forked.3, "claude");
+        assert_eq!(forked.4, "fork/alt-approach");
+        assert_eq!(forked.5, worktree.path);
+        assert!(forked.6, "pivot seeded");
 
         let remove =
             crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);

@@ -851,6 +851,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    AgentForked,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1335,6 +1336,22 @@ pub enum EventData {
         custom_status: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
+    /// the epic's telemetry design). One event per `agent.fork`.
+    AgentForked {
+        run_id: String,
+        parent_pane_id: String,
+        parent_workspace_id: String,
+        /// The shared repo key (git common dir) both sides belong to.
+        parent_repo: String,
+        agent: String,
+        child_workspace_id: String,
+        child_pane_id: String,
+        child_worktree: String,
+        child_branch: String,
+        /// Whether a pivot prompt seeded the fork's opening turn.
+        seeded: bool,
     },
 }
 
