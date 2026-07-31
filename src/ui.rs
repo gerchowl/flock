@@ -7,7 +7,7 @@ use ratatui::{
 
 mod dialogs;
 mod float;
-mod grammar;
+pub(crate) mod grammar;
 mod keybind_help;
 mod medallion;
 mod menus;
@@ -22,7 +22,7 @@ mod settings;
 pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
-mod status;
+pub(crate) mod status;
 mod tabs;
 mod widgets;
 
