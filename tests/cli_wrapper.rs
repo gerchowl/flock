@@ -2240,6 +2240,52 @@ fn agent_commands_work() {
 }
 
 #[test]
+fn agent_fork_command_refuses_cleanly_over_the_socket() {
+    // #175 F1/F2: the CLI wiring and the refusal paths. The success path
+    // (worktree + forked pane) is covered at the handler level; here the
+    // shell pane has no agent session, so the fork must refuse loudly with
+    // a machine-readable code and a non-zero exit, spawning nothing.
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+
+    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(created.status.success());
+    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let root_pane_id = created_json["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // #175 F3: the raw seen bit rides every pane record.
+    assert_eq!(created_json["result"]["root_pane"]["seen"], true);
+
+    let no_session = run_cli(&socket_path, &["agent", "fork", &root_pane_id]);
+    assert!(!no_session.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&no_session.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "no_agent_session");
+
+    let missing = run_cli(&socket_path, &["agent", "fork", "no-such-agent"]);
+    assert!(!missing.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_not_found");
+
+    let usage = run_cli(&socket_path, &["agent", "fork"]);
+    assert_eq!(usage.status.code(), Some(2));
+
+    let listed = run_cli_json(&socket_path, &["agent", "list"]);
+    assert_eq!(listed["result"]["agents"].as_array().unwrap().len(), 1);
+
+    cleanup_spawned_flock(flock, base);
+}
+
+#[test]
 fn pane_close_only_removes_the_target_tab_when_other_tabs_exist() {
     let base = unique_test_dir();
     let config_home = base.join("config");

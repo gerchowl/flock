@@ -4,8 +4,8 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
-    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
+    AgentForkParams, AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams,
+    AgentStatus, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -24,6 +24,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "fork" => agent_fork(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
             Ok(0)
@@ -116,6 +117,100 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             split,
             focus,
             argv: args[separator + 1..].to_vec(),
+        }),
+    })?)
+}
+
+/// Fork the target pane's agent conversation into a new linked worktree
+/// (#175 F1). `--pivot ""` / `--no-pivot` opt out of the configured seed
+/// prompt; omitting the flag uses the `worktrees.branch_pivot_message`
+/// template with `<branch>` resolved server-side.
+fn agent_fork(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
+    let Some(target) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+
+    let mut branch = None;
+    let mut base = None;
+    let mut path = None;
+    let mut label = None;
+    let mut pivot = None;
+    let mut focus = false;
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--branch" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --branch");
+                    return Ok(2);
+                };
+                branch = Some(value.clone());
+                index += 2;
+            }
+            "--base" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --base");
+                    return Ok(2);
+                };
+                base = Some(value.clone());
+                index += 2;
+            }
+            "--path" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --path");
+                    return Ok(2);
+                };
+                path = Some(value.clone());
+                index += 2;
+            }
+            "--label" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --label");
+                    return Ok(2);
+                };
+                label = Some(value.clone());
+                index += 2;
+            }
+            "--pivot" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --pivot");
+                    return Ok(2);
+                };
+                pivot = Some(value.clone());
+                index += 2;
+            }
+            "--no-pivot" => {
+                pivot = Some(String::new());
+                index += 1;
+            }
+            "--focus" => {
+                focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                focus = false;
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:fork".into(),
+        method: Method::AgentFork(AgentForkParams {
+            target: target.clone(),
+            branch,
+            base,
+            path,
+            label,
+            pivot,
+            focus,
         }),
     })?)
 }
@@ -429,6 +524,7 @@ fn print_agent_help() {
     eprintln!("  flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"
