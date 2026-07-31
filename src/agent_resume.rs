@@ -154,20 +154,43 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     })
 }
 
+/// Why a session cannot be branched into a fork (#175 F2). Distinguishes
+/// "there is nothing to resume" from "resuming would be dangerous": a plain
+/// resume of a fork target puts two live processes on one session id, so the
+/// old silent plain-resume fallback is now a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchUnsupported {
+    /// The (source, agent) pair is not an official resumable integration, or
+    /// the session ref shape is wrong for the agent — no resume plan exists.
+    NotResumable { source: String, agent: String },
+    /// The agent resumes sessions but its CLI has no conversation-fork
+    /// affordance; forking would double-attach the same session id.
+    ForkUnsupported { agent: String },
+}
+
 /// Like [`plan`], but for branching: the new pane should fork the
-/// conversation instead of taking over the original session. Claude has a
-/// dedicated `--fork-session` flag; other agents fall back to a plain
-/// resume of the same session.
+/// conversation instead of taking over the original session. Only Claude has
+/// a fork affordance (`--fork-session`); every other agent is refused with a
+/// typed reason instead of silently degrading to a plain resume (#175 F2).
 pub fn branch_plan(
     source: &str,
     agent: &str,
     session_ref: &AgentSessionRef,
-) -> Option<AgentResumePlan> {
-    let mut plan = plan(source, agent, session_ref)?;
+) -> Result<AgentResumePlan, BranchUnsupported> {
+    let Some(mut plan) = plan(source, agent, session_ref) else {
+        return Err(BranchUnsupported::NotResumable {
+            source: source.to_string(),
+            agent: agent.to_string(),
+        });
+    };
     if source == "flock:claude" {
         plan.argv.push("--fork-session".into());
+        Ok(plan)
+    } else {
+        Err(BranchUnsupported::ForkUnsupported {
+            agent: agent.to_string(),
+        })
     }
-    Some(plan)
 }
 
 /// Append a one-shot pivot prompt as the forked agent's first turn (#106).
@@ -420,24 +443,70 @@ mod tests {
         append_pivot_message(&mut claude2, "");
         assert_eq!(claude2.argv.last().unwrap(), "--fork-session");
 
-        // Non-claude (codex): no positional prompt appended even if asked.
-        let mut codex = branch_plan("flock:codex", "codex", &session).unwrap();
+        // Non-claude (codex): a plain-resume plan gets no positional prompt
+        // appended even if asked.
+        let mut codex = plan("flock:codex", "codex", &session).unwrap();
         let before = codex.argv.clone();
         append_pivot_message(&mut codex, "PIVOT now");
         assert_eq!(codex.argv, before);
     }
 
     #[test]
-    fn branch_plan_non_claude_agents_fall_back_to_plain_resume() {
-        let session = AgentSessionRef::id("codex-session").unwrap();
-        let plan = branch_plan("flock:codex", "codex", &session).unwrap();
-        assert_eq!(plan.argv, vec!["codex", "resume", "codex-session"]);
+    fn branch_plan_refuses_non_claude_agents_instead_of_plain_resume() {
+        // #175 F2: the old behavior silently returned a plain resume, which
+        // races two processes on one session id. Every resumable non-Claude
+        // agent must now be a typed refusal.
+        for (source, agent, session_ref) in [
+            ("flock:codex", "codex", AgentSessionRef::id("s").unwrap()),
+            (
+                "flock:copilot",
+                "copilot",
+                AgentSessionRef::id("s").unwrap(),
+            ),
+            (
+                "flock:pi",
+                "pi",
+                AgentSessionRef::path("/tmp/s.jsonl").unwrap(),
+            ),
+            ("flock:hermes", "hermes", AgentSessionRef::id("s").unwrap()),
+            (
+                "flock:opencode",
+                "opencode",
+                AgentSessionRef::id("s").unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                branch_plan(source, agent, &session_ref),
+                Err(BranchUnsupported::ForkUnsupported {
+                    agent: agent.to_string()
+                }),
+                "{agent} must refuse to fork"
+            );
+        }
     }
 
     #[test]
-    fn branch_plan_rejects_unofficial_sources() {
+    fn branch_plan_classifies_unofficial_sources_as_not_resumable() {
         let session = AgentSessionRef::id("claude-session").unwrap();
-        assert!(branch_plan("tmux:claude", "claude", &session).is_none());
+        assert_eq!(
+            branch_plan("tmux:claude", "claude", &session),
+            Err(BranchUnsupported::NotResumable {
+                source: "tmux:claude".into(),
+                agent: "claude".into()
+            })
+        );
+        // Agents flock detects but has no resume integration for (#175: the
+        // "not 9" gap — omp/kimi/qodercli have no official resume source).
+        for agent in ["omp", "kimi", "qodercli"] {
+            assert_eq!(
+                branch_plan(&format!("flock:{agent}"), agent, &session),
+                Err(BranchUnsupported::NotResumable {
+                    source: format!("flock:{agent}"),
+                    agent: agent.into()
+                }),
+                "{agent} has no resume integration and must be not_resumable"
+            );
+        }
     }
 
     #[test]

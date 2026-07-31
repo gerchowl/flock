@@ -47,6 +47,14 @@ fn resolve_seed_prompt(seed: &str, branch: &str) -> String {
     seed.replace("<branch>", branch.trim())
 }
 
+/// Why the focused pane can't be branched: nothing to resume at all, or a
+/// resumable agent whose CLI can't fork a conversation (#175 F2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchUnavailable {
+    NoSession,
+    Unsupported(crate::agent_resume::BranchUnsupported),
+}
+
 impl App {
     fn worktree_source_metadata(
         &self,
@@ -173,10 +181,13 @@ impl App {
     /// dialog as new-worktree, but the created workspace's root pane resumes
     /// a fork of the session instead of starting a shell.
     pub(crate) fn open_branch_session_dialog(&mut self, ws_idx: usize) {
-        let Some(plan) = self.focused_branch_plan(ws_idx) else {
-            let notice = self.branch_unavailable_notice(ws_idx);
-            self.show_action_notice(notice);
-            return;
+        let plan = match self.focused_branch_plan(ws_idx) {
+            Ok(plan) => plan,
+            Err(unavailable) => {
+                let notice = self.branch_unavailable_notice(ws_idx, unavailable);
+                self.show_action_notice(notice);
+                return;
+            }
         };
         self.open_new_linked_worktree_dialog(ws_idx, None);
         // Pre-fill the editable seed with the pivot template (#159). The
@@ -200,7 +211,18 @@ impl App {
     /// got flock's hooks) — so the agent never reports its session id. Point at
     /// `flk integration status` instead of the flat "no resumable agent
     /// session", which sent a real debugging session down the wrong path.
-    fn branch_unavailable_notice(&self, ws_idx: usize) -> String {
+    /// A fork-unsupported agent gets the honest reason instead (#175 F2): the
+    /// old behavior silently plain-resumed, racing two processes on one
+    /// session id.
+    fn branch_unavailable_notice(&self, ws_idx: usize, unavailable: BranchUnavailable) -> String {
+        if let BranchUnavailable::Unsupported(
+            crate::agent_resume::BranchUnsupported::ForkUnsupported { agent },
+        ) = unavailable
+        {
+            return format!(
+                "branch session: {agent} can't fork a conversation — only claude supports --fork-session"
+            );
+        }
         let agent = self
             .state
             .workspaces
@@ -219,17 +241,25 @@ impl App {
 
     /// Resolve a fork-aware resume plan for the focused pane of `ws_idx`.
     /// Prefers the live hook-authority session over the persisted one.
-    fn focused_branch_plan(&self, ws_idx: usize) -> Option<crate::agent_resume::AgentResumePlan> {
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_id = ws.focused_pane_id()?;
-        let pane = ws.pane_state(pane_id)?;
-        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
-        let info = super::creation::terminal_agent_session_info(terminal)?;
+    fn focused_branch_plan(
+        &self,
+        ws_idx: usize,
+    ) -> Result<crate::agent_resume::AgentResumePlan, BranchUnavailable> {
+        let info = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| Some((ws, ws.focused_pane_id()?)))
+            .and_then(|(ws, pane_id)| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .and_then(super::creation::terminal_agent_session_info)
+            .ok_or(BranchUnavailable::NoSession)?;
         let session_ref = crate::agent_resume::AgentSessionRef {
             kind: info.kind,
             value: info.value,
         };
         crate::agent_resume::branch_plan(&info.source, &info.agent, &session_ref)
+            .map_err(BranchUnavailable::Unsupported)
     }
 
     pub(crate) fn open_remove_linked_worktree_confirmation(&mut self, ws_idx: usize) {
@@ -2049,6 +2079,49 @@ mod tests {
         assert_eq!(
             plan.argv,
             vec!["claude", "--resume", "sess-1", "--fork-session"]
+        );
+    }
+
+    #[test]
+    fn branch_session_dialog_refuses_fork_unsupported_agent_loudly() {
+        // #175 F2: a resumable non-Claude agent must be refused with the
+        // real reason — never silently plain-resumed into a double attach.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("workspace should have a pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state should exist")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-2")
+                .expect("session id should validate"),
+        });
+        app.state.terminals.insert(terminal_id, terminal);
+
+        app.open_branch_session_dialog(0);
+
+        assert!(app.state.worktree_create.is_none(), "nothing staged");
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(
+            app.state.action_notice.as_deref(),
+            Some("branch session: codex can't fork a conversation — only claude supports --fork-session")
         );
     }
 

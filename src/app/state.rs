@@ -2130,7 +2130,7 @@ impl AppState {
             kind: info.kind,
             value: info.value,
         };
-        crate::agent_resume::branch_plan(&info.source, &info.agent, &session_ref).is_some()
+        crate::agent_resume::branch_plan(&info.source, &info.agent, &session_ref).is_ok()
     }
 
     /// The sidebar section scopes, bundled for session-snapshot capture.
