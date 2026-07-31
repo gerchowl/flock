@@ -25,6 +25,25 @@ pub(crate) fn member_label(server: &str, target: &str) -> String {
     format!("{server}:{target}")
 }
 
+/// A member row's identity per the viewer's `server_label` mode (#164). In
+/// `icon` mode a server that declared a (usable) icon reads `<glyph> · <target>`
+/// — the symbol standing in for the hostname — falling back to the uniform
+/// `<host>:<target>` when it has no icon. `name`/`both` keep `<host>:<target>`,
+/// so the default look is unchanged; only the opt-in `icon` mode shifts.
+pub(crate) fn member_label_moded(
+    mode: crate::config::ServerLabelConfig,
+    icon_name: Option<&str>,
+    host: &str,
+    target: &str,
+) -> String {
+    if mode == crate::config::ServerLabelConfig::Icon {
+        if let Some(glyph) = icon_name.and_then(crate::server_icons::resolve) {
+            return format!("{glyph} \u{00b7} {target}");
+        }
+    }
+    member_label(host, target)
+}
+
 /// The target half of a local member's label: the branch for a git checkout
 /// (the branch IS the label — the two-line name+branch row collapses), else
 /// the workspace display name for misc (non-git) workspaces.
@@ -51,7 +70,9 @@ pub(crate) fn local_member_label(
     ws: &Workspace,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> String {
-    member_label(
+    member_label_moded(
+        app.server_label,
+        crate::app::configured_node_icon().as_deref(),
         &local_server_name(),
         &local_member_target(app, ws, terminal_runtimes),
     )
@@ -150,11 +171,17 @@ pub(crate) fn remote_member_target(summary: &crate::api::schema::PeerWorkspaceSu
 /// group-leader row to nest members beneath. When the peer reports no project
 /// identity, falls back to the bare `<host>:<target>` member label.
 pub(crate) fn solo_remote_label(
+    mode: crate::config::ServerLabelConfig,
     peer: &crate::peers::PeerSummaryState,
     summary: &crate::api::schema::PeerWorkspaceSummary,
 ) -> String {
     let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
-    let member = member_label(host, &remote_member_target(summary));
+    let member = member_label_moded(
+        mode,
+        peer.icon.as_deref(),
+        host,
+        &remote_member_target(summary),
+    );
     match summary
         .project_key
         .as_deref()
@@ -357,7 +384,7 @@ mod tests {
         let peer = peer_named("sage");
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
-            solo_remote_label(&peer, &summary),
+            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
             "gerchowl/flock \u{00b7} sage:main"
         );
     }
@@ -368,7 +395,47 @@ mod tests {
         // dangling `· `.
         let peer = peer_named("sage");
         let summary = remote_summary(None, Some("wip"));
-        assert_eq!(solo_remote_label(&peer, &summary), "sage:wip");
+        assert_eq!(
+            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
+            "sage:wip"
+        );
+    }
+
+    #[test]
+    fn member_label_moded_icon_replaces_host_with_glyph() {
+        use crate::config::ServerLabelConfig;
+        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        // `icon` mode: the server's glyph stands in for the host, `· branch`.
+        assert_eq!(
+            member_label_moded(ServerLabelConfig::Icon, Some("anvil"), "anvil", "fix/pty"),
+            format!("{glyph} \u{00b7} fix/pty")
+        );
+        // No usable icon → falls back to the uniform `host:branch`.
+        assert_eq!(
+            member_label_moded(ServerLabelConfig::Icon, None, "ksb", "wip"),
+            "ksb:wip"
+        );
+        // `both` / `name` are unchanged: always `host:branch`.
+        assert_eq!(
+            member_label_moded(ServerLabelConfig::Both, Some("anvil"), "anvil", "fix/pty"),
+            "anvil:fix/pty"
+        );
+        assert_eq!(
+            member_label_moded(ServerLabelConfig::Name, Some("anvil"), "anvil", "fix/pty"),
+            "anvil:fix/pty"
+        );
+    }
+
+    #[test]
+    fn solo_remote_label_icon_mode_uses_glyph_member() {
+        let glyph = crate::server_icons::glyph("toad").unwrap();
+        let mut peer = peer_named("sage");
+        peer.icon = Some("toad".into());
+        let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
+        assert_eq!(
+            solo_remote_label(crate::config::ServerLabelConfig::Icon, &peer, &summary),
+            format!("gerchowl/flock \u{00b7} {glyph} \u{00b7} main")
+        );
     }
 
     #[test]
