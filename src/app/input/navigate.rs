@@ -827,7 +827,10 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::FocusAgent(idx) => {
-            if state.focus_agent_entry(idx) {
+            // The pressed digit numbers LOCAL rows contiguously (remotes are
+            // interleaved by the panel sort but are unaddressable), matching
+            // the ordinal rendered on each local row (#147).
+            if state.focus_local_agent_entry(idx) {
                 leave_navigate_mode(state);
             }
         }

@@ -736,6 +736,23 @@ impl AppState {
                         return None;
                     }
 
+                    // Left-clicking a project-group header row toggles collapse
+                    // — symmetric to the right-click "Collapse" menu entry
+                    // (#122). The visible ▾/▸ triangle lives on the header row,
+                    // not a card row, so without this branch clicking the
+                    // triangle silently no-ops. Header rows and card rows never
+                    // share a `row`, so this is safe to run before the card
+                    // hit-tests below.
+                    if let Some(key) = self.space_header_at_row(mouse.row) {
+                        if self.collapsed_space_keys.contains(&key) {
+                            self.collapsed_space_keys.remove(&key);
+                        } else {
+                            self.collapsed_space_keys.insert(key);
+                        }
+                        self.mark_session_dirty();
+                        return None;
+                    }
+
                     let cards = if self.view.workspace_card_areas.is_empty() {
                         crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
                     } else {
