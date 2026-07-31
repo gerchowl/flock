@@ -319,7 +319,7 @@ fn remote_workspace_detail(
     };
     let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
     let mut parts = vec![
-        super::grammar::solo_remote_label(peer, summary),
+        super::grammar::solo_remote_label(app.server_label, peer, summary),
         format!("server {host}"),
     ];
     if let Some(agent) = summary.agent.as_deref().filter(|a| !a.is_empty()) {

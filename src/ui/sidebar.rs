@@ -1002,7 +1002,14 @@ pub(crate) fn remote_entry_label(
         return String::new();
     };
     let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
-    let member = super::grammar::member_label(host, &super::grammar::remote_member_target(ws));
+    // #164: in `icon` mode the member reads `<glyph> · <branch>` (the server's
+    // gossiped icon standing in for the host), else `<host>:<branch>`.
+    let member = super::grammar::member_label_moded(
+        app.server_label,
+        peer.icon.as_deref(),
+        host,
+        &super::grammar::remote_member_target(ws),
+    );
     if indented {
         return member;
     }
