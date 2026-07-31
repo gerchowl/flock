@@ -344,6 +344,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentRename(_) => "agent.rename",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentFork(_) => "agent.fork",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneMove(_) => "pane.move",
         Method::PaneList(_) => "pane.list",

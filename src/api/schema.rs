@@ -72,6 +72,8 @@ pub enum Method {
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
+    #[serde(rename = "agent.fork")]
+    AgentFork(AgentForkParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -336,6 +338,36 @@ pub struct AgentStartParams {
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+}
+
+/// Fork a pane's agent conversation into a new linked worktree (#175 F1):
+/// the socket twin of the TUI `branch_session` flow. The new workspace's
+/// root pane resumes a fork of the target's session (`--fork-session`),
+/// optionally seeded with a pivot prompt as its opening turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentForkParams {
+    /// Pane id, terminal id, or agent name — same grammar as `agent.send`.
+    pub target: String,
+    /// New branch name; a slug is generated when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Base ref for the new branch (default `HEAD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Absolute checkout path; derived from the worktree directory when
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Custom label for the new workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Pivot prompt injected as the fork's opening turn. Omitted ⇒ the
+    /// configured `worktrees.branch_pivot_message` template; empty string ⇒
+    /// no seed. `<branch>` resolves to the final branch name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<String>,
+    #[serde(default)]
+    pub focus: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -946,6 +978,19 @@ pub enum ResponseResult {
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+    },
+    AgentForked {
+        /// Unique id for this fork, stamped on the lineage event (#175 O2).
+        run_id: String,
+        /// The pane whose session was forked, as a public pane id.
+        parent_pane_id: String,
+        workspace: WorkspaceInfo,
+        tab: TabInfo,
+        root_pane: PaneInfo,
+        worktree: WorktreeInfo,
+        argv: Vec<String>,
+        /// Whether a pivot prompt was injected as the fork's opening turn.
+        seeded: bool,
     },
     AgentList {
         agents: Vec<AgentInfo>,

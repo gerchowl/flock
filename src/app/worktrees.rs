@@ -56,7 +56,9 @@ pub(crate) enum BranchUnavailable {
 }
 
 impl App {
-    fn worktree_source_metadata(
+    /// `pub(super)` so the `agent.fork` API handler shares the TUI's source
+    /// semantics (#124 branch-from-here) instead of re-deriving them.
+    pub(super) fn worktree_source_metadata(
         &self,
         ws_idx: usize,
     ) -> Result<
