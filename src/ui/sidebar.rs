@@ -1840,7 +1840,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 let Some(snapshot) = app.fleet_snapshot.as_ref() else {
                     continue;
                 };
-                home_server_rows(snapshot, p)
+                home_server_rows(snapshot, p, app.server_label)
             }
             Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
                 let Some(peer) = app
@@ -1850,13 +1850,13 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 else {
                     continue;
                 };
-                snapshot_server_rows(peer, p)
+                snapshot_server_rows(peer, p, app.server_label)
             }
             Some(crate::app::state::PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
                 let Some(peer) = app.peer_summaries.get(peer_idx) else {
                     continue;
                 };
-                peer_server_rows(peer, p)
+                peer_server_rows(peer, p, app.server_label)
             }
             Some(crate::app::state::PeerSwitchRequest::RelayedPeer { .. }) => {
                 // Rendering relayed cache rows on the LOCAL band is deferred
@@ -2041,18 +2041,45 @@ fn server_icon_span(icon_name: Option<&str>, style: Style) -> Span<'static> {
     }
 }
 
+/// The name field of a band row, per the viewer's `server_label` mode (#164):
+/// `both` (default) = the fixed icon slot + hostname; `icon` = the glyph alone
+/// (falling back to the hostname when the server declared no icon); `name` =
+/// the bare hostname (the pre-icon look). The band's global name-pad aligns the
+/// count columns across whatever widths these produce.
+fn server_name_spans(
+    icon_name: Option<&str>,
+    host: &str,
+    mode: crate::config::ServerLabelConfig,
+    style: Style,
+) -> Vec<Span<'static>> {
+    use crate::config::ServerLabelConfig;
+    match mode {
+        ServerLabelConfig::Name => vec![Span::styled(host.to_string(), style)],
+        ServerLabelConfig::Both => vec![
+            server_icon_span(icon_name, style),
+            Span::styled(host.to_string(), style),
+        ],
+        ServerLabelConfig::Icon => match icon_name.and_then(crate::server_icons::resolve) {
+            Some(glyph) => vec![Span::styled(glyph.to_string(), style)],
+            None => vec![Span::styled(host.to_string(), style)],
+        },
+    }
+}
+
 fn self_server_rows(app: &AppState) -> ServerRowBuild {
     use super::status::{band_battery_style, battery_icon, format_net_io, push_band_metric};
     let p = &app.palette;
     // No self marker (user: redundant) — the current-row highlight fill and
     // band position already say "this is where you are".
     let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
-    let name = vec![
-        // #164: our OWN self-declared icon, resolved locally (matches what we
-        // gossip so the self row and peers' view of us agree).
-        server_icon_span(crate::app::configured_node_icon().as_deref(), name_style),
-        Span::styled(crate::app::short_host_name(), name_style),
-    ];
+    // #164: our OWN self-declared icon, resolved locally (matches what we
+    // gossip so the self row and peers' view of us agree).
+    let name = server_name_spans(
+        crate::app::configured_node_icon().as_deref(),
+        &crate::app::short_host_name(),
+        app.server_label,
+        name_style,
+    );
 
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     let mut health: Vec<Span<'static>> = Vec::new();
@@ -2097,21 +2124,21 @@ fn self_server_rows(app: &AppState) -> ServerRowBuild {
 fn home_server_rows(
     snapshot: &crate::peers::FleetSnapshotState,
     p: &crate::app::state::Palette,
+    mode: crate::config::ServerLabelConfig,
 ) -> ServerRowBuild {
     // The way-home row renders like any server row (user: "I know my home")
     // — its pinned slot-0 position IS the label; no arrow, no suffix.
     let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
-    let name = vec![
-        // #164: the origin's self-declared icon, carried in its summary.
-        server_icon_span(
-            snapshot
-                .origin_summary
-                .as_ref()
-                .and_then(|origin| origin.icon.as_deref()),
-            name_style,
-        ),
-        Span::styled(snapshot.origin.clone(), name_style),
-    ];
+    // #164: the origin's self-declared icon, carried in its summary.
+    let name = server_name_spans(
+        snapshot
+            .origin_summary
+            .as_ref()
+            .and_then(|origin| origin.icon.as_deref()),
+        &snapshot.origin,
+        mode,
+        name_style,
+    );
     // The carried origin summary (#66) makes the home row live like a peer
     // row: the hub's own machine health below, its workspace tally in the
     // count columns. Falls back to the bare snapshot-age line when no origin
@@ -2168,8 +2195,9 @@ fn home_server_rows(
 fn snapshot_server_rows(
     peer: &crate::peers::PeerSummaryState,
     p: &crate::app::state::Palette,
+    mode: crate::config::ServerLabelConfig,
 ) -> ServerRowBuild {
-    let mut build = peer_server_rows(peer, p);
+    let mut build = peer_server_rows(peer, p, mode);
     // The down (ghost) form already carries the broken-link icon + age.
     if peer.reachability() != crate::peers::PeerReachability::Down {
         if let Some(at) = peer.last_ok {
@@ -2193,6 +2221,7 @@ fn snapshot_server_rows(
 fn peer_server_rows(
     peer: &crate::peers::PeerSummaryState,
     p: &crate::app::state::Palette,
+    mode: crate::config::ServerLabelConfig,
 ) -> ServerRowBuild {
     use crate::peers::PeerReachability;
     let reach = peer.reachability();
@@ -2215,10 +2244,7 @@ fn peer_server_rows(
             .add_modifier(Modifier::ITALIC | Modifier::CROSSED_OUT);
         // #164: the icon degrades with the row — a lit icon beside a struck-out
         // host reads as a half-painted bug; identity dims as one unit.
-        let name = vec![
-            server_icon_span(peer.icon.as_deref(), ghost_style),
-            Span::styled(host, ghost_style),
-        ];
+        let name = server_name_spans(peer.icon.as_deref(), &host, mode, ghost_style);
         let title_rest = vec![Span::styled(
             age,
             Style::default()
@@ -2251,11 +2277,8 @@ fn peer_server_rows(
     }
 
     let name_style = Style::default().fg(p.subtext0);
-    let name = vec![
-        // #164: the peer's self-declared icon (gossiped name → glyph here).
-        server_icon_span(peer.icon.as_deref(), name_style),
-        Span::styled(host, name_style),
-    ];
+    // #164: the peer's self-declared icon (gossiped name → glyph here).
+    let name = server_name_spans(peer.icon.as_deref(), &host, mode, name_style);
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     if let Some(ms) = peer.latency_ms {
         let color = if ms > crate::peers::PEER_SLOW_LATENCY_MS {
@@ -3676,7 +3699,11 @@ mod tests {
     fn home_server_rows_mark_origin_and_snapshot_age() {
         let app = crate::app::state::AppState::test_new();
         let snapshot = carried_snapshot("mba22", vec![]);
-        let row = home_server_rows(&snapshot, &app.palette);
+        let row = home_server_rows(
+            &snapshot,
+            &app.palette,
+            crate::config::ServerLabelConfig::Both,
+        );
         let name = spans_text(&row.name);
         let health = line_text(&row.health);
         // Ornaments kicked: the home row is just the origin name — its
@@ -3695,7 +3722,7 @@ mod tests {
         let app = crate::app::state::AppState::test_new();
         let mut peer = peer_with_workspaces("anvil", vec![]);
         peer.last_ok = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
-        let row = snapshot_server_rows(&peer, &app.palette);
+        let row = snapshot_server_rows(&peer, &app.palette, crate::config::ServerLabelConfig::Both);
         // The staleness chip rides the title's trailing metrics, not the
         // name field (which must stay paddable).
         let rest = spans_text(&row.title_rest);
@@ -3786,7 +3813,8 @@ mod tests {
         peer.host = Some("mac-studio-12345.local".into());
         peer.latency_ms = Some(10);
 
-        let name = spans_text(&peer_server_rows(&peer, &p).name);
+        let name =
+            spans_text(&peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).name);
         // The leading 2-cell icon slot (#164) is blank (no icon set) → the host
         // follows two spaces.
         assert_eq!(name, "  anvil");
@@ -3823,6 +3851,64 @@ mod tests {
     }
 
     #[test]
+    fn server_name_spans_respects_the_server_label_mode() {
+        use crate::config::ServerLabelConfig;
+        let style = Style::default();
+        let text = |spans: &[Span<'_>]| spans_text(spans);
+        let glyph = crate::server_icons::glyph("laptop").unwrap();
+
+        // `name` = bare hostname, no icon.
+        assert_eq!(
+            text(&server_name_spans(
+                Some("laptop"),
+                "mba22",
+                ServerLabelConfig::Name,
+                style
+            )),
+            "mba22"
+        );
+        // `both` = the 2-cell icon slot + hostname.
+        assert_eq!(
+            text(&server_name_spans(
+                Some("laptop"),
+                "mba22",
+                ServerLabelConfig::Both,
+                style
+            )),
+            format!("{glyph} mba22")
+        );
+        // `icon` = glyph alone...
+        assert_eq!(
+            text(&server_name_spans(
+                Some("laptop"),
+                "mba22",
+                ServerLabelConfig::Icon,
+                style
+            )),
+            glyph
+        );
+        // ...falling back to the hostname when the server declared no (usable) icon.
+        assert_eq!(
+            text(&server_name_spans(
+                None,
+                "ksb",
+                ServerLabelConfig::Icon,
+                style
+            )),
+            "ksb"
+        );
+        assert_eq!(
+            text(&server_name_spans(
+                Some("bogus"),
+                "ksb",
+                ServerLabelConfig::Icon,
+                style
+            )),
+            "ksb"
+        );
+    }
+
+    #[test]
     fn peer_server_rows_render_the_gossiped_icon_glyph() {
         // #164: a peer that gossiped `icon = "anvil"` renders the mapped glyph
         // ahead of its name; both viewers resolve the SAME glyph from the name.
@@ -3832,7 +3918,8 @@ mod tests {
         peer.latency_ms = Some(10);
         peer.icon = Some("anvil".into());
 
-        let name = spans_text(&peer_server_rows(&peer, &p).name);
+        let name =
+            spans_text(&peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).name);
         let glyph = crate::server_icons::glyph("anvil").unwrap();
         assert_eq!(name, format!("{glyph} anvil"));
     }
@@ -3897,7 +3984,7 @@ mod tests {
             mem_total: Some(64 * 1024 * 1024 * 1024),
             disk_free: None,
         });
-        let row = peer_server_rows(&peer, &p);
+        let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         let name = spans_text(&row.name);
         let rest = spans_text(&row.title_rest);
         let health = line_text(&row.health);
@@ -3927,7 +4014,9 @@ mod tests {
         // naming its protocol (#58).
         let skewed = crate::protocol::PROTOCOL_VERSION - 1;
         peer.protocol = Some(skewed);
-        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        let rest = spans_text(
+            &peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).title_rest,
+        );
         assert!(rest.contains('\u{f0026}'), "expected alert glyph: {rest}");
         assert!(
             rest.contains(&format!("p{skewed}")),
@@ -3936,7 +4025,9 @@ mod tests {
 
         // Same protocol → no badge.
         peer.protocol = Some(crate::protocol::PROTOCOL_VERSION);
-        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        let rest = spans_text(
+            &peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).title_rest,
+        );
         assert!(
             !rest.contains('\u{f0026}'),
             "matching protocol must not badge: {rest}"
@@ -3944,7 +4035,9 @@ mod tests {
 
         // Unknown protocol (pre-#58 peer / not yet polled) → no badge.
         peer.protocol = None;
-        let rest = spans_text(&peer_server_rows(&peer, &p).title_rest);
+        let rest = spans_text(
+            &peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).title_rest,
+        );
         assert!(
             !rest.contains('\u{f0026}'),
             "unknown protocol must not badge: {rest}"
@@ -3963,7 +4056,7 @@ mod tests {
             mem_total: Some(512 * G),
             disk_free: None,
         });
-        let row = peer_server_rows(&peer, &p);
+        let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         let health = line_text(&row.health);
         // 100% fills the width-3 column exactly; mem used pads to the
         // width of total so the slash column never jitters.
@@ -3984,7 +4077,7 @@ mod tests {
             mem_total: Some(16 * 1024 * 1024 * 1024),
             disk_free: Some(100 * 1024 * 1024 * 1024),
         });
-        let row = peer_server_rows(&peer, &p);
+        let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         // Ghost of the normal row (#42): the struck name LEADS (same
         // name-first order as live rows), the broken-link glyph sits in the
         // latency slot after the counts, everything muted + italic —
@@ -4035,7 +4128,7 @@ mod tests {
 
         // A peer that was reachable once shows the outage age by the icon.
         peer.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(300));
-        let row = peer_server_rows(&peer, &p);
+        let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         let rest = spans_text(&row.title_rest);
         assert!(rest.contains("5m"), "{rest:?}");
     }

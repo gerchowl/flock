@@ -21,9 +21,9 @@ pub use self::{
     model::{
         validated_prompt_float_lines, validated_sidebar_bounds, validated_sidebar_pane_gap,
         validated_sidebar_row_gap, Config, ConfigReloadReport, ConfigReloadStatus, FileDropMode,
-        KeysConfig, NewTerminalCwdConfig, PanelScopeConfig, PeerConfig, ServerStateMarkConfig,
-        ShellModeConfig, TabModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
-        ToastFlockPosition, UpdateChannelConfig,
+        KeysConfig, NewTerminalCwdConfig, PanelScopeConfig, PeerConfig, ServerLabelConfig,
+        ServerStateMarkConfig, ShellModeConfig, TabModeConfig, ToastClipboardPosition, ToastConfig,
+        ToastDelivery, ToastFlockPosition, UpdateChannelConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

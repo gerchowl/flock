@@ -1940,6 +1940,9 @@ pub struct AppState {
     pub tab_mode: crate::config::TabModeConfig,
     /// Servers-band state-medallion raster (#42): sextant or quadrant.
     pub server_state_mark: crate::config::ServerStateMarkConfig,
+    /// How a server is identified in the band + spaces member rows (#164):
+    /// icon, name, or both. Viewer-local.
+    pub server_label: crate::config::ServerLabelConfig,
     /// Reserve the agent pane header strip.
     pub pane_header: bool,
     /// Show the global machine status line.
@@ -2693,6 +2696,7 @@ impl AppState {
             auto_collapse_groups: false,
             tab_mode: crate::config::TabModeConfig::Tabs,
             server_state_mark: crate::config::ServerStateMarkConfig::Counts,
+            server_label: crate::config::ServerLabelConfig::Both,
             pane_header: true,
             status_line: true,
             system_stats: None,

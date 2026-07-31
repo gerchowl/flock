@@ -596,6 +596,7 @@ impl App {
             auto_collapse_groups: config.ui.auto_collapse_groups,
             tab_mode: config.ui.tab_mode,
             server_state_mark: config.ui.server_state_mark,
+            server_label: config.ui.server_label,
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
             system_stats: None,
@@ -1365,6 +1366,7 @@ impl App {
                 self.state.auto_collapse_groups = config.ui.auto_collapse_groups;
                 self.state.tab_mode = config.ui.tab_mode;
                 self.state.server_state_mark = config.ui.server_state_mark;
+                self.state.server_label = config.ui.server_label;
                 self.state.pane_header = config.ui.pane_header;
                 self.state.status_line = config.ui.status_line;
                 self.state.agent_aliases = config.ui.agent_aliases.clone();
