@@ -2219,6 +2219,48 @@ pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
     );
 }
 
+/// Periodic client render-loop heartbeat (#176). Emitted from the loop's Timer
+/// arm on a coarse cadence so a UI freeze is unambiguous in flock-client.log —
+/// a genuine stall shows up as a gap BOUNDED by the last tick, not indefinite
+/// silence (a frozen loop cannot log, so absence of ticks localizes the freeze).
+/// `active_slot` names the slot currently driving input, so a hang is
+/// attributable to the peer the loop was serving.
+pub(crate) fn client_tick(active_slot: &str) {
+    tracing::info!(
+        event = "client.tick",
+        subsystem = "client",
+        outcome = "alive",
+        active_slot,
+        "client render loop heartbeat"
+    );
+}
+
+/// The active slot's transport wedged or died and the client fell back to the
+/// always-warm home slot instead of exiting (#176). The user keeps a live
+/// session on local rather than losing the whole client to one bad peer.
+pub(crate) fn client_slot_active_degraded_to_home(dead_slot: &str) {
+    tracing::warn!(
+        event = "client.slot.degrade",
+        subsystem = "client_slot",
+        outcome = "fell_back_to_home",
+        dead_slot,
+        "active slot transport failed; flipped to home"
+    );
+}
+
+/// A slot's writer thread dropped a message because it could not be framed
+/// (oversized payload). Rare, but logged because a dropped Resize/subscription
+/// toggle silently desyncs server-side geometry / stream state (#176).
+pub(crate) fn client_slot_write_encode_failed(err: &str) {
+    tracing::warn!(
+        event = "client.slot.write",
+        subsystem = "client_slot",
+        outcome = "encode_failed",
+        err,
+        "dropped an unframeable slot message"
+    );
+}
+
 pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
     tracing::debug!(
         event = "client.slot.disconnect",

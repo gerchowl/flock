@@ -1600,6 +1600,13 @@ pub(crate) struct SshStdioBridge {
     keepalive_ssh_config: Option<PathBuf>,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// PID of the ssh child for the currently-connected tunnel, if any. The
+    /// accept thread parks in `child.wait()` while a tunnel is live, so on
+    /// teardown `Drop` SIGKILLs this child to unblock the wait promptly instead
+    /// of leaving the thread parked until `ServerAlive` times out (~tens of
+    /// seconds) — bounding a flaky-peer teardown so writer threads don't pile up
+    /// under a reconnect storm (#176).
+    active_child_pid: Arc<std::sync::Mutex<Option<u32>>>,
     /// Gossip v3 (#101 part 3): retained for the observability event so a
     /// snapshot-derived leg's ProxyJump identity is visible in flock.log.
     #[allow(dead_code)]
@@ -1646,7 +1653,10 @@ impl SshStdioBridge {
         );
 
         let should_stop = Arc::new(AtomicBool::new(false));
+        let active_child_pid: Arc<std::sync::Mutex<Option<u32>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let thread_stop = Arc::clone(&should_stop);
+        let thread_child_pid = Arc::clone(&active_child_pid);
         let thread_ssh_config = keepalive_ssh_config.clone();
         let thread_proxy_jump = proxy_jump.clone();
         let thread = thread::spawn(move || {
@@ -1666,6 +1676,7 @@ impl SshStdioBridge {
                             &session_name,
                             thread_ssh_config.as_deref(),
                             thread_proxy_jump.as_deref(),
+                            &thread_child_pid,
                         ) {
                             crate::logging::remote_bridge_failed(&target, &err.to_string());
                             eprintln!("flock: remote bridge failed: {err}");
@@ -1687,6 +1698,7 @@ impl SshStdioBridge {
             keepalive_ssh_config,
             should_stop,
             thread: Some(thread),
+            active_child_pid,
             proxy_jump,
         })
     }
@@ -1696,6 +1708,35 @@ impl Drop for SshStdioBridge {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
         let _ = std::fs::remove_file(&self.local_socket);
+        // Unblock the accept thread if it is parked in `child.wait()` on a live
+        // tunnel: SIGKILL the ssh child so the wait returns now instead of after
+        // the ssh keepalive timeout. `should_stop` is already set, so the accept
+        // loop exits rather than dialing again (#176).
+        //
+        // Teardown is thus bounded by (kill → child reap → one BRIDGE_ACCEPT_POLL
+        // tick), not the ssh keepalive — but it is not instantaneous.
+        //
+        // The pid is published while the child is alive and cleared under the
+        // same lock the instant `child.wait()` reaps it (`bridge_connection`).
+        // There is a bounded window — between `wait()` reaping and the clear —
+        // where a taken pid could name a recycled process; it is a few
+        // instructions wide and requires Drop to race that exact gap AND the OS
+        // to recycle the pid into a process we then signal. Accepted as
+        // vanishingly unlikely; closing it fully needs an owned-`Child` guard
+        // polled via `try_wait`, which would replace the efficient blocking wait
+        // on the live data path.
+        if let Some(pid) = self
+            .active_child_pid
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            // SAFETY: `pid` names our own just-spawned ssh child. SIGKILL is a
+            // no-op (ESRCH) if it already exited; we ignore the result.
+            unsafe {
+                libc::kill(pid as libc::c_int, libc::SIGKILL);
+            }
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1948,6 +1989,7 @@ fn bridge_connection(
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
     proxy_jump: Option<&str>,
+    active_child_pid: &std::sync::Mutex<Option<u32>>,
 ) -> io::Result<()> {
     let mut command = TracedCommand::new("ssh", "remote");
     let argv = bridge_dial_argv(
@@ -1968,6 +2010,11 @@ fn bridge_connection(
     let mut child = command
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
+    // Publish the child's pid so bridge Drop can SIGKILL it to unblock the
+    // `child.wait()` below on teardown (#176). Cleared before returning.
+    if let Ok(mut guard) = active_child_pid.lock() {
+        *guard = Some(child.id());
+    }
     let mut child_stdin = child
         .stdin
         .take()
@@ -1988,6 +2035,9 @@ fn bridge_connection(
     });
 
     let status = child.wait()?;
+    if let Ok(mut guard) = active_child_pid.lock() {
+        *guard = None;
+    }
     let _ = upload.join();
     let _ = download.join();
 

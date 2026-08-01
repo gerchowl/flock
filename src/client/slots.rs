@@ -21,14 +21,23 @@
 //! active-stream swap live in the client event loop (`client/mod.rs`).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{ClientMessage, HOME_SWITCH_TARGET};
 
-/// Backoff applied to a cold slot whose last dial failed, before it is
-/// eligible to be re-dialed. Gentle — a down server should ghost, not spin.
+/// Base backoff applied to a cold slot after its first failed dial, before it
+/// is eligible to be re-dialed. Gentle — a down server should ghost, not spin.
+/// Subsequent consecutive failures escalate it via [`redial_backoff`].
 const COLD_REDIAL_BACKOFF: Duration = Duration::from_secs(15);
+
+/// Cap on the escalating redial backoff (the open-circuit cooldown ceiling). A
+/// persistently unreachable peer is retried at most this often (#176).
+const MAX_REDIAL_BACKOFF: Duration = Duration::from_secs(300);
 
 /// A slot's dial target. `Home` is the local server (always warm); `Ssh`
 /// names a fleet peer's ssh destination (the same string a `SwitchServer`
@@ -81,6 +90,27 @@ pub(crate) enum SlotPhase {
 struct Slot {
     target: SlotTarget,
     phase: SlotPhase,
+    /// Consecutive dial failures / transport deaths since this slot was last
+    /// healthy (warmed). Drives the exponential redial backoff — the circuit
+    /// breaker that stops the 2s warm-sweep from re-dialing a flaky peer every
+    /// tick and piling up multi-second ssh probes (#176). Reset on a successful
+    /// warm.
+    consecutive_failures: u32,
+}
+
+/// Redial backoff for a cold slot given its consecutive-failure count: the
+/// breaker cooldown. Starts at [`COLD_REDIAL_BACKOFF`] and doubles per failure,
+/// capped at [`MAX_REDIAL_BACKOFF`] — 15s, 30s, 60s, 2m, 4m, 5m(cap). The sweep
+/// only re-dials once the cooldown elapses, so an open circuit yields at most
+/// one half-open probe per cooldown instead of a per-tick storm.
+fn redial_backoff(consecutive_failures: u32) -> Duration {
+    if consecutive_failures <= 1 {
+        return COLD_REDIAL_BACKOFF;
+    }
+    let shifted = COLD_REDIAL_BACKOFF
+        .checked_mul(1u32 << (consecutive_failures - 1).min(31))
+        .unwrap_or(MAX_REDIAL_BACKOFF);
+    shifted.min(MAX_REDIAL_BACKOFF)
 }
 
 /// What the caller must do after a registry mutation, so the registry stays
@@ -131,6 +161,7 @@ impl SlotRegistry {
             Slot {
                 target: active,
                 phase: SlotPhase::Active,
+                consecutive_failures: 0,
             },
         );
         for target in targets {
@@ -139,6 +170,7 @@ impl SlotRegistry {
                 .or_insert_with(|| Slot {
                     target: target.clone(),
                     phase: SlotPhase::Cold { failed_at: None },
+                    consecutive_failures: 0,
                 });
         }
         Self {
@@ -191,7 +223,7 @@ impl SlotRegistry {
             .values()
             .filter(|s| match s.phase {
                 SlotPhase::Cold { failed_at } => failed_at
-                    .map(|at| now.duration_since(at) >= COLD_REDIAL_BACKOFF)
+                    .map(|at| now.duration_since(at) >= redial_backoff(s.consecutive_failures))
                     .unwrap_or(true),
                 _ => false,
             })
@@ -215,15 +247,21 @@ impl SlotRegistry {
         if matches!(slot.phase, SlotPhase::Active) {
             return None;
         }
+        // A healthy warm closes the breaker: reset the failure streak so the
+        // next death starts backoff from the base again.
+        slot.consecutive_failures = 0;
         slot.phase = SlotPhase::Warm;
         Some(SlotEffect::Pause(target.clone()))
     }
 
-    /// A background dial failed: keep the target cold and stamp it for backoff
-    /// so it ghosts as today and is gently re-dialed later.
+    /// A background dial failed: keep the target cold, count the failure, and
+    /// stamp it so the escalating backoff ([`redial_backoff`]) gates the next
+    /// re-dial. A flaky peer thus ghosts with an ever-widening cooldown instead
+    /// of being re-dialed every sweep tick (#176).
     pub(crate) fn mark_dial_failed(&mut self, target: &SlotTarget, now: Instant) {
         if let Some(slot) = self.slots.get_mut(target.key()) {
             if !matches!(slot.phase, SlotPhase::Active | SlotPhase::Warm) {
+                slot.consecutive_failures = slot.consecutive_failures.saturating_add(1);
                 slot.phase = SlotPhase::Cold {
                     failed_at: Some(now),
                 };
@@ -234,10 +272,15 @@ impl SlotRegistry {
     /// Transport death of a warm (or active) slot: demote it to cold silently.
     /// The failure surfaces only if the user later switches to it (#65). A
     /// dead active slot leaves the registry with no active slot — the caller
-    /// must reattach it (the only slot driving the terminal).
-    pub(crate) fn demote_dead(&mut self, target: &SlotTarget) {
+    /// must reattach it (the only slot driving the terminal). Counts toward the
+    /// breaker and stamps `failed_at` so a flapping peer (connect→die→connect)
+    /// backs off instead of re-dialing on the very next sweep tick (#176).
+    pub(crate) fn demote_dead(&mut self, target: &SlotTarget, now: Instant) {
         if let Some(slot) = self.slots.get_mut(target.key()) {
-            slot.phase = SlotPhase::Cold { failed_at: None };
+            slot.consecutive_failures = slot.consecutive_failures.saturating_add(1);
+            slot.phase = SlotPhase::Cold {
+                failed_at: Some(now),
+            };
             if self.active.as_deref() == Some(target.key()) {
                 self.active = None;
             }
@@ -274,6 +317,7 @@ impl SlotRegistry {
                 self.slots.entry(key).or_insert_with(|| Slot {
                     target: target.clone(),
                     phase: SlotPhase::Cold { failed_at: None },
+                    consecutive_failures: 0,
                 });
                 SwitchOutcome::ColdDial(target.clone())
             }
@@ -354,36 +398,219 @@ pub(crate) fn route_slot_event(
     }
 }
 
-/// A live warm/active slot connection the client holds open: the writable
-/// stream half plus the slot's target. Frames arrive on the shared loop event
-/// channel (the reader half lives in a spawned thread); a paused slot's server
-/// stops streaming, so the active slot is the only one painting.
+/// Bounded depth of a slot's writer queue. Interactive traffic is tiny; a full
+/// queue means the writer thread has been unable to drain a wedged/slow peer's
+/// transport for a sustained stretch. The loop treats a full queue as the slot
+/// going dead (its `send` returns `WouldBlock`) rather than blocking on it — the
+/// bulkhead that keeps one flaky peer from freezing the render loop (#176).
+const WRITER_QUEUE_DEPTH: usize = 512;
+
+/// Per-write socket timeout on a PEER slot's transport. Bounds how long a single
+/// `write` syscall parks when the kernel send buffer is full before the writer
+/// thread loops and retries. Writes are offset-tracked, so a timeout never
+/// leaves the stream mid-frame — a transient stall delays delivery instead of
+/// corrupting framing (#176). Home (local socket) writes carry no timeout.
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Hard ceiling on how long the writer thread keeps retrying a single frame
+/// against a wedged transport before declaring the slot dead. Bounds the
+/// lifetime of a thread stuck on a black-holed peer (it still owns the ssh
+/// bridge, so we cannot let it park forever). The loop's bounded queue usually
+/// trips first; this backstops a peer that wedges mid-frame (#176).
+const WRITER_HARD_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A cheap, cloneable handle to a slot's dedicated writer thread. The loop holds
+/// one for the active slot and enqueues every keystroke/resize/subscription
+/// toggle through [`send`](SlotWriter::send) — a non-blocking channel push. The
+/// writer thread owns the transport's write half and (for a client-built ssh
+/// peer) the [`SshStdioBridge`](crate::remote::SshStdioBridge), so blocking
+/// socket I/O and the bridge's blocking teardown never touch the loop thread
+/// (#176). This is the per-peer bulkhead: a wedged peer can only ever fill its
+/// own queue, never stall the render loop.
+#[derive(Clone)]
+pub(crate) struct SlotWriter {
+    tx: SyncSender<ClientMessage>,
+    /// Set by the writer thread when its transport dies (or it gives up on a
+    /// wedged peer). Lets `send` fail fast without waiting for the channel to
+    /// disconnect, so the loop demotes promptly.
+    dead: Arc<AtomicBool>,
+}
+
+impl SlotWriter {
+    /// Spawn the writer thread for a slot, taking ownership of `stream`'s write
+    /// side and any client-built `bridge`. `apply_write_timeout` bounds each
+    /// write on a peer transport. `on_death` fires once if the transport dies
+    /// mid-session (a hard write error or a wedged-peer give-up), letting the
+    /// caller post the slot's disconnect to the loop; it does NOT fire on a
+    /// clean shutdown (all handles dropped).
+    pub(crate) fn spawn(
+        mut stream: UnixStream,
+        bridge: Option<crate::remote::SshStdioBridge>,
+        apply_write_timeout: bool,
+        on_death: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        let (tx, rx) = sync_channel::<ClientMessage>(WRITER_QUEUE_DEPTH);
+        let dead = Arc::new(AtomicBool::new(false));
+        let thread_dead = Arc::clone(&dead);
+        std::thread::spawn(move || {
+            // Writes must block (the reader clone shares this fd's O_NONBLOCK via
+            // try_clone; both sides want blocking). A nonblocking fd would busy-
+            // spin the pump on WouldBlock instead of honoring the write timeout.
+            let _ = stream.set_nonblocking(false);
+            if apply_write_timeout {
+                // A failure to arm the timeout is non-fatal: the write loop still
+                // makes progress on a healthy transport; it just can't bound a
+                // stall. The bounded queue remains the primary bulkhead.
+                let _ = stream.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
+            }
+            let errored = writer_pump(&mut stream, &rx);
+            thread_dead.store(true, Ordering::Release);
+            // Teardown runs HERE, on the writer thread: dropping the bridge joins
+            // its listener, which can block for seconds on a live ssh child —
+            // never on the loop thread (#176).
+            drop(stream);
+            drop(bridge);
+            if errored {
+                on_death();
+            }
+        });
+        Self { tx, dead }
+    }
+
+    /// Enqueue a message for the slot's writer thread. Never blocks: returns an
+    /// error the caller treats as the slot going dead — either the writer
+    /// already died, or its queue is full (a sustained stall on this peer).
+    pub(crate) fn send(&self, msg: ClientMessage) -> std::io::Result<()> {
+        if self.dead.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "slot writer terminated",
+            ));
+        }
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "slot writer backpressured (peer stalled)",
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "slot writer gone",
+            )),
+        }
+    }
+
+    /// Test-only: whether the writer thread has marked this slot dead.
+    #[cfg(test)]
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+}
+
+/// Drain `rx`, framing each message into the transport with offset-tracked
+/// writes. Returns `true` if it stopped on a transport ERROR (a death to
+/// report), `false` if it stopped because all senders dropped (clean shutdown).
 ///
-/// An optional `bridge` keeps a client-built ssh-stdio transport (#93 cold
-/// switch dial) alive for the slot's lifetime: when the slot is dropped or
-/// demoted, the bridge's `Drop` tears down the listener thread and removes
-/// the local socket. Slots reached over an already-live transport (home, the
-/// active leg's launcher-owned bridge) leave this `None`.
+/// A `WouldBlock`/`TimedOut` from the per-write timeout is retried — the stream
+/// stays consistent at `off`, so a transient stall never corrupts framing or
+/// kills the slot. Only a hard error, an EOF, or exceeding
+/// [`WRITER_HARD_DEADLINE`] on a single frame ends the slot; the loop's bounded
+/// queue normally trips first and demotes the peer.
+fn writer_pump(stream: &mut UnixStream, rx: &Receiver<ClientMessage>) -> bool {
+    for msg in rx.iter() {
+        let mut buf = Vec::new();
+        if let Err(err) = crate::protocol::write_message(&mut buf, &msg) {
+            // Serializing into an in-memory buffer cannot fail on I/O; a framing
+            // error here is an oversized payload. Drop the message and keep the
+            // slot alive, but log it — a dropped Resize/SetFrameSubscription
+            // would silently desync the server's geometry / stream state.
+            crate::logging::client_slot_write_encode_failed(&err.to_string());
+            continue;
+        }
+        let mut off = 0;
+        let started = Instant::now();
+        while off < buf.len() {
+            match stream.write(&buf[off..]) {
+                Ok(0) => return true, // EOF: peer closed the transport.
+                Ok(n) => off += n,
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted => {
+                        // Send buffer full for the whole timeout (or a signal).
+                        // Framing is intact at `off`; retry until the peer drains
+                        // or we hit the hard deadline on a truly wedged link.
+                        if started.elapsed() >= WRITER_HARD_DEADLINE {
+                            return true;
+                        }
+                        continue;
+                    }
+                    _ => return true,
+                },
+            }
+        }
+    }
+    false
+}
+
+/// A live warm/active slot connection the client holds open: a cloneable
+/// [`SlotWriter`] handle to the slot's dedicated writer thread, plus a reserved
+/// read-half clone so a flip can spawn the active reader from the same
+/// transport. Frames arrive on the shared loop event channel (the reader half
+/// lives in a spawned thread); a paused slot's server stops streaming, so the
+/// active slot is the only one painting.
+///
+/// The writer thread owns the transport write half and any client-built
+/// ssh-stdio bridge (#93 cold switch dial); when this connection is dropped or
+/// demoted, the last writer handle drops, the writer thread exits, and the
+/// bridge's teardown runs there — off the loop thread (#176).
 pub(crate) struct SlotConnection {
     pub(crate) target: SlotTarget,
-    pub(crate) write_stream: UnixStream,
-    /// Kept alive solely for its Drop side effects: tearing down the ssh-stdio
-    /// bridge when the slot is dropped/demoted. The popup-cancel path also
-    /// relies on this — a stale dial's `SlotConnection` going out of scope
-    /// reclaims the bridge transport. Read access is never needed.
-    #[allow(dead_code)]
-    pub(crate) bridge: Option<crate::remote::SshStdioBridge>,
+    writer: SlotWriter,
+    /// A read-half clone reserved so a flip TO this slot can spawn its reader
+    /// from the same transport the writer drives. Warm slots hold it idle.
+    reader_src: UnixStream,
 }
 
 impl SlotConnection {
+    /// Build a live slot connection: spawn the writer thread (owning `stream`'s
+    /// write side + any `bridge`) and reserve a read-half clone for a future
+    /// flip's reader. `on_death` posts this slot's disconnect to the loop if the
+    /// transport dies mid-session. A peer (`Ssh`) slot arms the per-write
+    /// timeout; home does not.
+    pub(crate) fn new(
+        target: SlotTarget,
+        stream: UnixStream,
+        bridge: Option<crate::remote::SshStdioBridge>,
+        on_death: Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<Self> {
+        let reader_src = stream.try_clone()?;
+        let apply_write_timeout = matches!(target, SlotTarget::Ssh(_));
+        let writer = SlotWriter::spawn(stream, bridge, apply_write_timeout, on_death);
+        Ok(Self {
+            target,
+            writer,
+            reader_src,
+        })
+    }
+
     /// Send the frame-subscription toggle for this slot (pause when it stops
-    /// being active, resume + full redraw when it becomes active).
-    pub(crate) fn set_frame_subscription(&mut self, enabled: bool) -> std::io::Result<()> {
-        crate::protocol::write_message(
-            &mut self.write_stream,
-            &ClientMessage::SetFrameSubscription { enabled },
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    /// being active, resume + full redraw when it becomes active). Non-blocking:
+    /// the enqueue fails only if the slot's transport is already dead/stalled.
+    pub(crate) fn set_frame_subscription(&self, enabled: bool) -> std::io::Result<()> {
+        self.writer
+            .send(ClientMessage::SetFrameSubscription { enabled })
+    }
+
+    /// A cheap clone of this slot's writer handle — the loop's active-write path
+    /// after a flip makes this slot active.
+    pub(crate) fn writer(&self) -> SlotWriter {
+        self.writer.clone()
+    }
+
+    /// A fresh read-half clone for spawning this slot's reader on a flip.
+    pub(crate) fn reader_clone(&self) -> std::io::Result<UnixStream> {
+        self.reader_src.try_clone()
     }
 }
 
@@ -421,7 +648,7 @@ impl SlotManager {
     /// server. The connection joins the registry as warm. The caller must only
     /// call this for a slot with no existing connection (see [`has_connection`]),
     /// so a racing dial can never replace a live transport.
-    pub(crate) fn add_warm(&mut self, mut conn: SlotConnection) -> std::io::Result<()> {
+    pub(crate) fn add_warm(&mut self, conn: SlotConnection) -> std::io::Result<()> {
         let key = conn.target.key().to_string();
         if let Some(SlotEffect::Pause(_)) = self.registry.mark_warm(&conn.target) {
             conn.set_frame_subscription(false)?;
@@ -432,10 +659,14 @@ impl SlotManager {
 
     /// Resolve a switch and, when the target is warm, perform the in-process
     /// flip: pause the old active slot, resume the new one (full redraw), and
-    /// return the new active slot's write stream so the loop can rebind input.
-    /// A cold/unknown target returns `Ok(None)` — the caller falls back to the
-    /// dial / relaunch-leg path (#67 frozen frame).
-    pub(crate) fn flip_to(&mut self, target: &SlotTarget) -> std::io::Result<Option<UnixStream>> {
+    /// return the new active slot's writer handle plus a read-half clone so the
+    /// loop can rebind input and spawn the new reader. A cold/unknown target
+    /// returns `Ok(None)` — the caller falls back to the dial / relaunch-leg
+    /// path (#67 frozen frame).
+    pub(crate) fn flip_to(
+        &mut self,
+        target: &SlotTarget,
+    ) -> std::io::Result<Option<(SlotWriter, UnixStream)>> {
         match self.registry.request_switch(target) {
             SwitchOutcome::AlreadyActive => Ok(None),
             SwitchOutcome::ColdDial(_) => Ok(None),
@@ -443,14 +674,14 @@ impl SlotManager {
                 for effect in &effects {
                     match effect {
                         SlotEffect::Pause(t) => {
-                            if let Some(conn) = self.connections.get_mut(t.key()) {
+                            if let Some(conn) = self.connections.get(t.key()) {
                                 // Best-effort: a dead warm slot we are leaving
                                 // is harmless, it just stops painting.
                                 let _ = conn.set_frame_subscription(false);
                             }
                         }
                         SlotEffect::Resume(t) => {
-                            let conn = self.connections.get_mut(t.key()).ok_or_else(|| {
+                            let conn = self.connections.get(t.key()).ok_or_else(|| {
                                 std::io::Error::other("warm slot missing connection")
                             })?;
                             conn.set_frame_subscription(true)?;
@@ -458,20 +689,23 @@ impl SlotManager {
                         SlotEffect::Dial(_) => {}
                     }
                 }
-                let new_stream = self
+                let flipped = self
                     .connections
                     .get(target.key())
-                    .map(|c| c.write_stream.try_clone())
+                    .map(|c| Ok::<_, std::io::Error>((c.writer(), c.reader_clone()?)))
                     .transpose()?;
-                Ok(new_stream)
+                Ok(flipped)
             }
         }
     }
 
-    /// Drop a dead slot's connection and demote it in the registry.
-    pub(crate) fn handle_dead(&mut self, target: &SlotTarget) {
+    /// Drop a dead slot's connection and demote it in the registry. `now` stamps
+    /// the demotion for the escalating redial backoff (#176) — dropping the
+    /// connection here releases the last [`SlotWriter`] handle, so the writer
+    /// thread exits and tears down its ssh bridge off the loop thread.
+    pub(crate) fn handle_dead(&mut self, target: &SlotTarget, now: Instant) {
         self.connections.remove(target.key());
-        self.registry.demote_dead(target);
+        self.registry.demote_dead(target, now);
     }
 }
 
@@ -599,10 +833,16 @@ mod tests {
     fn demote_dead_warm_slot_is_silent_and_redials_later() {
         let mut reg = SlotRegistry::new(SlotTarget::Home, vec![ssh("a")], 8);
         reg.mark_warm(&ssh("a"));
-        reg.demote_dead(&ssh("a"));
+        let t0 = Instant::now();
+        reg.demote_dead(&ssh("a"), t0);
+        // Demotion stamps `failed_at` for the breaker backoff (#176): the death
+        // is silent but the peer now ghosts with a cooldown, not an instant
+        // re-dial.
         assert_eq!(
             reg.phase(&ssh("a")),
-            Some(SlotPhase::Cold { failed_at: None })
+            Some(SlotPhase::Cold {
+                failed_at: Some(t0)
+            })
         );
         // Active (home) is untouched: the death is silent.
         assert_eq!(reg.active_target(), Some(&SlotTarget::Home));
@@ -616,8 +856,40 @@ mod tests {
     #[test]
     fn demote_dead_active_slot_clears_active() {
         let mut reg = SlotRegistry::new(SlotTarget::Home, vec![], 8);
-        reg.demote_dead(&SlotTarget::Home);
+        reg.demote_dead(&SlotTarget::Home, Instant::now());
         assert_eq!(reg.active_target(), None);
+    }
+
+    #[test]
+    fn breaker_escalates_backoff_on_repeated_dial_failures() {
+        let mut reg = SlotRegistry::new(SlotTarget::Home, vec![ssh("a")], 8);
+        let t0 = Instant::now();
+        // First failure: eligible again after the base 15s backoff.
+        reg.mark_dial_failed(&ssh("a"), t0);
+        assert_eq!(reg.pending_dials(t0 + Duration::from_secs(14)), vec![]);
+        assert_eq!(
+            reg.pending_dials(t0 + Duration::from_secs(16)),
+            vec![SlotEffect::Dial(ssh("a"))]
+        );
+        // Second consecutive failure doubles the cooldown to ~30s: still gated
+        // at 16s, eligible past 30s. This is the sweep-storm suppression (#176).
+        let t1 = t0 + Duration::from_secs(16);
+        reg.mark_dial_failed(&ssh("a"), t1);
+        assert_eq!(reg.pending_dials(t1 + Duration::from_secs(16)), vec![]);
+        assert_eq!(
+            reg.pending_dials(t1 + Duration::from_secs(31)),
+            vec![SlotEffect::Dial(ssh("a"))]
+        );
+        // A successful warm closes the breaker: the streak resets, so the next
+        // failure is gated by the base backoff again.
+        reg.mark_warm(&ssh("a"));
+        let t2 = t1 + Duration::from_secs(31);
+        reg.demote_dead(&ssh("a"), t2);
+        assert_eq!(reg.pending_dials(t2 + Duration::from_secs(14)), vec![]);
+        assert_eq!(
+            reg.pending_dials(t2 + Duration::from_secs(16)),
+            vec![SlotEffect::Dial(ssh("a"))]
+        );
     }
 
     // --- SlotManager transport tests (real socketpairs, no server) ---
@@ -627,6 +899,13 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         crate::protocol::read_message(stream, crate::protocol::MAX_FRAME_SIZE).unwrap()
+    }
+
+    /// Build a `SlotConnection` over a socketpair local end, with a no-op death
+    /// hook. Spawns the slot's real writer thread — subscription toggles reach
+    /// the peer end asynchronously, which `read_one_client_message` waits for.
+    fn test_conn(target: SlotTarget, local: UnixStream) -> SlotConnection {
+        SlotConnection::new(target, local, None, Box::new(|| {})).unwrap()
     }
 
     /// The load-bearing #65 behavior: switching to a WARM slot flips in process
@@ -639,11 +918,7 @@ mod tests {
         // Active = home; its peer end is `home_peer`.
         let (home_local, mut home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
-            SlotConnection {
-                target: SlotTarget::Home,
-                write_stream: home_local,
-                bridge: None,
-            },
+            test_conn(SlotTarget::Home, home_local),
             vec![ssh("anvil")],
             8,
         );
@@ -651,11 +926,7 @@ mod tests {
         // Warm the anvil slot with its own socketpair; add_warm pauses it.
         let (anvil_local, mut anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(SlotConnection {
-                target: ssh("anvil"),
-                write_stream: anvil_local,
-                bridge: None,
-            })
+            .add_warm(test_conn(ssh("anvil"), anvil_local))
             .unwrap();
         // anvil received a pause on warm registration.
         assert_eq!(
@@ -744,35 +1015,30 @@ mod tests {
     fn warm_slot_death_demotes_and_session_survives() {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
-            SlotConnection {
-                target: SlotTarget::Home,
-                write_stream: home_local,
-                bridge: None,
-            },
+            test_conn(SlotTarget::Home, home_local),
             vec![ssh("anvil")],
             8,
         );
         // Warm anvil over its own socketpair.
         let (anvil_local, anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(SlotConnection {
-                target: ssh("anvil"),
-                write_stream: anvil_local,
-                bridge: None,
-            })
+            .add_warm(test_conn(ssh("anvil"), anvil_local))
             .unwrap();
         assert_eq!(manager.registry.phase(&ssh("anvil")), Some(SlotPhase::Warm));
 
         // Kill the warm slot's transport: drop its peer end (EOF on the reader).
         drop(anvil_peer);
         // The loop's reaction to that reader's ServerDisconnected:
-        manager.handle_dead(&ssh("anvil"));
+        let died_at = Instant::now();
+        manager.handle_dead(&ssh("anvil"), died_at);
 
-        // The warm slot is demoted to cold; the ACTIVE (home) slot is intact —
-        // the session did NOT tear down.
+        // The warm slot is demoted to cold (stamped for breaker backoff); the
+        // ACTIVE (home) slot is intact — the session did NOT tear down.
         assert_eq!(
             manager.registry.phase(&ssh("anvil")),
-            Some(SlotPhase::Cold { failed_at: None })
+            Some(SlotPhase::Cold {
+                failed_at: Some(died_at)
+            })
         );
         assert_eq!(manager.registry.active_target(), Some(&SlotTarget::Home));
         // A later switch to the dead slot re-dials it (cold fallback).
@@ -790,11 +1056,7 @@ mod tests {
     fn has_connection_reflects_active_and_warm_only() {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
-            SlotConnection {
-                target: SlotTarget::Home,
-                write_stream: home_local,
-                bridge: None,
-            },
+            test_conn(SlotTarget::Home, home_local),
             vec![ssh("anvil")],
             8,
         );
@@ -806,16 +1068,12 @@ mod tests {
         // Warming a slot gives it a connection.
         let (anvil_local, _anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(SlotConnection {
-                target: ssh("anvil"),
-                write_stream: anvil_local,
-                bridge: None,
-            })
+            .add_warm(test_conn(ssh("anvil"), anvil_local))
             .unwrap();
         assert!(manager.has_connection(&ssh("anvil")));
 
         // A demoted (dead) slot loses its connection, so a re-dial may re-add it.
-        manager.handle_dead(&ssh("anvil"));
+        manager.handle_dead(&ssh("anvil"), Instant::now());
         assert!(!manager.has_connection(&ssh("anvil")));
     }
 
@@ -823,15 +1081,124 @@ mod tests {
     fn flip_to_cold_slot_returns_none_for_relaunch_fallback() {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
-            SlotConnection {
-                target: SlotTarget::Home,
-                write_stream: home_local,
-                bridge: None,
-            },
+            test_conn(SlotTarget::Home, home_local),
             vec![ssh("anvil")],
             8,
         );
         // anvil is cold (never warmed): flip falls back to the dial/leg path.
         assert!(manager.flip_to(&ssh("anvil")).unwrap().is_none());
+    }
+
+    // --- SlotWriter actor (#176): the per-peer write bulkhead ---
+
+    /// A message enqueued on a healthy writer reaches the peer end intact — the
+    /// happy path proving the writer thread frames and flushes correctly.
+    #[test]
+    fn slot_writer_delivers_enqueued_message() {
+        let (local, mut peer) = UnixStream::pair().unwrap();
+        let writer = SlotWriter::spawn(local, None, true, Box::new(|| {}));
+        writer
+            .send(ClientMessage::SetFrameSubscription { enabled: true })
+            .unwrap();
+        assert_eq!(
+            read_one_client_message(&mut peer),
+            ClientMessage::SetFrameSubscription { enabled: true }
+        );
+    }
+
+    /// The load-bearing #176 invariant: `send` NEVER blocks. Even when the peer
+    /// never reads and the kernel send buffer fills, enqueues return promptly —
+    /// eventually `Err(WouldBlock)` once the bounded queue saturates — instead of
+    /// parking the caller (the render loop) on a wedged transport. The writer is
+    /// then marked dead so the loop can demote the slot.
+    #[test]
+    fn slot_writer_send_never_blocks_on_a_wedged_peer() {
+        // A peer we never read from: once both the socket buffer and the bounded
+        // queue fill, the writer can make no progress.
+        let (local, _peer) = UnixStream::pair().unwrap();
+        let writer = SlotWriter::spawn(local, None, true, Box::new(|| {}));
+        // Push far more than the queue depth of large frames. The point is not
+        // that every send succeeds — it's that not one of them blocks the caller.
+        let payload = vec![0u8; 32 * 1024];
+        let mut saw_backpressure = false;
+        let start = Instant::now();
+        for _ in 0..(WRITER_QUEUE_DEPTH * 4) {
+            match writer.send(ClientMessage::Input {
+                data: payload.clone(),
+            }) {
+                Ok(()) => {}
+                Err(_) => {
+                    saw_backpressure = true;
+                    break;
+                }
+            }
+            // No single iteration may approach the writer's hard deadline; if the
+            // caller were blocking on the socket this would blow past it.
+            assert!(
+                start.elapsed() < WRITER_HARD_DEADLINE,
+                "send() blocked the caller on a wedged peer"
+            );
+        }
+        assert!(
+            saw_backpressure,
+            "a never-draining peer must eventually backpressure the bounded queue"
+        );
+    }
+
+    /// When the transport dies, the writer thread fires its `on_death` hook
+    /// exactly once and marks itself dead — the signal the loop turns into a slot
+    /// demotion (#176).
+    #[test]
+    fn slot_writer_reports_death_when_transport_closes() {
+        use std::sync::mpsc::channel;
+        let (local, peer) = UnixStream::pair().unwrap();
+        let (death_tx, death_rx) = channel::<()>();
+        let writer = SlotWriter::spawn(
+            local,
+            None,
+            true,
+            Box::new(move || {
+                let _ = death_tx.send(());
+            }),
+        );
+        // Close the peer, then write: the pump hits EOF/EPIPE and dies.
+        drop(peer);
+        // A few sends to ensure the pump observes the broken transport.
+        for _ in 0..4 {
+            let _ = writer.send(ClientMessage::Input {
+                data: vec![1, 2, 3],
+            });
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        death_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer must report death once its transport dies");
+        assert!(
+            writer.is_dead(),
+            "writer marks itself dead after a transport error"
+        );
+    }
+
+    /// A clean shutdown (all handles dropped) must NOT fire `on_death`: dropping
+    /// a slot is not a transport failure, and a spurious disconnect would demote
+    /// a slot the caller intentionally retired (#176).
+    #[test]
+    fn slot_writer_clean_drop_does_not_report_death() {
+        use std::sync::mpsc::channel;
+        let (local, _peer) = UnixStream::pair().unwrap();
+        let (death_tx, death_rx) = channel::<()>();
+        let writer = SlotWriter::spawn(
+            local,
+            None,
+            true,
+            Box::new(move || {
+                let _ = death_tx.send(());
+            }),
+        );
+        drop(writer); // last handle → channel closes → clean exit.
+        assert!(
+            death_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a clean shutdown must not fire the death hook"
+        );
     }
 }
