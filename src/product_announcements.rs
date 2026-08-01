@@ -308,7 +308,9 @@ mod tests {
 
     #[test]
     fn fake_announcement_body_env_creates_preview() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var(FAKE_ANNOUNCEMENT_BODY_ENV, "### Preview\n- Local body");
             std::env::set_var(FAKE_ANNOUNCEMENT_TITLE_ENV, "Local title");

@@ -3886,7 +3886,9 @@ mod tests {
     /// the same leg does not repeat it.
     #[test]
     fn take_attach_notice_is_one_shot() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _notice = EnvVarGuard::set(SWITCH_NOTICE_ENV_VAR, "switch to sage failed: boom");
 
         assert_eq!(
@@ -3899,7 +3901,9 @@ mod tests {
 
     #[test]
     fn take_attach_notice_ignores_empty() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _notice = EnvVarGuard::set(SWITCH_NOTICE_ENV_VAR, "");
         assert!(take_attach_notice().is_none());
     }
@@ -3917,7 +3921,9 @@ mod tests {
     /// hands it None and strips its servers band / home row.
     #[test]
     fn resolve_handshake_fleet_prefers_the_explicit_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Even with a DIFFERENT env snapshot present, the explicit override
         // wins -- this is exactly the hub case the slots dial must honor.
         let env_snap = sample_snapshot("stale-env");
@@ -3934,7 +3940,9 @@ mod tests {
     /// source of truth -- the legacy behavior must be preserved.
     #[test]
     fn resolve_handshake_fleet_falls_back_to_env_without_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env_snap = sample_snapshot("launcher-carried");
         let _env = EnvVarGuard::set(
             crate::remote::FLEET_SNAPSHOT_ENV_VAR,
@@ -3948,7 +3956,9 @@ mod tests {
     /// now only reachable when the caller genuinely has nothing to send.
     #[test]
     fn resolve_handshake_fleet_is_none_when_neither_present() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cleared = EnvVarsRemovedGuard::new(&[crate::remote::FLEET_SNAPSHOT_ENV_VAR]);
         assert!(resolve_handshake_fleet(None).is_none());
     }
@@ -3967,7 +3977,9 @@ mod tests {
         use std::path::PathBuf;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The hub case: the env carry is empty. Without the explicit override
         // threaded through, the spoke would receive fleet: None -- the #102 bug.
         let _cleared = EnvVarsRemovedGuard::new(&[
@@ -4431,7 +4443,9 @@ mod tests {
 
     #[test]
     fn client_error_display_detached_default_session_reattach_hint() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvVarsRemovedGuard::new(&[
             crate::remote::REATTACH_COMMAND_ENV_VAR,
             crate::session::SESSION_ENV_VAR,
@@ -4448,7 +4462,9 @@ mod tests {
 
     #[test]
     fn client_error_display_detached_named_session_reattach_hint() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
         let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
         let err = ClientError::ServerShutdown {
@@ -4463,7 +4479,9 @@ mod tests {
 
     #[test]
     fn client_error_display_detached_remote_reattach_hint_takes_precedence() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
             "flk --remote host --session work",
