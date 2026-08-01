@@ -418,7 +418,9 @@ mod tests {
 
     #[test]
     fn clipboard_commands_prefer_wayland_when_available() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::remove_var("DISPLAY");
@@ -430,7 +432,9 @@ mod tests {
 
     #[test]
     fn clipboard_commands_include_x11_fallbacks() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
@@ -542,7 +546,9 @@ mod tests {
 
     #[test]
     fn desktop_notification_separates_option_like_titles() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");

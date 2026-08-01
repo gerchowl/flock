@@ -2439,8 +2439,12 @@ fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
+    // Poison-tolerant: a prior integration test panicking under this lock must
+    // not cascade PoisonError into the rest of the integration suite (#180).
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
