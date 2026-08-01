@@ -131,9 +131,22 @@ impl IssueGuardFold {
         self.next_poll = Some(now + Duration::from_secs(poll_secs));
     }
 
+    /// An error verdict, at most once per (repo, issue, body). Without this
+    /// a single malformed owner-authored trigger would post a `gh issue
+    /// comment` on every poll — a self-inflicted comment flood until the
+    /// body is edited.
+    fn error_once(&mut self, repo: &str, issue: &GhIssue, reason: String) -> IssueGuardOutcome {
+        let key = format!("err:{}", body_dedupe_key(repo, issue.number, &issue.body));
+        if self.fired.contains(&key) {
+            return IssueGuardOutcome::Deduped { dedupe_key: key };
+        }
+        self.fired.insert(key);
+        IssueGuardOutcome::Errored { reason }
+    }
+
     /// Fold one issue against the guard: parse the body, apply the owner
-    /// gate and dedupe, return the outcome. Pure — mutates the dedupe set
-    /// only when returning `Fire`.
+    /// gate and dedupe, return the outcome. Mutates the dedupe set when
+    /// returning `Fire` or a first-time `Errored`.
     pub(crate) fn evaluate(
         &mut self,
         repo: &str,
@@ -144,18 +157,12 @@ impl IssueGuardFold {
         if extracted.is_empty() {
             return IssueGuardOutcome::NoTrigger;
         }
-        if extracted.len() > 1 {
-            return IssueGuardOutcome::Errored {
-                reason: format!(
-                    "found {n} `flk-trigger` fenced blocks; issue bodies may declare at most one",
-                    n = extracted.len()
-                ),
-            };
-        }
-        let raw = &extracted[0];
-        // Owner gate BEFORE parse: never surface parse errors on non-owner
-        // posts — they're audited as ignored, full stop.
-        if issue.author.login != config.owner {
+        // Owner gate BEFORE every other verdict (P7, §8.7). The repo is
+        // public: a non-owner issue must produce NOTHING but an audit line.
+        // Erroring first would let any GitHub user drive flock into posting
+        // `gh issue comment` on their own issue — comment-spam amplification
+        // with flock's identity.
+        if !issue.author.login.eq_ignore_ascii_case(&config.owner) {
             return IssueGuardOutcome::Ignored {
                 reason: format!(
                     "author {} is not the configured owner {}",
@@ -163,30 +170,47 @@ impl IssueGuardFold {
                 ),
             };
         }
+        if extracted.len() > 1 {
+            return self.error_once(
+                repo,
+                issue,
+                format!(
+                    "found {n} `flk-trigger` fenced blocks; issue bodies may declare at most one",
+                    n = extracted.len()
+                ),
+            );
+        }
+        let raw = &extracted[0];
         let block = match toml::from_str::<TriggerBlock>(raw) {
             Ok(block) => block,
             Err(err) => {
-                return IssueGuardOutcome::Errored {
-                    reason: format!("could not parse flk-trigger block: {err}"),
-                };
+                return self.error_once(
+                    repo,
+                    issue,
+                    format!("could not parse flk-trigger block: {err}"),
+                );
             }
         };
         if block.on != "issue_updated" {
-            return IssueGuardOutcome::Errored {
-                reason: format!(
+            return self.error_once(
+                repo,
+                issue,
+                format!(
                     "flk-trigger `on` must be `issue_updated`; got {other:?}",
                     other = block.on
                 ),
-            };
+            );
         }
         // Actions are limited to Notify in phase 4 — the SpawnAgent variant
         // is explicitly deferred to S1.
         if !matches!(block.action, ActionSpec::Notify { .. }) {
-            return IssueGuardOutcome::Errored {
-                reason: "flk-trigger action must be `notify` in phase 4; \
-                         spawn actions are deferred to S1"
-                    .into(),
-            };
+            return self.error_once(
+                repo,
+                issue,
+                "flk-trigger action must be `notify` in phase 4; \
+                 spawn actions are deferred to S1"
+                    .to_string(),
+            );
         }
 
         let dedupe_key = block
@@ -249,6 +273,7 @@ mod tests {
             repos: vec!["gerchowl/flock".into()],
             gh_bin: "gh".into(),
             poll_secs: 60,
+            max_issues: 50,
         }
     }
 
@@ -265,6 +290,77 @@ mod tests {
             author,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn non_owner_never_reaches_an_error_verdict() {
+        // §8.7 / P7 (the repo is PUBLIC): a stranger's issue must produce
+        // nothing but an audit line. If a malformed-trigger verdict could
+        // outrank the owner gate, any GitHub user could drive flock into
+        // posting `gh issue comment` on their own issue — comment-spam
+        // amplification signed with the operator's identity.
+        let mut guard = IssueGuardFold::default();
+        let config = config("gerchowl");
+        let hostile_bodies = [
+            // two fences (the old first-checked branch)
+            "```flk-trigger\na = 1\n```\n```flk-trigger\nb = 2\n```\n",
+            // unparseable TOML
+            "```flk-trigger\n!!! not toml\n```\n",
+            // wrong `on`
+            "```flk-trigger\non = \"push\"\n```\n",
+            // disallowed action
+            "```flk-trigger\non = \"issue_updated\"\n[action.hibernate]\npane = \"w1:p1\"\n```\n",
+        ];
+        for body in hostile_bodies {
+            let outcome = guard.evaluate(
+                "gerchowl/flock",
+                &issue(body, author("randostranger")),
+                &config,
+            );
+            assert!(
+                matches!(outcome, IssueGuardOutcome::Ignored { .. }),
+                "non-owner body must be ignored, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_login_compares_case_insensitively() {
+        // GitHub logins are case-insensitive; a config typo'd as "Gerchowl"
+        // must not silently ignore every legitimate trigger.
+        let mut guard = IssueGuardFold::default();
+        let config = config("Gerchowl");
+        let body = "```flk-trigger\non = \"issue_updated\"\n[action.notify]\ntitle = \"hi\"\n```\n";
+        let outcome = guard.evaluate("gerchowl/flock", &issue(body, author("gerchowl")), &config);
+        assert!(
+            matches!(outcome, IssueGuardOutcome::Fire { .. }),
+            "case-different owner must still fire, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn owner_error_verdicts_are_deduped_per_body() {
+        // A malformed owner-authored trigger posts ONE comment, not one per
+        // poll — otherwise a typo floods the issue every cadence tick.
+        let mut guard = IssueGuardFold::default();
+        let config = config("gerchowl");
+        let body = "```flk-trigger\n!!! not toml\n```\n";
+        let first = guard.evaluate("gerchowl/flock", &issue(body, author("gerchowl")), &config);
+        assert!(matches!(first, IssueGuardOutcome::Errored { .. }));
+        let second = guard.evaluate("gerchowl/flock", &issue(body, author("gerchowl")), &config);
+        assert!(
+            matches!(second, IssueGuardOutcome::Deduped { .. }),
+            "repeat poll of the same bad body must dedupe, got {second:?}"
+        );
+        // Editing the body is a new error episode — the owner sees the new
+        // failure once.
+        let edited = "```flk-trigger\nstill !!! broken\n```\n";
+        let third = guard.evaluate(
+            "gerchowl/flock",
+            &issue(edited, author("gerchowl")),
+            &config,
+        );
+        assert!(matches!(third, IssueGuardOutcome::Errored { .. }));
     }
 
     #[test]

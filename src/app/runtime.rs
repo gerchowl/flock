@@ -934,7 +934,7 @@ impl App {
 
         let mut changed = false;
         for repo in &config.repos {
-            let issues = match fetch_open_issues(&config.gh_bin, repo) {
+            let issues = match fetch_open_issues(&config.gh_bin, repo, config.max_issues) {
                 Ok(issues) => issues,
                 Err(err) => {
                     // gh failure surfaces as a `CheckErrored` for the guard —
@@ -1064,7 +1064,11 @@ impl App {
 /// Argv-form `gh issue list --repo <repo> --state open --json body,author,number,updatedAt`.
 /// Returns the parsed issues; every error path is a `Result::Err` so the
 /// caller can surface a `CheckErrored` instead of silently passing.
-fn fetch_open_issues(gh_bin: &str, repo: &str) -> Result<Vec<crate::checks::GhIssue>, String> {
+fn fetch_open_issues(
+    gh_bin: &str,
+    repo: &str,
+    max_issues: u32,
+) -> Result<Vec<crate::checks::GhIssue>, String> {
     let output = crate::process::TracedCommand::new(gh_bin, "checks")
         .args([
             "issue",
@@ -1076,7 +1080,7 @@ fn fetch_open_issues(gh_bin: &str, repo: &str) -> Result<Vec<crate::checks::GhIs
             "--json",
             "body,author,number,updatedAt",
             "--limit",
-            "50",
+            &max_issues.to_string(),
         ])
         .output_traced()
         .map_err(|err| err.to_string())?;

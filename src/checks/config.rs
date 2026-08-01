@@ -130,6 +130,14 @@ pub struct IssueGuardConfig {
     pub repos: Vec<String>,
     pub gh_bin: String,
     pub poll_secs: u64,
+    /// Cap on open issues fetched per poll. Older issues beyond the cap are
+    /// never evaluated — raise it for a busy repo.
+    #[serde(default = "default_max_issues")]
+    pub max_issues: u32,
+}
+
+fn default_max_issues() -> u32 {
+    50
 }
 
 impl Default for IssueGuardConfig {
@@ -140,6 +148,7 @@ impl Default for IssueGuardConfig {
             repos: Vec::new(),
             gh_bin: DEFAULT_ISSUE_GUARD_GH_BIN.to_string(),
             poll_secs: DEFAULT_ISSUE_GUARD_POLL_SECS,
+            max_issues: default_max_issues(),
         }
     }
 }

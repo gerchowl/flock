@@ -87,13 +87,7 @@ impl BlockedAlertFold {
 
     /// Ack every currently Blocked episode so no more fires land for it until
     /// each pane leaves + re-enters Blocked. Returns the number of episodes
-    /// acked (0 when nothing was blocked). Consumed by `flk checks ack` in a
-    /// later phase-4 commit — the wiring is intentionally landing in commit D
-    /// alongside the runner-side ack call site so both wake at the same time.
-    #[allow(
-        dead_code,
-        reason = "consumed by `flk checks ack` in the phase 4 CLI commit"
-    )]
+    /// acked (0 when nothing was blocked). Consumed by `flk checks ack`.
     pub(crate) fn ack_current_episodes(&mut self, panes: &[BlockedPaneSnapshot]) -> usize {
         let mut acked = 0;
         for pane in panes {

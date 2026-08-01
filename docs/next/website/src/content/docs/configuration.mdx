@@ -487,6 +487,7 @@ owner = "gerchowl"       # only bodies from this GitHub login can trigger
 repos = ["gerchowl/flock"]
 gh_bin = "gh"
 poll_secs = 60
+max_issues = 50          # open issues fetched per poll; older ones are not evaluated
 
 # One or more user-declared script checks.
 # [[checks.script]]
@@ -500,6 +501,18 @@ poll_secs = 60
 # title = "disk low"
 # sound = "request"
 ```
+
+Hibernation is per-host policy: `enable = false` is the right default on a
+big machine and `true` on a laptop. A hibernated pane's resume plan lives in
+memory only — after a server restart the pane comes back as a normal
+restorable agent rather than a hibernated one, so nothing is lost, but the
+memory saving ends with the restart. Only `idle` panes the operator has
+already seen, and long-finished `done` panes, are ever hibernated; `working`
+and `blocked` panes are never touched.
+
+Only issue bodies authored by `owner` can trigger anything, and the check
+refuses to act on any other body — the repository is public, so every other
+issue is untrusted input.
 
 Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
 
