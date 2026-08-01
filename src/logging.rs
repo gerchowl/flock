@@ -2168,6 +2168,22 @@ pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
     );
 }
 
+/// Periodic client render-loop heartbeat (#176). Emitted from the loop's Timer
+/// arm on a coarse cadence so a UI freeze is unambiguous in flock-client.log —
+/// a genuine stall shows up as a gap BOUNDED by the last tick, not indefinite
+/// silence (a frozen loop cannot log, so absence of ticks localizes the freeze).
+/// `active_slot` names the slot currently driving input, so a hang is
+/// attributable to the peer the loop was serving.
+pub(crate) fn client_tick(active_slot: &str) {
+    tracing::info!(
+        event = "client.tick",
+        subsystem = "client",
+        outcome = "alive",
+        active_slot,
+        "client render loop heartbeat"
+    );
+}
+
 pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
     tracing::debug!(
         event = "client.slot.disconnect",

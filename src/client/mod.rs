@@ -1661,19 +1661,17 @@ async fn run_client_loop(
         max_frame_size,
     );
 
-    // Use the original stream for writing (blocking is fine since we write
-    // from the async loop).
-    let mut write_stream = stream;
-    write_stream
-        .set_nonblocking(false)
+    // Connection slots (#65) + write isolation (#176): the active slot's writes
+    // go through a dedicated writer thread (a `SlotWriter`), never a blocking
+    // socket call on this loop thread. When `[slots] enabled`, the same writer
+    // is the manager's active connection and a warm switch flips it in process
+    // without releasing the terminal. When disabled, the manager is None and the
+    // legacy exit-and-relaunch leg path drives every switch, but the active
+    // writer still isolates the loop from a stalled transport. The reader was
+    // already spawned from its own clone above; `stream` (the write half) is
+    // moved into the writer thread here.
+    let (mut slot_manager, mut active_writer) = build_active_writer_and_manager(stream, &event_tx)
         .map_err(ClientError::ConnectionFailed)?;
-
-    // Connection slots (#65): when enabled, build the slot manager over the
-    // active connection and background-dial the warm-all fleet. The active
-    // slot's write stream is `write_stream`; a warm switch flips it in process
-    // without releasing the terminal. When disabled, `slot_manager` is None and
-    // the legacy exit-and-relaunch leg path drives every switch.
-    let mut slot_manager = build_slot_manager(&write_stream, max_frame_size);
     // Whether the warm sweep pre-warms cold ssh peers by building their bridge
     // ahead of time (#139), not just home + the active leg. Read once at start.
     let prewarm_ssh_peers = crate::config::Config::load().config.slots.prewarm_ssh_peers;
@@ -1683,7 +1681,7 @@ async fn run_client_loop(
     // server parses any color replies in here exactly like live ones.
     if let Some(data) = initial_input {
         let msg = ClientMessage::Input { data };
-        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+        if let Err(e) = active_writer.send(msg) {
             return Err(ClientError::ConnectionLost(e));
         }
     }
@@ -1714,6 +1712,9 @@ async fn run_client_loop(
     // Last popup paint timestamp; throttle to POPUP_REPAINT_INTERVAL so the
     // Timer-driven repaint never thrashes the host terminal.
     let mut last_popup_paint: Option<Instant> = None;
+    // Last render-loop heartbeat (#176). Emitted on a coarse cadence from the
+    // Timer arm so a freeze is a bounded gap in flock-client.log, not silence.
+    let mut last_heartbeat: Option<Instant> = None;
 
     // Main event loop.
     let mut stdin_closed = false;
@@ -1795,13 +1796,13 @@ async fn run_client_loop(
                                 row,
                                 modifiers,
                             };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                            if let Err(e) = active_writer.send(msg) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                            let _ = active_writer.send(ClientMessage::Detach);
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
@@ -1835,7 +1836,7 @@ async fn run_client_loop(
                             extension: image.extension.to_owned(),
                             data: image.bytes,
                         };
-                        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        if let Err(e) = active_writer.send(msg) {
                             return Err(ClientError::ConnectionLost(e));
                         }
                         continue;
@@ -1867,7 +1868,7 @@ async fn run_client_loop(
                                     extension,
                                     data: bytes,
                                 };
-                                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                if let Err(e) = active_writer.send(msg) {
                                     return Err(ClientError::ConnectionLost(e));
                                 }
                                 continue;
@@ -1884,7 +1885,7 @@ async fn run_client_loop(
                     }
                 }
                 let msg = ClientMessage::Input { data };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = active_writer.send(msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
@@ -1897,7 +1898,7 @@ async fn run_client_loop(
                     cell_width_px,
                     cell_height_px,
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = active_writer.send(msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
@@ -1916,7 +1917,10 @@ async fn run_client_loop(
                         // silently (the #65 ghost). The active session is
                         // untouched; a later switch re-dials it.
                         if let Some(manager) = slot_manager.as_mut() {
-                            manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
+                            manager.handle_dead(
+                                &slots::SlotTarget::from_key(&slot_key),
+                                Instant::now(),
+                            );
                         }
                         crate::logging::client_slot_shutdown_demoted(&slot_key);
                         continue;
@@ -2005,14 +2009,15 @@ async fn run_client_loop(
                             let _ = &focus_workspace;
                             let target = slots::SlotTarget::from_key(&ssh_target);
                             match manager.flip_to(&target) {
-                                Ok(Some(new_stream)) => {
+                                Ok(Some((new_writer, new_reader_src))) => {
                                     // Warm flip: apply in-process.
                                     apply_slot_flip(
-                                        new_stream,
+                                        new_writer,
+                                        new_reader_src,
                                         &target,
                                         &mut active_reader_quit,
                                         &mut active_slot_key,
-                                        &mut write_stream,
+                                        &mut active_writer,
                                         &mut state,
                                         &event_tx,
                                         &should_quit,
@@ -2077,7 +2082,7 @@ async fn run_client_loop(
                                         &ssh_target,
                                         &err.to_string(),
                                     );
-                                    manager.handle_dead(&target);
+                                    manager.handle_dead(&target, Instant::now());
                                     // Surface in the popup as a switch failure
                                     // beat; the user sees the reason and the
                                     // active slot is unchanged.
@@ -2170,7 +2175,10 @@ async fn run_client_loop(
                     // non-active slot routes here (never to Drop).
                     slots::SlotRouting::DemoteDead | slots::SlotRouting::Drop => {
                         if let Some(manager) = slot_manager.as_mut() {
-                            manager.handle_dead(&slots::SlotTarget::from_key(&slot_key));
+                            manager.handle_dead(
+                                &slots::SlotTarget::from_key(&slot_key),
+                                Instant::now(),
+                            );
                         }
                         crate::logging::client_slot_disconnected_demoted(&slot_key);
                         continue;
@@ -2208,14 +2216,18 @@ async fn run_client_loop(
                                 drop(bridge);
                             });
                         } else {
-                            // Register the new connection as warm (with bridge
-                            // ownership), then flip to it in-process.
-                            let conn = slots::SlotConnection {
-                                target: target.clone(),
-                                write_stream: stream,
+                            // Register the new connection as warm (its writer
+                            // thread owns the transport + bridge, so the bridge's
+                            // teardown never blocks the loop, #176), then flip to
+                            // it in-process.
+                            let added = slots::SlotConnection::new(
+                                target.clone(),
+                                stream,
                                 bridge,
-                            };
-                            if let Err(err) = manager.add_warm(conn) {
+                                slot_death_hook(key.clone(), &event_tx),
+                            )
+                            .and_then(|conn| manager.add_warm(conn));
+                            if let Err(err) = added {
                                 crate::logging::client_slot_switch_pause_failed(
                                     &key,
                                     &err.to_string(),
@@ -2232,7 +2244,7 @@ async fn run_client_loop(
                             }
                         }
                         match manager.flip_to(&target) {
-                            Ok(Some(new_stream)) => {
+                            Ok(Some((new_writer, new_reader_src))) => {
                                 // Teardown popup BEFORE applying further events
                                 // (PopupGuard discipline #93).
                                 let cold_timing = pending_switch
@@ -2242,11 +2254,12 @@ async fn run_client_loop(
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
                                 apply_slot_flip(
-                                    new_stream,
+                                    new_writer,
+                                    new_reader_src,
                                     &target,
                                     &mut active_reader_quit,
                                     &mut active_slot_key,
-                                    &mut write_stream,
+                                    &mut active_writer,
                                     &mut state,
                                     &event_tx,
                                     &should_quit,
@@ -2287,12 +2300,14 @@ async fn run_client_loop(
                                 drop(bridge);
                             });
                         } else {
-                            let conn = slots::SlotConnection {
+                            let added = slots::SlotConnection::new(
                                 target,
-                                write_stream: stream,
+                                stream,
                                 bridge,
-                            };
-                            if let Err(err) = manager.add_warm(conn) {
+                                slot_death_hook(key.clone(), &event_tx),
+                            )
+                            .and_then(|conn| manager.add_warm(conn));
+                            if let Err(err) = added {
                                 crate::logging::client_slot_warm_pause_failed(
                                     &key,
                                     &err.to_string(),
@@ -2346,6 +2361,14 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::Timer => {
+                // Render-loop heartbeat (#176), coarse cadence: a live loop
+                // stamps flock-client.log every HEARTBEAT_INTERVAL, so a freeze
+                // localizes to the gap after the last tick.
+                let now = Instant::now();
+                if last_heartbeat.is_none_or(|at| now.duration_since(at) >= HEARTBEAT_INTERVAL) {
+                    crate::logging::client_tick(&active_slot_key);
+                    last_heartbeat = Some(now);
+                }
                 // Debounced bare Esc: nothing followed it, so it was a real
                 // Esc keypress -- cancel (while pending) or swallow (grace).
                 if pending_esc
@@ -2463,8 +2486,7 @@ async fn run_client_loop(
     }
 
     // Clean exit (Ctrl+C). Send Detach before closing.
-    let detach = ClientMessage::Detach;
-    let _ = write_to_server(&mut write_stream, &detach);
+    let _ = active_writer.send(ClientMessage::Detach);
     let _ = io::stdout().flush();
 
     Ok(())
@@ -2482,11 +2504,12 @@ async fn run_client_loop(
 /// success arm (#93) so they cannot drift.
 #[allow(clippy::too_many_arguments)]
 fn apply_slot_flip(
-    new_stream: UnixStream,
+    new_writer: slots::SlotWriter,
+    new_reader_src: UnixStream,
     target: &slots::SlotTarget,
     active_reader_quit: &mut Arc<AtomicBool>,
     active_slot_key: &mut String,
-    write_stream: &mut UnixStream,
+    active_writer: &mut slots::SlotWriter,
     state: &mut ClientState,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -2494,13 +2517,10 @@ fn apply_slot_flip(
 ) -> Result<(), ClientError> {
     active_reader_quit.store(true, Ordering::Release);
     let new_quit = Arc::new(AtomicBool::new(false));
-    let read_clone = new_stream
-        .try_clone()
-        .map_err(ClientError::ConnectionFailed)?;
     let new_key = target.key().to_string();
     spawn_slot_reader(
         new_key.clone(),
-        read_clone,
+        new_reader_src,
         event_tx.clone(),
         should_quit.clone(),
         new_quit.clone(),
@@ -2508,10 +2528,11 @@ fn apply_slot_flip(
     );
     *active_reader_quit = new_quit;
     // Flip the active-slot tag BEFORE any further events apply, so queued
-    // stale frames from the old reader are dropped from here on (#65).
+    // stale frames from the old reader are dropped from here on (#65). The
+    // active writer becomes the new slot's writer handle — input now routes to
+    // its dedicated writer thread (#176).
     *active_slot_key = new_key;
-    *write_stream = new_stream;
-    let _ = write_stream.set_nonblocking(false);
+    *active_writer = new_writer;
     // Re-assert geometry to the slot we just made active (#77).
     let (cur_cols, cur_rows) = state.reported_size;
     let (cur_cw, cur_ch) = state.reported_cell_size;
@@ -2521,7 +2542,7 @@ fn apply_slot_flip(
         cell_width_px: cur_cw,
         cell_height_px: cur_ch,
     };
-    if let Err(e) = write_to_server(write_stream, &resize) {
+    if let Err(e) = active_writer.send(resize) {
         return Err(ClientError::ConnectionLost(e));
     }
     state.request_full_redraw();
@@ -2565,6 +2586,11 @@ struct PendingSwitch {
 /// flickers the box; the elapsed counter renders whole seconds anyway, so
 /// 4-5x/sec is plenty.
 const POPUP_REPAINT_INTERVAL: Duration = Duration::from_millis(220);
+
+/// Cadence of the render-loop heartbeat trace (#176). Coarse: a live loop only
+/// needs to prove it isn't wedged, and a per-frame log would flood the file. A
+/// freeze then reads as a gap larger than this after the last `client.tick`.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What the loop should do with a gen-stamped dial outcome event (#93).
 /// Pure function so the cancel/re-switch race table is unit-testable.
@@ -2817,23 +2843,46 @@ fn active_slot_key() -> String {
     active_slot_target().key().to_string()
 }
 
-/// Build the connection-slots manager when `[slots] enabled`, owning the active
-/// connection (a clone of the active write stream) and the warm-all target
-/// list derived from config peers plus the carried fleet snapshot. Returns None
-/// when slots are disabled — the legacy leg path then drives switches.
-fn build_slot_manager(
-    active_write_stream: &UnixStream,
-    _max_frame_size: usize,
-) -> Option<slots::SlotManager> {
+/// Death-notification closure for a slot's writer thread: posts the slot's
+/// disconnect to the loop if its transport dies mid-session (#176). Reuses the
+/// existing `ServerDisconnected` handling, which demotes a warm slot silently
+/// and tears the session down only for the active slot.
+fn slot_death_hook(
+    key: String,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> Box<dyn FnOnce() + Send> {
+    let tx = event_tx.clone();
+    Box::new(move || {
+        let _ = tx.blocking_send(ClientLoopEvent::ServerDisconnected(key));
+    })
+}
+
+/// Build the active slot's [`SlotWriter`] (always) and, when `[slots] enabled`,
+/// the connection-slots manager owning that same writer as its active
+/// connection plus the warm-all target list. Takes ownership of the active
+/// write stream (moved into the writer thread); the reader was already spawned
+/// from its own clone. When slots are disabled the manager is `None` and the
+/// returned writer alone drives input — the legacy leg path handles switches.
+fn build_active_writer_and_manager(
+    active_stream: UnixStream,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> io::Result<(Option<slots::SlotManager>, slots::SlotWriter)> {
     let loaded = crate::config::Config::load();
     let slots_config = loaded.config.slots.clone();
-    if !slots_config.enabled {
-        return None;
-    }
 
     // The active slot is whatever leg launched this client: home for a local
     // attach, the ssh target for a remote leg (carried in REATTACH/remote env).
     let active_target = active_slot_target();
+    let on_death = slot_death_hook(active_target.key().to_string(), event_tx);
+    let active_conn = slots::SlotConnection::new(active_target, active_stream, None, on_death)?;
+    let active_writer = active_conn.writer();
+
+    if !slots_config.enabled {
+        // No manager: dropping `active_conn` releases one writer handle, but the
+        // returned `active_writer` clone keeps the writer thread alive to drive
+        // input on the single active connection.
+        return Ok((None, active_writer));
+    }
 
     // Warm-all targets: locally-configured peers (a hub knows its fleet) plus
     // the carried snapshot's peers and origin (a spoke learns its fleet from
@@ -2853,16 +2902,8 @@ fn build_slot_manager(
     }
     let targets = slots::warm_all_targets(&config_peers, &carried, slots_config.max);
 
-    let active_conn = slots::SlotConnection {
-        target: active_target,
-        write_stream: active_write_stream.try_clone().ok()?,
-        bridge: None,
-    };
-    Some(slots::SlotManager::new(
-        active_conn,
-        targets,
-        slots_config.max,
-    ))
+    let manager = slots::SlotManager::new(active_conn, targets, slots_config.max);
+    Ok((Some(manager), active_writer))
 }
 
 /// Background-dial a warm slot: connect its socket and complete the handshake
@@ -4886,7 +4927,11 @@ mod tests {
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let old_quit_observer = active_reader_quit.clone();
         let mut active_slot_key = "<home>".to_string();
-        let mut write_stream = old_local;
+        // Active writer over the old transport (a writer thread owns old_local).
+        let old_conn =
+            slots::SlotConnection::new(slots::SlotTarget::Home, old_local, None, Box::new(|| {}))
+                .unwrap();
+        let mut active_writer = old_conn.writer();
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
             mouse_capture_active: false,
@@ -4901,13 +4946,20 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
         let should_quit = Arc::new(AtomicBool::new(false));
         let target = slots::SlotTarget::Ssh("anvil".to_string());
+        // The new transport the flip makes active — mirror production: derive the
+        // writer handle + a reserved reader clone from one SlotConnection.
+        let new_conn =
+            slots::SlotConnection::new(target.clone(), new_local, None, Box::new(|| {})).unwrap();
+        let new_writer = new_conn.writer();
+        let new_reader_src = new_conn.reader_clone().unwrap();
 
         apply_slot_flip(
-            new_local,
+            new_writer,
+            new_reader_src,
             &target,
             &mut active_reader_quit,
             &mut active_slot_key,
-            &mut write_stream,
+            &mut active_writer,
             &mut state,
             &event_tx,
             &should_quit,
