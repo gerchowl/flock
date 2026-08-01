@@ -3243,6 +3243,10 @@ impl HeadlessServer {
             changed = true;
         }
 
+        // #175 phase 4 dual-loop rule: the headless server ticks the same
+        // check-runner path as the TUI runtime.
+        changed |= self.app.dispatch_due_script_checks(now);
+
         if geometry_dirty || self.foreground_client_id.is_none() {
             self.app.pending_agent_resume_deadline = None;
         } else {

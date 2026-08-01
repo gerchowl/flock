@@ -147,6 +147,14 @@ pub struct App {
     pub(crate) has_foreground_viewer: bool,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
+    /// #175 phase 4: per-check runner + its scheduling deadline. The runner
+    /// owns the debounce state machine; the App folds its `next_due`
+    /// into the loop deadline and dispatches `FireDecision`s.
+    pub(crate) checks_runner: crate::checks::CheckRunner,
+    pub(crate) checks_next_deadline: Option<Instant>,
+    pub(crate) checks_heartbeat_deadline: Option<Instant>,
+    pub(crate) checks_run_count: u64,
+    pub(crate) checks_error_count: u64,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -710,6 +718,17 @@ impl App {
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,
+            checks_runner: crate::checks::CheckRunner::from_config(&config.checks, Instant::now()),
+            checks_next_deadline: None,
+            // Arm the heartbeat only when the runner has something to run —
+            // otherwise a config-defaulted server would wake every
+            // heartbeat_secs for a no-op, and the loop-deadline tests would
+            // stop seeing None. Once built-in checks land the gate widens
+            // (their config.enable joins the disjunction).
+            checks_heartbeat_deadline: (config.checks.enable && !config.checks.scripts.is_empty())
+                .then(|| Instant::now() + Duration::from_secs(config.checks.heartbeat_secs.max(1))),
+            checks_run_count: 0,
+            checks_error_count: 0,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,

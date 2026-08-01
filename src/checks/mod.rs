@@ -6,5 +6,9 @@
 //! notification / event paths.
 
 pub(crate) mod config;
+pub(crate) mod runner;
+pub(crate) mod script;
 
-pub(crate) use config::ChecksConfig;
+pub(crate) use config::{ActionSpec, ChecksConfig};
+pub(crate) use runner::CheckRunner;
+pub(crate) use script::{run_script, Outcome};

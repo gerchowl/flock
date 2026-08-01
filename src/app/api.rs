@@ -318,6 +318,16 @@ impl App {
             return;
         }
 
+        if let AppEvent::CheckCompleted {
+            name,
+            outcome,
+            duration_ms,
+        } = ev
+        {
+            self.handle_check_completed(name, outcome, duration_ms);
+            return;
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             // Floating panes live outside the workspace tree: when their
             // process exits, reap the float here (this handler runs in both

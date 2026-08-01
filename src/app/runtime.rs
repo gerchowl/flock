@@ -269,6 +269,11 @@ impl App {
             changed = true;
         }
 
+        // #175 phase 4: tick the check runner. dispatch_due_script_checks
+        // returns true when it either dispatched a run or emitted a
+        // heartbeat — both mean the loop should render (an event landed).
+        changed |= self.dispatch_due_script_checks(now);
+
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;
         } else {
@@ -541,6 +546,10 @@ impl App {
                 .flatten(),
             self.next_auto_update_check,
             self.agent_metadata_deadline,
+            // #175 phase 4: wake for the next runnable script check (or its
+            // heartbeat), so the runner ticks even in an otherwise quiet loop.
+            self.checks_next_deadline,
+            self.checks_heartbeat_deadline,
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
@@ -592,6 +601,165 @@ impl App {
             self.handle_internal_event_with_prefix_sync(ev);
         }
         had_event
+    }
+
+    /// #175 phase 4: scan the runner for due script checks, spawn one worker
+    /// per RunnableCheck (the worker sends `AppEvent::CheckCompleted` back
+    /// via `event_tx`), refresh the runner's next-due deadline, and emit
+    /// `ChecksHeartbeat` when its window elapses. Returns true if either
+    /// path emitted a persisted event.
+    ///
+    /// Mirrored in both the TUI runtime loop and the headless server loop
+    /// (the #25 dual-loop rule): this helper is called from
+    /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
+    /// (headless).
+    pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.enable {
+            self.checks_next_deadline = None;
+            self.checks_heartbeat_deadline = None;
+            return false;
+        }
+        let mut changed = false;
+
+        if self
+            .checks_next_deadline
+            .is_none_or(|deadline| now >= deadline)
+        {
+            let runnable = self.checks_runner.next_runnable(now);
+            for job in runnable {
+                let event_tx = self.event_tx.clone();
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let (outcome, _output) = crate::checks::run_script(&job.check);
+                    let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let _ = event_tx.blocking_send(crate::events::AppEvent::CheckCompleted {
+                        name: job.name,
+                        outcome,
+                        duration_ms,
+                    });
+                });
+                changed = true;
+            }
+            self.checks_next_deadline = self.checks_runner.next_due(now);
+        }
+
+        if self
+            .checks_heartbeat_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::ChecksHeartbeat,
+                data: crate::api::schema::EventData::ChecksHeartbeat {
+                    runs: self.checks_run_count,
+                    errors: self.checks_error_count,
+                },
+            });
+            let heartbeat_secs = self.state.config.checks.heartbeat_secs.max(1);
+            self.checks_heartbeat_deadline = Some(now + Duration::from_secs(heartbeat_secs));
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// #175 phase 4: fold one completed script check back into the runner
+    /// and emit the durable event pair (`CheckRan` always; `CheckErrored` on
+    /// Error, `CheckFired` on a FireDecision). Called from the shared
+    /// internal-event handler; the notification-side dispatch of the
+    /// FireDecision's `on_fire: ActionSpec` runs here too so both loops
+    /// share one code path.
+    pub(crate) fn handle_check_completed(
+        &mut self,
+        name: String,
+        outcome: crate::checks::Outcome,
+        duration_ms: u64,
+    ) {
+        self.checks_run_count = self.checks_run_count.saturating_add(1);
+        let outcome_label = match &outcome {
+            crate::checks::Outcome::Fire => "fire",
+            crate::checks::Outcome::Pass => "pass",
+            crate::checks::Outcome::Error(_) => "error",
+        };
+        self.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::CheckRan,
+            data: crate::api::schema::EventData::CheckRan {
+                name: name.clone(),
+                outcome: outcome_label.to_string(),
+                duration_ms,
+            },
+        });
+        if let crate::checks::Outcome::Error(reason) = &outcome {
+            self.checks_error_count = self.checks_error_count.saturating_add(1);
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckErrored,
+                data: crate::api::schema::EventData::CheckErrored {
+                    name: name.clone(),
+                    reason: reason.clone(),
+                },
+            });
+        }
+
+        let decision = self.checks_runner.complete(&name, outcome, Instant::now());
+        // Whether or not we fire, the runner's next_due changed — refresh
+        // the scheduling deadline so the loop sleeps to the right point.
+        self.checks_next_deadline = self.checks_runner.next_due(Instant::now());
+
+        if let Some(decision) = decision {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckFired,
+                data: crate::api::schema::EventData::CheckFired {
+                    name: decision.name.clone(),
+                    episode: decision.episode.clone(),
+                },
+            });
+            self.dispatch_check_action(&decision);
+        }
+    }
+
+    /// Route a `FireDecision.action` through the existing notification path
+    /// so `[ui.toast]` delivery policy applies uniformly. `ActionSpec::Event`
+    /// is fire-and-forget — the durable `CheckFired` event is already on the
+    /// hub by this point; the Event variant just carries a semantic label
+    /// external listeners can key on.
+    fn dispatch_check_action(&mut self, decision: &crate::checks::runner::FireDecision) {
+        use crate::api::schema::NotificationShowParams;
+        use crate::checks::ActionSpec;
+
+        match &decision.action {
+            ActionSpec::Notify { title, sound } => {
+                let title = if title.is_empty() {
+                    format!("check fired: {}", decision.name)
+                } else {
+                    title.clone()
+                };
+                let params = NotificationShowParams {
+                    title,
+                    body: Some(format!("episode {}", decision.episode)),
+                    position: None,
+                    sound: *sound,
+                };
+                // Reuse the API's notification-show shape so the toast /
+                // sound / terminal / system routing lives in ONE place.
+                let request_id = format!("check:{}", decision.episode);
+                let _ = self.handle_api_request_after_internal_events_drained(
+                    crate::api::schema::Request {
+                        id: request_id,
+                        method: crate::api::schema::Method::NotificationShow(params),
+                    },
+                );
+            }
+            ActionSpec::Event { label } => {
+                let _ = label;
+                // No-op: the CheckFired event above IS the dispatch.
+                // A follow-up commit can enrich it with the label.
+            }
+        }
+    }
+
+    /// Helper used by tests to force a heartbeat now.
+    #[cfg(test)]
+    pub(crate) fn force_checks_heartbeat_now(&mut self) {
+        self.checks_heartbeat_deadline = Some(Instant::now());
     }
 }
 
@@ -1047,5 +1215,142 @@ mod tests {
             .pending_agent_resume_plan
             .is_some());
         assert!(app.pending_agent_resume_deadline.is_none());
+    }
+
+    /// #175 phase 4 end-to-end: a `[[checks.script]]` fixture wired through
+    /// the App tick emits `CheckRan { outcome = "fire" }` and (with
+    /// `debounce = 1`) a `CheckFired` on the event hub.
+    #[tokio::test]
+    async fn check_runner_ticks_emit_ran_and_fired_events_on_hub() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fixture script: exit 0 → Fire on the runner's classification.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flock-checks-runtime-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fire.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.min_tick_secs = 1;
+        config.checks.heartbeat_secs = 3600;
+        config.checks.scripts = vec![crate::checks::config::ScriptCheck {
+            name: "e2e".into(),
+            program: script_path.clone(),
+            interval_secs: 1,
+            timeout_secs: 5,
+            debounce: 1,
+            on_fire: crate::checks::ActionSpec::Event {
+                label: "e2e-fired".into(),
+            },
+            ..crate::checks::config::ScriptCheck::default()
+        }];
+        let event_hub = crate::api::EventHub::default();
+        let mut app = super::super::App::new(&config, true, None, api_rx, event_hub.clone());
+
+        // Force the runner past its first-tick warmup.
+        app.checks_runner
+            .force_due("e2e", Instant::now() - Duration::from_millis(1));
+        app.checks_next_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // Tick: dispatches the check on a worker thread.
+        assert!(app.dispatch_due_script_checks(Instant::now()));
+
+        // Wait for the worker's `AppEvent::CheckCompleted` (fixture script
+        // is `exit 0` — should return within a few hundred ms). We poll the
+        // App's event channel and hand each event to the shared handler,
+        // stopping once the hub carries the CheckRan event.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(ev) = app.event_rx.try_recv() {
+                app.handle_internal_event(ev);
+            }
+            let events = app.event_hub.events_after(0);
+            let has_ran = events.iter().any(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckRan { name, outcome, .. }
+                        if name == "e2e" && outcome == "fire"
+                )
+            });
+            if has_ran {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let events = app.event_hub.events_after(0);
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::CheckRan { name, outcome, .. }
+                    if name == "e2e" && outcome == "fire"
+            )),
+            "expected CheckRan(fire) on the hub, got: {:?}",
+            events
+        );
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::CheckFired { name, .. } if name == "e2e"
+            )),
+            "expected CheckFired(e2e) on the hub, got: {:?}",
+            events
+        );
+        assert_eq!(app.checks_run_count, 1);
+        assert_eq!(app.checks_error_count, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Heartbeat: when the window elapses, `ChecksHeartbeat` lands on the
+    /// hub carrying the current run/error counts.
+    #[tokio::test]
+    async fn check_runner_heartbeat_emits_when_window_elapses() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.heartbeat_secs = 1;
+        let event_hub = crate::api::EventHub::default();
+        let mut app = super::super::App::new(&config, true, None, api_rx, event_hub.clone());
+
+        app.force_checks_heartbeat_now();
+        assert!(app.dispatch_due_script_checks(Instant::now()));
+
+        let events = app.event_hub.events_after(0);
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::ChecksHeartbeat { .. }
+            )),
+            "expected ChecksHeartbeat on the hub, got: {:?}",
+            events
+        );
+    }
+
+    /// Kill switch: `checks.enable = false` clears both deadlines and never
+    /// spawns work.
+    #[test]
+    fn check_runner_disabled_never_ticks() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.enable = false;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.checks_next_deadline = Some(Instant::now());
+        app.checks_heartbeat_deadline = Some(Instant::now());
+        assert!(!app.dispatch_due_script_checks(Instant::now()));
+        assert!(app.checks_next_deadline.is_none());
+        assert!(app.checks_heartbeat_deadline.is_none());
     }
 }

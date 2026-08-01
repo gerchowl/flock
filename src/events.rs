@@ -208,4 +208,12 @@ pub enum AppEvent {
     WorktreeKillGateFinished(WorktreeKillGateResult),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
     WorktreeKillAllFinished(WorktreeKillAllResult),
+    /// One script check completed on a runner-spawned worker thread
+    /// (#175 phase 4). The App folds it back into the runner and dispatches
+    /// any FireDecision through the notification / event path.
+    CheckCompleted {
+        name: String,
+        outcome: crate::checks::Outcome,
+        duration_ms: u64,
+    },
 }

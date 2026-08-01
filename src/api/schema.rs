@@ -954,6 +954,11 @@ pub enum EventKind {
     MessageQueued,
     MessageDelivered,
     MessageReplied,
+    /// #175 phase 4 check-runner telemetry.
+    CheckRan,
+    CheckFired,
+    CheckErrored,
+    ChecksHeartbeat,
 }
 
 impl EventKind {
@@ -983,7 +988,11 @@ impl EventKind {
             | Self::AgentForked
             | Self::MessageQueued
             | Self::MessageDelivered
-            | Self::MessageReplied => true,
+            | Self::MessageReplied
+            | Self::CheckRan
+            | Self::CheckFired
+            | Self::CheckErrored
+            | Self::ChecksHeartbeat => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1517,6 +1526,31 @@ pub enum EventData {
         reply_correlation_id: String,
         reply_latency_ms: u64,
         round_trips: u32,
+    },
+    /// #175 phase 4 check-runner: one script check completed.
+    /// `outcome` is one of `"fire"`, `"pass"`, or `"error"`.
+    CheckRan {
+        name: String,
+        outcome: String,
+        duration_ms: u64,
+    },
+    /// #175 phase 4 check-runner: a check crossed its debounce and the
+    /// runner emitted a FireDecision this episode.
+    CheckFired {
+        name: String,
+        episode: String,
+    },
+    /// #175 phase 4 check-runner: the last outcome was Error; the runner
+    /// leaves the debounce counter untouched but records the reason.
+    CheckErrored {
+        name: String,
+        reason: String,
+    },
+    /// #175 phase 4 check-runner: periodic liveness ping. `runs` and
+    /// `errors` are lifetime counters from the App's process start.
+    ChecksHeartbeat {
+        runs: u64,
+        errors: u64,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.

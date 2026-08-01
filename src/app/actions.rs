@@ -3346,6 +3346,11 @@ impl AppState {
             AppEvent::WorktreeKillGateFinished(_) => Vec::new(),
             AppEvent::WorktreeBranchDeleteFinished(_) => Vec::new(),
             AppEvent::WorktreeKillAllFinished(_) => Vec::new(),
+            // #175 phase 4: intercepted in App::handle_internal_event
+            // BEFORE reaching this dispatch (both loops); never touches
+            // AppState here. The interception keeps the FireDecision-side
+            // notification path off the state dispatch entirely.
+            AppEvent::CheckCompleted { .. } => Vec::new(),
         }
     }
 
