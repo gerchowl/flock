@@ -14,6 +14,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0002](0002-twelve-factor-config.md) | Twelve-factor configuration: four layers, one write target, one live source | Accepted |
 | [0003](0003-command-brand-split.md) | Command/brand split: executable is `flk`, product stays `flock` | Accepted |
 | [0004](0004-per-repo-config-layer.md) | Per-repo configuration: a committed `.flk.toml` policy layer for repo facts | Proposed |
+| [0005](0005-peer-io-isolation.md) | Peer I/O isolation: no blocking syscall or Drop on the client render loop | Accepted |
 
 ## Conventions
 
