@@ -139,6 +139,7 @@ impl Config {
             .chain(self.ui.sound.diagnostics())
             .chain(self.ui.idle.diagnostics())
             .chain(self.gossip.diagnostics())
+            .chain(self.checks.diagnostics())
             .collect()
     }
 

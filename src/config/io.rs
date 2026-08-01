@@ -4,6 +4,7 @@ use super::{env, model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
+    "checks",
     "experimental",
     "gossip",
     "icon",
@@ -455,6 +456,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.gossip = section,
+    );
+    load_live_section(
+        &table,
+        "checks",
+        "checks config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.checks = section,
     );
     validate_peers(&mut config.peers, &mut diagnostics);
 
@@ -1255,6 +1264,49 @@ mouse_capture = false
         let (updated, removed) = remove_keybinding_config_sections(content);
         assert!(!removed);
         assert_eq!(updated, content);
+    }
+
+    #[test]
+    fn checks_section_survives_live_reload() {
+        // #175 phase 4: `[checks]` is a known top-level key and must land into
+        // config.checks through the live reload path — a full-shape fixture,
+        // not just the default. Mirrors the gossip drift test below.
+        let loaded = load_live_config_from_str(
+            r#"
+[checks]
+enable = true
+max_concurrent = 3
+min_tick_secs = 20
+heartbeat_secs = 45
+
+[checks.blocked_alert]
+enable = false
+
+[[checks.script]]
+name = "disk-space"
+program = "/usr/local/bin/free-disk-check.sh"
+args = ["--min", "10G"]
+interval_secs = 300
+timeout_secs = 10
+debounce = 2
+
+[checks.script.on_fire.notify]
+title = "disk low"
+sound = "request"
+"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.config.checks.max_concurrent, 3);
+        assert_eq!(loaded.config.checks.min_tick_secs, 20);
+        assert_eq!(loaded.config.checks.heartbeat_secs, 45);
+        assert!(!loaded.config.checks.blocked_alert.enable);
+        assert_eq!(loaded.config.checks.scripts.len(), 1);
+        assert_eq!(loaded.config.checks.scripts[0].name, "disk-space");
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "a known section must not warn: {:?}",
+            loaded.diagnostics
+        );
     }
 
     #[test]

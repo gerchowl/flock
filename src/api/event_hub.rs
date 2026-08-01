@@ -168,7 +168,10 @@ fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
 }
 
 impl EventHub {
-    const MAX_EVENTS: usize = 512;
+    // #175 phase 4: bumped 512 → 4096 so the check-runner's per-tick fan-out
+    // (CheckRan / CheckFired / CheckErrored / ChecksHeartbeat) can't starve the
+    // pane-lifecycle events that share the in-memory ring. Operator-approved.
+    const MAX_EVENTS: usize = 4096;
 
     /// A hub whose persisted event kinds are mirrored to an append-only
     /// JSONL log at `path`, seeded from any existing log so sequences stay

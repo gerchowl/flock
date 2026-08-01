@@ -438,6 +438,7 @@ pub struct Config {
     pub slots: SlotsConfig,
     pub web: WebSectionConfig,
     pub gossip: GossipConfig,
+    pub checks: crate::checks::ChecksConfig,
     pub peers: Vec<PeerConfig>,
 }
 
