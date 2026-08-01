@@ -191,6 +191,19 @@ impl App {
                 return;
             }
         };
+        // #178: refuse before opening the dialog when the parent transcript
+        // is not on disk — the fork would resume nothing and die.
+        if let Some(session_id) = crate::agent_resume::claude_fork_session_id(&plan) {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            if crate::agent_resume::claude_transcript_path(&home, session_id).is_none() {
+                self.show_action_notice(format!(
+                    "branch session: no transcript on disk for session {session_id} — is transcript saving off?"
+                ));
+                return;
+            }
+        }
         self.open_new_linked_worktree_dialog(ws_idx, None);
         // Pre-fill the editable seed with the pivot template (#159). The
         // `<branch>` token is kept verbatim and resolved at confirm, so it
@@ -2040,6 +2053,7 @@ mod tests {
 
     #[test]
     fn branch_session_dialog_attaches_fork_plan_from_persisted_session() {
+        let _home = fake_claude_home_with("sess-1");
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
         app.state.mode = Mode::Navigate;
@@ -2085,6 +2099,58 @@ mod tests {
     }
 
     #[test]
+    fn branch_session_dialog_refuses_when_transcript_is_missing() {
+        // #178: without a transcript on disk the fork would die instantly,
+        // so the dialog must not even open.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let home =
+            std::env::temp_dir().join(format!("flock-tui-nohome-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-ghost")
+                .expect("session id"),
+        });
+        app.state.terminals.insert(terminal_id, terminal);
+
+        app.open_branch_session_dialog(0);
+
+        assert!(app.state.worktree_create.is_none(), "dialog must not open");
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(
+            app.state.action_notice.as_deref(),
+            Some("branch session: no transcript on disk for session sess-ghost — is transcript saving off?")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn branch_session_dialog_refuses_fork_unsupported_agent_loudly() {
         // #175 F2: a resumable non-Claude agent must be refused with the
         // real reason — never silently plain-resumed into a double attach.
@@ -2127,6 +2193,22 @@ mod tests {
         );
     }
 
+    /// #178: branch_session pre-flights the parent transcript. Point HOME at
+    /// a temp dir containing one for the session id used by these fixtures.
+    fn fake_claude_home_with(session_id: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let home =
+            std::env::temp_dir().join(format!("flock-tui-home-{}-{nanos}", std::process::id()));
+        let project = home.join(".claude/projects/-repo-flock");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::env::set_var("HOME", &home);
+        home
+    }
+
     /// #159: the branch-session dialog pre-fills the editable seed with the
     /// pivot template (verbatim `<branch>` token, resolved at confirm) and
     /// starts focus on the branch field.
@@ -2162,6 +2244,7 @@ mod tests {
 
     #[test]
     fn branch_session_dialog_prefills_editable_seed_from_pivot_template() {
+        let _home = fake_claude_home_with("sess-1");
         let mut app = app_with_persisted_claude_session();
         app.state.branch_pivot_message = "pivot for <branch>, stay put".into();
 
@@ -2238,6 +2321,7 @@ mod tests {
 
     #[test]
     fn tab_moves_focus_to_the_seed_field_and_typing_edits_it() {
+        let _home = fake_claude_home_with("sess-1");
         use crate::app::state::WorktreeCreateFocus;
         let mut app = app_with_persisted_claude_session();
         app.state.branch_pivot_message = "seed <branch>".into();
@@ -2314,6 +2398,7 @@ mod tests {
 
     #[test]
     fn dialog_supports_cursor_movement_and_word_delete() {
+        let _home = fake_claude_home_with("sess-1");
         let mut app = app_with_persisted_claude_session();
         app.state.branch_pivot_message = String::new(); // start with an empty seed
         app.open_branch_session_dialog(0);
@@ -2355,6 +2440,7 @@ mod tests {
 
     #[test]
     fn dialog_editing_is_unicode_safe() {
+        let _home = fake_claude_home_with("sess-1");
         let mut app = app_with_persisted_claude_session();
         app.state.branch_pivot_message = String::new();
         app.open_branch_session_dialog(0);
