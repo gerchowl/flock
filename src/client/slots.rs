@@ -463,7 +463,7 @@ impl SlotWriter {
                 // stall. The bounded queue remains the primary bulkhead.
                 let _ = stream.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
             }
-            let errored = writer_pump(&mut stream, &rx);
+            let errored = writer_pump(&mut stream, &rx, &thread_dead);
             thread_dead.store(true, Ordering::Release);
             // Teardown runs HERE, on the writer thread: dropping the bridge joins
             // its listener, which can block for seconds on a live ssh child —
@@ -516,7 +516,18 @@ impl SlotWriter {
 /// kills the slot. Only a hard error, an EOF, or exceeding
 /// [`WRITER_HARD_DEADLINE`] on a single frame ends the slot; the loop's bounded
 /// queue normally trips first and demotes the peer.
-fn writer_pump(stream: &mut UnixStream, rx: &Receiver<ClientMessage>) -> bool {
+///
+/// `dead` is the thread's own clone of the shared flag; every live [`SlotWriter`]
+/// handle holds another clone. When retrying a stalled write, we watch its
+/// strong count: once only this thread's clone remains, all handles are gone —
+/// a clean shutdown — so we stop retrying a slow-but-alive peer immediately
+/// instead of holding the last frame + ssh bridge until `WRITER_HARD_DEADLINE`
+/// (#193). This never consumes from `rx`, so in-flight framing is untouched.
+fn writer_pump(
+    stream: &mut UnixStream,
+    rx: &Receiver<ClientMessage>,
+    dead: &Arc<AtomicBool>,
+) -> bool {
     for msg in rx.iter() {
         let mut buf = Vec::new();
         if let Err(err) = crate::protocol::write_message(&mut buf, &msg) {
@@ -539,7 +550,12 @@ fn writer_pump(stream: &mut UnixStream, rx: &Receiver<ClientMessage>) -> bool {
                     | std::io::ErrorKind::Interrupted => {
                         // Send buffer full for the whole timeout (or a signal).
                         // Framing is intact at `off`; retry until the peer drains
-                        // or we hit the hard deadline on a truly wedged link.
+                        // or we hit the hard deadline on a truly wedged link —
+                        // but bail immediately on a clean shutdown (all handles
+                        // dropped) rather than holding the bridge for the deadline.
+                        if Arc::strong_count(dead) <= 1 {
+                            return false;
+                        }
                         if started.elapsed() >= WRITER_HARD_DEADLINE {
                             return true;
                         }
