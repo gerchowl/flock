@@ -380,6 +380,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ChecksAck(_) => "checks.ack",
         Method::ChecksRun(_) => "checks.run",
         Method::DigestRender(_) => "digest.render",
+        Method::FleetPause(_) => "fleet.pause",
+        Method::FleetResume(_) => "fleet.resume",
+        Method::FleetStatus(_) => "fleet.status",
     }
 }
 

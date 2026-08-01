@@ -346,6 +346,14 @@ impl App {
     /// Dwell-gating also delivers to a recipient that was already idle when
     /// the message arrived, instead of waiting for its next unrelated turn.
     pub(crate) fn deliver_due_messages(&mut self, now_instant: std::time::Instant) {
+        // US-9 (#175 S3 commit 3): fleet pause halts scheduled delivery.
+        // First-line early return — queued messages sit until resume; the
+        // TTL expiry (24h) still runs on the next non-paused tick. Human
+        // `agent.send` bypasses this path so operators can still talk to
+        // paused agents.
+        if self.fleet_pause.paused {
+            return;
+        }
         let now = now_ms();
         for expired in self.mailboxes.expire(now) {
             self.emit_event(EventEnvelope {
@@ -702,5 +710,70 @@ mod tests {
         };
         assert_eq!(messages.len(), 1, "message held for retry");
         assert_eq!(messages[0].delivery_attempts, 1);
+    }
+
+    /// #175 S3 commit 3 (US-9): fleet pause halts the settle-tick delivery
+    /// path. A message queued to a dwell-settled Idle recipient sees zero
+    /// delivery attempts while paused; after resume the drain runs again
+    /// (the test-terminal has no agent label so delivery holds — the
+    /// observable is the queue's `delivery_attempts` bump, not a
+    /// MessageDelivered event). Human-invoked `agent.send` is deliberately
+    /// UN-gated so operators can still talk to a paused agent.
+    #[tokio::test]
+    async fn fleet_pause_gates_scheduled_delivery_but_leaves_queue_intact() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let _ = basic_send(&mut app, "c-pause", "hi during pause");
+
+        let ws_idx = 1;
+        let pane_id = app.state.workspaces[ws_idx].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let now = std::time::Instant::now();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state = crate::detect::AgentState::Idle;
+            terminal.state_changed_at = Some(now - crate::app::actions::ATTENTION_SETTLE * 2);
+        }
+
+        fn queued_attempts(app: &mut crate::app::App) -> u32 {
+            let response = app.handle_api_request(Request {
+                id: "probe".into(),
+                method: Method::MsgList(MsgListParams::default()),
+            });
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MsgList { messages } = success.result else {
+                panic!("expected msg_list");
+            };
+            messages
+                .iter()
+                .find(|m| m.correlation_id == "c-pause")
+                .map(|m| m.delivery_attempts)
+                .unwrap_or(0)
+        }
+
+        assert_eq!(queued_attempts(&mut app), 0, "freshly queued: 0 attempts");
+
+        // Paused tick — the drain must not run, attempts stays at 0.
+        app.fleet_pause.paused = true;
+        app.deliver_due_messages(now);
+        assert_eq!(
+            queued_attempts(&mut app),
+            0,
+            "paused fleet must not attempt delivery"
+        );
+
+        // Resume — the next tick reaches the queue and bumps attempts (the
+        // no-agent-label branch retries; delivery is HELD but ATTEMPTED).
+        app.fleet_pause.paused = false;
+        app.deliver_due_messages(now);
+        assert_eq!(
+            queued_attempts(&mut app),
+            1,
+            "resume must let the next tick attempt delivery"
+        );
     }
 }

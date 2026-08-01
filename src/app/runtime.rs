@@ -622,6 +622,12 @@ impl App {
     /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
     /// (headless).
     pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        // US-9 (#175 S3 commit 3): fleet pause halts the scheduler tick.
+        // First-line early return — nothing fires, no built-in fold runs,
+        // no heartbeat lands. Human agency stays unaffected.
+        if self.fleet_pause.paused {
+            return false;
+        }
         if !self.state.config.checks.enable {
             self.checks_next_deadline = None;
             self.checks_heartbeat_deadline = None;
@@ -2126,5 +2132,30 @@ mod tests {
         assert!(!app.dispatch_due_script_checks(Instant::now()));
         assert!(app.checks_next_deadline.is_none());
         assert!(app.checks_heartbeat_deadline.is_none());
+    }
+
+    /// #175 S3 commit 3 (US-9): flipping the pause switch at runtime
+    /// early-returns the check runner tick even when the config would
+    /// otherwise fire. The gate is a first-line early return, so nothing
+    /// gets emitted and the heartbeat window is not consumed.
+    #[test]
+    fn fleet_pause_gates_the_check_runner_tick() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.fleet_pause.paused = true;
+        app.checks_next_deadline = Some(Instant::now());
+        app.checks_heartbeat_deadline = Some(Instant::now());
+        let before = app.event_hub.events_after(0).len();
+        assert!(
+            !app.dispatch_due_script_checks(Instant::now()),
+            "paused fleet must not tick the check runner"
+        );
+        assert_eq!(
+            app.event_hub.events_after(0).len(),
+            before,
+            "paused tick must not emit a heartbeat"
+        );
     }
 }

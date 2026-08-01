@@ -1696,6 +1696,41 @@ pub(super) fn render_sidebar(
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
     render_menu_row(app, frame, area);
     render_sidebar_toggle(app, frame, area, false, p);
+    // #175 S3 commit 3 (US-9): fleet-paused banner. Painted LAST so it
+    // sits on top of everything else — pause is loud on purpose. Overlays
+    // the top row of the sidebar; when unpaused this is a no-op.
+    render_fleet_paused_banner(app, frame, area);
+}
+
+/// Overlay the fleet-paused banner across the top row of the sidebar.
+/// Renders nothing when the fleet is not paused (the banner is a
+/// projection from `App::fleet_pause`, synced by
+/// `App::sync_fleet_pause_banner`). Reserved column at `area.width - 1`
+/// stays untouched so the vertical divider is not clipped.
+pub(crate) fn render_fleet_paused_banner(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(banner) = app.fleet_paused_banner.as_deref() else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width.saturating_sub(1); // keep the vertical divider
+    if width == 0 {
+        return;
+    }
+    let p = &app.palette;
+    // Peach is the palette's warning color; painting it as the bg with
+    // panel_bg text inverts the pause line so it reads as an alert strip.
+    let style = Style::default().fg(p.panel_bg).bg(p.peach);
+    let banner_rect = Rect::new(area.x, area.y, width, 1);
+    frame.buffer_mut().set_style(banner_rect, style);
+    // Left-clip the banner text with a leading `⏸` pause glyph.
+    let full = format!(" \u{23f8} {banner}");
+    let text: String = full.chars().take(width as usize).collect();
+    // Trailing cells padded so `set_style` covers the whole strip.
+    let padded = format!("{text:<width$}", text = text, width = width as usize);
+    let paragraph = Paragraph::new(padded).style(style);
+    frame.render_widget(paragraph, banner_rect);
 }
 
 /// Rect of the two-line server row at `slot` (0 = the local server, then
@@ -7217,6 +7252,42 @@ mod tests {
                     indented: true,
                 },
             ]
+        );
+    }
+
+    // #175 S3 commit 3 (US-9): the fleet-paused banner is a pure
+    // projection of `AppState::fleet_paused_banner`. Render tests confirm
+    // that the banner cells actually paint the pause glyph + reason and
+    // are absent when the banner is None.
+    #[test]
+    fn fleet_paused_banner_renders_glyph_and_reason() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_paused_banner = Some("fleet paused — kernel bump".into());
+        let buffer = render_sidebar_to_buffer(&mut app, Rect::new(0, 0, 40, 24));
+        let top: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            top.contains('\u{23f8}'),
+            "top row must show pause glyph: {top:?}"
+        );
+        assert!(
+            top.contains("kernel bump"),
+            "top row must show reason: {top:?}"
+        );
+    }
+
+    #[test]
+    fn fleet_paused_banner_absent_when_not_paused() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_paused_banner = None;
+        let buffer = render_sidebar_to_buffer(&mut app, Rect::new(0, 0, 40, 24));
+        let top: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            !top.contains('\u{23f8}'),
+            "no pause glyph when unpaused: {top:?}"
         );
     }
 }

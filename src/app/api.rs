@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod checks;
 mod digest;
+mod fleet;
 mod integrations;
 mod lineage;
 mod messages;
@@ -959,6 +960,9 @@ impl App {
             Method::ChecksAck(target) => return self.handle_checks_ack(request.id, target),
             Method::ChecksRun(target) => return self.handle_checks_run(request.id, target),
             Method::DigestRender(params) => return self.handle_digest_render(request.id, params),
+            Method::FleetPause(params) => return self.handle_fleet_pause(request.id, params),
+            Method::FleetResume(_) => return self.handle_fleet_resume(request.id),
+            Method::FleetStatus(_) => return self.handle_fleet_status(request.id),
             _ => {
                 return responses::encode_error(
                     request.id,
