@@ -1769,6 +1769,46 @@ pub(crate) fn worktree_add_failed(checkout_path: &str, err: &str) {
     );
 }
 
+pub(crate) fn event_log_torn_tail(path: &str) {
+    tracing::warn!(
+        event = "event_log.load",
+        subsystem = "event_log",
+        outcome = "torn_tail",
+        path,
+        "dropped torn tail line from event log (crash mid-write)"
+    );
+}
+
+pub(crate) fn event_log_corrupt(err: &str) {
+    tracing::warn!(
+        event = "event_log.load",
+        subsystem = "event_log",
+        outcome = "corrupt",
+        err,
+        "event log file rejected as corrupt; left on disk untouched"
+    );
+}
+
+pub(crate) fn event_log_open_failed(err: &str) {
+    tracing::warn!(
+        event = "event_log.open",
+        subsystem = "event_log",
+        outcome = "error",
+        err,
+        "event log unavailable; events stay in-memory only"
+    );
+}
+
+pub(crate) fn event_log_write_failed(err: &str) {
+    tracing::warn!(
+        event = "event_log.write",
+        subsystem = "event_log",
+        outcome = "error",
+        err,
+        "failed to append event to durable log"
+    );
+}
+
 pub(crate) fn worktree_remove_completed(workspace_id: &str, path: &str) {
     tracing::info!(
         event = "worktree.remove",
