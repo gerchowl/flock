@@ -1725,12 +1725,16 @@ impl Drop for SshStdioBridge {
         // vanishingly unlikely; closing it fully needs an owned-`Child` guard
         // polled via `try_wait`, which would replace the efficient blocking wait
         // on the live data path.
-        if let Some(pid) = self
+        // Poison-tolerant: the mutex only guards an `Option<u32>` (no invariant a
+        // panic could break), so on the practically-impossible poisoned case we
+        // still take the pid and kill rather than silently skipping the SIGKILL
+        // and leaving the accept thread parked on ssh keepalive (#193).
+        let pid = self
             .active_child_pid
             .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pid) = pid {
             // SAFETY: `pid` names our own just-spawned ssh child. SIGKILL is a
             // no-op (ESRCH) if it already exited; we ignore the result.
             unsafe {

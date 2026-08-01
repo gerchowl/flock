@@ -2171,16 +2171,31 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::ServerDisconnected(slot_key) => {
-                // Only the ACTIVE slot's death tears the session down with
-                // today's ConnectionLost semantics (#65). A warm slot dying is
-                // a silent demote — the ghost the design intends; the active
-                // session keeps painting.
+                // A warm slot dying is a silent demote — the ghost the design
+                // intends; the active session keeps painting (#65). The ACTIVE
+                // slot's death degrades to the always-warm home slot instead of
+                // ending the session — the same fallback the write-stall path
+                // takes (#176/#193), so a peer that cleanly disconnects no longer
+                // takes the whole client down with it. Only home-dying / slots-off
+                // stays fatal (`degrade_active_or_lost` returns ConnectionLost).
                 match slots::route_slot_event(&slot_key, &active_slot_key, true) {
                     slots::SlotRouting::Apply => {
-                        return Err(ClientError::ConnectionLost(io::Error::new(
+                        let err = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "server closed connection",
-                        )));
+                        );
+                        degrade_active_or_lost(
+                            err,
+                            &mut slot_manager,
+                            &mut active_writer,
+                            &mut active_slot_key,
+                            &mut active_reader_quit,
+                            &mut state,
+                            &event_tx,
+                            &should_quit,
+                            max_frame_size,
+                        )?;
+                        continue;
                     }
                     // A reader disconnect is always a lifecycle death, so a
                     // non-active slot routes here (never to Drop).
