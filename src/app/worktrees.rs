@@ -668,6 +668,10 @@ impl App {
                 }
                 KillAction::ClosePane => acted = true,
                 KillAction::Skip => {}
+                // Human sweep never emits Quarantine — that variant is
+                // reserved for scheduled reap (#175 S2). Treat it as Skip
+                // defensively so a future crossover doesn't fall through.
+                KillAction::Quarantine => {}
             }
         }
 

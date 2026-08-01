@@ -1021,6 +1021,148 @@ fn claude_hooks_fragment(hook_path: &Path) -> Value {
     Value::Object(hooks)
 }
 
+/// Verdict returned by [`verify_integration_manifest`] (#175 S2 gate for
+/// the #143 hook half-state class). `Ok` means the installed assets and the
+/// on-disk settings match every expected contract; the scheduled reap is
+/// then safe to run. Anything else is a LOUD gate: the scheduled reap
+/// refuses to touch worktrees while drift is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestVerdict {
+    /// Every installed integration is Current and every settings file flock
+    /// mutates matches the expected fragment field-by-field.
+    Ok,
+    /// One or more installed hook assets are out of date. `targets` lists
+    /// every Outdated integration in a stable order for the operator's
+    /// error surface.
+    Outdated {
+        targets: Vec<crate::api::schema::IntegrationTarget>,
+    },
+    /// A settings file flock manages is out of sync with the expected
+    /// fragment (#143 half-state — hook script present, but the settings
+    /// registration is stale or wrong). `details` describes the drift in
+    /// operator-readable terms; scheduled reap must never run in this
+    /// state.
+    HookHalfState {
+        target: crate::api::schema::IntegrationTarget,
+        details: Vec<String>,
+    },
+}
+
+/// #175 S2 gate: verify every installed integration is Current AND that the
+/// settings fragments flock mutates match what's on disk field-by-field.
+/// Returns `HookHalfState` on the first target whose settings drift, since
+/// the reap is refused wholesale — the gate is boolean, not per-target.
+///
+/// Today only Claude has a settings-file half-state class (`settings.json`);
+/// others (Codex `hooks.json`, Kimi/Hermes toml/yaml) ship without the
+/// same drift risk. As integrations grow more shared-settings surfaces,
+/// they extend this function's per-target arm.
+pub(crate) fn verify_integration_manifest() -> ManifestVerdict {
+    // (a) every installed integration must be Current.
+    let outdated: Vec<crate::api::schema::IntegrationTarget> = outdated_installed_integrations()
+        .into_iter()
+        .map(|s| s.target)
+        .collect();
+    if !outdated.is_empty() {
+        return ManifestVerdict::Outdated { targets: outdated };
+    }
+    // (b) settings drift, per manageable target. A half-installed target
+    // (shim gone but registration left behind, or vice versa) is drift, not
+    // an absence — that IS the #143 class.
+    if let Some(details) = verify_claude_settings_drift() {
+        return ManifestVerdict::HookHalfState {
+            target: crate::api::schema::IntegrationTarget::Claude,
+            details,
+        };
+    }
+    // (c) FAIL CLOSED. Reaching here with nothing installed means we have no
+    // evidence that agent state is being reported at all — on a fresh
+    // machine every pane looks Unknown, and "no signal" must never read as
+    // "safe to reap" (P4: a wrongly-reaped worktree costs work).
+    if installed_integration_statuses()
+        .iter()
+        .all(|status| status.state != IntegrationStatusKind::Current)
+    {
+        return ManifestVerdict::HookHalfState {
+            target: crate::api::schema::IntegrationTarget::Claude,
+            details: vec![
+                "no agent integration is installed and current; without hook-reported \
+                 agent state the reap has no evidence to act on"
+                    .to_string(),
+            ],
+        };
+    }
+    ManifestVerdict::Ok
+}
+
+/// Read the on-disk Claude settings.json and diff its `hooks` object
+/// against the fragment [`claude_hooks_fragment`] would emit. `Some(details)`
+/// means drift; `None` means matched OR the settings file doesn't exist
+/// (nothing to drift against — the reap is not stopped for missing files).
+fn verify_claude_settings_drift() -> Option<Vec<String>> {
+    let dir = claude_dir().ok()?;
+    let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+    let settings_path = dir.join("settings.json");
+    // Half-state is asymmetric and both directions are drift (#143):
+    //  * shim missing but settings still register it  -> hooks fire nothing
+    //  * settings missing but shim on disk            -> shim never invoked
+    // Only the fully-absent case is "not installed", and that is caught by
+    // the fail-closed arm in `verify_integration_manifest`.
+    let settings_registers_flock = settings_path
+        .is_file()
+        .then(|| fs::read_to_string(&settings_path).ok())
+        .flatten()
+        .is_some_and(|raw| raw.contains(CLAUDE_HOOK_INSTALL_NAME));
+    match (hook_path.is_file(), settings_registers_flock) {
+        (false, true) => {
+            return Some(vec![format!(
+                "settings.json still registers {name}, but the hook shim is missing from {dir}",
+                name = CLAUDE_HOOK_INSTALL_NAME,
+                dir = hook_path.parent().unwrap_or(&dir).display(),
+            )]);
+        }
+        (true, false) => {
+            return Some(vec![format!(
+                "hook shim {name} is installed but settings.json does not register it",
+                name = CLAUDE_HOOK_INSTALL_NAME,
+            )]);
+        }
+        (false, false) => return None,
+        (true, true) => {}
+    }
+    let raw = fs::read_to_string(&settings_path).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    let installed_hooks = parsed.get("hooks").cloned().unwrap_or(Value::Null);
+    let expected_hooks = claude_hooks_fragment(&hook_path);
+
+    let mut details = Vec::new();
+    if let Value::Object(expected_map) = &expected_hooks {
+        for (event, expected_entries) in expected_map {
+            let installed_entries = installed_hooks.get(event).cloned().unwrap_or(Value::Null);
+            if installed_entries != *expected_entries {
+                details.push(format!(
+                    "claude settings.json `hooks.{event}` drift: expected {} entries, found {}",
+                    describe_hook_entries(expected_entries),
+                    describe_hook_entries(&installed_entries),
+                ));
+            }
+        }
+    }
+    if details.is_empty() {
+        None
+    } else {
+        Some(details)
+    }
+}
+
+fn describe_hook_entries(v: &Value) -> String {
+    match v {
+        Value::Array(arr) => format!("[{} entries]", arr.len()),
+        Value::Null => "missing".to_string(),
+        other => format!("{other}"),
+    }
+}
+
 /// Emit the integration contract for `target` as data: the version, the hook
 /// script path, the settings path, and the exact `hooks` fragment to declare.
 /// Consumers (Nix/Home-Manager, Ansible, a human, a postinstall) read this and
@@ -4255,6 +4397,130 @@ mod tests {
         );
 
         std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // ------- #175 S2 gate: verify_integration_manifest -------
+
+    #[test]
+    fn verify_manifest_ok_on_matching_claude_settings() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("HOME", &home);
+        // Fresh install: the settings hooks fragment matches the expected
+        // fragment byte-for-byte (that's what install_claude produces).
+        let _ = install_claude().unwrap();
+        let verdict = verify_integration_manifest();
+        assert_eq!(verdict, ManifestVerdict::Ok, "expected Ok, got {verdict:?}");
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn verify_manifest_reports_hook_half_state_on_drifted_settings() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("HOME", &home);
+        // Install so the hook script is Current…
+        let _ = install_claude().unwrap();
+        // …then clobber `hooks.Stop` to a different command; that's the
+        // #143 half-state: hook file present but settings registration
+        // drifted.
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings["hooks"]["Stop"] = json!([{
+            "hooks": [ { "type": "command", "command": "echo hi" } ]
+        }]);
+        fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let verdict = verify_integration_manifest();
+        assert_ne!(
+            verdict,
+            ManifestVerdict::Ok,
+            "drifted settings must block the scheduled reap"
+        );
+        match verdict {
+            ManifestVerdict::HookHalfState { target, details } => {
+                assert_eq!(target, crate::api::schema::IntegrationTarget::Claude);
+                assert!(
+                    details.iter().any(|d| d.contains("hooks.Stop")),
+                    "expected Stop drift detail, got {details:?}"
+                );
+            }
+            other => panic!("expected HookHalfState, got {other:?}"),
+        }
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn verify_manifest_fails_closed_when_nothing_installed() {
+        // #175 S2 / #143, corrected after review: the gate must FAIL CLOSED.
+        // With no integration installed, no pane ever reports agent state —
+        // every pane looks Unknown, and "no signal" must never be read as
+        // "safe to reap" (P4: a stale worktree costs disk, a wrongly-reaped
+        // one costs work).
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home-empty");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        let verdict = verify_integration_manifest();
+        assert!(
+            matches!(verdict, ManifestVerdict::HookHalfState { .. }),
+            "fresh machine must refuse the reap, got {verdict:?}"
+        );
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn verify_manifest_catches_both_half_state_directions() {
+        // The #143 class is asymmetric and BOTH directions are drift:
+        // a settings entry pointing at a deleted shim (hooks fire nothing),
+        // and an installed shim nothing registers (shim never invoked).
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home-half");
+        let claude = home.join(".claude");
+        let hooks = claude.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        std::env::set_var("HOME", &home);
+
+        // (1) settings register the shim, but the shim is gone.
+        fs::write(
+            claude.join("settings.json"),
+            format!("{{\"hooks\": {{\"Stop\": [\"{CLAUDE_HOOK_INSTALL_NAME}\"]}}}}"),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                verify_integration_manifest(),
+                ManifestVerdict::HookHalfState { .. }
+            ),
+            "settings-without-shim must be refused"
+        );
+
+        // (2) the shim exists, but nothing registers it. (A shim without
+        // flock's version marker also reads as Outdated — either way the
+        // invariant under test is that the gate REFUSES, never that it
+        // picks one refusal variant.)
+        fs::write(hooks.join(CLAUDE_HOOK_INSTALL_NAME), "#!/bin/sh\n").unwrap();
+        fs::write(claude.join("settings.json"), "{}").unwrap();
+        assert_ne!(
+            verify_integration_manifest(),
+            ManifestVerdict::Ok,
+            "shim-without-registration must be refused"
+        );
+
+        std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
     }
 }

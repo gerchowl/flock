@@ -1769,6 +1769,17 @@ pub(crate) fn worktree_add_failed(checkout_path: &str, err: &str) {
     );
 }
 
+pub(crate) fn quarantine_note_write_failed(path: &str, err: &str) {
+    tracing::warn!(
+        event = "worktree.quarantine",
+        subsystem = "worktree",
+        outcome = "note_write_failed",
+        path,
+        err,
+        "quarantine succeeded but the recovery note could not be written"
+    );
+}
+
 pub(crate) fn event_log_torn_tail(path: &str) {
     tracing::warn!(
         event = "event_log.load",

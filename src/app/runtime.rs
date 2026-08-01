@@ -665,6 +665,13 @@ impl App {
         // dispatches every owner-authored `flk-trigger` block that hasn't
         // already fired.
         changed |= self.poll_issue_guard(now);
+        // #175 S1: scheduled cron predicates. `tick_crons` collapses
+        // missed-while-asleep slots to one fire per predicate.
+        changed |= self.dispatch_cron_fires();
+        // #175 S2: scheduled reap. Gated behind `verify_integration_manifest`
+        // per the #143 half-state class — any drift disables reap for the
+        // tick and emits a throttled `CheckErrored` + toast.
+        changed |= self.evaluate_reap_check(now);
 
         if self
             .checks_heartbeat_deadline
@@ -775,6 +782,236 @@ impl App {
                 let _ = label;
                 // No-op: the CheckFired event above IS the dispatch.
                 // A follow-up commit can enrich it with the label.
+            }
+        }
+    }
+
+    /// #175 S1: fold scheduled cron fires from the runner into the durable
+    /// event log + notification path. Missed-while-asleep collapses to ONE
+    /// fire per predicate (`CronRuntimeState::tick_crons`), reported as
+    /// `missed_fires` on the event so an operator can tell the machine
+    /// slept through slots.
+    pub(crate) fn dispatch_cron_fires(&mut self) -> bool {
+        if !self.state.config.checks.enable {
+            return false;
+        }
+        let now_wall_ms = crate::checks::runner::current_wall_ms();
+        let fires = self.checks_runner.tick_crons(now_wall_ms);
+        if fires.is_empty() {
+            return false;
+        }
+        for fire in fires {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CronFired,
+                data: crate::api::schema::EventData::CronFired {
+                    name: fire.name.clone(),
+                    run_id: fire.run_id.clone(),
+                    scheduled_ms: fire.scheduled_wall_ms,
+                    actual_ms: fire.actual_wall_ms,
+                    missed_fires: fire.missed_fires,
+                },
+            });
+            // Reuse the script-check FireDecision dispatch so notify /
+            // event actions travel one path. `episode` slot is the run_id.
+            self.dispatch_check_action(&crate::checks::runner::FireDecision {
+                name: fire.name,
+                episode: fire.run_id,
+                action: fire.action,
+            });
+        }
+        true
+    }
+
+    /// #175 S2: run the scheduled reap tick. Gates on
+    /// `verify_integration_manifest()` FIRST; a drifted verdict yields
+    /// zero candidates and emits a throttled `CheckErrored` + toast.
+    /// Otherwise collects workspace snapshots and dispatches each
+    /// candidate through the scheduled kill machinery.
+    pub(crate) fn evaluate_reap_check(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.enable || !self.state.config.checks.reap.enable {
+            self.reap_next_deadline = None;
+            return false;
+        }
+        // Cadence gate — the reap runs on its own slower cadence (default
+        // 1h) rather than every checks tick.
+        if self
+            .reap_next_deadline
+            .is_some_and(|deadline| now < deadline)
+        {
+            return false;
+        }
+        let cadence = self.state.config.checks.reap.cadence_secs.max(1);
+        self.reap_next_deadline = Some(now + Duration::from_secs(cadence));
+
+        // Half-state gate FIRST. Any drift disables the reap for this
+        // tick and (throttled) notifies.
+        let verdict = crate::integration::verify_integration_manifest();
+        if verdict != crate::integration::ManifestVerdict::Ok {
+            let should_emit = self.reap_check.should_emit_drift(now);
+            if should_emit {
+                let reason = format!("integration manifest verify failed: {verdict:?}");
+                self.event_hub.push(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckErrored,
+                    data: crate::api::schema::EventData::CheckErrored {
+                        name: crate::checks::REAP_CHECK_NAME.to_string(),
+                        reason: reason.clone(),
+                    },
+                });
+                use crate::api::schema::{NotificationShowParams, NotificationShowSound};
+                let params = NotificationShowParams {
+                    title: "flock reap disabled: integration drift".to_string(),
+                    body: Some(reason),
+                    position: None,
+                    sound: NotificationShowSound::Request,
+                };
+                let _ = self.handle_api_request_after_internal_events_drained(
+                    crate::api::schema::Request {
+                        id: format!("reap-drift:{}", now.elapsed().as_millis()),
+                        method: crate::api::schema::Method::NotificationShow(params),
+                    },
+                );
+                return true;
+            }
+            return false;
+        }
+
+        // Verdict Ok — collect snapshots and dispatch candidates.
+        let snapshots = self.collect_reap_snapshots();
+        let cfg = self.state.config.checks.reap;
+        let candidates = self.reap_check.evaluate(now, &cfg, &snapshots);
+        if candidates.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for candidate in candidates {
+            self.dispatch_reap_candidate(&candidate);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Build the per-workspace snapshots the reap fold consumes. Focus is
+    /// approximated as "the currently active workspace" (the operator's
+    /// window). Dirty / merged probes shell out to git; a failed probe
+    /// is passed as `None` and the fold treats absence conservatively
+    /// (assume-dirty → Quarantine, assume-unmerged → CheckoutOnly).
+    fn collect_reap_snapshots(&self) -> Vec<crate::checks::ReapWorkspaceSnapshot> {
+        let mut out = Vec::new();
+        let active_ws_idx = self.state.active;
+        for (idx, ws) in self.state.workspaces.iter().enumerate() {
+            let Some(space) = ws.worktree_space.as_ref() else {
+                continue;
+            };
+            if !space.is_linked_worktree {
+                continue;
+            }
+            let is_operator_focused = Some(idx) == active_ws_idx;
+            let mut panes = Vec::new();
+            for detail in ws.pane_details(&self.state.terminals) {
+                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                panes.push(crate::checks::ReapPaneSnapshot {
+                    status,
+                    seen: detail.seen,
+                    state_changed_at: detail.state_changed_at,
+                });
+            }
+            let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
+            let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
+            let merged = branch.as_deref().map(|b| {
+                matches!(
+                    crate::worktree::branch_merge_gate(&space.repo_root, &space.checkout_path, b),
+                    crate::worktree::WorktreeMergeGate::Merged { .. }
+                )
+            });
+            out.push(crate::checks::ReapWorkspaceSnapshot {
+                workspace_id: ws.id.clone(),
+                is_linked_worktree: true,
+                is_operator_focused,
+                repo_root: space.repo_root.clone(),
+                checkout_path: space.checkout_path.clone(),
+                branch,
+                dirty,
+                merged,
+                panes,
+            });
+        }
+        out
+    }
+
+    /// Dispatch one reap candidate through the scheduled kill machinery.
+    /// Emits `CheckFired` (with the workspace_id as episode) for every
+    /// action, `WorktreeQuarantined` on Quarantine, `CheckErrored` on a
+    /// failed move. Runs synchronously on the checks tick — the actions
+    /// are quick git commands; a slow git will delay the next tick, not
+    /// the whole app.
+    fn dispatch_reap_candidate(&mut self, candidate: &crate::checks::ReapCandidate) {
+        let action = crate::worktree::scheduled_action(candidate.tier);
+        let episode = format!("reap:{}", candidate.workspace_id);
+        match action {
+            crate::worktree::KillAction::Skip => {
+                // Protected tier; nothing to do.
+            }
+            crate::worktree::KillAction::Quarantine => {
+                let reason = reap_reason_label(&candidate.facts);
+                match crate::worktree::quarantine_worktree(
+                    &candidate.repo_root,
+                    &candidate.checkout_path,
+                    candidate.branch.as_deref(),
+                    &reason,
+                ) {
+                    Ok(dst) => {
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::WorktreeQuarantined,
+                            data: crate::api::schema::EventData::WorktreeQuarantined {
+                                workspace_id: candidate.workspace_id.clone(),
+                                path: dst.display().to_string(),
+                                reason,
+                            },
+                        });
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::CheckFired,
+                            data: crate::api::schema::EventData::CheckFired {
+                                name: crate::checks::REAP_CHECK_NAME.to_string(),
+                                episode,
+                            },
+                        });
+                    }
+                    Err(err) => {
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::CheckErrored,
+                            data: crate::api::schema::EventData::CheckErrored {
+                                name: crate::checks::REAP_CHECK_NAME.to_string(),
+                                reason: format!(
+                                    "quarantine failed for {}: {err}",
+                                    candidate.workspace_id
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+            // KillBranch / CheckoutOnly / ClosePane: the scheduled reap
+            // deliberately performs NO disk work for these tiers yet — the
+            // removal path is shared with the human sweep and lands with
+            // that unification. Recording `CheckFired` here would read as
+            // "a worktree was reaped" when nothing happened, so the
+            // deferral is audited as an error-shaped record instead: the
+            // operator sees the candidate and the reason it was skipped.
+            crate::worktree::KillAction::KillBranch { .. }
+            | crate::worktree::KillAction::CheckoutOnly
+            | crate::worktree::KillAction::ClosePane => {
+                let _ = episode;
+                self.event_hub.push(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckErrored,
+                    data: crate::api::schema::EventData::CheckErrored {
+                        name: crate::checks::REAP_CHECK_NAME.to_string(),
+                        reason: format!(
+                            "{} is reapable ({action:?}) but scheduled removal is not wired yet; \
+                             run `flk worktree kill` to act on it",
+                            candidate.workspace_id
+                        ),
+                    },
+                });
             }
         }
     }
@@ -1064,6 +1301,18 @@ impl App {
 /// Argv-form `gh issue list --repo <repo> --state open --json body,author,number,updatedAt`.
 /// Returns the parsed issues; every error path is a `Result::Err` so the
 /// caller can surface a `CheckErrored` instead of silently passing.
+/// Label the reap emits on `EventData::WorktreeQuarantined.reason` and on
+/// the recovery note. Kept small; the audit log tells the story, not the
+/// label.
+fn reap_reason_label(facts: &crate::worktree::KillFacts) -> String {
+    match (facts.dirty, facts.merged) {
+        (true, false) => "dirty+unmerged".to_string(),
+        (false, false) => "unmerged".to_string(),
+        (true, true) => "dirty".to_string(),
+        (false, true) => "reap".to_string(),
+    }
+}
+
 fn fetch_open_issues(
     gh_bin: &str,
     repo: &str,

@@ -7,8 +7,10 @@
 
 pub(crate) mod blocked_alert;
 pub(crate) mod config;
+pub(crate) mod cron;
 pub(crate) mod hibernation;
 pub(crate) mod issue_guard;
+pub(crate) mod reap;
 pub(crate) mod runner;
 pub(crate) mod script;
 
@@ -20,6 +22,9 @@ pub(crate) use config::{ActionSpec, ChecksConfig};
 pub(crate) use hibernation::{HibernationFold, HibernationPaneSnapshot, HIBERNATION_CHECK_NAME};
 pub(crate) use issue_guard::{
     GhIssue, IssueGuardFold, IssueGuardOutcome, TriggerBlock, ISSUE_GUARD_CHECK_NAME,
+};
+pub(crate) use reap::{
+    ReapCandidate, ReapFold, ReapPaneSnapshot, ReapWorkspaceSnapshot, REAP_CHECK_NAME,
 };
 pub(crate) use runner::CheckRunner;
 pub(crate) use script::{run_script, Outcome};

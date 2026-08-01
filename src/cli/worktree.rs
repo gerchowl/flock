@@ -20,6 +20,8 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
         "open" => worktree_open(&args[1..]),
         "remove" => worktree_remove(&args[1..]),
         "kill" => worktree_kill(&args[1..]),
+        "quarantine-list" => worktree_quarantine_list(&args[1..]),
+        "unquarantine" => worktree_unquarantine(&args[1..]),
         "help" | "--help" | "-h" => {
             print_worktree_help();
             Ok(0)
@@ -27,6 +29,49 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
         _ => {
             print_worktree_help();
             Ok(2)
+        }
+    }
+}
+
+/// #175 S2 read-only listing: enumerate every quarantined worktree under
+/// the current session's data dir. Prints one path per line for scripts.
+fn worktree_quarantine_list(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: flk worktree quarantine-list");
+        return Ok(2);
+    }
+    match crate::worktree::list_quarantined_worktrees() {
+        Ok(paths) => {
+            for path in paths {
+                println!("{}", path.display());
+            }
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            Ok(1)
+        }
+    }
+}
+
+/// #175 S2: `flk worktree unquarantine <path> <destination>` — move a
+/// quarantined checkout back onto the operator's chosen path. Never
+/// deletes anything; strict `git worktree move`.
+fn worktree_unquarantine(args: &[String]) -> std::io::Result<i32> {
+    if args.len() != 2 {
+        eprintln!("usage: flk worktree unquarantine <quarantined-path> <destination>");
+        return Ok(2);
+    }
+    let src = std::path::PathBuf::from(&args[0]);
+    let dst = std::path::PathBuf::from(&args[1]);
+    match crate::worktree::unquarantine_worktree(&src, &dst) {
+        Ok(()) => {
+            println!("moved {} -> {}", src.display(), dst.display());
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            Ok(1)
         }
     }
 }
@@ -461,6 +506,8 @@ fn print_worktree_help() {
     );
     eprintln!("  flk worktree remove --workspace ID [--force] [--json]");
     eprintln!("  flk worktree kill --workspace ID [--dry-run] [--force] [--keep-branch] [--json]");
+    eprintln!("  flk worktree quarantine-list");
+    eprintln!("  flk worktree unquarantine <quarantined-path> <destination>");
 }
 
 fn normalize_path_arg(value: &str) -> std::io::Result<String> {

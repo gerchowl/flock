@@ -16,6 +16,7 @@ pub(super) fn run_integration_command(args: &[String]) -> std::io::Result<i32> {
         "uninstall" => integration_uninstall(&args[1..]),
         "status" => integration_status(&args[1..]),
         "manifest" => integration_manifest(&args[1..]),
+        "verify" => integration_verify(&args[1..]),
         "help" | "--help" | "-h" => {
             print_integration_help();
             Ok(0)
@@ -23,6 +24,44 @@ pub(super) fn run_integration_command(args: &[String]) -> std::io::Result<i32> {
         _ => {
             print_integration_help();
             Ok(2)
+        }
+    }
+}
+
+/// #175 S2 gate: `flk integration verify` — one-shot check that every
+/// installed integration is Current AND that flock-managed settings files
+/// match their expected fragment field-by-field. Prints the drift and exits
+/// non-zero on drift so the reap and CI paths can both key off the exit
+/// code.
+fn integration_verify(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: flk integration verify");
+        return Ok(2);
+    }
+    match crate::integration::verify_integration_manifest() {
+        crate::integration::ManifestVerdict::Ok => {
+            println!("integrations verified: no drift detected");
+            Ok(0)
+        }
+        crate::integration::ManifestVerdict::Outdated { targets } => {
+            eprintln!("integrations verify FAILED: outdated hook assets");
+            for target in targets {
+                eprintln!(
+                    "  - {} is outdated",
+                    crate::integration::integration_target_label(target)
+                );
+            }
+            Ok(1)
+        }
+        crate::integration::ManifestVerdict::HookHalfState { target, details } => {
+            eprintln!(
+                "integrations verify FAILED: {} settings drifted (hook installed but registration is stale)",
+                crate::integration::integration_target_label(target)
+            );
+            for detail in details {
+                eprintln!("  - {detail}");
+            }
+            Ok(1)
         }
     }
 }
@@ -221,4 +260,5 @@ fn print_integration_help() {
     eprintln!("  flk integration uninstall qodercli");
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
+    eprintln!("  flk integration verify");
 }
