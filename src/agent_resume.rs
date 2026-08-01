@@ -193,6 +193,44 @@ pub fn branch_plan(
     }
 }
 
+/// Locate the on-disk transcript for a Claude session id (#178). Claude Code
+/// stores transcripts per project under
+/// `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`; session ids are
+/// UUIDs, unique across projects, so a scan of the project directories keyed
+/// on the file name is the robust lookup — the cwd encoding is
+/// claude-internal and not worth replicating. A missing or empty transcript
+/// means `claude --resume` would print "No conversation found" and exit,
+/// leaving a dead pane, so fork callers refuse up front.
+pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
+        return None;
+    }
+    let projects = home.join(".claude").join("projects");
+    let entries = std::fs::read_dir(projects).ok()?;
+    let file_name = format!("{session_id}.jsonl");
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(&file_name);
+        if candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The session id a Claude fork plan resumes, if `plan` is one (#178).
+pub fn claude_fork_session_id(plan: &AgentResumePlan) -> Option<&str> {
+    let is_claude_fork = plan.argv.first().map(String::as_str) == Some("claude")
+        && plan.argv.iter().any(|arg| arg == "--fork-session");
+    if !is_claude_fork {
+        return None;
+    }
+    let resume = plan.argv.iter().position(|arg| arg == "--resume")?;
+    plan.argv.get(resume + 1).map(String::as_str)
+}
+
 /// Append a one-shot pivot prompt as the forked agent's first turn (#106).
 /// Only applies to a CLAUDE fork (argv starts with `claude` and carries
 /// `--fork-session`); Claude takes a positional prompt as the opening user
@@ -525,6 +563,49 @@ mod tests {
             normalize_claude_session_start_source(Some(" resume ".into())),
             Some("resume".into())
         );
+    }
+
+    #[test]
+    fn claude_transcript_path_scans_project_dirs_and_rejects_bad_ids() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let home = std::env::temp_dir().join(format!("flock-home-{}-{nanos}", std::process::id()));
+        let project = home.join(".claude/projects/-tmp-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sess-1.jsonl"), "{}\n").unwrap();
+        std::fs::write(project.join("empty.jsonl"), "").unwrap();
+
+        assert_eq!(
+            claude_transcript_path(&home, "sess-1"),
+            Some(project.join("sess-1.jsonl"))
+        );
+        assert!(
+            claude_transcript_path(&home, "empty").is_none(),
+            "empty transcript is as dead as a missing one"
+        );
+        assert!(claude_transcript_path(&home, "missing").is_none());
+        assert!(
+            claude_transcript_path(&home, "../escape").is_none(),
+            "path traversal in a session id must never resolve"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_fork_session_id_extracts_only_from_fork_plans() {
+        let session = AgentSessionRef::id("sid-9").unwrap();
+        let fork = branch_plan("flock:claude", "claude", &session).unwrap();
+        assert_eq!(claude_fork_session_id(&fork), Some("sid-9"));
+        let plain = plan("flock:claude", "claude", &session).unwrap();
+        assert_eq!(
+            claude_fork_session_id(&plain),
+            None,
+            "plain resume is not a fork"
+        );
+        let codex = plan("flock:codex", "codex", &session).unwrap();
+        assert_eq!(claude_fork_session_id(&codex), None);
     }
 
     #[test]

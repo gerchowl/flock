@@ -218,6 +218,27 @@ impl App {
                 }
             };
 
+        // #178: a fork whose parent transcript is not on disk resumes
+        // nothing — claude exits instantly and the workspace would be
+        // silently reaped. Refuse up front, before any disk mutation
+        // (§8.4: "corrupt/truncate a transcript → fork refuses, clear
+        // error").
+        if let Some(session_id) = crate::agent_resume::claude_fork_session_id(&plan) {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            if crate::agent_resume::claude_transcript_path(&home, session_id).is_none() {
+                return encode_error(
+                    id,
+                    "transcript_not_found",
+                    format!(
+                        "no transcript on disk for session {session_id} — transcript saving \
+                         may be disabled for the parent; a fork would resume nothing and die"
+                    ),
+                );
+            }
+        }
+
         let branch = params
             .branch
             .unwrap_or_else(|| {
@@ -1817,6 +1838,18 @@ mod tests {
         terminal_id
     }
 
+    /// #178: fork pre-flight requires the parent transcript on disk. Point
+    /// HOME at a temp dir containing one (nextest = process per test, so the
+    /// env mutation is isolated).
+    fn fake_claude_home(name: &str, session_id: &str) -> PathBuf {
+        let home = unique_temp_path(name);
+        let project = home.join(".claude/projects/-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::env::set_var("HOME", &home);
+        home
+    }
+
     /// Put a stub `claude` executable on PATH so the forked pane's PTY spawn
     /// succeeds without the real CLI. Safe: nextest runs each test in its own
     /// process.
@@ -1837,6 +1870,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_agent_fork_creates_worktree_and_spawns_forked_pane() {
+        let claude_home = fake_claude_home("fork-home", "sess-fork");
         let repo = create_committed_repo("api-agent-fork-repo");
         let worktree_root = unique_temp_path("api-agent-fork-root");
         let bin_dir = stub_claude_on_path("api-agent-fork-bin");
@@ -1949,10 +1983,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
     }
 
     #[tokio::test]
     async fn api_agent_fork_empty_pivot_opts_out_of_seed() {
+        let claude_home = fake_claude_home("nopivot-home", "sess-fork");
         let repo = create_committed_repo("api-agent-fork-nopivot-repo");
         let worktree_root = unique_temp_path("api-agent-fork-nopivot-root");
         let bin_dir = stub_claude_on_path("api-agent-fork-nopivot-bin");
@@ -1996,10 +2032,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
     }
 
     #[tokio::test]
     async fn api_agent_fork_branches_from_a_linked_worktree_source() {
+        let claude_home = fake_claude_home("linked-home", "sess-fork");
         // #124 branch-from-here over the API: the target pane lives in a
         // flock-managed linked worktree; the fork branches from that
         // checkout's HEAD and the source keeps its linked membership.
@@ -2068,6 +2106,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
     }
 
     #[tokio::test]
@@ -2104,6 +2143,45 @@ mod tests {
             "no worktree may be created for a refused fork"
         );
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_agent_fork_refuses_when_transcript_is_missing() {
+        // #178 / §8.4: a fork whose parent transcript is absent must refuse
+        // loudly before any disk mutation — never spawn a doomed pane.
+        let repo = create_committed_repo("api-agent-fork-notranscript-repo");
+        let worktree_root = unique_temp_path("api-agent-fork-notranscript-root");
+        let home = unique_temp_path("api-agent-fork-notranscript-home");
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        std::env::set_var("HOME", &home);
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target,
+                branch: Some("fork/doomed".into()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: None,
+                focus: false,
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "transcript_not_found");
+        assert!(
+            error.error.message.contains("sess-fork"),
+            "{}",
+            error.error.message
+        );
+        assert_eq!(app.state.workspaces.len(), 1, "nothing spawned");
+        assert!(!worktree_root.exists(), "no worktree created");
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
