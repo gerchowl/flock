@@ -157,25 +157,53 @@ where
     }
 
     // 3. Create the branch off HEAD (never `main`) and revert on it.
+    // `--create` (not `--force-create`) refuses to clobber a branch from a
+    // prior attempt; that refusal is reported distinctly so the operator
+    // knows to inspect or delete it rather than re-running blindly.
     if let Err(err) = git(repo_path, &["switch", "--create", branch_name.as_str()]) {
+        let already_exists = err.contains("already exists");
         return RevertRepoResult {
             repo_path: repo_path.display().to_string(),
-            revert_branch: branch_name,
+            revert_branch: branch_name.clone(),
             reverted_commits: Vec::new(),
-            outcome: "git_failed".into(),
-            detail: Some(format!("git switch --create failed: {err}")),
+            outcome: if already_exists {
+                "revert_branch_exists".into()
+            } else {
+                "git_failed".into()
+            },
+            detail: Some(if already_exists {
+                format!(
+                    "branch {branch_name} already exists from an earlier revert of this run; \
+                     inspect it, then delete it to retry"
+                )
+            } else {
+                format!("git switch --create failed: {err}")
+            }),
             pr_command: None,
         };
     }
     let mut reverted = Vec::with_capacity(commits.len());
     for commit in &commits {
         if let Err(err) = git(repo_path, &["revert", "--no-edit", commit.as_str()]) {
+            // A conflicting revert leaves an in-progress sequencer: index
+            // full of conflict markers, and every later flk revert-run in
+            // this repo refused by the dirty-tree gate with no clue why.
+            // Abort so the operator gets the repo back on the revert
+            // branch, clean, and say what happened and what to do.
+            let aborted = git(repo_path, &["revert", "--abort"]).is_ok();
+            let recovery = if aborted {
+                "the in-progress revert was aborted, so the repo is clean; \
+                 resolve the conflict by hand or revert the remaining commits individually"
+            } else {
+                "the in-progress revert could NOT be aborted — run `git revert --abort` \
+                 in this repo before retrying"
+            };
             return RevertRepoResult {
                 repo_path: repo_path.display().to_string(),
                 revert_branch: branch_name,
                 reverted_commits: reverted,
-                outcome: "git_failed".into(),
-                detail: Some(format!("git revert {commit} failed: {err}")),
+                outcome: "revert_conflicted".into(),
+                detail: Some(format!("git revert {commit} failed: {err}; {recovery}")),
                 pr_command: None,
             };
         }
@@ -220,6 +248,7 @@ mod tests {
         clean: bool,
         commits: &'a [&'a str],
         fail_on: Option<&'a str>,
+        switch_error: Option<&'a str>,
         calls: Vec<(PathBuf, Vec<String>)>,
     }
 
@@ -229,6 +258,7 @@ mod tests {
                 clean,
                 commits,
                 fail_on: None,
+                switch_error: None,
                 calls: Vec::new(),
             }
         }
@@ -242,7 +272,10 @@ mod tests {
                     args.iter().map(|s| s.to_string()).collect(),
                 ));
                 if let Some(fail) = self.fail_on {
-                    if args.contains(&fail) {
+                    // `--abort` recovery must still succeed even when the
+                    // revert itself is the simulated failure.
+                    let is_abort = args == ["revert", "--abort"];
+                    if args.contains(&fail) && !is_abort {
                         return Err(format!("simulated failure on {fail}"));
                     }
                 }
@@ -253,11 +286,51 @@ mod tests {
                         " M src/foo.rs".into()
                     }),
                     "log" => Ok(self.commits.join("\n")),
-                    "switch" | "revert" => Ok(String::new()),
+                    "switch" => match self.switch_error {
+                        Some(err) => Err(err.to_string()),
+                        None => Ok(String::new()),
+                    },
+                    "revert" => Ok(String::new()),
                     other => panic!("unexpected git call: {other} {args:?}"),
                 }
             }
         }
+    }
+
+    #[test]
+    fn conflicting_revert_aborts_and_tells_the_operator() {
+        // US-8: a conflicting revert must not leave the repo wedged with a
+        // half-applied sequencer — every later revert-run would then hit
+        // the dirty-tree refusal with no clue why.
+        let mut fake = Fake::new(true, &["aaa111", "bbb222"]);
+        fake.fail_on = Some("aaa111");
+        let out = revert_one(&mut fake.shim(), Path::new("/tmp/repo"), "r-9", false);
+        assert_eq!(out.outcome, "revert_conflicted");
+        assert!(out.reverted_commits.is_empty());
+        let detail = out.detail.unwrap_or_default();
+        assert!(detail.contains("aborted"), "{detail}");
+        assert!(
+            fake.calls
+                .iter()
+                .any(|(_, args)| args == &["revert", "--abort"]),
+            "abort must be attempted: {:?}",
+            fake.calls
+        );
+        assert!(out.pr_command.is_none(), "no PR for a failed revert");
+    }
+
+    #[test]
+    fn existing_revert_branch_is_reported_distinctly() {
+        // `switch --create` refuses to clobber a prior attempt; the
+        // operator needs to know that is what happened.
+        let mut fake = Fake::new(true, &["aaa111"]);
+        fake.switch_error = Some("fatal: a branch named 'revert/r-9' already exists");
+        let out = revert_one(&mut fake.shim(), Path::new("/tmp/repo"), "r-9", false);
+        assert_eq!(out.outcome, "revert_branch_exists");
+        assert!(
+            out.detail.unwrap_or_default().contains("already exists"),
+            "operator must be told the branch survives from an earlier attempt"
+        );
     }
 
     #[test]

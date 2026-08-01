@@ -282,18 +282,34 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
 
 thread_local! {
     /// One-shot slot for the run_id that the *next* pane-spawn should
-    /// inherit. Set immediately before `Workspace::new_argv_command`;
-    /// cleared inside [`apply_pane_env`]. If nothing consumes it (the
-    /// spawn failed before env application), the value stays until the
-    /// next spawn takes it — that's a benign leak of one string.
+    /// inherit. Armed immediately before `Workspace::new_argv_command` and
+    /// consumed inside [`apply_pane_env`]. A leak here is NOT benign: an
+    /// id left armed by a failed spawn would be inherited by the next,
+    /// unrelated pane, whose commits would then carry `Agent-Run: <id>` —
+    /// and `flk revert-run <id>` would revert work that was never part of
+    /// that run (US-8). [`PendingRunIdGuard`] makes the disarm
+    /// unconditional.
     static PENDING_RUN_ID: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Set the run_id the *next* pane spawn on this thread should inherit as
-/// `FLOCK_RUN_ID`. Consumed exactly once by [`apply_pane_env`].
-pub(crate) fn set_pending_run_id(run_id: String) {
+/// Disarms the pending run_id on drop, so every early return between
+/// arming and the spawn clears it.
+#[must_use = "hold the guard across the spawn; dropping it immediately disarms the run_id"]
+pub(crate) struct PendingRunIdGuard;
+
+impl Drop for PendingRunIdGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_run_id();
+    }
+}
+
+/// Arm the run_id the *next* pane spawn on this thread inherits as
+/// `FLOCK_RUN_ID`. Consumed exactly once by [`apply_pane_env`]; the
+/// returned guard disarms it however the caller leaves scope.
+pub(crate) fn set_pending_run_id(run_id: String) -> PendingRunIdGuard {
     PENDING_RUN_ID.with(|slot| *slot.borrow_mut() = Some(run_id));
+    PendingRunIdGuard
 }
 
 /// Take the pending run_id, if any.
@@ -4753,6 +4769,28 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn pending_run_id_is_disarmed_when_the_guard_drops() {
+        // US-8: a run_id left armed by a FAILED spawn would be inherited by
+        // the next, unrelated pane — whose commits would then carry
+        // `Agent-Run: <id>`, and `flk revert-run <id>` would revert work
+        // that was never part of that run.
+        {
+            let _guard = set_pending_run_id("run:doomed".into());
+            // (spawn would consume it here; simulate a failure that never does)
+        }
+        assert!(
+            take_pending_run_id().is_none(),
+            "a dropped guard must leave nothing armed for the next spawn"
+        );
+
+        // And the happy path still hands the id to exactly one consumer.
+        let guard = set_pending_run_id("run:live".into());
+        assert_eq!(take_pending_run_id().as_deref(), Some("run:live"));
+        drop(guard);
+        assert!(take_pending_run_id().is_none(), "consumed exactly once");
     }
 
     // #175 S3 commit 4 (ops): trailer hook installer respects a

@@ -11,9 +11,11 @@
 //!    dispatches, and no heartbeat lands.
 //! 2. Mailbox drain — [`App::deliver_due_messages`] early-returns at the
 //!    top when paused, so a settled Idle boundary does not deliver.
-//! 3. Reap / quarantine dispatch — NOT ON THIS BRANCH. The scheduled reap
-//!    builtin lands with PR-A (S2). When it lands, gate it at the same
-//!    early-return point with a `// US-9` comment.
+//! 3. Cron fires ([`App::dispatch_cron_fires`], S1) and the scheduled
+//!    reap / quarantine tick ([`App::evaluate_reap_check`], S2) — both
+//!    gated transitively: they are dispatched from inside
+//!    [`App::dispatch_due_script_checks`], below its pause early-return,
+//!    so a paused fleet fires no scheduled run and quarantines nothing.
 //!
 //! # What pause does NOT gate
 //!

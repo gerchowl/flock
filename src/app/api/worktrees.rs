@@ -356,7 +356,10 @@ impl App {
                 )),
             }
         }
-        crate::integration::set_pending_run_id(run_id.clone());
+        // Guard, not a bare set: any early return below (spawn failure)
+        // must disarm the id, or the next unrelated pane inherits it and
+        // `flk revert-run` would revert that pane's work (US-8).
+        let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
         let ws_idx = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,
