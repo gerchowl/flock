@@ -80,6 +80,20 @@ pub(super) fn pane_agent_status(
     }
 }
 
+/// Same shape as [`pane_agent_status`] but honours the terminal's
+/// `hibernated_resume_plan` — a hibernated pane always reports Hibernated
+/// regardless of the underlying detected state (which will drift to Unknown
+/// once the child exits).
+pub(super) fn pane_agent_status_from_terminal(
+    terminal: &crate::terminal::TerminalState,
+    seen: bool,
+) -> crate::api::schema::AgentStatus {
+    if terminal.hibernated_resume_plan.is_some() {
+        return crate::api::schema::AgentStatus::Hibernated;
+    }
+    pane_agent_status(terminal.state, seen)
+}
+
 /// Cap reported prompts to a sane size and strip control characters that
 /// could corrupt the float rendering. Newlines and tabs survive.
 pub(super) fn sanitize_reported_prompt(prompt: &str) -> String {

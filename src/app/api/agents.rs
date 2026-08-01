@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, PaneReadResult, ReadFormat,
-    ReadSource, ResponseResult,
+    AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, ErrorBody, PaneReadResult,
+    ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::App;
 
@@ -100,6 +100,55 @@ impl App {
                 },
             },
         )
+    }
+
+    /// `agent.hibernate` (#175 C3): park a pane. Refuses with a typed code
+    /// when the agent has no resumable session (data loss guard) or the pane
+    /// is already hibernated. Emits `AgentHibernated` on success.
+    pub(super) fn handle_agent_hibernate(&mut self, id: String, target: AgentTarget) -> String {
+        let resolved = match self.resolve_terminal_target(&target.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        match self.hibernate_pane(resolved.ws_idx, resolved.pane_id) {
+            Ok(_) => {
+                let agent = self
+                    .agent_info(resolved.ws_idx, resolved.pane_id)
+                    .expect("hibernated pane's agent_info");
+                encode_success(id, ResponseResult::AgentInfo { agent })
+            }
+            Err(err) => encode_error_body(
+                id,
+                ErrorBody {
+                    code: err.code().to_string(),
+                    message: err.message(),
+                },
+            ),
+        }
+    }
+
+    /// `agent.resume` (#175 C3): spawn the hibernated pane's stashed argv
+    /// back into the same terminal.
+    pub(super) fn handle_agent_resume(&mut self, id: String, target: AgentTarget) -> String {
+        let resolved = match self.resolve_terminal_target(&target.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        match self.resume_hibernated_pane(resolved.ws_idx, resolved.pane_id) {
+            Ok(_) => {
+                let agent = self
+                    .agent_info(resolved.ws_idx, resolved.pane_id)
+                    .expect("resumed pane's agent_info");
+                encode_success(id, ResponseResult::AgentInfo { agent })
+            }
+            Err(err) => encode_error_body(
+                id,
+                ErrorBody {
+                    code: err.code().to_string(),
+                    message: err.message(),
+                },
+            ),
+        }
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {

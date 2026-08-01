@@ -74,6 +74,10 @@ pub enum Method {
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.fork")]
     AgentFork(AgentForkParams),
+    #[serde(rename = "agent.hibernate")]
+    AgentHibernate(AgentTarget),
+    #[serde(rename = "agent.resume")]
+    AgentResume(AgentTarget),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
     #[serde(rename = "msg.send")]
@@ -959,6 +963,11 @@ pub enum EventKind {
     CheckFired,
     CheckErrored,
     ChecksHeartbeat,
+    /// #175 C3: hibernation lifecycle. `AgentHibernated` fires once when a
+    /// pane transitions to hibernated (child asked to exit + resume plan
+    /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
+    AgentHibernated,
+    AgentResumedFromHibernation,
 }
 
 impl EventKind {
@@ -992,7 +1001,9 @@ impl EventKind {
             | Self::CheckRan
             | Self::CheckFired
             | Self::CheckErrored
-            | Self::ChecksHeartbeat => true,
+            | Self::ChecksHeartbeat
+            | Self::AgentHibernated
+            | Self::AgentResumedFromHibernation => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1552,6 +1563,23 @@ pub enum EventData {
         runs: u64,
         errors: u64,
     },
+    /// #175 C3: a pane's agent process has been asked to exit and its resume
+    /// plan is stashed on the pane; the next focus (or explicit
+    /// `agent.resume`) respawns it into the same pane.
+    AgentHibernated {
+        pane_id: String,
+        workspace_id: String,
+        agent: String,
+        /// The persisted session identity being hibernated, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    /// #175 C3: the stashed resume plan has been spawned back into the pane.
+    AgentResumedFromHibernation {
+        pane_id: String,
+        workspace_id: String,
+        agent: String,
+    },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
     AgentForked {
@@ -1692,6 +1720,10 @@ pub enum AgentStatus {
     Blocked,
     Done,
     Unknown,
+    /// #175 C3: agent process is gone but a resume plan is stashed on the
+    /// pane; the next focus (or explicit `agent.resume`) respawns it.
+    /// Ranked at the Idle attention tier — hibernated is a settled state.
+    Hibernated,
 }
 
 fn default_true() -> bool {

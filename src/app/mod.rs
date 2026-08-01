@@ -8,6 +8,7 @@ pub(crate) mod actions;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) mod hibernation;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 mod api_helpers;
 pub(crate) mod config_io;

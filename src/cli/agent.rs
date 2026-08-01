@@ -25,6 +25,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "fork" => agent_fork(&args[1..]),
+        "hibernate" => agent_hibernate(&args[1..]),
+        "resume" => agent_resume(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
             Ok(0)
@@ -211,6 +213,44 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
             label,
             pivot,
             focus,
+        }),
+    })?)
+}
+
+/// `flk agent hibernate <target>` — park the agent pane (#175 C3).
+/// Mirrors the socket verb; refusals surface with the wire's code+message.
+fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("usage: flk agent hibernate <target>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: flk agent hibernate <target>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:hibernate".into(),
+        method: Method::AgentHibernate(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
+/// `flk agent resume <target>` — spawn the hibernated pane's argv back
+/// into the same terminal (#175 C3).
+fn agent_resume(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("usage: flk agent resume <target>");
+        return Ok(2);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: flk agent resume <target>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:resume".into(),
+        method: Method::AgentResume(AgentTarget {
+            target: target.clone(),
         }),
     })?)
 }
@@ -495,6 +535,9 @@ fn agent_wait_status_satisfied(desired: AgentStatus, current: &str) -> bool {
         AgentStatus::Blocked => current == "blocked",
         AgentStatus::Unknown => current == "unknown",
         AgentStatus::Done => false,
+        // #175 C3: `hibernated` is a valid wait target so operators can
+        // block until a pane finishes going away.
+        AgentStatus::Hibernated => current == "hibernated",
     }
 }
 
@@ -525,6 +568,8 @@ fn print_agent_help() {
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
+    eprintln!("  flk agent hibernate <target>");
+    eprintln!("  flk agent resume <target>");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"
