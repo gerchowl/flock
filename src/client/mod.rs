@@ -1716,6 +1716,27 @@ async fn run_client_loop(
     // Timer arm so a freeze is a bounded gap in flock-client.log, not silence.
     let mut last_heartbeat: Option<Instant> = None;
 
+    // Send a message to the active slot, degrading to home instead of exiting
+    // if the active peer's transport wedged/died (#176). Expands against the
+    // loop's locals; `?` propagates only a genuinely-fatal loss.
+    macro_rules! send_active_or_degrade {
+        ($msg:expr) => {
+            if let Err(e) = active_writer.send($msg) {
+                degrade_active_or_lost(
+                    e,
+                    &mut slot_manager,
+                    &mut active_writer,
+                    &mut active_slot_key,
+                    &mut active_reader_quit,
+                    &mut state,
+                    &event_tx,
+                    &should_quit,
+                    max_frame_size,
+                )?;
+            }
+        };
+    }
+
     // Main event loop.
     let mut stdin_closed = false;
     while !should_quit.load(Ordering::Acquire) {
@@ -1796,9 +1817,7 @@ async fn run_client_loop(
                                 row,
                                 modifiers,
                             };
-                            if let Err(e) = active_writer.send(msg) {
-                                return Err(ClientError::ConnectionLost(e));
-                            }
+                            send_active_or_degrade!(msg);
                             continue;
                         }
                         AttachInputAction::Detach => {
@@ -1836,9 +1855,7 @@ async fn run_client_loop(
                             extension: image.extension.to_owned(),
                             data: image.bytes,
                         };
-                        if let Err(e) = active_writer.send(msg) {
-                            return Err(ClientError::ConnectionLost(e));
-                        }
+                        send_active_or_degrade!(msg);
                         continue;
                     }
                     info!(
@@ -1868,9 +1885,7 @@ async fn run_client_loop(
                                     extension,
                                     data: bytes,
                                 };
-                                if let Err(e) = active_writer.send(msg) {
-                                    return Err(ClientError::ConnectionLost(e));
-                                }
+                                send_active_or_degrade!(msg);
                                 continue;
                             }
                             Ok(bytes) => warn!(
@@ -1885,9 +1900,7 @@ async fn run_client_loop(
                     }
                 }
                 let msg = ClientMessage::Input { data };
-                if let Err(e) = active_writer.send(msg) {
-                    return Err(ClientError::ConnectionLost(e));
-                }
+                send_active_or_degrade!(msg);
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
@@ -1898,9 +1911,7 @@ async fn run_client_loop(
                     cell_width_px,
                     cell_height_px,
                 };
-                if let Err(e) = active_writer.send(msg) {
-                    return Err(ClientError::ConnectionLost(e));
-                }
+                send_active_or_degrade!(msg);
             }
             ClientLoopEvent::ServerMessage(slot_key, msg) => {
                 // Apply-time slot check (#65): a frame or message from a slot
@@ -2502,6 +2513,61 @@ async fn run_client_loop(
 /// the write stream, re-assert geometry to the new slot (#77), and request a
 /// full host-surface redraw. Shared by the warm-flip arm and the cold-dial
 /// success arm (#93) so they cannot drift.
+/// Handle a failed write to the ACTIVE slot (#176). A peer's active transport
+/// wedging or dying used to return `ConnectionLost` and terminate the client —
+/// one bad peer killing the whole session. Instead, demote the dead peer and
+/// fall back to the always-warm home slot so the client keeps running on local.
+///
+/// Returns `Ok(())` when it recovered (the caller should drop the undelivered
+/// message — it was destined for the now-dead peer — and continue the loop) or
+/// `Err(ConnectionLost)` when the failure is genuinely fatal: the active slot IS
+/// home, slots are disabled, or the fallback flip itself failed.
+#[allow(clippy::too_many_arguments)]
+fn degrade_active_or_lost(
+    err: io::Error,
+    slot_manager: &mut Option<slots::SlotManager>,
+    active_writer: &mut slots::SlotWriter,
+    active_slot_key: &mut String,
+    active_reader_quit: &mut Arc<AtomicBool>,
+    state: &mut ClientState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    max_frame_size: usize,
+) -> Result<(), ClientError> {
+    let home = slots::SlotTarget::Home;
+    // Home itself dying, or no slot manager to fall back through, is fatal —
+    // there is nowhere healthier to go.
+    if *active_slot_key == home.key() {
+        return Err(ClientError::ConnectionLost(err));
+    }
+    let Some(manager) = slot_manager.as_mut() else {
+        return Err(ClientError::ConnectionLost(err));
+    };
+    // Demote the dead active peer (drops its writer handle → off-loop bridge
+    // teardown), then flip to home. Home is always warm, so this normally
+    // succeeds; if it somehow doesn't, the original failure stands.
+    let dead = slots::SlotTarget::from_key(active_slot_key);
+    manager.handle_dead(&dead, Instant::now());
+    match manager.flip_to(&home) {
+        Ok(Some((new_writer, new_reader_src))) => {
+            crate::logging::client_slot_active_degraded_to_home(active_slot_key);
+            apply_slot_flip(
+                new_writer,
+                new_reader_src,
+                &home,
+                active_reader_quit,
+                active_slot_key,
+                active_writer,
+                state,
+                event_tx,
+                should_quit,
+                max_frame_size,
+            )
+        }
+        _ => Err(ClientError::ConnectionLost(err)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_slot_flip(
     new_writer: slots::SlotWriter,
@@ -4999,5 +5065,147 @@ mod tests {
         // And the new active_reader_quit is the freshly-allocated one (not
         // the old observer), so the new reader sees a clean false.
         assert!(!active_reader_quit.load(Ordering::Acquire));
+    }
+
+    /// #176 active-slot graceful degrade: when the ACTIVE peer's writer fails,
+    /// `degrade_active_or_lost` must demote it and flip to the always-warm home
+    /// slot (returning Ok = recovered) rather than ending the session. The
+    /// observable is the flipped `active_slot_key` + home receiving the geometry
+    /// re-assert.
+    #[test]
+    fn degrade_active_peer_flips_to_home_instead_of_exiting() {
+        use std::os::unix::net::UnixStream;
+        // Active = a peer ("anvil"); home is a warm fallback.
+        let (peer_local, _peer_peer) = UnixStream::pair().unwrap();
+        let peer_conn = slots::SlotConnection::new(
+            slots::SlotTarget::Ssh("anvil".to_string()),
+            peer_local,
+            None,
+            Box::new(|| {}),
+        )
+        .unwrap();
+        let mut active_writer = peer_conn.writer();
+        let mut manager: Option<slots::SlotManager> = Some(slots::SlotManager::new(
+            peer_conn,
+            vec![slots::SlotTarget::Home],
+            8,
+        ));
+
+        // Warm home over its own socketpair so the fallback flip has a target.
+        let (home_local, mut home_peer) = UnixStream::pair().unwrap();
+        manager
+            .as_mut()
+            .unwrap()
+            .add_warm(
+                slots::SlotConnection::new(
+                    slots::SlotTarget::Home,
+                    home_local,
+                    None,
+                    Box::new(|| {}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut active_slot_key = "anvil".to_string();
+        let mut active_reader_quit = Arc::new(AtomicBool::new(false));
+        let mut state = ClientState {
+            blit_encoder: render_ansi::BlitEncoder::new(),
+            mouse_capture_active: false,
+            reported_size: (100, 40),
+            reported_cell_size: (9, 18),
+            sound_config: crate::config::SoundConfig::default(),
+            kitty_graphics_enabled: false,
+            attach_escape: None,
+            mouse_scroll_lines: 3,
+            redraw_on_focus_gained: false,
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
+        let should_quit = Arc::new(AtomicBool::new(false));
+
+        let err = io::Error::new(io::ErrorKind::WouldBlock, "peer stalled");
+        degrade_active_or_lost(
+            err,
+            &mut manager,
+            &mut active_writer,
+            &mut active_slot_key,
+            &mut active_reader_quit,
+            &mut state,
+            &event_tx,
+            &should_quit,
+            MAX_FRAME_SIZE,
+        )
+        .expect("active-peer failure must recover to home, not propagate");
+
+        // Recovered onto home — the session did NOT end.
+        assert_eq!(active_slot_key, slots::SlotTarget::Home.key());
+        // Home received the geometry re-assert from the fallback flip.
+        home_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Home's first wire message is the pause (add_warm) then, after the
+        // flip, resume + resize. Drain until we see the Resize with our geometry.
+        let mut saw_resize = false;
+        for _ in 0..4 {
+            match protocol::read_message(&mut home_peer, MAX_FRAME_SIZE) {
+                Ok(ClientMessage::Resize { cols, rows, .. }) => {
+                    assert_eq!((cols, rows), (100, 40));
+                    saw_resize = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_resize,
+            "home must receive the geometry re-assert after degrade"
+        );
+    }
+
+    /// The fatal path: when the ACTIVE slot IS home (or slots are off), there is
+    /// no healthier fallback — `degrade_active_or_lost` must propagate
+    /// `ConnectionLost` rather than loop back onto the dying home slot.
+    #[test]
+    fn degrade_home_active_is_fatal() {
+        let (home_local, _home_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let home_conn =
+            slots::SlotConnection::new(slots::SlotTarget::Home, home_local, None, Box::new(|| {}))
+                .unwrap();
+        let mut active_writer = home_conn.writer();
+        let mut manager: Option<slots::SlotManager> =
+            Some(slots::SlotManager::new(home_conn, vec![], 8));
+        let mut active_slot_key = slots::SlotTarget::Home.key().to_string();
+        let mut active_reader_quit = Arc::new(AtomicBool::new(false));
+        let mut state = ClientState {
+            blit_encoder: render_ansi::BlitEncoder::new(),
+            mouse_capture_active: false,
+            reported_size: (80, 24),
+            reported_cell_size: (10, 20),
+            sound_config: crate::config::SoundConfig::default(),
+            kitty_graphics_enabled: false,
+            attach_escape: None,
+            mouse_scroll_lines: 3,
+            redraw_on_focus_gained: false,
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
+        let should_quit = Arc::new(AtomicBool::new(false));
+
+        let err = io::Error::new(io::ErrorKind::BrokenPipe, "home gone");
+        let result = degrade_active_or_lost(
+            err,
+            &mut manager,
+            &mut active_writer,
+            &mut active_slot_key,
+            &mut active_reader_quit,
+            &mut state,
+            &event_tx,
+            &should_quit,
+            MAX_FRAME_SIZE,
+        );
+        assert!(
+            matches!(result, Err(ClientError::ConnectionLost(_))),
+            "home dying has no fallback and must be fatal"
+        );
     }
 }

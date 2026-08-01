@@ -2184,6 +2184,19 @@ pub(crate) fn client_tick(active_slot: &str) {
     );
 }
 
+/// The active slot's transport wedged or died and the client fell back to the
+/// always-warm home slot instead of exiting (#176). The user keeps a live
+/// session on local rather than losing the whole client to one bad peer.
+pub(crate) fn client_slot_active_degraded_to_home(dead_slot: &str) {
+    tracing::warn!(
+        event = "client.slot.degrade",
+        subsystem = "client_slot",
+        outcome = "fell_back_to_home",
+        dead_slot,
+        "active slot transport failed; flipped to home"
+    );
+}
+
 /// A slot's writer thread dropped a message because it could not be framed
 /// (oversized payload). Rare, but logged because a dropped Resize/subscription
 /// toggle silently desyncs server-side geometry / stream state (#176).
