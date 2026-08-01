@@ -36,7 +36,7 @@ web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/ne
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
-base64 = "0.22.1"
+base64 = "0.23.0"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 # serde: KeyModifiers serializes inside RightClickPassthroughModifierConfig —
