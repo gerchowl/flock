@@ -74,7 +74,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.lineage` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
@@ -105,6 +105,8 @@ Remove a linked checkout:
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
+
+`agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 

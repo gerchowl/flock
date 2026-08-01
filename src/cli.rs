@@ -16,6 +16,7 @@ use crate::api::schema::{
 mod agent;
 mod hook;
 mod integration;
+mod lineage;
 mod notification;
 mod pane;
 mod peers;
@@ -51,6 +52,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
+        "lineage" => lineage::run_lineage_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "peers" => peers::run_peers_command(&args[2..])?,

@@ -74,6 +74,8 @@ pub enum Method {
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.fork")]
     AgentFork(AgentForkParams),
+    #[serde(rename = "agent.lineage")]
+    AgentLineage(LineageParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -368,6 +370,37 @@ pub struct AgentForkParams {
     pub pivot: Option<String>,
     #[serde(default)]
     pub focus: bool,
+}
+
+/// Walk the fork ancestry of a pane/worktree (#175 O1, US-4). Target uses
+/// the `agent.send` grammar for live panes, and falls back to persisted
+/// identities (child pane id, worktree path, branch) for reaped ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageParams {
+    pub target: String,
+}
+
+/// One fork edge in an ancestry chain, deepest (target) first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageEdge {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub run_id: String,
+    pub agent: String,
+    pub seeded: bool,
+    pub parent: LineageNode,
+    pub child: LineageNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageNode {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,6 +887,36 @@ pub enum EventKind {
     AgentForked,
 }
 
+impl EventKind {
+    /// Whether this kind is written to the durable event log (#175 O1).
+    /// Exhaustive on purpose: a new kind must make this decision explicitly.
+    /// `PaneOutputChanged` fires per terminal revision — far too hot for an
+    /// audit log, and the pane's textual state is not part of the audit
+    /// story; every lifecycle + lineage kind persists.
+    pub fn is_persisted(self) -> bool {
+        match self {
+            Self::WorkspaceCreated
+            | Self::WorkspaceUpdated
+            | Self::WorkspaceClosed
+            | Self::WorkspaceRenamed
+            | Self::WorkspaceFocused
+            | Self::TabCreated
+            | Self::TabClosed
+            | Self::TabRenamed
+            | Self::TabFocused
+            | Self::PaneCreated
+            | Self::PaneClosed
+            | Self::PaneFocused
+            | Self::PaneMoved
+            | Self::PaneExited
+            | Self::PaneAgentDetected
+            | Self::PaneAgentStatusChanged
+            | Self::AgentForked => true,
+            Self::PaneOutputChanged => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SuccessResponse {
     pub id: String,
@@ -995,6 +1058,9 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    Lineage {
+        chain: Vec<LineageEdge>,
     },
     PaneInfo {
         pane: PaneInfo,
@@ -2026,6 +2092,65 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"type\":\"tab_created\""));
         assert!(json.contains("\"root_pane\""));
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    #[test]
+    fn event_kind_persistence_classification() {
+        // #175 O1: only the per-revision output firehose stays memory-only.
+        assert!(!EventKind::PaneOutputChanged.is_persisted());
+        for kind in [
+            EventKind::WorkspaceCreated,
+            EventKind::PaneClosed,
+            EventKind::PaneAgentStatusChanged,
+            EventKind::AgentForked,
+        ] {
+            assert!(kind.is_persisted(), "{kind:?} must persist");
+        }
+    }
+
+    #[test]
+    fn lineage_method_and_response_round_trip() {
+        let request = Request {
+            id: "req_l".into(),
+            method: Method::AgentLineage(LineageParams {
+                target: "w2:p1".into(),
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"method\":\"agent.lineage\""));
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, request);
+
+        let response = SuccessResponse {
+            id: "req_l".into(),
+            result: ResponseResult::Lineage {
+                chain: vec![LineageEdge {
+                    seq: 7,
+                    ts_ms: 1_754_000_000_000,
+                    run_id: "fork:term_1".into(),
+                    agent: "claude".into(),
+                    seeded: true,
+                    parent: LineageNode {
+                        pane_id: "w1:p2".into(),
+                        workspace_id: "w1".into(),
+                        repo: "/repo/.git".into(),
+                        worktree: None,
+                        branch: None,
+                    },
+                    child: LineageNode {
+                        pane_id: "w2:p1".into(),
+                        workspace_id: "w2".into(),
+                        repo: "/repo/.git".into(),
+                        worktree: Some("/wt/fork-x".into()),
+                        branch: Some("fork/x".into()),
+                    },
+                }],
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"lineage\""));
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
     }
