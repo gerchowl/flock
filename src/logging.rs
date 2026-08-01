@@ -2184,6 +2184,19 @@ pub(crate) fn client_tick(active_slot: &str) {
     );
 }
 
+/// A slot's writer thread dropped a message because it could not be framed
+/// (oversized payload). Rare, but logged because a dropped Resize/subscription
+/// toggle silently desyncs server-side geometry / stream state (#176).
+pub(crate) fn client_slot_write_encode_failed(err: &str) {
+    tracing::warn!(
+        event = "client.slot.write",
+        subsystem = "client_slot",
+        outcome = "encode_failed",
+        err,
+        "dropped an unframeable slot message"
+    );
+}
+
 pub(crate) fn client_slot_disconnected_demoted(slot: &str) {
     tracing::debug!(
         event = "client.slot.disconnect",

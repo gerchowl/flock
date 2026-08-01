@@ -2847,13 +2847,19 @@ fn active_slot_key() -> String {
 /// disconnect to the loop if its transport dies mid-session (#176). Reuses the
 /// existing `ServerDisconnected` handling, which demotes a warm slot silently
 /// and tears the session down only for the active slot.
+///
+/// Uses a non-blocking `try_send`: the hook fires AFTER the writer thread has
+/// already torn down its transport, so parking it on a full/stuck loop channel
+/// would serve no purpose and could leak the thread. A dropped notification is
+/// backstopped — the slot's reader thread also posts `ServerDisconnected` on
+/// EOF, and any later flip/send to the dead slot re-demotes it.
 fn slot_death_hook(
     key: String,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) -> Box<dyn FnOnce() + Send> {
     let tx = event_tx.clone();
     Box::new(move || {
-        let _ = tx.blocking_send(ClientLoopEvent::ServerDisconnected(key));
+        let _ = tx.try_send(ClientLoopEvent::ServerDisconnected(key));
     })
 }
 

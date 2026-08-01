@@ -1712,6 +1712,19 @@ impl Drop for SshStdioBridge {
         // tunnel: SIGKILL the ssh child so the wait returns now instead of after
         // the ssh keepalive timeout. `should_stop` is already set, so the accept
         // loop exits rather than dialing again (#176).
+        //
+        // Teardown is thus bounded by (kill → child reap → one BRIDGE_ACCEPT_POLL
+        // tick), not the ssh keepalive — but it is not instantaneous.
+        //
+        // The pid is published while the child is alive and cleared under the
+        // same lock the instant `child.wait()` reaps it (`bridge_connection`).
+        // There is a bounded window — between `wait()` reaping and the clear —
+        // where a taken pid could name a recycled process; it is a few
+        // instructions wide and requires Drop to race that exact gap AND the OS
+        // to recycle the pid into a process we then signal. Accepted as
+        // vanishingly unlikely; closing it fully needs an owned-`Child` guard
+        // polled via `try_wait`, which would replace the efficient blocking wait
+        // on the live data path.
         if let Some(pid) = self
             .active_child_pid
             .lock()

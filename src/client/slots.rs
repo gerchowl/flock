@@ -519,10 +519,12 @@ impl SlotWriter {
 fn writer_pump(stream: &mut UnixStream, rx: &Receiver<ClientMessage>) -> bool {
     for msg in rx.iter() {
         let mut buf = Vec::new();
-        if crate::protocol::write_message(&mut buf, &msg).is_err() {
+        if let Err(err) = crate::protocol::write_message(&mut buf, &msg) {
             // Serializing into an in-memory buffer cannot fail on I/O; a framing
-            // error here is an oversized payload. Drop the message, keep the
-            // slot alive.
+            // error here is an oversized payload. Drop the message and keep the
+            // slot alive, but log it — a dropped Resize/SetFrameSubscription
+            // would silently desync the server's geometry / stream state.
+            crate::logging::client_slot_write_encode_failed(&err.to_string());
             continue;
         }
         let mut off = 0;
