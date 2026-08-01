@@ -232,9 +232,9 @@ impl App {
         let settled = self
             .state
             .commit_settled_completions(now, &self.terminal_runtimes);
-        // #175 M1: queued messages deliver exactly at the settle — mirrored
-        // in the headless loop (the #25 dual-loop lesson).
-        self.deliver_settled_messages(&settled);
+        // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
+        // mirrored in the headless loop (the #25 dual-loop lesson).
+        self.deliver_due_messages(now);
         for update in &settled {
             self.emit_pane_state_update(update);
         }

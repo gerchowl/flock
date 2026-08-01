@@ -3200,9 +3200,9 @@ impl HeadlessServer {
             .app
             .state
             .commit_settled_completions(now, &self.app.terminal_runtimes);
-        // #175 M1: queued messages deliver exactly at the settle — mirrored
-        // in the TUI runtime loop (the #25 dual-loop lesson).
-        self.app.deliver_settled_messages(&settled);
+        // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
+        // mirrored in the TUI runtime loop (the #25 dual-loop lesson).
+        self.app.deliver_due_messages(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }
