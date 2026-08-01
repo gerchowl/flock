@@ -438,7 +438,15 @@ mod tests {
         fn tzset();
     }
 
+    /// Serializes every TZ-mutating test: the process TZ + libc's cached
+    /// zone are global, and nextest runs tests in threads within a binary,
+    /// so two concurrent `with_tz` calls would race into flakes.
+    static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_tz<F: FnOnce()>(tz: &str, run: F) {
+        let guard = TZ_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("TZ").ok();
         std::env::set_var("TZ", tz);
         // libc caches TZ; tzset() reloads from env.
@@ -449,6 +457,7 @@ mod tests {
             None => std::env::remove_var("TZ"),
         }
         unsafe { tzset() };
+        drop(guard);
     }
 
     #[test]

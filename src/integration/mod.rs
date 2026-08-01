@@ -1066,11 +1066,30 @@ pub(crate) fn verify_integration_manifest() -> ManifestVerdict {
     if !outdated.is_empty() {
         return ManifestVerdict::Outdated { targets: outdated };
     }
-    // (b) settings drift, per manageable target.
+    // (b) settings drift, per manageable target. A half-installed target
+    // (shim gone but registration left behind, or vice versa) is drift, not
+    // an absence — that IS the #143 class.
     if let Some(details) = verify_claude_settings_drift() {
         return ManifestVerdict::HookHalfState {
             target: crate::api::schema::IntegrationTarget::Claude,
             details,
+        };
+    }
+    // (c) FAIL CLOSED. Reaching here with nothing installed means we have no
+    // evidence that agent state is being reported at all — on a fresh
+    // machine every pane looks Unknown, and "no signal" must never read as
+    // "safe to reap" (P4: a wrongly-reaped worktree costs work).
+    if installed_integration_statuses()
+        .iter()
+        .all(|status| status.state != IntegrationStatusKind::Current)
+    {
+        return ManifestVerdict::HookHalfState {
+            target: crate::api::schema::IntegrationTarget::Claude,
+            details: vec![
+                "no agent integration is installed and current; without hook-reported \
+                 agent state the reap has no evidence to act on"
+                    .to_string(),
+            ],
         };
     }
     ManifestVerdict::Ok
@@ -1084,11 +1103,32 @@ fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let dir = claude_dir().ok()?;
     let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
     let settings_path = dir.join("settings.json");
-    // If nothing is installed we have nothing to compare against — that's
-    // an install-missing case, handled elsewhere. Same for a missing
-    // settings.json: the operator has never installed the integration.
-    if !hook_path.is_file() || !settings_path.is_file() {
-        return None;
+    // Half-state is asymmetric and both directions are drift (#143):
+    //  * shim missing but settings still register it  -> hooks fire nothing
+    //  * settings missing but shim on disk            -> shim never invoked
+    // Only the fully-absent case is "not installed", and that is caught by
+    // the fail-closed arm in `verify_integration_manifest`.
+    let settings_registers_flock = settings_path
+        .is_file()
+        .then(|| fs::read_to_string(&settings_path).ok())
+        .flatten()
+        .is_some_and(|raw| raw.contains(CLAUDE_HOOK_INSTALL_NAME));
+    match (hook_path.is_file(), settings_registers_flock) {
+        (false, true) => {
+            return Some(vec![format!(
+                "settings.json still registers {name}, but the hook shim is missing from {dir}",
+                name = CLAUDE_HOOK_INSTALL_NAME,
+                dir = hook_path.parent().unwrap_or(&dir).display(),
+            )]);
+        }
+        (true, false) => {
+            return Some(vec![format!(
+                "hook shim {name} is installed but settings.json does not register it",
+                name = CLAUDE_HOOK_INSTALL_NAME,
+            )]);
+        }
+        (false, false) => return None,
+        (true, true) => {}
     }
     let raw = fs::read_to_string(&settings_path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
@@ -4421,17 +4461,65 @@ mod tests {
     }
 
     #[test]
-    fn verify_manifest_ok_when_nothing_installed() {
-        // No installed integrations = nothing to drift against. The gate is
-        // not the "have you installed" check; it's the "is what's installed
-        // consistent" check.
+    fn verify_manifest_fails_closed_when_nothing_installed() {
+        // #175 S2 / #143, corrected after review: the gate must FAIL CLOSED.
+        // With no integration installed, no pane ever reports agent state —
+        // every pane looks Unknown, and "no signal" must never be read as
+        // "safe to reap" (P4: a stale worktree costs disk, a wrongly-reaped
+        // one costs work).
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home-empty");
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("HOME", &home);
         let verdict = verify_integration_manifest();
-        assert_eq!(verdict, ManifestVerdict::Ok);
+        assert!(
+            matches!(verdict, ManifestVerdict::HookHalfState { .. }),
+            "fresh machine must refuse the reap, got {verdict:?}"
+        );
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn verify_manifest_catches_both_half_state_directions() {
+        // The #143 class is asymmetric and BOTH directions are drift:
+        // a settings entry pointing at a deleted shim (hooks fire nothing),
+        // and an installed shim nothing registers (shim never invoked).
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home-half");
+        let claude = home.join(".claude");
+        let hooks = claude.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        std::env::set_var("HOME", &home);
+
+        // (1) settings register the shim, but the shim is gone.
+        fs::write(
+            claude.join("settings.json"),
+            format!("{{\"hooks\": {{\"Stop\": [\"{CLAUDE_HOOK_INSTALL_NAME}\"]}}}}"),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                verify_integration_manifest(),
+                ManifestVerdict::HookHalfState { .. }
+            ),
+            "settings-without-shim must be refused"
+        );
+
+        // (2) the shim exists, but nothing registers it. (A shim without
+        // flock's version marker also reads as Outdated — either way the
+        // invariant under test is that the gate REFUSES, never that it
+        // picks one refusal variant.)
+        fs::write(hooks.join(CLAUDE_HOOK_INSTALL_NAME), "#!/bin/sh\n").unwrap();
+        fs::write(claude.join("settings.json"), "{}").unwrap();
+        assert_ne!(
+            verify_integration_manifest(),
+            ManifestVerdict::Ok,
+            "shim-without-registration must be refused"
+        );
+
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
     }

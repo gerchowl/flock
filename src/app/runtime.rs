@@ -990,20 +990,26 @@ impl App {
                     }
                 }
             }
-            // KillBranch / CheckoutOnly / ClosePane: reap only records the
-            // decision on the durable log here; the actual disk work
-            // reuses the existing worktree-remove path in a follow-up
-            // wiring commit. The design's scope for S2 is Quarantine +
-            // the manifest gate; expanding the reap to also run the
-            // KillBranch path lands with the sweep unification.
+            // KillBranch / CheckoutOnly / ClosePane: the scheduled reap
+            // deliberately performs NO disk work for these tiers yet — the
+            // removal path is shared with the human sweep and lands with
+            // that unification. Recording `CheckFired` here would read as
+            // "a worktree was reaped" when nothing happened, so the
+            // deferral is audited as an error-shaped record instead: the
+            // operator sees the candidate and the reason it was skipped.
             crate::worktree::KillAction::KillBranch { .. }
             | crate::worktree::KillAction::CheckoutOnly
             | crate::worktree::KillAction::ClosePane => {
+                let _ = episode;
                 self.event_hub.push(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::CheckFired,
-                    data: crate::api::schema::EventData::CheckFired {
+                    event: crate::api::schema::EventKind::CheckErrored,
+                    data: crate::api::schema::EventData::CheckErrored {
                         name: crate::checks::REAP_CHECK_NAME.to_string(),
-                        episode,
+                        reason: format!(
+                            "{} is reapable ({action:?}) but scheduled removal is not wired yet; \
+                             run `flk worktree kill` to act on it",
+                            candidate.workspace_id
+                        ),
                     },
                 });
             }

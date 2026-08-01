@@ -945,14 +945,18 @@ pub(crate) fn quarantine_worktree(
     })?;
 
     // Recovery breadcrumb. Deliberately Markdown so `less` renders cleanly.
+    // A write failure here must NOT fail the quarantine: the worktree is
+    // already safely moved, and returning Err would report a failure for an
+    // operation that succeeded (P4 — the preserved worktree is the point,
+    // the note is the convenience). `quarantine-list` still finds it.
     let note = quarantine_note(repo_root, &dst, branch, reason, checkout);
     let note_path = dst.join("QUARANTINE.md");
-    std::fs::write(&note_path, note).map_err(|err| {
-        format!(
-            "quarantine move succeeded, but writing recovery note {} failed: {err}",
-            note_path.display()
-        )
-    })?;
+    if let Err(err) = std::fs::write(&note_path, note) {
+        crate::logging::quarantine_note_write_failed(
+            &note_path.display().to_string(),
+            &err.to_string(),
+        );
+    }
     Ok(dst)
 }
 
@@ -987,7 +991,17 @@ fn quarantine_destination(root: &Path, repo_root: &Path, branch: Option<&str>) -
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    root.join(format!("{repo}-{branch_slug}-{ts}"))
+    // Second-resolution timestamps collide when two worktrees of the same
+    // repo+branch quarantine within one second; the move would fail on an
+    // existing destination and the operator would get an error instead of a
+    // preserved worktree. A per-process counter disambiguates.
+    static NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut candidate = root.join(format!("{repo}-{branch_slug}-{ts}"));
+    if candidate.exists() {
+        candidate = root.join(format!("{repo}-{branch_slug}-{ts}-{nonce}"));
+    }
+    candidate
 }
 
 fn quarantine_note(
