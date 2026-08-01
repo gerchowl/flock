@@ -643,6 +643,11 @@ impl App {
             self.checks_next_deadline = self.checks_runner.next_due(now);
         }
 
+        // #175 C2: built-in blocked-alert fold. Runs on every tick — cheap
+        // (walks live pane details), returns fires the App dispatches through
+        // the same Notify/CheckFired path as script checks.
+        changed |= self.evaluate_blocked_alert(now);
+
         if self
             .checks_heartbeat_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -760,6 +765,77 @@ impl App {
     #[cfg(test)]
     pub(crate) fn force_checks_heartbeat_now(&mut self) {
         self.checks_heartbeat_deadline = Some(Instant::now());
+    }
+
+    /// Snapshot every live pane's blocked-alert relevant fields, and hand
+    /// them to the [`BlockedAlertFold`]. Any fires are dispatched through
+    /// the same Notify + `CheckFired` path used by script checks so the
+    /// `[ui.toast]` policy applies uniformly and one code path emits the
+    /// durable event.
+    pub(crate) fn evaluate_blocked_alert(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.blocked_alert.enable {
+            return false;
+        }
+        let snapshots = self.collect_blocked_alert_snapshots();
+        self.blocked_alert
+            .evict_missing_panes(snapshots.iter().map(|s| s.pane_id));
+        let config = self.state.config.checks.blocked_alert;
+        let fires = self.blocked_alert.evaluate(now, &config, &snapshots);
+        if fires.is_empty() {
+            return false;
+        }
+        for fire in fires {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckFired,
+                data: crate::api::schema::EventData::CheckFired {
+                    name: crate::checks::BLOCKED_ALERT_CHECK_NAME.to_string(),
+                    episode: fire.episode.clone(),
+                },
+            });
+            self.dispatch_blocked_alert_notify(&fire);
+        }
+        true
+    }
+
+    fn collect_blocked_alert_snapshots(&self) -> Vec<crate::checks::BlockedPaneSnapshot> {
+        let mut out = Vec::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for detail in ws.pane_details(&self.state.terminals) {
+                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(public_pane_id) = self.public_pane_id(ws_idx, detail.pane_id) else {
+                    continue;
+                };
+                out.push(crate::checks::BlockedPaneSnapshot {
+                    pane_id: detail.pane_id,
+                    public_pane_id,
+                    label: detail.label,
+                    status,
+                    state_changed_at: detail.state_changed_at,
+                });
+            }
+        }
+        out
+    }
+
+    fn dispatch_blocked_alert_notify(&mut self, fire: &crate::checks::BlockedAlertFire) {
+        use crate::api::schema::{NotificationShowParams, NotificationShowSound};
+        let duration = crate::checks::format_blocked_duration(fire.duration_secs);
+        let title = format!("agent blocked {duration}: {}", fire.label);
+        let params = NotificationShowParams {
+            title,
+            body: Some(format!(
+                "pane {} — episode {}",
+                fire.public_pane_id, fire.episode
+            )),
+            position: None,
+            sound: NotificationShowSound::Request,
+        };
+        let request_id = format!("check:{}", fire.episode);
+        let _ =
+            self.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: request_id,
+                method: crate::api::schema::Method::NotificationShow(params),
+            });
     }
 }
 
@@ -934,6 +1010,9 @@ mod tests {
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
         app.last_git_remote_status_refresh = now - super::super::GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        // #175 C2: blocked-alert arms the checks heartbeat by default; clear
+        // it so the "only the git-refresh deadline" invariant still holds.
+        app.checks_heartbeat_deadline = None;
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, false),
@@ -1336,6 +1415,123 @@ mod tests {
             "expected ChecksHeartbeat on the hub, got: {:?}",
             events
         );
+    }
+
+    /// #175 C2: the built-in blocked-alert fold fires a `CheckFired` durable
+    /// event ONCE per Blocked episode past the threshold, and never for a
+    /// pane below the threshold.
+    #[test]
+    fn blocked_alert_fires_once_per_episode_via_app_tick() {
+        use crate::detect::{Agent, AgentState};
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 30;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let ws = Workspace::test_new("main");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        let now = Instant::now();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(now - Duration::from_secs(120));
+        }
+
+        assert!(app.evaluate_blocked_alert(now));
+        let fires_after_first: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(fires_after_first.len(), 1, "first evaluation must fire");
+
+        // Same episode, another tick — no new fire.
+        assert!(!app.evaluate_blocked_alert(now + Duration::from_secs(1)));
+        let fires_after_second: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(fires_after_second.len(), 1, "same episode must not re-fire");
+
+        // Re-block with a fresh state_changed_at → NEW episode fires.
+        let later = now + Duration::from_secs(600);
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.state_changed_at = Some(now + Duration::from_secs(60));
+        }
+        // Reset the fold's fired mark by evaluating an Idle tick.
+        let _ = app.evaluate_blocked_alert(now + Duration::from_secs(90));
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(later - Duration::from_secs(120));
+        }
+        assert!(app.evaluate_blocked_alert(later));
+        let fires_after_reblock: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(
+            fires_after_reblock.len(),
+            2,
+            "re-block must emit a fresh CheckFired"
+        );
+    }
+
+    /// A pane whose Blocked age hasn't crossed the threshold does not fire.
+    #[test]
+    fn blocked_alert_below_threshold_never_fires_via_app() {
+        use crate::detect::{Agent, AgentState};
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 3_600;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let ws = Workspace::test_new("main");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        let now = Instant::now();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+        terminal.state_changed_at = Some(now - Duration::from_secs(60));
+        assert!(!app.evaluate_blocked_alert(now));
     }
 
     /// Kill switch: `checks.enable = false` clears both deadlines and never

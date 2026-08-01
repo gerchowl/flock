@@ -4460,6 +4460,9 @@ next_tab = ""
             .state
             .workspaces
             .push(crate::workspace::Workspace::test_new("test"));
+        // #175 C2: silence the blocked-alert heartbeat so the git-refresh
+        // enablement invariant is the only thing under test.
+        server.app.checks_heartbeat_deadline = None;
         let (writer, _control_rx, _render_rx) = test_client_writer();
 
         assert!(server.handle_server_event(ServerEvent::ClientConnected {
@@ -4496,6 +4499,9 @@ next_tab = ""
             .state
             .workspaces
             .push(crate::workspace::Workspace::test_new("test"));
+        // #175 C2: silence the blocked-alert heartbeat so the git-refresh
+        // enablement invariant is the only thing under test.
+        server.app.checks_heartbeat_deadline = None;
         let (writer, _control_rx, _render_rx) = test_client_writer();
 
         assert!(server.handle_server_event(ServerEvent::ClientConnected {

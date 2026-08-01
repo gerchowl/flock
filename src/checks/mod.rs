@@ -5,10 +5,15 @@
 //! executed by the App tick which folds `FireDecision`s into the existing
 //! notification / event paths.
 
+pub(crate) mod blocked_alert;
 pub(crate) mod config;
 pub(crate) mod runner;
 pub(crate) mod script;
 
+pub(crate) use blocked_alert::{
+    format_blocked_duration, BlockedAlertFire, BlockedAlertFold, BlockedPaneSnapshot,
+    BLOCKED_ALERT_CHECK_NAME,
+};
 pub(crate) use config::{ActionSpec, ChecksConfig};
 pub(crate) use runner::CheckRunner;
 pub(crate) use script::{run_script, Outcome};

@@ -155,6 +155,9 @@ pub struct App {
     pub(crate) checks_heartbeat_deadline: Option<Instant>,
     pub(crate) checks_run_count: u64,
     pub(crate) checks_error_count: u64,
+    /// Built-in blocked-alert check (#175 C2). Runs from the same checks tick
+    /// as script checks; fires once per Blocked episode per pane.
+    pub(crate) blocked_alert: crate::checks::BlockedAlertFold,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -720,15 +723,15 @@ impl App {
             agent_metadata_deadline: None,
             checks_runner: crate::checks::CheckRunner::from_config(&config.checks, Instant::now()),
             checks_next_deadline: None,
-            // Arm the heartbeat only when the runner has something to run —
-            // otherwise a config-defaulted server would wake every
-            // heartbeat_secs for a no-op, and the loop-deadline tests would
-            // stop seeing None. Once built-in checks land the gate widens
-            // (their config.enable joins the disjunction).
-            checks_heartbeat_deadline: (config.checks.enable && !config.checks.scripts.is_empty())
+            // Arm the heartbeat when the runner has something to run OR any
+            // built-in check is enabled — the built-ins tick from the same
+            // dispatch, so the loop must wake even when only they're armed.
+            checks_heartbeat_deadline: (config.checks.enable
+                && (!config.checks.scripts.is_empty() || config.checks.blocked_alert.enable))
                 .then(|| Instant::now() + Duration::from_secs(config.checks.heartbeat_secs.max(1))),
             checks_run_count: 0,
             checks_error_count: 0,
+            blocked_alert: crate::checks::BlockedAlertFold::new(),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
@@ -3710,6 +3713,9 @@ sidebar_pane_gap = 99
         app.next_animation_tick = None;
         app.next_auto_update_check = None;
         app.session_save_deadline = None;
+        // #175 C2: the built-in blocked-alert wakes off the checks heartbeat
+        // even on a defaulted config, so clear it for the "quiet" pose.
+        app.checks_heartbeat_deadline = None;
         app.state.workspaces.clear();
 
         assert_eq!(
