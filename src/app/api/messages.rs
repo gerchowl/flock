@@ -69,6 +69,10 @@ impl App {
             .correlation_id
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
+        let mut warnings = Vec::new();
+        if from_pane.is_none() {
+            warnings.push("sender_unresolved_shared_rate_bucket".to_string());
+        }
         let message = PendingMessage {
             correlation_id: correlation_id.clone(),
             body,
@@ -81,7 +85,7 @@ impl App {
             delivery_attempts: 0,
         };
 
-        self.queue_message(id, message, Vec::new())
+        self.queue_message(id, message, warnings)
     }
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
@@ -155,29 +159,38 @@ impl App {
             .reply_correlation_id
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
-        let round_trips = self.mailboxes.bump_round_trips(&root);
-        self.emit_event(EventEnvelope {
-            event: EventKind::MessageReplied,
-            data: EventData::MessageReplied {
-                correlation_id: params.correlation_id.clone(),
-                reply_correlation_id: reply_correlation_id.clone(),
-                reply_latency_ms: now.saturating_sub(original_enqueued_ms),
-                round_trips,
-            },
-        });
-
+        let mut warnings = Vec::new();
+        if from_pane.is_none() {
+            warnings.push("sender_unresolved_shared_rate_bucket".to_string());
+        }
         let message = PendingMessage {
-            correlation_id: reply_correlation_id,
+            correlation_id: reply_correlation_id.clone(),
             body,
             from_pane,
             from_repo,
             to_pane,
             to_repo,
-            in_reply_to: Some(params.correlation_id),
+            in_reply_to: Some(params.correlation_id.clone()),
             enqueued_at_ms: now,
             delivery_attempts: 0,
         };
-        self.queue_message(id, message, Vec::new())
+        // Telemetry only records a reply the mailbox actually accepted: a
+        // full mailbox or a duplicate must not bump round_trips or leave a
+        // MessageReplied with no matching queued/delivered pair.
+        let response = self.queue_message(id, message, warnings);
+        if response.contains("\"state\":\"queued\"") {
+            let round_trips = self.mailboxes.bump_round_trips(&root);
+            self.emit_event(EventEnvelope {
+                event: EventKind::MessageReplied,
+                data: EventData::MessageReplied {
+                    correlation_id: params.correlation_id.clone(),
+                    reply_correlation_id,
+                    reply_latency_ms: now.saturating_sub(original_enqueued_ms),
+                    round_trips,
+                },
+            });
+        }
+        response
     }
 
     pub(super) fn handle_msg_list(&mut self, id: String, params: MsgListParams) -> String {
@@ -418,14 +431,11 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return Err(());
         };
-        let text = crate::app::api_helpers::encode_api_text(runtime, &rendered);
-        if runtime.try_send_bytes(bytes::Bytes::from(text)).is_err() {
-            return Err(());
-        }
-        if runtime
-            .try_send_bytes(bytes::Bytes::from(plan.submit_bytes.clone()))
-            .is_err()
-        {
+        // One write: a text-succeeded/enter-failed split would re-queue the
+        // whole message and visibly retype the body at the next boundary.
+        let mut payload = crate::app::api_helpers::encode_api_text(runtime, &rendered);
+        payload.extend_from_slice(&plan.submit_bytes);
+        if runtime.try_send_bytes(bytes::Bytes::from(payload)).is_err() {
             return Err(());
         }
         Ok(plan.generic)

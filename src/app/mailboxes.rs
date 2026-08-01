@@ -9,6 +9,12 @@ use crate::api::schema::{EventData, EventEnvelope};
 /// the at-least-once + dedupe-across-restarts contract (§8.4, §8.6).
 /// Queues are keyed by the recipient's *public pane id*, the identity that
 /// survives restarts; panes are re-resolved at drain time.
+///
+/// Dedupe is BOUNDED, not eternal: the seen-set holds the newest
+/// `MAX_SEEN` correlation ids (and the boot seed only sees what log
+/// rotation kept), so a duplicate older than both windows can be accepted
+/// again. Evicting a seen id also drops its reply-routing history — replies
+/// to sufficiently old messages return `message_not_found`.
 #[derive(Default)]
 pub(crate) struct MailboxRegistry {
     queues: HashMap<String, VecDeque<PendingMessage>>,

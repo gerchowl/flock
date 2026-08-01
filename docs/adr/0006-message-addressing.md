@@ -56,6 +56,15 @@ against.
   pane report verbs use). The stamp is routing and audit metadata; no code
   path branches on it for authorization.
 
+## Bounded dedupe
+
+Correlation-id dedupe survives restarts via the event-log seed, but both
+windows are bounded: the in-memory seen-set keeps the newest 4096 ids, and
+the boot seed only sees what ADR-0005 log rotation retained. A duplicate
+older than both can be accepted again; reply routing for evicted ids returns
+`message_not_found`. This is deliberate — unbounded dedupe is a disguised
+database, and the epic's §9 rules that out.
+
 ## Consequences
 
 - No fourth `:` grammar; §8.1's label-collision tests stay meaningful.
