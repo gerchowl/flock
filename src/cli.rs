@@ -18,6 +18,7 @@ mod checks;
 mod hook;
 mod integration;
 mod lineage;
+mod mcp;
 mod msg;
 mod notification;
 mod pane;
@@ -56,6 +57,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "agent" => agent::run_agent_command(&args[2..])?,
         "lineage" => lineage::run_lineage_command(&args[2..])?,
         "msg" => msg::run_msg_command(&args[2..])?,
+        "mcp" => mcp::run_mcp_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "peers" => peers::run_peers_command(&args[2..])?,

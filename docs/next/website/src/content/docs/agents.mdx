@@ -141,3 +141,7 @@ flock agent attach reviewer --takeover
 ```
 
 Use `flock terminal attach <terminal_id>` when you want the same direct attach behavior for a non-agent terminal.
+
+## Give an agent read-mostly access to the flock
+
+Point an MCP-capable agent at `flock mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, and — for Claude — fork a conversation or send/reply pane-to-pane messages. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table.
