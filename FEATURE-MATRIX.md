@@ -20,4 +20,4 @@ the full archive.
 | Config | Twelve-factor config: four layers, env convention, settings pane as shim, fleet-source write target (planned) | Shipped | ADR-0002 | #108, #112, docs/PRs |
 | Governance | guardrails gates, clippy print funnel, trace-field debt registry | Shipped | — | #21, #22, docs/DEBT.md |
 | Observability | JSONL logging spine, named-facade schema surface (raw trace-field debt census: 0) | Shipped | — | #87, docs/DEBT.md |
-| Fleet control | `agent.fork` + `flk agent fork`, durable event log, `flk lineage` ancestry | Shipped (Phase 1–2 of #175) | ADR-0005 | #175, #177 |
+| Fleet control | `agent.fork` + `flk agent fork`, durable event log, `flk lineage` ancestry, pane-to-pane messaging | Shipping (#175 phases) | ADR-0005, ADR-0006 | #175, #177, #183 |

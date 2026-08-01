@@ -16,6 +16,7 @@ pub(crate) mod float;
 mod ids;
 mod input;
 pub(crate) mod line_editor;
+pub(crate) mod mailboxes;
 mod peer_checkout;
 mod runtime;
 mod session;
@@ -120,6 +121,9 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    /// Pane-to-pane message queues (#175 M1), seeded from the durable
+    /// event log at construction.
+    pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -714,6 +718,12 @@ impl App {
             last_render_at: None,
             suppressed_repeat_keys: HashSet::new(),
             api_rx,
+            mailboxes: {
+                let mut mailboxes = crate::app::mailboxes::MailboxRegistry::default();
+                let restored = event_hub.persisted_events_after(0);
+                mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
+                mailboxes
+            },
             event_hub,
             last_focus,
             no_session,

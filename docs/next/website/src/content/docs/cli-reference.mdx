@@ -173,6 +173,9 @@ flock agent attach <target> [--takeover]
 flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
 flock agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
 flock lineage <target> [--json]
+flock msg send <target> <text...> [--repo NAME] [--correlation-id ID] [--reply-to ID]
+flock msg reply <correlation_id> <text...>
+flock msg list [--pane TARGET]
 ```
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
@@ -181,7 +184,7 @@ Agent targets can be terminal IDs, unique agent names, detected or reported agen
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
-`lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
+`msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
 
 ## Direct terminal attach
 

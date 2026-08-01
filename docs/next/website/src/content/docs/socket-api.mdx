@@ -75,6 +75,7 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.lineage` |
+| Message | `msg.send`, `msg.reply`, `msg.list` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
@@ -104,6 +105,12 @@ Remove a linked checkout:
 
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
+```
+
+`msg.send` queues a message for another pane's agent and delivers it at that pane's next settled turn boundary — never mid-turn, never to a blocked pane, and never into a pane whose agent is undetected (held instead). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, `message_not_found`, and `no_reply_address`.
+
+```json
+{"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1"}}
 ```
 
 `agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.

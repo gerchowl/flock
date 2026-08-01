@@ -76,6 +76,12 @@ pub enum Method {
     AgentFork(AgentForkParams),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
+    #[serde(rename = "msg.send")]
+    MsgSend(MsgSendParams),
+    #[serde(rename = "msg.reply")]
+    MsgReply(MsgReplyParams),
+    #[serde(rename = "msg.list")]
+    MsgList(MsgListParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -401,6 +407,66 @@ pub struct LineageNode {
     pub worktree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// Destination of a pane-to-pane message (#175 M1, ADR-0006). Structured on
+/// the wire: `:` is already load-bearing in pane ids, member labels, and
+/// agent-source labels, so no fourth string grammar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageTarget {
+    /// Bare pane: terminal id, public pane id, or unique agent name.
+    Pane { pane: String },
+    /// Repo-scoped pane: `repo` matches workspace worktree membership
+    /// (repo name); `pane` resolves within only those workspaces.
+    RepoPane { repo: String, pane: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgSendParams {
+    pub to: MessageTarget,
+    /// Sanitized like reported prompts: 16 KiB cap, control sequences
+    /// stripped.
+    pub body: String,
+    /// Client-supplied idempotency key. Minted server-side when omitted —
+    /// but then the sender loses at-least-once retry ergonomics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Correlation id of a prior message this one answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+}
+
+/// Reply to a delivered message: routed back to the original sender's pane,
+/// no addressing needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgReplyParams {
+    /// The original message's correlation id.
+    pub correlation_id: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_correlation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MsgListParams {
+    /// Restrict to one recipient pane (any bare-pane target shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessageInfo {
+    pub correlation_id: String,
+    pub to_pane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    pub enqueued_at_ms: u64,
+    pub delivery_attempts: u32,
+    /// Body preview, truncated for listing.
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -885,6 +951,9 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     AgentForked,
+    MessageQueued,
+    MessageDelivered,
+    MessageReplied,
 }
 
 impl EventKind {
@@ -911,7 +980,10 @@ impl EventKind {
             | Self::PaneExited
             | Self::PaneAgentDetected
             | Self::PaneAgentStatusChanged
-            | Self::AgentForked => true,
+            | Self::AgentForked
+            | Self::MessageQueued
+            | Self::MessageDelivered
+            | Self::MessageReplied => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1061,6 +1133,16 @@ pub enum ResponseResult {
     },
     Lineage {
         chain: Vec<LineageEdge>,
+    },
+    MsgQueued {
+        correlation_id: String,
+        /// "queued" | "duplicate"
+        state: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    MsgList {
+        messages: Vec<QueuedMessageInfo>,
     },
     PaneInfo {
         pane: PaneInfo,
@@ -1402,6 +1484,39 @@ pub enum EventData {
         custom_status: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+    },
+    /// Message telemetry (#175 O2 message-side, emitted with the verbs).
+    MessageQueued {
+        correlation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_pane: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_repo: Option<String>,
+        to_pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_repo: Option<String>,
+        cross_repo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<String>,
+        enqueued_at_ms: u64,
+        /// Sanitized body — the durable log doubles as the mailbox's
+        /// restart source, so the payload must survive here (ADR-0005/0006).
+        body: String,
+    },
+    MessageDelivered {
+        correlation_id: String,
+        delivered: bool,
+        /// "delivered" | "delivered_generic" | "dropped_undeliverable"
+        outcome: String,
+        delivery_attempts: u32,
+        latency_ms: u64,
+    },
+    MessageReplied {
+        /// The original message's correlation id.
+        correlation_id: String,
+        reply_correlation_id: String,
+        reply_latency_ms: u64,
+        round_trips: u32,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
