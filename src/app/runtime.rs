@@ -550,6 +550,14 @@ impl App {
             // heartbeat), so the runner ticks even in an otherwise quiet loop.
             self.checks_next_deadline,
             self.checks_heartbeat_deadline,
+            // #175 C4: issue-guard's own cadence — even in an otherwise
+            // quiet loop we must poll gh on schedule.
+            self.state
+                .config
+                .checks
+                .enable
+                .then_some(())
+                .and_then(|()| self.issue_guard.next_poll_deadline()),
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
@@ -652,6 +660,11 @@ impl App {
         // App-level hibernate seam; failures (no resume plan) emit
         // `CheckErrored` once per episode.
         changed |= self.evaluate_hibernation_check(now);
+        // #175 C4: owner-guarded issue triggers. Polls its own cadence off
+        // the checks tick; on the poll it shells out to `gh` per repo, then
+        // dispatches every owner-authored `flk-trigger` block that hasn't
+        // already fired.
+        changed |= self.poll_issue_guard(now);
 
         if self
             .checks_heartbeat_deadline
@@ -802,6 +815,12 @@ impl App {
         true
     }
 
+    pub(super) fn collect_blocked_alert_snapshots_public(
+        &self,
+    ) -> Vec<crate::checks::BlockedPaneSnapshot> {
+        self.collect_blocked_alert_snapshots()
+    }
+
     fn collect_blocked_alert_snapshots(&self) -> Vec<crate::checks::BlockedPaneSnapshot> {
         let mut out = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
@@ -896,6 +915,130 @@ impl App {
         out
     }
 
+    /// #175 C4: poll gh for open issues on the configured repos, evaluate
+    /// each body's `flk-trigger` block against the owner gate + dedupe, and
+    /// dispatch every `Fire` through the same Notify path script checks
+    /// use. On error, post a `gh issue comment` back on the issue.
+    pub(crate) fn poll_issue_guard(&mut self, now: Instant) -> bool {
+        let config = self.state.config.checks.issue_guard.clone();
+        if !config.enable {
+            return false;
+        }
+        if !self.issue_guard.poll_due(now) {
+            return false;
+        }
+        self.issue_guard.arm_next_poll(now, &config);
+        if config.repos.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for repo in &config.repos {
+            let issues = match fetch_open_issues(&config.gh_bin, repo) {
+                Ok(issues) => issues,
+                Err(err) => {
+                    // gh failure surfaces as a `CheckErrored` for the guard —
+                    // never a silent pass. The guard state persists across
+                    // ticks, so we retry on the next cadence.
+                    self.event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::CheckErrored,
+                        data: crate::api::schema::EventData::CheckErrored {
+                            name: crate::checks::ISSUE_GUARD_CHECK_NAME.to_string(),
+                            reason: format!("gh issue list on {repo} failed: {err}"),
+                        },
+                    });
+                    changed = true;
+                    continue;
+                }
+            };
+            for issue in issues {
+                match self.issue_guard.evaluate(repo, &issue, &config) {
+                    crate::checks::IssueGuardOutcome::NoTrigger => {}
+                    crate::checks::IssueGuardOutcome::Deduped { .. } => {}
+                    crate::checks::IssueGuardOutcome::Ignored { reason } => {
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerIgnored,
+                            data: crate::api::schema::EventData::TriggerIgnored {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                reason,
+                            },
+                        });
+                        changed = true;
+                    }
+                    crate::checks::IssueGuardOutcome::Errored { reason } => {
+                        // Best-effort comment-back so the owner sees the
+                        // trigger's failure on the issue itself; capture
+                        // any comment failure into the durable event's
+                        // reason so nothing goes silent.
+                        let comment_note =
+                            match post_error_comment(&config.gh_bin, repo, issue.number, &reason) {
+                                Ok(()) => String::new(),
+                                Err(err) => format!(" (gh comment failed: {err})"),
+                            };
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerErrored,
+                            data: crate::api::schema::EventData::TriggerErrored {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                reason: format!("{reason}{comment_note}"),
+                            },
+                        });
+                        changed = true;
+                    }
+                    crate::checks::IssueGuardOutcome::Fire { dedupe_key, block } => {
+                        let action_label = match &block.action {
+                            crate::checks::ActionSpec::Notify { .. } => "notify",
+                            crate::checks::ActionSpec::Event { .. } => "event",
+                        };
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerFired,
+                            data: crate::api::schema::EventData::TriggerFired {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                dedupe_key: dedupe_key.clone(),
+                                action: action_label.to_string(),
+                            },
+                        });
+                        self.dispatch_issue_guard_action(repo, issue.number, &block, &dedupe_key);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn dispatch_issue_guard_action(
+        &mut self,
+        repo: &str,
+        issue: u64,
+        block: &crate::checks::TriggerBlock,
+        dedupe_key: &str,
+    ) {
+        use crate::api::schema::NotificationShowParams;
+        if let crate::checks::ActionSpec::Notify { title, sound } = &block.action {
+            let title = if title.is_empty() {
+                format!("issue trigger: {repo}#{issue}")
+            } else {
+                title.clone()
+            };
+            let params = NotificationShowParams {
+                title,
+                body: Some(format!("{repo}#{issue} — {dedupe_key}")),
+                position: None,
+                sound: *sound,
+            };
+            let request_id = format!("trigger:{dedupe_key}");
+            let _ = self.handle_api_request_after_internal_events_drained(
+                crate::api::schema::Request {
+                    id: request_id,
+                    method: crate::api::schema::Method::NotificationShow(params),
+                },
+            );
+        }
+    }
+
     fn dispatch_blocked_alert_notify(&mut self, fire: &crate::checks::BlockedAlertFire) {
         use crate::api::schema::{NotificationShowParams, NotificationShowSound};
         let duration = crate::checks::format_blocked_duration(fire.duration_secs);
@@ -916,6 +1059,64 @@ impl App {
                 method: crate::api::schema::Method::NotificationShow(params),
             });
     }
+}
+
+/// Argv-form `gh issue list --repo <repo> --state open --json body,author,number,updatedAt`.
+/// Returns the parsed issues; every error path is a `Result::Err` so the
+/// caller can surface a `CheckErrored` instead of silently passing.
+fn fetch_open_issues(gh_bin: &str, repo: &str) -> Result<Vec<crate::checks::GhIssue>, String> {
+    let output = crate::process::TracedCommand::new(gh_bin, "checks")
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "body,author,number,updatedAt",
+            "--limit",
+            "50",
+        ])
+        .output_traced()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let issues: Vec<crate::checks::GhIssue> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("gh JSON parse failed: {err}"))?;
+    Ok(issues)
+}
+
+fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Result<(), String> {
+    let body = format!(
+        "flock issue-guard could not parse the `flk-trigger` block: {reason}\n\n\
+         Fix the block or remove it — no trigger will fire until it is valid."
+    );
+    let output = crate::process::TracedCommand::new(gh_bin, "checks")
+        .args([
+            "issue",
+            "comment",
+            &issue.to_string(),
+            "--repo",
+            repo,
+            "--body",
+            &body,
+        ])
+        .output_traced()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh comment exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn deduplicate_git_refresh_items(

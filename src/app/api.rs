@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+mod checks;
 mod integrations;
 mod lineage;
 mod messages;
@@ -953,6 +954,9 @@ impl App {
             Method::IntegrationUninstall(params) => {
                 return self.handle_integration_uninstall(request.id, params);
             }
+            Method::ChecksList(_) => return self.handle_checks_list(request.id),
+            Method::ChecksAck(target) => return self.handle_checks_ack(request.id, target),
+            Method::ChecksRun(target) => return self.handle_checks_run(request.id, target),
             _ => {
                 return responses::encode_error(
                     request.id,

@@ -8,6 +8,7 @@
 pub(crate) mod blocked_alert;
 pub(crate) mod config;
 pub(crate) mod hibernation;
+pub(crate) mod issue_guard;
 pub(crate) mod runner;
 pub(crate) mod script;
 
@@ -17,5 +18,8 @@ pub(crate) use blocked_alert::{
 };
 pub(crate) use config::{ActionSpec, ChecksConfig};
 pub(crate) use hibernation::{HibernationFold, HibernationPaneSnapshot, HIBERNATION_CHECK_NAME};
+pub(crate) use issue_guard::{
+    GhIssue, IssueGuardFold, IssueGuardOutcome, TriggerBlock, ISSUE_GUARD_CHECK_NAME,
+};
 pub(crate) use runner::CheckRunner;
 pub(crate) use script::{run_script, Outcome};

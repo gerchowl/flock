@@ -162,6 +162,10 @@ pub struct App {
     /// Built-in idle-hibernation check (#175 C3). Selects candidates and
     /// dispatches through `App::hibernate_pane`; disabled by default.
     pub(crate) hibernation_check: crate::checks::HibernationFold,
+    /// Built-in owner-guarded issue-trigger poller (#175 C4). Runs its own
+    /// cadence off the checks tick; dedupe set survives restarts by
+    /// seeding from the durable `TriggerFired` events at construction.
+    pub(crate) issue_guard: crate::checks::IssueGuardFold,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -737,6 +741,22 @@ impl App {
             checks_error_count: 0,
             blocked_alert: crate::checks::BlockedAlertFold::new(),
             hibernation_check: crate::checks::HibernationFold::new(),
+            issue_guard: {
+                // Seed the dedupe set from durable `TriggerFired` events —
+                // same pattern as the mailbox registry above so a restart
+                // never re-dispatches an issue trigger.
+                let mut guard = crate::checks::IssueGuardFold::new();
+                let seeded_keys = event_hub.persisted_events_after(0).into_iter().filter_map(
+                    |(_, _, envelope)| match envelope.data {
+                        crate::api::schema::EventData::TriggerFired { dedupe_key, .. } => {
+                            Some(dedupe_key)
+                        }
+                        _ => None,
+                    },
+                );
+                guard.seed_from_fired_keys(seeded_keys);
+                guard
+            },
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,

@@ -68,6 +68,17 @@ pub(crate) struct FireDecision {
     pub action: ActionSpec,
 }
 
+/// One row in `CheckRunner::list_entries` — a coarse read-out of one
+/// script check's runtime shape for `flk checks list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckListEntry {
+    pub name: String,
+    pub consecutive_fails: u32,
+    pub last_outcome: Option<&'static str>,
+    pub fired_this_episode: bool,
+    pub acked: bool,
+}
+
 /// One check ready to run (returned by `next_runnable`). The App spawns the
 /// executor with this data; the runner marks it in-flight so nothing else
 /// re-dispatches while the work is out.
@@ -241,13 +252,7 @@ impl CheckRunner {
 
     /// Suppress fires from `name` until `now + interval_secs`. The check
     /// keeps running (so a Pass resets the streak); fires just don't emit.
-    /// The interactive `ack` path — a UI action / API verb — lands in a
-    /// later phase-4 commit; kept here so the runner's public surface
-    /// doesn't reshape when it does.
-    #[allow(
-        dead_code,
-        reason = "consumed by the interactive ack path in a later phase 4 commit"
-    )]
+    /// Consumed by `flk checks ack`.
     pub(crate) fn ack(&mut self, name: &str, now: Instant) -> bool {
         let Some(script) = self.scripts.get(name) else {
             return false;
@@ -264,6 +269,38 @@ impl CheckRunner {
     #[cfg(test)]
     pub(crate) fn state_for(&self, name: &str) -> Option<&CheckRuntimeState> {
         self.state.get(name)
+    }
+
+    /// Force a check to be due right now. Consumed by `flk checks run`.
+    pub(crate) fn force_run_now(&mut self, name: &str, now: Instant) -> bool {
+        if let Some(state) = self.state.get_mut(name) {
+            state.next_due = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Enumerate every enrolled script check with a coarse
+    /// (last_outcome, consecutive_fails) view for `flk checks list`.
+    pub(crate) fn list_entries(&self) -> Vec<CheckListEntry> {
+        let mut out: Vec<CheckListEntry> = self
+            .state
+            .iter()
+            .map(|(name, state)| CheckListEntry {
+                name: name.clone(),
+                consecutive_fails: state.consecutive_fails,
+                last_outcome: state.last_outcome.as_ref().map(|outcome| match outcome {
+                    Outcome::Fire => "fire",
+                    Outcome::Pass => "pass",
+                    Outcome::Error(_) => "error",
+                }),
+                fired_this_episode: state.fired_this_episode,
+                acked: state.ack_until.is_some(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     #[cfg(test)]

@@ -460,6 +460,49 @@ When enabled, Flock switches input sources only after prefix mode is entered, th
 
 You can also toggle it from Settings > Experiments > switch to ascii input source in prefix (macOS).
 
+## Checks
+
+The `[checks]` section configures the per-host check runner (#175). Every knob has a sane default, so an unset section still runs the built-ins the way most operators expect.
+
+```toml
+[checks]
+enable = true            # master switch — off disables ALL check work
+max_concurrent = 4       # cap on in-flight script check runs
+min_tick_secs = 10       # minimum scheduler wake; refuses smaller per-script intervals
+heartbeat_secs = 60      # cadence for the durable ChecksHeartbeat event
+
+[checks.blocked_alert]
+enable = true
+threshold_secs = 1800    # 30m before a Blocked pane triggers a notification
+
+[checks.hibernation]
+enable = false           # opt-in — off by default
+idle_threshold_secs = 3600
+done_threshold_secs = 21600
+min_secs_since_last_stop = 60
+
+[checks.issue_guard]
+enable = true
+owner = "gerchowl"       # only bodies from this GitHub login can trigger
+repos = ["gerchowl/flock"]
+gh_bin = "gh"
+poll_secs = 60
+
+# One or more user-declared script checks.
+# [[checks.script]]
+# name = "disk-space"
+# program = "/usr/local/bin/free-disk.sh"   # absolute or under ~/.flock/checks/
+# args = ["--min", "10G"]
+# interval_secs = 300
+# timeout_secs = 20
+# debounce = 3
+# [checks.script.on_fire.notify]
+# title = "disk low"
+# sound = "request"
+```
+
+Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
+
 ## Environment variables
 
 | Variable | Purpose |
