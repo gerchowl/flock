@@ -383,6 +383,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::FleetPause(_) => "fleet.pause",
         Method::FleetResume(_) => "fleet.resume",
         Method::FleetStatus(_) => "fleet.status",
+        Method::RevertRun(_) => "revert.run",
     }
 }
 

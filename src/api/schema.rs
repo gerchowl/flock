@@ -165,6 +165,23 @@ pub enum Method {
     /// #175 S3 commit 3: read the persisted pause switch.
     #[serde(rename = "fleet.status")]
     FleetStatus(EmptyParams),
+    /// #175 S3 commit 4 (ops): trailer-scan every repo flock knows about
+    /// and revert commits carrying `Agent-Run: <run_id>`. Reverts land on
+    /// a fresh `revert/<run-id>` branch — never on `main`.
+    #[serde(rename = "revert.run")]
+    RevertRun(RevertRunParams),
+}
+
+/// `revert.run` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertRunParams {
+    /// The run id to revert. Matched against `^Agent-Run: <run_id>$` in
+    /// commit message trailers.
+    pub run_id: String,
+    /// When true, list matches and the branches that would be created
+    /// but write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// `fleet.pause` params.

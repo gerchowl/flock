@@ -83,6 +83,27 @@ const QODERCLI_INTEGRATION_VERSION: u32 = 1;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
 const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
+// #175 S3 commit 4 (ops): per-worktree `prepare-commit-msg` hook that
+// appends `Agent-Run: <FLOCK_RUN_ID>` when the environment carries a run
+// id. Installation is OPT-IN via `[checks] run_trailers = true` — never
+// silently written into a user repo — and always target-specific (an
+// exact worktree path, not "every git repo on disk").
+pub(crate) const RUN_TRAILER_HOOK_NAME: &str = "prepare-commit-msg";
+pub(crate) const RUN_TRAILER_ASSET: &str = include_str!("assets/run_trailer/prepare-commit-msg");
+// Consumed only by the status probe + tests today; the fork installer
+// keys on the marker STRING, not the number. Kept public so a future
+// `flk integration` uninstall / status surface has a stable hook.
+#[allow(
+    dead_code,
+    reason = "reserved for `flk integration` uninstall / status surfaces"
+)]
+pub(crate) const RUN_TRAILER_INTEGRATION_VERSION: u32 = 1;
+/// Environment variable read by the prepare-commit-msg hook AND stamped
+/// on scheduler-spawned / forked panes so a commit made inside such a
+/// pane carries `Agent-Run: <FLOCK_RUN_ID>`. Kept here (not in the
+/// crate root) so both sides of the trailer story import the same name.
+pub(crate) const FLOCK_RUN_ID_ENV_VAR: &str = "FLOCK_RUN_ID";
+
 #[derive(Debug)]
 pub(crate) struct ClaudeInstallPaths {
     pub hook_path: PathBuf,
@@ -250,6 +271,34 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     if let Ok(exe) = std::env::current_exe() {
         cmd.env(FLOCK_BIN_ENV_VAR, exe);
     }
+    // #175 S3 commit 4 (ops): consume the one-shot FLOCK_RUN_ID set by
+    // the caller right before spawn. Thread-local because pane spawn is
+    // synchronous from the App thread; a global slot would race with
+    // concurrent forks.
+    if let Some(run_id) = take_pending_run_id() {
+        cmd.env(FLOCK_RUN_ID_ENV_VAR, run_id);
+    }
+}
+
+thread_local! {
+    /// One-shot slot for the run_id that the *next* pane-spawn should
+    /// inherit. Set immediately before `Workspace::new_argv_command`;
+    /// cleared inside [`apply_pane_env`]. If nothing consumes it (the
+    /// spawn failed before env application), the value stays until the
+    /// next spawn takes it — that's a benign leak of one string.
+    static PENDING_RUN_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the run_id the *next* pane spawn on this thread should inherit as
+/// `FLOCK_RUN_ID`. Consumed exactly once by [`apply_pane_env`].
+pub(crate) fn set_pending_run_id(run_id: String) {
+    PENDING_RUN_ID.with(|slot| *slot.borrow_mut() = Some(run_id));
+}
+
+/// Take the pending run_id, if any.
+fn take_pending_run_id() -> Option<String> {
+    PENDING_RUN_ID.with(|slot| slot.borrow_mut().take())
 }
 
 pub(crate) fn install_target(
@@ -2579,6 +2628,188 @@ fn home_dir() -> io::Result<PathBuf> {
         .map_err(|_| io::Error::other("HOME is not set; cannot locate home directory"))
 }
 
+/// #175 S3 commit 4 (ops): install the `prepare-commit-msg` trailer hook
+/// into `<worktree>/.git/hooks/prepare-commit-msg`. Idempotent.
+///
+/// SAFETY / trust model: this function is called exclusively from the
+/// scheduler-spawned path (fork children when `[checks] run_trailers =
+/// true`), never automatically from a user checkout. See
+/// `install_run_trailer_at`'s only caller in the App.
+///
+/// Existing hooks are handled carefully:
+/// - A hook we previously installed (same version marker) is overwritten
+///   in place.
+/// - A hook we installed at a stale version is upgraded.
+/// - A hook that does NOT bear our marker is left alone and the function
+///   returns `RunTrailerInstall::Skipped`. We never clobber a user's
+///   commit-msg hook.
+pub(crate) fn install_run_trailer_at(worktree_root: &Path) -> io::Result<RunTrailerInstall> {
+    let hook_path = worktree_root
+        .join(".git")
+        .join("hooks")
+        .join(RUN_TRAILER_HOOK_NAME);
+    if let Some(parent) = hook_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if hook_path.exists() {
+        let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+        if !existing.contains(INTEGRATION_VERSION_MARKER)
+            || !existing.contains("FLOCK_INTEGRATION_ID=run_trailer")
+        {
+            return Ok(RunTrailerInstall {
+                hook_path,
+                state: RunTrailerInstallState::SkippedUserHook,
+            });
+        }
+    }
+    fs::write(&hook_path, RUN_TRAILER_ASSET)?;
+    // 0o755 so git can execute it. Silently ignored on Windows (which
+    // flock doesn't target — this crate is unix-only for pty/hooks).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+    Ok(RunTrailerInstall {
+        hook_path,
+        state: RunTrailerInstallState::Installed,
+    })
+}
+
+/// Complement to [`install_run_trailer_at`]: remove the hook we installed
+/// (identified by the version marker), leaving user-authored hooks alone.
+#[allow(
+    dead_code,
+    reason = "reserved for `flk integration uninstall run_trailer` (future S1 surface); exercised by unit tests"
+)]
+pub(crate) fn uninstall_run_trailer_at(worktree_root: &Path) -> io::Result<RunTrailerUninstall> {
+    let hook_path = worktree_root
+        .join(".git")
+        .join("hooks")
+        .join(RUN_TRAILER_HOOK_NAME);
+    if !hook_path.exists() {
+        return Ok(RunTrailerUninstall {
+            hook_path,
+            removed: false,
+        });
+    }
+    let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+    if !existing.contains(INTEGRATION_VERSION_MARKER)
+        || !existing.contains("FLOCK_INTEGRATION_ID=run_trailer")
+    {
+        return Ok(RunTrailerUninstall {
+            hook_path,
+            removed: false,
+        });
+    }
+    fs::remove_file(&hook_path)?;
+    Ok(RunTrailerUninstall {
+        hook_path,
+        removed: true,
+    })
+}
+
+/// Cheap read for callers that want to know whether the hook is present
+/// and up-to-date before deciding to install. Consumed by the App's
+/// fork-installer to skip re-writes.
+#[allow(
+    dead_code,
+    reason = "reserved for `flk integration status` surface; exercised by unit tests"
+)]
+pub(crate) fn run_trailer_status_at(worktree_root: &Path) -> RunTrailerStatus {
+    let hook_path = worktree_root
+        .join(".git")
+        .join("hooks")
+        .join(RUN_TRAILER_HOOK_NAME);
+    if !hook_path.exists() {
+        return RunTrailerStatus {
+            hook_path,
+            kind: IntegrationStatusKind::NotInstalled,
+            installed_version: None,
+        };
+    }
+    let Ok(existing) = fs::read_to_string(&hook_path) else {
+        return RunTrailerStatus {
+            hook_path,
+            kind: IntegrationStatusKind::NotInstalled,
+            installed_version: None,
+        };
+    };
+    if !existing.contains("FLOCK_INTEGRATION_ID=run_trailer") {
+        // Someone else's hook — treat as absent from our POV.
+        return RunTrailerStatus {
+            hook_path,
+            kind: IntegrationStatusKind::NotInstalled,
+            installed_version: None,
+        };
+    }
+    let installed_version = parse_installed_version(&existing);
+    let kind = if installed_version == Some(RUN_TRAILER_INTEGRATION_VERSION) {
+        IntegrationStatusKind::Current
+    } else {
+        IntegrationStatusKind::Outdated
+    };
+    RunTrailerStatus {
+        hook_path,
+        kind,
+        installed_version,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by run_trailer_status_at; that helper is opt-in surface reserved for a future subcommand"
+)]
+fn parse_installed_version(content: &str) -> Option<u32> {
+    content
+        .lines()
+        .find_map(|line| {
+            line.trim_start_matches('#')
+                .trim()
+                .strip_prefix(INTEGRATION_VERSION_MARKER)
+        })
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunTrailerInstall {
+    pub hook_path: PathBuf,
+    pub state: RunTrailerInstallState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunTrailerInstallState {
+    Installed,
+    /// A non-flock prepare-commit-msg hook is present; we did NOT
+    /// overwrite it. Caller may log and continue.
+    SkippedUserHook,
+}
+
+#[allow(
+    dead_code,
+    reason = "returned by uninstall_run_trailer_at (opt-in future surface); exercised by tests"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunTrailerUninstall {
+    pub hook_path: PathBuf,
+    /// True when we removed our marker-bearing hook; false when it was
+    /// absent, or belonged to the user.
+    pub removed: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "returned by run_trailer_status_at (opt-in future surface); exercised by tests"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunTrailerStatus {
+    pub hook_path: PathBuf,
+    pub kind: IntegrationStatusKind,
+    pub installed_version: Option<u32>,
+}
+
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4522,5 +4753,82 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    // #175 S3 commit 4 (ops): trailer hook installer respects a
+    // user-authored prepare-commit-msg (never clobbers) and is
+    // idempotent for its own installs.
+    fn trailer_worktree() -> PathBuf {
+        let base = unique_base();
+        fs::create_dir_all(base.join(".git/hooks")).unwrap();
+        base
+    }
+
+    #[test]
+    fn run_trailer_installs_into_fresh_worktree() {
+        let root = trailer_worktree();
+        let outcome = install_run_trailer_at(&root).unwrap();
+        assert_eq!(outcome.state, RunTrailerInstallState::Installed);
+        assert!(outcome.hook_path.exists());
+        let contents = fs::read_to_string(&outcome.hook_path).unwrap();
+        assert!(contents.contains("FLOCK_INTEGRATION_ID=run_trailer"));
+        assert!(contents.contains("Agent-Run: %s"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_trailer_refuses_to_overwrite_user_hook() {
+        let root = trailer_worktree();
+        let hook_path = root.join(".git/hooks/prepare-commit-msg");
+        fs::write(&hook_path, "#!/bin/sh\n# my custom hook\n").unwrap();
+        let outcome = install_run_trailer_at(&root).unwrap();
+        assert_eq!(outcome.state, RunTrailerInstallState::SkippedUserHook);
+        let contents = fs::read_to_string(&hook_path).unwrap();
+        assert!(
+            contents.contains("my custom hook"),
+            "user hook survived intact"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_trailer_uninstall_only_removes_our_marker_hook() {
+        let root = trailer_worktree();
+        let hook_path = root.join(".git/hooks/prepare-commit-msg");
+        // User hook — must not be removed.
+        fs::write(&hook_path, "#!/bin/sh\n# custom\n").unwrap();
+        let outcome = uninstall_run_trailer_at(&root).unwrap();
+        assert!(!outcome.removed, "user hook must not be removed");
+        assert!(hook_path.exists(), "user hook still on disk");
+        // Now install ours and un-install — that one goes.
+        fs::remove_file(&hook_path).unwrap();
+        let _ = install_run_trailer_at(&root).unwrap();
+        let outcome = uninstall_run_trailer_at(&root).unwrap();
+        assert!(outcome.removed);
+        assert!(!hook_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_trailer_status_reads_version_and_current_state() {
+        let root = trailer_worktree();
+        assert_eq!(
+            run_trailer_status_at(&root).kind,
+            IntegrationStatusKind::NotInstalled
+        );
+        let _ = install_run_trailer_at(&root).unwrap();
+        let status = run_trailer_status_at(&root);
+        assert_eq!(status.kind, IntegrationStatusKind::Current);
+        assert_eq!(
+            status.installed_version,
+            Some(RUN_TRAILER_INTEGRATION_VERSION)
+        );
+        // A user hook flips status back to NotInstalled from our POV.
+        fs::write(status.hook_path, "#!/bin/sh\n# user\n").unwrap();
+        assert_eq!(
+            run_trailer_status_at(&root).kind,
+            IntegrationStatusKind::NotInstalled
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

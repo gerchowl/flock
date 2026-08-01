@@ -23,6 +23,28 @@ impl ApiFailure {
     }
 }
 
+/// #175 S3 commit 4 (ops): mint a unique run_id for an `agent.fork`
+/// child. Format: `fork:<unix_us>-<pid>-<counter>` — cheap, monotonic
+/// within a process, and never colliding across a restart because unix
+/// micros + a fresh pid + a fresh counter never re-hit the same tuple.
+/// Callers stamp this on the child's env and reuse it for the
+/// `AgentForked.run_id` field so the two agree.
+///
+/// EXTENSION POINT: when a scheduler-spawned path lands (S1 `SpawnAgent`
+/// action), reuse this function to mint the run_id there too — the
+/// trailer hook already keys on `FLOCK_RUN_ID`, so the same env stamp
+/// makes those commits revertable by `flk revert-run`.
+fn generated_fork_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    format!("fork:{micros:x}-{}-{count}", std::process::id())
+}
+
 fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
     let path = crate::worktree::expand_tilde_path(path);
     if path.is_absolute() {
@@ -297,6 +319,44 @@ impl App {
         let seeded = plan.argv.len() > argv_len_before;
 
         let (rows, cols) = self.state.estimate_pane_size();
+        // #175 S3 commit 4 (ops): compute the run_id BEFORE spawn so we
+        // can stamp it as FLOCK_RUN_ID in the child's environment via
+        // `integration::set_pending_run_id` (thread-local one-shot,
+        // consumed inside `apply_pane_env`). The event we emit below
+        // reuses the same value so an operator can join `agent.lineage`
+        // → `flk revert-run` off a single id.
+        //
+        // Uniqueness: process id + monotonic counter + wallclock micros.
+        // The old `fork:<child terminal id>` shape was equally unstable
+        // across restarts, and both remain audit-tokens, not addresses.
+        let run_id = generated_fork_run_id();
+        // Install the trailer hook when opt-in configuration says so
+        // (`[checks] run_trailers = true`) — never silently write into a
+        // user repo. Failures are non-fatal: the trailer is a
+        // convenience, not a correctness invariant.
+        if self.state.config.checks.run_trailers {
+            let outcome = crate::integration::install_run_trailer_at(&checkout_path);
+            match outcome {
+                Ok(crate::integration::RunTrailerInstall { state, hook_path }) => match state {
+                    crate::integration::RunTrailerInstallState::Installed => {
+                        crate::logging::event_log_write_failed(&format!(
+                            "run-trailer hook installed at {} (run_trailers=true)",
+                            hook_path.display()
+                        ));
+                    }
+                    crate::integration::RunTrailerInstallState::SkippedUserHook => {
+                        crate::logging::event_log_write_failed(&format!(
+                            "run-trailer hook not installed at {}: user-authored prepare-commit-msg present",
+                            hook_path.display()
+                        ));
+                    }
+                },
+                Err(err) => crate::logging::event_log_write_failed(&format!(
+                    "run-trailer hook install failed: {err}"
+                )),
+            }
+        }
+        crate::integration::set_pending_run_id(run_id.clone());
         let ws_idx = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,
@@ -368,9 +428,10 @@ impl App {
                 "forked workspace is missing its root pane",
             );
         };
-        // Unique by construction: the child's terminal id is unique per
-        // server run, and one fork creates exactly one child terminal.
-        let run_id = format!("fork:{}", root_pane.terminal_id);
+        // NOTE: `run_id` was minted before spawn so we could stamp
+        // FLOCK_RUN_ID in the child env (S3 commit 4). The event below
+        // reuses that same value so `agent.lineage` and `flk revert-run
+        // <id>` join on a single token.
         let info_source = WorktreeSource {
             workspace_idx: None,
             source_checkout_path: space.repo_root.clone(),
@@ -1917,7 +1978,13 @@ mod tests {
             ]
         );
         assert!(seeded);
-        assert_eq!(run_id, format!("fork:{}", root_pane.terminal_id));
+        // #175 S3 commit 4: run_id is now pre-computed (so it can stamp
+        // FLOCK_RUN_ID in the child env before spawn), no longer derived
+        // from the terminal id. Assert the shape instead.
+        assert!(
+            run_id.starts_with("fork:"),
+            "run_id has the fork: prefix: {run_id}"
+        );
         let expected_parent = app.state.workspaces[0]
             .focused_pane_id()
             .and_then(|pane_id| app.public_pane_id(0, pane_id))

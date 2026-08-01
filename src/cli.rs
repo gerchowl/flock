@@ -25,6 +25,7 @@ mod msg;
 mod notification;
 mod pane;
 mod peers;
+mod revert;
 mod server;
 mod status;
 mod tab;
@@ -68,6 +69,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
+        "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),

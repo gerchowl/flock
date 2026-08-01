@@ -11,6 +11,7 @@ mod messages;
 mod panes;
 pub(crate) mod peers;
 mod responses;
+mod revert;
 mod tabs;
 mod workspaces;
 mod worktrees;
@@ -963,6 +964,7 @@ impl App {
             Method::FleetPause(params) => return self.handle_fleet_pause(request.id, params),
             Method::FleetResume(_) => return self.handle_fleet_resume(request.id),
             Method::FleetStatus(_) => return self.handle_fleet_status(request.id),
+            Method::RevertRun(params) => return self.handle_revert_run(request.id, params),
             _ => {
                 return responses::encode_error(
                     request.id,
