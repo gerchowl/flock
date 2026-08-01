@@ -647,6 +647,11 @@ impl App {
         // (walks live pane details), returns fires the App dispatches through
         // the same Notify/CheckFired path as script checks.
         changed |= self.evaluate_blocked_alert(now);
+        // #175 C3: built-in idle-hibernation fold. Selects panes past the
+        // configured threshold and dispatches each candidate through the
+        // App-level hibernate seam; failures (no resume plan) emit
+        // `CheckErrored` once per episode.
+        changed |= self.evaluate_hibernation_check(now);
 
         if self
             .checks_heartbeat_deadline
@@ -811,6 +816,80 @@ impl App {
                     label: detail.label,
                     status,
                     state_changed_at: detail.state_changed_at,
+                });
+            }
+        }
+        out
+    }
+
+    /// Run the built-in idle-hibernation fold and dispatch each candidate
+    /// through `App::hibernate_pane`. Failures (no resume plan, etc.) emit
+    /// a durable `CheckErrored` and mark the pane's episode as errored so
+    /// the fold does NOT retry it hot.
+    pub(crate) fn evaluate_hibernation_check(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.hibernation.enable {
+            return false;
+        }
+        let snapshots = self.collect_hibernation_snapshots();
+        self.hibernation_check
+            .evict_missing_panes(snapshots.iter().map(|s| s.pane_id));
+        let config = self.state.config.checks.hibernation;
+        let candidates = self.hibernation_check.evaluate(now, &config, &snapshots);
+        if candidates.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for candidate in candidates {
+            let ws_idx = match self.find_pane(candidate.pane_id) {
+                Some((ws_idx, _)) => ws_idx,
+                None => continue,
+            };
+            match self.hibernate_pane(ws_idx, candidate.pane_id) {
+                Ok(_) => {
+                    changed = true;
+                }
+                Err(err) => {
+                    // Mark the episode errored so we don't retry hot on the
+                    // very next tick — the next state change on the pane
+                    // resets the guard.
+                    self.hibernation_check
+                        .mark_errored(candidate.pane_id, candidate.state_changed_at);
+                    self.event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::CheckErrored,
+                        data: crate::api::schema::EventData::CheckErrored {
+                            name: crate::checks::HIBERNATION_CHECK_NAME.to_string(),
+                            reason: format!(
+                                "pane_id={} {}",
+                                candidate.pane_id.raw(),
+                                err.message()
+                            ),
+                        },
+                    });
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn collect_hibernation_snapshots(&self) -> Vec<crate::checks::HibernationPaneSnapshot> {
+        let mut out = Vec::new();
+        for ws in &self.state.workspaces {
+            for detail in ws.pane_details(&self.state.terminals) {
+                let pane_state = ws.pane_state(detail.pane_id);
+                let terminal =
+                    pane_state.and_then(|p| self.state.terminals.get(&p.attached_terminal_id));
+                let already_hibernated =
+                    terminal.is_some_and(|t| t.hibernated_resume_plan.is_some());
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal.expect("terminal for live pane"),
+                    detail.seen,
+                );
+                out.push(crate::checks::HibernationPaneSnapshot {
+                    pane_id: detail.pane_id,
+                    status,
+                    state_changed_at: detail.state_changed_at,
+                    already_hibernated,
                 });
             }
         }

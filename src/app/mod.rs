@@ -159,6 +159,9 @@ pub struct App {
     /// Built-in blocked-alert check (#175 C2). Runs from the same checks tick
     /// as script checks; fires once per Blocked episode per pane.
     pub(crate) blocked_alert: crate::checks::BlockedAlertFold,
+    /// Built-in idle-hibernation check (#175 C3). Selects candidates and
+    /// dispatches through `App::hibernate_pane`; disabled by default.
+    pub(crate) hibernation_check: crate::checks::HibernationFold,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -733,6 +736,7 @@ impl App {
             checks_run_count: 0,
             checks_error_count: 0,
             blocked_alert: crate::checks::BlockedAlertFold::new(),
+            hibernation_check: crate::checks::HibernationFold::new(),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,

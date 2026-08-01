@@ -7,6 +7,7 @@
 
 pub(crate) mod blocked_alert;
 pub(crate) mod config;
+pub(crate) mod hibernation;
 pub(crate) mod runner;
 pub(crate) mod script;
 
@@ -15,5 +16,6 @@ pub(crate) use blocked_alert::{
     BLOCKED_ALERT_CHECK_NAME,
 };
 pub(crate) use config::{ActionSpec, ChecksConfig};
+pub(crate) use hibernation::{HibernationFold, HibernationPaneSnapshot, HIBERNATION_CHECK_NAME};
 pub(crate) use runner::CheckRunner;
 pub(crate) use script::{run_script, Outcome};
