@@ -1819,6 +1819,11 @@ pub struct AppState {
     /// Transient feedback for a rejected/era action (rendered verbatim,
     /// auto-expires) — unlike config_diagnostic, which is for config problems.
     pub action_notice: Option<String>,
+    /// #175 S3 commit 3 (US-9): sidebar banner when the fleet is paused,
+    /// synced by the App from the persistent `fleet_pause` state so the
+    /// pure render (`ui::sidebar::render_sidebar`) never needs to reach
+    /// past `AppState`. `None` when running normally.
+    pub fleet_paused_banner: Option<String>,
     /// Sidebar display aliases for agent labels ([ui] agent_aliases).
     pub agent_aliases: std::collections::HashMap<String, String>,
     /// Auto-adopt external linked worktrees into managed groups.
@@ -2605,6 +2610,7 @@ impl AppState {
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             action_notice: None,
+            fleet_paused_banner: None,
             agent_aliases: std::collections::HashMap::new(),
             adopt_external_worktrees: true,
             branch_pivot_message: String::new(),

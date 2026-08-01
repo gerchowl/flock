@@ -3,12 +3,15 @@ use std::time::{Duration, Instant};
 
 mod agents;
 mod checks;
+mod digest;
+mod fleet;
 mod integrations;
 mod lineage;
 mod messages;
 mod panes;
 pub(crate) mod peers;
 mod responses;
+mod revert;
 mod tabs;
 mod workspaces;
 mod worktrees;
@@ -957,6 +960,11 @@ impl App {
             Method::ChecksList(_) => return self.handle_checks_list(request.id),
             Method::ChecksAck(target) => return self.handle_checks_ack(request.id, target),
             Method::ChecksRun(target) => return self.handle_checks_run(request.id, target),
+            Method::DigestRender(params) => return self.handle_digest_render(request.id, params),
+            Method::FleetPause(params) => return self.handle_fleet_pause(request.id, params),
+            Method::FleetResume(_) => return self.handle_fleet_resume(request.id),
+            Method::FleetStatus(_) => return self.handle_fleet_status(request.id),
+            Method::RevertRun(params) => return self.handle_revert_run(request.id, params),
             _ => {
                 return responses::encode_error(
                     request.id,

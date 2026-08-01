@@ -8,6 +8,7 @@ pub(crate) mod actions;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) mod fleet_pause;
 pub(crate) mod hibernation;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 mod api_helpers;
@@ -173,6 +174,12 @@ pub struct App {
     /// Instant the reap tick last ran — folds the reap's own cadence
     /// (`[checks.reap] cadence_secs`) on top of the checks tick.
     pub(crate) reap_next_deadline: Option<Instant>,
+    /// #175 S3 commit 3 (US-9): fleet-wide pause switch. Persisted to
+    /// `session::data_dir()/pause.json` and re-read at boot, so a paused
+    /// fleet survives a `flk server stop && flk server start`. Gates
+    /// `dispatch_due_script_checks` and `deliver_due_messages` — human
+    /// keystrokes and human-invoked CLI verbs are deliberately UN-gated.
+    pub(crate) fleet_pause: fleet_pause::FleetPauseState,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -520,6 +527,10 @@ impl App {
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             action_notice: None,
+            // Seeded below (`fleet_pause` field default), but the AppState
+            // struct is constructed first so keep this None here — the
+            // App constructor syncs it right after both are in place.
+            fleet_paused_banner: None,
             agent_aliases: config.ui.agent_aliases.clone(),
             adopt_external_worktrees: config.worktrees.adopt_external,
             branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
@@ -709,7 +720,7 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
-        Self {
+        let mut this = Self {
             config_diagnostic_deadline: None,
             action_notice_deadline: None,
             toast_deadline: None,
@@ -768,6 +779,7 @@ impl App {
             reap_next_deadline: (config.checks.enable && config.checks.reap.enable).then(|| {
                 Instant::now() + Duration::from_secs(config.checks.reap.cadence_secs.max(1))
             }),
+            fleet_pause: fleet_pause::FleetPauseState::load_from(&fleet_pause::default_pause_path()),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
@@ -796,7 +808,29 @@ impl App {
             gossip_poll_interval_secs,
             peer_poll_tracker: crate::peers::PeerPollTracker::new(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
-        }
+        };
+        // Sync the render-facing pause banner from the persisted state so
+        // a paused fleet renders the banner immediately on restart.
+        Self::sync_fleet_pause_banner(&this.fleet_pause, &mut this.state);
+        this
+    }
+
+    /// Render-side projection helper: turn a `FleetPauseState` into the
+    /// human string the sidebar banner shows. Public inside the crate so
+    /// `api/fleet.rs` calls it every time it flips the switch.
+    pub(crate) fn sync_fleet_pause_banner(
+        pause: &fleet_pause::FleetPauseState,
+        state: &mut crate::app::state::AppState,
+    ) {
+        state.fleet_paused_banner = if pause.paused {
+            Some(if pause.reason.is_empty() {
+                "fleet paused".to_string()
+            } else {
+                format!("fleet paused — {}", pause.reason)
+            })
+        } else {
+            None
+        };
     }
 
     #[cfg(unix)]

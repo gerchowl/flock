@@ -33,7 +33,13 @@ mod checksum;
 mod cli;
 mod client;
 mod config;
+// #175 phase 5 / S3 commit 1: per-agent spend accountant folded from the
+// durable event log. Consumed by the digest render (commit 2); imported
+// here so `just test` picks up its unit tests without waiting on the digest.
+mod costs;
 mod detect;
+// #175 phase 5 / S3 commit 2: morning digest rendered from the durable log.
+mod digest;
 mod events;
 mod ghostty;
 mod handoff_runtime;
@@ -56,6 +62,8 @@ mod raw_input;
 mod release_notes;
 mod remote;
 mod render_prof;
+// #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.
+mod revert;
 mod selection;
 mod server;
 mod server_icons;

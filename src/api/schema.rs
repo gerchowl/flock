@@ -146,6 +146,66 @@ pub enum Method {
     /// Force a named script check to run right now, out of cadence.
     #[serde(rename = "checks.run")]
     ChecksRun(ChecksNamedTarget),
+    /// #175 phase 5 / S3 commit 2: fold the durable event log into a
+    /// self-contained HTML digest and write it under `data_dir()/digest/`.
+    #[serde(rename = "digest.render")]
+    DigestRender(DigestRenderParams),
+    /// #175 S3 commit 3 (US-9): pause the SCHEDULER + MESSAGE DELIVERY.
+    /// Persisted so `flk server stop && flk server start` stays paused.
+    /// Does not gate human keystrokes, `agent.send`, or human-invoked
+    /// `flk agent fork` / `flk msg send`.
+    #[serde(rename = "fleet.pause")]
+    FleetPause(FleetPauseParams),
+    /// #175 S3 commit 3 (US-9): resume — the scheduler starts ticking on
+    /// its next scheduled deadline. Missed cron fires collapse to at most
+    /// one fire (the runner's asleep-across-intervals rule); queued
+    /// messages already wait.
+    #[serde(rename = "fleet.resume")]
+    FleetResume(EmptyParams),
+    /// #175 S3 commit 3: read the persisted pause switch.
+    #[serde(rename = "fleet.status")]
+    FleetStatus(EmptyParams),
+    /// #175 S3 commit 4 (ops): trailer-scan every repo flock knows about
+    /// and revert commits carrying `Agent-Run: <run_id>`. Reverts land on
+    /// a fresh `revert/<run-id>` branch — never on `main`.
+    #[serde(rename = "revert.run")]
+    RevertRun(RevertRunParams),
+}
+
+/// `revert.run` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertRunParams {
+    /// The run id to revert. Matched against `^Agent-Run: <run_id>$` in
+    /// commit message trailers.
+    pub run_id: String,
+    /// When true, list matches and the branches that would be created
+    /// but write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `fleet.pause` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FleetPauseParams {
+    /// Optional operator note; rendered in the sidebar banner and the
+    /// `FleetPaused` durable event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `digest.render` params. Every field is optional so `{}` triggers the
+/// default (last 24h, `data_dir()/digest/<today>.html`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DigestRenderParams {
+    /// Filter events with `ts_ms >= since_ms`. Omitted = "everything".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Path template (accepts `{date}`). Omitted = `{date}.html`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_template: Option<String>,
+    /// Absolute path or path relative to `data_dir()/digest/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Target for `checks.ack` / `checks.run`.
@@ -1012,6 +1072,13 @@ pub enum EventKind {
     TriggerFired,
     TriggerIgnored,
     TriggerErrored,
+    /// #175 S3 commit 3 (US-9): fleet pause / resume audit trail. Emitted
+    /// on `fleet.pause` and `fleet.resume`.
+    FleetPaused,
+    FleetResumed,
+    /// #175 S3 commit 4 (ops): every commit whose tree was reverted via
+    /// `flk revert-run` writes one of these onto the durable log.
+    RunReverted,
 }
 
 impl EventKind {
@@ -1052,7 +1119,10 @@ impl EventKind {
             | Self::AgentResumedFromHibernation
             | Self::TriggerFired
             | Self::TriggerIgnored
-            | Self::TriggerErrored => true,
+            | Self::TriggerErrored
+            | Self::FleetPaused
+            | Self::FleetResumed
+            | Self::RunReverted => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1251,7 +1321,55 @@ pub enum ResponseResult {
     ChecksList {
         checks: Vec<ChecksListEntry>,
     },
+    /// #175 S3 commit 2: reply for `digest.render`.
+    DigestRendered {
+        /// Absolute path of the written HTML file.
+        path: String,
+        /// Total events considered (post-`since_ms` filter).
+        events_considered: u64,
+        /// The `YYYY-MM-DD` used for the header + filename expansion.
+        generated_for_date: String,
+    },
+    /// #175 S3 commit 3 (US-9): reply for `fleet.pause` / `fleet.resume` /
+    /// `fleet.status`. `since_ms` is zero when `paused = false`.
+    FleetStatus {
+        paused: bool,
+        since_ms: u64,
+        reason: String,
+    },
+    /// #175 S3 commit 4 (ops): reply for `revert.run`. Reports every repo
+    /// scanned + the resulting revert branch + reverted commit count.
+    RunReverted {
+        run_id: String,
+        dry_run: bool,
+        results: Vec<RevertRepoResult>,
+    },
     Ok {},
+}
+
+/// One row in `revert.run.results`: what happened for a single repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevertRepoResult {
+    /// Repo checkout path (absolute).
+    pub repo_path: String,
+    /// The revert branch created (or the branch that would have been
+    /// created in `--dry-run`). Empty when the repo had zero matching
+    /// commits or was refused (dirty tree).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revert_branch: String,
+    /// Commit shas reverted, newest-first (or refused when in dry-run
+    /// mode / dirty tree). Empty when nothing matched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reverted_commits: Vec<String>,
+    /// `ok` | `dry_run` | `dirty_tree` | `no_matches` | `git_failed`
+    pub outcome: String,
+    /// Human-readable extra info (git stderr, refused reason, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The `gh pr create` command the operator can paste, when a branch
+    /// was actually created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1677,6 +1795,31 @@ pub enum EventData {
         repo: String,
         issue: u64,
         reason: String,
+    },
+    /// #175 S3 commit 3 (US-9): the operator-invoked `fleet.pause` verb
+    /// (or its CLI twin) transitioned the fleet to paused. `since_ms` is
+    /// the epoch-ms at which the pause took effect; the pause record on
+    /// disk (`data_dir()/pause.json`) is the durable source of truth for
+    /// restart-time re-loading, this event is the log breadcrumb.
+    FleetPaused {
+        since_ms: u64,
+        reason: String,
+    },
+    /// #175 S3 commit 3: the fleet was resumed after a pause. `resumed_ms`
+    /// is the epoch-ms at which the switch flipped; the runner + mailbox
+    /// drain start ticking again on the next scheduled tick.
+    FleetResumed {
+        resumed_ms: u64,
+    },
+    /// #175 S3 commit 4 (ops): one commit reverted by `flk revert-run`.
+    /// Fires per reverted commit in a per-run branch so an audit can walk
+    /// the log back to the exact revert history without needing git.
+    RunReverted {
+        run_id: String,
+        repo_path: String,
+        reverted_commit: String,
+        revert_branch: String,
+        dry_run: bool,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.

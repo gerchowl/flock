@@ -1,0 +1,49 @@
+#!/bin/sh
+# installed by flock
+# managed by flock; reinstalling or updating the integration overwrites this file.
+# FLOCK_INTEGRATION_ID=run_trailer
+# FLOCK_INTEGRATION_VERSION=1
+#
+# #175 S3 commit 4: append `Agent-Run: <FLOCK_RUN_ID>` to the commit message
+# when this repo is used by a scheduled/forked flock pane whose spawn
+# environment set FLOCK_RUN_ID. Human commits (no FLOCK_RUN_ID) are
+# untouched — the whole point of the trailer is that reverts target
+# agent-created commits only.
+#
+# Git invokes this as: prepare-commit-msg <path> [source] [sha1]
+# We APPEND to the file so any user-authored body survives.
+#
+# Never fails the commit: a missing var or a write error exits 0 silently.
+
+msg_file="$1"
+source="$2"
+
+# Skip when there is no run id set (human commits) or the commit is a
+# merge/squash/message-supplied one where the header shape is already
+# fixed by git — appending would land after `# Please enter the commit
+# message` boilerplate. Regular sources (empty, 'template', 'commit')
+# are the safe ones.
+case "$source" in
+    merge|squash|message) exit 0 ;;
+esac
+if [ -z "${FLOCK_RUN_ID:-}" ]; then
+    exit 0
+fi
+if [ ! -w "$msg_file" ]; then
+    exit 0
+fi
+
+# Idempotent: if the trailer is already present (amend / rebase re-run),
+# do not double-append.
+if grep -q "^Agent-Run: ${FLOCK_RUN_ID}$" "$msg_file" 2>/dev/null; then
+    exit 0
+fi
+
+# Make sure the trailer block sits on its own paragraph (git commit
+# trailers require an empty line before the block per RFC-ish spec).
+{
+    printf '\n'
+    printf 'Agent-Run: %s\n' "$FLOCK_RUN_ID"
+} >>"$msg_file"
+
+exit 0
