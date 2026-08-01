@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::cron::{CronExpr, CronTz};
 use crate::api::schema::NotificationShowSound;
 
 /// Default cap on concurrent script check runs — a small backstop against a
@@ -61,6 +62,11 @@ pub struct ChecksConfig {
     /// User-declared `[[checks.script]]` entries.
     #[serde(default, rename = "script", skip_serializing_if = "Vec::is_empty")]
     pub scripts: Vec<ScriptCheck>,
+    /// User-declared `[[checks.cron]]` entries — scheduled predicates (S1).
+    /// Each entry fires on its cron schedule with missed-fires-while-asleep
+    /// collapsing to ONE fire per wake (`CheckRunner::tick_crons`).
+    #[serde(default, rename = "cron", skip_serializing_if = "Vec::is_empty")]
+    pub crons: Vec<CronCheck>,
 }
 
 impl Default for ChecksConfig {
@@ -74,8 +80,24 @@ impl Default for ChecksConfig {
             hibernation: HibernationConfig::default(),
             issue_guard: IssueGuardConfig::default(),
             scripts: Vec::new(),
+            crons: Vec::new(),
         }
     }
+}
+
+/// One `[[checks.cron]]` entry (#175 S1). Parse-time validation runs through
+/// `CronExpr::parse` in the field's serde impl, so a malformed expression
+/// bubbles up as a deserialize error — loud rejection at config load, no
+/// silent fallback. `name` + `expr` are required; `tz` defaults to `local`
+/// and `on_fire` to the closed `ActionSpec::default()`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CronCheck {
+    pub name: String,
+    pub expr: CronExpr,
+    #[serde(default)]
+    pub tz: CronTz,
+    #[serde(default)]
+    pub on_fire: ActionSpec,
 }
 
 /// Built-in blocked-alert check: fire when an agent pane has been Blocked for
@@ -326,6 +348,22 @@ impl ChecksConfig {
                 ));
             }
         }
+
+        // Cron entries share the script-name namespace: two different
+        // predicate kinds with the same name would confuse ack/list/run.
+        for cron in &self.crons {
+            let name = cron.name.trim();
+            if name.is_empty() {
+                out.push("[[checks.cron]] entry is missing name; entry ignored".to_string());
+                continue;
+            }
+            if !seen.insert(name.to_string()) {
+                out.push(format!(
+                    "[[checks.cron]] duplicate name \"{name}\"; later entry ignored"
+                ));
+                continue;
+            }
+        }
         out
     }
 }
@@ -554,6 +592,76 @@ label = "custom-fired"
             diags
                 .iter()
                 .any(|d| d.contains("\"fast\"") && d.contains("debounce")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn parses_cron_section_and_rejects_bad_expression() {
+        let toml = r#"
+[[cron]]
+name = "nightly-digest"
+expr = "0 3 * * *"
+tz = "utc"
+
+[cron.on_fire.event]
+label = "digest"
+"#;
+        let checks: ChecksConfig = toml::from_str(toml).unwrap();
+        assert_eq!(checks.crons.len(), 1);
+        assert_eq!(checks.crons[0].name, "nightly-digest");
+        assert_eq!(checks.crons[0].tz, super::CronTz::Utc);
+        assert_eq!(format!("{}", checks.crons[0].expr), "0 3 * * *");
+
+        // A malformed expression is a hard load-time error — not a
+        // diagnostic. That is the loud-rejection posture the design calls
+        // for.
+        let bad = r#"
+[[cron]]
+name = "nope"
+expr = "@daily"
+"#;
+        let err = toml::from_str::<ChecksConfig>(bad).unwrap_err().to_string();
+        assert!(err.contains("cron"), "{err}");
+    }
+
+    #[test]
+    fn cron_diagnostics_flag_missing_name_and_duplicate() {
+        let expr = super::CronExpr::parse("* * * * *").unwrap();
+        let checks = ChecksConfig {
+            crons: vec![
+                super::CronCheck {
+                    name: String::new(),
+                    expr: expr.clone(),
+                    tz: super::CronTz::Local,
+                    on_fire: ActionSpec::default(),
+                },
+                super::CronCheck {
+                    name: "dup".into(),
+                    expr: expr.clone(),
+                    tz: super::CronTz::Local,
+                    on_fire: ActionSpec::default(),
+                },
+                super::CronCheck {
+                    name: "dup".into(),
+                    expr,
+                    tz: super::CronTz::Local,
+                    on_fire: ActionSpec::default(),
+                },
+            ],
+            ..ChecksConfig::default()
+        };
+        let diags = checks.diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("[[checks.cron]] entry is missing name")),
+            "{diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("[[checks.cron]] duplicate name")),
             "{diags:?}"
         );
     }

@@ -26,7 +26,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::config::{ActionSpec, ChecksConfig, ScriptCheck};
+use super::config::{ActionSpec, ChecksConfig, CronCheck, ScriptCheck};
+use super::cron::{cron_run_id, CronExpr, CronTz};
 use super::script::Outcome;
 
 /// Per-check runtime state — the runner's authoritative view of one check.
@@ -97,6 +98,34 @@ pub(crate) struct RunnableCheck {
     pub check: ScriptCheck,
 }
 
+/// One enrolled cron predicate — the schedule state the runner advances
+/// each tick. `next_fire_wall_ms` is authoritative (wall clock, not
+/// monotonic); `Instant`-space deadlines are derived when the App tick asks
+/// via `next_cron_instant`.
+#[derive(Debug, Clone)]
+pub(crate) struct CronRuntimeState {
+    pub expr: CronExpr,
+    pub tz: CronTz,
+    pub on_fire: ActionSpec,
+    /// The next epoch millisecond the predicate should fire at.
+    pub next_fire_wall_ms: u64,
+}
+
+/// A cron firing surfaced by `tick_crons` — one per collapsed episode. See
+/// the [`super::cron`] module doc for the DST + asleep semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CronFireDecision {
+    pub name: String,
+    pub run_id: String,
+    pub scheduled_wall_ms: u64,
+    pub actual_wall_ms: u64,
+    /// Whole scheduled slots that were skipped because the process was
+    /// asleep past them. Reported for observability; the fold is still one
+    /// fire (§8.4 collapse rule).
+    pub missed_fires: u32,
+    pub action: ActionSpec,
+}
+
 /// The check runner. Owns per-check state, applies outcomes, and answers
 /// scheduling questions. It's a plain struct — no threads, no channels —
 /// so tests exercise the state machine directly.
@@ -107,6 +136,11 @@ pub(crate) struct CheckRunner {
     /// runner across the tick.
     scripts: HashMap<String, ScriptCheck>,
     state: HashMap<String, CheckRuntimeState>,
+    /// The enrolled cron predicates, keyed by name. Kept in a separate table
+    /// from `scripts` because the two kinds have disjoint state shapes —
+    /// scripts have debounce/consecutive_fails, crons have a wall-clock
+    /// deadline. Both surface as `FireDecision`-equivalents when they fire.
+    crons: HashMap<String, CronRuntimeState>,
     max_concurrent: usize,
     /// Episode monotonic counter — every FireDecision has a unique id so
     /// the app can correlate CheckFired events with an episode.
@@ -118,6 +152,12 @@ impl CheckRunner {
     /// (those `ChecksConfig::diagnostics()` accepts) are enrolled; the rest
     /// are silently dropped here — the diagnostic path is the surface.
     pub(crate) fn from_config(config: &ChecksConfig, now: Instant) -> Self {
+        Self::from_config_at(config, now, current_wall_ms())
+    }
+
+    /// Testable seam: enroll checks with an explicit wall-clock anchor so
+    /// cron scheduling is deterministic under a fake clock.
+    pub(crate) fn from_config_at(config: &ChecksConfig, now: Instant, now_wall_ms: u64) -> Self {
         let max_concurrent = config.max_concurrent.max(1);
         let min_interval_secs = config.min_tick_secs.max(1);
         let mut scripts: HashMap<String, ScriptCheck> = HashMap::new();
@@ -144,9 +184,11 @@ impl CheckRunner {
                 CheckRuntimeState::new(now + Duration::from_secs(min_interval_secs)),
             );
         }
+        let crons = enroll_crons(&config.crons, now_wall_ms, scripts.keys());
         Self {
             scripts,
             state,
+            crons,
             max_concurrent,
             next_episode: 0,
         }
@@ -161,12 +203,85 @@ impl CheckRunner {
     /// The nearest deadline the loop must wake for. `None` means the runner
     /// has nothing pending (no checks, or all in-flight with none due). The
     /// App folds this into `next_loop_deadline_with_resize_poll`.
-    pub(crate) fn next_due(&self, _now: Instant) -> Option<Instant> {
-        self.state
+    ///
+    /// Cron predicates fold in too: if a cron fires at wall time W and now's
+    /// wall time is `now_wall_ms`, the corresponding Instant is
+    /// `now + (W - now_wall_ms)`. If W is already in the past, the deadline
+    /// is `now` (fire immediately on next tick).
+    pub(crate) fn next_due(&self, now: Instant) -> Option<Instant> {
+        let script_soonest = self
+            .state
             .values()
             .filter(|s| !s.in_flight)
             .map(|s| s.next_due)
-            .min()
+            .min();
+        let cron_soonest = self.next_cron_instant(now, current_wall_ms());
+        match (script_soonest, cron_soonest) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn next_cron_instant(&self, now: Instant, now_wall_ms: u64) -> Option<Instant> {
+        let next_wall = self.crons.values().map(|c| c.next_fire_wall_ms).min()?;
+        Some(if next_wall <= now_wall_ms {
+            now
+        } else {
+            now + Duration::from_millis(next_wall.saturating_sub(now_wall_ms))
+        })
+    }
+
+    /// Fire every cron whose `next_fire_wall_ms <= now_wall_ms`. Missed
+    /// slots collapse: for a cron scheduled at S1 < S2 < ... < Sn <= now,
+    /// ONE `CronFireDecision` is emitted with `scheduled_wall_ms = S1`,
+    /// `actual_wall_ms = now_wall_ms`, `missed_fires = n - 1`. The
+    /// predicate's `next_fire_wall_ms` is advanced to the first slot
+    /// strictly after `now_wall_ms`, so a subsequent tick will not
+    /// re-collapse the same run.
+    pub(crate) fn tick_crons(&mut self, now_wall_ms: u64) -> Vec<CronFireDecision> {
+        let mut out = Vec::new();
+        for (name, cron) in self.crons.iter_mut() {
+            if cron.next_fire_wall_ms > now_wall_ms {
+                continue;
+            }
+            let scheduled = cron.next_fire_wall_ms;
+            // Count skipped slots by iterating `next_after` until it exceeds
+            // `now_wall_ms`, then finalize `next_fire_wall_ms` to that
+            // first-past-now instant. Cap the collapse count to guard
+            // against pathological configurations.
+            let mut missed: u32 = 0;
+            let mut cursor = scheduled;
+            const MAX_COLLAPSE: u32 = 1_000_000;
+            while let Some(next) = cron.expr.next_after(cursor, cron.tz) {
+                if next > now_wall_ms {
+                    cron.next_fire_wall_ms = next;
+                    break;
+                }
+                missed = missed.saturating_add(1);
+                cursor = next;
+                if missed >= MAX_COLLAPSE {
+                    // Give up counting; still advance past now so we don't
+                    // re-fire in an infinite loop.
+                    if let Some(next) = cron.expr.next_after(now_wall_ms, cron.tz) {
+                        cron.next_fire_wall_ms = next;
+                    }
+                    break;
+                }
+            }
+            out.push(CronFireDecision {
+                name: name.clone(),
+                run_id: cron_run_id(name, scheduled),
+                scheduled_wall_ms: scheduled,
+                actual_wall_ms: now_wall_ms,
+                missed_fires: missed,
+                action: cron.on_fire.clone(),
+            });
+        }
+        // Stable ordering for deterministic tests / event log ordering.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Pop up to `max_concurrent - in_flight` checks whose `next_due <= now`.
@@ -309,6 +424,65 @@ impl CheckRunner {
             state.next_due = at;
         }
     }
+
+    /// Test seam: force a cron's next scheduled slot. Consumed by the
+    /// asleep-collapse coverage.
+    #[cfg(test)]
+    pub(crate) fn force_cron_next_fire(&mut self, name: &str, at_wall_ms: u64) {
+        if let Some(state) = self.crons.get_mut(name) {
+            state.next_fire_wall_ms = at_wall_ms;
+        }
+    }
+}
+
+/// Enroll `[[checks.cron]]` entries into runtime state. Silently drops
+/// entries whose name is empty or collides with an already-enrolled name —
+/// the diagnostic path is the surface (`ChecksConfig::diagnostics()`).
+fn enroll_crons<'a, I>(
+    crons: &[CronCheck],
+    now_wall_ms: u64,
+    used_names: I,
+) -> HashMap<String, CronRuntimeState>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut taken: std::collections::HashSet<String> = used_names.into_iter().cloned().collect();
+    let mut out: HashMap<String, CronRuntimeState> = HashMap::new();
+    for cron in crons {
+        let name = cron.name.trim();
+        if name.is_empty() || taken.contains(name) {
+            continue;
+        }
+        // The first fire is the first slot strictly AFTER now (never fires
+        // for a slot the machine was already past when the runner
+        // materialized — that's what the collapse semantics is for on
+        // subsequent ticks). If the expression is unreachable, the entry is
+        // silently dropped rather than left in a poll-forever state.
+        let Some(next_fire_wall_ms) = cron.expr.next_after(now_wall_ms, cron.tz) else {
+            continue;
+        };
+        taken.insert(name.to_string());
+        out.insert(
+            name.to_string(),
+            CronRuntimeState {
+                expr: cron.expr.clone(),
+                tz: cron.tz,
+                on_fire: cron.on_fire.clone(),
+                next_fire_wall_ms,
+            },
+        );
+    }
+    out
+}
+
+/// Current unix wall-clock time in milliseconds. Used as the cron
+/// scheduler's ground truth. Panics only if the system clock is before the
+/// unix epoch (a state no realistic machine ships in).
+pub(crate) fn current_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -479,6 +653,115 @@ mod tests {
         assert_eq!(runner.in_flight(), 1);
         let batch2 = runner.next_runnable(now);
         assert_eq!(batch2.len(), 1);
+    }
+
+    // ------- cron predicate -------
+
+    fn cron_config(name: &str, expr: &str) -> ChecksConfig {
+        ChecksConfig {
+            max_concurrent: 4,
+            min_tick_secs: 1,
+            crons: vec![super::CronCheck {
+                name: name.into(),
+                expr: super::CronExpr::parse(expr).unwrap(),
+                tz: super::CronTz::Utc,
+                on_fire: ActionSpec::Event {
+                    label: format!("cron-{name}"),
+                },
+            }],
+            ..ChecksConfig::default()
+        }
+    }
+
+    #[test]
+    fn cron_asleep_collapses_missed_fires_to_one() {
+        // "Every minute" cron; the machine "slept" ten minutes past the last
+        // scheduled slot. The runner must fire ONCE with missed_fires = 9
+        // (nine slots skipped between S1 and now), not ten separate fires.
+        let now = Instant::now();
+        // Pick a wall time on an exact minute boundary so the arithmetic
+        // below is intuitive.
+        let base_ms: u64 = 1_720_000_000 * 1000; // some minute-aligned epoch ms
+        let mut runner =
+            super::CheckRunner::from_config_at(&cron_config("nightly", "* * * * *"), now, base_ms);
+        // Force the next fire to base + 60s, then tick at base + 10*60s.
+        runner.force_cron_next_fire("nightly", base_ms + 60_000);
+        let fires = runner.tick_crons(base_ms + 10 * 60_000);
+        assert_eq!(fires.len(), 1, "collapsed asleep must fire exactly once");
+        let fire = &fires[0];
+        assert_eq!(fire.name, "nightly");
+        assert_eq!(fire.scheduled_wall_ms, base_ms + 60_000);
+        assert_eq!(fire.actual_wall_ms, base_ms + 10 * 60_000);
+        // 9 slots were skipped (S+2m .. S+10m == 9 slots after S+1m).
+        assert_eq!(fire.missed_fires, 9);
+        // A subsequent tick at the same wall time must NOT re-fire — the
+        // runner advanced next_fire past now.
+        assert!(runner.tick_crons(base_ms + 10 * 60_000).is_empty());
+    }
+
+    #[test]
+    fn cron_two_fires_one_tick_dedupe() {
+        // Same tick, two enrolled crons that are both due; each fires once.
+        // The list is stable by name so tests can rely on ordering.
+        let now = Instant::now();
+        let base_ms: u64 = 1_720_000_000 * 1000;
+        let mut config = cron_config("alpha", "* * * * *");
+        config.crons.push(super::CronCheck {
+            name: "bravo".into(),
+            expr: super::CronExpr::parse("* * * * *").unwrap(),
+            tz: super::CronTz::Utc,
+            on_fire: ActionSpec::Event {
+                label: "cron-bravo".into(),
+            },
+        });
+        let mut runner = super::CheckRunner::from_config_at(&config, now, base_ms);
+        runner.force_cron_next_fire("alpha", base_ms + 60_000);
+        runner.force_cron_next_fire("bravo", base_ms + 60_000);
+        let fires = runner.tick_crons(base_ms + 60_000);
+        assert_eq!(fires.len(), 2);
+        assert_eq!(fires[0].name, "alpha");
+        assert_eq!(fires[1].name, "bravo");
+        // Second tick at same wall time — nothing new fires.
+        assert!(runner.tick_crons(base_ms + 60_000).is_empty());
+    }
+
+    #[test]
+    fn cron_run_id_matches_scheduled_slot() {
+        let now = Instant::now();
+        let base_ms: u64 = 1_720_000_000 * 1000;
+        let mut runner =
+            super::CheckRunner::from_config_at(&cron_config("nightly", "* * * * *"), now, base_ms);
+        runner.force_cron_next_fire("nightly", base_ms + 60_000);
+        let fires = runner.tick_crons(base_ms + 60_000);
+        assert_eq!(
+            fires[0].run_id,
+            super::cron_run_id("nightly", base_ms + 60_000)
+        );
+    }
+
+    #[test]
+    fn next_due_folds_cron_and_script_deadlines() {
+        let now = Instant::now();
+        let base_ms: u64 = 1_720_000_000 * 1000;
+        // Enrol both a script (never fires soon) and a cron that fires in
+        // ~30s. `next_due` must return the cron's deadline.
+        let mut config = cron_config("nightly", "* * * * *");
+        config.scripts.push(super::ScriptCheck {
+            name: "later".into(),
+            program: std::path::PathBuf::from("/usr/bin/true"),
+            interval_secs: 3_600,
+            timeout_secs: 5,
+            debounce: 1,
+            ..super::ScriptCheck::default()
+        });
+        let mut runner = super::CheckRunner::from_config_at(&config, now, base_ms);
+        // Force the cron 30 seconds ahead.
+        runner.force_cron_next_fire("nightly", base_ms + 30_000);
+        // Force the script much further out.
+        runner.force_due("later", now + std::time::Duration::from_secs(3600));
+        let deadline = runner.next_due(now).expect("some deadline");
+        // The deadline must be BEFORE the 1h mark — the cron dominates.
+        assert!(deadline < now + std::time::Duration::from_secs(3600));
     }
 
     #[test]

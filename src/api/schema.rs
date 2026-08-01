@@ -995,6 +995,9 @@ pub enum EventKind {
     CheckFired,
     CheckErrored,
     ChecksHeartbeat,
+    /// #175 S1: scheduled cron predicate fired. See
+    /// `EventData::CronFired` for the payload shape.
+    CronFired,
     /// #175 C3: hibernation lifecycle. `AgentHibernated` fires once when a
     /// pane transitions to hibernated (child asked to exit + resume plan
     /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
@@ -1040,6 +1043,7 @@ impl EventKind {
             | Self::CheckFired
             | Self::CheckErrored
             | Self::ChecksHeartbeat
+            | Self::CronFired
             | Self::AgentHibernated
             | Self::AgentResumedFromHibernation
             | Self::TriggerFired
@@ -1607,6 +1611,17 @@ pub enum EventData {
     ChecksHeartbeat {
         runs: u64,
         errors: u64,
+    },
+    /// #175 S1: a scheduled cron predicate fired. `run_id` is the
+    /// `run:<name>:<scheduled_ms hex>` shape shared with digest / revert.
+    /// `missed_fires` counts scheduled slots that were skipped because the
+    /// runner slept past them (asleep-collapse; §8.4).
+    CronFired {
+        name: String,
+        run_id: String,
+        scheduled_ms: u64,
+        actual_ms: u64,
+        missed_fires: u32,
     },
     /// #175 C3: a pane's agent process has been asked to exit and its resume
     /// plan is stashed on the pane; the next focus (or explicit

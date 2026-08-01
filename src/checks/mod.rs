@@ -7,6 +7,7 @@
 
 pub(crate) mod blocked_alert;
 pub(crate) mod config;
+pub(crate) mod cron;
 pub(crate) mod hibernation;
 pub(crate) mod issue_guard;
 pub(crate) mod runner;

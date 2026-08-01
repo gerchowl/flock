@@ -665,6 +665,9 @@ impl App {
         // dispatches every owner-authored `flk-trigger` block that hasn't
         // already fired.
         changed |= self.poll_issue_guard(now);
+        // #175 S1: scheduled cron predicates. `tick_crons` collapses
+        // missed-while-asleep slots to one fire per predicate.
+        changed |= self.dispatch_cron_fires();
 
         if self
             .checks_heartbeat_deadline
@@ -777,6 +780,42 @@ impl App {
                 // A follow-up commit can enrich it with the label.
             }
         }
+    }
+
+    /// #175 S1: fold scheduled cron fires from the runner into the durable
+    /// event log + notification path. Missed-while-asleep collapses to ONE
+    /// fire per predicate (`CronRuntimeState::tick_crons`), reported as
+    /// `missed_fires` on the event so an operator can tell the machine
+    /// slept through slots.
+    pub(crate) fn dispatch_cron_fires(&mut self) -> bool {
+        if !self.state.config.checks.enable {
+            return false;
+        }
+        let now_wall_ms = crate::checks::runner::current_wall_ms();
+        let fires = self.checks_runner.tick_crons(now_wall_ms);
+        if fires.is_empty() {
+            return false;
+        }
+        for fire in fires {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CronFired,
+                data: crate::api::schema::EventData::CronFired {
+                    name: fire.name.clone(),
+                    run_id: fire.run_id.clone(),
+                    scheduled_ms: fire.scheduled_wall_ms,
+                    actual_ms: fire.actual_wall_ms,
+                    missed_fires: fire.missed_fires,
+                },
+            });
+            // Reuse the script-check FireDecision dispatch so notify /
+            // event actions travel one path. `episode` slot is the run_id.
+            self.dispatch_check_action(&crate::checks::runner::FireDecision {
+                name: fire.name,
+                episode: fire.run_id,
+                action: fire.action,
+            });
+        }
+        true
     }
 
     /// Helper used by tests to force a heartbeat now.
