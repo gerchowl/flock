@@ -17,6 +17,7 @@ pub(super) fn run_lineage_command(args: &[String]) -> std::io::Result<i32> {
     if matches!(first, "help" | "--help" | "-h") {
         eprintln!("{USAGE}");
         eprintln!("  target: pane id, agent name, worktree path or basename, or branch name");
+        eprintln!("  ambiguous identities (reused branch names) resolve to the most recent fork");
         return Ok(0);
     }
     let mut json = false;

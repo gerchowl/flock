@@ -276,7 +276,8 @@ impl EventHub {
     }
 
     /// Stream persisted history (rotated files + active) with `seq >
-    /// sequence`, oldest first. Reads from disk, not the in-memory ring, so
+    /// sequence`, oldest first. COLD PATH: re-reads every log file per call
+    /// — fine for one-shot queries like lineage, wrong for polling. Reads from disk, not the in-memory ring, so
     /// it sees events from before this process started. Used by the lineage
     /// walker; an unreadable file contributes nothing rather than failing
     /// the whole read.
@@ -407,8 +408,18 @@ mod tests {
             let mut file = std::fs::File::options().append(true).open(&path).unwrap();
             file.write_all(b"{\"seq\":3,\"ts_ms\":1,\"envel").unwrap();
         }
+        let truncated_len = std::fs::metadata(&path).unwrap().len();
         let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < truncated_len,
+            "load must physically truncate the torn tail before any append"
+        );
         assert_eq!(restarted.current_sequence(), 2, "torn tail dropped");
+        assert_eq!(
+            restarted.events_after(0).len(),
+            2,
+            "ring is seeded from disk at boot"
+        );
         restarted.push(workspace_event("w3"));
         let persisted = restarted.persisted_events_after(0);
         assert_eq!(

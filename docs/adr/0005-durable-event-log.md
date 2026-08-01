@@ -49,6 +49,16 @@ out a second event system — the hub itself must become durable.
   live subscribers. Replaying history to *new* subscribers is a non-goal
   (that is broker territory, §9).
 
+## Known gap — live-handoff overlap
+
+During a `live-handoff`, the outgoing and incoming server processes briefly
+hold the same active log file; a rotation in that window would leave the
+loser appending to the rotated inode with stale byte accounting. The window
+is seconds long and rotation needs 32 MB/100k events, so the practical risk
+is negligible for now — but the per-session isolation story above assumes a
+single writer. TODO (pre check-runner, which raises event volume): defer
+opening the incoming server's persistent log until the handoff completes.
+
 ## Consequences
 
 - `flk lineage <target>` reconstructs fork ancestry across restarts from

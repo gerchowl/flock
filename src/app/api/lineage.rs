@@ -95,6 +95,10 @@ impl App {
     }
 }
 
+/// One persisted `agent_forked` edge. `parent_repo` doubles as the child's
+/// repo on the wire: forks are same-repo by construction today (the handler
+/// derives the child from the parent's repo root); if cross-repo forks ever
+/// exist, `AgentForked` needs a distinct `child_repo` field first.
 struct ForkEdge {
     run_id: String,
     parent_pane_id: String,
