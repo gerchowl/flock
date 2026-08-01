@@ -8,6 +8,7 @@ pub(crate) mod actions;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) mod hibernation;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 mod api_helpers;
 pub(crate) mod config_io;
@@ -147,6 +148,24 @@ pub struct App {
     pub(crate) has_foreground_viewer: bool,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
+    /// #175 phase 4: per-check runner + its scheduling deadline. The runner
+    /// owns the debounce state machine; the App folds its `next_due`
+    /// into the loop deadline and dispatches `FireDecision`s.
+    pub(crate) checks_runner: crate::checks::CheckRunner,
+    pub(crate) checks_next_deadline: Option<Instant>,
+    pub(crate) checks_heartbeat_deadline: Option<Instant>,
+    pub(crate) checks_run_count: u64,
+    pub(crate) checks_error_count: u64,
+    /// Built-in blocked-alert check (#175 C2). Runs from the same checks tick
+    /// as script checks; fires once per Blocked episode per pane.
+    pub(crate) blocked_alert: crate::checks::BlockedAlertFold,
+    /// Built-in idle-hibernation check (#175 C3). Selects candidates and
+    /// dispatches through `App::hibernate_pane`; disabled by default.
+    pub(crate) hibernation_check: crate::checks::HibernationFold,
+    /// Built-in owner-guarded issue-trigger poller (#175 C4). Runs its own
+    /// cadence off the checks tick; dedupe set survives restarts by
+    /// seeding from the durable `TriggerFired` events at construction.
+    pub(crate) issue_guard: crate::checks::IssueGuardFold,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -710,6 +729,34 @@ impl App {
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,
+            checks_runner: crate::checks::CheckRunner::from_config(&config.checks, Instant::now()),
+            checks_next_deadline: None,
+            // Arm the heartbeat when the runner has something to run OR any
+            // built-in check is enabled — the built-ins tick from the same
+            // dispatch, so the loop must wake even when only they're armed.
+            checks_heartbeat_deadline: (config.checks.enable
+                && (!config.checks.scripts.is_empty() || config.checks.blocked_alert.enable))
+                .then(|| Instant::now() + Duration::from_secs(config.checks.heartbeat_secs.max(1))),
+            checks_run_count: 0,
+            checks_error_count: 0,
+            blocked_alert: crate::checks::BlockedAlertFold::new(),
+            hibernation_check: crate::checks::HibernationFold::new(),
+            issue_guard: {
+                // Seed the dedupe set from durable `TriggerFired` events —
+                // same pattern as the mailbox registry above so a restart
+                // never re-dispatches an issue trigger.
+                let mut guard = crate::checks::IssueGuardFold::new();
+                let seeded_keys = event_hub.persisted_events_after(0).into_iter().filter_map(
+                    |(_, _, envelope)| match envelope.data {
+                        crate::api::schema::EventData::TriggerFired { dedupe_key, .. } => {
+                            Some(dedupe_key)
+                        }
+                        _ => None,
+                    },
+                );
+                guard.seed_from_fired_keys(seeded_keys);
+                guard
+            },
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
@@ -3691,6 +3738,9 @@ sidebar_pane_gap = 99
         app.next_animation_tick = None;
         app.next_auto_update_check = None;
         app.session_save_deadline = None;
+        // #175 C2: the built-in blocked-alert wakes off the checks heartbeat
+        // even on a defaulted config, so clear it for the "quiet" pose.
+        app.checks_heartbeat_deadline = None;
         app.state.workspaces.clear();
 
         assert_eq!(

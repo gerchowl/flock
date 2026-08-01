@@ -269,6 +269,11 @@ impl App {
             changed = true;
         }
 
+        // #175 phase 4: tick the check runner. dispatch_due_script_checks
+        // returns true when it either dispatched a run or emitted a
+        // heartbeat — both mean the loop should render (an event landed).
+        changed |= self.dispatch_due_script_checks(now);
+
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;
         } else {
@@ -541,6 +546,18 @@ impl App {
                 .flatten(),
             self.next_auto_update_check,
             self.agent_metadata_deadline,
+            // #175 phase 4: wake for the next runnable script check (or its
+            // heartbeat), so the runner ticks even in an otherwise quiet loop.
+            self.checks_next_deadline,
+            self.checks_heartbeat_deadline,
+            // #175 C4: issue-guard's own cadence — even in an otherwise
+            // quiet loop we must poll gh on schedule.
+            self.state
+                .config
+                .checks
+                .enable
+                .then_some(())
+                .and_then(|()| self.issue_guard.next_poll_deadline()),
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
@@ -593,6 +610,517 @@ impl App {
         }
         had_event
     }
+
+    /// #175 phase 4: scan the runner for due script checks, spawn one worker
+    /// per RunnableCheck (the worker sends `AppEvent::CheckCompleted` back
+    /// via `event_tx`), refresh the runner's next-due deadline, and emit
+    /// `ChecksHeartbeat` when its window elapses. Returns true if either
+    /// path emitted a persisted event.
+    ///
+    /// Mirrored in both the TUI runtime loop and the headless server loop
+    /// (the #25 dual-loop rule): this helper is called from
+    /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
+    /// (headless).
+    pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.enable {
+            self.checks_next_deadline = None;
+            self.checks_heartbeat_deadline = None;
+            return false;
+        }
+        let mut changed = false;
+
+        if self
+            .checks_next_deadline
+            .is_none_or(|deadline| now >= deadline)
+        {
+            let runnable = self.checks_runner.next_runnable(now);
+            for job in runnable {
+                let event_tx = self.event_tx.clone();
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let (outcome, _output) = crate::checks::run_script(&job.check);
+                    let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let _ = event_tx.blocking_send(crate::events::AppEvent::CheckCompleted {
+                        name: job.name,
+                        outcome,
+                        duration_ms,
+                    });
+                });
+                changed = true;
+            }
+            self.checks_next_deadline = self.checks_runner.next_due(now);
+        }
+
+        // #175 C2: built-in blocked-alert fold. Runs on every tick — cheap
+        // (walks live pane details), returns fires the App dispatches through
+        // the same Notify/CheckFired path as script checks.
+        changed |= self.evaluate_blocked_alert(now);
+        // #175 C3: built-in idle-hibernation fold. Selects panes past the
+        // configured threshold and dispatches each candidate through the
+        // App-level hibernate seam; failures (no resume plan) emit
+        // `CheckErrored` once per episode.
+        changed |= self.evaluate_hibernation_check(now);
+        // #175 C4: owner-guarded issue triggers. Polls its own cadence off
+        // the checks tick; on the poll it shells out to `gh` per repo, then
+        // dispatches every owner-authored `flk-trigger` block that hasn't
+        // already fired.
+        changed |= self.poll_issue_guard(now);
+
+        if self
+            .checks_heartbeat_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::ChecksHeartbeat,
+                data: crate::api::schema::EventData::ChecksHeartbeat {
+                    runs: self.checks_run_count,
+                    errors: self.checks_error_count,
+                },
+            });
+            let heartbeat_secs = self.state.config.checks.heartbeat_secs.max(1);
+            self.checks_heartbeat_deadline = Some(now + Duration::from_secs(heartbeat_secs));
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// #175 phase 4: fold one completed script check back into the runner
+    /// and emit the durable event pair (`CheckRan` always; `CheckErrored` on
+    /// Error, `CheckFired` on a FireDecision). Called from the shared
+    /// internal-event handler; the notification-side dispatch of the
+    /// FireDecision's `on_fire: ActionSpec` runs here too so both loops
+    /// share one code path.
+    pub(crate) fn handle_check_completed(
+        &mut self,
+        name: String,
+        outcome: crate::checks::Outcome,
+        duration_ms: u64,
+    ) {
+        self.checks_run_count = self.checks_run_count.saturating_add(1);
+        let outcome_label = match &outcome {
+            crate::checks::Outcome::Fire => "fire",
+            crate::checks::Outcome::Pass => "pass",
+            crate::checks::Outcome::Error(_) => "error",
+        };
+        self.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::CheckRan,
+            data: crate::api::schema::EventData::CheckRan {
+                name: name.clone(),
+                outcome: outcome_label.to_string(),
+                duration_ms,
+            },
+        });
+        if let crate::checks::Outcome::Error(reason) = &outcome {
+            self.checks_error_count = self.checks_error_count.saturating_add(1);
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckErrored,
+                data: crate::api::schema::EventData::CheckErrored {
+                    name: name.clone(),
+                    reason: reason.clone(),
+                },
+            });
+        }
+
+        let decision = self.checks_runner.complete(&name, outcome, Instant::now());
+        // Whether or not we fire, the runner's next_due changed — refresh
+        // the scheduling deadline so the loop sleeps to the right point.
+        self.checks_next_deadline = self.checks_runner.next_due(Instant::now());
+
+        if let Some(decision) = decision {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckFired,
+                data: crate::api::schema::EventData::CheckFired {
+                    name: decision.name.clone(),
+                    episode: decision.episode.clone(),
+                },
+            });
+            self.dispatch_check_action(&decision);
+        }
+    }
+
+    /// Route a `FireDecision.action` through the existing notification path
+    /// so `[ui.toast]` delivery policy applies uniformly. `ActionSpec::Event`
+    /// is fire-and-forget — the durable `CheckFired` event is already on the
+    /// hub by this point; the Event variant just carries a semantic label
+    /// external listeners can key on.
+    fn dispatch_check_action(&mut self, decision: &crate::checks::runner::FireDecision) {
+        use crate::api::schema::NotificationShowParams;
+        use crate::checks::ActionSpec;
+
+        match &decision.action {
+            ActionSpec::Notify { title, sound } => {
+                let title = if title.is_empty() {
+                    format!("check fired: {}", decision.name)
+                } else {
+                    title.clone()
+                };
+                let params = NotificationShowParams {
+                    title,
+                    body: Some(format!("episode {}", decision.episode)),
+                    position: None,
+                    sound: *sound,
+                };
+                // Reuse the API's notification-show shape so the toast /
+                // sound / terminal / system routing lives in ONE place.
+                let request_id = format!("check:{}", decision.episode);
+                let _ = self.handle_api_request_after_internal_events_drained(
+                    crate::api::schema::Request {
+                        id: request_id,
+                        method: crate::api::schema::Method::NotificationShow(params),
+                    },
+                );
+            }
+            ActionSpec::Event { label } => {
+                let _ = label;
+                // No-op: the CheckFired event above IS the dispatch.
+                // A follow-up commit can enrich it with the label.
+            }
+        }
+    }
+
+    /// Helper used by tests to force a heartbeat now.
+    #[cfg(test)]
+    pub(crate) fn force_checks_heartbeat_now(&mut self) {
+        self.checks_heartbeat_deadline = Some(Instant::now());
+    }
+
+    /// Snapshot every live pane's blocked-alert relevant fields, and hand
+    /// them to the [`BlockedAlertFold`]. Any fires are dispatched through
+    /// the same Notify + `CheckFired` path used by script checks so the
+    /// `[ui.toast]` policy applies uniformly and one code path emits the
+    /// durable event.
+    pub(crate) fn evaluate_blocked_alert(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.blocked_alert.enable {
+            return false;
+        }
+        let snapshots = self.collect_blocked_alert_snapshots();
+        self.blocked_alert
+            .evict_missing_panes(snapshots.iter().map(|s| s.pane_id));
+        let config = self.state.config.checks.blocked_alert;
+        let fires = self.blocked_alert.evaluate(now, &config, &snapshots);
+        if fires.is_empty() {
+            return false;
+        }
+        for fire in fires {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::CheckFired,
+                data: crate::api::schema::EventData::CheckFired {
+                    name: crate::checks::BLOCKED_ALERT_CHECK_NAME.to_string(),
+                    episode: fire.episode.clone(),
+                },
+            });
+            self.dispatch_blocked_alert_notify(&fire);
+        }
+        true
+    }
+
+    pub(super) fn collect_blocked_alert_snapshots_public(
+        &self,
+    ) -> Vec<crate::checks::BlockedPaneSnapshot> {
+        self.collect_blocked_alert_snapshots()
+    }
+
+    fn collect_blocked_alert_snapshots(&self) -> Vec<crate::checks::BlockedPaneSnapshot> {
+        let mut out = Vec::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for detail in ws.pane_details(&self.state.terminals) {
+                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(public_pane_id) = self.public_pane_id(ws_idx, detail.pane_id) else {
+                    continue;
+                };
+                out.push(crate::checks::BlockedPaneSnapshot {
+                    pane_id: detail.pane_id,
+                    public_pane_id,
+                    label: detail.label,
+                    status,
+                    state_changed_at: detail.state_changed_at,
+                });
+            }
+        }
+        out
+    }
+
+    /// Run the built-in idle-hibernation fold and dispatch each candidate
+    /// through `App::hibernate_pane`. Failures (no resume plan, etc.) emit
+    /// a durable `CheckErrored` and mark the pane's episode as errored so
+    /// the fold does NOT retry it hot.
+    pub(crate) fn evaluate_hibernation_check(&mut self, now: Instant) -> bool {
+        if !self.state.config.checks.hibernation.enable {
+            return false;
+        }
+        let snapshots = self.collect_hibernation_snapshots();
+        self.hibernation_check
+            .evict_missing_panes(snapshots.iter().map(|s| s.pane_id));
+        let config = self.state.config.checks.hibernation;
+        let candidates = self.hibernation_check.evaluate(now, &config, &snapshots);
+        if candidates.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for candidate in candidates {
+            let ws_idx = match self.find_pane(candidate.pane_id) {
+                Some((ws_idx, _)) => ws_idx,
+                None => continue,
+            };
+            match self.hibernate_pane(ws_idx, candidate.pane_id) {
+                Ok(_) => {
+                    changed = true;
+                }
+                Err(err) => {
+                    // Mark the episode errored so we don't retry hot on the
+                    // very next tick — the next state change on the pane
+                    // resets the guard.
+                    self.hibernation_check
+                        .mark_errored(candidate.pane_id, candidate.state_changed_at);
+                    self.event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::CheckErrored,
+                        data: crate::api::schema::EventData::CheckErrored {
+                            name: crate::checks::HIBERNATION_CHECK_NAME.to_string(),
+                            reason: format!(
+                                "pane_id={} {}",
+                                candidate.pane_id.raw(),
+                                err.message()
+                            ),
+                        },
+                    });
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn collect_hibernation_snapshots(&self) -> Vec<crate::checks::HibernationPaneSnapshot> {
+        let mut out = Vec::new();
+        for ws in &self.state.workspaces {
+            for detail in ws.pane_details(&self.state.terminals) {
+                let pane_state = ws.pane_state(detail.pane_id);
+                let terminal =
+                    pane_state.and_then(|p| self.state.terminals.get(&p.attached_terminal_id));
+                let already_hibernated =
+                    terminal.is_some_and(|t| t.hibernated_resume_plan.is_some());
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal.expect("terminal for live pane"),
+                    detail.seen,
+                );
+                out.push(crate::checks::HibernationPaneSnapshot {
+                    pane_id: detail.pane_id,
+                    status,
+                    state_changed_at: detail.state_changed_at,
+                    already_hibernated,
+                });
+            }
+        }
+        out
+    }
+
+    /// #175 C4: poll gh for open issues on the configured repos, evaluate
+    /// each body's `flk-trigger` block against the owner gate + dedupe, and
+    /// dispatch every `Fire` through the same Notify path script checks
+    /// use. On error, post a `gh issue comment` back on the issue.
+    pub(crate) fn poll_issue_guard(&mut self, now: Instant) -> bool {
+        let config = self.state.config.checks.issue_guard.clone();
+        if !config.enable {
+            return false;
+        }
+        if !self.issue_guard.poll_due(now) {
+            return false;
+        }
+        self.issue_guard.arm_next_poll(now, &config);
+        if config.repos.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for repo in &config.repos {
+            let issues = match fetch_open_issues(&config.gh_bin, repo, config.max_issues) {
+                Ok(issues) => issues,
+                Err(err) => {
+                    // gh failure surfaces as a `CheckErrored` for the guard —
+                    // never a silent pass. The guard state persists across
+                    // ticks, so we retry on the next cadence.
+                    self.event_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::CheckErrored,
+                        data: crate::api::schema::EventData::CheckErrored {
+                            name: crate::checks::ISSUE_GUARD_CHECK_NAME.to_string(),
+                            reason: format!("gh issue list on {repo} failed: {err}"),
+                        },
+                    });
+                    changed = true;
+                    continue;
+                }
+            };
+            for issue in issues {
+                match self.issue_guard.evaluate(repo, &issue, &config) {
+                    crate::checks::IssueGuardOutcome::NoTrigger => {}
+                    crate::checks::IssueGuardOutcome::Deduped { .. } => {}
+                    crate::checks::IssueGuardOutcome::Ignored { reason } => {
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerIgnored,
+                            data: crate::api::schema::EventData::TriggerIgnored {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                reason,
+                            },
+                        });
+                        changed = true;
+                    }
+                    crate::checks::IssueGuardOutcome::Errored { reason } => {
+                        // Best-effort comment-back so the owner sees the
+                        // trigger's failure on the issue itself; capture
+                        // any comment failure into the durable event's
+                        // reason so nothing goes silent.
+                        let comment_note =
+                            match post_error_comment(&config.gh_bin, repo, issue.number, &reason) {
+                                Ok(()) => String::new(),
+                                Err(err) => format!(" (gh comment failed: {err})"),
+                            };
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerErrored,
+                            data: crate::api::schema::EventData::TriggerErrored {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                reason: format!("{reason}{comment_note}"),
+                            },
+                        });
+                        changed = true;
+                    }
+                    crate::checks::IssueGuardOutcome::Fire { dedupe_key, block } => {
+                        let action_label = match &block.action {
+                            crate::checks::ActionSpec::Notify { .. } => "notify",
+                            crate::checks::ActionSpec::Event { .. } => "event",
+                        };
+                        self.event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::TriggerFired,
+                            data: crate::api::schema::EventData::TriggerFired {
+                                repo: repo.clone(),
+                                issue: issue.number,
+                                dedupe_key: dedupe_key.clone(),
+                                action: action_label.to_string(),
+                            },
+                        });
+                        self.dispatch_issue_guard_action(repo, issue.number, &block, &dedupe_key);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn dispatch_issue_guard_action(
+        &mut self,
+        repo: &str,
+        issue: u64,
+        block: &crate::checks::TriggerBlock,
+        dedupe_key: &str,
+    ) {
+        use crate::api::schema::NotificationShowParams;
+        if let crate::checks::ActionSpec::Notify { title, sound } = &block.action {
+            let title = if title.is_empty() {
+                format!("issue trigger: {repo}#{issue}")
+            } else {
+                title.clone()
+            };
+            let params = NotificationShowParams {
+                title,
+                body: Some(format!("{repo}#{issue} — {dedupe_key}")),
+                position: None,
+                sound: *sound,
+            };
+            let request_id = format!("trigger:{dedupe_key}");
+            let _ = self.handle_api_request_after_internal_events_drained(
+                crate::api::schema::Request {
+                    id: request_id,
+                    method: crate::api::schema::Method::NotificationShow(params),
+                },
+            );
+        }
+    }
+
+    fn dispatch_blocked_alert_notify(&mut self, fire: &crate::checks::BlockedAlertFire) {
+        use crate::api::schema::{NotificationShowParams, NotificationShowSound};
+        let duration = crate::checks::format_blocked_duration(fire.duration_secs);
+        let title = format!("agent blocked {duration}: {}", fire.label);
+        let params = NotificationShowParams {
+            title,
+            body: Some(format!(
+                "pane {} — episode {}",
+                fire.public_pane_id, fire.episode
+            )),
+            position: None,
+            sound: NotificationShowSound::Request,
+        };
+        let request_id = format!("check:{}", fire.episode);
+        let _ =
+            self.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: request_id,
+                method: crate::api::schema::Method::NotificationShow(params),
+            });
+    }
+}
+
+/// Argv-form `gh issue list --repo <repo> --state open --json body,author,number,updatedAt`.
+/// Returns the parsed issues; every error path is a `Result::Err` so the
+/// caller can surface a `CheckErrored` instead of silently passing.
+fn fetch_open_issues(
+    gh_bin: &str,
+    repo: &str,
+    max_issues: u32,
+) -> Result<Vec<crate::checks::GhIssue>, String> {
+    let output = crate::process::TracedCommand::new(gh_bin, "checks")
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "body,author,number,updatedAt",
+            "--limit",
+            &max_issues.to_string(),
+        ])
+        .output_traced()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let issues: Vec<crate::checks::GhIssue> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("gh JSON parse failed: {err}"))?;
+    Ok(issues)
+}
+
+fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Result<(), String> {
+    let body = format!(
+        "flock issue-guard could not parse the `flk-trigger` block: {reason}\n\n\
+         Fix the block or remove it — no trigger will fire until it is valid."
+    );
+    let output = crate::process::TracedCommand::new(gh_bin, "checks")
+        .args([
+            "issue",
+            "comment",
+            &issue.to_string(),
+            "--repo",
+            repo,
+            "--body",
+            &body,
+        ])
+        .output_traced()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh comment exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn deduplicate_git_refresh_items(
@@ -766,6 +1294,9 @@ mod tests {
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
         app.last_git_remote_status_refresh = now - super::super::GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+        // #175 C2: blocked-alert arms the checks heartbeat by default; clear
+        // it so the "only the git-refresh deadline" invariant still holds.
+        app.checks_heartbeat_deadline = None;
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, false),
@@ -1047,5 +1578,259 @@ mod tests {
             .pending_agent_resume_plan
             .is_some());
         assert!(app.pending_agent_resume_deadline.is_none());
+    }
+
+    /// #175 phase 4 end-to-end: a `[[checks.script]]` fixture wired through
+    /// the App tick emits `CheckRan { outcome = "fire" }` and (with
+    /// `debounce = 1`) a `CheckFired` on the event hub.
+    #[tokio::test]
+    async fn check_runner_ticks_emit_ran_and_fired_events_on_hub() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fixture script: exit 0 → Fire on the runner's classification.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flock-checks-runtime-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fire.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.min_tick_secs = 1;
+        config.checks.heartbeat_secs = 3600;
+        config.checks.scripts = vec![crate::checks::config::ScriptCheck {
+            name: "e2e".into(),
+            program: script_path.clone(),
+            interval_secs: 1,
+            timeout_secs: 5,
+            debounce: 1,
+            on_fire: crate::checks::ActionSpec::Event {
+                label: "e2e-fired".into(),
+            },
+            ..crate::checks::config::ScriptCheck::default()
+        }];
+        let event_hub = crate::api::EventHub::default();
+        let mut app = super::super::App::new(&config, true, None, api_rx, event_hub.clone());
+
+        // Force the runner past its first-tick warmup.
+        app.checks_runner
+            .force_due("e2e", Instant::now() - Duration::from_millis(1));
+        app.checks_next_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // Tick: dispatches the check on a worker thread.
+        assert!(app.dispatch_due_script_checks(Instant::now()));
+
+        // Wait for the worker's `AppEvent::CheckCompleted` (fixture script
+        // is `exit 0` — should return within a few hundred ms). We poll the
+        // App's event channel and hand each event to the shared handler,
+        // stopping once the hub carries the CheckRan event.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(ev) = app.event_rx.try_recv() {
+                app.handle_internal_event(ev);
+            }
+            let events = app.event_hub.events_after(0);
+            let has_ran = events.iter().any(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckRan { name, outcome, .. }
+                        if name == "e2e" && outcome == "fire"
+                )
+            });
+            if has_ran {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let events = app.event_hub.events_after(0);
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::CheckRan { name, outcome, .. }
+                    if name == "e2e" && outcome == "fire"
+            )),
+            "expected CheckRan(fire) on the hub, got: {:?}",
+            events
+        );
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::CheckFired { name, .. } if name == "e2e"
+            )),
+            "expected CheckFired(e2e) on the hub, got: {:?}",
+            events
+        );
+        assert_eq!(app.checks_run_count, 1);
+        assert_eq!(app.checks_error_count, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Heartbeat: when the window elapses, `ChecksHeartbeat` lands on the
+    /// hub carrying the current run/error counts.
+    #[tokio::test]
+    async fn check_runner_heartbeat_emits_when_window_elapses() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.heartbeat_secs = 1;
+        let event_hub = crate::api::EventHub::default();
+        let mut app = super::super::App::new(&config, true, None, api_rx, event_hub.clone());
+
+        app.force_checks_heartbeat_now();
+        assert!(app.dispatch_due_script_checks(Instant::now()));
+
+        let events = app.event_hub.events_after(0);
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::ChecksHeartbeat { .. }
+            )),
+            "expected ChecksHeartbeat on the hub, got: {:?}",
+            events
+        );
+    }
+
+    /// #175 C2: the built-in blocked-alert fold fires a `CheckFired` durable
+    /// event ONCE per Blocked episode past the threshold, and never for a
+    /// pane below the threshold.
+    #[test]
+    fn blocked_alert_fires_once_per_episode_via_app_tick() {
+        use crate::detect::{Agent, AgentState};
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 30;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let ws = Workspace::test_new("main");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        let now = Instant::now();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(now - Duration::from_secs(120));
+        }
+
+        assert!(app.evaluate_blocked_alert(now));
+        let fires_after_first: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(fires_after_first.len(), 1, "first evaluation must fire");
+
+        // Same episode, another tick — no new fire.
+        assert!(!app.evaluate_blocked_alert(now + Duration::from_secs(1)));
+        let fires_after_second: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(fires_after_second.len(), 1, "same episode must not re-fire");
+
+        // Re-block with a fresh state_changed_at → NEW episode fires.
+        let later = now + Duration::from_secs(600);
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.state_changed_at = Some(now + Duration::from_secs(60));
+        }
+        // Reset the fold's fired mark by evaluating an Idle tick.
+        let _ = app.evaluate_blocked_alert(now + Duration::from_secs(90));
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+            terminal.state_changed_at = Some(later - Duration::from_secs(120));
+        }
+        assert!(app.evaluate_blocked_alert(later));
+        let fires_after_reblock: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::CheckFired { name, .. }
+                        if name == crate::checks::BLOCKED_ALERT_CHECK_NAME
+                )
+            })
+            .collect();
+        assert_eq!(
+            fires_after_reblock.len(),
+            2,
+            "re-block must emit a fresh CheckFired"
+        );
+    }
+
+    /// A pane whose Blocked age hasn't crossed the threshold does not fire.
+    #[test]
+    fn blocked_alert_below_threshold_never_fires_via_app() {
+        use crate::detect::{Agent, AgentState};
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 3_600;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let ws = Workspace::test_new("main");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        let now = Instant::now();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+        terminal.state_changed_at = Some(now - Duration::from_secs(60));
+        assert!(!app.evaluate_blocked_alert(now));
+    }
+
+    /// Kill switch: `checks.enable = false` clears both deadlines and never
+    /// spawns work.
+    #[test]
+    fn check_runner_disabled_never_ticks() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.enable = false;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.checks_next_deadline = Some(Instant::now());
+        app.checks_heartbeat_deadline = Some(Instant::now());
+        assert!(!app.dispatch_due_script_checks(Instant::now()));
+        assert!(app.checks_next_deadline.is_none());
+        assert!(app.checks_heartbeat_deadline.is_none());
     }
 }

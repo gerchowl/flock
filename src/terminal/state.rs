@@ -118,6 +118,12 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// #175 C3: stashed resume plan for a pane the operator (or the
+    /// hibernation check) parked. When set, the pane's child has been asked
+    /// to exit; on child exit the pane is KEPT (no PaneClosed, no respawn),
+    /// and the next focus / explicit `agent.resume` respawns the argv into
+    /// the same pane and terminal.
+    pub hibernated_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
 }
 
 impl TerminalState {
@@ -150,6 +156,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             pending_agent_resume_plan: None,
+            hibernated_resume_plan: None,
         }
     }
 
@@ -916,6 +923,7 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.pending_agent_resume_plan = None;
+        self.hibernated_resume_plan = None;
         self.clear_agent_name();
     }
 

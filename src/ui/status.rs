@@ -266,7 +266,9 @@ pub(crate) fn remote_state(status: crate::api::schema::AgentStatus) -> (AgentSta
         AgentStatus::Blocked => (AgentState::Blocked, true),
         AgentStatus::Working => (AgentState::Working, true),
         AgentStatus::Done => (AgentState::Idle, false),
-        AgentStatus::Idle => (AgentState::Idle, true),
+        // #175 C3: hibernated renders as a settled seen state — the pane is
+        // idle from the fleet's perspective until the next focus/resume.
+        AgentStatus::Idle | AgentStatus::Hibernated => (AgentState::Idle, true),
         AgentStatus::Unknown => (AgentState::Unknown, true),
     }
 }

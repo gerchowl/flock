@@ -74,6 +74,10 @@ pub enum Method {
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.fork")]
     AgentFork(AgentForkParams),
+    #[serde(rename = "agent.hibernate")]
+    AgentHibernate(AgentTarget),
+    #[serde(rename = "agent.resume")]
+    AgentResume(AgentTarget),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
     #[serde(rename = "msg.send")]
@@ -132,6 +136,38 @@ pub enum Method {
     IntegrationInstall(IntegrationInstallParams),
     #[serde(rename = "integration.uninstall")]
     IntegrationUninstall(IntegrationUninstallParams),
+    /// #175 phase 4 CLI surface: list runner + built-in check states.
+    #[serde(rename = "checks.list")]
+    ChecksList(EmptyParams),
+    /// Suppress fires from a named check for the next debounce window
+    /// (script checks) or for the current in-flight episodes (built-in).
+    #[serde(rename = "checks.ack")]
+    ChecksAck(ChecksNamedTarget),
+    /// Force a named script check to run right now, out of cadence.
+    #[serde(rename = "checks.run")]
+    ChecksRun(ChecksNamedTarget),
+}
+
+/// Target for `checks.ack` / `checks.run`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksNamedTarget {
+    pub name: String,
+}
+
+/// One row in `checks.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChecksListEntry {
+    pub name: String,
+    /// One of `script`, `blocked_alert`, `hibernation`, `issue_guard`.
+    pub kind: String,
+    /// `enabled` / `disabled` / `errored` — a coarse human-readable state.
+    pub state: String,
+    /// Consecutive Fire outcomes (script checks only; 0 for built-ins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_fails: Option<u32>,
+    /// Last outcome string (`fire` / `pass` / `error`) or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -954,6 +990,22 @@ pub enum EventKind {
     MessageQueued,
     MessageDelivered,
     MessageReplied,
+    /// #175 phase 4 check-runner telemetry.
+    CheckRan,
+    CheckFired,
+    CheckErrored,
+    ChecksHeartbeat,
+    /// #175 C3: hibernation lifecycle. `AgentHibernated` fires once when a
+    /// pane transitions to hibernated (child asked to exit + resume plan
+    /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
+    AgentHibernated,
+    AgentResumedFromHibernation,
+    /// #175 C4 issue-guard: `TriggerFired` on a matched owner-authored
+    /// trigger, `TriggerIgnored` on a non-owner post (audit trail),
+    /// `TriggerErrored` on a bad fence / YAML.
+    TriggerFired,
+    TriggerIgnored,
+    TriggerErrored,
 }
 
 impl EventKind {
@@ -983,7 +1035,16 @@ impl EventKind {
             | Self::AgentForked
             | Self::MessageQueued
             | Self::MessageDelivered
-            | Self::MessageReplied => true,
+            | Self::MessageReplied
+            | Self::CheckRan
+            | Self::CheckFired
+            | Self::CheckErrored
+            | Self::ChecksHeartbeat
+            | Self::AgentHibernated
+            | Self::AgentResumedFromHibernation
+            | Self::TriggerFired
+            | Self::TriggerIgnored
+            | Self::TriggerErrored => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1177,6 +1238,10 @@ pub enum ResponseResult {
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
+    },
+    /// #175 phase 4: reply for `checks.list`.
+    ChecksList {
+        checks: Vec<ChecksListEntry>,
     },
     Ok {},
 }
@@ -1518,6 +1583,73 @@ pub enum EventData {
         reply_latency_ms: u64,
         round_trips: u32,
     },
+    /// #175 phase 4 check-runner: one script check completed.
+    /// `outcome` is one of `"fire"`, `"pass"`, or `"error"`.
+    CheckRan {
+        name: String,
+        outcome: String,
+        duration_ms: u64,
+    },
+    /// #175 phase 4 check-runner: a check crossed its debounce and the
+    /// runner emitted a FireDecision this episode.
+    CheckFired {
+        name: String,
+        episode: String,
+    },
+    /// #175 phase 4 check-runner: the last outcome was Error; the runner
+    /// leaves the debounce counter untouched but records the reason.
+    CheckErrored {
+        name: String,
+        reason: String,
+    },
+    /// #175 phase 4 check-runner: periodic liveness ping. `runs` and
+    /// `errors` are lifetime counters from the App's process start.
+    ChecksHeartbeat {
+        runs: u64,
+        errors: u64,
+    },
+    /// #175 C3: a pane's agent process has been asked to exit and its resume
+    /// plan is stashed on the pane; the next focus (or explicit
+    /// `agent.resume`) respawns it into the same pane.
+    AgentHibernated {
+        pane_id: String,
+        workspace_id: String,
+        agent: String,
+        /// The persisted session identity being hibernated, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    /// #175 C3: the stashed resume plan has been spawned back into the pane.
+    AgentResumedFromHibernation {
+        pane_id: String,
+        workspace_id: String,
+        agent: String,
+    },
+    /// #175 C4 issue-guard: an owner-authored `flk-trigger` block matched
+    /// and dispatched. `dedupe_key` is the same key the runner uses to
+    /// avoid firing twice on a re-poll (run_id when the block sets one,
+    /// hash otherwise).
+    TriggerFired {
+        repo: String,
+        issue: u64,
+        dedupe_key: String,
+        action: String,
+    },
+    /// #175 C4 issue-guard: a non-owner post; recorded for the audit
+    /// trail but nothing is dispatched.
+    TriggerIgnored {
+        repo: String,
+        issue: u64,
+        reason: String,
+    },
+    /// #175 C4 issue-guard: the body carried a broken `flk-trigger`
+    /// block; a comment was posted back on the issue explaining the
+    /// error (unless `gh comment` itself failed — captured in `reason`).
+    TriggerErrored {
+        repo: String,
+        issue: u64,
+        reason: String,
+    },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
     AgentForked {
@@ -1658,6 +1790,10 @@ pub enum AgentStatus {
     Blocked,
     Done,
     Unknown,
+    /// #175 C3: agent process is gone but a resume plan is stashed on the
+    /// pane; the next focus (or explicit `agent.resume`) respawns it.
+    /// Ranked at the Idle attention tier — hibernated is a settled state.
+    Hibernated,
 }
 
 fn default_true() -> bool {

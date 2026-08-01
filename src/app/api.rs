@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+mod checks;
 mod integrations;
 mod lineage;
 mod messages;
@@ -19,6 +20,10 @@ use crate::events::AppEvent;
 enum RuntimeExitAction {
     RespawnShell,
     ClosePane,
+    /// #175 C3: the pane is hibernated — keep it, do not respawn a shell,
+    /// do not tear it down. The next focus / `agent.resume` respawns the
+    /// stashed argv.
+    HoldHibernated,
 }
 
 /// One background `gh pr view` query of the 120s PR poll: a unique
@@ -318,6 +323,16 @@ impl App {
             return;
         }
 
+        if let AppEvent::CheckCompleted {
+            name,
+            outcome,
+            duration_ms,
+        } = ev
+        {
+            self.handle_check_completed(name, outcome, duration_ms);
+            return;
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             // Floating panes live outside the workspace tree: when their
             // process exits, reap the float here (this handler runs in both
@@ -329,13 +344,25 @@ impl App {
                 self.render_notify.notify_one();
                 return;
             }
-            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
-                && self.respawn_shell_for_launch_pane(*pane_id)
-            {
-                self.overlay_panes.remove(pane_id);
-                self.render_dirty.store(true, Ordering::Release);
-                self.render_notify.notify_one();
-                return;
+            match self.runtime_exit_action(*pane_id) {
+                RuntimeExitAction::RespawnShell => {
+                    if self.respawn_shell_for_launch_pane(*pane_id) {
+                        self.overlay_panes.remove(pane_id);
+                        self.render_dirty.store(true, Ordering::Release);
+                        self.render_notify.notify_one();
+                        return;
+                    }
+                }
+                RuntimeExitAction::HoldHibernated => {
+                    // Drop the dead runtime but KEEP the pane — no
+                    // PaneClosed, no PaneExited event; the pane sits
+                    // hibernated until the next focus/resume.
+                    self.shutdown_detached_terminal_runtimes();
+                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_notify.notify_one();
+                    return;
+                }
+                RuntimeExitAction::ClosePane => {}
             }
         }
 
@@ -600,7 +627,12 @@ impl App {
             return RuntimeExitAction::ClosePane;
         };
 
-        if terminal.respawn_shell_on_exit {
+        // #175 C3: hibernation wins over the respawn-shell path. The stashed
+        // resume plan means the child died BECAUSE we asked it to; keeping
+        // the pane empty is the whole point.
+        if terminal.hibernated_resume_plan.is_some() {
+            RuntimeExitAction::HoldHibernated
+        } else if terminal.respawn_shell_on_exit {
             RuntimeExitAction::RespawnShell
         } else {
             RuntimeExitAction::ClosePane
@@ -864,6 +896,10 @@ impl App {
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentFork(params) => return self.handle_agent_fork(request.id, params),
+            Method::AgentHibernate(target) => {
+                return self.handle_agent_hibernate(request.id, target)
+            }
+            Method::AgentResume(target) => return self.handle_agent_resume(request.id, target),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
@@ -918,6 +954,9 @@ impl App {
             Method::IntegrationUninstall(params) => {
                 return self.handle_integration_uninstall(request.id, params);
             }
+            Method::ChecksList(_) => return self.handle_checks_list(request.id),
+            Method::ChecksAck(target) => return self.handle_checks_ack(request.id, target),
+            Method::ChecksRun(target) => return self.handle_checks_run(request.id, target),
             _ => {
                 return responses::encode_error(
                     request.id,

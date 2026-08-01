@@ -39,6 +39,19 @@ impl App {
         self.state
             .focus_pane_in_workspace(resolved.ws_idx, resolved.pane_id);
         self.state.mode = Mode::Terminal;
+        // #175 C3: focusing a hibernated pane wakes it up — best-effort so a
+        // pane that isn't ready to spawn (e.g. no terminal area yet) just
+        // stays hibernated until the next focus.
+        if self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|ws| ws.pane_state(resolved.pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .is_some_and(|terminal| terminal.hibernated_resume_plan.is_some())
+        {
+            let _ = self.resume_hibernated_pane(resolved.ws_idx, resolved.pane_id);
+        }
         self.agent_info(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(|| TerminalTargetError::NotFound {
                 target: target.to_string(),
@@ -396,7 +409,7 @@ impl App {
         Ok((ws_idx, result.0, result.1.pane_id))
     }
 
-    fn agent_info(
+    pub(super) fn agent_info(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,

@@ -28,6 +28,7 @@ mod agent_submit;
 mod api;
 mod app;
 mod build_info;
+mod checks;
 mod checksum;
 mod cli;
 mod client;

@@ -345,6 +345,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentFork(_) => "agent.fork",
+        Method::AgentHibernate(_) => "agent.hibernate",
+        Method::AgentResume(_) => "agent.resume",
         Method::AgentLineage(_) => "agent.lineage",
         Method::MsgSend(_) => "msg.send",
         Method::MsgReply(_) => "msg.reply",
@@ -374,6 +376,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
+        Method::ChecksList(_) => "checks.list",
+        Method::ChecksAck(_) => "checks.ack",
+        Method::ChecksRun(_) => "checks.run",
     }
 }
 

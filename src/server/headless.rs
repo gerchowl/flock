@@ -3243,6 +3243,10 @@ impl HeadlessServer {
             changed = true;
         }
 
+        // #175 phase 4 dual-loop rule: the headless server ticks the same
+        // check-runner path as the TUI runtime.
+        changed |= self.app.dispatch_due_script_checks(now);
+
         if geometry_dirty || self.foreground_client_id.is_none() {
             self.app.pending_agent_resume_deadline = None;
         } else {
@@ -4456,6 +4460,9 @@ next_tab = ""
             .state
             .workspaces
             .push(crate::workspace::Workspace::test_new("test"));
+        // #175 C2: silence the blocked-alert heartbeat so the git-refresh
+        // enablement invariant is the only thing under test.
+        server.app.checks_heartbeat_deadline = None;
         let (writer, _control_rx, _render_rx) = test_client_writer();
 
         assert!(server.handle_server_event(ServerEvent::ClientConnected {
@@ -4492,6 +4499,9 @@ next_tab = ""
             .state
             .workspaces
             .push(crate::workspace::Workspace::test_new("test"));
+        // #175 C2: silence the blocked-alert heartbeat so the git-refresh
+        // enablement invariant is the only thing under test.
+        server.app.checks_heartbeat_deadline = None;
         let (writer, _control_rx, _render_rx) = test_client_writer();
 
         assert!(server.handle_server_event(ServerEvent::ClientConnected {

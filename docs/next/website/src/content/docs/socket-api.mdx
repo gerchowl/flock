@@ -74,8 +74,9 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.lineage` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
 | Message | `msg.send`, `msg.reply`, `msg.list` |
+| Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
@@ -113,7 +114,26 @@ Remove a linked checkout:
 {"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1"}}
 ```
 
-`agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
+`agent.hibernate` parks a pane: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. `AgentStatus::Hibernated` appears on the record and a durable `agent_hibernated` event is emitted. Panes without a resumable session are refused with `hibernate_unsupported` (data-loss guard); a pane that is already hibernated returns `already_hibernated`. `agent.resume` respawns the stashed argv into the same terminal and clears the plan (`not_hibernated` if the pane is not parked); the next `focus` of a hibernated pane triggers the same resume implicitly. Both verbs emit durable events (`agent_hibernated`, `agent_resumed_from_hibernation`).
+
+```json
+{"id":"req_h","method":"agent.hibernate","params":{"target":"1-1"}}
+{"id":"req_r","method":"agent.resume","params":{"target":"1-1"}}
+```
+
+`checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
+
+`agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone.
+
+## Checks
+
+The check runner is per-host, driven from the same App tick as everything else — no separate thread. Every completed run emits a durable `check_ran { name, outcome, duration_ms }` event (`outcome` ∈ `fire`, `pass`, `error`); the runner also emits `check_fired { name, episode }` when a check crosses its debounce, `check_errored { name, reason }` on mechanical failures, and `checks_heartbeat { runs, errors }` on a periodic cadence. Script checks classify by exit code (0 = Fire, non-zero = Pass, timeout / signal / spawn failure = Error). Script programs must be absolute paths or live under `~/.flock/checks/` — anything else is refused at config time.
+
+Built-in checks:
+
+- **`blocked_alert`** — pure fold, on by default. Fires once per Blocked episode per pane past `threshold_secs` (default 30m). Re-blocking is a fresh episode. Dispatches through the same notification path scripts use.
+- **`hibernation`** — pure fold, OFF by default. Selects Idle-past-`idle_threshold_secs` or Done-past-`done_threshold_secs` panes and dispatches `agent.hibernate` server-side. Never touches Blocked / Working / Unknown / Idle-unseen. Failures (no resume plan) emit `check_errored` once per episode.
+- **`issue_guard`** — polls the configured GitHub repos via the `gh` CLI, parses a `flk-trigger` fenced block from ISSUE BODIES only (never comments), and dispatches the trigger's action when the author matches the configured `owner`. Non-owner bodies are audited via `trigger_ignored`; broken blocks emit `trigger_errored` and post a comment back on the issue. Dedupe by `run_id` (when set on the block) or hash of the body; the dedupe set persists across server restarts by seeding from the durable log's `trigger_fired` events. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
