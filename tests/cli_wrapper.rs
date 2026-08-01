@@ -2279,8 +2279,11 @@ fn agent_fork_command_refuses_cleanly_over_the_socket() {
     let usage = run_cli(&socket_path, &["agent", "fork"]);
     assert_eq!(usage.status.code(), Some(2));
 
-    let listed = run_cli_json(&socket_path, &["agent", "list"]);
-    assert_eq!(listed["result"]["agents"].as_array().unwrap().len(), 1);
+    // Nothing spawned: still exactly the one workspace we created. (A plain
+    // shell pane has no agent identity, so `agent list` is empty here — the
+    // workspace count is the right "no fork happened" signal.)
+    let listed = run_cli_json(&socket_path, &["workspace", "list"]);
+    assert_eq!(listed["result"]["workspaces"].as_array().unwrap().len(), 1);
 
     cleanup_spawned_flock(flock, base);
 }
