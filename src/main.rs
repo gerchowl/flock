@@ -38,6 +38,8 @@ mod config;
 // here so `just test` picks up its unit tests without waiting on the digest.
 mod costs;
 mod detect;
+// #175 phase 5 / S3 commit 2: morning digest rendered from the durable log.
+mod digest;
 mod events;
 mod ghostty;
 mod handoff_runtime;

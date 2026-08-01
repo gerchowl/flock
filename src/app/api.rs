@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 mod agents;
 mod checks;
+mod digest;
 mod integrations;
 mod lineage;
 mod messages;
@@ -957,6 +958,7 @@ impl App {
             Method::ChecksList(_) => return self.handle_checks_list(request.id),
             Method::ChecksAck(target) => return self.handle_checks_ack(request.id, target),
             Method::ChecksRun(target) => return self.handle_checks_run(request.id, target),
+            Method::DigestRender(params) => return self.handle_digest_render(request.id, params),
             _ => {
                 return responses::encode_error(
                     request.id,

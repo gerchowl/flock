@@ -269,6 +269,20 @@ pub enum ActionSpec {
     /// Emit a durable `CheckFired { episode: <label> }` event and nothing
     /// else — a hook point for external listeners.
     Event { label: String },
+    /// #175 phase 5 / S3 commit 2: fold the durable event log into a
+    /// self-contained HTML digest and write it under `session::data_dir()`.
+    /// `path_template` accepts the `{date}` placeholder (YYYY-MM-DD).
+    /// P1: no LLM in the loop — the fold is pure.
+    WriteDigest {
+        /// Path relative to `session::data_dir()/digest/`, or absolute.
+        /// `{date}` expands to the local YYYY-MM-DD at run time.
+        #[serde(default = "default_digest_path_template")]
+        path_template: String,
+    },
+}
+
+fn default_digest_path_template() -> String {
+    "{date}.html".to_string()
 }
 
 impl Default for ActionSpec {

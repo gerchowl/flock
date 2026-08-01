@@ -146,6 +146,25 @@ pub enum Method {
     /// Force a named script check to run right now, out of cadence.
     #[serde(rename = "checks.run")]
     ChecksRun(ChecksNamedTarget),
+    /// #175 phase 5 / S3 commit 2: fold the durable event log into a
+    /// self-contained HTML digest and write it under `data_dir()/digest/`.
+    #[serde(rename = "digest.render")]
+    DigestRender(DigestRenderParams),
+}
+
+/// `digest.render` params. Every field is optional so `{}` triggers the
+/// default (last 24h, `data_dir()/digest/<today>.html`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DigestRenderParams {
+    /// Filter events with `ts_ms >= since_ms`. Omitted = "everything".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Path template (accepts `{date}`). Omitted = `{date}.html`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_template: Option<String>,
+    /// Absolute path or path relative to `data_dir()/digest/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Target for `checks.ack` / `checks.run`.
@@ -1250,6 +1269,15 @@ pub enum ResponseResult {
     /// #175 phase 4: reply for `checks.list`.
     ChecksList {
         checks: Vec<ChecksListEntry>,
+    },
+    /// #175 S3 commit 2: reply for `digest.render`.
+    DigestRendered {
+        /// Absolute path of the written HTML file.
+        path: String,
+        /// Total events considered (post-`since_ms` filter).
+        events_considered: u64,
+        /// The `YYYY-MM-DD` used for the header + filename expansion.
+        generated_for_date: String,
     },
     Ok {},
 }

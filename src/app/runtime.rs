@@ -783,6 +783,19 @@ impl App {
                 // No-op: the CheckFired event above IS the dispatch.
                 // A follow-up commit can enrich it with the label.
             }
+            ActionSpec::WriteDigest { path_template } => {
+                // #175 S3 commit 2: cron-scheduled digest emission. Pure
+                // fold over the durable log — no LLM, no shell. Failures
+                // are LOG-ONLY on purpose: the CheckFired event above is
+                // already on the durable log; a filesystem hiccup should
+                // not error the check episode.
+                if let Err(err) = self.write_scheduled_digest(path_template) {
+                    crate::logging::event_log_write_failed(&format!(
+                        "digest write failed for {}: {err}",
+                        decision.name
+                    ));
+                }
+            }
         }
     }
 
@@ -1016,6 +1029,37 @@ impl App {
         }
     }
 
+    /// Fold the durable log into a self-contained HTML digest and write it
+    /// under `session::data_dir()/digest/`. Deterministic — see
+    /// `crate::digest::render`.
+    fn write_scheduled_digest(&self, path_template: &str) -> std::io::Result<std::path::PathBuf> {
+        let events = self.event_hub.persisted_events_after(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        // Local YYYY-MM-DD; no external date crates — we only need days.
+        let date = crate::digest::local_ymd_utc(now_ms);
+        let opts = crate::digest::RenderOptions {
+            since_ms: 0,
+            generated_for_date: &date,
+            since_label: "epoch",
+        };
+        let html =
+            crate::digest::render(events.iter().map(|(seq, ts, env)| (*seq, *ts, env)), &opts);
+        let expanded = crate::digest::expand_path_template(path_template, &date);
+        let resolved = if std::path::Path::new(&expanded).is_absolute() {
+            std::path::PathBuf::from(&expanded)
+        } else {
+            crate::session::data_dir().join("digest").join(&expanded)
+        };
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&resolved, html)?;
+        Ok(resolved)
+    }
+
     /// Helper used by tests to force a heartbeat now.
     #[cfg(test)]
     pub(crate) fn force_checks_heartbeat_now(&mut self) {
@@ -1227,6 +1271,7 @@ impl App {
                         let action_label = match &block.action {
                             crate::checks::ActionSpec::Notify { .. } => "notify",
                             crate::checks::ActionSpec::Event { .. } => "event",
+                            crate::checks::ActionSpec::WriteDigest { .. } => "write_digest",
                         };
                         self.event_hub.push(crate::api::schema::EventEnvelope {
                             event: crate::api::schema::EventKind::TriggerFired,
