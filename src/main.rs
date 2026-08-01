@@ -43,6 +43,7 @@ mod ipc;
 mod kitty_graphics;
 mod layout;
 mod logging;
+mod mcp;
 mod pane;
 mod peers;
 mod persist;
