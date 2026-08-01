@@ -337,14 +337,15 @@ impl App {
         }
     }
 
-    /// Deliver queued messages to every pane that just settled Idle→Done
-    /// (#175 M1/M2). MUST be called by BOTH event loops right after
-    /// `commit_settled_completions` (the #25 dual-loop lesson): the TUI
-    /// runtime tick and the headless server tick.
-    pub(crate) fn deliver_settled_messages(
-        &mut self,
-        settled: &[crate::app::actions::PaneStateUpdate],
-    ) {
+    /// Deliver queued messages to every recipient pane that is Idle and has
+    /// dwelled past the attention settle (#175 M1/M2). Polled from the
+    /// scheduled tick of BOTH event loops (the #25 dual-loop lesson) rather
+    /// than hooked on the Idle→Done completion edge: that edge only commits
+    /// while a completion stays UNSEEN, so any read (API poll, operator
+    /// glance) swallowed it and stranded the mailbox — live-e2e finding.
+    /// Dwell-gating also delivers to a recipient that was already idle when
+    /// the message arrived, instead of waiting for its next unrelated turn.
+    pub(crate) fn deliver_due_messages(&mut self, now_instant: std::time::Instant) {
         let now = now_ms();
         for expired in self.mailboxes.expire(now) {
             self.emit_event(EventEnvelope {
@@ -358,12 +359,31 @@ impl App {
                 },
             });
         }
-        for update in settled {
-            let Some(public) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+        for public in self.mailboxes.queued_pane_ids() {
+            let Ok(resolved) = self.resolve_terminal_target(&public) else {
                 continue;
             };
+            let (ws_idx, pane_id) = (resolved.ws_idx, resolved.pane_id);
+            // Turn-boundary gate: Idle, and settled long enough that this is
+            // a real boundary rather than a between-chunks flicker (§8.3).
+            let at_boundary = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.pane_state(pane_id))
+                .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                .is_some_and(|terminal| {
+                    terminal.state == crate::detect::AgentState::Idle
+                        && terminal.state_changed_at.is_some_and(|changed_at| {
+                            now_instant.duration_since(changed_at)
+                                >= crate::app::actions::ATTENTION_SETTLE
+                        })
+                });
+            if !at_boundary {
+                continue;
+            }
             while let Some(mut message) = self.mailboxes.pop_next(&public) {
-                match self.try_deliver_message(update.ws_idx, update.pane_id, &message) {
+                match self.try_deliver_message(ws_idx, pane_id, &message) {
                     Ok(generic) => {
                         self.mailboxes.record_delivered(&message);
                         self.emit_event(EventEnvelope {
@@ -644,26 +664,33 @@ mod tests {
         assert_eq!(messages[0].correlation_id, "c-list");
         assert_eq!(messages[0].delivery_attempts, 0);
 
-        // Settle the recipient: no agent label on the test terminal, so the
-        // message is HELD (never typed into a bare prompt) with a bumped
-        // attempt count — the §8.3 unknown-agent gate.
+        // Dwell-settled Idle recipient: no agent label on the test
+        // terminal, so the message is HELD (never typed into a bare prompt)
+        // with a bumped attempt count — the §8.3 unknown-agent gate.
         let ws_idx = 1;
         let pane_id = app.state.workspaces[ws_idx].focused_pane_id().unwrap();
-        let update = crate::app::actions::PaneStateUpdate {
-            ws_idx,
-            pane_id,
-            state: crate::detect::AgentState::Idle,
-            seen: false,
-            previous_state: crate::detect::AgentState::Working,
-            previous_seen: true,
-            agent_label: None,
-            known_agent: None,
-            previous_agent_label: None,
-            previous_known_agent: None,
-            presentation: crate::terminal::EffectivePresentation::empty(),
-            previous_presentation: crate::terminal::EffectivePresentation::empty(),
-        };
-        app.deliver_settled_messages(&[update]);
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let now = std::time::Instant::now();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state = crate::detect::AgentState::Idle;
+            terminal.state_changed_at = Some(now - crate::app::actions::ATTENTION_SETTLE * 2);
+        }
+        // A Working recipient is never drained (§8.3 mid-turn guard).
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state = crate::detect::AgentState::Working;
+        }
+        app.deliver_due_messages(now);
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        app.deliver_due_messages(now);
 
         let response = app.handle_api_request(Request {
             id: "req".into(),

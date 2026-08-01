@@ -189,6 +189,15 @@ impl MailboxRegistry {
         EnqueueOutcome::Queued
     }
 
+    /// Recipient pane ids that currently have queued messages.
+    pub(crate) fn queued_pane_ids(&self) -> Vec<String> {
+        self.queues
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(pane, _)| pane.clone())
+            .collect()
+    }
+
     /// Pop the next deliverable message for a pane; the caller re-queues on
     /// delivery failure via [`Self::requeue_front`].
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
