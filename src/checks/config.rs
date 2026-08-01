@@ -26,6 +26,12 @@ pub const DEFAULT_MIN_TICK_SECS: u64 = 10;
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 60;
 /// Blocked-alert defaults (from the phase-4 design).
 pub const DEFAULT_BLOCKED_ALERT_THRESHOLD_SECS: u64 = 1800;
+/// Reap defaults (S2 scheduled reap builtin). 24h idle threshold; a slow
+/// cadence so a manifest-drift trip doesn't spam. Off by default — the
+/// integration-manifest gate is precisely the "don't autopilot until the
+/// operator opts in" surface (P8 gradual-rollout).
+pub const DEFAULT_REAP_IDLE_THRESHOLD_SECS: u64 = 86_400;
+pub const DEFAULT_REAP_CADENCE_SECS: u64 = 3_600;
 /// Hibernation defaults (from the phase-4 design).
 pub const DEFAULT_HIBERNATION_IDLE_THRESHOLD_SECS: u64 = 3600;
 pub const DEFAULT_HIBERNATION_DONE_THRESHOLD_SECS: u64 = 21600;
@@ -59,6 +65,10 @@ pub struct ChecksConfig {
     pub hibernation: HibernationConfig,
     /// Issue-guard built-in check.
     pub issue_guard: IssueGuardConfig,
+    /// Scheduled reap built-in (S2). Default OFF — enabling requires the
+    /// operator has verified their installed integrations first (the
+    /// runner refuses to reap while `verify_integration_manifest` trips).
+    pub reap: ReapConfig,
     /// User-declared `[[checks.script]]` entries.
     #[serde(default, rename = "script", skip_serializing_if = "Vec::is_empty")]
     pub scripts: Vec<ScriptCheck>,
@@ -79,8 +89,35 @@ impl Default for ChecksConfig {
             blocked_alert: BlockedAlertConfig::default(),
             hibernation: HibernationConfig::default(),
             issue_guard: IssueGuardConfig::default(),
+            reap: ReapConfig::default(),
             scripts: Vec::new(),
             crons: Vec::new(),
+        }
+    }
+}
+
+/// Scheduled reap built-in (#175 S2). Off by default; when enabled, every
+/// tick first calls `verify_integration_manifest` — a HookHalfState /
+/// Outdated verdict emits a throttled `CheckErrored` + toast and yields
+/// ZERO candidates. When Ok, worktree workspaces whose panes are all
+/// Idle+seen past `idle_threshold_secs` and not operator-focused are
+/// classified through the scheduled variant of the kill machinery and
+/// dispatched (Quarantine for skip-because-unmerged/dirty; the existing
+/// merge-gated delete rules still apply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ReapConfig {
+    pub enable: bool,
+    pub cadence_secs: u64,
+    pub idle_threshold_secs: u64,
+}
+
+impl Default for ReapConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            cadence_secs: DEFAULT_REAP_CADENCE_SECS,
+            idle_threshold_secs: DEFAULT_REAP_IDLE_THRESHOLD_SECS,
         }
     }
 }

@@ -304,6 +304,11 @@ pub enum KillAction {
     KillBranch { dirty: bool },
     /// `git worktree remove`, keep the branch.
     CheckoutOnly,
+    /// #175 S2: `git worktree move <checkout> <quarantine_dst>`; branch is
+    /// PRESERVED. This is what the SCHEDULED reap yields for tiers that
+    /// today would `Skip` — never a delete without evidence. Human CLI
+    /// paths never emit this variant (see [`scheduled_action`]).
+    Quarantine,
     /// Do nothing this pass.
     Skip,
 }
@@ -324,6 +329,32 @@ pub fn planned_action(tier: KillTier, force_dirty: bool) -> KillAction {
                 KillAction::Skip
             }
         }
+        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+    }
+}
+
+/// #175 S2: scheduled-reap variant of [`planned_action`]. The scheduled
+/// caller flag replaces the tiers that today `Skip`-because-unmerged/dirty
+/// with [`KillAction::Quarantine`] — atomic move, branch preserved. Every
+/// other tier resolves exactly as the human `planned_action` does; the
+/// merge-gated `KillBranch` still requires positive evidence, and the
+/// protected `SkipMainDirty` / `SkipAgent` tiers still skip.
+///
+/// The invariant this function encodes is: SCHEDULED code paths can never
+/// delete a branch without merge evidence, and never touch main-dirty /
+/// active-agent rows. Human `flk worktree kill --force` retains its
+/// escalation-to-checkout-only semantics via [`planned_action`].
+pub fn scheduled_action(tier: KillTier) -> KillAction {
+    match tier {
+        KillTier::ClosePane => KillAction::ClosePane,
+        KillTier::KillBranch { dirty } => KillAction::KillBranch { dirty },
+        KillTier::CheckoutOnly => KillAction::CheckoutOnly,
+        // The skip-because-unmerged/dirty tier becomes Quarantine under
+        // scheduled reap: preserve the checkout by moving it, keep the
+        // branch alive. §8.5 adversarial rows land here.
+        KillTier::SkipUnmergedDirty => KillAction::Quarantine,
+        // Protected tiers stay protected. A running agent is never
+        // disturbed; main-dirty is never quarantined either.
         KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
     }
 }
@@ -862,6 +893,163 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
     })
 }
 
+/// #175 S2 — the atomic move a scheduled reap performs when the classified
+/// tier is [`KillAction::Quarantine`]. `git worktree move` is atomic on
+/// same filesystem (a plain `renameat`) and refuses cross-fs with a clear
+/// error; we surface that error to the caller so the reap emits a `Skip`
+/// with a diagnostic instead of a half-moved worktree.
+///
+/// Writes a `QUARANTINE.md` file in the moved checkout describing why the
+/// worktree was quarantined and how to recover it (`git worktree move`
+/// back). Returns the destination path on success.
+///
+/// The branch is NEVER deleted. That is the reap-scheduled invariant this
+/// function encodes at the ONLY place scheduled reap touches the disk.
+pub(crate) fn quarantine_worktree(
+    repo_root: &Path,
+    checkout: &Path,
+    branch: Option<&str>,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    let quarantine_root = quarantine_root_dir();
+    std::fs::create_dir_all(&quarantine_root).map_err(|err| {
+        format!(
+            "failed to create quarantine dir {}: {err}",
+            quarantine_root.display()
+        )
+    })?;
+    let dst = quarantine_destination(&quarantine_root, repo_root, branch);
+
+    let checkout_str = checkout.to_string_lossy().to_string();
+    let repo_str = repo_root.to_string_lossy().to_string();
+    let dst_str = dst.to_string_lossy().to_string();
+    // `git worktree move` is what we want: atomic (same-fs rename), refuses
+    // cross-fs with `invalid argument: cross-device link`, and updates git's
+    // internal admin dir so the worktree stays a first-class worktree at
+    // its new location. Never `mv`/`rename` by hand — that would corrupt
+    // .git/worktrees admin state.
+    run_command_capture(
+        "git",
+        &["-C", &repo_str, "worktree", "move", &checkout_str, &dst_str],
+        None,
+    )
+    .map_err(|err| {
+        // Same-fs vs cross-fs is the classic failure mode. Callers can
+        // key off the substring the same way the sweep keys off
+        // `is_dirty_worktree_remove_error`.
+        format!(
+            "git worktree move failed (checkout={}, dst={}): {err}",
+            checkout.display(),
+            dst.display()
+        )
+    })?;
+
+    // Recovery breadcrumb. Deliberately Markdown so `less` renders cleanly.
+    let note = quarantine_note(repo_root, &dst, branch, reason, checkout);
+    let note_path = dst.join("QUARANTINE.md");
+    std::fs::write(&note_path, note).map_err(|err| {
+        format!(
+            "quarantine move succeeded, but writing recovery note {} failed: {err}",
+            note_path.display()
+        )
+    })?;
+    Ok(dst)
+}
+
+/// Move a quarantined worktree back into an operator-chosen path via
+/// `git worktree move` (atomic same-fs). NEVER deletes the source; the
+/// quarantine dir is the single record.
+pub(crate) fn unquarantine_worktree(quarantined: &Path, dst: &Path) -> Result<(), String> {
+    // Repo root is the quarantined worktree itself; `git -C` there
+    // resolves to the shared common dir automatically.
+    let src_str = quarantined.to_string_lossy().to_string();
+    let dst_str = dst.to_string_lossy().to_string();
+    run_command_capture(
+        "git",
+        &["-C", &src_str, "worktree", "move", &src_str, &dst_str],
+        None,
+    )
+    .map(|_| ())
+    .map_err(|err| format!("git worktree move (unquarantine) failed: {err}"))
+}
+
+fn quarantine_root_dir() -> PathBuf {
+    crate::session::data_dir().join("quarantine")
+}
+
+fn quarantine_destination(root: &Path, repo_root: &Path, branch: Option<&str>) -> PathBuf {
+    let repo = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let branch_slug = branch_to_path_slug(branch.unwrap_or("detached"));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    root.join(format!("{repo}-{branch_slug}-{ts}"))
+}
+
+fn quarantine_note(
+    repo_root: &Path,
+    dst: &Path,
+    branch: Option<&str>,
+    reason: &str,
+    original_checkout: &Path,
+) -> String {
+    // Kept plain-text, easy to eyeball. Recovery command uses the DST as
+    // the source because that's where the worktree now lives.
+    let branch_desc = branch.unwrap_or("(detached)");
+    format!(
+        "# Quarantined worktree\n\n\
+         This worktree was moved by the flock scheduled reap.\n\
+         The branch was preserved; no git ref was deleted.\n\n\
+         - repo:            {}\n\
+         - branch:          {}\n\
+         - reason:          {}\n\
+         - original path:   {}\n\
+         - quarantined at:  {}\n\n\
+         ## Recover\n\n\
+         Move the worktree back to any location on the same filesystem:\n\n\
+         ```\n\
+         git -C {} worktree move {} <your-target-path>\n\
+         ```\n\n\
+         Or run:\n\n\
+         ```\n\
+         flk worktree unquarantine {}\n\
+         ```\n",
+        repo_root.display(),
+        branch_desc,
+        reason,
+        original_checkout.display(),
+        dst.display(),
+        dst.display(),
+        dst.display(),
+        dst.display(),
+    )
+}
+
+/// Enumerate every quarantined worktree under the session's data dir. Each
+/// entry surfaces the raw quarantine path; the recovery note inside carries
+/// the repo/branch context. `Ok(vec![])` when no quarantine exists.
+pub(crate) fn list_quarantined_worktrees() -> Result<Vec<PathBuf>, String> {
+    let root = quarantine_root_dir();
+    let read = match std::fs::read_dir(&root) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("failed to read {}: {err}", root.display())),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|err| format!("{err}"))?;
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
@@ -949,6 +1137,201 @@ mod tests {
             planned_action(KillTier::SkipUnmergedDirty, true),
             KillAction::CheckoutOnly
         );
+    }
+
+    // ------- #175 S2: scheduled reap classification + quarantine -------
+
+    /// Scheduled paths preserve every non-skip tier's action byte-for-byte.
+    /// Human `planned_action` is UNCHANGED — no scheduled variant leaks.
+    #[test]
+    fn scheduled_action_never_emits_quarantine_from_safe_tiers() {
+        assert_eq!(scheduled_action(KillTier::ClosePane), KillAction::ClosePane);
+        assert_eq!(
+            scheduled_action(KillTier::KillBranch { dirty: false }),
+            KillAction::KillBranch { dirty: false }
+        );
+        assert_eq!(
+            scheduled_action(KillTier::KillBranch { dirty: true }),
+            KillAction::KillBranch { dirty: true }
+        );
+        assert_eq!(
+            scheduled_action(KillTier::CheckoutOnly),
+            KillAction::CheckoutOnly
+        );
+        // Protected tiers keep their protection under scheduled reap too.
+        assert_eq!(scheduled_action(KillTier::SkipMainDirty), KillAction::Skip);
+        assert_eq!(scheduled_action(KillTier::SkipAgent), KillAction::Skip);
+    }
+
+    /// §8.5 adversarial rows: every state that would normally trip the
+    /// human `Skip-because-unmerged/dirty` path becomes `Quarantine` under
+    /// scheduled reap. Human `planned_action(...)` still yields `Skip` (or
+    /// force-escalated `CheckoutOnly`) for the same tier.
+    #[test]
+    fn scheduled_action_quarantines_skip_unmerged_dirty_tier() {
+        assert_eq!(
+            scheduled_action(KillTier::SkipUnmergedDirty),
+            KillAction::Quarantine,
+            "scheduled reap must never delete an unmerged-dirty worktree; the tier converts to Quarantine"
+        );
+        // The human path is undisturbed — regressing that is the invariant
+        // this assertion locks down.
+        assert_eq!(
+            planned_action(KillTier::SkipUnmergedDirty, false),
+            KillAction::Skip,
+            "human planned_action for this tier must still Skip"
+        );
+    }
+
+    /// §8.5 adversarial matrix: classify_kill_tier on each of the shapes
+    /// the design calls out (dirty tree, unpushed commits, detached HEAD,
+    /// stash) — and scheduled_action must yield Quarantine (never a delete)
+    /// for the ones that are unmerged/dirty.
+    #[test]
+    fn scheduled_reap_covers_adversarial_rows() {
+        let mut facts = KillFacts {
+            is_main: false,
+            working_agent: false,
+            dirty: false,
+            merged: false,
+        };
+
+        // 1. Dirty tree (unmerged + dirty) → SkipUnmergedDirty → Quarantine.
+        facts.dirty = true;
+        let tier = classify_kill_tier(facts);
+        assert_eq!(tier, KillTier::SkipUnmergedDirty);
+        assert_eq!(scheduled_action(tier), KillAction::Quarantine);
+
+        // 2. Unpushed commits (unmerged, clean) → CheckoutOnly. The
+        // scheduled reap still removes the checkout, but the BRANCH stays
+        // — no delete without merge evidence.
+        facts.dirty = false;
+        let tier = classify_kill_tier(facts);
+        assert_eq!(tier, KillTier::CheckoutOnly);
+        assert_eq!(scheduled_action(tier), KillAction::CheckoutOnly);
+
+        // 3. Detached HEAD: the sweep asks classify_kill_tier via
+        //    is_main=false, merged=false, dirty=? The tier is
+        //    SkipUnmergedDirty when dirty, CheckoutOnly when clean. Both
+        //    map to non-delete actions.
+        facts.dirty = true;
+        assert!(!matches!(
+            scheduled_action(classify_kill_tier(facts)),
+            KillAction::KillBranch { .. }
+        ));
+
+        // 4. Active agent wins over everything — even scheduled.
+        facts.working_agent = true;
+        assert_eq!(
+            scheduled_action(classify_kill_tier(facts)),
+            KillAction::Skip
+        );
+    }
+
+    #[test]
+    fn quarantine_worktree_moves_atomically_and_writes_note() {
+        // Fixture: main repo with a real worktree, dirty tree so the
+        // scheduled reap would trip §8.5. We invoke `quarantine_worktree`
+        // directly (no runner needed) to prove the atomic-move + note
+        // contract.
+        let repo = create_committed_repo("quarantine-move");
+        // Create a linked worktree on a feature branch.
+        let wt = unique_temp_path("quarantine-wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-y",
+                &wt.display().to_string(),
+            ],
+        );
+        // Dirty the tree.
+        std::fs::write(wt.join("scratch.txt"), "wip\n").unwrap();
+
+        // Redirect XDG so quarantine goes into a test-owned dir.
+        let sandbox = unique_temp_path("quarantine-sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &sandbox);
+
+        let dst = quarantine_worktree(&repo, &wt, Some("feature-y"), "dirty").unwrap();
+        assert!(
+            dst.is_dir(),
+            "moved worktree dir must exist: {}",
+            dst.display()
+        );
+        assert!(!wt.exists(), "original checkout must have moved");
+        // The quarantined checkout is still a working worktree (git knows
+        // about it) — its README from the initial commit is present.
+        assert!(dst.join("README.md").is_file());
+        // Recovery note is dropped alongside.
+        let note = std::fs::read_to_string(dst.join("QUARANTINE.md")).unwrap();
+        assert!(
+            note.contains("feature-y"),
+            "note must mention branch: {note}"
+        );
+        assert!(note.contains("dirty"), "note must mention reason: {note}");
+        assert!(
+            note.contains("unquarantine"),
+            "recovery instructions: {note}"
+        );
+        // Branch was NOT deleted (never delete without merge evidence).
+        let branches = run_command_capture(
+            "git",
+            &["-C", &repo.display().to_string(), "branch", "--list"],
+            None,
+        )
+        .unwrap();
+        assert!(
+            branches.contains("feature-y"),
+            "branch preserved: {branches}"
+        );
+
+        // list_quarantined_worktrees sees it.
+        let list = list_quarantined_worktrees().unwrap();
+        assert!(list.iter().any(|p| p == &dst));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn unquarantine_moves_back_and_preserves_branch() {
+        let repo = create_committed_repo("unquarantine");
+        let wt = unique_temp_path("unquarantine-wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-z",
+                &wt.display().to_string(),
+            ],
+        );
+        std::fs::write(wt.join("scratch.txt"), "wip\n").unwrap();
+
+        let sandbox = unique_temp_path("unquarantine-sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &sandbox);
+        let quarantined = quarantine_worktree(&repo, &wt, Some("feature-z"), "dirty").unwrap();
+
+        let restored = unique_temp_path("unquarantine-restored");
+        unquarantine_worktree(&quarantined, &restored).unwrap();
+        assert!(
+            restored.join("scratch.txt").is_file(),
+            "scratch content restored"
+        );
+        // The quarantined path is now empty (git worktree move renamed it).
+        assert!(
+            !quarantined.exists()
+                || std::fs::read_dir(&quarantined)
+                    .ok()
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     fn unique_temp_path(name: &str) -> PathBuf {

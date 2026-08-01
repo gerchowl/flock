@@ -574,6 +574,13 @@ pub(super) fn render_kill_all_worktrees_overlay(app: &AppState, frame: &mut Fram
                 };
                 (reason, app.palette.overlay0)
             }
+            // Defensive: the human dialog never plans a scheduled-only
+            // quarantine action, but the render must not panic if one
+            // ever crosses (belt-and-braces).
+            KillAction::Quarantine => {
+                n_skip += 1;
+                ("skip — quarantine (scheduled only)", app.palette.overlay0)
+            }
         };
         let status = match &row.status {
             WorktreeKillRowStatus::Removing => "  …",

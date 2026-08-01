@@ -998,6 +998,9 @@ pub enum EventKind {
     /// #175 S1: scheduled cron predicate fired. See
     /// `EventData::CronFired` for the payload shape.
     CronFired,
+    /// #175 S2: a worktree was atomically moved into the session
+    /// quarantine (branch preserved). See `EventData::WorktreeQuarantined`.
+    WorktreeQuarantined,
     /// #175 C3: hibernation lifecycle. `AgentHibernated` fires once when a
     /// pane transitions to hibernated (child asked to exit + resume plan
     /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
@@ -1044,6 +1047,7 @@ impl EventKind {
             | Self::CheckErrored
             | Self::ChecksHeartbeat
             | Self::CronFired
+            | Self::WorktreeQuarantined
             | Self::AgentHibernated
             | Self::AgentResumedFromHibernation
             | Self::TriggerFired
@@ -1622,6 +1626,15 @@ pub enum EventData {
         scheduled_ms: u64,
         actual_ms: u64,
         missed_fires: u32,
+    },
+    /// #175 S2: a worktree was atomically moved into the session quarantine
+    /// directory. The branch stays local; the checkout can be restored via
+    /// `flk worktree unquarantine`. `reason` is the classification fact that
+    /// tripped the scheduled reap (dirty / unpushed / detached / stash).
+    WorktreeQuarantined {
+        workspace_id: String,
+        path: String,
+        reason: String,
     },
     /// #175 C3: a pane's agent process has been asked to exit and its resume
     /// plan is stashed on the pane; the next focus (or explicit

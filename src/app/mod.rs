@@ -166,6 +166,13 @@ pub struct App {
     /// cadence off the checks tick; dedupe set survives restarts by
     /// seeding from the durable `TriggerFired` events at construction.
     pub(crate) issue_guard: crate::checks::IssueGuardFold,
+    /// Built-in scheduled reap (#175 S2). Owns the manifest-drift
+    /// throttle; the App tick collects workspace snapshots and dispatches
+    /// each candidate through the scheduled kill machinery.
+    pub(crate) reap_check: crate::checks::ReapFold,
+    /// Instant the reap tick last ran — folds the reap's own cadence
+    /// (`[checks.reap] cadence_secs`) on top of the checks tick.
+    pub(crate) reap_next_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
@@ -757,6 +764,10 @@ impl App {
                 guard.seed_from_fired_keys(seeded_keys);
                 guard
             },
+            reap_check: crate::checks::ReapFold::new(),
+            reap_next_deadline: (config.checks.enable && config.checks.reap.enable).then(|| {
+                Instant::now() + Duration::from_secs(config.checks.reap.cadence_secs.max(1))
+            }),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
