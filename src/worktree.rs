@@ -136,6 +136,28 @@ pub(crate) fn build_worktree_add_new_branch_command(
     }
 }
 
+/// Translate the one `git worktree add` failure that reads as a flock bug
+/// (#198). A repo that has been `git init`-ed but never committed has an
+/// unborn HEAD, so branching from the default base fails with
+///
+/// ```text
+/// fatal: invalid reference: HEAD
+/// ```
+///
+/// which says nothing about the actual remedy. Only the default base is
+/// rewritten: `invalid reference: <some-branch>` for an explicit base is a
+/// genuinely different problem (a typo, or a branch that isn't there) and git
+/// already names it.
+pub(crate) fn explain_worktree_add_failure(base: &str, message: &str) -> String {
+    if base == "HEAD" && message.contains("invalid reference: HEAD") {
+        return format!(
+            "{message}\n\nThis repo has no commits yet, so there is nothing to branch \
+             from. Make an initial commit, then create the worktree."
+        );
+    }
+    message.to_string()
+}
+
 pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
     let output = crate::process::TracedCommand::new(&command.program, "worktree")
         .args(&command.args)
@@ -1672,6 +1694,45 @@ prunable stale
                 "HEAD"
             ]
         );
+    }
+
+    #[test]
+    fn worktree_add_in_a_repo_without_commits_names_the_unborn_head() {
+        // #198: `git init` with nothing committed leaves HEAD unborn, so the
+        // default base can't resolve. git's own words are "fatal: invalid
+        // reference: HEAD", which reads as a flock bug rather than a missing
+        // initial commit — four such failures sat in a live server log.
+        let repo = unique_temp_path("worktree-unborn-head-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "--quiet"]);
+        let checkout = unique_temp_path("worktree-unborn-head-checkout");
+
+        let add = build_worktree_add_new_branch_command(&repo, &checkout, "worktree/x", "HEAD");
+        let err = run_worktree_command(&add).expect_err("unborn HEAD cannot be branched");
+        assert!(err.contains("invalid reference: HEAD"), "{err}");
+
+        let explained = explain_worktree_add_failure("HEAD", &err);
+        assert!(explained.contains("no commits yet"), "{explained}");
+        assert!(explained.contains("initial commit"), "{explained}");
+        // git's own text is kept: it is what a user would search for.
+        assert!(explained.contains("invalid reference: HEAD"), "{explained}");
+
+        assert!(!checkout.exists());
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn unrelated_worktree_add_failures_pass_through_untouched() {
+        // An explicit base that isn't there is a different problem, and git
+        // already names it — don't blame a missing initial commit for it.
+        let missing_base = "fatal: invalid reference: no-such-branch";
+        assert_eq!(
+            explain_worktree_add_failure("no-such-branch", missing_base),
+            missing_base
+        );
+
+        let occupied = "fatal: '/w/x' already exists";
+        assert_eq!(explain_worktree_add_failure("HEAD", occupied), occupied);
     }
 
     #[test]

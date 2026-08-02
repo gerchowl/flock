@@ -1229,6 +1229,7 @@ impl App {
             &create.checkout_path.display().to_string(),
         );
         let path = create.checkout_path.clone();
+        let base = create.base.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = if let Some(parent_dir) = parent_dir {
@@ -1238,6 +1239,8 @@ impl App {
             } else {
                 crate::worktree::run_worktree_command(&command)
             };
+            let result =
+                result.map_err(|err| crate::worktree::explain_worktree_add_failure(&base, &err));
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(WorktreeAddResult {
                 path,
                 result,

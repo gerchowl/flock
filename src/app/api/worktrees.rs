@@ -142,7 +142,11 @@ impl App {
             &base,
         );
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
-            return encode_error(id, "worktree_create_failed", err);
+            return encode_error(
+                id,
+                "worktree_create_failed",
+                crate::worktree::explain_worktree_add_failure(&base, &err),
+            );
         }
         if let Err(err) = self.ensure_source_parent_membership(&mut source, true) {
             return encode_error(id, err.code, err.message);
@@ -305,7 +309,11 @@ impl App {
             &base,
         );
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
-            return encode_error(id, "worktree_create_failed", err);
+            return encode_error(
+                id,
+                "worktree_create_failed",
+                crate::worktree::explain_worktree_add_failure(&base, &err),
+            );
         }
 
         // #106/#159 pivot: explicit param wins; omitted falls back to the
