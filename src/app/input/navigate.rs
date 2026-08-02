@@ -747,27 +747,29 @@ pub(super) fn execute_navigate_action_in_context(
             state.request_new_workspace = true;
             leave_navigate_mode(state);
         }
+        // #196: no pre-filter on the three worktree-source actions. The
+        // dialogs resolve their source through `worktree_source_metadata`,
+        // which already refuses ad-hoc linked checkouts and non-git
+        // workspaces WITH a notice — and, since #124, accepts a
+        // flock-managed linked worktree as a branch-from-here source. The
+        // old keyboard-only gate refused every linked worktree and did it
+        // silently (a `.filter()` drops the key with no message), so
+        // right-click could branch-from-here and the key could not.
         NavigateAction::NewWorktree => {
-            if let Some(ws_idx) = workspace_action_target(state, context)
-                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
-            {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
                 state.request_new_linked_worktree =
                     Some(crate::app::state::NewLinkedWorktreeRequest { ws_idx, base: None });
                 leave_navigate_mode(state);
             }
         }
         NavigateAction::BranchSession => {
-            if let Some(ws_idx) = workspace_action_target(state, context)
-                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
-            {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
                 state.request_branch_session = Some(ws_idx);
                 leave_navigate_mode(state);
             }
         }
         NavigateAction::OpenWorktree => {
-            if let Some(ws_idx) = workspace_action_target(state, context)
-                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
-            {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
                 state.request_open_existing_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
@@ -997,28 +999,6 @@ fn workspace_action_target(state: &AppState, context: ActionContext) -> Option<u
         ActionContext::Navigate => state.selected,
     };
     (idx < state.workspaces.len()).then_some(idx)
-}
-
-fn workspace_can_start_worktree_action(
-    state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    ws_idx: usize,
-) -> bool {
-    let Some(ws) = state.workspaces.get(ws_idx) else {
-        return false;
-    };
-    if ws
-        .worktree_space()
-        .is_some_and(|space| space.is_linked_worktree)
-    {
-        return false;
-    }
-    let git_space = ws.git_space().cloned().or_else(|| {
-        ws.resolved_identity_cwd_from(&state.terminals, terminal_runtimes)
-            .as_deref()
-            .and_then(crate::workspace::git_space_metadata)
-    });
-    !git_space.is_some_and(|space| space.is_linked_worktree)
 }
 
 fn leave_navigate_mode(state: &mut AppState) {
@@ -1282,8 +1262,6 @@ mod tests {
         let mut app = super::super::app_for_mouse_test();
         app.state.keybinds = config.keybinds();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
-        // Pin a non-git identity cwd: the test process may itself run inside a
-        // linked worktree checkout, where worktree actions are refused.
         app.state.workspaces[0].identity_cwd = unique_temp_path("navigate-branch-session-prefix");
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1301,8 +1279,6 @@ mod tests {
     fn prefix_branch_session_key_requests_active_workspace() {
         let mut app = super::super::app_for_mouse_test();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
-        // Pin a non-git identity cwd: the test process may itself run inside a
-        // linked worktree checkout, where worktree actions are refused.
         app.state.workspaces[0].identity_cwd = unique_temp_path("navigate-branch-session-prefix");
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1336,7 +1312,13 @@ mod tests {
     }
 
     #[test]
-    fn worktree_actions_do_not_start_from_linked_child_workspace() {
+    fn worktree_actions_reach_the_dialog_from_a_linked_child_workspace() {
+        // #196: the keyboard used to drop these three actions on the floor
+        // inside a linked worktree — silently, and in contradiction of #124,
+        // which made a flock-managed linked worktree a valid branch-from-here
+        // source for the same dialogs via the context menu. The request now
+        // always reaches the dialog, which is the one place that knows how to
+        // refuse (with a notice) an ad-hoc linked checkout or a non-git row.
         let mut terminal_runtimes = TerminalRuntimeRegistry::new();
         let mut state = state_with_workspaces(&["main", "issue"]);
         mark_worktree_space_member(&mut state, 0, "repo-key");
@@ -1351,7 +1333,13 @@ mod tests {
             NavigateAction::NewWorktree,
             ActionContext::Navigate,
         );
-        assert_eq!(state.request_new_linked_worktree, None);
+        assert_eq!(
+            state.request_new_linked_worktree,
+            Some(crate::app::state::NewLinkedWorktreeRequest {
+                ws_idx: 1,
+                base: None
+            })
+        );
 
         execute_navigate_action_in_context(
             &mut state,
@@ -1359,7 +1347,15 @@ mod tests {
             NavigateAction::OpenWorktree,
             ActionContext::Navigate,
         );
-        assert_eq!(state.request_open_existing_worktree, None);
+        assert_eq!(state.request_open_existing_worktree, Some(1));
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::BranchSession,
+            ActionContext::Navigate,
+        );
+        assert_eq!(state.request_branch_session, Some(1));
     }
 
     #[test]
