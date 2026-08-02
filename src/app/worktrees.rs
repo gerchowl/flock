@@ -287,15 +287,16 @@ impl App {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return;
         };
-        if !ws
-            .worktree_space()
-            .is_some_and(|space| space.is_linked_worktree)
-        {
+        // #197: through the action view — a membership live git places in
+        // another repo would aim this delete at THAT repo's checkout from an
+        // unrelated row.
+        let Some(space) = ws
+            .worktree_space_for_actions(ws.git_space())
+            .filter(|space| space.is_linked_worktree)
+            .cloned()
+        else {
             self.state.config_diagnostic =
                 Some("This workspace is not a Flock-managed worktree checkout.".into());
-            return;
-        }
-        let Some(space) = ws.worktree_space().cloned() else {
             return;
         };
         self.state.selected = ws_idx;
@@ -327,8 +328,12 @@ impl App {
         // worktree (created by an agent, by hand, by another tool) gets the
         // same merge-gated kill. Only non-worktree checkouts are refused —
         // the main checkout is never killable.
+        // #197: through the action view. A membership live git places in
+        // another repo would hand this kill that repo's checkout — the
+        // destructive direction of the same disagreement. Withheld, the row
+        // falls through to live git below, where a main checkout is refused.
         let managed_space = ws
-            .worktree_space()
+            .worktree_space_for_actions(ws.git_space())
             .filter(|space| space.is_linked_worktree)
             .cloned();
         let (repo_root, checkout, managed) = match managed_space {
@@ -465,8 +470,11 @@ impl App {
     pub(crate) fn open_kill_all_worktrees_confirmation(&mut self) {
         let mut rows: Vec<WorktreeKillRow> = Vec::new();
         for ws in &self.state.workspaces {
-            let candidate = if let Some(space) =
-                ws.worktree_space().filter(|space| space.is_linked_worktree)
+            // #197: through the action view, so a stale membership can't put
+            // another repo's checkout on the sweep under this row's name.
+            let candidate = if let Some(space) = ws
+                .worktree_space_for_actions(ws.git_space())
+                .filter(|space| space.is_linked_worktree)
             {
                 Some((
                     space.repo_root.clone(),
@@ -836,7 +844,9 @@ impl App {
                 let entry_checkout_key = entry_checkout_path.display().to_string();
                 let repo_checkout_path = crate::worktree::canonical_or_original(&space.repo_root);
                 let already_open_ws_idx = self.state.workspaces.iter().position(|ws| {
-                    if let Some(membership) = ws.worktree_space() {
+                    // #197: a membership live git places elsewhere would claim
+                    // this entry is "already open" in a row that is not it.
+                    if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
                         return crate::worktree::canonical_or_original(&membership.checkout_path)
                             == entry_checkout_path;
                     }
@@ -1459,12 +1469,20 @@ impl App {
                     .position(|ws| ws.id == result.workspace_id)
                 {
                     let ws = &self.state.workspaces[ws_idx];
-                    let still_same_linked_worktree = ws.worktree_space().is_some_and(|space| {
-                        space.is_linked_worktree && space.checkout_path == result.path
-                    }) || (!removed_managed
-                        && ws
-                            .git_space()
-                            .is_some_and(|space| space.repo_root == result.path));
+                    // #197: through the action view, so removing one repo's
+                    // worktree can't close a workspace that merely carries a
+                    // stale membership for it. The row that really lived in the
+                    // removed checkout still closes: its checkout is gone, so
+                    // live git answers nothing and its membership stands.
+                    let still_same_linked_worktree = ws
+                        .worktree_space_for_actions(ws.git_space())
+                        .is_some_and(|space| {
+                            space.is_linked_worktree && space.checkout_path == result.path
+                        })
+                        || (!removed_managed
+                            && ws
+                                .git_space()
+                                .is_some_and(|space| space.repo_root == result.path));
                     if still_same_linked_worktree {
                         self.state.selected = ws_idx;
                         self.state.close_selected_workspace();
@@ -2083,6 +2101,83 @@ mod tests {
             std::path::PathBuf::from("/repo/guardrails")
         );
         assert!(create.source_existing_membership.is_none());
+    }
+
+    /// A workspace the same way round as the dialog test above: membership for
+    /// `dompt`, live git says it is the `guardrails` main checkout.
+    fn workspace_with_foreign_repo_membership() -> crate::workspace::Workspace {
+        let mut ws = crate::workspace::Workspace::test_new("main");
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/repo/dompt/.git".into(),
+            label: "dompt".into(),
+            repo_root: "/repo/dompt".into(),
+            checkout_path: "/worktrees/dompt/website".into(),
+            is_linked_worktree: true,
+        });
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/guardrails/.git".into(),
+            checkout_key: "/repo/guardrails".into(),
+            label: "guardrails".into(),
+            repo_root: "/repo/guardrails".into(),
+            is_linked_worktree: false,
+            project_key: "dir:guardrails".into(),
+        });
+        ws
+    }
+
+    #[test]
+    fn foreign_repo_membership_cannot_aim_a_delete_or_kill_at_another_repo() {
+        // #197, destructive direction: both of these read the membership for
+        // the checkout to remove. Trusted, the guardrails row would have
+        // offered to delete — and merge-gate-kill — dompt's worktree.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![workspace_with_foreign_repo_membership()];
+        app.state.mode = Mode::Navigate;
+
+        app.open_remove_linked_worktree_confirmation(0);
+        assert!(app.state.worktree_remove.is_none());
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some("This workspace is not a Flock-managed worktree checkout.")
+        );
+
+        // Kill falls through to live git, which sees a main checkout — never
+        // killable — instead of dompt's linked worktree.
+        app.state.config_diagnostic = None;
+        app.open_kill_worktree_confirmation(0);
+        assert!(app.state.worktree_remove.is_none());
+        assert_eq!(
+            app.state.action_notice.as_deref(),
+            Some("kill worktree: this workspace is not a linked git worktree checkout")
+        );
+    }
+
+    #[test]
+    fn foreign_repo_membership_stays_off_the_kill_all_sweep() {
+        // #81's fleet sweep classifies every row; the stale membership would
+        // have put dompt's checkout on the plan under the guardrails row.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![workspace_with_foreign_repo_membership()];
+        app.state.mode = Mode::Navigate;
+
+        app.open_kill_all_worktrees_confirmation();
+
+        let listed_checkouts: Vec<_> = app
+            .state
+            .worktree_kill_all
+            .as_ref()
+            .map(|kill_all| {
+                kill_all
+                    .rows
+                    .iter()
+                    .map(|row| row.checkout.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !listed_checkouts.contains(&std::path::PathBuf::from("/worktrees/dompt/website")),
+            "{listed_checkouts:?}"
+        );
     }
 
     #[test]
