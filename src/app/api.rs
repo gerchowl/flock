@@ -49,13 +49,16 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
         let Some(branch) = ws.branch() else {
             continue;
         };
-        let (repo_root, checkout) = if let Some(space) = ws.worktree_space() {
-            (space.repo_root.clone(), space.checkout_path.clone())
-        } else if let Some(git) = ws.git_space() {
-            (git.repo_root.clone(), git.repo_root.clone())
-        } else {
-            continue;
-        };
+        // #197: the action view, so a diverged workspace's PR poll follows
+        // the repo its branch actually lives in.
+        let (repo_root, checkout) =
+            if let Some(space) = ws.worktree_space_for_actions(ws.git_space()) {
+                (space.repo_root.clone(), space.checkout_path.clone())
+            } else if let Some(git) = ws.git_space() {
+                (git.repo_root.clone(), git.repo_root.clone())
+            } else {
+                continue;
+            };
         match targets
             .iter_mut()
             .find(|target| target.repo_root == repo_root && target.branch == branch)
