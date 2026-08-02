@@ -864,6 +864,40 @@ impl Workspace {
         self.worktree_space.as_ref()
     }
 
+    /// Membership viewed as a *worktree-action source* (#197): the same
+    /// membership, unless live git says this checkout belongs to a different
+    /// repo family, in which case the membership describes somewhere the pane
+    /// no longer is and must not be used to pick a repo to act on.
+    ///
+    /// Membership and live git can legitimately diverge. `create_sibling_workspace`
+    /// (#25) clones membership onto a sibling as the durable grouping key, while
+    /// `cached_git_space` follows the root pane's LIVE cwd (the probe keys on
+    /// `resolved_identity_cwd_from`) — so a `cd` into another repo leaves the two
+    /// describing different places. Observed in the wild: a workspace sitting in
+    /// `~/Projects/guardrails` still carrying a `dompt` worktree membership, where
+    /// a branch/new-worktree would have created a worktree of dompt.
+    ///
+    /// Git is authoritative for what is on disk — the same principle #125 applied
+    /// to `checkout_path`. Only the ACTION seam looks through this; the membership
+    /// itself stays persisted (it is the grouping key, and dropping it is the
+    /// destructive direction — a `cd` back agrees again).
+    ///
+    /// `None` for `live_space` means "no live git answer" (probe not finished, or
+    /// a non-git cwd), which is not disagreement: membership stands.
+    pub(crate) fn worktree_space_for_actions(
+        &self,
+        live_space: Option<&GitSpaceMetadata>,
+    ) -> Option<&WorktreeSpaceMembership> {
+        let membership = self.worktree_space.as_ref()?;
+        let Some(live_space) = live_space else {
+            return Some(membership);
+        };
+        let same_repo_family =
+            self::git::canonicalize_best_effort_path(std::path::Path::new(&membership.key))
+                == self::git::canonicalize_best_effort_path(std::path::Path::new(&live_space.key));
+        same_repo_family.then_some(membership)
+    }
+
     /// Reconcile the cached worktree `checkout_path` against live git (#125).
     /// After a `git worktree move`, the membership's stored `checkout_path`
     /// goes stale — flock has no move API, so it only used to refresh on
@@ -1216,6 +1250,52 @@ mod tests {
             ws.worktree_space.as_ref().unwrap().checkout_path,
             std::path::PathBuf::from("/old/path")
         );
+    }
+
+    #[test]
+    fn action_membership_is_withheld_when_live_git_is_another_repo() {
+        // #197: the shape seen in the wild — a sibling workspace (#25) carries
+        // the source worktree's membership, then its root pane `cd`s into an
+        // unrelated repo. `worktree_space()` still reports the old repo (it is
+        // the durable grouping key), but a branch/new-worktree keyed on it
+        // would create a worktree of the repo the pane LEFT.
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(WorktreeSpaceMembership {
+            key: "/repo/dompt/.git".into(),
+            label: "dompt".into(),
+            repo_root: "/repo/dompt".into(),
+            checkout_path: "/worktrees/dompt/website".into(),
+            is_linked_worktree: true,
+        });
+
+        let mut elsewhere = linked_space_meta("/repo/guardrails");
+        elsewhere.key = "/repo/guardrails/.git".into();
+        elsewhere.is_linked_worktree = false;
+        assert!(ws.worktree_space_for_actions(Some(&elsewhere)).is_none());
+
+        // Persisted state is untouched — a `cd` back agrees again, and
+        // dropping the grouping key is the destructive direction.
+        assert!(ws.worktree_space().is_some());
+    }
+
+    #[test]
+    fn action_membership_stands_when_live_git_agrees_or_is_silent() {
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(WorktreeSpaceMembership {
+            key: "/repo/flock/.git".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/worktrees/flock/feature".into(),
+            is_linked_worktree: true,
+        });
+
+        // Same repo family (the sibling that stayed put): membership stands.
+        let same_family = linked_space_meta("/worktrees/flock/feature");
+        assert!(ws.worktree_space_for_actions(Some(&same_family)).is_some());
+
+        // No live answer is not disagreement: a probe that hasn't finished, or
+        // a non-git cwd, must not strip a workspace of its worktree actions.
+        assert!(ws.worktree_space_for_actions(None).is_some());
     }
 
     /// #102 part 3: tabs render in `(display_name, tab.number)` order, so
