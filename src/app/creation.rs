@@ -392,7 +392,7 @@ impl App {
             // what `flk worktree kill` reads to pick a checkout to remove and
             // to run the merge gate over, so a membership live git places in
             // another repo would aim a kill at THAT repo's worktree.
-            worktree: ws.worktree_space_for_actions(ws.git_space()).map(|space| {
+            worktree: ws.worktree_space_here().map(|space| {
                 crate::api::schema::WorkspaceWorktreeInfo {
                     repo_key: space.key.clone(),
                     repo_name: space.label.clone(),
