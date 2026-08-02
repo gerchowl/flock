@@ -86,8 +86,12 @@ impl App {
         // ambiguous.)
         // #197: read through `worktree_space_for_actions`, which withholds a
         // membership that live git places in a different repo — acting on it
-        // would branch the repo the pane LEFT, not the one it is in.
-        let existing_membership = ws.worktree_space_for_actions(git_space.as_ref()).cloned();
+        // would branch the repo the pane LEFT, not the one it is in. Judged
+        // against the PROBED space only (`git_space()`), never the synchronous
+        // fallback above: the fallback exists to give an unprobed workspace a
+        // source, and a half-resolved answer is too thin to invalidate
+        // persisted membership on.
+        let existing_membership = ws.worktree_space_for_actions(ws.git_space()).cloned();
         // An ad-hoc linked checkout (no flock-managed membership) stays refused
         // — its repo_root is ambiguous. A membership-backed linked worktree is
         // the #124 branch-from-here case, resolved from the membership below.
