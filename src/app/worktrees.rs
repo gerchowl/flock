@@ -73,19 +73,21 @@ impl App {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return Err("Workspace not found.".into());
         };
+        let git_space = ws.git_space().cloned().or_else(|| {
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                .as_deref()
+                .and_then(crate::workspace::git_space_metadata)
+        });
         // #124: a flock-managed linked worktree IS a valid source — the new
         // branch forks from that worktree's HEAD (branch-from-here). Its
         // membership carries the shared repo_root + its own checkout_path, so
         // `git worktree add` runs from the linked checkout. (An ad-hoc, non
         // -membership linked checkout below stays refused — its repo_root is
         // ambiguous.)
-        let existing_membership = ws.worktree_space().cloned();
-
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
+        // #197: read through `worktree_space_for_actions`, which withholds a
+        // membership that live git places in a different repo — acting on it
+        // would branch the repo the pane LEFT, not the one it is in.
+        let existing_membership = ws.worktree_space_for_actions(git_space.as_ref()).cloned();
         // An ad-hoc linked checkout (no flock-managed membership) stays refused
         // — its repo_root is ambiguous. A membership-backed linked worktree is
         // the #124 branch-from-here case, resolved from the membership below.
@@ -2031,6 +2033,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(repo);
     }
+    #[test]
+    fn worktree_dialog_follows_live_git_over_a_foreign_repo_membership() {
+        // #197: membership calls this a linked worktree of `dompt` while live
+        // git calls it the `guardrails` main checkout. The dialog must target
+        // guardrails — with the membership trusted, the action created a
+        // worktree of the repo the pane had left, and the workspace read as a
+        // linked worktree it isn't.
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/repo/dompt/.git".into(),
+            label: "dompt".into(),
+            repo_root: "/repo/dompt".into(),
+            checkout_path: "/worktrees/dompt/website".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/guardrails/.git".into(),
+            checkout_key: "/repo/guardrails".into(),
+            label: "guardrails".into(),
+            repo_root: "/repo/guardrails".into(),
+            is_linked_worktree: false,
+            project_key: "dir:guardrails".into(),
+        });
+
+        app.open_new_linked_worktree_dialog(0, None);
+
+        let create = app
+            .state
+            .worktree_create
+            .as_ref()
+            .expect("live git resolves a source, so the dialog opens");
+        assert_eq!(create.repo_name, "guardrails");
+        assert_eq!(
+            create.source_repo_root,
+            std::path::PathBuf::from("/repo/guardrails")
+        );
+        assert_eq!(
+            create.source_checkout_path,
+            std::path::PathBuf::from("/repo/guardrails")
+        );
+        assert!(create.source_existing_membership.is_none());
+    }
+
     #[test]
     fn branch_session_dialog_requires_agent_session() {
         let mut app = app_for_worktree_tests();
