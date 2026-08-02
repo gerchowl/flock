@@ -2784,11 +2784,20 @@ fn render_workspace_list(
         let label = remote_entry_label(app, &card.peer, card.ws_idx, card.indented);
         // #164 P2: the owning server's icon badges the folded remote row, tying
         // the workspace to its machine. Fixed 2-cell slot so multiple remotes in
-        // a group line up; +2 to the label budget for it.
+        // a group line up; +2 to the label budget for it. But in `icon` mode the
+        // label ALREADY leads with that glyph (`member_label_moded` /
+        // `remote_entry_label` → `<glyph> · branch`), so a badge would render the
+        // machine symbol TWICE (#193 follow-up). Suppress it there — remote rows
+        // then read exactly like local rows, which carry the glyph in the label
+        // and never wear a badge.
+        let badge = app.server_label != crate::config::ServerLabelConfig::Icon;
+        // The badge, when present, eats a fixed 2-cell slot; drop that from the
+        // label budget only when it actually renders.
+        let badge_cells = if badge { 2 } else { 0 };
         let max_label = (card.rect.width as usize).saturating_sub(if card.indented {
-            7 + member_indent_extra
+            5 + badge_cells + member_indent_extra
         } else {
-            5
+            3 + badge_cells
         });
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
         // labels carry a `·` separator (and the origin rows from #66 are long),
@@ -2813,15 +2822,18 @@ fn render_workspace_list(
         } else {
             " ".to_string()
         };
-        // The server icon inherits the label style, so it dims with a stale row.
-        let server_icon = server_icon_span(peer.icon.as_deref(), label_style);
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(indent, Style::default()),
             Span::styled(icon, final_icon_style),
             Span::styled(" ", Style::default()),
-            server_icon,
-            Span::styled(label, label_style),
-        ]);
+        ];
+        // The server icon inherits the label style, so it dims with a stale row.
+        // Only in name/both mode — icon mode's label already carries the glyph.
+        if badge {
+            spans.push(server_icon_span(peer.icon.as_deref(), label_style));
+        }
+        spans.push(Span::styled(label, label_style));
+        let line = Line::from(spans);
         frame.render_widget(
             Paragraph::new(line),
             Rect::new(card.rect.x, card.rect.y, card.rect.width, 1),
@@ -4003,6 +4015,53 @@ mod tests {
         assert!(
             has_badge,
             "folded remote row should show the server icon glyph"
+        );
+    }
+
+    #[test]
+    fn icon_mode_folded_remote_row_shows_the_server_glyph_once() {
+        // #193 follow-up: in `icon` mode the remote member's LABEL already leads
+        // with the machine glyph (`<glyph> · branch`), so the P2 badge must NOT
+        // also render it — otherwise the row reads `<glyph> <glyph> · branch`.
+        // The default-`Both` sibling test above only checks presence, so it
+        // stayed green while the row doubled; this one pins the COUNT.
+        let mut app = crate::app::state::AppState::test_new();
+        app.server_label = crate::config::ServerLabelConfig::Icon;
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        let mut peer = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        );
+        peer.icon = Some("anvil".into());
+        app.peer_summaries = vec![peer];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 40, 40);
+        let buffer = render_sidebar_to_buffer(&mut app, area);
+        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        // The remote member is the row carrying its branch.
+        let remote_row = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains("fix/pty"))
+            .expect("remote member row with the branch should render");
+        let count = remote_row.matches(glyph).count();
+        assert_eq!(
+            count, 1,
+            "icon-mode remote row should show the machine glyph exactly once, got {count}: {remote_row:?}"
         );
     }
 
