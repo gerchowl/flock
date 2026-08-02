@@ -388,15 +388,19 @@ impl App {
                 crate::workspace::public_tab_id_for_number(&ws.id, ws.active_tab + 1)
             }),
             agent_status: pane_agent_status(agg_state, seen),
-            worktree: ws
-                .worktree_space()
-                .map(|space| crate::api::schema::WorkspaceWorktreeInfo {
+            // #197: the action view, not the raw membership. This field is
+            // what `flk worktree kill` reads to pick a checkout to remove and
+            // to run the merge gate over, so a membership live git places in
+            // another repo would aim a kill at THAT repo's worktree.
+            worktree: ws.worktree_space_for_actions(ws.git_space()).map(|space| {
+                crate::api::schema::WorkspaceWorktreeInfo {
                     repo_key: space.key.clone(),
                     repo_name: space.label.clone(),
                     repo_root: space.repo_root.display().to_string(),
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
-                }),
+                }
+            }),
         }
     }
 }

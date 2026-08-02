@@ -270,7 +270,9 @@ impl App {
 
     fn workspace_repo_label(&self, ws_idx: usize) -> Option<String> {
         let ws = self.state.workspaces.get(ws_idx)?;
-        ws.worktree_space()
+        // #197: the action view — repo addressing must name the repo the pane
+        // is in, not one its grouping still remembers.
+        ws.worktree_space_for_actions(ws.git_space())
             .map(|space| space.label.clone())
             .or_else(|| ws.git_space().map(|space| space.label.clone()))
     }
@@ -296,7 +298,7 @@ impl App {
                 let mut matches: Vec<(usize, crate::layout::PaneId)> = Vec::new();
                 for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
                     let repo_label = ws
-                        .worktree_space()
+                        .worktree_space_for_actions(ws.git_space())
                         .map(|space| space.label.clone())
                         .or_else(|| ws.git_space().map(|space| space.label.clone()));
                     if repo_label.as_deref() != Some(repo.as_str()) {

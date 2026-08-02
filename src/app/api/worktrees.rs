@@ -601,11 +601,14 @@ impl App {
                 format!("workspace {} not found", params.workspace_id),
             );
         };
+        // #197: the action view. This is the mutation itself — a membership
+        // live git places in another repo would delete THAT repo's checkout
+        // on this workspace's name.
         let Some(space) = self
             .state
             .workspaces
             .get(ws_idx)
-            .and_then(|ws| ws.worktree_space().cloned())
+            .and_then(|ws| ws.worktree_space_for_actions(ws.git_space()).cloned())
         else {
             return encode_error(
                 id,
@@ -637,11 +640,13 @@ impl App {
 
         let workspace_id = self.public_workspace_id(ws_idx);
         let path = space.checkout_path.display().to_string();
-        let still_same_linked_worktree = self.state.workspaces[ws_idx]
-            .worktree_space()
-            .is_some_and(|current| {
-                current.is_linked_worktree && current.checkout_path == space.checkout_path
-            });
+        let still_same_linked_worktree = {
+            let ws = &self.state.workspaces[ws_idx];
+            ws.worktree_space_for_actions(ws.git_space())
+                .is_some_and(|current| {
+                    current.is_linked_worktree && current.checkout_path == space.checkout_path
+                })
+        };
         if still_same_linked_worktree {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
@@ -779,7 +784,10 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(membership) = ws.worktree_space() {
+        // #197: the action view here and in the list variant below — a
+        // membership live git places in another repo would make every
+        // create/open/list on this workspace operate on that repo.
+        if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
             if membership.is_linked_worktree {
                 return Err(ApiFailure::new(
                     "linked_worktree_source",
@@ -831,7 +839,7 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(membership) = ws.worktree_space() {
+        if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
             let source_checkout_path = if membership.is_linked_worktree {
                 membership.repo_root.clone()
             } else {
@@ -919,7 +927,9 @@ impl App {
 
     fn find_parent_workspace_by_key(&self, repo_key: &str) -> Option<usize> {
         self.state.workspaces.iter().position(|ws| {
-            ws.worktree_space()
+            // #197: the action view — a stale membership must not let an
+            // unrelated workspace stand in as this repo's parent checkout.
+            ws.worktree_space_for_actions(ws.git_space())
                 .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
                 || ws
                     .git_space()
@@ -1045,7 +1055,8 @@ impl App {
         source: &WorktreeSource,
         ws_idx: usize,
     ) -> Option<WorktreeInfo> {
-        let membership = self.state.workspaces.get(ws_idx)?.worktree_space()?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let membership = ws.worktree_space_for_actions(ws.git_space())?;
         let branch = crate::workspace::git_branch(&membership.checkout_path);
         let is_detached = branch.is_none();
         Some(WorktreeInfo {
@@ -1064,9 +1075,13 @@ impl App {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
         self.state.workspaces.iter().position(|ws| {
-            if ws.worktree_space().is_some_and(|space| {
-                crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
-            }) {
+            if ws
+                .worktree_space_for_actions(ws.git_space())
+                .is_some_and(|space| {
+                    crate::worktree::canonical_or_original(&space.checkout_path)
+                        == canonical_checkout
+                })
+            {
                 return true;
             }
 
@@ -1762,6 +1777,83 @@ mod tests {
 
         run_git(&repo, &["worktree", "prune"]);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn api_worktree_remove_refuses_a_membership_live_git_places_elsewhere() {
+        // #197 over the API seam. Two real repos: the workspace carries a
+        // membership for `owner`'s worktree while live git says its checkout
+        // is `elsewhere`'s main checkout. That is the shape a sibling
+        // workspace (#25) takes once its pane `cd`s away.
+        //
+        // Unguarded, `flk worktree kill --workspace <this>` reads the
+        // workspace's reported worktree, runs the merge gate over owner's
+        // checkout, and calls worktree.remove — deleting a worktree of a repo
+        // this workspace is not in. Both halves must refuse.
+        let owner = create_committed_repo("api-foreign-owner-repo");
+        let checkout = unique_temp_path("api-foreign-owner-checkout");
+        run_git(
+            &owner,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-foreign",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let elsewhere = create_committed_repo("api-foreign-elsewhere-repo");
+
+        let mut app = app_with_parent(&owner);
+        let mut diverged = Workspace::test_new("diverged");
+        diverged.identity_cwd = elsewhere.clone();
+        diverged.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&owner).unwrap().key,
+            label: "api-foreign-owner-repo".into(),
+            repo_root: owner.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        diverged.cached_git_space = crate::workspace::git_space_metadata(&elsewhere);
+        let diverged_id = diverged.id.clone();
+        app.state.workspaces.push(diverged);
+        app.state.ensure_test_terminals();
+
+        // What `flk worktree kill` reads to pick a checkout: nothing.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorkspaceGet(crate::api::schema::WorkspaceTarget {
+                workspace_id: diverged_id.clone(),
+            }),
+        });
+        let reported_worktree = serde_json::from_str::<serde_json::Value>(&response)
+            .unwrap()
+            .pointer("/result/workspace/worktree")
+            .cloned();
+        assert!(
+            reported_worktree.is_none_or(|value| value.is_null()),
+            "a foreign membership must not be reported as this workspace's worktree"
+        );
+
+        // And the mutation itself refuses, so a caller holding a stale id
+        // cannot delete owner's checkout through this workspace.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: diverged_id,
+                force: true,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "not_linked_worktree");
+        assert!(checkout.exists(), "owner's worktree must survive");
+        assert_eq!(app.state.workspaces.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&owner);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
