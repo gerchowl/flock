@@ -91,7 +91,7 @@ impl App {
         // fallback above: the fallback exists to give an unprobed workspace a
         // source, and a half-resolved answer is too thin to invalidate
         // persisted membership on.
-        let existing_membership = ws.worktree_space_for_actions(ws.git_space()).cloned();
+        let existing_membership = ws.worktree_space_here().cloned();
         // An ad-hoc linked checkout (no flock-managed membership) stays refused
         // — its repo_root is ambiguous. A membership-backed linked worktree is
         // the #124 branch-from-here case, resolved from the membership below.
@@ -291,7 +291,7 @@ impl App {
         // another repo would aim this delete at THAT repo's checkout from an
         // unrelated row.
         let Some(space) = ws
-            .worktree_space_for_actions(ws.git_space())
+            .worktree_space_here()
             .filter(|space| space.is_linked_worktree)
             .cloned()
         else {
@@ -333,7 +333,7 @@ impl App {
         // destructive direction of the same disagreement. Withheld, the row
         // falls through to live git below, where a main checkout is refused.
         let managed_space = ws
-            .worktree_space_for_actions(ws.git_space())
+            .worktree_space_here()
             .filter(|space| space.is_linked_worktree)
             .cloned();
         let (repo_root, checkout, managed) = match managed_space {
@@ -473,7 +473,7 @@ impl App {
             // #197: through the action view, so a stale membership can't put
             // another repo's checkout on the sweep under this row's name.
             let candidate = if let Some(space) = ws
-                .worktree_space_for_actions(ws.git_space())
+                .worktree_space_here()
                 .filter(|space| space.is_linked_worktree)
             {
                 Some((
@@ -846,7 +846,7 @@ impl App {
                 let already_open_ws_idx = self.state.workspaces.iter().position(|ws| {
                     // #197: a membership live git places elsewhere would claim
                     // this entry is "already open" in a row that is not it.
-                    if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
+                    if let Some(membership) = ws.worktree_space_here() {
                         return crate::worktree::canonical_or_original(&membership.checkout_path)
                             == entry_checkout_path;
                     }
@@ -1474,12 +1474,10 @@ impl App {
                     // stale membership for it. The row that really lived in the
                     // removed checkout still closes: its checkout is gone, so
                     // live git answers nothing and its membership stands.
-                    let still_same_linked_worktree = ws
-                        .worktree_space_for_actions(ws.git_space())
-                        .is_some_and(|space| {
+                    let still_same_linked_worktree =
+                        ws.worktree_space_here().is_some_and(|space| {
                             space.is_linked_worktree && space.checkout_path == result.path
-                        })
-                        || (!removed_managed
+                        }) || (!removed_managed
                             && ws
                                 .git_space()
                                 .is_some_and(|space| space.repo_root == result.path));

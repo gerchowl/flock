@@ -850,8 +850,10 @@ impl Workspace {
     /// dir, shared by the main checkout and every linked worktree. Sourced
     /// from worktree membership first, then live git metadata.
     pub fn repo_group_key(&self) -> Option<&str> {
-        self.worktree_space
-            .as_ref()
+        // #197: `_here`, so a workspace whose pane moved repos groups under the
+        // repo it is in. Reading raw membership put a `~/Projects/guardrails`
+        // row inside the `dompt` group on a live fleet.
+        self.worktree_space_here()
             .map(|space| space.key.as_str())
             .or_else(|| {
                 self.cached_git_space
@@ -864,10 +866,11 @@ impl Workspace {
         self.worktree_space.as_ref()
     }
 
-    /// Membership viewed as a *worktree-action source* (#197): the same
-    /// membership, unless live git says this checkout belongs to a different
-    /// repo family, in which case the membership describes somewhere the pane
-    /// no longer is and must not be used to pick a repo to act on.
+    /// Membership *as it applies to where this workspace actually is* (#197):
+    /// the same membership, unless live git says this checkout belongs to a
+    /// different repo family — in which case it describes somewhere the pane
+    /// no longer is, and neither an action nor the sidebar's grouping may use
+    /// it to name a repo.
     ///
     /// Membership and live git can legitimately diverge. `create_sibling_workspace`
     /// (#25) clones membership onto a sibling as the durable grouping key, while
@@ -878,18 +881,15 @@ impl Workspace {
     /// a branch/new-worktree would have created a worktree of dompt.
     ///
     /// Git is authoritative for what is on disk — the same principle #125 applied
-    /// to `checkout_path`. Only the ACTION seam looks through this; the membership
-    /// itself stays persisted (it is the grouping key, and dropping it is the
-    /// destructive direction — a `cd` back agrees again).
+    /// to `checkout_path`. The membership itself stays persisted (dropping it is
+    /// the destructive direction — a `cd` back agrees again); only what reads it
+    /// changes.
     ///
-    /// `None` for `live_space` means "no live git answer" (probe not finished, or
-    /// a non-git cwd), which is not disagreement: membership stands.
-    pub(crate) fn worktree_space_for_actions(
-        &self,
-        live_space: Option<&GitSpaceMetadata>,
-    ) -> Option<&WorktreeSpaceMembership> {
+    /// No cached git space means "no live answer" (probe not finished, or a
+    /// non-git cwd), which is not disagreement: membership stands.
+    pub(crate) fn worktree_space_here(&self) -> Option<&WorktreeSpaceMembership> {
         let membership = self.worktree_space.as_ref()?;
-        let Some(live_space) = live_space else {
+        let Some(live_space) = self.cached_git_space.as_ref() else {
             return Some(membership);
         };
         let same_repo_family =
@@ -932,8 +932,7 @@ impl Workspace {
     /// checkout): explicit membership provenance first, then live git
     /// metadata. The main checkout is the project section's primary row (#33).
     pub fn is_linked_checkout(&self) -> bool {
-        self.worktree_space
-            .as_ref()
+        self.worktree_space_here()
             .map(|space| space.is_linked_worktree)
             .or_else(|| {
                 self.cached_git_space
@@ -1271,11 +1270,17 @@ mod tests {
         let mut elsewhere = linked_space_meta("/repo/guardrails");
         elsewhere.key = "/repo/guardrails/.git".into();
         elsewhere.is_linked_worktree = false;
-        assert!(ws.worktree_space_for_actions(Some(&elsewhere)).is_none());
+        ws.cached_git_space = Some(elsewhere);
+        assert!(ws.worktree_space_here().is_none());
 
         // Persisted state is untouched — a `cd` back agrees again, and
         // dropping the grouping key is the destructive direction.
         assert!(ws.worktree_space().is_some());
+
+        // #197: identity follows too, so the sidebar groups the row under the
+        // repo it is in rather than the one its membership remembers.
+        assert_eq!(ws.repo_group_key(), Some("/repo/guardrails/.git"));
+        assert!(!ws.is_linked_checkout());
     }
 
     #[test]
@@ -1289,13 +1294,18 @@ mod tests {
             is_linked_worktree: true,
         });
 
-        // Same repo family (the sibling that stayed put): membership stands.
-        let same_family = linked_space_meta("/worktrees/flock/feature");
-        assert!(ws.worktree_space_for_actions(Some(&same_family)).is_some());
+        // Same repo family (the sibling that stayed put): membership stands,
+        // and the row keeps its place in the group.
+        ws.cached_git_space = Some(linked_space_meta("/worktrees/flock/feature"));
+        assert!(ws.worktree_space_here().is_some());
+        assert_eq!(ws.repo_group_key(), Some("/repo/flock/.git"));
+        assert!(ws.is_linked_checkout());
 
         // No live answer is not disagreement: a probe that hasn't finished, or
         // a non-git cwd, must not strip a workspace of its worktree actions.
-        assert!(ws.worktree_space_for_actions(None).is_some());
+        ws.cached_git_space = None;
+        assert!(ws.worktree_space_here().is_some());
+        assert!(ws.is_linked_checkout());
     }
 
     /// #102 part 3: tabs render in `(display_name, tab.number)` order, so

@@ -608,7 +608,7 @@ impl App {
             .state
             .workspaces
             .get(ws_idx)
-            .and_then(|ws| ws.worktree_space_for_actions(ws.git_space()).cloned())
+            .and_then(|ws| ws.worktree_space_here().cloned())
         else {
             return encode_error(
                 id,
@@ -642,10 +642,9 @@ impl App {
         let path = space.checkout_path.display().to_string();
         let still_same_linked_worktree = {
             let ws = &self.state.workspaces[ws_idx];
-            ws.worktree_space_for_actions(ws.git_space())
-                .is_some_and(|current| {
-                    current.is_linked_worktree && current.checkout_path == space.checkout_path
-                })
+            ws.worktree_space_here().is_some_and(|current| {
+                current.is_linked_worktree && current.checkout_path == space.checkout_path
+            })
         };
         if still_same_linked_worktree {
             self.state.selected = ws_idx;
@@ -787,13 +786,14 @@ impl App {
         // #197: the action view here and in the list variant below — a
         // membership live git places in another repo would make every
         // create/open/list on this workspace operate on that repo.
-        if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
-            if membership.is_linked_worktree {
-                return Err(ApiFailure::new(
-                    "linked_worktree_source",
-                    "New and open worktree actions start from the repo parent workspace.",
-                ));
-            }
+        // #124 parity: a flock-managed linked worktree is a valid source over
+        // the API too — the new branch forks from that worktree's own HEAD,
+        // and `git worktree add` runs from its checkout. This path used to
+        // refuse every linked worktree, so branch-from-here worked in the app
+        // and through agent.fork but not through `flk worktree create`. An
+        // ad-hoc linked checkout (no membership) still falls through to the
+        // refusal below: its repo_root is ambiguous.
+        if let Some(membership) = ws.worktree_space_here() {
             return Ok(WorktreeSource {
                 workspace_idx: Some(ws_idx),
                 source_checkout_path: membership.checkout_path.clone(),
@@ -839,7 +839,7 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(membership) = ws.worktree_space_for_actions(ws.git_space()) {
+        if let Some(membership) = ws.worktree_space_here() {
             let source_checkout_path = if membership.is_linked_worktree {
                 membership.repo_root.clone()
             } else {
@@ -895,8 +895,22 @@ impl App {
             created_parent = true;
         }
         if let Some(ws_idx) = source.workspace_idx {
-            let membership =
-                worktree_membership(source, source.source_checkout_path.clone(), false);
+            // #124 branch-from-here: a source that is itself a flock-managed
+            // linked worktree keeps its own membership. Stamping the parent
+            // shape over it would demote the row out of its worktree group
+            // for having been branched from — the TUI path preserves it, and
+            // this one has to agree.
+            let existing_linked = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.worktree_space_here())
+                .is_some_and(|space| space.is_linked_worktree);
+            let membership = if existing_linked {
+                worktree_membership(source, source.source_checkout_path.clone(), true)
+            } else {
+                worktree_membership(source, source.source_checkout_path.clone(), false)
+            };
             self.set_worktree_membership(ws_idx, membership, !created_parent);
             if created_parent && emit_created_event {
                 self.emit_workspace_open_events(ws_idx);
@@ -929,7 +943,7 @@ impl App {
         self.state.workspaces.iter().position(|ws| {
             // #197: the action view — a stale membership must not let an
             // unrelated workspace stand in as this repo's parent checkout.
-            ws.worktree_space_for_actions(ws.git_space())
+            ws.worktree_space_here()
                 .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
                 || ws
                     .git_space()
@@ -1056,7 +1070,7 @@ impl App {
         ws_idx: usize,
     ) -> Option<WorktreeInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
-        let membership = ws.worktree_space_for_actions(ws.git_space())?;
+        let membership = ws.worktree_space_here()?;
         let branch = crate::workspace::git_branch(&membership.checkout_path);
         let is_detached = branch.is_none();
         Some(WorktreeInfo {
@@ -1075,13 +1089,9 @@ impl App {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
         self.state.workspaces.iter().position(|ws| {
-            if ws
-                .worktree_space_for_actions(ws.git_space())
-                .is_some_and(|space| {
-                    crate::worktree::canonical_or_original(&space.checkout_path)
-                        == canonical_checkout
-                })
-            {
+            if ws.worktree_space_here().is_some_and(|space| {
+                crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
+            }) {
                 return true;
             }
 
@@ -1777,6 +1787,70 @@ mod tests {
 
         run_git(&repo, &["worktree", "prune"]);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_branches_from_a_linked_worktree_source() {
+        // #124 parity over the API. `worktree.create` used to refuse every
+        // linked worktree source, so branch-from-here worked in the app and
+        // through agent.fork but `flk worktree create --workspace <linked>`
+        // said "start from the repo parent workspace" — for a checkout flock
+        // manages and knows the parent of.
+        let repo = create_committed_repo("api-create-from-linked-repo");
+        let linked = unique_temp_path("api-create-from-linked-child");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "task/linked-source",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let worktree_root = unique_temp_path("api-create-from-linked-root");
+
+        let mut app = app_with_parent(&linked);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&repo).unwrap().key,
+            label: "api-create-from-linked-repo".into(),
+            repo_root: repo.clone(),
+            checkout_path: linked.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces[0].cached_git_space = crate::workspace::git_space_metadata(&linked);
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                workspace_id: Some(workspace_id),
+                branch: Some("worktree/from-linked".into()),
+                focus: false,
+                ..Default::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated { worktree, .. } = success.result else {
+            panic!("expected worktree_created response: {response}");
+        };
+        assert_eq!(worktree.branch.as_deref(), Some("worktree/from-linked"));
+
+        // The source keeps its linked membership — branch-from-here must not
+        // demote it into the repo's parent row.
+        assert!(
+            app.state.workspaces[0]
+                .worktree_space()
+                .expect("source keeps membership")
+                .is_linked_worktree
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree_root);
+        let _ = std::fs::remove_dir_all(&linked);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
