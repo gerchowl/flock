@@ -13,6 +13,9 @@
 - Config startup and reload now warn about unknown top-level table sections, including a `[toast]` hint that points to `[ui.toast]`, instead of silently ignoring them. (#21)
 
 ### Fixed
+- The keybindings for new-worktree, branch-session, and open-worktree now reach their dialogs from inside a linked worktree instead of doing nothing at all. The keyboard path carried its own refusal that predated branch-from-here and dropped the keypress with no message; refusals now come from the dialog, which explains itself. (#196)
+- Worktree actions no longer act on a worktree membership that live git places in a different repo. A workspace whose pane has moved to another checkout kept its old grouping, so branch-session and new-worktree would create a worktree of the repo it had left, delete-checkout and the merge-gated kill offered to remove that repo's worktree, and the fleet sweep listed it under the wrong row. The membership itself is still kept — a move back agrees again. (#197)
+- Creating a worktree in a repo with no commits now says so, instead of passing git's `fatal: invalid reference: HEAD` through as if flock had failed. (#198)
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
 - Linux clipboard image reads now validate image payloads before accepting them, preventing malformed clipboard data from reaching pane image paste flows. (#18)
 - Pane resize keybindings now shrink panes again instead of only being able to grow them; when the focused pane has no split on the requested edge, the resize falls back to the opposite-edge split so an ancestor border still moves. (#23)
