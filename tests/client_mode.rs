@@ -1117,6 +1117,11 @@ fn client_receives_notify_on_agent_state_change() {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
+    // app_dir_name() is "flock-dev" in debug builds, so the flock/config.toml
+    // written above is NOT read; point FLOCK_CONFIG_PATH straight at it so the
+    // [ui.toast]/[ui.sound] enables actually load. (This test needs sound ON; it
+    // passed before only because the built-in default was enabled = true.)
+    cmd.env("FLOCK_CONFIG_PATH", config_home.join("flock/config.toml"));
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
     cmd.env("FLOCK_SOCKET_PATH", &api_socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");

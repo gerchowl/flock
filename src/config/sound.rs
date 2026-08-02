@@ -6,9 +6,12 @@ use crate::detect::Agent;
 
 use super::io::resolve_config_relative_path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SoundConfig {
+    /// Master switch for the attention chime + agent sounds. Off by default
+    /// (opt-in): set `[ui.sound] enabled = true` to turn them on. Was `true`;
+    /// flipped so a fresh install / a config without [ui.sound] is silent.
     pub enabled: bool,
     /// Optional mp3 file path used for all notification sounds.
     /// Relative paths are resolved from the config file's directory.
@@ -139,19 +142,6 @@ impl AgentSoundOverrides {
             Some(Agent::Kilo) => self.kilo,
             Some(Agent::Qodercli) => self.qodercli,
             None => AgentSoundSetting::Default,
-        }
-    }
-}
-
-impl Default for SoundConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            path: None,
-            done_path: None,
-            request_path: None,
-            all_clear_path: None,
-            agents: AgentSoundOverrides::default(),
         }
     }
 }
