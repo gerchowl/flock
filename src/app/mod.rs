@@ -526,6 +526,7 @@ impl App {
             request_kill_all_worktrees: false,
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
+            pending_ui_events: Vec::new(),
             action_notice: None,
             // Seeded below (`fleet_pause` field default), but the AppState
             // struct is constructed first so keep this None here — the
@@ -963,6 +964,11 @@ impl App {
             if self.drain_api_requests() {
                 needs_render = true;
             }
+
+            // Publish lifecycle events the keyboard paths queued this tick
+            // (#175 ADR-0005) — the socket path drains inside its own request
+            // handler, so this covers everything else.
+            self.drain_pending_ui_events();
 
             self.sync_focus_events();
             self.sync_session_save_schedule();

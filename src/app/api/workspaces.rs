@@ -153,10 +153,9 @@ impl App {
         self.state.selected = index;
         self.state.close_selected_workspace();
         self.shutdown_detached_terminal_runtimes();
-        self.emit_event(EventEnvelope {
-            event: EventKind::WorkspaceClosed,
-            data: EventData::WorkspaceClosed { workspace_id },
-        });
+        // WorkspaceClosed is queued by close_workspace_indices — the one place
+        // every close funnels through — and published by the drain below.
+        let _ = workspace_id;
 
         encode_success(id, ResponseResult::Ok {})
     }

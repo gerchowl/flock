@@ -802,6 +802,41 @@ pub(crate) struct PeerCheckoutState {
 /// (the dialog closes, `git worktree add` runs on a thread) and by then the
 /// focused pane may have moved. Capturing it up front lets the keyboard emit
 /// the same lineage edge the API does (#175 O2) instead of none at all.
+/// A lifecycle change made from the keyboard, queued for the App loop to turn
+/// into an event envelope.
+///
+/// Ids that describe something about to disappear are resolved at PUSH time —
+/// a closed pane cannot be named once it is gone. Everything else carries ids
+/// rather than indices, because indices shift when a workspace is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingUiEvent {
+    /// A pane was split into existence. Resolved at drain (the pane still
+    /// exists, and its `PaneInfo` needs App-level terminal runtimes).
+    PaneCreated {
+        workspace_id: String,
+        pane_id: crate::layout::PaneId,
+    },
+    PaneClosed {
+        pane_id: String,
+    },
+    TabClosed {
+        workspace_id: String,
+        tab_id: String,
+    },
+    WorkspaceClosed {
+        workspace_id: String,
+    },
+    WorkspaceRenamed {
+        workspace_id: String,
+        label: String,
+    },
+    TabRenamed {
+        workspace_id: String,
+        tab_id: String,
+        label: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkParent {
     /// Public pane id of the session being forked.
@@ -1835,6 +1870,15 @@ pub struct AppState {
     pub pending_attention_chime: bool,
     /// Transient feedback for a rejected/era action (rendered verbatim,
     /// auto-expires) — unlike config_diagnostic, which is for config problems.
+    /// Lifecycle events the keyboard paths produced, waiting for the App loop
+    /// to resolve and publish them (#175 ADR-0005).
+    ///
+    /// The socket handlers emit directly; the keyboard ones cannot — they hold
+    /// `&mut AppState` and the event hub lives on `App`. Without this the
+    /// durable log and `events.subscribe` saw socket-driven mutations only, so
+    /// anything replaying the log reconstructed the wrong pane tree whenever
+    /// the operator used the keyboard.
+    pub pending_ui_events: Vec<PendingUiEvent>,
     pub action_notice: Option<String>,
     /// #175 S3 commit 3 (US-9): sidebar banner when the fleet is paused,
     /// synced by the App from the persistent `fleet_pause` state so the
@@ -2626,6 +2670,7 @@ impl AppState {
             request_kill_all_worktrees: false,
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
+            pending_ui_events: Vec::new(),
             action_notice: None,
             fleet_paused_banner: None,
             agent_aliases: std::collections::HashMap::new(),

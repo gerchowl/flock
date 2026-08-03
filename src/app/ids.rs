@@ -13,15 +13,11 @@ impl App {
     }
 
     pub(super) fn public_workspace_id(&self, ws_idx: usize) -> String {
-        self.state.workspaces[ws_idx].id.clone()
+        self.state.public_workspace_id(ws_idx)
     }
 
     pub(super) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let tab_number = ws.public_tab_number(tab_idx)?;
-        Some(crate::workspace::public_tab_id_for_number(
-            &ws.id, tab_number,
-        ))
+        self.state.public_tab_id(ws_idx, tab_idx)
     }
 
     pub(super) fn public_pane_id(
@@ -29,12 +25,7 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<String> {
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_number = ws.public_pane_number(pane_id)?;
-        Some(crate::workspace::public_pane_id_for_number(
-            &ws.id,
-            pane_number,
-        ))
+        self.state.public_pane_id(ws_idx, pane_id)
     }
 
     pub(super) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
@@ -253,6 +244,36 @@ fn peer_ancestor_chain(peer: u32) -> Vec<u32> {
     ancestors
 }
 
+/// Public id resolution. These live on `AppState` rather than `App` because
+/// they read nothing else — and the keyboard mutation paths only ever hold
+/// `&mut AppState`, yet must name a pane, tab or workspace *before* removing
+/// it in order to report what closed (#175 ADR-0005).
+impl crate::app::state::AppState {
+    pub(crate) fn public_workspace_id(&self, ws_idx: usize) -> String {
+        self.workspaces[ws_idx].id.clone()
+    }
+
+    pub(crate) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
+        let ws = self.workspaces.get(ws_idx)?;
+        let tab_number = ws.public_tab_number(tab_idx)?;
+        Some(crate::workspace::public_tab_id_for_number(
+            &ws.id, tab_number,
+        ))
+    }
+
+    pub(crate) fn public_pane_id(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<String> {
+        let ws = self.workspaces.get(ws_idx)?;
+        let pane_number = ws.public_pane_number(pane_id)?;
+        Some(crate::workspace::public_pane_id_for_number(
+            &ws.id,
+            pane_number,
+        ))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::super::App;

@@ -753,6 +753,96 @@ impl App {
         }
     }
 
+    /// Resolve and publish the lifecycle events the keyboard paths queued.
+    ///
+    /// Called from the App loop and at the end of every socket request, so a
+    /// mutation announces itself exactly once no matter which door it came
+    /// through — and a caller that mutates over the socket still sees its own
+    /// event published before the response is written.
+    pub(crate) fn drain_pending_ui_events(&mut self) {
+        if self.state.pending_ui_events.is_empty() {
+            return;
+        }
+        for pending in std::mem::take(&mut self.state.pending_ui_events) {
+            let envelope = match pending {
+                crate::app::state::PendingUiEvent::PaneCreated {
+                    workspace_id,
+                    pane_id,
+                } => {
+                    // Resolved late on purpose: PaneInfo needs App-level
+                    // terminal runtimes, and the pane still exists.
+                    let Some(ws_idx) = self
+                        .state
+                        .workspaces
+                        .iter()
+                        .position(|ws| ws.id == workspace_id)
+                    else {
+                        continue;
+                    };
+                    let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+                        continue;
+                    };
+                    crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneCreated,
+                        data: crate::api::schema::EventData::PaneCreated { pane },
+                    }
+                }
+                crate::app::state::PendingUiEvent::PaneClosed { pane_id } => {
+                    let workspace_id = pane_id
+                        .split_once(':')
+                        .map(|(ws, _)| ws.to_string())
+                        .unwrap_or_default();
+                    crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneClosed,
+                        data: crate::api::schema::EventData::PaneClosed {
+                            pane_id,
+                            workspace_id,
+                        },
+                    }
+                }
+                crate::app::state::PendingUiEvent::TabClosed {
+                    workspace_id,
+                    tab_id,
+                } => crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::TabClosed,
+                    data: crate::api::schema::EventData::TabClosed {
+                        tab_id,
+                        workspace_id,
+                    },
+                },
+                crate::app::state::PendingUiEvent::WorkspaceClosed { workspace_id } => {
+                    crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::WorkspaceClosed,
+                        data: crate::api::schema::EventData::WorkspaceClosed { workspace_id },
+                    }
+                }
+                crate::app::state::PendingUiEvent::WorkspaceRenamed {
+                    workspace_id,
+                    label,
+                } => crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::WorkspaceRenamed,
+                    data: crate::api::schema::EventData::WorkspaceRenamed {
+                        workspace_id,
+                        label,
+                    },
+                },
+                crate::app::state::PendingUiEvent::TabRenamed {
+                    workspace_id,
+                    tab_id,
+                    label,
+                } => crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::TabRenamed,
+                    data: crate::api::schema::EventData::TabRenamed {
+                        tab_id,
+                        workspace_id,
+                        label,
+                    },
+                },
+            };
+            self.emit_event(envelope);
+        }
+    }
+
     pub(super) fn emit_event(&self, event: crate::api::schema::EventEnvelope) {
         self.event_hub.push(event);
     }
@@ -828,6 +918,15 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        let response = self.dispatch_api_request(request);
+        // Publish anything the handler's state mutation queued (#175
+        // ADR-0005) before the response goes out, so a socket caller sees its
+        // own event on the stream.
+        self.drain_pending_ui_events();
+        response
+    }
+
+    fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
