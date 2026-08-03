@@ -638,12 +638,7 @@ impl App {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
             self.shutdown_detached_terminal_runtimes();
-            self.emit_event(EventEnvelope {
-                event: EventKind::WorkspaceClosed,
-                data: EventData::WorkspaceClosed {
-                    workspace_id: workspace_id.clone(),
-                },
-            });
+            // WorkspaceClosed is queued by close_workspace_indices.
         }
         Ok(workspace_id)
     }
@@ -2275,6 +2270,58 @@ mod tests {
         assert_eq!(app.state.workspaces.len(), 1);
 
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// #175 ADR-0005: a workspace close announces itself exactly once, whether
+    /// the operator pressed a key or a socket caller asked for it. The socket
+    /// handlers used to emit directly while the keyboard emitted nothing, so
+    /// anything replaying the log reconstructed the wrong workspace list after
+    /// a keyboard close — and moving to one emitter must not start emitting
+    /// twice on the socket path.
+    #[test]
+    fn workspace_close_announces_itself_once_from_either_door() {
+        let event_hub = crate::api::EventHub::default();
+        let mut app = test_app_with_event_hub(event_hub.clone());
+        app.state.workspaces = vec![
+            Workspace::test_new("keyboard"),
+            Workspace::test_new("socket"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+
+        // Keyboard: mutate state directly, exactly as the input layer does.
+        let keyboard_id = app.state.workspaces[0].id.clone();
+        app.state.selected = 0;
+        app.state.close_selected_workspace();
+        app.drain_pending_ui_events();
+
+        let closed = |id: &str| {
+            event_hub
+                .events_after(0)
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(&event.data, EventData::WorkspaceClosed { workspace_id } if workspace_id == id)
+                })
+                .count()
+        };
+        assert_eq!(closed(&keyboard_id), 1, "keyboard close must announce once");
+
+        // Socket: the same close through workspace.close.
+        let socket_id = app.state.workspaces[0].id.clone();
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorkspaceClose(
+                crate::api::schema::WorkspaceTarget {
+                    workspace_id: socket_id.clone(),
+                },
+            ),
+        });
+        assert!(!response.contains("\"error\""), "{response}");
+        assert_eq!(
+            closed(&socket_id),
+            1,
+            "socket close must announce once, not twice"
+        );
     }
 
     #[test]

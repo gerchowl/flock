@@ -2228,6 +2228,12 @@ impl AppState {
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
                 crate::logging::workspace_closed(&workspace_id);
+                // The ONE place a workspace close is announced (#175
+                // ADR-0005). Every close funnels through here — keyboard,
+                // context menu, and the socket handlers — so the event cannot
+                // depend on which door the caller came through.
+                self.pending_ui_events
+                    .push(crate::app::state::PendingUiEvent::WorkspaceClosed { workspace_id });
             }
         }
         let mut close_indices = close_indices;
@@ -2464,6 +2470,19 @@ impl AppState {
         self.selection = None;
         self.selection_autoscroll = None;
         self.mark_session_dirty();
+        // Name the pane while it still exists (#175 ADR-0005) — after the
+        // close there is nothing left to resolve a public id from.
+        if let Some(pane_id) = active
+            .and_then(|i| {
+                self.workspaces
+                    .get(i)
+                    .and_then(|ws| ws.focused_pane_id().map(|pane_id| (i, pane_id)))
+            })
+            .and_then(|(i, pane_id)| self.public_pane_id(i, pane_id))
+        {
+            self.pending_ui_events
+                .push(crate::app::state::PendingUiEvent::PaneClosed { pane_id });
+        }
         let terminal_ids = active
             .and_then(|i| {
                 self.workspaces
@@ -2531,6 +2550,11 @@ impl AppState {
             ws.close_active_tab();
             self.remove_unattached_terminal_ids(terminal_ids);
             crate::logging::tab_closed(&workspace_id, &closing_tab_id);
+            self.pending_ui_events
+                .push(crate::app::state::PendingUiEvent::TabClosed {
+                    workspace_id: workspace_id.clone(),
+                    tab_id: closing_tab_id.clone(),
+                });
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }

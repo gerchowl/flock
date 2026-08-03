@@ -463,6 +463,15 @@ impl AppState {
                     .insert(new_pane.terminal.id.clone(), new_pane.terminal);
                 self.record_pane_focus_change(previous_focus, ws_idx, new_id);
                 self.mark_session_dirty();
+                // #175 ADR-0005: the socket's pane.split announces the new
+                // pane; a keyboard split has to as well, or a subscriber's
+                // pane tree diverges from the server's.
+                let workspace_id = self.public_workspace_id(ws_idx);
+                self.pending_ui_events
+                    .push(crate::app::state::PendingUiEvent::PaneCreated {
+                        workspace_id,
+                        pane_id: new_id,
+                    });
                 self.mode = Mode::Terminal;
             }
         }

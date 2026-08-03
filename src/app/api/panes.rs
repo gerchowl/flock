@@ -1043,10 +1043,8 @@ impl App {
                     workspace_id: workspace_id.clone(),
                 },
             });
-            self.emit_event(EventEnvelope {
-                event: EventKind::WorkspaceClosed,
-                data: EventData::WorkspaceClosed { workspace_id },
-            });
+            // WorkspaceClosed is queued by close_workspace_indices.
+            let _ = workspace_id;
         } else {
             self.state.remove_unattached_terminal_ids(terminal_id);
             self.shutdown_detached_terminal_runtimes();

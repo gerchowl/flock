@@ -409,6 +409,17 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                     let workspace_id = state.workspaces[state.selected].id.clone();
                     state.workspaces[state.selected].set_custom_name(new_name);
                     crate::logging::workspace_renamed(&workspace_id);
+                    // #175 ADR-0005: workspace.rename announces itself; the
+                    // dialog must too. The label is read back AFTER the set so
+                    // the event carries what was actually stored (trimmed).
+                    let label = state.workspaces[state.selected]
+                        .display_name_from(&state.terminals, &Default::default());
+                    state.pending_ui_events.push(
+                        crate::app::state::PendingUiEvent::WorkspaceRenamed {
+                            workspace_id,
+                            label,
+                        },
+                    );
                     state.mark_session_dirty();
                 }
                 Mode::RenameTab if state.creating_new_tab => {
@@ -422,6 +433,8 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                         };
                 }
                 Mode::RenameTab => {
+                    // Collected inside the borrow, pushed after it ends.
+                    let mut renamed_tab: Option<(String, String, String)> = None;
                     if let Some(ws_idx) = state.active {
                         if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                             let workspace_id = ws.id.clone();
@@ -441,10 +454,21 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                                         })
                                         .unwrap_or_else(|| workspace_id.clone());
                                     crate::logging::tab_renamed(&workspace_id, &tab_id);
+                                    let label = tab.display_name().to_string();
+                                    renamed_tab = Some((workspace_id.clone(), tab_id, label));
                                     state.mark_session_dirty();
                                 }
                             }
                         }
+                    }
+                    if let Some((workspace_id, tab_id, label)) = renamed_tab {
+                        state.pending_ui_events.push(
+                            crate::app::state::PendingUiEvent::TabRenamed {
+                                workspace_id,
+                                tab_id,
+                                label,
+                            },
+                        );
                     }
                 }
                 Mode::RenamePane => {
