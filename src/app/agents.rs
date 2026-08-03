@@ -422,6 +422,7 @@ impl App {
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
         Some(crate::api::schema::AgentInfo {
+            agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
             agent: pane.agent,

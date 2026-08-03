@@ -1529,6 +1529,10 @@ pub struct TabInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
+    /// Fleet-global, restart-stable identity — the name to address this agent
+    /// by. `terminal_id` names a running PTY and is re-minted every restart;
+    /// `pane_id` names a placement. Neither survives as an address.
+    pub agent_id: String,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
