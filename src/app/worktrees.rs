@@ -55,57 +55,100 @@ pub(crate) enum BranchUnavailable {
     Unsupported(crate::agent_resume::BranchUnsupported),
 }
 
+/// Which repo and checkout a workspace's worktree actions operate on.
+///
+/// THE single answer to that question. Every path that acts on a workspace's
+/// worktree — the TUI dialogs, `agent.fork`, and the `worktree.*` socket API —
+/// resolves through [`App::worktree_source`]. It used to be answered twice, once
+/// in the app and once in `src/app/api/`, and the copies drifted: #124's
+/// branch-from-here landed only in the app half, so the same action succeeded
+/// from the keyboard and was refused over the API for months, and #197's
+/// stale-membership guard then had to be applied to both by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeSource {
+    pub(crate) workspace_idx: usize,
+    pub(crate) workspace_id: String,
+    /// The membership when this checkout is flock-managed, read through the
+    /// #197 action view so a membership live git places in another repo is
+    /// withheld. `None` for an unmanaged checkout resolved from live git.
+    pub(crate) membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    /// Repo identity for the source: derived from the membership when there is
+    /// one (it carries the shared repo_root), else the live git answer.
+    pub(crate) space: crate::workspace::GitSpaceMetadata,
+    /// The checkout `git worktree add` runs from. For a #124 branch-from-here
+    /// source this is the linked worktree itself, so the new branch forks from
+    /// that worktree's HEAD rather than the repo's.
+    pub(crate) source_checkout_path: std::path::PathBuf,
+}
+
+/// Why a workspace can't be a worktree-action source. Carries both an API error
+/// code and the human message, so the two front ends can't drift in what they
+/// refuse or in what they call it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreeSourceRefusal {
+    WorkspaceNotFound,
+    /// A linked checkout flock does not manage: no membership, so its parent
+    /// repo_root is ambiguous.
+    AdHocLinkedCheckout,
+    NotInGitWorkTree,
+}
+
+impl WorktreeSourceRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::WorkspaceNotFound => "workspace_not_found",
+            Self::AdHocLinkedCheckout => "linked_worktree_source",
+            Self::NotInGitWorkTree => "not_git_worktree",
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::WorkspaceNotFound => "Workspace not found.",
+            Self::AdHocLinkedCheckout => {
+                "New and open worktree actions start from the repo parent workspace."
+            }
+            Self::NotInGitWorkTree => {
+                "Flock worktree actions require a workspace inside a Git work tree."
+            }
+        }
+    }
+}
+
 impl App {
-    /// `pub(super)` so the `agent.fork` API handler shares the TUI's source
-    /// semantics (#124 branch-from-here) instead of re-deriving them.
-    pub(super) fn worktree_source_metadata(
+    /// Which repo a workspace belongs to, and whether flock manages the
+    /// checkout — the precedence question, with no policy about what may be
+    /// acted on. THE one implementation: this is the reasoning #197 had to
+    /// patch in two places because it existed twice.
+    ///
+    /// #197: `worktree_space_here` withholds a membership that live git places
+    /// in a different repo — acting on it would name the repo the pane LEFT,
+    /// not the one it is in. Judged against the PROBED space only, never the
+    /// synchronous fallback: the fallback exists to give an unprobed workspace
+    /// an answer at all, and a half-resolved one is too thin to invalidate
+    /// persisted membership on.
+    pub(super) fn worktree_source_space(
         &self,
         ws_idx: usize,
     ) -> Result<
         (
             Option<crate::workspace::WorktreeSpaceMembership>,
             crate::workspace::GitSpaceMetadata,
-            std::path::PathBuf,
-            String,
         ),
-        String,
+        WorktreeSourceRefusal,
     > {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
-            return Err("Workspace not found.".into());
+            return Err(WorktreeSourceRefusal::WorkspaceNotFound);
         };
         let git_space = ws.git_space().cloned().or_else(|| {
             ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
-        // #124: a flock-managed linked worktree IS a valid source — the new
-        // branch forks from that worktree's HEAD (branch-from-here). Its
-        // membership carries the shared repo_root + its own checkout_path, so
-        // `git worktree add` runs from the linked checkout. (An ad-hoc, non
-        // -membership linked checkout below stays refused — its repo_root is
-        // ambiguous.)
-        // #197: read through `worktree_space_for_actions`, which withholds a
-        // membership that live git places in a different repo — acting on it
-        // would branch the repo the pane LEFT, not the one it is in. Judged
-        // against the PROBED space only (`git_space()`), never the synchronous
-        // fallback above: the fallback exists to give an unprobed workspace a
-        // source, and a half-resolved answer is too thin to invalidate
-        // persisted membership on.
-        let existing_membership = ws.worktree_space_here().cloned();
-        // An ad-hoc linked checkout (no flock-managed membership) stays refused
-        // — its repo_root is ambiguous. A membership-backed linked worktree is
-        // the #124 branch-from-here case, resolved from the membership below.
-        if existing_membership.is_none()
-            && git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.is_linked_worktree)
-        {
-            return Err(
-                "New and open worktree actions start from the repo parent workspace.".into(),
-            );
-        }
-
-        let space = existing_membership
+        let membership = ws.worktree_space_here().cloned();
+        // A membership carries the shared repo_root, so it describes the repo
+        // more completely than the checkout's own git metadata does.
+        let space = membership
             .as_ref()
             .map_or(git_space, |membership| {
                 Some(crate::workspace::GitSpaceMetadata {
@@ -120,31 +163,59 @@ impl App {
                     ),
                 })
             })
-            .ok_or_else(|| {
-                "Flock worktree actions require a workspace inside a Git work tree.".to_string()
-            })?;
-        let source_checkout_path = existing_membership
+            .ok_or(WorktreeSourceRefusal::NotInGitWorkTree)?;
+        Ok((membership, space))
+    }
+
+    /// Resolve `ws_idx` as a source to CREATE from. See [`WorktreeSource`] —
+    /// the TUI dialogs, `agent.fork` and `worktree.create`/`open` all land
+    /// here, deliberately.
+    ///
+    /// The one policy this adds over [`App::worktree_source_space`]: an ad-hoc
+    /// linked checkout — linked per git, but with no flock membership — is
+    /// refused, because nothing says which repo_root the new worktree belongs
+    /// to. A membership-backed linked worktree is the #124 branch-from-here
+    /// case and IS a valid source: `git worktree add` runs from the linked
+    /// checkout, so the new branch forks from that worktree's HEAD.
+    ///
+    /// `worktree.list` deliberately does not use this: inspecting from an
+    /// ad-hoc linked checkout is harmless and resolves to the parent repo.
+    pub(super) fn worktree_source(
+        &self,
+        ws_idx: usize,
+    ) -> Result<WorktreeSource, WorktreeSourceRefusal> {
+        let (membership, space) = self.worktree_source_space(ws_idx)?;
+        if membership.is_none() && space.is_linked_worktree {
+            return Err(WorktreeSourceRefusal::AdHocLinkedCheckout);
+        }
+        let source_checkout_path = membership
             .as_ref()
             .map(|membership| membership.checkout_path.clone())
             .unwrap_or_else(|| space.repo_root.clone());
-        let source_workspace_id = self.state.workspaces[ws_idx].id.clone();
-        Ok((
-            existing_membership,
+        Ok(WorktreeSource {
+            workspace_idx: ws_idx,
+            workspace_id: self.state.workspaces[ws_idx].id.clone(),
+            membership,
             space,
             source_checkout_path,
-            source_workspace_id,
-        ))
+        })
     }
 
     pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize, base: Option<String>) {
-        let (existing_membership, space, source_checkout_path, source_workspace_id) =
-            match self.worktree_source_metadata(ws_idx) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    self.show_action_notice(err);
-                    return;
-                }
-            };
+        let source = match self.worktree_source(ws_idx) {
+            Ok(source) => source,
+            Err(refusal) => {
+                self.show_action_notice(refusal.message());
+                return;
+            }
+        };
+        let crate::app::worktrees::WorktreeSource {
+            membership: existing_membership,
+            space,
+            source_checkout_path,
+            workspace_id: source_workspace_id,
+            ..
+        } = source;
 
         let repo_name = space.label.clone();
         let seed = SystemTime::now()
@@ -820,14 +891,20 @@ impl App {
     }
 
     pub(crate) fn open_existing_worktree_dialog(&mut self, ws_idx: usize) {
-        let (existing_membership, space, source_checkout_path, source_workspace_id) =
-            match self.worktree_source_metadata(ws_idx) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    self.show_action_notice(err);
-                    return;
-                }
-            };
+        let source = match self.worktree_source(ws_idx) {
+            Ok(source) => source,
+            Err(refusal) => {
+                self.show_action_notice(refusal.message());
+                return;
+            }
+        };
+        let crate::app::worktrees::WorktreeSource {
+            membership: existing_membership,
+            space,
+            source_checkout_path,
+            workspace_id: source_workspace_id,
+            ..
+        } = source;
 
         let list = match crate::worktree::list_existing_worktrees(&space.repo_root) {
             Ok(list) => list,
