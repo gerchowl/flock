@@ -14,6 +14,7 @@ pub(crate) use api::peers::{configured_node_icon, short_host_name};
 mod api_helpers;
 pub(crate) mod config_io;
 mod creation;
+pub(crate) mod directory;
 pub(crate) mod float;
 mod ids;
 mod input;

@@ -4439,6 +4439,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Working,
             status_age_secs: Some(3),
             activity: None,
+            agents: Vec::new(),
         }];
         peer.last_ok = Some(std::time::Instant::now());
         peer
@@ -4596,6 +4597,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Idle,
             status_age_secs: None,
             activity: None,
+            agents: Vec::new(),
         }];
         anvil.last_ok = Some(std::time::Instant::now());
         state.peer_summaries = vec![fleet_peer_flock_main(), anvil];
@@ -6564,6 +6566,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Working,
             status_age_secs: Some(10),
             activity: None,
+            agents: Vec::new(),
         }];
         peer.last_ok = Some(std::time::Instant::now());
         peer

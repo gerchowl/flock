@@ -138,6 +138,15 @@ pub fn frame_message(payload: &[u8]) -> Vec<u8> {
     framed
 }
 
+/// The wire protocol version these integration tests handshake with.
+///
+/// Restated here because integration tests link the binary, not the library,
+/// so they cannot import `protocol::PROTOCOL_VERSION`. Keeping it in ONE place
+/// means a protocol bump touches one line rather than the dozen call sites
+/// that used to hardcode the number — which is how a bump used to fail a
+/// terminal-size test for reasons that had nothing to do with terminal sizes.
+pub const PROTOCOL_VERSION: u32 = 25;
+
 /// The live-handoff refusal notice a server sends a connecting client while a
 /// live update is in flight (#38). A client that reads it opens its retry
 /// window. Mirror of `protocol::LIVE_HANDOFF_ATTACH_NOTICE`.

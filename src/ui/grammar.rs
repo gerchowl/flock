@@ -366,6 +366,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Idle,
             status_age_secs: None,
             activity: None,
+            agents: Vec::new(),
         }
     }
 

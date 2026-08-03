@@ -1266,6 +1266,7 @@ mod tests {
                         status: crate::api::schema::AgentStatus::Blocked,
                         status_age_secs: Some(840),
                         activity: None,
+                        agents: Vec::new(),
                     }],
                     relayed_fleet: Vec::new(),
                     icon: None,
@@ -1329,6 +1330,7 @@ mod tests {
                     status: crate::api::schema::AgentStatus::Idle,
                     status_age_secs: None,
                     activity: None,
+                    agents: Vec::new(),
                 })
                 .collect()
         };

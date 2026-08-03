@@ -543,6 +543,10 @@ pub enum MessageTarget {
     /// Repo-scoped pane: `repo` matches workspace worktree membership
     /// (repo name); `pane` resolves within only those workspaces.
     RepoPane { repo: String, pane: String },
+    /// Fleet-global agent identity (ADR-0008). The only target shape that
+    /// means the same thing on every host: pane ids name a placement on ONE
+    /// server, so they cannot address across machines.
+    Agent { agent: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1997,6 +2001,31 @@ pub struct PeerWorkspaceSummary {
     /// Live status-line activity while Working (e.g. "Implementing the parser").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Every agent in this workspace, by fleet-global identity — the rows that
+    /// make a directory possible (ADR-0008).
+    ///
+    /// Distinct from [`agent`](Self::agent), which is the attention-LEADING
+    /// pane's short label for the sidebar. A directory has to answer "where
+    /// does THIS agent live", so it needs all of them, addressed by a name
+    /// that means the same thing on every host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<PeerAgentSummary>,
+}
+
+/// One agent as the fleet sees it: its identity, and where that identity
+/// currently lives.
+///
+/// The split is the point. `agent_id` is the NAME — stable across restarts,
+/// pane moves and workspace renames. Everything else is where it happens to be
+/// right now, and is expected to change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAgentSummary {
+    pub agent_id: String,
+    /// Public pane id on the owning server. A routing detail, not a name.
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub status: AgentStatus,
 }
 
 /// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
