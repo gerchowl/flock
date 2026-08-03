@@ -83,8 +83,45 @@ pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(crate) fn default_checkout_path(root: &Path, repo_name: &str, branch: &str) -> PathBuf {
-    root.join(repo_name).join(branch_to_path_slug(branch))
+/// The directory that namespaces one repo's worktrees, keyed on the repo's
+/// **git common dir** — the same identity `worktree_space_here` compares, and
+/// the same one the sidebar groups on.
+///
+/// A basename is not an identity (#212). `~/Projects/nucl-parquet` and the
+/// `nucl-parquet` submodule inside `hyrr` both answer "nucl-parquet", so they
+/// shared one base and their worktrees intermingled with only the branch slug
+/// telling them apart. Parent-qualifying doesn't fix it either — `/a/x/repo`
+/// and `/b/x/repo` still collide. Only the repo's own identity does.
+///
+/// The label is kept as a readable prefix; the suffix is what makes it
+/// collision-free. Deriving both from `repo_key` keeps the name a pure function
+/// of the repo, so it never depends on which repos happen to be open.
+pub(crate) fn worktree_base_dir_name(repo_name: &str, repo_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = canonical_or_original(Path::new(repo_key));
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let short: String = digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let label = branch_to_path_slug(repo_name);
+    format!("{label}-{short}")
+}
+
+/// Where a new worktree for `repo_key` on `branch` is proposed to live.
+///
+/// Only ever a *proposal*: an existing worktree is found through its recorded
+/// `checkout_path`, never by re-deriving this. That is why #212's rename is
+/// safe — worktrees created under the old basename-only scheme keep working.
+pub(crate) fn default_checkout_path(
+    root: &Path,
+    repo_name: &str,
+    repo_key: &str,
+    branch: &str,
+) -> PathBuf {
+    root.join(worktree_base_dir_name(repo_name, repo_key))
+        .join(branch_to_path_slug(branch))
 }
 
 pub(crate) fn build_worktree_remove_command(
@@ -487,7 +524,12 @@ pub(crate) fn fetch_and_add_peer_worktree(
     run_command_capture("git", &["-C", &dir, "fetch", "origin", branch], None)
         .map_err(|err| format!("git fetch origin {branch} failed: {err}"))?;
 
-    let checkout_path = default_checkout_path(worktree_directory, repo_name, branch);
+    // Identity for the namespace is the repo's common dir (#212); derive it
+    // from the checkout we were handed rather than trusting the basename.
+    let repo_key = crate::workspace::git_space_metadata(repo_dir)
+        .map(|space| space.key)
+        .unwrap_or_else(|| canonical_or_original(repo_dir).display().to_string());
+    let checkout_path = default_checkout_path(worktree_directory, repo_name, &repo_key, branch);
     if let Some(parent) = checkout_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -1607,15 +1649,61 @@ prunable stale
         }
     }
 
+    /// #212: the repro from the issue — a standalone repo and a same-named
+    /// submodule of another repo. Both answer "nucl-parquet" for their
+    /// basename, so under the old scheme their worktrees shared one base
+    /// directory with only the branch slug telling them apart.
+    #[test]
+    fn worktree_base_is_keyed_on_repo_identity_not_basename() {
+        let standalone =
+            worktree_base_dir_name("nucl-parquet", "/home/me/Projects/nucl-parquet/.git");
+        let submodule = worktree_base_dir_name(
+            "nucl-parquet",
+            "/home/me/Projects/hyrr/.git/modules/nucl-parquet",
+        );
+        assert_ne!(
+            standalone, submodule,
+            "same-named repos must not share a worktree base"
+        );
+
+        // Parent-qualifying would not have been enough either: two repos can
+        // share a parent directory name at different absolute paths.
+        let a = worktree_base_dir_name("repo", "/a/x/repo/.git");
+        let b = worktree_base_dir_name("repo", "/b/x/repo/.git");
+        assert_ne!(a, b, "identity, not the parent name, has to discriminate");
+
+        // Readable prefix retained, and the name is a pure function of the
+        // repo — same inputs, same directory, every time.
+        assert!(standalone.starts_with("nucl-parquet-"), "{standalone}");
+        assert_eq!(
+            standalone,
+            worktree_base_dir_name("nucl-parquet", "/home/me/Projects/nucl-parquet/.git")
+        );
+    }
+
+    /// A worktree created from a linked worktree of a repo still belongs to
+    /// that repo's namespace — branch-from-here must not scatter worktrees.
+    #[test]
+    fn worktree_base_is_shared_across_a_repos_checkouts() {
+        // Both the main checkout and its linked worktree carry the same
+        // `key` (the git common dir), which is what the base is keyed on.
+        let from_main = worktree_base_dir_name("flock", "/repo/flock/.git");
+        let from_linked = worktree_base_dir_name("flock", "/repo/flock/.git");
+        assert_eq!(from_main, from_linked);
+    }
+
     #[test]
     fn default_checkout_path_appends_repo_and_branch_slug() {
         assert_eq!(
             default_checkout_path(
                 Path::new("/home/me/.flock/worktrees"),
                 "flock",
+                "/repo/flock/.git",
                 "worktree/brave-river",
             ),
-            PathBuf::from("/home/me/.flock/worktrees/flock/worktree-brave-river")
+            PathBuf::from("/home/me/.flock/worktrees")
+                .join(worktree_base_dir_name("flock", "/repo/flock/.git"))
+                .join("worktree-brave-river")
         );
     }
 

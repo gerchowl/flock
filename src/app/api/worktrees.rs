@@ -104,6 +104,7 @@ impl App {
             None => crate::worktree::default_checkout_path(
                 &self.state.worktree_directory,
                 &source.repo_name,
+                &source.repo_key,
                 &branch,
             ),
         };
@@ -282,6 +283,7 @@ impl App {
             None => crate::worktree::default_checkout_path(
                 &self.state.worktree_directory,
                 &space.label,
+                &space.key,
                 &branch,
             ),
         };
