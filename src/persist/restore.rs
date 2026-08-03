@@ -499,6 +499,13 @@ fn restore_tab(
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_last_prompt = saved_pane.and_then(|p| p.last_prompt.clone());
         let saved_header_reserved = saved_pane.is_some_and(|p| p.header_reserved);
+        // A restored pane keeps the agent identity it was minted with. Only a
+        // pane from a pre-identity snapshot gets a fresh one — those agents
+        // never had a stable name to preserve.
+        let restored_agent_id = saved_pane
+            .and_then(|p| p.agent_id.clone())
+            .map(crate::terminal::AgentId::from_persisted)
+            .unwrap_or_else(|| crate::terminal::AgentId::alloc(&crate::app::short_host_name()));
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -524,8 +531,12 @@ fn restore_tab(
         };
         if let Some(plan) = pending_native_agent_restore {
             let terminal_id = TerminalId::alloc();
-            let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                .with_pending_agent_resume_plan(plan);
+            let mut terminal = TerminalState::with_agent_id(
+                terminal_id.clone(),
+                restored_agent_id.clone(),
+                cwd.clone(),
+            )
+            .with_pending_agent_resume_plan(plan);
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
@@ -587,7 +598,11 @@ fn restore_tab(
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                let mut terminal = TerminalState::with_agent_id(
+                    terminal_id.clone(),
+                    restored_agent_id.clone(),
+                    cwd.clone(),
+                );
                 terminal.last_prompt = saved_last_prompt.clone();
                 terminal.header_reserved = saved_header_reserved;
                 if was_imported {
@@ -1111,6 +1126,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            agent_id: None,
                             cwd,
                             label: None,
                             last_prompt: None,
@@ -1195,6 +1211,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            agent_id: None,
                             cwd,
                             label: None,
                             last_prompt: None,
@@ -1367,6 +1384,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                agent_id: None,
                 cwd: cwd.clone(),
                 label: None,
                 last_prompt: None,

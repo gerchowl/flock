@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 // Process-exit updates clear matching hook authority before recomputing state.
 
 use crate::detect::{Agent, AgentState};
-use crate::terminal::TerminalId;
+use crate::terminal::{AgentId, TerminalId};
 
 #[path = "metadata.rs"]
 mod metadata;
@@ -73,6 +73,19 @@ pub struct TerminalStateMutation {
 /// metadata.
 pub struct TerminalState {
     pub id: TerminalId,
+    /// Fleet-global, restart-stable identity for the agent in this pane.
+    ///
+    /// `id` (the `TerminalId`) survives a pane move but is RE-MINTED on every
+    /// server start — it names a running PTY, not an agent. Public pane ids
+    /// (`w3:p1`) name a *placement*, so they change when the pane moves and
+    /// mean nothing on another host. Neither can address an agent across a
+    /// restart or a machine, which is why a cross-machine message could not
+    /// say who sent it.
+    ///
+    /// This is minted once when the pane is created, persisted in the session
+    /// snapshot, and never rewritten. Address ≠ location: host and pane are
+    /// resolvable *metadata* about an agent, not its name.
+    pub agent_id: AgentId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
@@ -127,9 +140,20 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
+    /// Mint a terminal with a fresh agent identity. Restore uses
+    /// [`Self::with_agent_id`] so a persisted agent keeps its name.
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
+        let agent_id = AgentId::alloc(&crate::app::short_host_name());
+        Self::with_agent_id(id, agent_id, cwd)
+    }
+
+    /// Rebuild a terminal around an identity that already exists — the restore
+    /// path. Minting here instead would re-address every agent on restart and
+    /// orphan any in-flight message thread.
+    pub fn with_agent_id(id: TerminalId, agent_id: AgentId, cwd: PathBuf) -> Self {
         Self {
             id,
+            agent_id,
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,

@@ -113,6 +113,14 @@ pub struct TabSnapshot {
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub cwd: PathBuf,
+    /// Fleet-global agent identity (see [`crate::terminal::AgentId`]).
+    ///
+    /// Optional so pre-existing snapshots restore: a pane without one is
+    /// minted a fresh id on first restore and carries it from then on. That
+    /// one-time renaming is unavoidable — those agents never had a stable name
+    /// to preserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -396,16 +404,25 @@ fn capture_tab(
                         }
                     })
                 });
-        let (last_prompt, header_reserved) = tab
+        let (last_prompt, header_reserved, agent_id) = tab
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id))
-            .map(|terminal| (terminal.last_prompt.clone(), terminal.header_reserved))
-            .unwrap_or((None, false));
+            .map(|terminal| {
+                (
+                    terminal.last_prompt.clone(),
+                    terminal.header_reserved,
+                    // Persisting this is what makes it an identity rather than
+                    // a handle: without it, restart re-addresses every agent.
+                    Some(terminal.agent_id.to_string()),
+                )
+            })
+            .unwrap_or((None, false, None));
         panes.insert(
             id.raw(),
             PaneSnapshot {
                 cwd,
+                agent_id,
                 label,
                 last_prompt,
                 header_reserved,
@@ -562,6 +579,41 @@ mod tests {
         state
     }
 
+    /// The property that makes an AgentId an identity rather than a handle:
+    /// it goes into the snapshot and comes back unchanged. `TerminalId` does
+    /// not — it is re-minted every start — which is why an agent had no name
+    /// that survived a restart, and why a relayed message could not say who
+    /// sent it.
+    #[test]
+    fn agent_identity_survives_a_capture() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("main")];
+        state.active = Some(0);
+        state.ensure_test_terminals();
+
+        let pane_id = state.workspaces[0].focused_pane_id().expect("pane");
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let minted = state.terminals[&terminal_id].agent_id.to_string();
+        assert!(minted.starts_with("agent_"), "{minted}");
+
+        let snapshot = capture_from_state(&state);
+        let persisted = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .and_then(|pane| pane.agent_id.clone())
+            .expect("the identity must be persisted");
+        assert_eq!(persisted, minted);
+
+        // And it is genuinely per-agent, not per-process.
+        let other = crate::terminal::AgentId::alloc("sage").to_string();
+        assert_ne!(other, minted);
+    }
+
     fn capture_from_state(state: &AppState) -> SessionSnapshot {
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         capture_from_state_with_runtimes(state, &terminal_runtimes)
@@ -650,6 +702,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/flock"),
                 label: None,
                 last_prompt: None,
@@ -662,6 +715,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 last_prompt: None,
@@ -1338,6 +1392,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                agent_id: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-flock-test"),
                 label: None,
                 last_prompt: None,
@@ -1350,6 +1405,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                agent_id: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
