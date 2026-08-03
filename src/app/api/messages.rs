@@ -1,6 +1,6 @@
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, MessageTarget, MsgListParams, MsgReplyParams,
-    MsgSendParams, ResponseResult,
+    EventData, EventEnvelope, EventKind, MessageTarget, MsgListParams, MsgReadParams,
+    MsgReplyParams, MsgSendParams, ResponseResult,
 };
 use crate::app::mailboxes::{EnqueueOutcome, PendingMessage};
 use crate::app::App;
@@ -214,6 +214,70 @@ impl App {
         )
     }
 
+    /// `msg.read` — the recipient consumes its inbox (ADR-0008).
+    ///
+    /// This is where "delivered" now happens. Under pane injection, delivery
+    /// meant flock typed the body into a TTY and hoped the agent read it;
+    /// here it means the agent actually took the message. The event is
+    /// emitted on the same edge, so the audit trail gets truer rather than
+    /// noisier.
+    pub(super) fn handle_msg_read(&mut self, id: String, params: MsgReadParams) -> String {
+        let pane = match params.pane {
+            Some(pane) => match self.resolve_terminal_target(&pane) {
+                Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
+                Err(err) => {
+                    return super::responses::encode_error_body(
+                        id,
+                        self.agent_target_error_body(err),
+                    )
+                }
+            },
+            // Omitted: the caller's own pane, resolved the way `msg.send`
+            // resolves its sender.
+            None => self
+                .parse_pane_id_or_peer("", self.current_api_peer_pid)
+                .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
+        };
+        let Some(pane) = pane else {
+            return encode_error(
+                id,
+                "msg_target_not_found",
+                "no pane to read: pass `pane`, or call from inside the pane whose inbox you want",
+            );
+        };
+
+        let now = now_ms();
+        let mut messages = Vec::new();
+        while let Some(message) = self.mailboxes.pop_next(&pane) {
+            self.mailboxes.record_delivered(&message);
+            self.emit_event(EventEnvelope {
+                event: EventKind::MessageDelivered,
+                data: EventData::MessageDelivered {
+                    correlation_id: message.correlation_id.clone(),
+                    delivered: true,
+                    outcome: "read".into(),
+                    delivery_attempts: message.delivery_attempts + 1,
+                    latency_ms: now.saturating_sub(message.enqueued_at_ms),
+                },
+            });
+            messages.push(crate::api::schema::InboxMessage {
+                correlation_id: message.correlation_id.clone(),
+                // `replyable` is computed from the same field `msg.reply`
+                // routes on, so the recipient is never told it can reply when
+                // it cannot — the failure #213 was filed for.
+                replyable: message.from_pane.is_some(),
+                from_pane: message.from_pane.clone(),
+                from_repo: message.from_repo.clone(),
+                to_pane: message.to_pane.clone(),
+                in_reply_to: message.in_reply_to.clone(),
+                enqueued_at_ms: message.enqueued_at_ms,
+                body: message.body.clone(),
+            });
+        }
+        messages.sort_by_key(|message| message.enqueued_at_ms);
+        encode_success(id, ResponseResult::MsgRead { messages })
+    }
+
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
     /// answer the caller.
     fn queue_message(
@@ -339,20 +403,19 @@ impl App {
         }
     }
 
-    /// Deliver queued messages to every recipient pane that is Idle and has
-    /// dwelled past the attention settle (#175 M1/M2). Polled from the
-    /// scheduled tick of BOTH event loops (the #25 dual-loop lesson) rather
-    /// than hooked on the Idle→Done completion edge: that edge only commits
-    /// while a completion stays UNSEEN, so any read (API poll, operator
-    /// glance) swallowed it and stranded the mailbox — live-e2e finding.
-    /// Dwell-gating also delivers to a recipient that was already idle when
-    /// the message arrived, instead of waiting for its next unrelated turn.
-    pub(crate) fn deliver_due_messages(&mut self, now_instant: std::time::Instant) {
-        // US-9 (#175 S3 commit 3): fleet pause halts scheduled delivery.
-        // First-line early return — queued messages sit until resume; the
-        // TTL expiry (24h) still runs on the next non-paused tick. Human
-        // `agent.send` bypasses this path so operators can still talk to
-        // paused agents.
+    /// Expire messages nobody read in time.
+    ///
+    /// ADR-0008: this used to also DELIVER, by typing each message into its
+    /// recipient's pane. That is gone — agents read their own inbox with
+    /// `msg.read`, woken at a turn boundary by the stop hook. With the
+    /// keystrokes went the machinery they required: the `Idle` +
+    /// `ATTENTION_SETTLE` dwell that made typing safe, the retry/backoff for a
+    /// pane that was mid-turn, and the refusal that kept a message out of a
+    /// bare shell prompt. A pull inbox has no such hazards, so what remains is
+    /// the one thing still time-based — the TTL sweep.
+    pub(crate) fn expire_undeliverable_messages(&mut self) {
+        // US-9 (#175 S3 commit 3): fleet pause halts the mailbox clock, so a
+        // paused fleet does not quietly age messages out.
         if self.fleet_pause.paused {
             return;
         }
@@ -369,117 +432,7 @@ impl App {
                 },
             });
         }
-        for public in self.mailboxes.queued_pane_ids() {
-            let Ok(resolved) = self.resolve_terminal_target(&public) else {
-                continue;
-            };
-            let (ws_idx, pane_id) = (resolved.ws_idx, resolved.pane_id);
-            // Turn-boundary gate: Idle, and settled long enough that this is
-            // a real boundary rather than a between-chunks flicker (§8.3).
-            let at_boundary = self
-                .state
-                .workspaces
-                .get(ws_idx)
-                .and_then(|ws| ws.pane_state(pane_id))
-                .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
-                .is_some_and(|terminal| {
-                    terminal.state == crate::detect::AgentState::Idle
-                        && terminal.state_changed_at.is_some_and(|changed_at| {
-                            now_instant.duration_since(changed_at)
-                                >= crate::app::actions::ATTENTION_SETTLE
-                        })
-                });
-            if !at_boundary {
-                continue;
-            }
-            while let Some(mut message) = self.mailboxes.pop_next(&public) {
-                match self.try_deliver_message(ws_idx, pane_id, &message) {
-                    Ok(generic) => {
-                        self.mailboxes.record_delivered(&message);
-                        self.emit_event(EventEnvelope {
-                            event: EventKind::MessageDelivered,
-                            data: EventData::MessageDelivered {
-                                correlation_id: message.correlation_id.clone(),
-                                delivered: true,
-                                outcome: if generic {
-                                    "delivered_generic".into()
-                                } else {
-                                    "delivered".into()
-                                },
-                                delivery_attempts: message.delivery_attempts + 1,
-                                latency_ms: now.saturating_sub(message.enqueued_at_ms),
-                            },
-                        });
-                    }
-                    Err(()) => {
-                        message.delivery_attempts += 1;
-                        if message.delivery_attempts >= 8 {
-                            self.emit_event(EventEnvelope {
-                                event: EventKind::MessageDelivered,
-                                data: EventData::MessageDelivered {
-                                    correlation_id: message.correlation_id.clone(),
-                                    delivered: false,
-                                    outcome: "dropped_undeliverable".into(),
-                                    delivery_attempts: message.delivery_attempts,
-                                    latency_ms: now.saturating_sub(message.enqueued_at_ms),
-                                },
-                            });
-                        } else {
-                            self.mailboxes.requeue_front(message);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
     }
-
-    /// Type the message into the settled pane and submit it as a turn (M2).
-    /// `Err(())` means "retry at a later boundary" — the queue is the
-    /// backpressure, never a mid-turn injection.
-    fn try_deliver_message(
-        &mut self,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        message: &PendingMessage,
-    ) -> Result<bool, ()> {
-        let agent = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.pane_state(pane_id))
-            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.effective_agent_label())
-            .map(str::to_string);
-        // Unknown agent ⇒ hold: a message must never be typed into a bare
-        // shell prompt at Idle.
-        let Some(agent) = agent else {
-            return Err(());
-        };
-        let plan = crate::agent_submit::submit_plan(&agent);
-        let rendered = render_message(message);
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return Err(());
-        };
-        // One write: a text-succeeded/enter-failed split would re-queue the
-        // whole message and visibly retype the body at the next boundary.
-        let mut payload = crate::app::api_helpers::encode_api_text(runtime, &rendered);
-        payload.extend_from_slice(&plan.submit_bytes);
-        if runtime.try_send_bytes(bytes::Bytes::from(payload)).is_err() {
-            return Err(());
-        }
-        Ok(plan.generic)
-    }
-}
-
-/// The message as the recipient agent sees it: sender stamp + correlation
-/// id (routing/audit — P3) and the reply affordance, then the body.
-fn render_message(message: &PendingMessage) -> String {
-    let from = message.from_pane.as_deref().unwrap_or("unknown");
-    format!(
-        "[flk msg {} from {}] {}\n(reply with: flk msg reply {} <text>)",
-        message.correlation_id, from, message.body, message.correlation_id
-    )
 }
 
 #[cfg(test)]
@@ -658,124 +611,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msg_list_shows_queued_messages_and_delivery_retry_holds_them() {
+    async fn msg_list_peeks_and_msg_read_consumes() {
+        // ADR-0008: two verbs, two side effects. `msg.list` is the operator's
+        // view and must never consume; `msg.read` is the recipient taking its
+        // mail, and a second read finds an empty inbox.
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         basic_send(&mut app, "c-list", "queued body");
 
-        let response = app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgList(MsgListParams::default()),
-        });
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::MsgList { messages } = success.result else {
-            panic!("expected msg_list");
-        };
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].correlation_id, "c-list");
-        assert_eq!(messages[0].delivery_attempts, 0);
-
-        // Dwell-settled Idle recipient: no agent label on the test
-        // terminal, so the message is HELD (never typed into a bare prompt)
-        // with a bumped attempt count — the §8.3 unknown-agent gate.
-        let ws_idx = 1;
-        let pane_id = app.state.workspaces[ws_idx].focused_pane_id().unwrap();
-        let terminal_id = app.state.workspaces[ws_idx]
-            .pane_state(pane_id)
-            .unwrap()
-            .attached_terminal_id
-            .clone();
-        let now = std::time::Instant::now();
-        {
-            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.state = crate::detect::AgentState::Idle;
-            terminal.state_changed_at = Some(now - crate::app::actions::ATTENTION_SETTLE * 2);
-        }
-        // A Working recipient is never drained (§8.3 mid-turn guard).
-        {
-            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.state = crate::detect::AgentState::Working;
-        }
-        app.deliver_due_messages(now);
-        {
-            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.state = crate::detect::AgentState::Idle;
-        }
-        app.deliver_due_messages(now);
-
-        let response = app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgList(MsgListParams::default()),
-        });
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::MsgList { messages } = success.result else {
-            panic!("expected msg_list");
-        };
-        assert_eq!(messages.len(), 1, "message held for retry");
-        assert_eq!(messages[0].delivery_attempts, 1);
-    }
-
-    /// #175 S3 commit 3 (US-9): fleet pause halts the settle-tick delivery
-    /// path. A message queued to a dwell-settled Idle recipient sees zero
-    /// delivery attempts while paused; after resume the drain runs again
-    /// (the test-terminal has no agent label so delivery holds — the
-    /// observable is the queue's `delivery_attempts` bump, not a
-    /// MessageDelivered event). Human-invoked `agent.send` is deliberately
-    /// UN-gated so operators can still talk to a paused agent.
-    #[tokio::test]
-    async fn fleet_pause_gates_scheduled_delivery_but_leaves_queue_intact() {
-        let hub = crate::api::EventHub::default();
-        let mut app = test_app_with_hub(hub.clone());
-        let _ = basic_send(&mut app, "c-pause", "hi during pause");
-
-        let ws_idx = 1;
-        let pane_id = app.state.workspaces[ws_idx].focused_pane_id().unwrap();
-        let terminal_id = app.state.workspaces[ws_idx]
-            .pane_state(pane_id)
-            .unwrap()
-            .attached_terminal_id
-            .clone();
-        let now = std::time::Instant::now();
-        {
-            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.state = crate::detect::AgentState::Idle;
-            terminal.state_changed_at = Some(now - crate::app::actions::ATTENTION_SETTLE * 2);
-        }
-
-        fn queued_attempts(app: &mut crate::app::App) -> u32 {
+        let peek = |app: &mut crate::app::App| -> usize {
             let response = app.handle_api_request(Request {
-                id: "probe".into(),
+                id: "req".into(),
                 method: Method::MsgList(MsgListParams::default()),
             });
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
             let ResponseResult::MsgList { messages } = success.result else {
                 panic!("expected msg_list");
             };
-            messages
+            messages.len()
+        };
+
+        assert_eq!(peek(&mut app), 1);
+        assert_eq!(peek(&mut app), 1, "listing must not consume");
+
+        let to_pane = app
+            .state
+            .workspaces
+            .get(1)
+            .and_then(|ws| ws.focused_pane_id())
+            .and_then(|pane_id| app.public_pane_id(1, pane_id))
+            .expect("recipient pane");
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(to_pane),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgRead { messages } = success.result else {
+            panic!("expected msg_read: {response}");
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].correlation_id, "c-list");
+        // The whole body, not a preview — the recipient acts on this.
+        assert_eq!(messages[0].body, "queued body");
+
+        assert_eq!(peek(&mut app), 0, "read consumed the inbox");
+    }
+
+    #[tokio::test]
+    async fn msg_read_marks_delivered_on_the_read_edge() {
+        // "Delivered" now means the agent took it, not that flock typed it
+        // into a TTY and hoped.
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        basic_send(&mut app, "c-read", "body");
+
+        let delivered = |hub: &crate::api::EventHub| {
+            hub.events_after(0)
                 .iter()
-                .find(|m| m.correlation_id == "c-pause")
-                .map(|m| m.delivery_attempts)
-                .unwrap_or(0)
-        }
+                .filter(|(_, event)| {
+                    matches!(
+                        &event.data,
+                        EventData::MessageDelivered { correlation_id, outcome, .. }
+                            if correlation_id == "c-read" && outcome == "read"
+                    )
+                })
+                .count()
+        };
+        assert_eq!(delivered(&hub), 0, "queued is not delivered");
 
-        assert_eq!(queued_attempts(&mut app), 0, "freshly queued: 0 attempts");
+        let to_pane = app
+            .state
+            .workspaces
+            .get(1)
+            .and_then(|ws| ws.focused_pane_id())
+            .and_then(|pane_id| app.public_pane_id(1, pane_id))
+            .expect("recipient pane");
+        let _ = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(to_pane),
+            }),
+        });
+        assert_eq!(delivered(&hub), 1);
+    }
 
-        // Paused tick — the drain must not run, attempts stays at 0.
+    /// #175 S3 commit 3 (US-9): fleet pause halts the mailbox clock. Under
+    /// ADR-0008 there is no scheduled delivery left to gate — what pause must
+    /// still hold is the TTL sweep, so a paused fleet does not quietly age
+    /// messages out from under a recipient that never got the chance to read.
+    #[tokio::test]
+    async fn fleet_pause_holds_the_ttl_sweep() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let _ = basic_send(&mut app, "c-pause", "hi during pause");
+
+        let dropped = |hub: &crate::api::EventHub| {
+            hub.events_after(0)
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(
+                        &event.data,
+                        EventData::MessageDelivered { correlation_id, outcome, .. }
+                            if correlation_id == "c-pause" && outcome == "dropped_undeliverable"
+                    )
+                })
+                .count()
+        };
+
+        // Age the message past its TTL, then sweep while paused.
+        app.mailboxes
+            .test_age_all(crate::app::mailboxes::UNDELIVERED_TTL_MS + 1);
         app.fleet_pause.paused = true;
-        app.deliver_due_messages(now);
-        assert_eq!(
-            queued_attempts(&mut app),
-            0,
-            "paused fleet must not attempt delivery"
-        );
+        app.expire_undeliverable_messages();
+        assert_eq!(dropped(&hub), 0, "paused fleet must not age messages out");
 
-        // Resume — the next tick reaches the queue and bumps attempts (the
-        // no-agent-label branch retries; delivery is HELD but ATTEMPTED).
         app.fleet_pause.paused = false;
-        app.deliver_due_messages(now);
-        assert_eq!(
-            queued_attempts(&mut app),
-            1,
-            "resume must let the next tick attempt delivery"
-        );
+        app.expire_undeliverable_messages();
+        assert_eq!(dropped(&hub), 1, "resume lets the sweep run");
     }
 }

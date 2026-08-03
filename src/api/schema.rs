@@ -88,6 +88,8 @@ pub enum Method {
     MsgReply(MsgReplyParams),
     #[serde(rename = "msg.list")]
     MsgList(MsgListParams),
+    #[serde(rename = "msg.read")]
+    MsgRead(MsgReadParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -576,6 +578,21 @@ pub struct MsgListParams {
     pub pane: Option<String>,
 }
 
+/// `msg.read` — CONSUME a pane's inbox (ADR-0008).
+///
+/// Deliberately a separate verb from `msg.list` rather than a flag on it:
+/// peeking and consuming differ in their side effects, and a boolean that
+/// switches whether a call marks messages delivered is the kind of trap that
+/// makes a caller's intent unreadable. `msg.list` stays the operator's
+/// non-destructive view; this is the recipient's read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgReadParams {
+    /// Whose inbox. Omitted means the caller's own pane, resolved from the
+    /// connection the way `msg.send` resolves its sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessageInfo {
     pub correlation_id: String,
@@ -588,6 +605,35 @@ pub struct QueuedMessageInfo {
     pub delivery_attempts: u32,
     /// Body preview, truncated for listing.
     pub preview: String,
+}
+
+/// One message as its recipient reads it (ADR-0008).
+///
+/// Distinct from [`QueuedMessageInfo`], which is the operator's *peek* and
+/// carries a truncated preview. This is the delivered payload: the whole body
+/// plus the provenance and threading the recipient needs to act — as fields,
+/// not flattened into a prefix string for the agent to parse by eye.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxMessage {
+    pub correlation_id: String,
+    /// Sender's pane, when the server could resolve one. `None` means the
+    /// sender was not attributable — the message is still readable, and the
+    /// recipient can see it has no reply address rather than being handed a
+    /// reply command that fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_repo: Option<String>,
+    pub to_pane: String,
+    /// Set when this message answers an earlier one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    pub enqueued_at_ms: u64,
+    /// Whether `msg.reply` can route back to the sender. False when
+    /// `from_pane` is absent — surfaced so the recipient never attempts a
+    /// reply that would fail.
+    pub replyable: bool,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1329,6 +1375,11 @@ pub enum ResponseResult {
     MsgList {
         messages: Vec<QueuedMessageInfo>,
     },
+    MsgRead {
+        /// The messages just consumed, oldest first. Each is marked delivered
+        /// as part of this call, so a second read returns an empty list.
+        messages: Vec<InboxMessage>,
+    },
     PaneInfo {
         pane: PaneInfo,
     },
@@ -1743,7 +1794,8 @@ pub enum EventData {
     MessageDelivered {
         correlation_id: String,
         delivered: bool,
-        /// "delivered" | "delivered_generic" | "dropped_undeliverable"
+        /// "read" (ADR-0008 inbox) | "delivered" | "delivered_generic"
+        /// | "dropped_undeliverable"
         outcome: String,
         delivery_attempts: u32,
         latency_ms: u64,

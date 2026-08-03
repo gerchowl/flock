@@ -189,26 +189,15 @@ impl MailboxRegistry {
         EnqueueOutcome::Queued
     }
 
-    /// Recipient pane ids that currently have queued messages.
-    pub(crate) fn queued_pane_ids(&self) -> Vec<String> {
-        self.queues
-            .iter()
-            .filter(|(_, queue)| !queue.is_empty())
-            .map(|(pane, _)| pane.clone())
-            .collect()
-    }
-
-    /// Pop the next deliverable message for a pane; the caller re-queues on
-    /// delivery failure via [`Self::requeue_front`].
+    /// Take the next message for a pane. The recipient's `msg.read` drains
+    /// this until empty.
+    ///
+    /// There is no re-queue counterpart any more: under pane injection a
+    /// delivery could fail halfway (pane mid-turn, no agent label) and the
+    /// message had to go back on the front. A pull read cannot half-fail —
+    /// the recipient either took the message or never asked (ADR-0008).
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
         self.queues.get_mut(pane_id)?.pop_front()
-    }
-
-    pub(crate) fn requeue_front(&mut self, message: PendingMessage) {
-        self.queues
-            .entry(message.to_pane.clone())
-            .or_default()
-            .push_front(message);
     }
 
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
@@ -253,6 +242,17 @@ impl MailboxRegistry {
 
     /// Drop messages past the undeliverable TTL; returns them so the caller
     /// can emit terminal `MessageDelivered { delivered: false }` events.
+    /// Backdate every queued message so a TTL sweep can be exercised without
+    /// sleeping.
+    #[cfg(test)]
+    pub(crate) fn test_age_all(&mut self, by_ms: u64) {
+        for queue in self.queues.values_mut() {
+            for message in queue.iter_mut() {
+                message.enqueued_at_ms = message.enqueued_at_ms.saturating_sub(by_ms);
+            }
+        }
+    }
+
     pub(crate) fn expire(&mut self, now_ms: u64) -> Vec<PendingMessage> {
         let mut expired = Vec::new();
         for queue in self.queues.values_mut() {

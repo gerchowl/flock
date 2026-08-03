@@ -1011,6 +1011,7 @@ impl App {
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
+            Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),

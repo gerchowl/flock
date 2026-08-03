@@ -141,7 +141,24 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         return Ok(0);
     }
 
-    let outcome = plan(agent, action, &input, &hook_event_name, &pane_id);
+    // ADR-0008: the inbox is pull, so an idle agent would never learn mail
+    // arrived. The stop hook is the wake — a peek (never a consume; the agent
+    // reads its own inbox) whose count rides the existing decision:block
+    // contract. Fire-and-forget like every other hook query: a server that
+    // does not answer means no nudge, never a blocked turn.
+    let pending_messages = if matches!(action, Action::Stop) {
+        pending_message_count(&pane_id)
+    } else {
+        0
+    };
+    let outcome = plan(
+        agent,
+        action,
+        &input,
+        &hook_event_name,
+        &pane_id,
+        pending_messages,
+    );
     emit(outcome);
     Ok(0)
 }
@@ -154,13 +171,14 @@ fn plan(
     input: &serde_json::Value,
     hook_event_name: &str,
     pane_id: &str,
+    pending_messages: usize,
 ) -> HookOutcome {
     match action {
         Action::Session => plan_session(agent, input, hook_event_name, pane_id),
         Action::Prompt => plan_prompt(agent, input, pane_id),
         // Only Claude carries a scrapable transcript + nudge protocol on Stop.
         Action::Stop => match agent {
-            Agent::Claude => plan_stop(agent, input, pane_id),
+            Agent::Claude => plan_stop(agent, input, pane_id, pending_messages),
             Agent::Opencode => HookOutcome::default(),
         },
     }
@@ -218,7 +236,12 @@ fn plan_prompt(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOu
     }
 }
 
-fn plan_stop(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOutcome {
+fn plan_stop(
+    agent: Agent,
+    input: &serde_json::Value,
+    pane_id: &str,
+    pending_messages: usize,
+) -> HookOutcome {
     // Parity with the shim's `bool(hook_input.get("agent_id"))`: a non-empty
     // string agent_id marks a subagent. `str_field` already rejects empty
     // strings, so an `agent_id: ""` is (correctly) not treated as a subagent.
@@ -256,6 +279,8 @@ fn plan_stop(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOutc
                 recap: cap(recap, 4096),
                 seq: Some(seq()),
             }));
+        // A clean turn still has to be told about mail.
+        outcome.stdout = mail_nudge(pending_messages, false);
         return outcome;
     }
 
@@ -263,16 +288,62 @@ fn plan_stop(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOutc
     // Skip when we saw no assistant text or this is a subagent, so we don't
     // loop on nothing.
     if !last_assistant.is_empty() && !is_subagent {
-        outcome.stdout = Some(
-            serde_json::json!({
-                "decision": "block",
-                "reason": "End your turn with a single sentinel line: `※ recap: \
-                           <current state>. Next: <one concrete step>.` Then stop.",
-            })
-            .to_string(),
-        );
+        outcome.stdout = mail_nudge(pending_messages, true);
+    } else {
+        outcome.stdout = mail_nudge(pending_messages, false);
     }
     outcome
+}
+
+/// The `decision:block` payload that wakes an agent at its turn boundary.
+///
+/// ADR-0008: this names the COUNT and the tool, never a body. Message content
+/// reaches the recipient only through `flock_msg_read`, so nothing another
+/// agent wrote can arrive dressed as the operator's instruction — the wake
+/// channel carries no attacker-controlled text.
+fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
+    let recap = "End your turn with a single sentinel line: `※ recap: \
+                 <current state>. Next: <one concrete step>.` Then stop.";
+    let reason = match (pending_messages, want_recap) {
+        (0, false) => return None,
+        (0, true) => recap.to_string(),
+        (n, false) => format!(
+            "You have {n} unread message{} from another agent. Read {} with the \
+             `flock_msg_read` tool before you stop.",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        ),
+        (n, true) => format!(
+            "You have {n} unread message{} from another agent — read {} with the \
+             `flock_msg_read` tool. Then {}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" },
+            recap
+        ),
+    };
+    Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
+}
+
+/// Peek at how many messages are waiting for this pane. Never consumes — the
+/// agent reads its own inbox. Any failure counts as zero: a hook must never
+/// block or fail the parent agent.
+fn pending_message_count(pane_id: &str) -> usize {
+    let request = Request {
+        id: format!("flock:hook:{}", seq()),
+        method: Method::MsgList(crate::api::schema::MsgListParams {
+            pane: Some(pane_id.to_string()),
+        }),
+    };
+    ApiClient::local()
+        .request_value_with_timeout(&request, HOOK_TIMEOUT)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/result/messages")
+                .and_then(|messages| messages.as_array())
+                .map(Vec::len)
+        })
+        .unwrap_or(0)
 }
 
 /// Apply a planned outcome: fire each report (swallowing errors) then print any
@@ -440,6 +511,7 @@ mod tests {
             &input,
             "SessionStart",
             "p_1",
+            0,
         );
         assert_eq!(out.reports.len(), 1);
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
@@ -460,6 +532,7 @@ mod tests {
             &input,
             "SessionStart",
             "p_1",
+            0,
         );
         assert!(out.reports.is_empty());
     }
@@ -469,7 +542,14 @@ mod tests {
         // A non-SessionStart lifecycle action can't spoof an identity change.
         let input =
             json!({"hook_event_name": "SessionEnd", "session_id": "sid", "source": "resume"});
-        let out = plan(Agent::Claude, Action::Session, &input, "SessionEnd", "p_1");
+        let out = plan(
+            Agent::Claude,
+            Action::Session,
+            &input,
+            "SessionEnd",
+            "p_1",
+            0,
+        );
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
             panic!()
         };
@@ -479,7 +559,7 @@ mod tests {
     #[test]
     fn opencode_session_maps_to_report_with_opencode_identity() {
         let input = json!({"session_id": "os-1"});
-        let out = plan(Agent::Opencode, Action::Session, &input, "", "p_1");
+        let out = plan(Agent::Opencode, Action::Session, &input, "", "p_1", 0);
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
             panic!()
         };
@@ -494,7 +574,7 @@ mod tests {
     fn opencode_stop_is_a_noop() {
         // Only claude carries a scrapable transcript + nudge protocol on Stop.
         let input = json!({"hook_event_name": "Stop", "transcript_path": "/whatever"});
-        let out = plan(Agent::Opencode, Action::Stop, &input, "Stop", "p_1");
+        let out = plan(Agent::Opencode, Action::Stop, &input, "Stop", "p_1", 0);
         assert!(out.reports.is_empty() && out.stdout.is_none());
     }
 
@@ -503,7 +583,7 @@ mod tests {
     #[test]
     fn prompt_reports_text() {
         let input = json!({"prompt": "fix the bug"});
-        let out = plan(Agent::Claude, Action::Prompt, &input, "", "p_1");
+        let out = plan(Agent::Claude, Action::Prompt, &input, "", "p_1", 0);
         let Method::PaneReportPrompt(params) = &out.reports[0] else {
             panic!()
         };
@@ -519,6 +599,7 @@ mod tests {
                 &json!({ "prompt": p }),
                 "",
                 "p_1",
+                0,
             );
             assert!(out.reports.is_empty(), "expected no report for {p:?}");
         }
@@ -534,6 +615,7 @@ mod tests {
             &json!({ "prompt": prompt }),
             "",
             "p_1",
+            0,
         );
         let Method::PaneReportPrompt(params) = &out.reports[0] else {
             panic!()
@@ -565,7 +647,7 @@ mod tests {
             r#"{"message":{"role":"assistant","content":[{"type":"text","text":"Did it.\n※ recap: done. Next: ship."}]}}"#,
         ]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1");
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
         let names: Vec<_> = out.reports.iter().map(method_name).collect();
         assert_eq!(names, ["report_reply", "report_recap"]);
         assert!(out.stdout.is_none(), "sentinel present ⇒ no nudge");
@@ -577,12 +659,56 @@ mod tests {
     }
 
     #[test]
+    fn stop_wakes_the_agent_when_mail_is_waiting() {
+        // ADR-0008: the inbox is pull, so the stop hook is what tells an idle
+        // agent mail arrived. The nudge names the COUNT and the TOOL — never a
+        // body, so nothing another agent wrote reaches this one through the
+        // wake channel.
+        let path = transcript_with(&[
+            r#"{"message":{"role":"assistant","content":[{"type":"text","text":"Done.\n※ recap: done. Next: ship."}]}}"#,
+        ]);
+        let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
+
+        // Clean turn, no mail: nothing to say.
+        let quiet = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        assert!(
+            quiet.stdout.is_none(),
+            "no mail, sentinel present ⇒ no nudge"
+        );
+
+        // Clean turn WITH mail: still woken.
+        let woken = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 2);
+        let nudge = woken.stdout.expect("mail must wake a clean turn too");
+        assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
+        assert!(nudge.contains("2 unread messages"), "{nudge}");
+        assert!(nudge.contains("flock_msg_read"), "{nudge}");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn stop_combines_the_mail_wake_with_the_recap_nudge() {
+        // Both are true at once: no sentinel AND mail waiting. One block, both
+        // instructions — never two turns' worth of blocking.
+        let path = transcript_with(&[r#"{"type":"assistant","content":"No sentinel here."}"#]);
+        let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 1);
+        let nudge = out.stdout.expect("expected a nudge");
+        assert!(nudge.contains("1 unread message"), "{nudge}");
+        assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
+        assert!(nudge.contains("flock_msg_read"), "{nudge}");
+        assert!(nudge.contains("※ recap:"), "recap still required: {nudge}");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn stop_without_sentinel_nudges() {
         let path = transcript_with(&[
             r#"{"type":"assistant","content":"Just did the work, no sentinel."}"#,
         ]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1");
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
         assert_eq!(
             out.reports.iter().map(method_name).collect::<Vec<_>>(),
             ["report_reply"]
@@ -598,7 +724,7 @@ mod tests {
         let path =
             transcript_with(&[r#"{"type":"assistant","content":"subagent output, no sentinel"}"#]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap(), "agent_id": "sub-1"});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1");
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
         assert!(out.stdout.is_none(), "subagent must not loop on a nudge");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -618,6 +744,7 @@ mod tests {
             &json!({"session_id": "s"}),
             "SessionStart",
             "p_1",
+            0,
         );
         assert_eq!(outcome.reports.len(), 1, "precondition: one report to send");
         emit(outcome); // must not panic or block the caller
@@ -633,7 +760,7 @@ mod tests {
     #[test]
     fn stop_empty_transcript_is_a_noop() {
         let input = json!({"hook_event_name": "Stop", "transcript_path": "/no/such/path"});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1");
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
         assert!(out.reports.is_empty() && out.stdout.is_none());
     }
 
