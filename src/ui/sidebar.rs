@@ -4569,8 +4569,13 @@ mod tests {
     #[test]
     fn collapsed_local_group_hides_matched_remote_rows() {
         let mut app = crate::app::state::AppState::test_new();
+        // A membership's `key` is the repo's git common dir — the same string
+        // live git reports for every checkout in the family, parent and linked
+        // worktree alike. Fixtures that use a placeholder here describe a
+        // workspace that cannot exist, and since #197 such a mismatch reads as
+        // "this membership belongs to another repo".
         let space = |linked: bool| crate::workspace::WorktreeSpaceMembership {
-            key: "family-key".into(),
+            key: "/repo/flock/.git".into(),
             label: "flock".into(),
             repo_root: "/repo/flock".into(),
             checkout_path: if linked {
@@ -4583,6 +4588,10 @@ mod tests {
         let mut parent = workspace_with_project_key("flock", "github.com/gerchowl/flock");
         parent.worktree_space = Some(space(false));
         let mut child = workspace_with_project_key("flock-wt", "github.com/gerchowl/flock");
+        if let Some(git) = child.cached_git_space.as_mut() {
+            git.key = "/repo/flock/.git".into();
+            git.is_linked_worktree = true;
+        }
         child.worktree_space = Some(space(true));
         app.workspaces = vec![parent, child];
         app.peer_summaries = vec![peer_with_workspaces(
@@ -4600,7 +4609,7 @@ mod tests {
             .iter()
             .any(|entry| matches!(entry, WorkspaceListEntry::Remote { .. })));
 
-        app.collapsed_space_keys.insert("family-key".into());
+        app.collapsed_space_keys.insert("/repo/flock/.git".into());
         let collapsed = workspace_list_entries(&app);
         assert!(!collapsed
             .iter()
@@ -7053,8 +7062,10 @@ mod tests {
     fn same_origin_checkouts_merge_into_one_section_keyed_by_membership() {
         let mut app = AppState::test_new();
         let mut main = workspace_with_project_key("flock", "github.com/gerchowl/flock");
+        // The membership key is this checkout's git common dir (see the note
+        // in collapsed_local_group_hides_matched_remote_rows).
         main.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
-            key: "family-key".into(),
+            key: "/repo/flock/.git".into(),
             label: "flock".into(),
             repo_root: "/repo/flock".into(),
             checkout_path: "/repo/flock".into(),
@@ -7069,7 +7080,7 @@ mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Header {
-                    key: "family-key".into(),
+                    key: "/repo/flock/.git".into(),
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -7083,16 +7094,16 @@ mod tests {
         );
         assert_eq!(
             workspace_parent_group_state(&app, 0),
-            Some(("family-key".into(), false))
+            Some(("/repo/flock/.git".into(), false))
         );
         // Collapsing by the membership key folds the whole merged section.
-        app.collapsed_space_keys.insert("family-key".into());
+        app.collapsed_space_keys.insert("/repo/flock/.git".into());
         app.active = None;
         app.mode = Mode::Terminal;
         assert_eq!(
             workspace_list_entries(&app),
             vec![WorkspaceListEntry::Header {
-                key: "family-key".into(),
+                key: "/repo/flock/.git".into(),
             }]
         );
     }
