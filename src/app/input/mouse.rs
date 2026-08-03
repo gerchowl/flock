@@ -1193,7 +1193,7 @@ impl AppState {
                                     .as_deref()
                                     .and_then(crate::workspace::git_space_metadata)
                             });
-                            let is_linked_worktree = ws.worktree_space().map_or_else(
+                            let is_linked_worktree = ws.worktree_space_here().map_or_else(
                                 || {
                                     git_space
                                         .as_ref()
@@ -1201,7 +1201,7 @@ impl AppState {
                                 },
                                 |space| space.is_linked_worktree,
                             );
-                            let show_git_menu = ws.worktree_space().is_some()
+                            let show_git_menu = ws.worktree_space_here().is_some()
                                 || git_space
                                     .as_ref()
                                     .is_some_and(|space| !space.is_linked_worktree);

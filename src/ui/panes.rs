@@ -420,7 +420,7 @@ fn render_pane_header(
     // Context line: owner/project · worktree · branch.
     let mut spans: Vec<Span> = vec![Span::styled(" ", bar_bg)];
     let project_label = ws
-        .worktree_space()
+        .worktree_space_here()
         .map(|space| space.label.clone())
         .unwrap_or_else(|| ws.display_name());
     let project = owner_qualified_project(ws.repo_group_key(), &project_label);
@@ -429,7 +429,7 @@ fn render_pane_header(
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     ));
     if let Some(worktree_dir) = ws
-        .worktree_space()
+        .worktree_space_here()
         .filter(|space| space.is_linked_worktree)
         .and_then(|space| space.checkout_path.file_name())
         .map(|name| name.to_string_lossy().to_string())

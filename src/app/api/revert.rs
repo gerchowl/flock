@@ -91,7 +91,10 @@ impl App {
 fn collect_known_repos(app: &App) -> Vec<PathBuf> {
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for ws in &app.state.workspaces {
-        if let Some(space) = ws.worktree_space.as_ref() {
+        // #197: the action view — revert.run writes a branch and commits
+        // into each repo it collects here, so a stale membership would land
+        // them in a repo the workspace no longer represents.
+        if let Some(space) = ws.worktree_space_here() {
             let path = space.checkout_path.clone();
             let canon = std::fs::canonicalize(&path).unwrap_or(path);
             seen.insert(canon);

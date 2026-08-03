@@ -1031,7 +1031,7 @@ impl AppState {
             project_of_family
                 .entry(space.key.as_str())
                 .or_insert(space.project_key.as_str());
-            if let Some(membership) = ws.worktree_space() {
+            if let Some(membership) = ws.worktree_space_here() {
                 project_of_family
                     .entry(membership.key.as_str())
                     .or_insert(space.project_key.as_str());
@@ -1051,7 +1051,7 @@ impl AppState {
         let mut canonical = std::collections::HashMap::<&str, &str>::new();
         for (ws_idx, group_id) in group_ids.iter().enumerate() {
             if let (Some(group_id), Some(membership)) =
-                (group_id, self.workspaces[ws_idx].worktree_space())
+                (group_id, self.workspaces[ws_idx].worktree_space_here())
             {
                 canonical.entry(group_id).or_insert(membership.key.as_str());
             }
@@ -1092,7 +1092,7 @@ impl AppState {
             project_of_family
                 .entry(space.key.as_str())
                 .or_insert(space.project_key.as_str());
-            if let Some(membership) = ws.worktree_space() {
+            if let Some(membership) = ws.worktree_space_here() {
                 project_of_family
                     .entry(membership.key.as_str())
                     .or_insert(space.project_key.as_str());
@@ -2192,13 +2192,16 @@ impl AppState {
         let indices = self
             .workspaces
             .get(self.selected)
-            .and_then(|ws| ws.worktree_space())
+            .and_then(|ws| ws.worktree_space_here())
             .map(|space| {
+                // #197: the action view on both sides — closing "this space"
+                // must close the group the sidebar shows, not the one a stale
+                // membership still names.
                 self.workspaces
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, ws)| {
-                        ws.worktree_space()
+                        ws.worktree_space_here()
                             .is_some_and(|member| member.key == space.key)
                             .then_some(idx)
                     })
@@ -2399,13 +2402,16 @@ impl AppState {
     pub(crate) fn workspace_close_would_close_worktree_group(&self, ws_idx: usize) -> bool {
         self.workspaces
             .get(ws_idx)
-            .and_then(|ws| ws.worktree_space())
+            .and_then(|ws| ws.worktree_space_here())
             .filter(|space| !space.is_linked_worktree)
             .is_some_and(|space| {
+                // Must agree with close_selected_space above, or the
+                // "closing the whole space?" prompt describes a different set
+                // than the close performs.
                 self.workspaces
                     .iter()
                     .filter(|ws| {
-                        ws.worktree_space()
+                        ws.worktree_space_here()
                             .is_some_and(|member| member.key == space.key)
                     })
                     .count()
@@ -2992,7 +2998,7 @@ impl AppState {
         }
         let mut changed = false;
         for idx in 0..self.workspaces.len() {
-            if self.workspaces[idx].worktree_space().is_some() {
+            if self.workspaces[idx].worktree_space_here().is_some() {
                 continue;
             }
             let Some(space) = self.workspaces[idx].git_space().cloned() else {
@@ -3014,7 +3020,8 @@ impl AppState {
             // Give the open parent checkout its parent-side membership so the
             // sidebar renders the group.
             for parent_idx in 0..self.workspaces.len() {
-                if parent_idx == idx || self.workspaces[parent_idx].worktree_space().is_some() {
+                if parent_idx == idx || self.workspaces[parent_idx].worktree_space_here().is_some()
+                {
                     continue;
                 }
                 let is_parent = self.workspaces[parent_idx]
@@ -6555,8 +6562,9 @@ mod tests {
             checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
+        // Membership key == this checkout's git common dir, as in real data.
         state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "gitspace-key".into(),
+            key: "repo-key".into(),
             checkout_key: "gitspace-key-co".into(),
             label: "flock".into(),
             repo_root: "/repo/flock".into(),

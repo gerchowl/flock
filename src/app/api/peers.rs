@@ -98,7 +98,15 @@ impl App {
                 ),
             );
         };
-        let Some(checkout) = ws.resolved_identity_cwd() else {
+        // The branch above comes from the live probe (the root pane's CURRENT
+        // cwd); `resolved_identity_cwd` is frozen at construction. Mixing them
+        // pushes a branch that exists in one repo from the directory of
+        // another — `prepare_peer_checkout` runs `git -C <checkout> push -u
+        // origin <branch>`. Resolve the checkout the same live way the branch
+        // was resolved.
+        let Some(checkout) =
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        else {
             return encode_error(
                 id,
                 "no_checkout",

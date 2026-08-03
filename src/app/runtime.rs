@@ -918,7 +918,12 @@ impl App {
         let mut out = Vec::new();
         let active_ws_idx = self.state.active;
         for (idx, ws) in self.state.workspaces.iter().enumerate() {
-            let Some(space) = ws.worktree_space.as_ref() else {
+            // #197: the action view. The reap's whole plan — checkout,
+            // repo_root, the dirty and merge probes below — is keyed on this,
+            // and it runs unattended. A membership live git places in another
+            // repo would `git worktree move` that repo's live worktree out
+            // from under it, with no human in the loop.
+            let Some(space) = ws.worktree_space_here() else {
                 continue;
             };
             if !space.is_linked_worktree {
@@ -1487,6 +1492,54 @@ mod tests {
     use crate::app::state;
     use crate::workspace::Workspace;
     use std::path::PathBuf;
+
+    /// #197: the scheduled reap runs unattended and takes its whole plan —
+    /// checkout, repo_root, the dirty/merge probes — from the membership. A
+    /// membership live git places in another repo would have it `git worktree
+    /// move` that repo's live worktree out from under it, with nobody
+    /// watching. It must not even reach the snapshot.
+    #[test]
+    fn reap_skips_a_workspace_whose_membership_is_another_repo() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("diverged");
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/repo/owner/.git".into(),
+            label: "owner".into(),
+            repo_root: PathBuf::from("/repo/owner"),
+            checkout_path: PathBuf::from("/worktrees/owner/feature"),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces.push(ws);
+
+        // While live git still agrees, the row is a reap candidate.
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/owner/.git".into(),
+            checkout_key: "/worktrees/owner/feature".into(),
+            label: "owner".into(),
+            repo_root: PathBuf::from("/worktrees/owner/feature"),
+            is_linked_worktree: true,
+            project_key: "dir:owner".into(),
+        });
+        assert_eq!(app.collect_reap_snapshots().len(), 1);
+
+        // Once it disagrees, the candidate disappears rather than aiming the
+        // sweep at the owner repo's checkout.
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/elsewhere/.git".into(),
+            checkout_key: "/repo/elsewhere".into(),
+            label: "elsewhere".into(),
+            repo_root: PathBuf::from("/repo/elsewhere"),
+            is_linked_worktree: false,
+            project_key: "dir:elsewhere".into(),
+        });
+        assert!(app.collect_reap_snapshots().is_empty());
+    }
 
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {
         let mut app = super::super::App::new(
