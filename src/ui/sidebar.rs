@@ -3188,6 +3188,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Working,
             status_age_secs: Some(10),
             activity: None,
+            agents: Vec::new(),
         }
     }
 

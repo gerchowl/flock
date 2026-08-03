@@ -696,6 +696,7 @@ mod tests {
                 status: AgentStatus::Working,
                 status_age_secs: Some(12),
                 activity: None,
+                agents: Vec::new(),
             }],
             last_ok: age_secs
                 .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),

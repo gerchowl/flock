@@ -380,6 +380,7 @@ mod tests {
                 status: AgentStatus::Working,
                 status_age_secs: None,
                 activity: None,
+                agents: Vec::new(),
             }],
             last_ok: Some(std::time::Instant::now()),
             error: None,

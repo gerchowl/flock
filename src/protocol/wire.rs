@@ -57,12 +57,18 @@ use serde::{Deserialize, Serialize};
 /// reaching peers the launcher's box cannot dial directly. Additive with
 /// `#[serde(default)]`; positional wire so a deliberate bump is required.
 ///
+/// v25: `FleetWorkspace.agents` (ADR-0008). Every agent gossips its
+/// fleet-global `AgentId` alongside where it currently lives, so any node can
+/// resolve an identity to a host and pane — the directory cross-machine
+/// messaging addresses through. Additive with `#[serde(default)]`; positional
+/// wire so a deliberate bump is required.
+///
 /// v24: `FleetPeer.icon` (#164). A node's SELF-DECLARED fleet icon name gossips
 /// with its identity so every viewer renders the same flat Nerd Font glyph in
 /// the servers band (fixing viewer-relative naming). Only an ASCII name travels
 /// — the receiver maps it to a glyph. Additive with `#[serde(default)]`;
 /// positional wire so a deliberate bump is required.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -246,6 +252,31 @@ pub struct FleetWorkspace {
     pub status: crate::api::schema::AgentStatus,
     pub status_age_secs: Option<u64>,
     pub activity: Option<String>,
+    /// v25: every agent in the workspace by fleet-global identity, so any node
+    /// can answer where an `AgentId` lives (ADR-0008). Additive with
+    /// `#[serde(default)]`; positional wire, so the bump is deliberate.
+    #[serde(default)]
+    pub agents: Vec<FleetAgent>,
+}
+
+/// Wire twin of [`crate::api::schema::PeerAgentSummary`] (v25).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FleetAgent {
+    pub agent_id: String,
+    pub pane_id: String,
+    pub agent: Option<String>,
+    pub status: crate::api::schema::AgentStatus,
+}
+
+impl From<crate::api::schema::PeerAgentSummary> for FleetAgent {
+    fn from(agent: crate::api::schema::PeerAgentSummary) -> Self {
+        Self {
+            agent_id: agent.agent_id,
+            pane_id: agent.pane_id,
+            agent: agent.agent,
+            status: agent.status,
+        }
+    }
 }
 
 impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
@@ -261,6 +292,18 @@ impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
+            agents: ws.agents.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<FleetAgent> for crate::api::schema::PeerAgentSummary {
+    fn from(agent: FleetAgent) -> Self {
+        Self {
+            agent_id: agent.agent_id,
+            pane_id: agent.pane_id,
+            agent: agent.agent,
+            status: agent.status,
         }
     }
 }
@@ -278,6 +321,7 @@ impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
+            agents: ws.agents.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1087,6 +1131,7 @@ mod tests {
                     // `skip_serializing_if`-guarded, which is exactly what
                     // the wire mirrors exist to avoid.
                     activity: None,
+                    agents: Vec::new(),
                 }],
                 age_secs: Some(5),
                 error: None,
@@ -1118,6 +1163,7 @@ mod tests {
                     status: crate::api::schema::AgentStatus::Working,
                     status_age_secs: Some(3),
                     activity: None,
+                    agents: Vec::new(),
                 }],
                 age_secs: Some(0),
                 error: None,
@@ -1674,7 +1720,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 24;
+    const PINNED_PROTOCOL_VERSION: u32 = 25;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1895,7 +1941,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0xf146670b2b5dc410),
+            ("SwitchServer", 0x44513fbb2aa1e54e),
         ];
 
         if actual.as_slice() != GOLDEN {

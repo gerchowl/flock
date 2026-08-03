@@ -586,6 +586,26 @@ fn workspace_peer_summary(
         status: super::super::api_helpers::pane_agent_status(state, seen),
         status_age_secs,
         activity,
+        // Directory rows: every agent here, by identity (ADR-0008). The
+        // sidebar wants the leading pane; a directory wants all of them.
+        agents: ws
+            .pane_details(terminals)
+            .into_iter()
+            .filter_map(|detail| {
+                let terminal =
+                    terminals.get(&ws.pane_state(detail.pane_id)?.attached_terminal_id)?;
+                if !terminal.is_agent_terminal() {
+                    return None;
+                }
+                let pane_number = ws.public_pane_number(detail.pane_id)?;
+                Some(crate::api::schema::PeerAgentSummary {
+                    agent_id: terminal.agent_id.to_string(),
+                    pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
+                    agent: Some(crate::detect::short_agent_label(&detail.agent_label).to_string()),
+                    status: super::super::api_helpers::pane_agent_status(detail.state, detail.seen),
+                })
+            })
+            .collect(),
     }
 }
 
@@ -728,6 +748,7 @@ mod tests {
             status: crate::api::schema::AgentStatus::Working,
             status_age_secs: Some(4),
             activity: None,
+            agents: Vec::new(),
         }];
         let mut snapshot = carried_snapshot();
         snapshot.origin_summary = Some(origin);

@@ -358,6 +358,37 @@ impl App {
                     Err((code, body.message))
                 }
             },
+            // ADR-0008: address by identity. Resolution goes through the ONE
+            // fleet directory, so messaging, targeting and lineage cannot
+            // drift into separate answers for "where is this agent".
+            MessageTarget::Agent { agent } => {
+                let Some(location) = self.locate_agent(agent) else {
+                    return Err((
+                        "msg_target_not_found",
+                        format!("no agent with id {agent} anywhere in the fleet"),
+                    ));
+                };
+                if !location.local {
+                    // Named, not silently dropped: the caller learns the agent
+                    // exists and where, which is strictly more than the old
+                    // "from unknown" dead end.
+                    return Err((
+                        "agent_not_local",
+                        format!(
+                            "agent {agent} lives on {} (pane {}); cross-host delivery is not \
+                             wired yet",
+                            location.host, location.pane_id
+                        ),
+                    ));
+                }
+                match self.resolve_terminal_target(&location.pane_id) {
+                    Ok(resolved) => Ok((resolved.ws_idx, resolved.pane_id)),
+                    Err(err) => {
+                        let body = self.agent_target_error_body(err);
+                        Err(("msg_target_not_found", body.message))
+                    }
+                }
+            }
             MessageTarget::RepoPane { repo, pane } => {
                 let mut matches: Vec<(usize, crate::layout::PaneId)> = Vec::new();
                 for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
