@@ -9,6 +9,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "gossip",
     "icon",
     "keys",
+    "msg",
     "onboarding",
     "name",
     "peers",
@@ -464,6 +465,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.checks = section,
+    );
+    load_live_section(
+        &table,
+        "msg",
+        "msg config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.msg = section,
     );
     validate_peers(&mut config.peers, &mut diagnostics);
 

@@ -439,6 +439,7 @@ pub struct Config {
     pub web: WebSectionConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
+    pub msg: MsgConfig,
     pub peers: Vec<PeerConfig>,
 }
 
@@ -996,6 +997,63 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
+/// Who may message this node's agents (ADR-0008).
+///
+/// Enforced by the RECEIVER, because that is the only party that cannot be
+/// bypassed: a sender-side check is advice, and once the hub forwards for
+/// spokes, reachability stops being gated by which SSH keys happen to exist.
+/// The policy makes that explicit instead of leaving it an accident of
+/// topology.
+///
+/// Host-level, not agent-level, on purpose: agent ids are opaque and a pane's
+/// id changes every time it is recreated, so an agent-granular allowlist would
+/// be unmaintainable. The host is the trust boundary the fleet already has.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MsgConfig {
+    /// Accept agent-to-agent messages at all. Default: true.
+    ///
+    /// A node that sets this false still SENDS — this governs what it is
+    /// willing to have delivered into its own agents' turns.
+    pub enabled: bool,
+    /// Hosts whose agents may message this node's agents. `["*"]` (the
+    /// default) allows the whole fleet.
+    ///
+    /// Open by default because a flock fleet is already one trust domain —
+    /// SSH keys plus a host CA — so a mandatory allowlist would be friction
+    /// against no threat model. Narrow it when that stops being true:
+    /// `allow_from = ["mba22"]`.
+    pub allow_from: Vec<String>,
+}
+
+impl Default for MsgConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_from: vec!["*".to_string()],
+        }
+    }
+}
+
+impl MsgConfig {
+    /// Whether a message originating on `host` may be delivered here.
+    ///
+    /// A message with no known origin host is treated as LOCAL — it was
+    /// attested by this server's own process ancestry, so there is no remote
+    /// party to gate.
+    pub fn accepts_from(&self, host: Option<&str>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(host) = host else {
+            return true;
+        };
+        self.allow_from
+            .iter()
+            .any(|rule| rule == "*" || rule.eq_ignore_ascii_case(host))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteConfig {
@@ -1301,6 +1359,44 @@ impl Default for AdvancedConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn msg_policy_is_open_by_default_and_narrows_by_host() {
+        let open = super::MsgConfig::default();
+        assert!(
+            open.accepts_from(Some("anvil")),
+            "default is the whole fleet"
+        );
+        assert!(
+            open.accepts_from(None),
+            "a locally attested sender is not gated"
+        );
+
+        let narrowed = super::MsgConfig {
+            enabled: true,
+            allow_from: vec!["mba22".into()],
+        };
+        assert!(narrowed.accepts_from(Some("mba22")));
+        assert!(
+            narrowed.accepts_from(Some("MBA22")),
+            "host match is case-insensitive"
+        );
+        assert!(!narrowed.accepts_from(Some("anvil")));
+        assert!(
+            narrowed.accepts_from(None),
+            "narrowing inbound hosts must not break local sends"
+        );
+
+        let closed = super::MsgConfig {
+            enabled: false,
+            allow_from: vec!["*".into()],
+        };
+        assert!(!closed.accepts_from(Some("mba22")));
+        assert!(
+            !closed.accepts_from(None),
+            "disabled means disabled, including locally"
+        );
+    }
     use super::*;
 
     #[test]
