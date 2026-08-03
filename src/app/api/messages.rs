@@ -5,8 +5,18 @@ use crate::api::schema::{
 use crate::app::mailboxes::{EnqueueOutcome, PendingMessage};
 use crate::app::App;
 
-/// Sentinel code meaning "resolved, but not on this host" (ADR-0008).
-const REMOTE_AGENT_SENTINEL: &str = "__remote_agent__";
+/// Where a message target resolved to.
+///
+/// A typed outcome rather than an error code carrying a delimiter-packed
+/// string. The packed form existed briefly and immediately produced the bug it
+/// invites: the writer emitted two fields, the reader expected three, and a
+/// cross-host send reported "agent lives on agent_vm-dev_…" with the id in the
+/// host slot. Two functions in one module do not need a wire format between
+/// them.
+enum ResolvedTarget {
+    Local(usize, crate::layout::PaneId),
+    Remote(Box<crate::app::directory::AgentLocation>),
+}
 
 use super::responses::{encode_error, encode_success};
 
@@ -33,30 +43,24 @@ fn mint_correlation_id() -> String {
 /// process ancestry and is routing/audit metadata only (P3): no code path
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
-    /// Internal marker: `resolve_message_target` found the agent, but on
-    /// another host. Not an error code any caller sees — `handle_msg_send`
-    /// intercepts it and routes.
-    const REMOTE: &'static str = REMOTE_AGENT_SENTINEL;
-
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
         }
 
-        let (to_ws_idx, to_pane_id) = match self.resolve_message_target(&params.to) {
+        // Resolved to another host: hand the message to the server that owns
+        // the recipient and let ITS mailbox do the rest. One delivery
+        // implementation, wherever the sender was.
+        let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            // Resolved to another host: hand the message to the server that
-            // owns the recipient and let ITS mailbox do the rest. One delivery
-            // implementation, wherever the sender was.
-            Err((code, detail)) if code == Self::REMOTE => {
-                let mut parts = detail.split('\u{1f}');
-                let route = parts.next().unwrap_or_default().to_string();
-                let host = parts.next().unwrap_or_default().to_string();
-                let to_agent = parts.next().unwrap_or_default().to_string();
-                return self.relay_message_to_host(id, &route, &host, &to_agent, &body, params);
-            }
             Err((code, message)) => return encode_error(id, code, message),
+        };
+        let (to_ws_idx, to_pane_id) = match resolved {
+            ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
+            ResolvedTarget::Remote(location) => {
+                return self.relay_message_to_host(id, &location, &body, params)
+            }
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
             return encode_error(id, "internal_error", "target pane has no public id");
@@ -184,20 +188,18 @@ impl App {
                 }
             },
         };
-        let (to_ws_idx, to_pane_id) = match self.resolve_message_target(&reply_target) {
+        let reply_resolved = match self.resolve_message_target(&reply_target) {
             Ok(resolved) => resolved,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        let (to_ws_idx, to_pane_id) = match reply_resolved {
+            ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
             // The original sender is on another host: relay the reply the same
             // way the message came.
-            Err((code, detail)) if code == Self::REMOTE => {
-                let mut parts = detail.split('\u{1f}');
-                let route = parts.next().unwrap_or_default().to_string();
-                let host = parts.next().unwrap_or_default().to_string();
-                let to_agent = parts.next().unwrap_or_default().to_string();
+            ResolvedTarget::Remote(location) => {
                 return self.relay_message_to_host(
                     id,
-                    &route,
-                    &host,
-                    &to_agent,
+                    &location,
                     &body,
                     MsgSendParams {
                         from_agent: None,
@@ -208,7 +210,6 @@ impl App {
                     },
                 );
             }
-            Err((code, message)) => return encode_error(id, code, message),
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
             return encode_error(id, "internal_error", "reply pane has no public id");
@@ -375,12 +376,13 @@ impl App {
     fn relay_message_to_host(
         &mut self,
         id: String,
-        route: &str,
-        host: &str,
-        to_agent: &str,
+        location: &crate::app::directory::AgentLocation,
         body: &str,
         params: MsgSendParams,
     ) -> String {
+        let route = location.route.as_deref().unwrap_or_default();
+        let host = location.host.as_str();
+        let to_agent = location.agent_id.as_str();
         // Route by the peer entry the DIRECTORY answered from, not by the name
         // the far machine calls itself. Those differ in any normal fleet — a
         // peer configured as `anvil` reports its hostname as `vm-dev` — and
@@ -519,10 +521,10 @@ impl App {
     fn resolve_message_target(
         &mut self,
         target: &MessageTarget,
-    ) -> Result<(usize, crate::layout::PaneId), (&'static str, String)> {
+    ) -> Result<ResolvedTarget, (&'static str, String)> {
         match target {
             MessageTarget::Pane { pane } => match self.resolve_terminal_target(pane) {
-                Ok(resolved) => Ok((resolved.ws_idx, resolved.pane_id)),
+                Ok(resolved) => Ok(ResolvedTarget::Local(resolved.ws_idx, resolved.pane_id)),
                 Err(err) => {
                     let body = self.agent_target_error_body(err);
                     let code = if body.code == "agent_target_ambiguous" {
@@ -544,17 +546,13 @@ impl App {
                     ));
                 };
                 if !location.local {
-                    // Remote: this is not ours to deliver. The caller gets a
-                    // typed signal so `handle_msg_send` can hand it to the
-                    // owning server rather than guessing here — resolution and
-                    // delivery stay separate concerns.
-                    return Err((
-                        REMOTE_AGENT_SENTINEL,
-                        format!("{}\u{1f}{}", location.host, location.agent_id),
-                    ));
+                    // Not ours to deliver. Handing back the whole location
+                    // keeps resolution and delivery separate concerns without
+                    // inventing a format between them.
+                    return Ok(ResolvedTarget::Remote(Box::new(location)));
                 }
                 match self.resolve_terminal_target(&location.pane_id) {
-                    Ok(resolved) => Ok((resolved.ws_idx, resolved.pane_id)),
+                    Ok(resolved) => Ok(ResolvedTarget::Local(resolved.ws_idx, resolved.pane_id)),
                     Err(err) => {
                         let body = self.agent_target_error_body(err);
                         Err(("msg_target_not_found", body.message))
@@ -596,7 +594,7 @@ impl App {
                         "msg_target_not_found",
                         format!("no pane {pane} in a workspace of repo {repo}"),
                     )),
-                    1 => Ok(matches[0]),
+                    1 => Ok(ResolvedTarget::Local(matches[0].0, matches[0].1)),
                     _ => Err((
                         "msg_target_ambiguous",
                         format!("pane {pane} is ambiguous within repo {repo}"),
