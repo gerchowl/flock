@@ -248,6 +248,7 @@ impl App {
         let checkout_path = crate::worktree::default_checkout_path(
             &self.state.worktree_directory,
             &repo_name,
+            &space.key,
             &branch,
         );
 
@@ -1358,6 +1359,7 @@ impl App {
         create.checkout_path = crate::worktree::default_checkout_path(
             &self.state.worktree_directory,
             &create.repo_name,
+            &create.repo_key,
             &create.branch,
         );
         create.error = None;
@@ -1381,6 +1383,7 @@ impl App {
         create.checkout_path = crate::worktree::default_checkout_path(
             &self.state.worktree_directory,
             &create.repo_name,
+            &create.repo_key,
             &branch,
         );
         create.creating = true;
@@ -2006,9 +2009,12 @@ mod tests {
 
         let create = app.state.worktree_create.unwrap();
         assert_eq!(create.branch, "issue/137");
+        // Base directory is keyed on the repo identity (#212).
         assert_eq!(
             create.checkout_path,
-            std::path::PathBuf::from("/w/flock/issue-137")
+            std::path::PathBuf::from("/w")
+                .join(crate::worktree::worktree_base_dir_name("flock", "repo-key"))
+                .join("issue-137")
         );
         assert_eq!(create.error, None);
     }
@@ -2018,7 +2024,15 @@ mod tests {
         let repo = create_committed_repo("app-worktree-add-repo");
         let worktree_root = unique_temp_path("app-worktree-add-root");
         let branch = "worktree/app-worker";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
+        let checkout = crate::worktree::default_checkout_path(
+            &worktree_root,
+            "flock",
+            // Same key the dialog state carries below: the base directory is a
+            // function of the repo identity now (#212), so the expectation has
+            // to come from the identity under test.
+            "repo-key",
+            branch,
+        );
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.worktree_create = Some(WorktreeCreateState {
@@ -2085,7 +2099,15 @@ mod tests {
 
         let worktree_root = unique_temp_path("app-worktree-add-from-source-root");
         let branch = "worktree/from-source";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "flock", branch);
+        let checkout = crate::worktree::default_checkout_path(
+            &worktree_root,
+            "flock",
+            // Same key the dialog state carries below: the base directory is a
+            // function of the repo identity now (#212), so the expectation has
+            // to come from the identity under test.
+            "repo-key",
+            branch,
+        );
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.worktree_create = Some(WorktreeCreateState {
@@ -2927,9 +2949,16 @@ mod tests {
         }
         let create = app.state.worktree_create.as_ref().unwrap();
         assert_eq!(create.branch, "feat/login");
+        // The base directory is keyed on the repo identity (#212), so derive
+        // the expectation the same way rather than hardcoding the basename.
         assert_eq!(
             create.checkout_path,
-            std::path::PathBuf::from("/w/flock/feat-login")
+            std::path::PathBuf::from("/w")
+                .join(crate::worktree::worktree_base_dir_name(
+                    &create.repo_name,
+                    &create.repo_key
+                ))
+                .join("feat-login")
         );
     }
 
