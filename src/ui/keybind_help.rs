@@ -126,6 +126,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         ),
         help_entry(keybind_label(&kb.rename_workspace), "rename workspace"),
         help_entry(keybind_label(&kb.close_workspace), "close workspace"),
+        help_entry(
+            keybind_label(&kb.toggle_collapse_all),
+            "collapse / expand every worktree group",
+        ),
         help_entry(keybind_label(&kb.previous_workspace), "previous workspace"),
         help_entry(keybind_label(&kb.next_workspace), "next workspace"),
         help_entry(indexed_label(&kb.switch_space), "switch space 1-9"),
@@ -142,6 +146,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(
             keybind_label(&kb.focus_attention_project),
             "attention within project (repo + worktrees)",
+        ),
+        help_entry(
+            keybind_label(&kb.focus_attention_project_previous),
+            "attention within project, backwards",
         ),
         help_entry(
             keybind_label(&kb.focus_attention_defer),
@@ -170,6 +178,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(keybind_label(&kb.copy_mode), "copy mode"),
         help_entry(keybind_label(&kb.zoom), "zoom pane"),
         help_entry(keybind_label(&kb.toggle_float), "toggle floating pane"),
+        help_entry(
+            keybind_label(&kb.toggle_prompt_expand),
+            "expand the pane header's last prompt",
+        ),
         help_entry(keybind_label(&kb.resize_mode), "resize mode"),
         help_entry(keybind_label(&kb.toggle_sidebar), "toggle sidebar"),
         help_entry(keybind_label(&kb.focus_pane_left), "focus pane left"),
