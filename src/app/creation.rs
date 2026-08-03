@@ -106,39 +106,50 @@ impl App {
     /// across restarts. Without membership this degrades to a plain new
     /// workspace seeded like a tab would have been.
     fn create_sibling_workspace(&mut self, custom_name: Option<String>) {
-        let source = self
-            .state
-            .active
-            .and_then(|ws_idx| self.state.workspaces.get(ws_idx));
+        let source_ws_idx = self.state.active;
+        if let Err(e) = self.create_sibling_workspace_from(source_ws_idx, custom_name, None, true) {
+            crate::logging::sibling_workspace_create_failed(&e.to_string());
+        }
+    }
+
+    /// The sibling-workspace spawn itself, shared by the keyboard path above
+    /// and the `tab.create` API handler — a tab-mode decision that lived only
+    /// on the keyboard side meant an agent asking for a tab got an inner tab
+    /// invisible to the workspace-mode strip while a human got a sibling.
+    ///
+    /// `cwd_override` lets the API honour an explicit `cwd` param; without one
+    /// the cwd pins to the membership's checkout path, so group identity
+    /// survives a root-pane `cd` across restarts.
+    pub(super) fn create_sibling_workspace_from(
+        &mut self,
+        source_ws_idx: Option<usize>,
+        custom_name: Option<String>,
+        cwd_override: Option<PathBuf>,
+        focus: bool,
+    ) -> std::io::Result<usize> {
+        let source = source_ws_idx.and_then(|ws_idx| self.state.workspaces.get(ws_idx));
         let (membership, pinned_cwd) = sibling_spawn_seed(source);
-        let initial_cwd = match pinned_cwd {
+        let initial_cwd = match cwd_override.or(pinned_cwd) {
             Some(path) => path,
             None => {
-                let follow_cwd = self
-                    .state
-                    .active
-                    .and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
+                let follow_cwd =
+                    source_ws_idx.and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
                 self.resolve_new_terminal_cwd(follow_cwd)
             }
         };
-        match self.create_workspace_with_options(initial_cwd, true) {
-            Ok(idx) => {
-                if membership.is_some() {
-                    self.state.workspaces[idx].worktree_space = membership;
-                }
-                if let Some(name) = custom_name {
-                    self.state.workspaces[idx].set_custom_name(name);
-                }
-                // Second (load-bearing) save: create_workspace_with_options
-                // scheduled one BEFORE membership/name were stamped above; the
-                // debounced saver must capture the stamped state or a crash in
-                // the window would restore the sibling ungrouped.
-                self.schedule_session_save();
-            }
-            Err(e) => {
-                crate::logging::sibling_workspace_create_failed(&e.to_string());
-            }
+        let idx = self.create_workspace_with_options(initial_cwd, focus)?;
+        if membership.is_some() {
+            self.state.workspaces[idx].worktree_space = membership;
         }
+        if let Some(name) = custom_name {
+            self.state.workspaces[idx].set_custom_name(name);
+        }
+        // Second (load-bearing) save: create_workspace_with_options scheduled
+        // one BEFORE membership/name were stamped above; the debounced saver
+        // must capture the stamped state or a crash in the window would
+        // restore the sibling ungrouped.
+        self.schedule_session_save();
+        Ok(idx)
     }
 
     pub(super) fn create_tab_with_options(

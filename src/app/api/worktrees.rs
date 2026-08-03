@@ -1083,7 +1083,7 @@ impl App {
         })
     }
 
-    fn emit_workspace_open_events(&self, ws_idx: usize) {
+    pub(super) fn emit_workspace_open_events(&self, ws_idx: usize) {
         let workspace_info = self.workspace_info(ws_idx);
         let Some(tab) = self.tab_info(ws_idx, 0) else {
             return;

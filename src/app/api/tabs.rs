@@ -46,6 +46,42 @@ impl App {
         encode_success(id, ResponseResult::TabInfo { tab })
     }
 
+    /// `tab.create` under workspace tab mode: spawn the sibling workspace the
+    /// keyboard would have, then answer with ITS root tab. The caller asked for
+    /// a tab and gets a real tab id — it simply lives in the sibling, which is
+    /// exactly what the human sees happen.
+    fn create_sibling_workspace_for_api(
+        &mut self,
+        id: String,
+        source_ws_idx: usize,
+        cwd: Option<String>,
+        label: Option<String>,
+        focus: bool,
+    ) -> String {
+        let cwd_override = cwd.map(PathBuf::from);
+        let ws_idx = match self.create_sibling_workspace_from(
+            Some(source_ws_idx),
+            label,
+            cwd_override,
+            focus,
+        ) {
+            Ok(ws_idx) => ws_idx,
+            Err(err) => return encode_error(id, "tab_create_failed", err.to_string()),
+        };
+        if focus {
+            self.state.mode = Mode::Terminal;
+        }
+        self.emit_workspace_open_events(ws_idx);
+        match self.tab_created_result(ws_idx, 0) {
+            Some(result) => encode_success(id, result),
+            None => encode_error(
+                id,
+                "tab_create_failed",
+                "sibling workspace produced no root tab",
+            ),
+        }
+    }
+
     pub(super) fn handle_tab_create(&mut self, id: String, params: TabCreateParams) -> String {
         let TabCreateParams {
             workspace_id,
@@ -63,6 +99,13 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
+        // Workspace-as-unit tab mode (#25): a "tab" IS a sibling workspace.
+        // The keyboard path branches here; this one did not, so an agent
+        // calling tab.create grew an inner tab that the workspace-mode strip
+        // never shows and that carries none of the space grouping.
+        if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+            return self.create_sibling_workspace_for_api(id, ws_idx, cwd, label, focus);
+        }
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
             let follow_cwd = self
                 .state
@@ -236,4 +279,95 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 
 fn tab_not_found(id: String, tab_id: &str) -> String {
     encode_error(id, "tab_not_found", format!("tab {tab_id} not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::Request;
+
+    fn test_app() -> App {
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    /// A "tab" under workspace tab mode (#25) is a sibling workspace. The
+    /// keyboard has branched on this since #25; `tab.create` did not, so an
+    /// agent asking for a tab grew an inner tab the workspace-mode strip never
+    /// shows, carrying none of the space grouping the sibling would inherit.
+    #[tokio::test]
+    async fn tab_create_spawns_a_sibling_workspace_under_workspace_tab_mode() {
+        let mut app = test_app();
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        let mut ws = crate::workspace::Workspace::test_new("main");
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/repo/flock/.git".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
+            is_linked_worktree: false,
+        });
+        let source_id = ws.id.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                workspace_id: Some(source_id.clone()),
+                cwd: None,
+                focus: false,
+                label: None,
+            }),
+        });
+        assert!(
+            !response.contains("\"error\""),
+            "tab.create should succeed: {response}"
+        );
+
+        // A sibling workspace, not an inner tab.
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+
+        // And it inherits the space grouping, which is what makes it a sibling
+        // rather than an unrelated workspace.
+        assert_eq!(
+            app.state.workspaces[1]
+                .worktree_space()
+                .map(|space| space.key.as_str()),
+            Some("/repo/flock/.git")
+        );
+    }
+
+    /// The default mode is unchanged: a tab is still a tab.
+    #[tokio::test]
+    async fn tab_create_still_grows_an_inner_tab_under_tabs_mode() {
+        let mut app = test_app();
+        app.state.tab_mode = crate::config::TabModeConfig::Tabs;
+        let ws = crate::workspace::Workspace::test_new("main");
+        let source_id = ws.id.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                workspace_id: Some(source_id),
+                cwd: None,
+                focus: false,
+                label: None,
+            }),
+        });
+        assert!(!response.contains("\"error\""), "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+    }
 }
