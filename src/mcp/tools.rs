@@ -364,6 +364,7 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
+        from_host: None,
         to,
         body: required_string(&args, "body")?,
         correlation_id: optional_string(&args, "correlation_id")?,

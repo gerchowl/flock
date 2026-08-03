@@ -520,6 +520,14 @@ fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, Str
 
 /// Run one command on a peer over SSH (batch mode, short timeouts), returning
 /// stdout. Shared by the summary poll and the checkout-prepare invocation.
+/// Wrap a value as one POSIX single-quoted shell word.
+///
+/// `'` cannot appear inside single quotes, so each one closes the quote, emits
+/// an escaped quote, and reopens — the standard `'\''` idiom.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Hand a message to the peer that owns the recipient, for it to enqueue in
 /// its own mailbox (ADR-0008).
 ///
@@ -537,6 +545,7 @@ pub fn send_peer_message(
     peer: &PeerConfig,
     to_agent: &str,
     from_agent: &str,
+    from_host: &str,
     body: &str,
     correlation_id: &str,
 ) -> Result<(), String> {
@@ -545,6 +554,7 @@ pub fn send_peer_message(
     for (label, value) in [
         ("agent id", to_agent),
         ("sender id", from_agent),
+        ("sender host", from_host),
         ("correlation id", correlation_id),
     ] {
         if value.is_empty()
@@ -555,14 +565,22 @@ pub fn send_peer_message(
             return Err(format!("invalid {label}: {value:?}"));
         }
     }
-    // The BODY is caller-supplied and cannot be validated the same way, so it
-    // never reaches the shell as syntax: single-quoted with embedded quotes
-    // neutralised the POSIX way.
-    let quoted_body = format!("'{}'", body.replace('\'', "'\\''"));
-    let remote = format!(
-        "sh -lc 'flk msg send --agent {to_agent} --from-agent {from_agent} \
-         --correlation-id {correlation_id} --json -- {quoted_body}'"
+    // Quote ONCE, at the outside. The body is caller-supplied and cannot be
+    // validated like the ids, so it must never reach the remote shell as
+    // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
+    // closes the outer quote and the shell then word-splits the message. A
+    // live cross-host send arrived as "cross-machine" instead of
+    // "cross-machine hello from sage" for exactly that reason.
+    //
+    // So: build the inner command with the body quoted, then quote the whole
+    // inner command once more for `sh -lc`. Nesting handled by the same POSIX
+    // idiom at both levels rather than by hand at one.
+    let inner = format!(
+        "flk msg send --agent {to_agent} --from-agent {from_agent} --from-host {from_host} \
+         --correlation-id {correlation_id} --json -- {}",
+        shell_single_quote(body)
     );
+    let remote = format!("sh -lc {}", shell_single_quote(&inner));
     run_peer_ssh(peer, &remote).map(|_| ())
 }
 
@@ -670,6 +688,23 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shell_quoting_survives_spaces_and_quotes() {
+        // A live cross-host send arrived truncated at the first space, because
+        // the body was quoted INSIDE an already single-quoted `sh -lc '...'`:
+        // the inner quote closed the outer one and the remote shell then word-
+        // split the message. Quote once per level.
+        assert_eq!(super::shell_single_quote("hello world"), "'hello world'");
+        assert_eq!(super::shell_single_quote("it's fine"), r#"'it'\''s fine'"#);
+
+        // Nesting the way the relay does: inner command quoted, then the whole
+        // thing quoted again for `sh -lc`. The body must survive both.
+        let inner = format!("flk msg send -- {}", super::shell_single_quote("a b c"));
+        let outer = super::shell_single_quote(&inner);
+        assert!(outer.starts_with('\''), "{outer}");
+        assert!(outer.contains("a b c"), "body must survive: {outer}");
+    }
     #[test]
     fn to_wire_dedups_origin_and_caps_peer_count() {
         let mk = |name: &str| PeerSummaryState {

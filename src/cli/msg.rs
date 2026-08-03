@@ -43,6 +43,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     let mut in_reply_to = None;
     let mut agent = None;
     let mut from_agent = None;
+    let mut from_host = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -74,6 +75,14 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 agent = Some(value.clone());
+                index += 2;
+            }
+            "--from-host" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --from-host");
+                    return Ok(2);
+                };
+                from_host = Some(value.clone());
                 index += 2;
             }
             "--from-agent" => {
@@ -127,6 +136,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         id: "cli:msg:send".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent,
+            from_host,
             to,
             body,
             correlation_id,
