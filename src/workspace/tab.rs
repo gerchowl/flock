@@ -192,8 +192,18 @@ impl Tab {
         self.custom_name.is_none()
     }
 
+    /// Set (or clear) the user-visible name. Trims, and treats an all-blank
+    /// name as "clear it" — falling back to the derived name.
+    ///
+    /// The normalization lives HERE rather than in each caller: the rename
+    /// dialog trimmed and guarded, `workspace.rename` / `tab.rename` passed the
+    /// label through raw, so the same rename produced `"  foo  "` over the
+    /// socket and `"foo"` from the keyboard, and a blank name stored an
+    /// invisible label instead of restoring the derived one. `set_manual_label`
+    /// on panes has always done it this way; this brings the other two in line.
     pub fn set_custom_name(&mut self, name: String) {
-        self.custom_name = Some(name);
+        let name = name.trim().to_string();
+        self.custom_name = (!name.is_empty()).then_some(name);
     }
 
     pub fn split_focused(

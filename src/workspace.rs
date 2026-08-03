@@ -783,8 +783,18 @@ impl Workspace {
         self.public_tab_number(tab_idx)
     }
 
+    /// Set (or clear) the user-visible name. Trims, and treats an all-blank
+    /// name as "clear it" — falling back to the derived name.
+    ///
+    /// The normalization lives HERE rather than in each caller: the rename
+    /// dialog trimmed and guarded, `workspace.rename` / `tab.rename` passed the
+    /// label through raw, so the same rename produced `"  foo  "` over the
+    /// socket and `"foo"` from the keyboard, and a blank name stored an
+    /// invisible label instead of restoring the derived one. `set_manual_label`
+    /// on panes has always done it this way; this brings the other two in line.
     pub fn set_custom_name(&mut self, name: String) {
-        self.custom_name = Some(name);
+        let name = name.trim().to_string();
+        self.custom_name = (!name.is_empty()).then_some(name);
     }
 
     pub fn resolved_identity_cwd(&self) -> Option<PathBuf> {
@@ -1205,6 +1215,26 @@ mod tests {
             is_linked_worktree: true,
             project_key: "github.com/gerchowl/flock".into(),
         }
+    }
+
+    #[test]
+    fn custom_name_is_normalized_once_for_every_caller() {
+        // The rename dialog trimmed and guarded; workspace.rename / tab.rename
+        // passed the label through raw. Same rename, two results — `"  foo  "`
+        // over the socket, `"foo"` from the keyboard — and a blank name stored
+        // an invisible label instead of restoring the derived one.
+        let mut ws = Workspace::test_new("main");
+        ws.set_custom_name("  spaced  ".into());
+        assert_eq!(ws.custom_name.as_deref(), Some("spaced"));
+
+        // Blank clears, so the derived name comes back rather than a label made
+        // of spaces.
+        ws.set_custom_name("   ".into());
+        assert_eq!(ws.custom_name, None);
+
+        ws.set_custom_name("kept".into());
+        ws.set_custom_name(String::new());
+        assert_eq!(ws.custom_name, None);
     }
 
     #[test]
