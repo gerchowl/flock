@@ -51,15 +51,18 @@ repos:
         language: system
         pass_filenames: true
 
-      # Derived/generated doc regions must match their source-of-truth command
-      # (docs/DEBT.md census etc.). Drift → unified diff; `--fix` regenerates.
+      # Doc regions that DECLARE a generator (`<!-- guardrails:derived cmd=... -->`)
+      # must still match its output. Scope is opt-in per region — today that is
+      # docs/DEBT.md's trace-fields census and nothing else, so the label says
+      # "declared" rather than implying every doc in the tree is verified.
       - id: derived-docs
-        name: "derived docs match their source of truth"
+        name: "declared-derived doc regions still match their generator"
         entry: guardrails-derived-docs
         language: system
         pass_filenames: true
-      # Every Accepted ADR (docs/adr/README.md index) must be cited as ADR-NNNN
-      # in FEATURE-MATRIX.md — decided designs can't silently outrun the matrix.
+      # Every Accepted ADR — read from each ADR file's own `- Status:` header,
+      # not from the index — must be cited as ADR-NNNN in FEATURE-MATRIX.md.
+      # Also fails duplicate ADR ids and an index that omits or disagrees.
       - id: adr-matrix
         name: "every Accepted ADR cited in FEATURE-MATRIX.md"
         entry: guardrails-adr-matrix

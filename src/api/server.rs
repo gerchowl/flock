@@ -312,6 +312,21 @@ fn handle_request(
     }
 }
 
+/// Wire name for a method, for the request log line.
+///
+/// This restates the `#[serde(rename = ...)]` on each `Method` variant, which
+/// looks like the kind of duplication that drifts — an audit flagged it as
+/// exactly that. It does not, and the reason is worth writing down so the next
+/// audit doesn't re-litigate it: **the match has no catch-all**, so adding a
+/// variant fails to compile until its arm exists (verified: adding a probe
+/// variant errors with "non-exhaustive patterns"). The compiler enforces the
+/// one dimension that matters — the set.
+///
+/// What remains is a typo in a single arm, which mislabels one log field.
+/// Deriving the name from serde instead would mean either serializing the
+/// params on every request just to read the tag, or ~60 lines of custom
+/// `Serializer` to capture it without them. Both are worse than a
+/// compiler-checked table for a logging label, so this stays deliberate.
 fn api_method_name(method: &Method) -> &'static str {
     match method {
         Method::Ping(_) => "ping",
