@@ -27,6 +27,17 @@ pub(crate) struct AgentLocation {
     /// `true` when the agent is on this server — i.e. reachable without the
     /// peer channel.
     pub(crate) local: bool,
+    /// How to REACH that host: the `[[peers]]` config name of the entry that
+    /// told us about this agent. `None` when local.
+    ///
+    /// Separate from `host` on purpose. `host` is what the machine calls
+    /// itself (`vm-dev`); the route is what THIS server knows it as
+    /// (`anvil`). They routinely differ — a live cross-host send failed with
+    /// "not in this server's [[peers]]" because the relay looked up a peer
+    /// named after the reported hostname. Resolution knows which peer the
+    /// answer came from, so it should hand that back rather than make the
+    /// caller re-derive it.
+    pub(crate) route: Option<String>,
 }
 
 impl App {
@@ -55,6 +66,7 @@ impl App {
                         host: crate::app::short_host_name(),
                         pane_id: self.state.public_pane_id(ws_idx, *pane_id)?,
                         local: true,
+                        route: None,
                     });
                 }
             }
@@ -72,6 +84,7 @@ impl App {
         // set is small and the borrow shape stays obvious.
         for peer in &self.state.peer_summaries {
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+            let route = Some(peer.peer.clone());
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     if agent.agent_id == agent_id {
@@ -80,6 +93,7 @@ impl App {
                             host,
                             pane_id: agent.pane_id.clone(),
                             local: false,
+                            route,
                         });
                     }
                 }
@@ -87,6 +101,9 @@ impl App {
         }
         for peer in self.state.relayed_fleet_cache.values() {
             let host = peer.host.clone().unwrap_or_else(|| peer.name.clone());
+            // A relayed entry is reachable only via the origin that relayed
+            // it; we have no direct edge, so there is no route of our own.
+            let route: Option<String> = None;
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     if agent.agent_id == agent_id {
@@ -95,6 +112,7 @@ impl App {
                             host,
                             pane_id: agent.pane_id.clone(),
                             local: false,
+                            route,
                         });
                     }
                 }
@@ -180,6 +198,42 @@ mod tests {
         assert!(!found.local);
         assert_eq!(found.host, "anvil-dev");
         assert_eq!(found.pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn a_remote_location_carries_the_route_not_just_the_hostname() {
+        // Found live: a peer configured as `anvil` reports its hostname as
+        // `vm-dev`, so a relay that looked up `[[peers]]` by the REPORTED host
+        // found nothing and refused a message it could actually deliver. The
+        // directory knows which peer entry answered — it has to hand that back.
+        let mut app = test_app();
+        app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
+
+        let found = app.locate_agent("agent_vm-dev_1").expect("resolves");
+        assert_eq!(found.host, "vm-dev", "where the agent is");
+        assert_eq!(
+            found.route.as_deref(),
+            Some("anvil"),
+            "how THIS server reaches it — the [[peers]] name, not the hostname"
+        );
+    }
+
+    #[test]
+    fn a_local_location_needs_no_route() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].focused_pane_id().expect("pane");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let agent_id = app.state.terminals[&terminal_id].agent_id.to_string();
+
+        let found = app.locate_agent(&agent_id).expect("resolves");
+        assert!(found.local);
+        assert!(found.route.is_none(), "no peer hop for a local agent");
     }
 
     #[test]

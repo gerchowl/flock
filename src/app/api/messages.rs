@@ -50,8 +50,11 @@ impl App {
             // owns the recipient and let ITS mailbox do the rest. One delivery
             // implementation, wherever the sender was.
             Err((code, detail)) if code == Self::REMOTE => {
-                let (host, to_agent) = detail.split_once('\u{1f}').unwrap_or((&detail, ""));
-                return self.relay_message_to_host(id, host, to_agent, &body, params);
+                let mut parts = detail.split('\u{1f}');
+                let route = parts.next().unwrap_or_default().to_string();
+                let host = parts.next().unwrap_or_default().to_string();
+                let to_agent = parts.next().unwrap_or_default().to_string();
+                return self.relay_message_to_host(id, &route, &host, &to_agent, &body, params);
             }
             Err((code, message)) => return encode_error(id, code, message),
         };
@@ -186,11 +189,15 @@ impl App {
             // The original sender is on another host: relay the reply the same
             // way the message came.
             Err((code, detail)) if code == Self::REMOTE => {
-                let (host, to_agent) = detail.split_once('\u{1f}').unwrap_or((&detail, ""));
+                let mut parts = detail.split('\u{1f}');
+                let route = parts.next().unwrap_or_default().to_string();
+                let host = parts.next().unwrap_or_default().to_string();
+                let to_agent = parts.next().unwrap_or_default().to_string();
                 return self.relay_message_to_host(
                     id,
-                    host,
-                    to_agent,
+                    &route,
+                    &host,
+                    &to_agent,
                     &body,
                     MsgSendParams {
                         from_agent: None,
@@ -368,17 +375,26 @@ impl App {
     fn relay_message_to_host(
         &mut self,
         id: String,
+        route: &str,
         host: &str,
         to_agent: &str,
         body: &str,
         params: MsgSendParams,
     ) -> String {
+        // Route by the peer entry the DIRECTORY answered from, not by the name
+        // the far machine calls itself. Those differ in any normal fleet — a
+        // peer configured as `anvil` reports its hostname as `vm-dev` — and
+        // matching on the reported host is exactly why the first live
+        // cross-host send came back "not in this server's [[peers]]". Falls
+        // back to the host for a directory answer that carried no route.
         let Some(peer) = self
             .state
             .peers
             .iter()
             .find(|peer| {
-                peer.name.eq_ignore_ascii_case(host) || peer.ssh_target().eq_ignore_ascii_case(host)
+                (!route.is_empty() && peer.name.eq_ignore_ascii_case(route))
+                    || peer.name.eq_ignore_ascii_case(host)
+                    || peer.ssh_target().eq_ignore_ascii_case(host)
             })
             .cloned()
         else {
