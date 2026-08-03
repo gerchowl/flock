@@ -24,28 +24,6 @@ impl ApiFailure {
     }
 }
 
-/// #175 S3 commit 4 (ops): mint a unique run_id for an `agent.fork`
-/// child. Format: `fork:<unix_us>-<pid>-<counter>` — cheap, monotonic
-/// within a process, and never colliding across a restart because unix
-/// micros + a fresh pid + a fresh counter never re-hit the same tuple.
-/// Callers stamp this on the child's env and reuse it for the
-/// `AgentForked.run_id` field so the two agree.
-///
-/// EXTENSION POINT: when a scheduler-spawned path lands (S1 `SpawnAgent`
-/// action), reuse this function to mint the run_id there too — the
-/// trailer hook already keys on `FLOCK_RUN_ID`, so the same env stamp
-/// makes those commits revertable by `flk revert-run`.
-fn generated_fork_run_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0);
-    format!("fork:{micros:x}-{}-{count}", std::process::id())
-}
-
 fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
     let path = crate::worktree::expand_tilde_path(path);
     if path.is_absolute() {
@@ -347,33 +325,8 @@ impl App {
         // Uniqueness: process id + monotonic counter + wallclock micros.
         // The old `fork:<child terminal id>` shape was equally unstable
         // across restarts, and both remain audit-tokens, not addresses.
-        let run_id = generated_fork_run_id();
-        // Install the trailer hook when opt-in configuration says so
-        // (`[checks] run_trailers = true`) — never silently write into a
-        // user repo. Failures are non-fatal: the trailer is a
-        // convenience, not a correctness invariant.
-        if self.state.config.checks.run_trailers {
-            let outcome = crate::integration::install_run_trailer_at(&checkout_path);
-            match outcome {
-                Ok(crate::integration::RunTrailerInstall { state, hook_path }) => match state {
-                    crate::integration::RunTrailerInstallState::Installed => {
-                        crate::logging::event_log_write_failed(&format!(
-                            "run-trailer hook installed at {} (run_trailers=true)",
-                            hook_path.display()
-                        ));
-                    }
-                    crate::integration::RunTrailerInstallState::SkippedUserHook => {
-                        crate::logging::event_log_write_failed(&format!(
-                            "run-trailer hook not installed at {}: user-authored prepare-commit-msg present",
-                            hook_path.display()
-                        ));
-                    }
-                },
-                Err(err) => crate::logging::event_log_write_failed(&format!(
-                    "run-trailer hook install failed: {err}"
-                )),
-            }
-        }
+        let run_id = super::super::worktrees::generated_fork_run_id();
+        self.install_run_trailer_if_enabled(&checkout_path);
         // Guard, not a bare set: any early return below (spawn failure)
         // must disarm the id, or the next unrelated pane inherits it and
         // `flk revert-run` would revert that pane's work (US-8).

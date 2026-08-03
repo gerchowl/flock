@@ -1205,6 +1205,7 @@ mod tests {
     ) -> WorktreeCreateState {
         use crate::app::line_editor::LineEditor;
         WorktreeCreateState {
+            branch_parent: None,
             branch_plan,
             source_workspace_id: "w".into(),
             source_checkout_path: "/repo".into(),

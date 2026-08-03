@@ -47,6 +47,28 @@ fn resolve_seed_prompt(seed: &str, branch: &str) -> String {
     seed.replace("<branch>", branch.trim())
 }
 
+/// #175 S3 commit 4 (ops): mint a unique run_id for an `agent.fork`
+/// child. Format: `fork:<unix_us>-<pid>-<counter>` — cheap, monotonic
+/// within a process, and never colliding across a restart because unix
+/// micros + a fresh pid + a fresh counter never re-hit the same tuple.
+/// Callers stamp this on the child's env and reuse it for the
+/// `AgentForked.run_id` field so the two agree.
+///
+/// EXTENSION POINT: when a scheduler-spawned path lands (S1 `SpawnAgent`
+/// action), reuse this function to mint the run_id there too — the
+/// trailer hook already keys on `FLOCK_RUN_ID`, so the same env stamp
+/// makes those commits revertable by `flk revert-run`.
+pub(super) fn generated_fork_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    format!("fork:{micros:x}-{}-{count}", std::process::id())
+}
+
 /// Why the focused pane can't be branched: nothing to resume at all, or a
 /// resumable agent whose CLI can't fork a conversation (#175 F2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +260,7 @@ impl App {
         self.state.selected = ws_idx;
         self.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
+            branch_parent: None,
             source_workspace_id,
             source_checkout_path,
             source_existing_membership: existing_membership,
@@ -259,6 +282,39 @@ impl App {
     /// Branch the focused pane's agent session into a new worktree: same
     /// dialog as new-worktree, but the created workspace's root pane resumes
     /// a fork of the session instead of starting a shell.
+    /// Install the `prepare-commit-msg` run-trailer hook in a freshly created
+    /// worktree, but only when `[checks] run_trailers = true` — flock never
+    /// silently writes hooks into a user repo. Failures are non-fatal: the
+    /// trailer makes commits findable by `flk revert-run`, it is not a
+    /// correctness invariant.
+    ///
+    /// Shared by both fork paths. It used to live only in `agent.fork`, so a
+    /// keyboard branch-session produced commits no run id could find.
+    pub(super) fn install_run_trailer_if_enabled(&self, checkout_path: &std::path::Path) {
+        if !self.state.config.checks.run_trailers {
+            return;
+        }
+        match crate::integration::install_run_trailer_at(checkout_path) {
+            Ok(crate::integration::RunTrailerInstall { state, hook_path }) => match state {
+                crate::integration::RunTrailerInstallState::Installed => {
+                    crate::logging::event_log_write_failed(&format!(
+                        "run-trailer hook installed at {} (run_trailers=true)",
+                        hook_path.display()
+                    ));
+                }
+                crate::integration::RunTrailerInstallState::SkippedUserHook => {
+                    crate::logging::event_log_write_failed(&format!(
+                        "run-trailer hook not installed at {}: user-authored prepare-commit-msg present",
+                        hook_path.display()
+                    ));
+                }
+            },
+            Err(err) => crate::logging::event_log_write_failed(&format!(
+                "run-trailer hook install failed: {err}"
+            )),
+        }
+    }
+
     pub(crate) fn open_branch_session_dialog(&mut self, ws_idx: usize) {
         let plan = match self.focused_branch_plan(ws_idx) {
             Ok(plan) => plan,
@@ -287,8 +343,34 @@ impl App {
         // tracks the branch name even if the user edits it. Empty config =>
         // empty field => no seed, same as today.
         let pivot_template = self.state.branch_pivot_message.clone();
+        // Capture the parent NOW (#175 O2). The dialog closes and `git worktree
+        // add` runs on a thread, so by completion the focused pane may have
+        // moved — `agent.fork` has this to hand, the keyboard has to keep it.
+        let branch_parent = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.focused_pane_id())
+            .and_then(|pane_id| {
+                let pane_public = self.public_pane_id(ws_idx, pane_id)?;
+                let agent = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.pane_state(pane_id))
+                    .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                    .and_then(|terminal| terminal.effective_agent_label())
+                    .unwrap_or("agent")
+                    .to_string();
+                Some(crate::app::state::ForkParent {
+                    pane_id: pane_public,
+                    workspace_id: self.public_workspace_id(ws_idx),
+                    agent,
+                })
+            });
         if let Some(create) = self.state.worktree_create.as_mut() {
             create.branch_plan = Some(plan);
+            create.branch_parent = branch_parent;
             // Fresh dialog => empty seed; guard so a re-open can't clobber edits.
             if create.seed.is_empty() {
                 create.seed.set(pivot_template);
@@ -1420,7 +1502,15 @@ impl App {
                 let repo_name = create.repo_name.clone();
                 let source_repo_root = create.source_repo_root.clone();
                 let seed_prompt = create.seed.value().to_string();
+                let branch_parent = create.branch_parent.clone();
                 self.state.worktree_create = None;
+                // A branch-session fork is tracked exactly as `agent.fork`
+                // is (#175 O2): a run id stamped into the child's env, the
+                // opt-in trailer hook, and an AgentForked edge. Without these
+                // the keyboard produced commits `flk revert-run` could not
+                // find and a lineage `agent.lineage` never saw — while the
+                // programmatic fork of the same session was fully tracked.
+                let mut fork_run_id = None;
                 let created = if let Some(mut plan) = branch_plan {
                     // #106/#159: inject the one-shot pivot prompt as the fork's
                     // first turn. The prompt is the dialog's editable seed
@@ -1430,7 +1520,15 @@ impl App {
                     // non-claude fork => no-op.
                     let pivot = resolve_seed_prompt(&seed_prompt, &branch_name);
                     crate::agent_resume::append_pivot_message(&mut plan, &pivot);
+                    let seeded = !pivot.trim().is_empty();
                     let (rows, cols) = self.state.estimate_pane_size();
+                    let run_id = generated_fork_run_id();
+                    self.install_run_trailer_if_enabled(&path);
+                    // Guard, not a bare set: a spawn failure below must disarm
+                    // the id, or the next unrelated pane inherits it and
+                    // `flk revert-run` would revert that pane's work (#192).
+                    let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
+                    fork_run_id = Some((run_id, seeded));
                     self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
                         .map(|(ws_idx, _, _)| ws_idx)
                         .map_err(|err| match err {
@@ -1462,12 +1560,41 @@ impl App {
                         }
                         if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
                             ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
-                                key: repo_key,
+                                key: repo_key.clone(),
                                 label: repo_name,
                                 repo_root: source_repo_root,
-                                checkout_path: path,
+                                checkout_path: path.clone(),
                                 is_linked_worktree: true,
                             });
+                        }
+                        // The same lineage edge `agent.fork` emits, so a
+                        // keyboard fork is visible to `flk agent lineage` and
+                        // joinable with `flk revert-run <id>` on one token.
+                        if let (Some((run_id, seeded)), Some(parent)) = (fork_run_id, branch_parent)
+                        {
+                            if let Some(child_pane_id) = self
+                                .state
+                                .workspaces
+                                .get(ws_idx)
+                                .and_then(|ws| ws.focused_pane_id())
+                                .and_then(|pane_id| self.public_pane_id(ws_idx, pane_id))
+                            {
+                                self.emit_event(crate::api::schema::EventEnvelope {
+                                    event: crate::api::schema::EventKind::AgentForked,
+                                    data: crate::api::schema::EventData::AgentForked {
+                                        run_id,
+                                        parent_pane_id: parent.pane_id,
+                                        parent_workspace_id: parent.workspace_id,
+                                        parent_repo: repo_key,
+                                        agent: parent.agent,
+                                        child_workspace_id: self.public_workspace_id(ws_idx),
+                                        child_pane_id,
+                                        child_worktree: path.display().to_string(),
+                                        child_branch: branch_name.clone(),
+                                        seeded,
+                                    },
+                                });
+                            }
                         }
                         self.state.mark_session_dirty();
                     }
@@ -1858,6 +1985,7 @@ mod tests {
         app.state.worktree_directory = std::path::PathBuf::from("/w");
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
+            branch_parent: None,
             source_workspace_id: "source".into(),
             source_checkout_path: std::path::PathBuf::from("/repo/flock"),
             source_existing_membership: None,
@@ -1895,6 +2023,7 @@ mod tests {
         app.state.worktree_directory = worktree_root.clone();
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
+            branch_parent: None,
             source_workspace_id: "source".into(),
             source_checkout_path: repo.clone(),
             source_existing_membership: None,
@@ -1961,6 +2090,7 @@ mod tests {
         app.state.worktree_directory = worktree_root.clone();
         app.state.worktree_create = Some(WorktreeCreateState {
             branch_plan: None,
+            branch_parent: None,
             source_workspace_id: "source".into(),
             source_checkout_path: source_checkout.clone(),
             source_existing_membership: None,
@@ -2277,6 +2407,79 @@ mod tests {
             app.state.action_notice.as_deref(),
             Some("branch session: focused pane has no resumable agent session")
         );
+    }
+
+    #[test]
+    fn branch_session_dialog_captures_the_fork_parent_for_the_lineage_edge() {
+        // #175 O2: the API fork emits an AgentForked edge and stamps a run
+        // id. The keyboard path emitted neither, so a human-driven fork produced
+        // commits `flk revert-run` could not find and a lineage the graph never
+        // saw. The parent has to be captured HERE — the dialog closes and
+        // `git worktree add` runs on a thread, so by completion the focused
+        // pane may have moved.
+        let _home = fake_claude_home_with("sess-parent");
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+
+        let ws = &app.state.workspaces[0];
+        let pane_id = ws.focused_pane_id().expect("workspace should have a pane");
+        let expected_pane_id = app.public_pane_id(0, pane_id).expect("public pane id");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state should exist")
+            .attached_terminal_id
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/repo/flock".into());
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("sess-parent")
+                .expect("session id should validate"),
+        });
+        app.state.terminals.insert(terminal_id, terminal);
+
+        app.open_branch_session_dialog(0);
+
+        let parent = app
+            .state
+            .worktree_create
+            .as_ref()
+            .and_then(|create| create.branch_parent.as_ref())
+            .expect("branch-session dialog must record its fork parent");
+        assert_eq!(parent.pane_id, expected_pane_id);
+        assert_eq!(parent.workspace_id, app.public_workspace_id(0));
+    }
+
+    /// A plain new-worktree has no parent to record — it is not a fork.
+    #[test]
+    fn new_worktree_dialog_records_no_fork_parent() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.mode = Mode::Navigate;
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "checkout-key".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            is_linked_worktree: false,
+            project_key: "dir:flock".into(),
+        });
+
+        app.open_new_linked_worktree_dialog(0, None);
+
+        let create = app.state.worktree_create.as_ref().expect("dialog opened");
+        assert!(create.branch_plan.is_none());
+        assert!(create.branch_parent.is_none());
     }
 
     #[test]
