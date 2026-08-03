@@ -572,6 +572,13 @@ pub struct MsgSendParams {
     /// never authorization, so a claim is all this ever needs to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_agent: Option<String>,
+    /// Host the sender is on, asserted alongside `from_agent` by a relay.
+    ///
+    /// The receiver cannot derive this: the sending host is by definition not
+    /// itself, and its directory may not carry the sender. Without it the
+    /// receiver had to guess, and guessed its own host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_host: Option<String>,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,

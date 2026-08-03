@@ -85,12 +85,17 @@ impl App {
                 .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
             Some(terminal.agent_id.to_string())
         });
-        let from_host = params
-            .from_agent
-            .as_ref()
-            .and_then(|agent| self.locate_agent(agent))
-            .map(|location| location.host)
-            .or_else(|| Some(crate::app::short_host_name()));
+        // The sender's host: asserted by a relay, else this host when WE
+        // attested the sender locally. Never guessed — a relayed message whose
+        // sender the local directory cannot see used to fall back to
+        // `short_host_name()` and claim the recipient's own host as the
+        // origin, which read as "sage sent this" on the machine that received
+        // it from sage.
+        let from_host = params.from_host.clone().or_else(|| {
+            attested_agent
+                .as_ref()
+                .map(|_| crate::app::short_host_name())
+        });
         let from_agent = attested_agent.or_else(|| params.from_agent.clone());
 
         if from_pane.as_deref() == Some(to_pane.as_str()) {
@@ -203,6 +208,7 @@ impl App {
                     &body,
                     MsgSendParams {
                         from_agent: None,
+                        from_host: None,
                         to: reply_target.clone(),
                         body: body.clone(),
                         correlation_id: params.reply_correlation_id.clone(),
@@ -436,7 +442,14 @@ impl App {
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
 
-        match crate::peers::send_peer_message(&peer, to_agent, &from_agent, body, &correlation_id) {
+        match crate::peers::send_peer_message(
+            &peer,
+            to_agent,
+            &from_agent,
+            &crate::app::short_host_name(),
+            body,
+            &correlation_id,
+        ) {
             Ok(()) => encode_success(
                 id,
                 ResponseResult::MsgQueued {
@@ -675,6 +688,7 @@ mod tests {
             app,
             MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::Pane { pane: to },
                 body: body.into(),
                 correlation_id: Some(correlation.into()),
@@ -729,6 +743,7 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::Pane {
                     pane: "w9:p9".into(),
                 },
@@ -744,6 +759,7 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::Pane {
                     pane: "no-such".into(),
                 },
@@ -759,6 +775,7 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::RepoPane {
                     repo: "ghost-repo".into(),
                     pane: "p1".into(),
@@ -853,6 +870,7 @@ mod tests {
             id: "req".into(),
             method: Method::MsgSend(MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_anvil-dev_beef".into(),
                 },
@@ -880,6 +898,7 @@ mod tests {
             id: "req".into(),
             method: Method::MsgSend(MsgSendParams {
                 from_agent: None,
+                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_nowhere_0".into(),
                 },
@@ -912,6 +931,7 @@ mod tests {
             method: Method::MsgSend(MsgSendParams {
                 // No local ancestry attests this — it came off the wire.
                 from_agent: Some("agent_mba22_cafe".into()),
+                from_host: Some("mba22".into()),
                 to: MessageTarget::Pane {
                     pane: to_pane.clone(),
                 },
@@ -934,6 +954,9 @@ mod tests {
         };
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from_agent.as_deref(), Some("agent_mba22_cafe"));
+        // The relay's asserted host, not the receiver's own — a receiver that
+        // guesses reports itself as the origin.
+        assert_eq!(messages[0].from_host.as_deref(), Some("mba22"));
         assert!(
             messages[0].replyable,
             "a named sender must be replyable even with no local pane"
