@@ -544,7 +544,14 @@ mod tests {
     // --- stop ------------------------------------------------------------
 
     fn transcript_with(lines: &[&str]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("flk-hook-{}", seq()));
+        // The pid is load-bearing: nextest gives each test its own process, so
+        // `seq()`'s counter restarts at 0 per process and only the clock reading
+        // separates them. On a CI runner with a coarse clock two processes can
+        // land the same name — and every test here ends with `remove_dir_all` on
+        // its parent, so a collision deletes the other test's transcript
+        // mid-run. That is the `stop_without_sentinel_nudges` flake. Every other
+        // temp-dir fixture in this repo already includes the pid.
+        let dir = std::env::temp_dir().join(format!("flk-hook-{}-{}", std::process::id(), seq()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.jsonl");
         std::fs::write(&path, lines.join("\n")).unwrap();
