@@ -3,14 +3,17 @@
     reason = "CLI output surface: usage and errors go to stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    EmptyParams, MessageTarget, Method, MsgListParams, MsgReplyParams, MsgSendParams, Request,
+    EmptyParams, MessageTarget, Method, MsgListParams, MsgReadParams, MsgReplyParams,
+    MsgSendParams, Request,
 };
 
-/// `flk msg` (#175 M1): queue a message for another pane's agent, delivered
-/// at that pane's next settled turn boundary. Addressing per ADR-0006: the
-/// wire is structured; the CLI accepts `--repo NAME` explicitly, or a
-/// `<repo>:<pane>` positional shorthand that only splits when the left side
-/// matches a known repo name (pane ids and agent labels also contain `:`).
+/// `flk msg` (#175 M1): queue a message for another pane's agent. The
+/// recipient reads it from its own inbox (ADR-0008) — flock does not type
+/// into a session, so there is no settled-turn-boundary window to wait for;
+/// the stop hook wakes an idle recipient. Addressing per ADR-0006: the wire is
+/// structured; the CLI accepts `--repo NAME` explicitly, or a `<repo>:<pane>`
+/// positional shorthand that only splits when the left side matches a known
+/// repo name (pane ids and agent labels also contain `:`).
 pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
         print_msg_help();
@@ -20,6 +23,7 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
         "send" => msg_send(&args[1..]),
         "reply" => msg_reply(&args[1..]),
         "list" => msg_list(&args[1..]),
+        "read" => msg_read(&args[1..]),
         "help" | "--help" | "-h" => {
             print_msg_help();
             Ok(0)
@@ -175,6 +179,34 @@ fn msg_list(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// `flk msg read` — consume an inbox (ADR-0008). The agent-facing path is the
+/// `flock_msg_read` MCP tool; this is the same verb for operators and scripts,
+/// so there is one delivery semantic rather than a CLI-only variant.
+fn msg_read(args: &[String]) -> std::io::Result<i32> {
+    let mut pane = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pane" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --pane");
+                    return Ok(2);
+                };
+                pane = Some(value.clone());
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:msg:read".into(),
+        method: Method::MsgRead(MsgReadParams { pane }),
+    })?)
+}
+
 fn print_msg_help() {
     eprintln!("flk msg commands:");
     eprintln!(
@@ -182,6 +214,7 @@ fn print_msg_help() {
     );
     eprintln!("  flk msg reply <correlation_id> <text...>");
     eprintln!("  flk msg list [--pane TARGET]");
+    eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
-    eprintln!("  delivery happens at the recipient's next settled turn boundary, never mid-turn");
+    eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
 }

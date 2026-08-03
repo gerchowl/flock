@@ -234,7 +234,7 @@ impl App {
             .commit_settled_completions(now, &self.terminal_runtimes);
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the headless loop (the #25 dual-loop lesson).
-        self.deliver_due_messages(now);
+        self.expire_undeliverable_messages();
         for update in &settled {
             self.emit_pane_state_update(update);
         }
