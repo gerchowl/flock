@@ -4,8 +4,8 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    Method, Request, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
-    WorktreeRemoveParams,
+    Method, Request, WorktreeCreateParams, WorktreeKillParams, WorktreeListParams,
+    WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
@@ -393,105 +393,40 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    // Resolve the workspace's worktree membership through the server.
+    // Transport only. The merge gate, the #121 protected-branch tiers and the
+    // branch deletion all live in the server's `worktree.kill` — they used to
+    // live HERE, which meant anything reaching the socket or MCP directly got
+    // the destructive half without them.
     let response = super::send_request(&Request {
-        id: "cli:worktree:kill:lookup".into(),
-        method: Method::WorkspaceGet(crate::api::schema::WorkspaceTarget {
-            workspace_id: workspace_id.clone(),
-        }),
-    })?;
-    let value = response;
-    let worktree = value
-        .pointer("/result/workspace/worktree")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    if !worktree
-        .get("is_linked_worktree")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        eprintln!("workspace {workspace_id} is not a linked worktree checkout");
-        return Ok(2);
-    }
-    let repo_root = std::path::PathBuf::from(
-        worktree
-            .get("repo_root")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default(),
-    );
-    let checkout = std::path::PathBuf::from(
-        worktree
-            .get("checkout_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default(),
-    );
-
-    let branch = crate::worktree::checkout_branch_name(&checkout);
-    let gate = match branch.as_deref() {
-        Some(branch) => crate::worktree::branch_merge_gate(&repo_root, &checkout, branch),
-        None => crate::worktree::WorktreeMergeGate::NotMerged,
-    };
-    let (merged, evidence) = match &gate {
-        crate::worktree::WorktreeMergeGate::Merged { evidence } => (true, evidence.clone()),
-        crate::worktree::WorktreeMergeGate::NotMerged => (false, String::new()),
-    };
-    let delete_branch = merged && !keep_branch;
-
-    if dry_run {
-        println!(
-            "{}",
-            serde_json::json!({
-                "workspace_id": workspace_id,
-                "checkout_path": checkout,
-                "branch": branch,
-                "merged": merged,
-                "evidence": if merged { Some(&evidence) } else { None },
-                "would_delete_branch": delete_branch,
-            })
-        );
-        return Ok(if merged { 0 } else { 3 });
-    }
-
-    let remove_response = super::send_request(&Request {
         id: "cli:worktree:kill".into(),
-        method: Method::WorktreeRemove(WorktreeRemoveParams {
+        method: Method::WorktreeKill(WorktreeKillParams {
             workspace_id: workspace_id.clone(),
             force,
+            keep_branch,
+            dry_run,
         }),
     })?;
-    let remove_value = remove_response;
-    if remove_value.get("error").is_some() {
-        println!("{remove_value}");
-        let dirty = remove_value
-            .pointer("/error/code")
-            .and_then(|v| v.as_str())
-            .is_some_and(|code| code == "dirty_worktree_requires_force");
-        return Ok(if dirty { 4 } else { 1 });
+
+    if let Some(error) = response.get("error") {
+        println!("{response}");
+        let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        return Ok(match code {
+            "not_linked_worktree" | "workspace_not_found" => 2,
+            "dirty_worktree_requires_force" => 4,
+            _ => 1,
+        });
     }
 
-    let mut branch_deleted = false;
-    let mut branch_delete_error = None;
-    if delete_branch {
-        if let Some(branch) = branch.as_deref() {
-            match crate::worktree::delete_local_branch(&repo_root, branch) {
-                Ok(()) => branch_deleted = true,
-                Err(err) => branch_delete_error = Some(err),
-            }
-        }
+    let result = response.pointer("/result").cloned().unwrap_or_default();
+    println!("{result}");
+    let merged = result
+        .get("merged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if dry_run {
+        // Unchanged contract: 0 when the gate would pass, 3 when it would not.
+        return Ok(if merged { 0 } else { 3 });
     }
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "workspace_id": workspace_id,
-            "removed": true,
-            "branch": branch,
-            "merged": merged,
-            "evidence": if merged { Some(&evidence) } else { None },
-            "branch_deleted": branch_deleted,
-            "branch_delete_error": branch_delete_error,
-        })
-    );
     Ok(0)
 }
 

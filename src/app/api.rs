@@ -889,6 +889,9 @@ impl App {
             Method::WorktreeRemove(params) => {
                 return self.handle_worktree_remove(request.id, params);
             }
+            Method::WorktreeKill(params) => {
+                return self.handle_worktree_kill(request.id, params);
+            }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
             Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
