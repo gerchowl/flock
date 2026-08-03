@@ -520,6 +520,52 @@ fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, Str
 
 /// Run one command on a peer over SSH (batch mode, short timeouts), returning
 /// stdout. Shared by the summary poll and the checkout-prepare invocation.
+/// Hand a message to the peer that owns the recipient, for it to enqueue in
+/// its own mailbox (ADR-0008).
+///
+/// The same SSH-invoked verb surface `run_summary_command` and
+/// `run_checkout_prepare_command` use: we ask the owning server to act on its
+/// own state rather than reaching into it. That keeps ADR-0001 intact — the
+/// constraint there is that fleet *gossip* is pull, with no push/broadcast
+/// between servers; a directed, user-initiated verb call is neither, which is
+/// why cross-machine checkout-prepare already works this way.
+///
+/// The recipient's own flock does the queueing, the inbox and the wake, so
+/// there is exactly one delivery implementation no matter which host the
+/// sender was on.
+pub fn send_peer_message(
+    peer: &PeerConfig,
+    to_agent: &str,
+    from_agent: &str,
+    body: &str,
+    correlation_id: &str,
+) -> Result<(), String> {
+    // Ids are server-minted and travel into a remote shell command; refuse
+    // anything that could escape it (same guard shape as checkout-prepare).
+    for (label, value) in [
+        ("agent id", to_agent),
+        ("sender id", from_agent),
+        ("correlation id", correlation_id),
+    ] {
+        if value.is_empty()
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':')
+        {
+            return Err(format!("invalid {label}: {value:?}"));
+        }
+    }
+    // The BODY is caller-supplied and cannot be validated the same way, so it
+    // never reaches the shell as syntax: single-quoted with embedded quotes
+    // neutralised the POSIX way.
+    let quoted_body = format!("'{}'", body.replace('\'', "'\\''"));
+    let remote = format!(
+        "sh -lc 'flk msg send --agent {to_agent} --from-agent {from_agent} \
+         --correlation-id {correlation_id} --json -- {quoted_body}'"
+    );
+    run_peer_ssh(peer, &remote).map(|_| ())
+}
+
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
     let output = crate::process::TracedCommand::new("ssh", "peers")
         .args([

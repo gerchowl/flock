@@ -5,6 +5,9 @@ use crate::api::schema::{
 use crate::app::mailboxes::{EnqueueOutcome, PendingMessage};
 use crate::app::App;
 
+/// Sentinel code meaning "resolved, but not on this host" (ADR-0008).
+const REMOTE_AGENT_SENTINEL: &str = "__remote_agent__";
+
 use super::responses::{encode_error, encode_success};
 
 fn now_ms() -> u64 {
@@ -30,6 +33,11 @@ fn mint_correlation_id() -> String {
 /// process ancestry and is routing/audit metadata only (P3): no code path
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
+    /// Internal marker: `resolve_message_target` found the agent, but on
+    /// another host. Not an error code any caller sees — `handle_msg_send`
+    /// intercepts it and routes.
+    const REMOTE: &'static str = REMOTE_AGENT_SENTINEL;
+
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
@@ -38,6 +46,13 @@ impl App {
 
         let (to_ws_idx, to_pane_id) = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
+            // Resolved to another host: hand the message to the server that
+            // owns the recipient and let ITS mailbox do the rest. One delivery
+            // implementation, wherever the sender was.
+            Err((code, detail)) if code == Self::REMOTE => {
+                let (host, to_agent) = detail.split_once('\u{1f}').unwrap_or((&detail, ""));
+                return self.relay_message_to_host(id, host, to_agent, &body, params);
+            }
             Err((code, message)) => return encode_error(id, code, message),
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -50,6 +65,26 @@ impl App {
         let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
         let from_pane = sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
         let from_repo = sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx));
+        // Provenance is a claim PLUS whatever this server could attest, kept
+        // apart. Locally, ancestry attests an identity. A message relayed from
+        // another host has no local ancestry — that is precisely why it used
+        // to arrive anonymous — so the relay's asserted `from_agent` carries
+        // it instead. Absence of proof must not mean absence of a name.
+        let attested_agent = sender.and_then(|(ws_idx, pane_id)| {
+            let ws = self.state.workspaces.get(ws_idx)?;
+            let terminal = self
+                .state
+                .terminals
+                .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+            Some(terminal.agent_id.to_string())
+        });
+        let from_host = params
+            .from_agent
+            .as_ref()
+            .and_then(|agent| self.locate_agent(agent))
+            .map(|location| location.host)
+            .or_else(|| Some(crate::app::short_host_name()));
+        let from_agent = attested_agent.or_else(|| params.from_agent.clone());
 
         if from_pane.as_deref() == Some(to_pane.as_str()) {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
@@ -77,6 +112,8 @@ impl App {
             correlation_id: correlation_id.clone(),
             body,
             from_pane,
+            from_agent,
+            from_host,
             from_repo,
             to_pane,
             to_repo,
@@ -101,6 +138,7 @@ impl App {
             .map(|meta| {
                 (
                     meta.from_pane.clone(),
+                    meta.from_agent.clone(),
                     meta.enqueued_at_ms,
                     meta.root.clone(),
                 )
@@ -111,29 +149,58 @@ impl App {
                     .map(|message| {
                         (
                             message.from_pane.clone(),
+                            message.from_agent.clone(),
                             message.enqueued_at_ms,
                             message.correlation_id.clone(),
                         )
                     })
             });
-        let Some((original_sender, original_enqueued_ms, root)) = original else {
+        let Some((original_sender, original_agent, original_enqueued_ms, root)) = original else {
             return encode_error(
                 id,
                 "message_not_found",
                 format!("no message with correlation id {}", params.correlation_id),
             );
         };
-        let Some(reply_to_pane) = original_sender else {
-            return encode_error(
-                id,
-                "no_reply_address",
-                "the original message carried no sender pane to reply to",
-            );
+        // Reply address: the fleet-global identity FIRST. A pane id only means
+        // something on the server that minted it, so replying to a message
+        // that crossed a machine boundary has to go through the identity —
+        // that is the whole reason a cross-host reply used to be impossible.
+        let reply_target = match &original_agent {
+            Some(agent) => MessageTarget::Agent {
+                agent: agent.clone(),
+            },
+            None => match &original_sender {
+                Some(pane) => MessageTarget::Pane { pane: pane.clone() },
+                None => {
+                    return encode_error(
+                        id,
+                        "no_reply_address",
+                        "the original message carried no sender to reply to",
+                    )
+                }
+            },
         };
-        let (to_ws_idx, to_pane_id) = match self.resolve_message_target(&MessageTarget::Pane {
-            pane: reply_to_pane.clone(),
-        }) {
+        let (to_ws_idx, to_pane_id) = match self.resolve_message_target(&reply_target) {
             Ok(resolved) => resolved,
+            // The original sender is on another host: relay the reply the same
+            // way the message came.
+            Err((code, detail)) if code == Self::REMOTE => {
+                let (host, to_agent) = detail.split_once('\u{1f}').unwrap_or((&detail, ""));
+                return self.relay_message_to_host(
+                    id,
+                    host,
+                    to_agent,
+                    &body,
+                    MsgSendParams {
+                        from_agent: None,
+                        to: reply_target.clone(),
+                        body: body.clone(),
+                        correlation_id: params.reply_correlation_id.clone(),
+                        in_reply_to: Some(params.correlation_id.clone()),
+                    },
+                );
+            }
             Err((code, message)) => return encode_error(id, code, message),
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -143,6 +210,14 @@ impl App {
         let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
         let from_pane = sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
         let from_repo = sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx));
+        let attested_agent = sender.and_then(|(ws_idx, pane_id)| {
+            let ws = self.state.workspaces.get(ws_idx)?;
+            let terminal = self
+                .state
+                .terminals
+                .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+            Some(terminal.agent_id.to_string())
+        });
         let to_repo = self.workspace_repo_label(to_ws_idx);
 
         let now = now_ms();
@@ -167,6 +242,8 @@ impl App {
             correlation_id: reply_correlation_id.clone(),
             body,
             from_pane,
+            from_agent: attested_agent,
+            from_host: Some(crate::app::short_host_name()),
             from_repo,
             to_pane,
             to_repo,
@@ -262,10 +339,14 @@ impl App {
             });
             messages.push(crate::api::schema::InboxMessage {
                 correlation_id: message.correlation_id.clone(),
+                from_agent: message.from_agent.clone(),
+                from_host: message.from_host.clone(),
                 // `replyable` is computed from the same field `msg.reply`
                 // routes on, so the recipient is never told it can reply when
                 // it cannot — the failure #213 was filed for.
-                replyable: message.from_pane.is_some(),
+                // Replyable when there is ANY routable sender: a local pane, or
+                // a fleet-global identity the directory can still resolve.
+                replyable: message.from_pane.is_some() || message.from_agent.is_some(),
                 from_pane: message.from_pane.clone(),
                 from_repo: message.from_repo.clone(),
                 to_pane: message.to_pane.clone(),
@@ -276,6 +357,82 @@ impl App {
         }
         messages.sort_by_key(|message| message.enqueued_at_ms);
         encode_success(id, ResponseResult::MsgRead { messages })
+    }
+
+    /// Hand a message to the peer that owns the recipient (ADR-0008).
+    ///
+    /// The sender's own identity travels with it: the receiving server has no
+    /// local process ancestry to attest from, so without an asserted
+    /// `from_agent` the message would arrive anonymous and unreplyable —
+    /// exactly the failure that started this.
+    fn relay_message_to_host(
+        &mut self,
+        id: String,
+        host: &str,
+        to_agent: &str,
+        body: &str,
+        params: MsgSendParams,
+    ) -> String {
+        let Some(peer) = self
+            .state
+            .peers
+            .iter()
+            .find(|peer| {
+                peer.name.eq_ignore_ascii_case(host) || peer.ssh_target().eq_ignore_ascii_case(host)
+            })
+            .cloned()
+        else {
+            return encode_error(
+                id,
+                "peer_not_configured",
+                format!(
+                    "agent lives on {host}, which is not in this server's [[peers]] — add it to \
+                     reach that agent"
+                ),
+            );
+        };
+
+        // The sender is whoever asked, attested locally where possible.
+        let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
+        let from_agent = sender
+            .and_then(|(ws_idx, pane_id)| {
+                let ws = self.state.workspaces.get(ws_idx)?;
+                let terminal = self
+                    .state
+                    .terminals
+                    .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+                Some(terminal.agent_id.to_string())
+            })
+            .or_else(|| params.from_agent.clone());
+        let Some(from_agent) = from_agent else {
+            return encode_error(
+                id,
+                "sender_unresolved",
+                "cross-host delivery needs a sender identity: call from inside a pane, or pass \
+                 from_agent",
+            );
+        };
+
+        let correlation_id = params
+            .correlation_id
+            .filter(|explicit| !explicit.trim().is_empty())
+            .unwrap_or_else(mint_correlation_id);
+
+        match crate::peers::send_peer_message(&peer, to_agent, &from_agent, body, &correlation_id) {
+            Ok(()) => encode_success(
+                id,
+                ResponseResult::MsgQueued {
+                    correlation_id,
+                    state: "relayed".into(),
+                    warnings: Vec::new(),
+                },
+            ),
+            Err(err) => encode_error(
+                id,
+                "peer_unreachable",
+                format!("could not reach {host}: {err}"),
+            ),
+        }
     }
 
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
@@ -290,6 +447,8 @@ impl App {
         let event = EventData::MessageQueued {
             correlation_id: correlation_id.clone(),
             from_pane: message.from_pane.clone(),
+            from_agent: message.from_agent.clone(),
+            from_host: message.from_host.clone(),
             from_repo: message.from_repo.clone(),
             to_pane: message.to_pane.clone(),
             to_repo: message.to_repo.clone(),
@@ -369,16 +528,13 @@ impl App {
                     ));
                 };
                 if !location.local {
-                    // Named, not silently dropped: the caller learns the agent
-                    // exists and where, which is strictly more than the old
-                    // "from unknown" dead end.
+                    // Remote: this is not ours to deliver. The caller gets a
+                    // typed signal so `handle_msg_send` can hand it to the
+                    // owning server rather than guessing here — resolution and
+                    // delivery stay separate concerns.
                     return Err((
-                        "agent_not_local",
-                        format!(
-                            "agent {agent} lives on {} (pane {}); cross-host delivery is not \
-                             wired yet",
-                            location.host, location.pane_id
-                        ),
+                        REMOTE_AGENT_SENTINEL,
+                        format!("{}\u{1f}{}", location.host, location.agent_id),
                     ));
                 }
                 match self.resolve_terminal_target(&location.pane_id) {
@@ -504,6 +660,7 @@ mod tests {
         send(
             app,
             MsgSendParams {
+                from_agent: None,
                 to: MessageTarget::Pane { pane: to },
                 body: body.into(),
                 correlation_id: Some(correlation.into()),
@@ -557,6 +714,7 @@ mod tests {
         let response = send(
             &mut app,
             MsgSendParams {
+                from_agent: None,
                 to: MessageTarget::Pane {
                     pane: "w9:p9".into(),
                 },
@@ -571,6 +729,7 @@ mod tests {
         let response = send(
             &mut app,
             MsgSendParams {
+                from_agent: None,
                 to: MessageTarget::Pane {
                     pane: "no-such".into(),
                 },
@@ -585,6 +744,7 @@ mod tests {
         let response = send(
             &mut app,
             MsgSendParams {
+                from_agent: None,
                 to: MessageTarget::RepoPane {
                     repo: "ghost-repo".into(),
                     pane: "p1".into(),
@@ -639,6 +799,131 @@ mod tests {
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "no_reply_address");
+    }
+
+    #[tokio::test]
+    async fn a_remote_agent_is_relayed_not_refused() {
+        // ADR-0008 end state: addressing an agent that lives on another host
+        // is a ROUTING decision, not a failure. Without a peer entry for that
+        // host we cannot reach it — but the refusal names the host, which is
+        // already more than the "from unknown" dead end this started as.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.peer_summaries = vec![{
+            let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+                name: "anvil".into(),
+                ..Default::default()
+            });
+            peer.host = Some("anvil-dev".into());
+            peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+                id: "w1".into(),
+                workspace: "remote".into(),
+                project_key: None,
+                project_label: None,
+                branch: None,
+                is_linked_worktree: false,
+                agent: Some("cc".into()),
+                status: crate::api::schema::AgentStatus::Idle,
+                status_age_secs: None,
+                activity: None,
+                agents: vec![crate::api::schema::PeerAgentSummary {
+                    agent_id: "agent_anvil-dev_beef".into(),
+                    pane_id: "w1:p1".into(),
+                    agent: Some("cc".into()),
+                    status: crate::api::schema::AgentStatus::Idle,
+                }],
+            }];
+            peer
+        }];
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: None,
+                to: MessageTarget::Agent {
+                    agent: "agent_anvil-dev_beef".into(),
+                },
+                body: "cross-host".into(),
+                correlation_id: Some("c-remote".into()),
+                in_reply_to: None,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        // Routed, then blocked on reachability — never "unknown agent".
+        assert_eq!(error.error.code, "peer_not_configured");
+        assert!(
+            error.error.message.contains("anvil-dev"),
+            "the refusal must name where the agent is: {}",
+            error.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_exists_nowhere_is_a_clean_miss() {
+        // Routing to the wrong agent is worse than refusing, so an unknown
+        // identity must not fall back to any pane.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: None,
+                to: MessageTarget::Agent {
+                    agent: "agent_nowhere_0".into(),
+                },
+                body: "hello".into(),
+                correlation_id: None,
+                in_reply_to: None,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "msg_target_not_found");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_message_keeps_its_senders_identity_and_stays_replyable() {
+        // The failure that started all of this: a message from another host
+        // arrived with no sender and a reply command that could not work.
+        // A relay asserts `from_agent`, so the recipient reads a named sender
+        // and `replyable` is true.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to_pane = app
+            .state
+            .workspaces
+            .get(1)
+            .and_then(|ws| ws.focused_pane_id())
+            .and_then(|pane_id| app.public_pane_id(1, pane_id))
+            .expect("recipient pane");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                // No local ancestry attests this — it came off the wire.
+                from_agent: Some("agent_mba22_cafe".into()),
+                to: MessageTarget::Pane {
+                    pane: to_pane.clone(),
+                },
+                body: "from another machine".into(),
+                correlation_id: Some("c-relayed".into()),
+                in_reply_to: None,
+            }),
+        });
+        assert!(!response.contains("\"error\""), "{response}");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(to_pane),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgRead { messages } = success.result else {
+            panic!("expected msg_read: {response}");
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent.as_deref(), Some("agent_mba22_cafe"));
+        assert!(
+            messages[0].replyable,
+            "a named sender must be replyable even with no local pane"
+        );
     }
 
     #[tokio::test]

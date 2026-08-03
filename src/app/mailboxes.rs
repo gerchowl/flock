@@ -31,6 +31,12 @@ pub(crate) struct PendingMessage {
     pub correlation_id: String,
     pub body: String,
     pub from_pane: Option<String>,
+    /// Sender's fleet-global identity. Unlike `from_pane` this survives a
+    /// restart, a pane move, and the trip across a machine boundary — it is
+    /// what makes a cross-host reply addressable.
+    pub from_agent: Option<String>,
+    /// Host the sender was on when it sent.
+    pub from_host: Option<String>,
     pub from_repo: Option<String>,
     pub to_pane: String,
     pub to_repo: Option<String>,
@@ -42,6 +48,9 @@ pub(crate) struct PendingMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveredMeta {
     pub from_pane: Option<String>,
+    /// Fleet-global sender, so a reply can be routed after the original has
+    /// left the queue.
+    pub from_agent: Option<String>,
     pub enqueued_at_ms: u64,
     /// Correlation id of the thread root (self for a fresh message).
     pub root: String,
@@ -81,6 +90,8 @@ impl MailboxRegistry {
                     in_reply_to,
                     enqueued_at_ms,
                     body,
+                    from_agent,
+                    from_host,
                     ..
                 } => {
                     self.mark_seen(correlation_id.clone());
@@ -90,6 +101,8 @@ impl MailboxRegistry {
                             correlation_id: correlation_id.clone(),
                             body: body.clone(),
                             from_pane: from_pane.clone(),
+                            from_agent: from_agent.clone(),
+                            from_host: from_host.clone(),
                             from_repo: from_repo.clone(),
                             to_pane: to_pane.clone(),
                             to_repo: to_repo.clone(),
@@ -112,6 +125,7 @@ impl MailboxRegistry {
                             correlation_id.clone(),
                             DeliveredMeta {
                                 from_pane: message.from_pane.clone(),
+                                from_agent: message.from_agent.clone(),
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
                                 round_trips: 0,
@@ -210,6 +224,7 @@ impl MailboxRegistry {
         self.history.insert(
             message.correlation_id.clone(),
             DeliveredMeta {
+                from_agent: message.from_agent.clone(),
                 from_pane: message.from_pane.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,
@@ -299,6 +314,8 @@ mod tests {
 
     fn message(correlation: &str, to: &str) -> PendingMessage {
         PendingMessage {
+            from_agent: None,
+            from_host: None,
             correlation_id: correlation.into(),
             body: "hello".into(),
             from_pane: Some("w1:p1".into()),
@@ -315,6 +332,8 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                from_agent: None,
+                from_host: None,
                 correlation_id: message.correlation_id.clone(),
                 from_pane: message.from_pane.clone(),
                 from_repo: message.from_repo.clone(),

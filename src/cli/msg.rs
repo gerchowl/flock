@@ -36,11 +36,13 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn msg_send(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str =
-        "usage: flk msg send <target> <text...> [--repo NAME] [--correlation-id ID] [--reply-to ID]";
+    const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
+         [--correlation-id ID] [--reply-to ID] [--from-agent ID]";
     let mut repo = None;
     let mut correlation_id = None;
     let mut in_reply_to = None;
+    let mut agent = None;
+    let mut from_agent = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -62,6 +64,31 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
                 correlation_id = Some(value.clone());
                 index += 2;
             }
+            // ADR-0008 addressing: `--agent` targets a fleet-global identity
+            // rather than a pane, and `--from-agent` carries the sender's when
+            // a peer relays on its behalf (the receiving server has no local
+            // ancestry to attest from).
+            "--agent" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent");
+                    return Ok(2);
+                };
+                agent = Some(value.clone());
+                index += 2;
+            }
+            "--from-agent" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --from-agent");
+                    return Ok(2);
+                };
+                from_agent = Some(value.clone());
+                index += 2;
+            }
+            "--json" => index += 1,
+            "--" => {
+                positional.extend(args[index + 1..].iter().cloned());
+                break;
+            }
             "--reply-to" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --reply-to");
@@ -76,20 +103,30 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    if positional.len() < 2 {
-        eprintln!("{USAGE}");
-        return Ok(2);
-    }
-    let target = positional[0].clone();
-    let body = positional[1..].join(" ");
-
-    let to = match repo {
-        Some(repo) => MessageTarget::RepoPane { repo, pane: target },
-        None => resolve_shorthand(target)?,
+    // With --agent the identity IS the target, so only the body is positional.
+    let (to, body) = if let Some(agent) = agent {
+        if positional.is_empty() {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+        (MessageTarget::Agent { agent }, positional.join(" "))
+    } else {
+        if positional.len() < 2 {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+        let target = positional[0].clone();
+        let body = positional[1..].join(" ");
+        let to = match repo {
+            Some(repo) => MessageTarget::RepoPane { repo, pane: target },
+            None => resolve_shorthand(target)?,
+        };
+        (to, body)
     };
     super::print_response(&super::send_request(&Request {
         id: "cli:msg:send".into(),
         method: Method::MsgSend(MsgSendParams {
+            from_agent,
             to,
             body,
             correlation_id,

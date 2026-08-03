@@ -133,6 +133,8 @@ impl Accountant {
                     self.last_status.insert(pane_id.clone(), *agent_status);
                 }
                 EventData::MessageQueued {
+                    from_agent: None,
+                    from_host: None,
                     from_pane,
                     from_repo,
                     to_pane,
@@ -264,6 +266,8 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                from_agent: None,
+                from_host: None,
                 correlation_id: cid.into(),
                 from_pane: from_pane.map(str::to_string),
                 from_repo: from_repo.map(str::to_string),
