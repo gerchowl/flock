@@ -27,6 +27,7 @@
 - `flk --default-config` now points at the published configuration reference instead of `docs/config-reference.md`, a path that was never written.
 - The keybinding help now lists `toggle_collapse_all`, `toggle_prompt_expand` and `focus_attention_project_previous`, which were bindable and dispatched but undocumented.
 - Keyboard-driven pane splits and closes, tab closes and renames, and workspace closes and renames now reach the durable event log and `events.subscribe`. Only socket-driven mutations were announced, so anything replaying the log per ADR-0005 reconstructed the wrong pane tree whenever the operator used the keyboard. Workspace closes now announce exactly once from either door. (#175)
+- Renaming a workspace or tab now trims the name whichever way you do it, and a blank name restores the derived name instead of storing an invisible label. `workspace.rename` and `tab.rename` passed the label through raw while the rename dialog trimmed it.
 - Creating a worktree in a repo with no commits now says so, instead of passing git's `fatal: invalid reference: HEAD` through as if flock had failed. (#198)
 - Resizing restored panes no longer aborts the server when libghostty-vt reflows a terminal whose pre-resize cursor row is past the new height. (#465)
 - Linux clipboard image reads now validate image payloads before accepting them, preventing malformed clipboard data from reaching pane image paste flows. (#18)
