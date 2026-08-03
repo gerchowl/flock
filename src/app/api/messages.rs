@@ -96,7 +96,32 @@ impl App {
                 .as_ref()
                 .map(|_| crate::app::short_host_name())
         });
-        let from_agent = attested_agent.or_else(|| params.from_agent.clone());
+        let from_agent = attested_agent.clone().or_else(|| params.from_agent.clone());
+
+        // Allow policy (ADR-0008), enforced HERE because the receiver is the
+        // only party that cannot be bypassed — a sender-side check is advice,
+        // and once the hub forwards for spokes, reachability is no longer
+        // gated by which SSH keys happen to exist. A locally-attested sender
+        // has no remote party to gate, so it is always accepted.
+        let origin_host = if attested_agent.is_some() {
+            None
+        } else {
+            params.from_host.as_deref()
+        };
+        if !self.state.config.msg.accepts_from(origin_host) {
+            return encode_error(
+                id,
+                "msg_not_allowed",
+                match origin_host {
+                    Some(host) => format!(
+                        "this node does not accept agent messages from {host} \
+                         (see [msg] allow_from)"
+                    ),
+                    None => "this node does not accept agent messages ([msg] enabled = false)"
+                        .to_string(),
+                },
+            );
+        }
 
         if from_pane.as_deref() == Some(to_pane.as_str()) {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
@@ -909,6 +934,50 @@ mod tests {
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "msg_target_not_found");
+    }
+
+    #[tokio::test]
+    async fn a_disallowed_origin_host_is_refused_at_the_receiver() {
+        // The policy has to bite on the RECEIVING side: a sender-side check is
+        // advice, and once the hub forwards for spokes, "can reach" stops
+        // being decided by which SSH keys exist.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.allow_from = vec!["mba22".into()];
+        let to_pane = app
+            .state
+            .workspaces
+            .get(1)
+            .and_then(|ws| ws.focused_pane_id())
+            .and_then(|pane_id| app.public_pane_id(1, pane_id))
+            .expect("recipient pane");
+
+        let send = |app: &mut crate::app::App, host: &str, cid: &str| {
+            app.handle_api_request(Request {
+                id: "req".into(),
+                method: Method::MsgSend(MsgSendParams {
+                    from_agent: Some("agent_elsewhere_1".into()),
+                    from_host: Some(host.into()),
+                    to: MessageTarget::Pane {
+                        pane: to_pane.clone(),
+                    },
+                    body: "knock knock".into(),
+                    correlation_id: Some(cid.into()),
+                    in_reply_to: None,
+                }),
+            })
+        };
+
+        let refused = send(&mut app, "anvil", "c-blocked");
+        let error: ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(error.error.code, "msg_not_allowed");
+        assert!(
+            error.error.message.contains("anvil"),
+            "{}",
+            error.error.message
+        );
+
+        let allowed = send(&mut app, "mba22", "c-allowed");
+        assert!(!allowed.contains("\"error\""), "{allowed}");
     }
 
     #[tokio::test]
