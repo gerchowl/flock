@@ -796,11 +796,28 @@ pub(crate) struct PeerCheckoutState {
     pub error: Option<String>,
 }
 
+/// The parent side of a branch-session fork, captured when the dialog opens.
+///
+/// `agent.fork` has this to hand; the keyboard flow completes asynchronously
+/// (the dialog closes, `git worktree add` runs on a thread) and by then the
+/// focused pane may have moved. Capturing it up front lets the keyboard emit
+/// the same lineage edge the API does (#175 O2) instead of none at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkParent {
+    /// Public pane id of the session being forked.
+    pub pane_id: String,
+    /// Public workspace id that pane lives in.
+    pub workspace_id: String,
+    pub agent: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     /// When set, the created workspace's root pane resumes a fork of this
     /// agent session instead of starting a shell (branch-session flow).
     pub branch_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// Set alongside `branch_plan`: who is being forked, for the lineage edge.
+    pub branch_parent: Option<ForkParent>,
     pub source_workspace_id: String,
     pub source_checkout_path: std::path::PathBuf,
     pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
