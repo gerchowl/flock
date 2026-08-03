@@ -329,6 +329,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorktreeCreate(_) => "worktree.create",
         Method::WorktreeOpen(_) => "worktree.open",
         Method::WorktreeRemove(_) => "worktree.remove",
+        Method::WorktreeKill(_) => "worktree.kill",
         Method::TabCreate(_) => "tab.create",
         Method::TabList(_) => "tab.list",
         Method::TabGet(_) => "tab.get",

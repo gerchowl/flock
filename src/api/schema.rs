@@ -42,6 +42,8 @@ pub enum Method {
     WorktreeOpen(WorktreeOpenParams),
     #[serde(rename = "worktree.remove")]
     WorktreeRemove(WorktreeRemoveParams),
+    #[serde(rename = "worktree.kill")]
+    WorktreeKill(WorktreeKillParams),
     #[serde(rename = "tab.create")]
     TabCreate(TabCreateParams),
     #[serde(rename = "tab.list")]
@@ -372,6 +374,29 @@ pub struct WorktreeRemoveParams {
     pub workspace_id: String,
     #[serde(default)]
     pub force: bool,
+}
+
+/// `worktree.kill` — remove a linked worktree's checkout AND, only on positive
+/// merge evidence, delete its local branch.
+///
+/// The merge gate lives here rather than in the CLI so every caller gets it:
+/// `flk worktree kill` used to run the gate client-side and delete the branch
+/// itself, which meant an agent over the socket or MCP got the destructive half
+/// with none of the evidence requirement and none of the protected-branch tiers
+/// (#121).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeKillParams {
+    pub workspace_id: String,
+    /// Remove the checkout even when it has uncommitted or untracked changes.
+    /// Never widens the BRANCH decision — an unmerged branch survives `force`.
+    #[serde(default)]
+    pub force: bool,
+    /// Keep the local branch even when the merge gate passes.
+    #[serde(default)]
+    pub keep_branch: bool,
+    /// Resolve and report the plan without touching anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1236,6 +1261,27 @@ pub enum ResponseResult {
         workspace_id: String,
         path: String,
         forced: bool,
+    },
+    WorktreeKilled {
+        workspace_id: String,
+        checkout_path: String,
+        branch: Option<String>,
+        /// Whether the branch's work is recorded elsewhere. The ONLY thing that
+        /// permits a branch deletion.
+        merged: bool,
+        /// What proved it, when merged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+        /// Refused because the branch is the repo default or config-protected
+        /// (#121), independent of merge state.
+        protected: bool,
+        /// False for a dry run.
+        removed: bool,
+        branch_deleted: bool,
+        /// What the same call would do for real — the dry-run answer.
+        would_delete_branch: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_delete_error: Option<String>,
     },
     TabInfo {
         tab: TabInfo,

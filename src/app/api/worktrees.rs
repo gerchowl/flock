@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
     AgentForkParams, EventData, EventEnvelope, EventKind, ResponseResult, WorktreeCreateParams,
-    WorktreeInfo, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams, WorktreeSourceInfo,
+    WorktreeInfo, WorktreeKillParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    WorktreeSourceInfo,
 };
 use crate::app::App;
 
@@ -633,22 +634,47 @@ impl App {
             );
         }
 
+        let workspace_id = match self.remove_worktree_checkout(ws_idx, &space, params.force) {
+            Ok(workspace_id) => workspace_id,
+            Err(failure) => return encode_error(id, failure.code, failure.message),
+        };
+
+        encode_success(
+            id,
+            ResponseResult::WorktreeRemoved {
+                workspace_id,
+                path: space.checkout_path.display().to_string(),
+                forced: params.force,
+            },
+        )
+    }
+
+    /// The checkout removal itself: `git worktree remove`, then close the
+    /// workspace if it still stands for that checkout. Shared by
+    /// `worktree.remove` and the gated `worktree.kill` so the dirty-vs-force
+    /// rule and the workspace teardown cannot drift apart. Returns the public
+    /// workspace id.
+    fn remove_worktree_checkout(
+        &mut self,
+        ws_idx: usize,
+        space: &crate::workspace::WorktreeSpaceMembership,
+        force: bool,
+    ) -> Result<String, ApiFailure> {
         let command = crate::worktree::build_worktree_remove_command(
             &space.repo_root,
             &space.checkout_path,
-            params.force,
+            force,
         );
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
-            let code = if !params.force && crate::worktree::is_dirty_worktree_remove_error(&err) {
+            let code = if !force && crate::worktree::is_dirty_worktree_remove_error(&err) {
                 "dirty_worktree_requires_force"
             } else {
                 "worktree_remove_failed"
             };
-            return encode_error(id, code, err);
+            return Err(ApiFailure::new(code, err));
         }
 
         let workspace_id = self.public_workspace_id(ws_idx);
-        let path = space.checkout_path.display().to_string();
         let still_same_linked_worktree = {
             let ws = &self.state.workspaces[ws_idx];
             ws.worktree_space_here().is_some_and(|current| {
@@ -666,13 +692,120 @@ impl App {
                 },
             });
         }
+        Ok(workspace_id)
+    }
+
+    /// `worktree.kill`: remove the checkout AND delete the local branch, but
+    /// only on positive merge evidence.
+    ///
+    /// The gate lives here, not in the CLI. `flk worktree kill` used to read
+    /// the workspace's reported worktree, run `branch_merge_gate` client-side,
+    /// call `worktree.remove`, and then delete the branch itself — so a caller
+    /// reaching the socket or MCP directly got the destructive half with none
+    /// of the evidence requirement and none of the #121 protected-branch tiers.
+    /// Now every caller crosses the same gate and the CLI is transport.
+    pub(super) fn handle_worktree_kill(
+        &mut self,
+        id: String,
+        params: WorktreeKillParams,
+    ) -> String {
+        let Some(ws_idx) = self.parse_workspace_id(&params.workspace_id) else {
+            return encode_error(
+                id,
+                "workspace_not_found",
+                format!("workspace {} not found", params.workspace_id),
+            );
+        };
+        // #197: the action view, as for every other worktree mutation.
+        let Some(space) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.worktree_space_here().cloned())
+            .filter(|space| space.is_linked_worktree)
+        else {
+            return encode_error(
+                id,
+                "not_linked_worktree",
+                "workspace is not a linked worktree checkout",
+            );
+        };
+
+        let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
+        let (merged, evidence) = match branch.as_deref() {
+            // A detached checkout has no branch to judge or delete.
+            None => (false, None),
+            Some(branch) => match crate::worktree::branch_merge_gate(
+                &space.repo_root,
+                &space.checkout_path,
+                branch,
+            ) {
+                crate::worktree::WorktreeMergeGate::Merged { evidence } => (true, Some(evidence)),
+                crate::worktree::WorktreeMergeGate::NotMerged => (false, None),
+            },
+        };
+        // #121: default and config-protected branches are never auto-deleted,
+        // however good the merge evidence is. The CLI never consulted these
+        // tiers — it relied on `delete_local_branch`'s main/master floor, so a
+        // repo whose default is `develop` had only that floor.
+        let protected = branch.as_deref().is_some_and(|branch| {
+            let default = crate::worktree::detect_default_branch(&space.repo_root);
+            crate::worktree::is_protected_branch(
+                branch,
+                default.as_deref(),
+                &self.state.config.worktrees.protected_branches,
+            )
+        });
+        let would_delete_branch = merged && !params.keep_branch && !protected;
+
+        let checkout_path = space.checkout_path.display().to_string();
+        if params.dry_run {
+            return encode_success(
+                id,
+                ResponseResult::WorktreeKilled {
+                    workspace_id: self.public_workspace_id(ws_idx),
+                    checkout_path,
+                    branch,
+                    merged,
+                    evidence,
+                    protected,
+                    removed: false,
+                    branch_deleted: false,
+                    would_delete_branch,
+                    branch_delete_error: None,
+                },
+            );
+        }
+
+        let workspace_id = match self.remove_worktree_checkout(ws_idx, &space, params.force) {
+            Ok(workspace_id) => workspace_id,
+            Err(failure) => return encode_error(id, failure.code, failure.message),
+        };
+
+        let mut branch_deleted = false;
+        let mut branch_delete_error = None;
+        if would_delete_branch {
+            if let Some(branch) = branch.as_deref() {
+                match crate::worktree::delete_local_branch(&space.repo_root, branch) {
+                    Ok(()) => branch_deleted = true,
+                    Err(err) => branch_delete_error = Some(err),
+                }
+            }
+        }
 
         encode_success(
             id,
-            ResponseResult::WorktreeRemoved {
+            ResponseResult::WorktreeKilled {
                 workspace_id,
-                path,
-                forced: params.force,
+                checkout_path,
+                branch,
+                merged,
+                evidence,
+                protected,
+                removed: true,
+                branch_deleted,
+                would_delete_branch,
+                branch_delete_error,
             },
         )
     }
@@ -1198,6 +1331,40 @@ mod tests {
             repo.display(),
             args.join(" ")
         );
+    }
+
+    /// Attach a workspace to an existing linked checkout and return its public
+    /// id — the shape every `worktree.kill` caller starts from.
+    fn push_worktree_workspace(app: &mut App, repo: &Path, checkout: &Path) -> String {
+        let mut ws = Workspace::test_new("child");
+        ws.identity_cwd = checkout.to_path_buf();
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(repo).unwrap().key,
+            label: "kill-test".into(),
+            repo_root: repo.to_path_buf(),
+            checkout_path: checkout.to_path_buf(),
+            is_linked_worktree: true,
+        });
+        ws.cached_git_space = crate::workspace::git_space_metadata(checkout);
+        let id = ws.id.clone();
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        id
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 
     fn create_committed_repo(name: &str) -> PathBuf {
@@ -1896,6 +2063,202 @@ mod tests {
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&owner);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// The gate is the point: a merged branch is deletable, an unmerged one is
+    /// not, and `force` does not widen that — it only covers a dirty checkout.
+    /// This used to live in `flk worktree kill`, so a socket or MCP caller got
+    /// the destructive half with no evidence requirement at all.
+    #[tokio::test]
+    async fn api_worktree_kill_deletes_only_a_merged_branch() {
+        let repo = create_committed_repo("api-kill-gate-repo");
+
+        // An UNMERGED branch: the checkout goes, the branch survives.
+        let unmerged = unique_temp_path("api-kill-unmerged");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/unmerged",
+                unmerged.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(unmerged.join("work.txt"), "unmerged work\n").unwrap();
+        run_git(&unmerged, &["add", "work.txt"]);
+        run_git(&unmerged, &["commit", "--quiet", "-m", "unmerged work"]);
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &unmerged);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: true,
+                keep_branch: false,
+                dry_run: false,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            merged,
+            branch_deleted,
+            removed,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(!merged);
+        assert!(removed, "the checkout still goes");
+        assert!(!branch_deleted, "force must not widen the branch decision");
+        assert!(branch_exists(&repo, "feature/unmerged"));
+
+        // A MERGED branch: evidence present, branch deleted.
+        let merged_path = unique_temp_path("api-kill-merged");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/merged",
+                merged_path.to_str().unwrap(),
+            ],
+        );
+        let ws_id = push_worktree_workspace(&mut app, &repo, &merged_path);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: false,
+                dry_run: false,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            merged,
+            branch_deleted,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(merged, "a branch at the base commit is merged");
+        assert!(branch_deleted);
+        assert!(!branch_exists(&repo, "feature/merged"));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A dry run resolves the same plan and touches nothing.
+    #[tokio::test]
+    async fn api_worktree_kill_dry_run_reports_without_mutating() {
+        let repo = create_committed_repo("api-kill-dry-repo");
+        let checkout = unique_temp_path("api-kill-dry-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/dry",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: false,
+                dry_run: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            removed,
+            would_delete_branch,
+            branch_deleted,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(!removed);
+        assert!(!branch_deleted);
+        assert!(would_delete_branch, "merged branch: the real run would");
+        assert!(checkout.exists(), "dry run must not remove the checkout");
+        assert!(branch_exists(&repo, "feature/dry"));
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// #121 tier 2: the repo's default branch is never auto-deleted, however
+    /// good the merge evidence. The CLI never consulted this — it relied on
+    /// `delete_local_branch`'s main/master floor, so a repo whose default is
+    /// `develop` had only that floor between it and deletion.
+    #[tokio::test]
+    async fn api_worktree_kill_refuses_to_delete_the_default_branch() {
+        let repo = create_committed_repo("api-kill-default-repo");
+        run_git(&repo, &["branch", "develop"]);
+        // Point origin/HEAD at develop, which is how `detect_default_branch`
+        // learns a repo's default. `develop` is not main/master, so only the
+        // tier-2 check can save it — exactly what the CLI never consulted.
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop",
+            ],
+        );
+        let checkout = unique_temp_path("api-kill-default-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                checkout.to_str().unwrap(),
+                "develop",
+            ],
+        );
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: true,
+                keep_branch: false,
+                dry_run: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            protected,
+            would_delete_branch,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(protected, "develop is this repo's default branch");
+        assert!(!would_delete_branch);
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
