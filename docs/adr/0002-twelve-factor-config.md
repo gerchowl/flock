@@ -8,6 +8,12 @@
 - Decision owner: human; advised by parallel review of the settings-pane
   write-path thread and the config subsystem code paths (config/io.rs,
   app/config_io.rs, web/mod.rs, main.rs::DEFAULT_CONFIG).
+- Amendment (2026-08-03): the field prose named below as
+  `docs/config-reference.md` was never written under that path — it lives on
+  the website (`website/src/content/docs/configuration.mdx`, published at
+  <https://flock.dev/configuration>). The decision stands; only the location
+  differs. `flk --default-config` pointed readers at the file that does not
+  exist until this was corrected. The rest of this ADR is left as decided.
 
 ## Context
 

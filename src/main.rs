@@ -87,13 +87,13 @@ fn init_logging() {
 /// `flk --default-config` output: the machine-true serde defaults, derived —
 /// never hand-maintained (it drifted whenever a field landed in `Config`
 /// without an edit here; round-trip-tested in `default_config_output_parses_
-/// back_to_default_config`). The annotated prose lives in
-/// docs/config-reference.md.
+/// back_to_default_config`). The annotated prose lives on the website
+/// (`website/src/content/docs/configuration.mdx`).
 fn default_config_toml() -> String {
     let body =
         toml::to_string_pretty(&config::Config::default()).expect("Config::default serializes");
     format!(
-        "# flock configuration — annotated reference: docs/config-reference.md\n\
+        "# flock configuration — annotated reference: https://flock.dev/configuration\n\
          # File: ~/.config/flock/config.toml (or $FLOCK_CONFIG_PATH). Read-only\n\
          # bases (nix/HM symlinks) take edits in config.local.toml (deep-merged,\n\
          # overlay wins). Values below are the built-in defaults.\n\n{body}"

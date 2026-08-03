@@ -1,4 +1,4 @@
-# ADR 0005 — Peer I/O isolation: no blocking syscall or Drop on the client render loop
+# ADR 0007 — Peer I/O isolation: no blocking syscall or Drop on the client render loop
 
 - Status: Accepted
 - Date: 2026-08-01
