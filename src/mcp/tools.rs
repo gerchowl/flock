@@ -363,6 +363,7 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
     let to: MessageTarget = serde_json::from_value(to_value)
         .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
     Ok(Method::MsgSend(MsgSendParams {
+        from_agent: None,
         to,
         body: required_string(&args, "body")?,
         correlation_id: optional_string(&args, "correlation_id")?,

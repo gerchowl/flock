@@ -562,6 +562,16 @@ pub struct MsgSendParams {
     /// Correlation id of a prior message this one answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    /// Sender's fleet-global identity, ASSERTED by the caller.
+    ///
+    /// Deliberately separate from what the server can verify. Local sends are
+    /// attested from process ancestry; a message relayed from another host has
+    /// no local ancestry to read, which is exactly why it used to arrive with
+    /// no sender at all. Carrying the claim means an unattested sender is
+    /// still a *named* one — and per #175 P3, identity is routing and audit,
+    /// never authorization, so a claim is all this ever needs to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,
@@ -620,6 +630,13 @@ pub struct QueuedMessageInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxMessage {
     pub correlation_id: String,
+    /// Sender's fleet-global identity, when known. Survives across hosts,
+    /// unlike `from_pane`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
+    /// Host the sender was on. Routing context for the reader, not identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_host: Option<String>,
     /// Sender's pane, when the server could resolve one. `None` means the
     /// sender was not attributable — the message is still readable, and the
     /// recipient can see it has no reply address rather than being handed a
@@ -1786,6 +1803,13 @@ pub enum EventData {
         correlation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_pane: Option<String>,
+        /// Fleet-global sender. The durable log doubles as the mailbox's
+        /// restart source, so without this a restart would drop the only
+        /// sender that survives a machine boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_host: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_repo: Option<String>,
         to_pane: String,
