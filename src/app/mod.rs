@@ -1423,6 +1423,9 @@ impl App {
         // keep their in-flight lock (matches the overlap guard's intent).
         self.peer_poll_tracker
             .retain_only(config.peers.iter().map(|p| p.name.as_str()));
+        // Same intent one layer down: a held ssh connection outlives a reload,
+        // but not one whose peer is gone or whose ssh target moved.
+        crate::peer_stream::retain_configured(&config.peers);
 
         if !invalid_section("keys") {
             match config.live_keybinds() {

@@ -50,6 +50,7 @@ mod layout;
 mod logging;
 mod mcp;
 mod pane;
+mod peer_stream;
 mod peers;
 mod persist;
 mod platform;
