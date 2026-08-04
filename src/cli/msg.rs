@@ -24,6 +24,7 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
         "reply" => msg_reply(&args[1..]),
         "list" => msg_list(&args[1..]),
         "read" => msg_read(&args[1..]),
+        "status" => msg_status(&args[1..]),
         "help" | "--help" | "-h" => {
             print_msg_help();
             Ok(0)
@@ -254,6 +255,24 @@ fn msg_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// `flk msg status` — the sender's view.
+///
+/// `msg list` answers "what is waiting for me"; nothing answered "what
+/// happened to what I sent". A cross-host send was the worst case: it left no
+/// local record at all, so the trail went cold at the correlation id.
+fn msg_status(args: &[String]) -> std::io::Result<i32> {
+    let Some(correlation_id) = args.first().filter(|arg| !arg.starts_with("--")) else {
+        eprintln!("usage: flk msg status <correlation_id>");
+        return Ok(2);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:msg:status".into(),
+        method: Method::MsgStatus(crate::api::schema::MsgStatusParams {
+            correlation_id: correlation_id.clone(),
+        }),
+    })?)
+}
+
 fn print_msg_help() {
     eprintln!("flk msg commands:");
     eprintln!(
@@ -262,6 +281,7 @@ fn print_msg_help() {
     eprintln!("  flk msg reply <correlation_id> <text...>");
     eprintln!("  flk msg list [--pane TARGET]");
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
+    eprintln!("  flk msg status <correlation_id>  what became of a message you sent");
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
     eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
 }
