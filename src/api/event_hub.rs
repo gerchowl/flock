@@ -132,6 +132,34 @@ fn truncate_torn_tail(path: &Path) {
 /// mid-write). A parse failure anywhere *before* the tail is a gap — the
 /// whole file is rejected so a silent hole never masquerades as history
 /// (#175 §8.2 "no gaps").
+/// Highest sequence still readable in a file we are about to quarantine.
+///
+/// Deliberately lenient where [`read_log_file`] is strict: that one refuses a
+/// file with any unparseable interior line, because a partial replay is worse
+/// than none. Here the file is already being set aside — the only question is
+/// which numbers it consumed, and every line that still parses answers it. A
+/// file too damaged to yield any seq returns 0 and the caller falls back to
+/// the rotated high-water mark.
+fn highest_seq_best_effort(path: &Path) -> u64 {
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut highest = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Ok(event) = serde_json::from_str::<PersistedEvent>(line.trim_end()) {
+            highest = highest.max(event.seq);
+        }
+    }
+    highest
+}
+
 fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -197,6 +225,7 @@ impl EventHub {
                     Err(err) => crate::logging::event_log_corrupt(&err),
                 }
             }
+            let mut highest_quarantined_seq = 0;
             match read_log_file(&path) {
                 Ok(events) => restored.extend(events),
                 Err(err) => {
@@ -204,6 +233,15 @@ impl EventHub {
                     // swallow every future event on the next load. Quarantine
                     // it aside (rename, never delete — P4) and start fresh.
                     crate::logging::event_log_corrupt(&err);
+                    // Its sequences are still SPENT. `next_sequence` below is
+                    // derived from what parsed, so without this the numbers
+                    // that lived in the quarantined file get handed out a
+                    // second time — and #175 O1's "monotonic across restarts"
+                    // silently stops holding. Nothing depends on it locally
+                    // today (restore reads from 0), but any offset-based
+                    // consumer would then skip or replay a whole range with no
+                    // way to notice. Salvage the high-water mark first.
+                    highest_quarantined_seq = highest_seq_best_effort(&path);
                     let mut name = path
                         .file_stem()
                         .and_then(|stem| stem.to_str())
@@ -215,7 +253,11 @@ impl EventHub {
             }
             truncate_torn_tail(&path);
             restored.sort_by_key(|event| event.seq);
-            state.next_sequence = restored.last().map(|event| event.seq).unwrap_or(0);
+            state.next_sequence = restored
+                .last()
+                .map(|event| event.seq)
+                .unwrap_or(0)
+                .max(highest_quarantined_seq);
             state.events = restored
                 .iter()
                 .rev()
@@ -460,6 +502,75 @@ mod tests {
         // The fresh active file accepts and serves new events.
         restarted.push(workspace_event("after-quarantine"));
         assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn quarantining_a_corrupt_active_file_never_re_uses_its_sequences() {
+        // #175 O1: sequences are monotonic ACROSS RESTARTS. The quarantine
+        // path is the one place that can falsify it — the corrupt file's
+        // events never land in `restored`, so a naive high-water mark is
+        // computed as if they had never existed and the next push hands out
+        // a number that is already spent. Nothing local reads by offset yet,
+        // so this regression is silent: it surfaces only once a consumer
+        // resumes from a cursor and skips or replays a whole range.
+        let path = temp_log("seq-reuse");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        hub.push(workspace_event("w2"));
+        hub.push(workspace_event("w3"));
+        let spent = hub
+            .persisted_events_after(0)
+            .last()
+            .map(|(seq, _, _)| *seq)
+            .expect("three events persisted");
+        drop(hub);
+
+        // Corrupt the FIRST line: the later ones stay parseable, so their
+        // sequences are recoverable even though the file is rejected whole.
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, original.replacen("\"seq\":1", "\"seq\":garbage", 1)).unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert_eq!(
+            restarted.persisted_events_after(0).len(),
+            0,
+            "quarantined file still contributes no events to the restore"
+        );
+        restarted.push(workspace_event("after-quarantine"));
+        let next = restarted
+            .persisted_events_after(0)
+            .last()
+            .map(|(seq, _, _)| *seq)
+            .expect("the post-quarantine push persisted");
+        assert!(
+            next > spent,
+            "seq {next} re-uses a number the quarantined file already spent (highest was {spent})"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_totally_unreadable_active_file_still_falls_back_to_rotated_history() {
+        // Salvage is best-effort by design: when not one line survives there
+        // is no high-water mark to recover, and the rotated files are the
+        // only remaining floor. Monotonicity must still hold against those.
+        let path = temp_log("seq-unsalvageable");
+        let hub = EventHub::with_persistence(path.clone());
+        for index in 0..3 {
+            hub.push(workspace_event(&format!("w{index}")));
+        }
+        drop(hub);
+        std::fs::write(&path, "\0\0\0 not json at all\n").unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        restarted.push(workspace_event("after"));
+        let next = restarted
+            .persisted_events_after(0)
+            .last()
+            .map(|(seq, _, _)| *seq)
+            .expect("push persisted");
+        assert!(next > 0, "sequence still advances from a zero floor");
         cleanup(&path);
     }
 
