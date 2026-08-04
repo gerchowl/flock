@@ -763,6 +763,11 @@ pub struct PeerConfig {
     /// Command run on the peer to fetch its summary. The default wraps the
     /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
     pub summary_command: String,
+    /// Command run on the peer to serve the held connection. Mirrors
+    /// `summary_command`: the default wraps `flk` in a login shell so
+    /// profile-managed PATHs (nix, brew) apply, and an override handles a peer
+    /// whose `flk` is not on the non-interactive PATH at all.
+    pub relay_command: String,
     /// Optional per-peer override for the summary poll cadence (#96). Unset
     /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
     /// back too — the round handler's overlap guard is the safety net, not a
@@ -777,6 +782,7 @@ impl Default for PeerConfig {
             name: String::new(),
             ssh: String::new(),
             summary_command: default_peer_summary_command().to_string(),
+            relay_command: default_peer_relay_command().to_string(),
             poll_interval_secs: None,
         }
     }
@@ -784,6 +790,10 @@ impl Default for PeerConfig {
 
 pub fn default_peer_summary_command() -> &'static str {
     "sh -lc 'flk peers summary --json'"
+}
+
+pub fn default_peer_relay_command() -> &'static str {
+    "sh -lc 'flk peers relay'"
 }
 
 impl PeerConfig {
