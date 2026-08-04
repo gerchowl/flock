@@ -793,7 +793,7 @@ pub fn default_peer_summary_command() -> &'static str {
 }
 
 pub fn default_peer_relay_command() -> &'static str {
-    "sh -lc 'flk peers relay'"
+    "sh -lc 'flk peers relay --push'"
 }
 
 impl PeerConfig {

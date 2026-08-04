@@ -65,6 +65,10 @@ struct PeerStream {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    /// Latest unsolicited summary the peer pushed. One slot, not a queue:
+    /// the payload is a snapshot, so an older push carries nothing the newer
+    /// one does not already say and queueing them would only serve staleness.
+    latest_push: Arc<Mutex<Option<String>>>,
 }
 
 impl PeerStream {
@@ -94,11 +98,22 @@ impl PeerStream {
         let stdin = child.stdin.take().ok_or("ssh stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("ssh stdout unavailable")?;
         let (tx, lines) = std::sync::mpsc::channel();
+        let latest_push = Arc::new(Mutex::new(None));
+        let push_slot = Arc::clone(&latest_push);
         std::thread::spawn(move || {
             // Ends on EOF, which is exactly how ssh reports the connection is
             // gone. The dropped sender then disconnects the channel and every
             // later request fails fast rather than waiting out the timeout.
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                // A push carries `push` where a response carries `id`, so
+                // routing needs no guessing. Anything else is a response and
+                // belongs to whoever is waiting on the channel.
+                if line.contains("\"push\"") {
+                    if let Ok(mut slot) = push_slot.lock() {
+                        *slot = Some(line);
+                    }
+                    continue;
+                }
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -110,6 +125,7 @@ impl PeerStream {
             stdin,
             lines,
             next_id: 0,
+            latest_push,
         })
     }
 
@@ -222,6 +238,23 @@ pub fn request(
             Err(err)
         }
     }
+}
+
+/// Take the freshest summary this peer pushed, if any.
+///
+/// Consuming rather than peeking: a summary answers exactly one poll, and
+/// leaving it in place would let a peer that has gone quiet keep answering
+/// with a snapshot that is no longer current. An empty slot falls through to
+/// an ordinary request, so a silent peer is still polled at its usual cadence.
+pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
+    let slot = {
+        let registry = registry().lock().ok()?;
+        Arc::clone(registry.get(&peer.name)?)
+    };
+    let mut slot = slot.lock().ok()?;
+    let stream = slot.stream.as_mut()?;
+    let mut push = stream.latest_push.lock().ok()?;
+    push.take()
 }
 
 /// Drop connections invalidated by a config reload.
