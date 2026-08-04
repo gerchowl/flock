@@ -476,6 +476,12 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
     // shipped default, so a customized one keeps the one-shot path rather
     // than being silently reinterpreted as `peers.summary`.
     if peer.summary_command == crate::config::model::default_peer_summary_command() {
+        // A push already answered this poll — the peer told us the moment its
+        // state changed, so the round trip would only re-fetch what is
+        // already here.
+        if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
+            return Ok(pushed);
+        }
         match crate::peer_stream::request(peer, "peers.summary", serde_json::json!({})) {
             Ok(response) => return Ok(response),
             // Every failure mode ends here — old `flk` without `peers relay`,

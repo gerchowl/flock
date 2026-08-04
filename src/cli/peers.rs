@@ -256,6 +256,9 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
         return Ok(0);
     }
     let socket = crate::api::socket_path();
+    if args.iter().any(|arg| arg == "--push") {
+        start_summary_push(socket.clone());
+    }
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -294,6 +297,106 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
         )
     })
 }
+
+/// Emit a fresh summary up the pipe whenever this node's state changes.
+///
+/// Pushes a SUMMARY rather than raw events, for two reasons. The hub already
+/// has exactly one path that applies a summary, so a push needs no second
+/// application path to drift from it. And a summary is inherently coalesced —
+/// it is a snapshot, so when changes arrive faster than the debounce only the
+/// latest matters, and dropping the intermediates is free rather than lossy.
+///
+/// Distinguished from a response by carrying `push` instead of `id`, so the
+/// hub can route it without guessing.
+fn start_summary_push(socket: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket) else {
+            return;
+        };
+        let subscribe = serde_json::json!({
+            "id": "relay-push",
+            "method": "events.subscribe",
+            // Every one of these must be field-free. `pane.agent_status_changed`
+            // reads as the obvious choice and is not usable here: it requires a
+            // `pane_id`, so it scopes to ONE pane while this needs "anything on
+            // this node changed". Subscribing to it makes the whole request
+            // invalid, which the server rejects and this thread then exits on,
+            // silently — the push would simply never arrive.
+            "params": { "subscriptions": [
+                {"type": "workspace.created"},
+                {"type": "workspace.updated"},
+                {"type": "workspace.closed"},
+                {"type": "pane.created"},
+                {"type": "pane.closed"},
+                {"type": "pane.exited"},
+                {"type": "pane.agent_detected"},
+            ]},
+        });
+        if writeln!(stream, "{subscribe}").is_err() {
+            return;
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        // The server answers a bad subscription with an error line and closes.
+        // Reading it here turns "pushes silently never happen" into a stated
+        // reason — the failure mode that hid a rejected subscription until a
+        // live run caught it.
+        let mut ack = String::new();
+        if reader.read_line(&mut ack).is_err() {
+            return;
+        }
+        if ack.contains("\"error\"") {
+            crate::logging::peer_push_subscribe_failed(ack.trim());
+            return;
+        }
+        let mut last_push = std::time::Instant::now() - SUMMARY_PUSH_DEBOUNCE;
+        for _ in reader.lines().map_while(Result::ok) {
+            // Coalesce: a burst of changes is worth one fresh snapshot, not
+            // one per event. Skipping is safe precisely because the payload is
+            // a snapshot — the next push carries everything the skipped ones
+            // would have said.
+            if last_push.elapsed() < SUMMARY_PUSH_DEBOUNCE {
+                continue;
+            }
+            last_push = std::time::Instant::now();
+            let Ok(mut summary_stream) = std::os::unix::net::UnixStream::connect(&socket) else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "id": "relay-push-summary",
+                "method": "peers.summary",
+                "params": {},
+            });
+            if writeln!(summary_stream, "{request}").is_err() {
+                continue;
+            }
+            let mut line = String::new();
+            if std::io::BufReader::new(summary_stream)
+                .read_line(&mut line)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let Some(result) = value.get("result") else {
+                continue;
+            };
+            let push = serde_json::json!({ "push": "peers.summary", "result": result });
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            if writeln!(out, "{push}").is_err() || out.flush().is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Fastest cadence at which state pushes leave a node. Not configurable: the
+/// #224 review flagged per-kind cadence config as a footgun, and this is a
+/// property of the payload rather than a preference — a snapshot coalesces,
+/// so a faster rate would only resend what the next one already carries.
+const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wire names of the two methods that hold their connection open streaming.
 ///
@@ -366,7 +469,9 @@ fn print_peers_help() {
     eprintln!("usage: flk peers summary [--json]");
     eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
     eprintln!("       flk peers logs [--all] [--lines N] [--json]");
-    eprintln!("       flk peers relay          (stdin/stdout API relay, for `ssh <peer> flk peers relay`)");
+    eprintln!(
+        "       flk peers relay [--push]  (stdin/stdout API relay, for `ssh <peer> flk peers relay`)"
+    );
 }
 
 #[cfg(test)]

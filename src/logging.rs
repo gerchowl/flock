@@ -2651,6 +2651,21 @@ pub(crate) fn peer_stream_fallback(peer: &str, err: &str) {
     );
 }
 
+/// The relay's push subscription was refused, so this node will never push
+/// state and the hub falls back to polling it. WARN because it is silent
+/// otherwise: nothing downstream can tell "nothing changed" from "the
+/// subscription never took".
+pub(crate) fn peer_push_subscribe_failed(err: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.push.subscribe_failed",
+        subsystem = "peers",
+        outcome = "error",
+        err,
+        "relay push subscription refused; this node will not push state"
+    );
+}
+
 pub(crate) fn config_edit_rollback_write_failed(target: &Path, err: &str) {
     tracing::warn!(
         event = "config.edit.rollback",
