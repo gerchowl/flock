@@ -90,6 +90,8 @@ pub enum Method {
     MsgList(MsgListParams),
     #[serde(rename = "msg.read")]
     MsgRead(MsgReadParams),
+    #[serde(rename = "msg.status")]
+    MsgStatus(MsgStatusParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -612,6 +614,16 @@ pub struct MsgReadParams {
     /// connection the way `msg.send` resolves its sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+}
+
+/// `msg.status` — what became of one message, asked by whoever sent it.
+///
+/// `msg.list` answers the recipient's question ("what is waiting for me").
+/// This answers the sender's, which nothing could before: a send returned a
+/// correlation id and then the trail went cold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgStatusParams {
+    pub correlation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,6 +1161,7 @@ pub enum EventKind {
     MessageQueued,
     MessageDelivered,
     MessageReplied,
+    MessageRelayed,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -1208,6 +1221,7 @@ impl EventKind {
             | Self::MessageQueued
             | Self::MessageDelivered
             | Self::MessageReplied
+            | Self::MessageRelayed
             | Self::CheckRan
             | Self::CheckFired
             | Self::CheckErrored
@@ -1402,6 +1416,24 @@ pub enum ResponseResult {
     },
     MsgList {
         messages: Vec<QueuedMessageInfo>,
+    },
+    MsgStatus {
+        correlation_id: String,
+        /// `queued` (waiting in a local inbox), `read` (the recipient took
+        /// it), `dropped` (aged out unread), or `relayed` (handed to another
+        /// host).
+        state: String,
+        /// True only when this node knows the outcome. A relayed message is
+        /// resolved on the RECEIVING node, so its fate is not in this log —
+        /// reporting `relayed` as though it were delivery is the mistake this
+        /// field exists to prevent.
+        outcome_known: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_host: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     MsgRead {
         /// The messages just consumed, oldest first. Each is marked delivered
@@ -1829,6 +1861,31 @@ pub enum EventData {
         /// Sanitized body — the durable log doubles as the mailbox's
         /// restart source, so the payload must survive here (ADR-0005/0006).
         body: String,
+    },
+    /// This node handed a message to another host.
+    ///
+    /// Deliberately NOT a `MessageQueued`: that one is the mailbox's restart
+    /// source, so `seed_from_events` would rebuild a local queue entry for a
+    /// recipient that lives on a different machine. A relayed message is gone
+    /// from here — what survives is the audit fact that it left, and where to.
+    ///
+    /// Carries no body. The payload is already durable on the receiving node,
+    /// and copying it here would put every cross-host message permanently on
+    /// the sender's disk too, for a record whose purpose is only "did it
+    /// leave, and where did it go".
+    MessageRelayed {
+        correlation_id: String,
+        from_agent: String,
+        to_agent: String,
+        /// Host as the directory reported it — what the far machine calls
+        /// itself.
+        to_host: String,
+        /// `[[peers]]` entry the relay actually routed through. Differs from
+        /// `to_host` in any normal fleet (a peer configured `anvil` reports
+        /// its hostname as `vm-dev`), and the route is what a reader needs to
+        /// reproduce or debug the hop.
+        route: String,
+        relayed_at_ms: u64,
     },
     MessageDelivered {
         correlation_id: String,

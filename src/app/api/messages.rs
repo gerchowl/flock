@@ -1,6 +1,6 @@
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, MessageTarget, MsgListParams, MsgReadParams,
-    MsgReplyParams, MsgSendParams, ResponseResult,
+    MsgReplyParams, MsgSendParams, MsgStatusParams, ResponseResult,
 };
 use crate::app::mailboxes::{EnqueueOutcome, PendingMessage};
 use crate::app::App;
@@ -330,6 +330,79 @@ impl App {
         )
     }
 
+    /// `msg.status` — what became of one message, asked by whoever sent it.
+    ///
+    /// Read from the durable log rather than the mailbox: a message that was
+    /// already consumed, aged out, or relayed away is gone from the queue,
+    /// and those are precisely the outcomes a sender wants to ask about.
+    ///
+    /// The last event for a correlation id wins. Ordering is by sequence, and
+    /// #175 O1 makes that monotonic across restarts, so "last" is a real
+    /// ordering rather than whatever the file happened to yield.
+    pub(super) fn handle_msg_status(&mut self, id: String, params: MsgStatusParams) -> String {
+        let mut found: Option<ResponseResult> = None;
+        for (_, event) in self.event_hub.events_after(0) {
+            match &event.data {
+                EventData::MessageQueued { correlation_id, .. }
+                    if *correlation_id == params.correlation_id =>
+                {
+                    found = Some(ResponseResult::MsgStatus {
+                        correlation_id: params.correlation_id.clone(),
+                        state: "queued".into(),
+                        outcome_known: true,
+                        to_host: None,
+                        route: None,
+                        detail: Some("waiting in a local inbox, not yet read".into()),
+                    });
+                }
+                EventData::MessageRelayed {
+                    correlation_id,
+                    to_host,
+                    route,
+                    ..
+                } if *correlation_id == params.correlation_id => {
+                    found = Some(ResponseResult::MsgStatus {
+                        correlation_id: params.correlation_id.clone(),
+                        state: "relayed".into(),
+                        // The receiving node owns the outcome. Saying so beats
+                        // implying delivery we cannot see.
+                        outcome_known: false,
+                        to_host: Some(to_host.clone()),
+                        route: Some(route.clone()),
+                        detail: Some(format!(
+                            "handed to {to_host} via [[peers]] {route}; whether it was read is \
+                             recorded there, not here"
+                        )),
+                    });
+                }
+                EventData::MessageDelivered {
+                    correlation_id,
+                    delivered,
+                    outcome,
+                    ..
+                } if *correlation_id == params.correlation_id => {
+                    found = Some(ResponseResult::MsgStatus {
+                        correlation_id: params.correlation_id.clone(),
+                        state: if *delivered { "read" } else { "dropped" }.into(),
+                        outcome_known: true,
+                        to_host: None,
+                        route: None,
+                        detail: Some(outcome.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+        match found {
+            Some(result) => encode_success(id, result),
+            None => encode_error(
+                id,
+                "message_not_found",
+                format!("no message with correlation id {}", params.correlation_id),
+            ),
+        }
+    }
+
     /// `msg.read` — the recipient consumes its inbox (ADR-0008).
     ///
     /// This is where "delivered" now happens. Under pane injection, delivery
@@ -475,14 +548,33 @@ impl App {
             body,
             &correlation_id,
         ) {
-            Ok(()) => encode_success(
-                id,
-                ResponseResult::MsgQueued {
-                    correlation_id,
-                    state: "relayed".into(),
-                    warnings: Vec::new(),
-                },
-            ),
+            Ok(()) => {
+                // Without this the sender's durable log has NO record that a
+                // cross-host message was ever sent — the relay path returned
+                // straight to the caller and never reached `queue_message`,
+                // which is what emits the local audit event. A message that
+                // left the machine was the one kind that vanished from the
+                // audit substrate it is supposed to be recorded in (#175).
+                self.emit_event(EventEnvelope {
+                    event: EventKind::MessageRelayed,
+                    data: EventData::MessageRelayed {
+                        correlation_id: correlation_id.clone(),
+                        from_agent: from_agent.clone(),
+                        to_agent: to_agent.to_string(),
+                        to_host: host.to_string(),
+                        route: peer.name.clone(),
+                        relayed_at_ms: now_ms(),
+                    },
+                });
+                encode_success(
+                    id,
+                    ResponseResult::MsgQueued {
+                        correlation_id,
+                        state: "relayed".into(),
+                        warnings: Vec::new(),
+                    },
+                )
+            }
             Err(err) => encode_error(
                 id,
                 "peer_unreachable",
@@ -677,8 +769,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{
-        ErrorResponse, EventData, MessageTarget, Method, MsgListParams, MsgReplyParams,
-        MsgSendParams, Request, ResponseResult, SuccessResponse,
+        ErrorResponse, EventData, EventEnvelope, EventKind, MessageTarget, Method, MsgListParams,
+        MsgReadParams, MsgReplyParams, MsgSendParams, MsgStatusParams, Request, ResponseResult,
+        SuccessResponse,
     };
     use crate::config::Config;
 
@@ -978,6 +1071,150 @@ mod tests {
 
         let allowed = send(&mut app, "mba22", "c-allowed");
         assert!(!allowed.contains("\"error\""), "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn msg_status_answers_the_senders_question_through_the_lifecycle() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let status = |app: &mut crate::app::App, correlation: &str| -> serde_json::Value {
+            let response = app.handle_api_request(Request {
+                id: "req".into(),
+                method: Method::MsgStatus(MsgStatusParams {
+                    correlation_id: correlation.into(),
+                }),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+
+        // Unknown ids are an error, not a fabricated "pending".
+        assert_eq!(
+            status(&mut app, "c-never-sent")["error"]["code"],
+            "message_not_found"
+        );
+
+        basic_send(&mut app, "c-live", "hello");
+        let queued = status(&mut app, "c-live");
+        assert_eq!(queued["result"]["state"], "queued");
+        assert_eq!(queued["result"]["outcome_known"], true);
+
+        // The LAST event wins, so reading it moves the answer on rather than
+        // leaving the first verdict standing.
+        let recipient = pane_target(&app, 1);
+        app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(MsgReadParams {
+                pane: Some(recipient),
+            }),
+        });
+        let read = status(&mut app, "c-live");
+        assert_eq!(read["result"]["state"], "read");
+        assert_eq!(read["result"]["outcome_known"], true);
+    }
+
+    #[tokio::test]
+    async fn msg_status_never_claims_to_know_a_relayed_messages_fate() {
+        // The receiving node resolves a relayed message, so its outcome is in
+        // that node's log. Reporting "relayed" as if it were delivery would
+        // turn the one honest answer into a misleading one.
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        app.emit_event(EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: "c-gone".into(),
+                from_agent: "agent_sage_cafe".into(),
+                to_agent: "agent_anvil-dev_beef".into(),
+                to_host: "anvil-dev".into(),
+                route: "anvil".into(),
+                relayed_at_ms: 1,
+            },
+        });
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgStatus(MsgStatusParams {
+                correlation_id: "c-gone".into(),
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["state"], "relayed");
+        assert_eq!(
+            value["result"]["outcome_known"], false,
+            "this node cannot see whether the far side read it"
+        );
+        assert_eq!(value["result"]["to_host"], "anvil-dev");
+        assert_eq!(
+            value["result"]["route"], "anvil",
+            "the route is what a reader needs to reproduce the hop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_never_left_the_machine_writes_no_audit_record() {
+        // `MessageRelayed` has to mean "this message left, and went there".
+        // Emitting it on the attempt rather than the success would make the
+        // audit trail claim delivery for messages that never crossed the
+        // wire — worse than the missing record it replaces, because a wrong
+        // record reads as a true one.
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        app.state.peers = vec![crate::config::PeerConfig {
+            name: "anvil".into(),
+            // Unresolvable, so the ssh attempt fails fast without a network.
+            ssh: "relay-audit-test-nonexistent-host.invalid".into(),
+            ..Default::default()
+        }];
+        app.state.peer_summaries = vec![{
+            let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+                name: "anvil".into(),
+                ..Default::default()
+            });
+            peer.host = Some("anvil-dev".into());
+            peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+                id: "w1".into(),
+                workspace: "remote".into(),
+                project_key: None,
+                project_label: None,
+                branch: None,
+                is_linked_worktree: false,
+                agent: Some("cc".into()),
+                status: crate::api::schema::AgentStatus::Idle,
+                status_age_secs: None,
+                activity: None,
+                agents: vec![crate::api::schema::PeerAgentSummary {
+                    agent_id: "agent_anvil-dev_beef".into(),
+                    pane_id: "w1:p1".into(),
+                    agent: Some("cc".into()),
+                    status: crate::api::schema::AgentStatus::Idle,
+                }],
+            }];
+            peer
+        }];
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: Some("agent_sage_cafe".into()),
+                from_host: None,
+                to: MessageTarget::Agent {
+                    agent: "agent_anvil-dev_beef".into(),
+                },
+                body: "never arrives".into(),
+                correlation_id: Some("c-unreachable".into()),
+                in_reply_to: None,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code, "peer_unreachable",
+            "the send fails synchronously, so the caller learns immediately"
+        );
+        let relayed = hub
+            .events_after(0)
+            .iter()
+            .filter(|(_, event)| matches!(event.data, EventData::MessageRelayed { .. }))
+            .count();
+        assert_eq!(relayed, 0, "a failed hop leaves no record claiming it left");
     }
 
     #[tokio::test]
