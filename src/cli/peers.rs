@@ -325,21 +325,10 @@ fn start_summary_push(socket: std::path::PathBuf) {
         let subscribe = serde_json::json!({
             "id": "relay-push",
             "method": "events.subscribe",
-            // Every one of these must be field-free. `pane.agent_status_changed`
-            // reads as the obvious choice and is not usable here: it requires a
-            // `pane_id`, so it scopes to ONE pane while this needs "anything on
-            // this node changed". Subscribing to it makes the whole request
-            // invalid, which the server rejects and this thread then exits on,
-            // silently — the push would simply never arrive.
-            "params": { "subscriptions": [
-                {"type": "workspace.created"},
-                {"type": "workspace.updated"},
-                {"type": "workspace.closed"},
-                {"type": "pane.created"},
-                {"type": "pane.closed"},
-                {"type": "pane.exited"},
-                {"type": "pane.agent_detected"},
-            ]},
+            "params": { "subscriptions": PUSH_SUBSCRIPTIONS
+                .iter()
+                .map(|kind| serde_json::json!({ "type": kind }))
+                .collect::<Vec<_>>() },
         });
         if writeln!(stream, "{subscribe}").is_err() {
             return;
@@ -357,7 +346,7 @@ fn start_summary_push(socket: std::path::PathBuf) {
             crate::logging::peer_push_subscribe_failed(ack.trim());
             return;
         }
-        crate::logging::peer_push_subscribed(PUSH_SUBSCRIPTION_COUNT);
+        crate::logging::peer_push_subscribed(PUSH_SUBSCRIPTIONS.len());
         let mut last_push = std::time::Instant::now() - SUMMARY_PUSH_DEBOUNCE;
         // Counted, not just dropped: "5 events became 1 push" is the evidence
         // coalescing is working, and its absence is the evidence it is not.
@@ -414,9 +403,24 @@ fn start_summary_push(socket: std::path::PathBuf) {
 /// so a faster rate would only resend what the next one already carries.
 const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Kept next to the subscription list so the logged count cannot drift from
-/// what was actually requested.
-const PUSH_SUBSCRIPTION_COUNT: usize = 7;
+/// Events that mean "something on this node changed", so the hub is owed a
+/// fresh summary.
+///
+/// Every one MUST be field-free. `pane.agent_status_changed` reads as the
+/// obvious inclusion and is not usable: it requires a `pane_id`, so it scopes
+/// to ONE pane where this needs the whole node. Including it makes the entire
+/// `events.subscribe` invalid — the server rejects it, this thread exits, and
+/// pushes silently never arrive, indistinguishable from a quiet node. That is
+/// only caught at runtime, against a live server.
+const PUSH_SUBSCRIPTIONS: [&str; 7] = [
+    "workspace.created",
+    "workspace.updated",
+    "workspace.closed",
+    "pane.created",
+    "pane.closed",
+    "pane.exited",
+    "pane.agent_detected",
+];
 
 /// Wire names of the two methods that hold their connection open streaming.
 ///
