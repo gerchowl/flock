@@ -4,6 +4,7 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 use crate::api::schema::{EmptyParams, Method, PeersCheckoutPrepareParams, Request};
+use std::io::{BufRead, Write};
 
 pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -15,6 +16,7 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
         "summary" => peers_summary(&args[1..]),
         "checkout-prepare" => peers_checkout_prepare(&args[1..]),
         "logs" => peers_logs(&args[1..]),
+        "relay" => peers_relay(&args[1..]),
         "help" | "--help" | "-h" => {
             print_peers_help();
             Ok(0)
@@ -229,10 +231,142 @@ fn peers_checkout_prepare(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// Relay API requests from stdin to this node's socket, responses to stdout.
+///
+/// The remote half of a hub that holds ONE ssh connection to a peer instead of
+/// spawning a fresh one per call. Measured cold handshake with multiplexing
+/// disabled: 0.01s on the LAN but 0.42s to a Tailscale-remote peer (0.95s
+/// cold). At that cost the handshake dominates — a few hundred bytes of
+/// payload behind half a second of setup, paid again on every poll and every
+/// message.
+///
+/// A multiplexer, NOT a byte pump: the API server is one-request-per-
+/// connection, so each stdin line gets its own short-lived local socket. Those
+/// are ~free (no handshake, no network); the ssh connection is the expensive
+/// thing and it is what gets amortized.
+///
+/// Not a second server either. The running instance owns `api_tx` and all
+/// state; this only carries bytes to it. Requests therefore arrive with no
+/// local process ancestry — the parent is sshd, not a pane — so they attest to
+/// no pane at all. That is correct rather than a gap: a relayed send takes its
+/// name from the relay's asserted `from_agent`, never from ancestry (P3).
+fn peers_relay(args: &[String]) -> std::io::Result<i32> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_peers_help();
+        return Ok(0);
+    }
+    let socket = crate::api::socket_path();
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(0);
+        }
+        let request = line.trim();
+        if request.is_empty() {
+            continue;
+        }
+        // A closed stdout means the hub hung up. That is the ordinary way
+        // this process ends, not a failure worth a message nobody can read.
+        match relay_one_request(&socket, request) {
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
+            other => other?,
+        }
+    }
+}
+
+/// The refusal, if this request cannot be carried — split from the IO so the
+/// decision is testable without a socket or a server.
+fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
+    let parsed: serde_json::Value = serde_json::from_str(request).ok()?;
+    let id = parsed
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let method = parsed.get("method").and_then(|method| method.as_str())?;
+    STREAMING_METHODS.contains(&method).then(|| {
+        (
+            id,
+            "unsupported_over_relay",
+            format!("{method} streams and would block the relay; not carried over this transport"),
+        )
+    })
+}
+
+/// Wire names of the two methods that hold their connection open streaming.
+///
+/// Sequential relaying is right for the only caller today — a hub poll is one
+/// request at a time — but a streaming method would hold the pipe forever and
+/// starve every request behind it. Refuse loudly instead of hanging quietly.
+/// Carrying these needs a demultiplexed channel, which is the push work, not
+/// this seam.
+const STREAMING_METHODS: [&str; 2] = ["events.subscribe", "pane.wait_for_output"];
+
+fn relay_one_request(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
+    if let Some((id, code, message)) = relay_refusal(request) {
+        return write_relay_error(&id, code, &message);
+    }
+    // Malformed input is the server's error to describe, not ours — pass it
+    // through so the one implementation answers.
+    let id = serde_json::from_str::<serde_json::Value>(request)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(err) => {
+            return write_relay_error(
+                &id,
+                "no_local_server",
+                &format!("no flk server on this node: {err}"),
+            );
+        }
+    };
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    // Read to EOF rather than taking one line: the server closes the
+    // connection when it is done, so this carries a single response without
+    // assuming there is exactly one.
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response = String::new();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        response.clear();
+        if reader.read_line(&mut response)? == 0 {
+            break;
+        }
+        out.write_all(response.as_bytes())?;
+    }
+    out.flush()
+}
+
+fn write_relay_error(id: &str, code: &str, message: &str) -> std::io::Result<()> {
+    let error = serde_json::json!({
+        "id": id,
+        "error": { "code": code, "message": message },
+    });
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{error}")?;
+    out.flush()
+}
+
 fn print_peers_help() {
     eprintln!("usage: flk peers summary [--json]");
     eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
     eprintln!("       flk peers logs [--all] [--lines N] [--json]");
+    eprintln!("       flk peers relay          (stdin/stdout API relay, for `ssh <peer> flk peers relay`)");
 }
 
 #[cfg(test)]
@@ -241,6 +375,44 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn streaming_methods_are_refused_rather_than_left_to_hang() {
+        // The relay is sequential, so a method that holds its connection open
+        // would starve every request behind it. Silence would look like a slow
+        // peer; the refusal names the reason.
+        for method in STREAMING_METHODS {
+            let request = format!(r#"{{"id":"r1","method":"{method}","params":{{}}}}"#);
+            let (id, code, message) =
+                relay_refusal(&request).expect("a streaming method is refused");
+            assert_eq!(
+                id, "r1",
+                "the refusal is addressed to the request that caused it"
+            );
+            assert_eq!(code, "unsupported_over_relay");
+            assert!(
+                message.contains(method),
+                "the refusal names the method: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_requests_are_carried_and_malformed_input_is_left_to_the_server() {
+        assert!(
+            relay_refusal(r#"{"id":"r1","method":"peers.summary","params":{}}"#).is_none(),
+            "a non-streaming method is carried"
+        );
+        assert!(
+            relay_refusal("not json at all").is_none(),
+            "malformed input is not refused here — the server owns that error \
+             message, and duplicating it would give two implementations to drift"
+        );
+        assert!(
+            relay_refusal(r#"{"id":"r1"}"#).is_none(),
+            "a request with no method is likewise the server's to reject"
+        );
     }
 
     #[test]
