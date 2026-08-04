@@ -59,7 +59,16 @@ pub(crate) fn help_log_paths_summary() -> String {
 
 /// The session's log files, in role order. The fixed set `peers logs` is
 /// allowed to read — never an arbitrary path (#67).
-const SESSION_LOG_FILES: [&str; 3] = ["flock.log", "flock-server.log", "flock-client.log"];
+const SESSION_LOG_FILES: [&str; 4] = [
+    "flock.log",
+    "flock-server.log",
+    "flock-client.log",
+    // The relay runs on the PEER, so its diagnostics are only reachable
+    // through this list — `flk peers logs --all` is how a hub sees why a peer
+    // stopped pushing. A separate file rather than sharing the server's:
+    // it is a separate process, and two rotating writers on one path race.
+    "flock-relay.log",
+];
 
 /// One parsed tracing record for the cross-host log view (#67), decoded from
 /// the on-disk JSONL layer (or a legacy text line — see `parse_log_lines`).
@@ -2648,6 +2657,76 @@ pub(crate) fn peer_stream_fallback(peer: &str, err: &str) {
         peer,
         err,
         "peer stream unavailable, using one-shot ssh"
+    );
+}
+
+/// The relay accepted a connection from a hub. Marks the far end of a held
+/// connection as actually running — without it, "the hub sees nothing" cannot
+/// be told apart from "the relay never started".
+pub(crate) fn peer_relay_started(pushing: bool) {
+    tracing::info!(
+        target: "flock::peers",
+        event = "peer.relay.started",
+        subsystem = "peers",
+        outcome = "ok",
+        pushing,
+        "peer relay serving a hub connection"
+    );
+}
+
+/// The push subscription took. Pairs with `peer.push.subscribe_failed` so the
+/// two outcomes are symmetric in the log — one of them always appears, and
+/// neither has to be inferred from absence.
+pub(crate) fn peer_push_subscribed(subscriptions: usize) {
+    tracing::info!(
+        target: "flock::peers",
+        event = "peer.push.subscribed",
+        subsystem = "peers",
+        outcome = "ok",
+        subscriptions,
+        "relay push subscription active"
+    );
+}
+
+/// A state push left this node. DEBUG — one per change at most, but a busy
+/// node still emits steadily.
+pub(crate) fn peer_push_emitted(coalesced: u64) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.push.emitted",
+        subsystem = "peers",
+        outcome = "ok",
+        coalesced,
+        "pushed a fresh summary to the hub"
+    );
+}
+
+/// The hub answered a poll from a push instead of a round trip. The ONE line
+/// that says push is working end to end — without it, a working push and a
+/// dead one both look like a poll that returned.
+pub(crate) fn peer_push_consumed(peer: &str) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.push.consumed",
+        subsystem = "peers",
+        outcome = "ok",
+        peer,
+        "poll answered from a pushed summary, no round trip"
+    );
+}
+
+/// A held connection ended. Says which peer and why, so a fleet that quietly
+/// degraded to one-shot polling is diagnosable rather than merely slower.
+pub(crate) fn peer_stream_closed(peer: &str, err: &str, backoff_secs: u64) {
+    tracing::info!(
+        target: "flock::peers",
+        event = "peer.stream.closed",
+        subsystem = "peers",
+        outcome = "closed",
+        peer,
+        err,
+        backoff_secs,
+        "peer connection dropped, backing off before reconnect"
     );
 }
 

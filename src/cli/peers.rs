@@ -255,8 +255,17 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
         print_peers_help();
         return Ok(0);
     }
+    // CLI commands normally skip logging setup — they are one-shot and a log
+    // line per `flk status` would be noise. The relay is the exception: it is
+    // long-lived, it runs on the PEER where nobody is watching stdout, and its
+    // failures (a refused subscription, a dead socket) are otherwise
+    // indistinguishable from a node where nothing happened. Its own file, so
+    // it never races the server's rotating writer.
+    crate::logging::init_file_logging("flock-relay.log");
     let socket = crate::api::socket_path();
-    if args.iter().any(|arg| arg == "--push") {
+    let pushing = args.iter().any(|arg| arg == "--push");
+    crate::logging::peer_relay_started(pushing);
+    if pushing {
         start_summary_push(socket.clone());
     }
     let stdin = std::io::stdin();
@@ -348,13 +357,18 @@ fn start_summary_push(socket: std::path::PathBuf) {
             crate::logging::peer_push_subscribe_failed(ack.trim());
             return;
         }
+        crate::logging::peer_push_subscribed(PUSH_SUBSCRIPTION_COUNT);
         let mut last_push = std::time::Instant::now() - SUMMARY_PUSH_DEBOUNCE;
+        // Counted, not just dropped: "5 events became 1 push" is the evidence
+        // coalescing is working, and its absence is the evidence it is not.
+        let mut coalesced: u64 = 0;
         for _ in reader.lines().map_while(Result::ok) {
             // Coalesce: a burst of changes is worth one fresh snapshot, not
             // one per event. Skipping is safe precisely because the payload is
             // a snapshot — the next push carries everything the skipped ones
             // would have said.
             if last_push.elapsed() < SUMMARY_PUSH_DEBOUNCE {
+                coalesced += 1;
                 continue;
             }
             last_push = std::time::Instant::now();
@@ -388,6 +402,8 @@ fn start_summary_push(socket: std::path::PathBuf) {
             if writeln!(out, "{push}").is_err() || out.flush().is_err() {
                 return;
             }
+            drop(out);
+            crate::logging::peer_push_emitted(std::mem::take(&mut coalesced));
         }
     });
 }
@@ -397,6 +413,10 @@ fn start_summary_push(socket: std::path::PathBuf) {
 /// property of the payload rather than a preference — a snapshot coalesces,
 /// so a faster rate would only resend what the next one already carries.
 const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Kept next to the subscription list so the logged count cannot drift from
+/// what was actually requested.
+const PUSH_SUBSCRIPTION_COUNT: usize = 7;
 
 /// Wire names of the two methods that hold their connection open streaming.
 ///
