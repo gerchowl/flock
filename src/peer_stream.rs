@@ -235,6 +235,7 @@ pub fn request(
             // between requests and responses is no longer known to hold.
             slot.stream = None;
             slot.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
+            crate::logging::peer_stream_closed(&peer.name, &err, RECONNECT_BACKOFF.as_secs());
             Err(err)
         }
     }

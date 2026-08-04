@@ -480,6 +480,7 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
         // state changed, so the round trip would only re-fetch what is
         // already here.
         if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
+            crate::logging::peer_push_consumed(&peer.name);
             return Ok(pushed);
         }
         match crate::peer_stream::request(peer, "peers.summary", serde_json::json!({})) {
