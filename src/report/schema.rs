@@ -41,6 +41,11 @@ pub struct ClientProvenance {
     pub commit: Option<String>,
     pub protocol: u32,
     pub binary: String,
+    /// Target triple and `debug`/`release`. Neither is derivable at runtime.
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub profile: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +95,8 @@ impl ReportProvenance {
                 // caller can serialize the raw value by accident.
                 binary: super::redact::Scrubber::from_env()
                     .scrub(&crate::cli::status::current_exe_label()),
+                target: crate::build_info::target().to_string(),
+                profile: crate::build_info::profile().to_string(),
             },
             server: ServerProvenance::from_runtime(server),
             host: HostProvenance::collect(),
@@ -108,17 +115,30 @@ impl ReportProvenance {
             "- Operating system: {} ({})\n",
             self.host.os, self.host.arch
         ));
+        // Absent values are STATED, not omitted.
+        //
+        // Borrowed from the `bugreport` crate, whose collectors turn a failure
+        // into a report entry rather than dropping the section
+        // (`collect(..).unwrap_or_else(|e| e.to_entry())`). A missing "Shell:"
+        // line leaves a triager unable to tell "the reporter has no SHELL set"
+        // — itself diagnostic, and the shape of a stripped systemd
+        // environment — from "flock never looked".
         out.push_str(&format!(
             "- Terminal: {}\n",
             self.host
                 .term_program
                 .as_deref()
                 .or(self.host.term.as_deref())
-                .unwrap_or("unknown")
+                .unwrap_or("not set")
         ));
-        if let Some(shell) = &self.host.shell {
-            out.push_str(&format!("- Shell: {shell}\n"));
-        }
+        out.push_str(&format!(
+            "- Shell: {}\n",
+            self.host.shell.as_deref().unwrap_or("not set")
+        ));
+        out.push_str(&format!(
+            "- Build: {} ({})\n",
+            self.client.target, self.client.profile
+        ));
         out.push_str(&format!("- Client protocol: {}\n", self.client.protocol));
         // #232 showed the resolved binary path is genuinely diagnostic — it is
         // how a Nix store path or an unexpected install location gets noticed.
@@ -204,6 +224,8 @@ mod tests {
                 commit: Some("abc1234".into()),
                 protocol: 24,
                 binary: "/usr/local/bin/flk".into(),
+                target: "aarch64-apple-darwin".into(),
+                profile: "release".into(),
             },
             server: ServerProvenance {
                 status: "running".into(),
@@ -233,6 +255,24 @@ mod tests {
                 collected.client.binary
             );
         }
+    }
+
+    #[test]
+    fn absent_values_are_stated_rather_than_omitted() {
+        let mut provenance = provenance();
+        provenance.host.shell = None;
+        provenance.host.term = None;
+        provenance.host.term_program = None;
+        let out = provenance.to_markdown();
+        // A missing line cannot be distinguished from a failed lookup.
+        assert!(out.contains("- Shell: not set"), "{out}");
+        assert!(out.contains("- Terminal: not set"), "{out}");
+    }
+
+    #[test]
+    fn build_shape_is_reported() {
+        let out = provenance().to_markdown();
+        assert!(out.contains("aarch64-apple-darwin (release)"), "{out}");
     }
 
     #[test]

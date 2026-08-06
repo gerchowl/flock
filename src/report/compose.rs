@@ -176,6 +176,8 @@ mod tests {
                 commit: Some("abc1234".into()),
                 protocol: 24,
                 binary: "/usr/local/bin/flk".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+                profile: "release".into(),
             },
             server: ServerProvenance {
                 status: "running".into(),

@@ -31,6 +31,20 @@ pub fn version() -> String {
     }
 }
 
+/// The target triple this binary was built for, e.g. `aarch64-apple-darwin`.
+///
+/// Not derivable at runtime: `std::env::consts` gives OS and arch but not the
+/// libc flavour, so it cannot tell a musl build from a gnu one.
+pub fn target() -> &'static str {
+    non_empty(option_env!("FLOCK_BUILD_TARGET")).unwrap_or("unknown")
+}
+
+/// `debug` or `release`. A debug build explains a whole class of "flock is
+/// slow" reports without any further investigation.
+pub fn profile() -> &'static str {
+    non_empty(option_env!("FLOCK_BUILD_PROFILE")).unwrap_or("unknown")
+}
+
 pub fn is_preview() -> bool {
     channel() == "preview"
 }
