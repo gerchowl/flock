@@ -158,13 +158,23 @@ mod tests {
     /// dependency, and the only thing under test is the `id:` sequence.
     #[test]
     fn table_matches_the_checked_in_forms() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/ISSUE_TEMPLATE/bug.yml");
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let github = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github");
+        if !github.is_dir() {
             // Sandboxed build (Nix fileset / crates.io package) — `.github` is
-            // not shipped. Nothing to drift against.
+            // not shipped at all. Nothing to drift against.
             return;
-        };
+        }
+        // From here the tree DOES carry `.github`, so a missing or unreadable
+        // form is a deleted template, not a sandbox. Skipping that case would
+        // make this gate pass loudest exactly when it should fail.
+        let path = github.join("ISSUE_TEMPLATE/bug.yml");
+        let content = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "{} is missing or unreadable ({err}) but .github exists — the \
+                 report form table has nothing to validate against",
+                path.display()
+            )
+        });
 
         let ids: Vec<String> = content
             .lines()

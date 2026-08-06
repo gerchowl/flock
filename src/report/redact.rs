@@ -102,32 +102,63 @@ impl Scrubber {
             home: home
                 .map(|home| home.trim_end_matches('/').to_string())
                 .filter(|home| home.len() > 1),
-            user: user.filter(|user| user.len() > 2),
+            // Two-character UNIX account names are common in corporate
+            // directories; filtering them out silently disabled masking for
+            // exactly those users. Only an empty name is useless.
+            user: user.filter(|user| !user.is_empty()),
         }
     }
 
+    /// Build from the process environment, falling back to the password
+    /// database.
+    ///
+    /// A server started by systemd or launchd frequently has neither `HOME` nor
+    /// `USER` — flock's own #232 was exactly that class of stripped-environment
+    /// bug. With both unset the scrubber silently became a no-op for the
+    /// username and for any non-standard home (`/opt/appuser/...`,
+    /// `/var/lib/...`), which the `/Users|/home` path rule does not cover.
     pub fn from_env() -> Self {
-        Self::new(
-            std::env::var("HOME").ok(),
-            std::env::var("USER")
-                .ok()
-                .or_else(|| std::env::var("LOGNAME").ok()),
-        )
+        let home = std::env::var("HOME").ok().or_else(passwd_home);
+        let user = std::env::var("USER")
+            .ok()
+            .or_else(|| std::env::var("LOGNAME").ok())
+            .or_else(passwd_name);
+        Self::new(home, user)
     }
 
     pub fn scrub(&self, value: &str) -> String {
         let mut out = value.to_string();
 
-        // Order matters: credentials first, so a token embedded in a path is
-        // masked before the path rules rewrite around it.
+        // Order matters. Credentials first, so a token embedded in a path is
+        // masked before the path rules rewrite around it. The git-remote rule
+        // must precede the email rule: `git@github.com:org/private.git` matches
+        // as an address, which masks only the prefix and publishes the org and
+        // repository in the tail.
+        // Swap the public hosts out before the host rule runs, and back after.
+        let mut preserved: Vec<(String, &str)> = Vec::new();
+        for (index, host) in PUBLIC_HOSTS.iter().enumerate() {
+            if out.contains(host) {
+                let token = format!("\u{0}flkhost{index}\u{0}");
+                out = out.replace(host, &token);
+                preserved.push((token, host));
+            }
+        }
+
         for (pattern, replacement) in [
+            (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
             (labeled_secret_re(), "$1=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
+            (ipv6_re(), "<ip>"),
             (ipv4_re(), "<ip>"),
+            (private_host_re(), "<host>"),
         ] {
             out = pattern.replace_all(&out, replacement).to_string();
+        }
+
+        for (token, host) in preserved {
+            out = out.replace(&token, host);
         }
 
         // This user's home first (most specific), then anyone else's.
@@ -162,8 +193,12 @@ fn secret_token_re() -> &'static Regex {
 fn labeled_secret_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // The label may be a SUFFIX of a longer identifier: `refresh_token`,
+        // `access_token`, `client_secret`, `github_token`. `\b` does not help
+        // there — `_` is a word character, so there is no boundary before
+        // `token` in `refresh_token` and the rule never fires.
         Regex::new(
-            r"(?i)\b(authorization|bearer|token|password|passwd|secret|api[-_]?key)\b\s*[=:]\s*\S+",
+            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*\S+",
         )
         .expect("static labeled-secret pattern")
     })
@@ -196,6 +231,69 @@ fn ipv4_re() -> &'static Regex {
         .expect("static ipv4 pattern")
     })
 }
+
+/// `git@host:org/repo.git` and `https://host/org/repo.git`.
+///
+/// Must run BEFORE the email rule, which matches the `git@host` prefix and
+/// leaves the org and repository name — the confidential part — in place.
+fn git_remote_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+              \bgit@[A-Za-z0-9._\-]+:[^\s\x22]+
+            | \bssh://[^\s\x22]+
+            | \bhttps?://[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+/[A-Za-z0-9._\-]+\.git
+            ",
+        )
+        .expect("static git-remote pattern")
+    })
+}
+
+/// IPv6, bracketed or bare. Runs before the IPv4 rule so an embedded
+/// dotted-quad tail cannot be masked first and strand the rest.
+fn ipv6_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\[?(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?\]?")
+            .expect("static ipv6 pattern")
+    })
+}
+
+/// Hostnames that identify a network rather than a public service.
+///
+/// The `user@host` rule only fires when there is a `user@`, and `err` strings
+/// overwhelmingly carry a bare FQDN instead ("Could not resolve hostname
+/// bastion.internal.acme.corp"). Two shapes are masked: anything under an
+/// unambiguously private suffix, and any name of three or more labels that is
+/// not on the public allowlist.
+///
+/// Three labels is the threshold on purpose — it keeps `flock-server.log` and
+/// `bug.yml` intact, and requiring an alphabetic final label keeps version
+/// strings like `0.6.8-fork.85ce040` from being mistaken for hosts.
+fn private_host_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?xi)
+              \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.(?:corp|internal|intranet|local|lan|home|priv|private|arpa)\b
+            | \b[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+){2,}\.[A-Za-z]{2,}\b
+            ",
+        )
+        .expect("static private-host pattern")
+    })
+}
+
+/// Public hosts that are diagnostic rather than identifying, and so survive
+/// [`private_host_re`]. Restoring them after the fact keeps the pattern itself
+/// simple — a negative lookahead is not available in this regex engine.
+const PUBLIC_HOSTS: &[&str] = &[
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "static.crates.io",
+    "index.crates.io",
+];
 
 /// Another account's home directory — the current user's is rewritten to `~`
 /// before this runs.
@@ -283,11 +381,53 @@ fn json_scalar(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Make a value safe to place inside the rendered block.
+///
+/// The block is a fenced ```` ```text ```` region nested in `<details>`, and a
+/// record is ONE line. A value carrying a fence, a closing `</details>`, or a
+/// newline would otherwise break out of both containers and land as live
+/// markdown in a public issue — GitHub strips `<script>` but renders
+/// `<img src=x onerror=...>` happily, so this is injection, not cosmetics.
+fn sanitize_for_block(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            // A record is one line by construction.
+            '\n' | '\r' => out.push('\u{23ce}'),
+            // Zero-width and bidi controls can hide the rest of a line from a
+            // reviewer reading the preview.
+            c if c.is_control() => out.push('\u{fffd}'),
+            c => out.push(c),
+        }
+    }
+    // Break any fence or container-closing sequence with a zero-width space so
+    // it renders as text and cannot terminate the block.
+    out.replace("```", "`\u{200b}`\u{200b}`")
+        .replace("~~~", "~\u{200b}~\u{200b}~")
+        .replace("</details", "<\u{200b}/details")
+        .replace("<summary", "<\u{200b}summary")
+}
+
+/// Cap a retained value.
+///
+/// `process.rs` already truncates logged args at 512 chars, but `err` and
+/// `message` have no ceiling, and GitHub rejects issue bodies over 65 535
+/// characters — one pathological record should not eat the whole budget.
+fn cap(value: &str) -> String {
+    const MAX: usize = 1_024;
+    if value.chars().count() <= MAX {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(MAX).collect();
+    format!("{kept}...[truncated]")
+}
+
 fn quote_if_spaced(value: &str) -> String {
+    let value = sanitize_for_block(&cap(value));
     if value.contains(char::is_whitespace) {
         format!("\"{value}\"")
     } else {
-        value.to_string()
+        value
     }
 }
 
@@ -300,6 +440,39 @@ pub fn render_block(records: &[DiagnosticRecord]) -> String {
     }
     out.push_str("```\n");
     out
+}
+
+/// The effective user's home from the password database, for environments that
+/// strip `HOME`.
+fn passwd_home() -> Option<String> {
+    passwd_field(|entry| entry.pw_dir)
+}
+
+/// The effective user's name from the password database, for environments that
+/// strip `USER`.
+fn passwd_name() -> Option<String> {
+    passwd_field(|entry| entry.pw_name)
+}
+
+fn passwd_field(select: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
+    // SAFETY: getpwuid returns a pointer into a static buffer owned by libc, or
+    // null. The value is copied into an owned String before returning, so the
+    // borrow does not outlive the call. Single-threaded use at report time.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() {
+            return None;
+        }
+        let field = select(&*entry);
+        if field.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(field)
+            .to_str()
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +574,106 @@ mod tests {
         }
         // Still diagnostic.
         assert!(out.contains("event=remote.install"), "{out}");
+    }
+
+    // ---- Red-team regressions -------------------------------------------
+    //
+    // Each of these was a demonstrated leak against the first implementation.
+
+    #[test]
+    fn attack_value_cannot_escape_the_markdown_fence() {
+        let out = rendered(
+            r#"{"timestamp":"t","level":"ERROR","message":"boom","target":"flk::logging","err":"parse failed near ```\n</details>\n\n# INJECTED\n<img src=x onerror=alert(1)>"}"#,
+        );
+        assert!(!out.contains("```"), "fence escaped: {out}");
+        assert!(!out.contains("</details"), "container escaped: {out}");
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "record broke onto several lines: {out}"
+        );
+    }
+
+    #[test]
+    fn attack_bare_internal_hostname_is_masked() {
+        let out = rendered(
+            r#"{"timestamp":"t","level":"WARN","message":"ssh bridge failed","target":"flk::logging","err":"Could not resolve hostname bastion.internal.acme.corp: nodename nor servname provided"}"#,
+        );
+        assert!(!out.contains("acme"), "{out}");
+        assert!(!out.contains("bastion"), "{out}");
+    }
+
+    #[test]
+    fn attack_ipv6_is_masked() {
+        let out = rendered(
+            r#"{"timestamp":"t","level":"WARN","message":"connect failed","target":"flk::logging","err":"connect to [2001:db8:85a3::8a2e:370:7334]:22 refused"}"#,
+        );
+        assert!(!out.contains("2001:db8"), "{out}");
+    }
+
+    #[test]
+    fn attack_underscored_secret_labels_are_masked() {
+        let scrubber = scrubber();
+        for input in [
+            "auth failed: refresh_token=1//0abcDEFghiJKL_opaque",
+            "client_secret: s3cr3t-value",
+            "github_token=abcdefghijklmnop",
+            "Cookie: session=deadbeefcafe",
+        ] {
+            let masked = scrubber.scrub(input);
+            assert!(masked.contains("<redacted>"), "not masked: {masked}");
+        }
+    }
+
+    #[test]
+    fn attack_scrubber_still_masks_when_home_and_user_are_unset() {
+        // A server started by systemd/launchd has neither set — flock#232's
+        // exact class of stripped-environment bug.
+        let bare = Scrubber::new(None, None);
+        let masked = bare.scrub("spawned for ops@int.acme.corp from /home/someone/x");
+        assert!(!masked.contains("acme"), "{masked}");
+        assert!(!masked.contains("someone"), "{masked}");
+    }
+
+    #[test]
+    fn attack_git_remote_does_not_leak_org_or_repo() {
+        let masked = scrubber().scrub("cloned git@github.com:acmecorp/prod-secrets-vault.git");
+        assert!(!masked.contains("acmecorp"), "{masked}");
+        assert!(!masked.contains("prod-secrets-vault"), "{masked}");
+    }
+
+    #[test]
+    fn two_character_usernames_are_still_masked() {
+        let masked = Scrubber::new(Some("/home/al".into()), Some("al".into()))
+            .scrub("process spawned by al");
+        assert!(!masked.contains(" al"), "{masked}");
+    }
+
+    #[test]
+    fn oversized_values_are_capped() {
+        let line = format!(
+            r#"{{"timestamp":"t","level":"ERROR","message":"boom","target":"flk::logging","err":"{}"}}"#,
+            "x".repeat(50_000)
+        );
+        let out = rendered(&line);
+        assert!(out.len() < 2_000, "value not capped: {} chars", out.len());
+        assert!(out.contains("[truncated]"), "{out}");
+    }
+
+    #[test]
+    fn diagnostic_text_survives_the_new_rules() {
+        // Over-masking would make the block useless. These must NOT be touched.
+        let scrubber = scrubber();
+        for keep in [
+            "No such file or directory (os error 2)",
+            "process exec completed",
+            "flock-server.log",
+            "flk::logging",
+            "0.6.8-fork.85ce040",
+            "protocol 24 vs 25",
+        ] {
+            assert_eq!(scrubber.scrub(keep), keep, "wrongly masked {keep:?}");
+        }
     }
 
     #[test]

@@ -122,12 +122,19 @@ fn advisories(inputs: &ReportInputs) -> Vec<Advisory> {
 fn is_placeholder(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     let stripped = normalized.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    // Counted in chars, not bytes: a byte length would flag "aaa\u{1f600}aaa"
+    // while letting four CJK characters through, and neither has anything to do
+    // with whether a reproduction is real.
+    //
+    // The threshold only catches near-empty text. "git push" and "make test" are
+    // complete reproductions, and an advisory that cries wolf on them stops
+    // being read at all — which costs more than the placeholders it would catch.
     stripped.is_empty()
         || matches!(
             stripped,
             "na" | "n a" | "none" | "todo" | "tbd" | "unknown" | "see above" | "not sure"
         )
-        || stripped.len() < 12
+        || stripped.chars().count() < 4
 }
 
 fn render_preview(
@@ -252,6 +259,17 @@ mod tests {
     fn accepts_a_real_reproduction() {
         let composed = compose(&inputs("run `flk worktree create --branch x` in any repo"));
         assert!(!composed.advisories.contains(&Advisory::ThinReproduction));
+    }
+
+    #[test]
+    fn short_but_genuine_reproductions_are_not_nagged() {
+        for real in ["git push", "make test", "cargo run", "flk web"] {
+            let composed = compose(&inputs(real));
+            assert!(
+                !composed.advisories.contains(&Advisory::ThinReproduction),
+                "{real:?} was wrongly flagged"
+            );
+        }
     }
 
     #[test]

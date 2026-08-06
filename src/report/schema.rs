@@ -84,7 +84,12 @@ impl ReportProvenance {
                 channel: crate::build_info::channel().to_string(),
                 commit: crate::build_info::commit().map(str::to_string),
                 protocol: crate::protocol::PROTOCOL_VERSION,
-                binary: crate::cli::status::current_exe_label(),
+                // Scrubbed AT COLLECTION, not at render: `current_exe_label`
+                // returns an absolute path carrying the username, and this
+                // struct exists to be published. Masking here means no future
+                // caller can serialize the raw value by accident.
+                binary: super::redact::Scrubber::from_env()
+                    .scrub(&crate::cli::status::current_exe_label()),
             },
             server: ServerProvenance::from_runtime(server),
             host: HostProvenance::collect(),
@@ -115,6 +120,9 @@ impl ReportProvenance {
             out.push_str(&format!("- Shell: {shell}\n"));
         }
         out.push_str(&format!("- Client protocol: {}\n", self.client.protocol));
+        // #232 showed the resolved binary path is genuinely diagnostic — it is
+        // how a Nix store path or an unexpected install location gets noticed.
+        out.push_str(&format!("- Binary: {}\n", self.client.binary));
         out.push_str(&format!("- Server: {}", self.server.status));
         if let Some(version) = &self.server.version {
             out.push_str(&format!(" (version {version}"));
@@ -211,6 +219,19 @@ mod tests {
                 term_program: Some("Alacritty".into()),
                 shell: Some("zsh".into()),
             },
+        }
+    }
+
+    #[test]
+    fn binary_path_is_masked_before_it_can_be_published() {
+        let collected = ReportProvenance::collect(&ServerRuntimeStatus::NotRunning);
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.len() > 1 {
+            assert!(
+                !collected.client.binary.contains(&home),
+                "raw home path in provenance: {}",
+                collected.client.binary
+            );
         }
     }
 

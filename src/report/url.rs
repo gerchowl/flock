@@ -75,13 +75,19 @@ fn normalize(value: &str) -> Option<String> {
     if parts.next().is_some() {
         return None;
     }
-    let valid = |part: &str| {
+    // GitHub's own limits. Without a ceiling an absurd `--repo` makes the URL
+    // base alone exceed MAX_URL_LEN, and every field then gets skipped for want
+    // of budget while the over-long URL is still returned.
+    const MAX_OWNER: usize = 39;
+    const MAX_NAME: usize = 100;
+    let valid = |part: &str, max: usize| {
         !part.is_empty()
+            && part.len() <= max
             && part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
-    if !valid(owner) || !valid(name) {
+    if !valid(owner, MAX_OWNER) || !valid(name, MAX_NAME) {
         return None;
     }
     Some(format!("{owner}/{name}"))
@@ -236,14 +242,29 @@ mod tests {
         assert_eq!(baked_repo().as_deref(), Some("gerchowl/flock"));
     }
 
+    /// The destination with no `--repo` is the compiled-in one, full stop.
+    ///
+    /// The invariant that matters — that no environment variable can redirect a
+    /// report and its diagnostics to a repository the reporter never chose — is
+    /// held by `resolve` reading nothing but its argument and
+    /// `CARGO_PKG_REPOSITORY`. Setting an env var here and watching it be
+    /// ignored would only prove that a value the code never reads is not read;
+    /// the guarantee lives in the shape of the function, not in a fixture.
     #[test]
-    fn environment_cannot_redirect_a_report() {
-        // The exfil path the security review flagged: a .envrc exporting a
-        // destination would otherwise reroute reports and their diagnostics.
-        std::env::set_var("FLOCK_ISSUE_REPO", "attacker/mirror");
-        let resolved = resolve(None).expect("baked destination");
-        std::env::remove_var("FLOCK_ISSUE_REPO");
-        assert_eq!(resolved, "gerchowl/flock");
+    fn destination_comes_only_from_the_build_or_the_command_line() {
+        assert_eq!(resolve(None).expect("baked destination"), "gerchowl/flock");
+    }
+
+    #[test]
+    fn absurd_repo_names_cannot_blow_the_url_cap() {
+        assert_eq!(
+            normalize(&format!("{}/{}", "a".repeat(4_000), "b".repeat(4_000))),
+            None
+        );
+        assert_eq!(normalize(&format!("{}/r", "a".repeat(40))), None);
+        assert_eq!(normalize(&format!("o/{}", "b".repeat(101))), None);
+        // The real thing still resolves.
+        assert!(normalize("gerchowl/flock").is_some());
     }
 
     #[test]

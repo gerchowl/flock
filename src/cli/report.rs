@@ -138,6 +138,16 @@ fn run_report(kind: ReportKind, args: &[String]) -> std::io::Result<i32> {
             report::only_problems(records)
         };
         let keep = options.records.unwrap_or(DEFAULT_RECORDS);
+        if records.len() < keep && !options.all_levels {
+            // The pre-filter window is a multiple of the ask, so a quiet period
+            // dominated by INFO can yield fewer. Silence here would read as
+            // "that is all there was".
+            eprintln!(
+                "note: found {} warning/error records, fewer than the {keep} requested — \
+                 pass --all-levels to include routine activity",
+                records.len()
+            );
+        }
         let start = records.len().saturating_sub(keep);
         records[start..].to_vec()
     };
@@ -305,21 +315,31 @@ fn gather_prose(kind: ReportKind, options: &Options) -> Result<BTreeMap<String, 
 
 /// Read a filled skeleton back. `## <field-id>` starts a section; HTML comment
 /// lines are guidance and never content.
+///
+/// Headings inside a fenced code block are content, not structure. Reproduction
+/// steps routinely paste shell transcripts and markdown, and treating a `##`
+/// inside a fence as a new section silently truncated the rest of the report.
 fn parse_skeleton(content: &str) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let mut current: Option<String> = None;
+    let mut in_fence = false;
     for line in content.lines() {
-        if let Some(heading) = line.trim().strip_prefix("## ") {
-            current = Some(heading.trim().to_string());
-            continue;
-        }
         let trimmed = line.trim();
-        if trimmed.starts_with("<!--") {
-            continue;
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if let Some(heading) = trimmed.strip_prefix("## ") {
+                current = Some(heading.trim().to_string());
+                continue;
+            }
+            if trimmed.starts_with("<!--") {
+                continue;
+            }
         }
         if let Some(field) = &current {
-            out.entry(field.clone()).or_default().push_str(line);
-            out.entry(field.clone()).or_default().push('\n');
+            let section = out.entry(field.clone()).or_default();
+            section.push_str(line);
+            section.push('\n');
         }
     }
     out.into_iter()
@@ -393,6 +413,17 @@ mod tests {
             Some("step one\nstep two")
         );
         assert_eq!(parsed.get("impact").map(String::as_str), Some("bad"));
+    }
+
+    #[test]
+    fn headings_inside_a_fence_are_content_not_structure() {
+        let parsed = parse_skeleton(
+            "## reproduction\nRun these:\n```sh\n## installing\nmake test\n```\nThen it dies.\n",
+        );
+        let repro = parsed.get("reproduction").expect("reproduction survived");
+        assert!(repro.contains("## installing"), "{repro}");
+        assert!(repro.contains("Then it dies."), "{repro}");
+        assert!(!parsed.contains_key("installing"));
     }
 
     #[test]
