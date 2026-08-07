@@ -786,9 +786,13 @@ mod tests {
                 "banner row {offset} was overdrawn: {row:?}"
             );
         }
+        // The toast box occupies the row after the banner: its border row, then
+        // its title. Assert on the title rather than a border glyph, which would
+        // break on any change to the border set.
         assert!(
-            rows[usize::from(banner_top) + 4].contains('┌'),
-            "toast should start on the row after the banner"
+            rows[usize::from(banner_top) + 5].contains("reloaded config"),
+            "toast should start on the row after the banner, rows were {:?}",
+            &rows[usize::from(banner_top)..usize::from(banner_top) + 7]
         );
     }
 
@@ -853,6 +857,16 @@ mod tests {
                 "banner row {offset} was overdrawn by the copy feedback"
             );
         }
+        // Surviving banner rows are only half the claim — the feedback has to land
+        // somewhere visible below them, not be pushed off the bottom of the frame.
+        let feedback_row = rows
+            .iter()
+            .position(|row| row.contains("copied to clipboard"))
+            .expect("copy feedback should still be on screen");
+        assert!(
+            feedback_row > banner_top + 2,
+            "copy feedback landed at row {feedback_row}, on or above the banner"
+        );
     }
 
     /// Widths came from `str::len`, which counts bytes. The real deprecation
@@ -887,10 +901,13 @@ mod tests {
         let rows = rendered_rows(&app, area);
         let hit = app.view.toast_hit_area;
 
+        // The title sits one row inside the box, so the hit area's top row plus one
+        // is where the toast actually announces itself.
         assert!(
-            rows[usize::from(hit.y)].contains('┌'),
-            "toast hit area starts at row {} but the toast border is elsewhere",
-            hit.y
+            rows[usize::from(hit.y) + 1].contains("reloaded config"),
+            "toast hit area starts at row {} but the toast renders elsewhere: {:?}",
+            hit.y,
+            rows
         );
     }
 
