@@ -231,6 +231,7 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "reset-keys" => config_reset_keys(&args[1..]),
         "edit" => config_edit(&args[1..]),
+        "check" => config_check(&args[1..]),
         "help" | "--help" | "-h" => {
             print_config_help();
             Ok(0)
@@ -238,6 +239,99 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
         _ => {
             print_config_help();
             Ok(2)
+        }
+    }
+}
+
+/// Exit codes for `flk config check`. The split between "loaded with warnings"
+/// and "did not load" is what makes the command usable as a deploy gate: a
+/// deprecation rename should not block a rollout, a config that leaves the
+/// session running on defaults should (#240).
+const CONFIG_CHECK_ADVISORY: i32 = 1;
+const CONFIG_CHECK_PARSE_FAILURE: i32 = 2;
+
+fn config_check(args: &[String]) -> std::io::Result<i32> {
+    let mut explicit_path: Option<String> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--path" => match rest.next() {
+                Some(path) => explicit_path = Some(path.clone()),
+                None => {
+                    eprintln!("usage: flk config check [--path PATH]");
+                    return Ok(CONFIG_CHECK_PARSE_FAILURE);
+                }
+            },
+            other => {
+                if let Some(path) = other.strip_prefix("--path=") {
+                    explicit_path = Some(path.to_string());
+                } else {
+                    eprintln!("usage: flk config check [--path PATH]");
+                    return Ok(CONFIG_CHECK_PARSE_FAILURE);
+                }
+            }
+        }
+    }
+
+    // Point the loader at the requested file. `config_path` and
+    // `config_overlay_path` both read this, so `--path` gets the same
+    // base + `config.local.toml` layering the running app resolves. Read-only:
+    // nothing here writes a file or talks to the server.
+    if let Some(path) = &explicit_path {
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, path);
+    }
+
+    let checked = crate::config::config_path();
+    match config_check_outcome() {
+        ConfigCheckOutcome::Clean => {
+            println!("{}: ok", checked.display());
+            Ok(0)
+        }
+        ConfigCheckOutcome::Warnings(diagnostics) => {
+            let count = diagnostics.len();
+            let noun = if count == 1 { "warning" } else { "warnings" };
+            eprintln!("{}: {count} {noun}", checked.display());
+            for diagnostic in &diagnostics {
+                eprintln!("  {diagnostic}");
+            }
+            Ok(CONFIG_CHECK_ADVISORY)
+        }
+        ConfigCheckOutcome::DidNotLoad(diagnostics) => {
+            eprintln!("{}: config did not load", checked.display());
+            for diagnostic in &diagnostics {
+                eprintln!("  {diagnostic}");
+            }
+            Ok(CONFIG_CHECK_PARSE_FAILURE)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigCheckOutcome {
+    Clean,
+    /// The config loaded; these are advisory. Every diagnostic is carried, not
+    /// the four-line summary the TUI banner shows.
+    Warnings(Vec<String>),
+    /// The config did not load at all — the session would run on defaults.
+    DidNotLoad(Vec<String>),
+}
+
+fn config_check_outcome() -> ConfigCheckOutcome {
+    match crate::config::load_live_config() {
+        Err(diagnostics) => ConfigCheckOutcome::DidNotLoad(diagnostics),
+        Ok(loaded) => {
+            // `load_live_config` reports parse- and section-level problems, but
+            // keybind conflicts and deprecation renames only surface once the
+            // bindings are actually resolved — and those are the warnings this
+            // command mostly exists to catch.
+            let mut diagnostics = loaded.diagnostics;
+            diagnostics.extend(loaded.config.collect_diagnostics());
+
+            if diagnostics.is_empty() {
+                ConfigCheckOutcome::Clean
+            } else {
+                ConfigCheckOutcome::Warnings(diagnostics)
+            }
         }
     }
 }
@@ -924,6 +1018,10 @@ fn print_config_help() {
     eprintln!("flk config commands:");
     eprintln!("  flk config edit        open the live config (or overlay) in $EDITOR");
     eprintln!("  flk config reset-keys  back up config.toml and remove custom keybindings");
+    eprintln!("  flk config check [--path PATH]");
+    eprintln!("                         validate a config without starting or touching a server");
+    eprintln!("                         exit 0 clean · 1 warnings · 2 did not load");
+    eprintln!("                         (unrelated to `flk checks`, which runs health checks)");
 }
 
 fn print_terminal_help() {
@@ -951,6 +1049,161 @@ fn print_session_help() {
 
 fn _print_json<T: Serialize>(value: &T) {
     println!("{}", serde_json::to_string(value).unwrap());
+}
+
+#[cfg(test)]
+mod config_check_tests {
+    use super::{ConfigCheckOutcome, CONFIG_CHECK_ADVISORY, CONFIG_CHECK_PARSE_FAILURE};
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{label}-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run `flk config check --path <base>` and hand back both the outcome and
+    /// the exit code, so the two can't drift apart in a test.
+    fn check(base: &std::path::Path) -> (ConfigCheckOutcome, i32) {
+        let _guard = crate::config::test_config_env_guard();
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        let args = vec!["--path".to_string(), base.display().to_string()];
+        let code = super::config_check(&args).expect("check runs");
+        let outcome = super::config_check_outcome();
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        (outcome, code)
+    }
+
+    #[test]
+    fn clean_config_exits_zero() {
+        let dir = unique_dir("flk-config-check-clean");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "onboarding = false\n").unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(outcome, ConfigCheckOutcome::Clean);
+        assert_eq!(code, 0);
+    }
+
+    /// The warning that motivated the command: a rename that still works, so the
+    /// config loads and the exit code must stay out of parse-failure territory.
+    #[test]
+    fn deprecated_keybinding_is_advisory() {
+        let dir = unique_dir("flk-config-check-deprecated");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "[keys]\nswitch_workspace = \"prefix+shift+1..9\"\n").unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+            panic!("expected advisory warnings, got {outcome:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("keys.switch_workspace was renamed to keys.switch_space")),
+            "{diagnostics:?}"
+        );
+    }
+
+    /// Conflicts only exist once the bindings are resolved — a check that merely
+    /// parsed TOML would call this config clean.
+    #[test]
+    fn keybind_conflict_is_detected_not_just_toml_syntax() {
+        let dir = unique_dir("flk-config-check-conflict");
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            "[keys]\nnew_workspace = \"ctrl+shift+j\"\nnew_tab = \"ctrl+shift+j\"\n",
+        )
+        .unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+            panic!("expected a conflict warning, got {outcome:?}");
+        };
+        assert!(
+            diagnostics.iter().any(|d| d.contains("ctrl+shift+j")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn unparseable_config_exits_two() {
+        let dir = unique_dir("flk-config-check-broken");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "this is not = = toml\n").unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_PARSE_FAILURE);
+        assert!(matches!(outcome, ConfigCheckOutcome::DidNotLoad(_)));
+    }
+
+    /// The banner truncates to four warnings plus "and N more"; the CLI is the
+    /// surface that has room to print all of them.
+    #[test]
+    fn every_diagnostic_is_reported_past_the_banner_cap() {
+        let dir = unique_dir("flk-config-check-many");
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            "[keys]\n\
+             new_workspace = \"ctrl+shift+j\"\n\
+             new_tab = \"ctrl+shift+j\"\n\
+             close_pane = \"ctrl+shift+k\"\n\
+             zoom = \"ctrl+shift+k\"\n\
+             split_vertical = \"ctrl+shift+l\"\n\
+             split_horizontal = \"ctrl+shift+l\"\n\
+             rename_tab = \"ctrl+shift+p\"\n\
+             rename_pane = \"ctrl+shift+p\"\n\
+             switch_workspace = \"prefix+shift+1..9\"\n",
+        )
+        .unwrap();
+
+        let (outcome, _) = check(&base);
+        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+            panic!("expected warnings, got {outcome:?}");
+        };
+        assert!(
+            diagnostics.len() > 4,
+            "the CLI must not truncate like the banner: {diagnostics:?}"
+        );
+    }
+
+    /// `--path` is for checking a file that is not the live config — a Nix build
+    /// checks a store path before anything is activated.
+    #[test]
+    fn path_flag_leaves_the_live_config_untouched() {
+        let dir = unique_dir("flk-config-check-path");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "onboarding = false\n").unwrap();
+        let before = std::fs::read_to_string(&base).unwrap();
+
+        let (_, code) = check(&base);
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read_to_string(&base).unwrap(), before);
+        assert!(!dir.join("config.local.toml").exists());
+    }
+
+    #[test]
+    fn missing_path_argument_is_a_usage_error() {
+        let _guard = crate::config::test_config_env_guard();
+        assert_eq!(
+            super::config_check(&["--path".to_string()]).expect("runs"),
+            CONFIG_CHECK_PARSE_FAILURE
+        );
+        assert_eq!(
+            super::config_check(&["--bogus".to_string()]).expect("runs"),
+            CONFIG_CHECK_PARSE_FAILURE
+        );
+    }
 }
 
 #[cfg(test)]

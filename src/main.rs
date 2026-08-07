@@ -490,6 +490,10 @@ fn main() -> io::Result<()> {
                 "Reload config.toml in the running server",
             ),
             (
+                "flk config check",
+                "Validate config.toml; exits non-zero on warnings",
+            ),
+            (
                 "flk config reset-keys",
                 "Back up config.toml and remove custom keybindings",
             ),
