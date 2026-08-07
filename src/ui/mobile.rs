@@ -177,15 +177,16 @@ pub(crate) fn render_mobile_header(
     render_switch_button(app, frame, switch);
 }
 
-pub(crate) fn mobile_toast_banner_rect(area: Rect, offset_for_warning: bool) -> Rect {
+/// The mobile toast is pinned to the bottom edge. The config-warning banner is
+/// pinned to the top of the terminal area, so the two never collide and the
+/// banner takes no part in this placement — it used to lift the toast a row for
+/// nothing (#239).
+pub(crate) fn mobile_toast_banner_rect(area: Rect) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect::default();
     }
 
-    let y = area.y
-        + area
-            .height
-            .saturating_sub(1 + if offset_for_warning { 1 } else { 0 });
+    let y = area.y + area.height.saturating_sub(1);
     Rect::new(area.x, y, area.width, 1)
 }
 
@@ -193,7 +194,6 @@ pub(crate) fn render_mobile_toast_banner(
     frame: &mut Frame,
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
     p: &Palette,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -205,7 +205,7 @@ pub(crate) fn render_mobile_toast_banner(
         ToastKind::Finished => p.blue,
         ToastKind::UpdateInstalled => p.accent,
     };
-    let banner = mobile_toast_banner_rect(area, offset_for_warning);
+    let banner = mobile_toast_banner_rect(area);
     let bg = p.surface0;
 
     frame.render_widget(Clear, banner);

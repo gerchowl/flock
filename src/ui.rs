@@ -61,8 +61,8 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
-    config_diagnostic_lines, copy_feedback_rect, render_config_diagnostic, render_copy_feedback,
-    render_status_line, render_toast_notification, toast_notification_rect,
+    banner_offset_in_frame, config_diagnostic_lines, copy_feedback_rect, render_config_diagnostic,
+    render_copy_feedback, render_status_line, render_toast_notification, toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -312,7 +312,7 @@ fn compute_view_internal(
             toast_notification_rect(
                 area,
                 toast,
-                app.config_diagnostic.is_some(),
+                banner_offset_in_frame(terminal_area, area, banner_lines.len() as u16),
                 toast.position.unwrap_or(app.toast_config().flock.position),
             )
         })
@@ -397,7 +397,7 @@ fn compute_mobile_view(
     let toast_hit_area = app
         .toast
         .as_ref()
-        .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
+        .map(|_| mobile_toast_banner_rect(area))
         .unwrap_or_default();
 
     app.view = crate::app::ViewState {
@@ -544,77 +544,64 @@ pub fn render_with_runtime_registry(
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
     let banner_lines = app.view.config_diagnostic_lines.as_slice();
-    let has_config_diagnostic = !banner_lines.is_empty();
-    if has_config_diagnostic {
+    let banner_rows = banner_lines.len() as u16;
+    if banner_rows > 0 {
         render_config_diagnostic(frame, terminal_area, banner_lines, &app.palette);
     }
-    let mut copy_feedback_offset = u16::from(has_config_diagnostic);
+
+    // Rows consumed at the top of `terminal_area`: the banner, then the action
+    // notice stacked directly under it.
+    let mut top_rows = banner_rows;
     if let Some(notice) = &app.action_notice {
-        self::status::render_action_notice(
-            frame,
-            terminal_area,
-            copy_feedback_offset,
-            notice,
-            &app.palette,
-        );
-        copy_feedback_offset += 1;
+        self::status::render_action_notice(frame, terminal_area, top_rows, notice, &app.palette);
+        top_rows += 1;
     }
+
+    // The banner and the action notice are placed against `terminal_area`, but the
+    // toast — and the copy feedback on mobile — are placed against the whole frame.
+    // Translate between the two so "below the banner" means the same absolute row
+    // in either space; offsetting by a raw row count ignored the sidebar/tab-bar
+    // inset and let the toast land back on top of the banner (#239).
+    let frame_area = frame.area();
+    let to_frame_space = |rows: u16| banner_offset_in_frame(terminal_area, frame_area, rows);
+
     let mut toast_rect = None;
+    let mut bottom_rows = 0u16;
     if let Some(toast) = &app.toast {
         if app.view.layout == ViewLayout::Mobile {
-            render_mobile_toast_banner(
-                frame,
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                &app.palette,
-            );
+            render_mobile_toast_banner(frame, frame_area, toast, &app.palette);
+            bottom_rows = bottom_rows.saturating_add(1);
         } else {
             let position = toast.position.unwrap_or(app.toast_config().flock.position);
-            render_toast_notification(
-                frame,
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                position,
-                &app.palette,
-            );
-            toast_rect = Some(toast_notification_rect(
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                position,
-            ));
-        }
-        if app.view.layout == ViewLayout::Mobile {
-            copy_feedback_offset = copy_feedback_offset.saturating_add(1);
+            let offset = to_frame_space(banner_rows);
+            render_toast_notification(frame, frame_area, toast, offset, position, &app.palette);
+            toast_rect = Some(toast_notification_rect(frame_area, toast, offset, position));
         }
     }
     if let Some(feedback) = &app.copy_feedback {
-        let area = if app.view.layout == ViewLayout::Mobile {
-            frame.area()
-        } else {
-            terminal_area
-        };
+        let mobile = app.view.layout == ViewLayout::Mobile;
+        let area = if mobile { frame_area } else { terminal_area };
         let position = app.toast_config().clipboard.position;
+        // Only count rows consumed at the edge this feedback actually anchors to.
+        let mut offset = if clipboard_position_is_top(position) {
+            if mobile {
+                to_frame_space(top_rows)
+            } else {
+                top_rows
+            }
+        } else {
+            bottom_rows
+        };
         if let Some(toast_rect) = toast_rect {
-            copy_feedback_offset = copy_feedback_offset_for_toast(
-                area,
-                feedback,
-                copy_feedback_offset,
-                position,
-                toast_rect,
-            );
+            offset = copy_feedback_offset_for_toast(area, feedback, offset, position, toast_rect);
         }
-        render_copy_feedback(
-            frame,
-            area,
-            feedback,
-            copy_feedback_offset,
-            position,
-            &app.palette,
-        );
+        render_copy_feedback(frame, area, feedback, offset, position, &app.palette);
     }
+}
+
+fn clipboard_position_is_top(position: crate::config::ToastClipboardPosition) -> bool {
+    use crate::config::ToastClipboardPosition as P;
+    matches!(position, P::TopLeft | P::TopCenter | P::TopRight)
 }
 
 fn copy_feedback_offset_for_toast(
@@ -749,6 +736,141 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         assert_eq!(app.view.mobile_header_rect, Rect::new(0, 0, 80, 2));
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 80, 18));
+    }
+
+    /// A desktop app with one workspace and `diagnostic` showing. Returns the app
+    /// plus the area to render into; `terminal_area.y` is where the banner starts.
+    fn app_with_config_diagnostic(diagnostic: &str) -> (crate::app::state::AppState, Rect) {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.config_diagnostic = Some(diagnostic.to_string());
+        (app, Rect::new(0, 0, 100, 20))
+    }
+
+    fn top_right_toast() -> crate::app::state::ToastNotification {
+        crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::UpdateInstalled,
+            title: "reloaded config".to_string(),
+            context: "with warnings".to_string(),
+            position: Some(crate::config::ToastFlockPosition::TopRight),
+            target: None,
+        }
+    }
+
+    fn rendered_rows(app: &crate::app::state::AppState, area: Rect) -> Vec<String> {
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| buffer_row_text(buffer, Rect::new(0, row, area.width, 1), row))
+            .collect()
+    }
+
+    /// Every banner row has to survive a toast stacked below it. The stack used to
+    /// offset by a hardcoded single row, so rows 2..N got overdrawn (#239).
+    #[test]
+    fn banner_and_toast_do_not_overdraw_with_four_lines() {
+        let (mut app, area) = app_with_config_diagnostic("one\ntwo\nthree\nfour");
+        app.toast = Some(top_right_toast());
+        compute_view(&mut app, area);
+        let banner_top = app.view.terminal_area.y;
+        let rows = rendered_rows(&app, area);
+
+        for (offset, warning) in ["one", "two", "three", "four"].iter().enumerate() {
+            let row = &rows[usize::from(banner_top) + offset];
+            assert!(
+                row.contains(&format!("config warning: {warning}")),
+                "banner row {offset} was overdrawn: {row:?}"
+            );
+        }
+        assert!(
+            rows[usize::from(banner_top) + 4].contains('┌'),
+            "toast should start on the row after the banner"
+        );
+    }
+
+    /// `config_diagnostic_summary` caps at four warnings plus an "and N more"
+    /// line, so five rows is the widest the banner ever gets.
+    #[test]
+    fn banner_and_toast_do_not_overdraw_at_the_five_line_cap() {
+        let diagnostics: Vec<String> = (1..=5).map(|n| format!("warning number {n}")).collect();
+        let summary = crate::config::config_diagnostic_summary(&diagnostics)
+            .expect("five diagnostics summarise");
+        let (mut app, area) = app_with_config_diagnostic(&summary);
+        app.toast = Some(top_right_toast());
+        compute_view(&mut app, area);
+        let banner_top = app.view.terminal_area.y;
+        assert_eq!(app.view.config_diagnostic_lines.len(), 5);
+        let rows = rendered_rows(&app, area);
+
+        for offset in 0..4 {
+            assert!(
+                rows[usize::from(banner_top) + offset].contains("warning number"),
+                "banner row {offset} was overdrawn"
+            );
+        }
+        assert!(
+            rows[usize::from(banner_top) + 4].contains("and 1 more config warnings"),
+            "the overflow line was overdrawn"
+        );
+    }
+
+    /// The two-warning case is the one that actually shows up on a fleet: one
+    /// shipped config, the same banner on every node.
+    #[test]
+    fn banner_and_action_notice_do_not_overdraw_with_two_lines() {
+        let (mut app, area) = app_with_config_diagnostic("first warning\nsecond warning");
+        app.action_notice = Some("copied worktree path".into());
+        compute_view(&mut app, area);
+        let banner_top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+
+        assert!(rows[banner_top].contains("config warning: first warning"));
+        assert!(rows[banner_top + 1].contains("config warning: second warning"));
+        assert!(
+            rows[banner_top + 2].contains("copied worktree path"),
+            "action notice belongs under the whole banner, not on its second row"
+        );
+    }
+
+    #[test]
+    fn banner_and_copy_feedback_do_not_overdraw_with_three_lines() {
+        let (mut app, area) = app_with_config_diagnostic("alpha\nbeta\ngamma");
+        app.config.ui.toast.clipboard.position = crate::config::ToastClipboardPosition::TopRight;
+        app.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied to clipboard".into(),
+        });
+        compute_view(&mut app, area);
+        let banner_top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+
+        for (offset, warning) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            assert!(
+                rows[banner_top + offset].contains(&format!("config warning: {warning}")),
+                "banner row {offset} was overdrawn by the copy feedback"
+            );
+        }
+    }
+
+    /// The hit area is computed in `compute_view` and the toast is drawn in
+    /// `render`; if they translate the banner offset differently, clicks land on
+    /// empty cells.
+    #[test]
+    fn toast_hit_area_agrees_with_the_rendered_toast_below_a_banner() {
+        let (mut app, area) = app_with_config_diagnostic("one\ntwo\nthree\nfour");
+        app.toast = Some(top_right_toast());
+        compute_view(&mut app, area);
+        let rows = rendered_rows(&app, area);
+        let hit = app.view.toast_hit_area;
+
+        assert!(
+            rows[usize::from(hit.y)].contains('┌'),
+            "toast hit area starts at row {} but the toast border is elsewhere",
+            hit.y
+        );
     }
 
     #[test]

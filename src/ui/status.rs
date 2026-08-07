@@ -48,10 +48,31 @@ pub(crate) fn copy_feedback_rect(
     Rect::new(x, y, width, height)
 }
 
+/// Translate a row count measured from the top of `terminal_area` into the
+/// frame-relative offset used by widgets placed against the whole frame.
+///
+/// The banner sits inside the terminal area (below the tab bar, right of the
+/// sidebar) while toasts are placed against the whole frame, so handing the raw
+/// row count to a frame-space widget ignores that inset and lands it back on top
+/// of the banner. Both the hit-area math and the renderer go through here (#239).
+pub(crate) fn banner_offset_in_frame(terminal_area: Rect, frame_area: Rect, rows: u16) -> u16 {
+    if rows == 0 {
+        return 0;
+    }
+    terminal_area
+        .y
+        .saturating_add(rows)
+        .saturating_sub(frame_area.y)
+}
+
+/// `banner_rows` is how many rows the config-warning banner occupies. The banner
+/// is anchored to the top of `area`, so it displaces top-positioned toasts and is
+/// irrelevant to bottom-positioned ones — offsetting those too (as this used to,
+/// by a hardcoded single row) just floated them above the bottom edge (#239).
 pub(crate) fn toast_notification_rect(
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    banner_rows: u16,
     position: ToastFlockPosition,
 ) -> Rect {
     let content_width = (toast.title.len().max(toast.context.len()) as u16) + 4;
@@ -64,13 +85,12 @@ pub(crate) fn toast_notification_rect(
             area.x + area.width.saturating_sub(width)
         }
     };
-    let warning_offset = u16::from(offset_for_warning);
     let y = match position {
         ToastFlockPosition::TopLeft | ToastFlockPosition::TopRight => {
-            area.y + warning_offset.min(area.height)
+            area.y + banner_rows.min(area.height)
         }
         ToastFlockPosition::BottomLeft | ToastFlockPosition::BottomRight => {
-            area.y + area.height.saturating_sub(height + warning_offset)
+            area.y + area.height.saturating_sub(height)
         }
     };
     Rect::new(x, y, width, height)
@@ -80,7 +100,7 @@ pub(super) fn render_toast_notification(
     frame: &mut Frame,
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    banner_rows: u16,
     position: ToastFlockPosition,
     p: &Palette,
 ) {
@@ -89,7 +109,7 @@ pub(super) fn render_toast_notification(
         ToastKind::Finished => p.blue,
         ToastKind::UpdateInstalled => p.accent,
     };
-    let toast_area = toast_notification_rect(area, toast, offset_for_warning, position);
+    let toast_area = toast_notification_rect(area, toast, banner_rows, position);
 
     frame.render_widget(Clear, toast_area);
     let block = Block::default()
