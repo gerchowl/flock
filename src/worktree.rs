@@ -743,7 +743,10 @@ fn branch_has_no_unique_commits(root: &str, branch: &str) -> bool {
             root,
             "rev-list",
             "--count",
-            branch,
+            // Fully qualified: a same-named tag outranks the branch in git's
+            // ambiguity order, and walking the tag's commit instead would make
+            // the branch's own work look like it lives elsewhere (#243).
+            &branch_ref(branch),
             "--not",
             // --exclude applies to the *next* ref glob, and its pattern is
             // relative to that glob's namespace: bare name for --branches,
@@ -760,6 +763,19 @@ fn branch_has_no_unique_commits(root: &str, branch: &str) -> bool {
     .ok()
     .and_then(|count| count.trim().parse::<u64>().ok())
     .is_some_and(|count| count == 0)
+}
+
+/// `refs/heads/<branch>` — the unambiguous spelling for any git argument that
+/// takes a commit-ish.
+///
+/// A bare branch name is ambiguous: `refs/tags/<name>` is checked before
+/// `refs/heads/<name>`, so with a release tag and a hotfix branch sharing a
+/// name (`v1.0`), every commit-ish argument in the gate silently resolves to
+/// the tag. That reads the wrong history and, because the tag usually sits on
+/// the default branch, produces *positive* deletion evidence for a branch whose
+/// work exists nowhere else (#243).
+fn branch_ref(branch: &str) -> String {
+    format!("refs/heads/{branch}")
 }
 
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
@@ -785,7 +801,12 @@ pub(crate) fn branch_merge_gate(
     branch: &str,
 ) -> WorktreeMergeGate {
     let root = repo_root.to_string_lossy().to_string();
-    let local_tip = run_command_capture("git", &["-C", &root, "rev-parse", branch], None).ok();
+    let local_tip = run_command_capture(
+        "git",
+        &["-C", &root, "rev-parse", &branch_ref(branch)],
+        None,
+    )
+    .ok();
     if let Some(evidence) = gh_pr_merged_evidence(
         &["pr", "view", branch, "--json", "state,number,headRefOid"],
         checkout,
@@ -848,7 +869,7 @@ pub(crate) fn branch_merge_gate(
             "branch",
             "-r",
             "--contains",
-            branch,
+            &branch_ref(branch),
             "--format",
             "%(refname:short)",
         ],
@@ -2091,6 +2112,51 @@ prunable stale
             "a branch's own tracking ref is not independent evidence"
         );
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_is_not_fooled_by_a_tag_sharing_the_branch_name() {
+        // git resolves a bare name against refs/tags BEFORE refs/heads, so a
+        // release tag and a hotfix branch sharing a name (`v1.0` here) made
+        // every commit-ish argument in the gate read the tag's history. The
+        // tag sits on the default branch, so the gate found *positive*
+        // deletion evidence for a branch whose commit exists nowhere else —
+        // both via remote containment and via the unique-commit count (#243).
+        let (repo, _origin) = create_repo_with_bare_origin("merge-gate-tag-collision");
+        let root = repo.display().to_string();
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["push", "--quiet", "origin", &default]);
+        run_git(&repo, &["tag", "-a", "v1.0", "-m", "release"]);
+        run_git(&repo, &["push", "--quiet", "origin", "v1.0"]);
+
+        let checkout = unique_temp_path("merge-gate-tag-collision-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "v1.0",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("hotfix.txt"), "hotfix\n").unwrap();
+        run_git(&checkout, &["add", "hotfix.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "real hotfix work"]);
+
+        assert!(
+            !branch_has_no_unique_commits(&root, "v1.0"),
+            "the branch's commit lives nowhere else — the tag is not it"
+        );
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "v1.0"),
+            WorktreeMergeGate::NotMerged,
+            "a same-named tag must not become evidence for deleting the branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
