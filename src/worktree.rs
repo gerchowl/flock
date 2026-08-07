@@ -845,12 +845,18 @@ pub(crate) fn branch_merge_gate(
                 &root,
                 "branch",
                 "--merged",
-                &default_branch,
+                // The *base* is a commit-ish too, and just as shadowable: a
+                // tag named after the default branch answers this question
+                // about the wrong commit (#243).
+                &branch_ref(&default_branch),
                 "--format",
                 "%(refname:short)",
             ],
             None,
         ) {
+            // The listed names are compared bare. When a tag shadows one of
+            // them git shortens it to `heads/<name>` instead, which matches
+            // nothing here — the branch is kept, which is the safe answer.
             if merged.lines().any(|line| line.trim() == branch) {
                 return WorktreeMergeGate::Merged {
                     evidence: format!("merged into {default_branch}"),
@@ -2157,6 +2163,76 @@ prunable stale
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_is_not_fooled_by_a_tag_shadowing_the_default_branch() {
+        // The *base* of `git branch --merged <base>` is a commit-ish too, and
+        // shadowable the same way: tag the default branch's name onto some
+        // other commit and the merged set is computed about the wrong history.
+        // A tag pointing forward inflates that set, which is the dangerous
+        // direction — it authorises deleting a branch that is not merged.
+        // Default branch names like `release`, `stable` or `v1` make a
+        // same-named tag entirely plausible.
+        let repo = create_committed_repo("merge-gate-default-shadow");
+        let default = detect_default_branch(&repo).expect("default branch");
+
+        let checkout = unique_temp_path("merge-gate-default-shadow-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "sidework",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("unique.txt"), "unique\n").unwrap();
+        run_git(&checkout, &["add", "unique.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "work only here"]);
+        let side_tip = run_command_capture(
+            "git",
+            &["-C", &checkout.display().to_string(), "rev-parse", "HEAD"],
+            None,
+        )
+        .expect("side tip");
+
+        // A tag named after the default branch, pointing past it.
+        run_git(
+            &repo,
+            &["update-ref", &format!("refs/tags/{default}"), &side_tip],
+        );
+
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "sidework"),
+            WorktreeMergeGate::NotMerged,
+            "a tag shadowing the default branch must not authorise a delete"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_has_no_unique_commits_keeps_the_branch_when_git_fails() {
+        // The count is only evidence when it is readable. Every failure path
+        // — nonzero exit, missing ref, unparsable stdout — has to answer
+        // `false`, because `true` is the answer that deletes a branch.
+        let repo = create_committed_repo("merge-gate-unreadable");
+        let root = repo.display().to_string();
+
+        assert!(
+            !branch_has_no_unique_commits(&root, "no/such/branch"),
+            "a ref that does not resolve is not evidence of anything"
+        );
+        assert!(
+            !branch_has_no_unique_commits("/no/such/repo/path", "main"),
+            "an unreadable repo is not evidence of anything"
+        );
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 
