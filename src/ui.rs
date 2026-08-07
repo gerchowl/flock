@@ -855,6 +855,27 @@ mod tests {
         }
     }
 
+    /// Widths came from `str::len`, which counts bytes. The real deprecation
+    /// warnings contain an em dash, so the banner reserved more columns than it
+    /// drew and stopped meeting the right edge (#239).
+    #[test]
+    fn banner_width_follows_display_columns_not_bytes() {
+        let (mut app, area) = app_with_config_diagnostic("renamed — jumps by section");
+        compute_view(&mut app, area);
+        let banner_top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+        let row = &rows[banner_top];
+
+        // `buffer_row_text` trims the trailing pad column, so a correctly measured
+        // banner reaches exactly one column short of the right edge. Measuring in
+        // bytes over-reserves two columns for the em dash and pulls it left.
+        assert_eq!(
+            row.chars().count(),
+            usize::from(area.width) - 1,
+            "banner should sit flush against the right edge, got {row:?}"
+        );
+    }
+
     /// The hit area is computed in `compute_view` and the toast is drawn in
     /// `render`; if they translate the banner offset differently, clicks land on
     /// empty cells.

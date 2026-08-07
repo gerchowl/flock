@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::widgets::panel_contrast_fg;
+use super::widgets::{display_width, panel_contrast_fg};
 use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
     config::{ToastClipboardPosition, ToastFlockPosition},
@@ -23,7 +23,7 @@ pub(crate) fn copy_feedback_rect(
         return Rect::default();
     }
 
-    let content_width = feedback.message.len() as u16 + 4;
+    let content_width = display_width(&feedback.message) + 4;
     let width = content_width.min(area.width);
     let height = 3u16.min(area.height);
     let x = match position {
@@ -75,7 +75,7 @@ pub(crate) fn toast_notification_rect(
     banner_rows: u16,
     position: ToastFlockPosition,
 ) -> Rect {
-    let content_width = (toast.title.len().max(toast.context.len()) as u16) + 4;
+    let content_width = display_width(&toast.title).max(display_width(&toast.context)) + 4;
     let width = content_width.saturating_add(2).min(area.width);
     let content_height = if toast.context.is_empty() { 1 } else { 2 };
     let height = (content_height + 2).min(area.height);
@@ -198,7 +198,7 @@ pub(super) fn render_action_notice(
         .bg(p.peach)
         .add_modifier(Modifier::BOLD);
     let text = format!(" {message} ");
-    let width = (text.len() as u16).min(area.width);
+    let width = display_width(&text).min(area.width);
     let notif_area = Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + row_offset,
@@ -242,7 +242,7 @@ pub(super) fn render_config_diagnostic(
 
     for (row, line) in lines.iter().enumerate() {
         let text = format!(" config warning: {line} ");
-        let width = (text.len() as u16).min(area.width);
+        let width = display_width(&text).min(area.width);
         let notif_area = Rect::new(
             area.x + area.width.saturating_sub(width),
             area.y + row as u16,

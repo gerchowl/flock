@@ -29,6 +29,18 @@ pub(super) fn render_panel_shell(
     Some(inner)
 }
 
+/// Terminal columns `text` occupies.
+///
+/// Notification widths used to come from `str::len`, which counts UTF-8 bytes.
+/// Any non-ASCII character in a warning, a branch name or an agent label made
+/// the box wider than the text and pushed a right-aligned notification off its
+/// own edge (#239). `sidebar::spans_display_width` is the same measure over
+/// styled spans.
+pub(crate) fn display_width(text: &str) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
+}
+
 pub(super) fn panel_contrast_fg(p: &Palette) -> Color {
     match p.panel_bg {
         Color::Reset => p.surface_dim,
