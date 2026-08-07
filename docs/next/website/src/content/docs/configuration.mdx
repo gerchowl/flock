@@ -189,6 +189,21 @@ Key strings accept plain keys, modifier combinations such as `ctrl+a`, `shift+n`
 
 If you have old custom keybindings and want the new defaults, run `flock config reset-keys`. Flock backs up `config.toml`, removes `[keys]` and `[[keys.command]]`, and uses built-in v2 defaults after restart or `flock server reload-config`.
 
+## Checking a config
+
+Flock shows config problems as a yellow warning banner in the session, which only helps once you are looking at it. To ask instead, run `flock config check`:
+
+```bash
+$ flock config check
+~/.config/flock/config.toml: 2 warnings
+  ctrl+shift+a: kept keys.focus_attention, disabled keys.focus_attention_defer
+  deprecated keybinding: keys.switch_workspace was renamed to keys.switch_space; ...
+```
+
+It exits `0` when clean, `1` when the config loaded with warnings, and `2` when it did not load at all. If you manage config centrally across several machines, gate the deploy on it with `--path` so a bad key fails on one host instead of reaching all of them. See the [CLI reference](/docs/cli-reference/#config) for details.
+
+A warning worth knowing about: if you bind a key that a Flock default also uses, your binding wins and the default is disabled — but the conflict is still reported. Silence it by unbinding the default explicitly, for example `focus_attention_defer = ""`.
+
 ## Indexed jumps
 
 Indexed keybindings use `1..9` in normal keybinding fields:
