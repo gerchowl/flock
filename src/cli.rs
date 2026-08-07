@@ -258,6 +258,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
             "--path" => match rest.next() {
                 Some(path) => explicit_path = Some(path.clone()),
                 None => {
+                    eprintln!("flk config check: --path needs a file path");
                     eprintln!("usage: flk config check [--path PATH]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
@@ -266,6 +267,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
                 if let Some(path) = other.strip_prefix("--path=") {
                     explicit_path = Some(path.to_string());
                 } else {
+                    eprintln!("flk config check: unknown argument {other}");
                     eprintln!("usage: flk config check [--path PATH]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
@@ -1067,6 +1069,11 @@ mod config_check_tests {
 
     /// Run `flk config check --path <base>` and hand back both the outcome and
     /// the exit code, so the two can't drift apart in a test.
+    ///
+    /// This deliberately loads twice: once through `config_check` so the argument
+    /// parsing and exit-code mapping are exercised end to end, then again to
+    /// recover the outcome for inspection. Asserting on only one of the two would
+    /// let the mapping between them rot.
     fn check(base: &std::path::Path) -> (ConfigCheckOutcome, i32) {
         let _guard = crate::config::test_config_env_guard();
         let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1190,6 +1197,22 @@ mod config_check_tests {
         assert_eq!(code, 0);
         assert_eq!(std::fs::read_to_string(&base).unwrap(), before);
         assert!(!dir.join("config.local.toml").exists());
+    }
+
+    /// The gating use case checks a read-only file — a Nix store path, before
+    /// anything is activated. Nothing in the check may need write access.
+    #[test]
+    fn read_only_config_can_be_checked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_dir("flk-config-check-readonly");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "onboarding = false\n").unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(outcome, ConfigCheckOutcome::Clean);
+        assert_eq!(code, 0);
     }
 
     #[test]
