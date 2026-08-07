@@ -173,24 +173,31 @@ pub(crate) fn build_worktree_add_new_branch_command(
     }
 }
 
-/// Translate the one `git worktree add` failure that reads as a flock bug
-/// (#198). A repo that has been `git init`-ed but never committed has an
-/// unborn HEAD, so branching from the default base fails with
+/// Translate the `git worktree add` failures that read as a flock bug (#198,
+/// #243) into git's own words plus the actual remedy.
 ///
-/// ```text
-/// fatal: invalid reference: HEAD
-/// ```
+/// A repo that has been `git init`-ed but never committed has an unborn HEAD,
+/// so branching from the default base fails with `fatal: invalid reference:
+/// HEAD`; a directory that is not a repo at all fails with `fatal: not a git
+/// repository (…)`. Both name the symptom and neither names the fix.
 ///
-/// which says nothing about the actual remedy. Only the default base is
-/// rewritten: `invalid reference: <some-branch>` for an explicit base is a
-/// genuinely different problem (a typo, or a branch that isn't there) and git
-/// already names it.
+/// The remedy goes on its own line, and each line is kept inside the create
+/// dialog's width so the wrapped error area shows the whole thing — the
+/// original two-paragraph phrasing was silently clipped to git's line alone,
+/// which is exactly the half that doesn't help (#243).
+///
+/// Only the default base is rewritten: `invalid reference: <some-branch>` for
+/// an explicit base is a genuinely different problem (a typo, or a branch that
+/// isn't there) and git already names it.
 pub(crate) fn explain_worktree_add_failure(base: &str, message: &str) -> String {
     if base == "HEAD" && message.contains("invalid reference: HEAD") {
-        return format!(
-            "{message}\n\nThis repo has no commits yet, so there is nothing to branch \
-             from. Make an initial commit, then create the worktree."
-        );
+        return format!("{message}\nno commits yet — make one, then branch a worktree.");
+    }
+    if message.contains("not a git repository") {
+        // git's parenthetical ("or any of the parent directories") is dropped:
+        // it doubles the length and the remedy is the same either way.
+        return "fatal: not a git repository\nrun `git init` and commit, then branch a worktree."
+            .to_string();
     }
     message.to_string()
 }
@@ -713,6 +720,48 @@ fn gh_pr_merged_evidence(
     })
 }
 
+/// Does every commit reachable from `branch` also live on some *other* ref?
+///
+/// This is the "nothing to lose" case, not a merge: an accidental worktree that
+/// was branched and never committed to has a tip identical to whatever it was
+/// branched from, so deleting it discards no work at all. The three evidence
+/// sources above it all miss that whenever the base is itself unpushed and not
+/// on the default branch — branch a session off a local feature branch, change
+/// your mind, and the kill dialog would refuse to clean up after itself (#243).
+///
+/// The branch's own refs are excluded on both sides: `refs/heads/<branch>`
+/// (which would otherwise make the count trivially zero) and
+/// `refs/remotes/*/<branch>` (its own tracking ref is not independent
+/// evidence — the remote-containment check below deliberately ignores it too).
+/// An unreadable count is not evidence: `false` keeps the branch.
+fn branch_has_no_unique_commits(root: &str, branch: &str) -> bool {
+    let own_remote = format!("*/{branch}");
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "rev-list",
+            "--count",
+            branch,
+            "--not",
+            // --exclude applies to the *next* ref glob, and its pattern is
+            // relative to that glob's namespace: bare name for --branches,
+            // remote-qualified for --remotes.
+            "--exclude",
+            branch,
+            "--branches",
+            "--exclude",
+            &own_remote,
+            "--remotes",
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|count| count.trim().parse::<u64>().ok())
+    .is_some_and(|count| count == 0)
+}
+
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
 /// 1. `gh pr view` with gh's own repo resolution, then pinned to the origin
 ///    remote's repo (multi-remote checkouts resolve to upstream otherwise).
@@ -720,7 +769,16 @@ fn gh_pr_merged_evidence(
 /// 3. Remote containment: the branch tip is reachable from another pushed
 ///    remote ref (e.g. merged into a feature branch) — the work is recorded,
 ///    so deleting the local branch loses nothing.
-///    Anything inconclusive is NotMerged — deletion needs positive evidence.
+/// 4. The branch holds no commits of its own (#243).
+///
+/// Anything inconclusive is NotMerged — deletion needs positive evidence.
+///
+/// (4) is deliberately last even though it is the only purely-local check and
+/// would short-circuit the `gh` call. A disposable branch is very often *also*
+/// merged or remotely contained, and "merged into main" / "contained in
+/// origin/x" tell the user where their work went; "no commits of its own" does
+/// not. Latency is the cheaper thing to spend here — the gate already runs off
+/// the UI thread behind "checking merge status…".
 pub(crate) fn branch_merge_gate(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
@@ -807,6 +865,12 @@ pub(crate) fn branch_merge_gate(
                 evidence: format!("contained in {remote_ref}"),
             };
         }
+    }
+
+    if branch_has_no_unique_commits(&root, branch) {
+        return WorktreeMergeGate::Merged {
+            evidence: "no commits of its own".to_string(),
+        };
     }
 
     WorktreeMergeGate::NotMerged
@@ -1801,12 +1865,49 @@ prunable stale
 
         let explained = explain_worktree_add_failure("HEAD", &err);
         assert!(explained.contains("no commits yet"), "{explained}");
-        assert!(explained.contains("initial commit"), "{explained}");
+        assert!(explained.contains("make one"), "{explained}");
         // git's own text is kept: it is what a user would search for.
         assert!(explained.contains("invalid reference: HEAD"), "{explained}");
+        // Every line has to fit the create dialog's error area or the remedy
+        // is the half that gets wrapped out of sight (#243).
+        for line in explained.lines() {
+            assert!(
+                line.chars().count() <= 64,
+                "line outruns the dialog width: {line}"
+            );
+        }
 
         assert!(!checkout.exists());
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn worktree_add_in_a_non_repo_names_the_remedy() {
+        // A project directory that was never `git init`-ed (#243). git's own
+        // message is accurate but the parenthetical doubles its length for no
+        // extra help, and it never says what to do.
+        let plain = unique_temp_path("worktree-non-repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        let add =
+            build_worktree_add_new_branch_command(&plain, &plain.join("wt"), "worktree/x", "HEAD");
+        let err = run_worktree_command(&add).expect_err("a non-repo cannot be branched");
+        assert!(err.contains("not a git repository"), "{err}");
+
+        let explained = explain_worktree_add_failure("HEAD", &err);
+        assert!(explained.contains("not a git repository"), "{explained}");
+        assert!(explained.contains("git init"), "{explained}");
+        assert!(
+            !explained.contains("parent directories"),
+            "the parenthetical is noise: {explained}"
+        );
+        for line in explained.lines() {
+            assert!(
+                line.chars().count() <= 64,
+                "line outruns the dialog width: {line}"
+            );
+        }
+
+        std::fs::remove_dir_all(&plain).ok();
     }
 
     #[test]
@@ -1915,6 +2016,82 @@ prunable stale
         );
         assert_eq!(gate, WorktreeMergeGate::NotMerged);
         assert!(timed_out, "a gate slower than the bound must be timed out");
+    }
+
+    #[test]
+    fn branch_merge_gate_deletes_a_branch_with_no_commits_of_its_own() {
+        // The reported case (#243): branch a session off a local feature
+        // branch that was never pushed, change your mind immediately, kill it.
+        // The tip is not on the default branch and not on any remote, so all
+        // three merge-evidence sources come up empty — but the branch holds no
+        // commits of its own, so deleting it discards nothing.
+        let repo = create_committed_repo("merge-gate-empty");
+        run_git(&repo, &["checkout", "--quiet", "-b", "feature/base"]);
+        std::fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+        run_git(&repo, &["add", "wip.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "unpushed base work"]);
+
+        let checkout = unique_temp_path("merge-gate-empty-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/fresh",
+                checkout.to_str().unwrap(),
+                "feature/base",
+            ],
+        );
+
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "worktree/fresh"),
+            WorktreeMergeGate::Merged {
+                evidence: "no commits of its own".to_string()
+            }
+        );
+
+        // One real commit and the branch is no longer disposable: its work
+        // exists nowhere else, so the gate must fall back to keeping it.
+        std::fs::write(checkout.join("new.txt"), "x\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "real work"]);
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "worktree/fresh"),
+            WorktreeMergeGate::NotMerged
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_has_no_unique_commits_ignores_the_branchs_own_refs() {
+        // Both exclusions matter: without --exclude <branch> --branches the
+        // count is trivially zero for every branch, and a branch's own remote
+        // tracking ref is not independent evidence that the work is safe.
+        let (repo, _origin) = create_repo_with_bare_origin("merge-gate-own-refs");
+        let root = repo.display().to_string();
+        run_git(&repo, &["checkout", "--quiet", "-b", "solo"]);
+        std::fs::write(repo.join("solo.txt"), "solo\n").unwrap();
+        run_git(&repo, &["add", "solo.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "solo work"]);
+
+        assert!(
+            !branch_has_no_unique_commits(&root, "solo"),
+            "a branch whose commit exists nowhere else has unique work"
+        );
+
+        // Pushing it creates refs/remotes/origin/solo — still its own ref, so
+        // the answer must not flip.
+        run_git(&repo, &["push", "--quiet", "origin", "solo"]);
+        assert!(
+            !branch_has_no_unique_commits(&root, "solo"),
+            "a branch's own tracking ref is not independent evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
