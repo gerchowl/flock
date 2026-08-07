@@ -1139,6 +1139,11 @@ pub struct ViewState {
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
+    /// Config-warning banner rows for this frame, already filtered and clamped to
+    /// the terminal area. The renderer draws these and every notification stacked
+    /// below the banner offsets by `.len()`, so the two can't disagree (#239).
+    /// Empty when there is no diagnostic.
+    pub config_diagnostic_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
 }
@@ -2734,6 +2739,7 @@ impl AppState {
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
+                config_diagnostic_lines: Vec::new(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },

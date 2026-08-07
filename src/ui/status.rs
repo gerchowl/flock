@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::widgets::panel_contrast_fg;
+use super::widgets::{display_width, panel_contrast_fg};
 use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
     config::{ToastClipboardPosition, ToastFlockPosition},
@@ -23,7 +23,7 @@ pub(crate) fn copy_feedback_rect(
         return Rect::default();
     }
 
-    let content_width = feedback.message.len() as u16 + 4;
+    let content_width = display_width(&feedback.message) + 4;
     let width = content_width.min(area.width);
     let height = 3u16.min(area.height);
     let x = match position {
@@ -48,13 +48,40 @@ pub(crate) fn copy_feedback_rect(
     Rect::new(x, y, width, height)
 }
 
+/// Translate a row count measured from the top of `terminal_area` into the
+/// frame-relative offset used by widgets placed against the whole frame.
+///
+/// The banner sits inside the terminal area (below the tab bar, right of the
+/// sidebar) while toasts are placed against the whole frame, so handing the raw
+/// row count to a frame-space widget ignores that inset and lands it back on top
+/// of the banner. Both the hit-area math and the renderer go through here (#239).
+///
+/// Deliberately discontinuous at `rows == 0`: no banner means no displacement at
+/// all, so a toast keeps sitting at the top of the frame rather than being pushed
+/// down by the terminal-area inset. Anything that later grows a zero-row banner
+/// state — the collapsed chip sketched in #239, say — has to decide whether it
+/// wants this branch or the inset, because the jump between them is `terminal_area.y`.
+pub(crate) fn banner_offset_in_frame(terminal_area: Rect, frame_area: Rect, rows: u16) -> u16 {
+    if rows == 0 {
+        return 0;
+    }
+    terminal_area
+        .y
+        .saturating_add(rows)
+        .saturating_sub(frame_area.y)
+}
+
+/// `banner_rows` is how many rows the config-warning banner occupies. The banner
+/// is anchored to the top of `area`, so it displaces top-positioned toasts and is
+/// irrelevant to bottom-positioned ones — offsetting those too (as this used to,
+/// by a hardcoded single row) just floated them above the bottom edge (#239).
 pub(crate) fn toast_notification_rect(
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    banner_rows: u16,
     position: ToastFlockPosition,
 ) -> Rect {
-    let content_width = (toast.title.len().max(toast.context.len()) as u16) + 4;
+    let content_width = display_width(&toast.title).max(display_width(&toast.context)) + 4;
     let width = content_width.saturating_add(2).min(area.width);
     let content_height = if toast.context.is_empty() { 1 } else { 2 };
     let height = (content_height + 2).min(area.height);
@@ -64,13 +91,12 @@ pub(crate) fn toast_notification_rect(
             area.x + area.width.saturating_sub(width)
         }
     };
-    let warning_offset = u16::from(offset_for_warning);
     let y = match position {
         ToastFlockPosition::TopLeft | ToastFlockPosition::TopRight => {
-            area.y + warning_offset.min(area.height)
+            area.y + banner_rows.min(area.height)
         }
         ToastFlockPosition::BottomLeft | ToastFlockPosition::BottomRight => {
-            area.y + area.height.saturating_sub(height + warning_offset)
+            area.y + area.height.saturating_sub(height)
         }
     };
     Rect::new(x, y, width, height)
@@ -80,7 +106,7 @@ pub(super) fn render_toast_notification(
     frame: &mut Frame,
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    banner_rows: u16,
     position: ToastFlockPosition,
     p: &Palette,
 ) {
@@ -89,7 +115,7 @@ pub(super) fn render_toast_notification(
         ToastKind::Finished => p.blue,
         ToastKind::UpdateInstalled => p.accent,
     };
-    let toast_area = toast_notification_rect(area, toast, offset_for_warning, position);
+    let toast_area = toast_notification_rect(area, toast, banner_rows, position);
 
     frame.render_widget(Clear, toast_area);
     let block = Block::default()
@@ -178,7 +204,7 @@ pub(super) fn render_action_notice(
         .bg(p.peach)
         .add_modifier(Modifier::BOLD);
     let text = format!(" {message} ");
-    let width = (text.len() as u16).min(area.width);
+    let width = display_width(&text).min(area.width);
     let notif_area = Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + row_offset,
@@ -193,20 +219,36 @@ pub(super) fn render_action_notice(
     }
 }
 
-pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+/// The rows the config-warning banner occupies in `area`.
+///
+/// Computed once per frame in `compute_view` and parked on [`crate::app::state::ViewState`]
+/// so the renderer below and everything that stacks beneath the banner measure the
+/// same rows. They used to disagree — the banner drew one row per warning line while
+/// every consumer offset by a hardcoded single row, so toasts and copy feedback
+/// overdrew rows 2..N (#239).
+pub(crate) fn config_diagnostic_lines(message: &str, area: Rect) -> Vec<String> {
+    message
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(area.height as usize)
+        .map(str::to_string)
+        .collect()
+}
+
+pub(super) fn render_config_diagnostic(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[String],
+    p: &Palette,
+) {
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.yellow)
         .add_modifier(Modifier::BOLD);
 
-    for (row, line) in message
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(area.height as usize)
-        .enumerate()
-    {
+    for (row, line) in lines.iter().enumerate() {
         let text = format!(" config warning: {line} ");
-        let width = (text.len() as u16).min(area.width);
+        let width = display_width(&text).min(area.width);
         let notif_area = Rect::new(
             area.x + area.width.saturating_sub(width),
             area.y + row as u16,
