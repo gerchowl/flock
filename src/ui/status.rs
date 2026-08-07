@@ -193,18 +193,34 @@ pub(super) fn render_action_notice(
     }
 }
 
-pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+/// The rows the config-warning banner occupies in `area`.
+///
+/// Computed once per frame in `compute_view` and parked on [`crate::app::state::ViewState`]
+/// so the renderer below and everything that stacks beneath the banner measure the
+/// same rows. They used to disagree — the banner drew one row per warning line while
+/// every consumer offset by a hardcoded single row, so toasts and copy feedback
+/// overdrew rows 2..N (#239).
+pub(crate) fn config_diagnostic_lines(message: &str, area: Rect) -> Vec<String> {
+    message
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(area.height as usize)
+        .map(str::to_string)
+        .collect()
+}
+
+pub(super) fn render_config_diagnostic(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[String],
+    p: &Palette,
+) {
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.yellow)
         .add_modifier(Modifier::BOLD);
 
-    for (row, line) in message
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(area.height as usize)
-        .enumerate()
-    {
+    for (row, line) in lines.iter().enumerate() {
         let text = format!(" config warning: {line} ");
         let width = (text.len() as u16).min(area.width);
         let notif_area = Rect::new(

@@ -61,8 +61,8 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
-    copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_status_line,
-    render_toast_notification, toast_notification_rect,
+    config_diagnostic_lines, copy_feedback_rect, render_config_diagnostic, render_copy_feedback,
+    render_status_line, render_toast_notification, toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -299,6 +299,12 @@ fn compute_view_internal(
         resize_float_runtime(app, terminal_runtimes, terminal_area, cell_size);
     }
 
+    let banner_lines = app
+        .config_diagnostic
+        .as_deref()
+        .map(|message| config_diagnostic_lines(message, terminal_area))
+        .unwrap_or_default();
+
     let toast_hit_area = app
         .toast
         .as_ref()
@@ -330,6 +336,7 @@ fn compute_view_internal(
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
+        config_diagnostic_lines: banner_lines,
         pane_infos,
         split_borders,
     };
@@ -381,6 +388,12 @@ fn compute_mobile_view(
     }
     let header_hits = compute_mobile_header_hit_areas(app, header_rect);
 
+    let banner_lines = app
+        .config_diagnostic
+        .as_deref()
+        .map(|message| config_diagnostic_lines(message, terminal_area))
+        .unwrap_or_default();
+
     let toast_hit_area = app
         .toast
         .as_ref()
@@ -405,6 +418,7 @@ fn compute_mobile_view(
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
+        config_diagnostic_lines: banner_lines,
         pane_infos,
         split_borders,
     };
@@ -529,9 +543,10 @@ pub fn render_with_runtime_registry(
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    let has_config_diagnostic = app.config_diagnostic.is_some();
-    if let Some(message) = &app.config_diagnostic {
-        render_config_diagnostic(frame, terminal_area, message, &app.palette);
+    let banner_lines = app.view.config_diagnostic_lines.as_slice();
+    let has_config_diagnostic = !banner_lines.is_empty();
+    if has_config_diagnostic {
+        render_config_diagnostic(frame, terminal_area, banner_lines, &app.palette);
     }
     let mut copy_feedback_offset = u16::from(has_config_diagnostic);
     if let Some(notice) = &app.action_notice {

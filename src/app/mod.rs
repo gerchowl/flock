@@ -607,6 +607,7 @@ impl App {
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
+                config_diagnostic_lines: Vec::new(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },
