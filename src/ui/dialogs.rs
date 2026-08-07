@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -351,9 +351,20 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
             row(next + 2),
         );
     } else if let Some(error) = &create.error {
+        // Errors get every row between here and the button row, wrapped. A
+        // one-row Rect silently truncated `explain_worktree_add_failure`'s
+        // remedy line and left only git's cryptic half on screen (#243).
+        // That is two rows without a seed and three with one, which is why
+        // the explanations are written to fit two — see that function.
+        let top = next + 2;
+        let rows_available = inner.height.saturating_sub(1).saturating_sub(top).max(1);
         frame.render_widget(
-            Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
-            row(next + 2),
+            // Wrap does not indent continuations, so re-apply the same left
+            // margin the rows above use to every line of the message.
+            Paragraph::new(format!(" {}", error.replace('\n', "\n ")))
+                .style(Style::default().fg(app.palette.red))
+                .wrap(Wrap { trim: false }),
+            Rect::new(inner.x, inner.y + top, inner.width, rows_available),
         );
     }
 
@@ -1269,6 +1280,38 @@ mod tests {
             rendered.contains("seed the fork here"),
             "seed value must show"
         );
+    }
+
+    #[test]
+    fn create_error_shows_the_remedy_not_just_gits_half() {
+        // #243: the error sat in a one-row Rect, so a two-line explanation
+        // rendered its first line and dropped the only actionable part. Both
+        // dialog variants have to show it — the seed flow is where the unborn
+        // HEAD was actually hit.
+        let explained =
+            crate::worktree::explain_worktree_add_failure("HEAD", "fatal: invalid reference: HEAD");
+        assert!(explained.lines().count() > 1, "fixture must be multi-line");
+
+        for plan in [None, Some(claude_fork_plan())] {
+            let has_seed = plan.is_some();
+            let mut app = AppState::test_new();
+            let mut create = worktree_create_with(plan, "", WorktreeCreateFocus::Branch);
+            create.error = Some(explained.clone());
+            app.worktree_create = Some(create);
+
+            let rendered = render_worktree_dialog(&app);
+            for line in explained.lines() {
+                assert!(
+                    rendered.contains(line.trim()),
+                    "has_seed={has_seed}: dropped {line:?}"
+                );
+            }
+            // The buttons keep their row — the error must not overrun them.
+            assert!(
+                rendered.contains("create and open"),
+                "has_seed={has_seed}: the error overran the button row"
+            );
+        }
     }
 
     #[test]
