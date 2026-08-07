@@ -43,6 +43,32 @@ flock server reload-config
 
 `flock server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
+## Config
+
+```bash
+flock config check [--path PATH]
+flock config edit
+flock config reset-keys
+```
+
+`config check` validates a config without starting or touching a server, and exits on a three-way code so it can gate a deploy:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | clean |
+| `1` | loaded, with advisory warnings (deprecated keys, keybinding conflicts) |
+| `2` | did not load — a session would fall back to built-in defaults |
+
+Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
+
+`--path` checks a file that is not the live config, which is what a build-time gate wants:
+
+```bash
+flock config check --path ./config.toml || exit 1
+```
+
+Base and `config.local.toml` layering resolves exactly as it does at runtime. This is unrelated to `flock checks`, which runs the health-check runner.
+
 ## Sessions
 
 ```bash
