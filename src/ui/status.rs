@@ -55,6 +55,12 @@ pub(crate) fn copy_feedback_rect(
 /// sidebar) while toasts are placed against the whole frame, so handing the raw
 /// row count to a frame-space widget ignores that inset and lands it back on top
 /// of the banner. Both the hit-area math and the renderer go through here (#239).
+///
+/// Deliberately discontinuous at `rows == 0`: no banner means no displacement at
+/// all, so a toast keeps sitting at the top of the frame rather than being pushed
+/// down by the terminal-area inset. Anything that later grows a zero-row banner
+/// state — the collapsed chip sketched in #239, say — has to decide whether it
+/// wants this branch or the inset, because the jump between them is `terminal_area.y`.
 pub(crate) fn banner_offset_in_frame(terminal_area: Rect, frame_area: Rect, rows: u16) -> u16 {
     if rows == 0 {
         return 0;
