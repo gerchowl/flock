@@ -1540,12 +1540,21 @@ fn run_client_with_mode(
             held_restore.into_handoff();
         }
 
-        // Non-panicking: a clean switch exits through here with err =
-        // "switching" while the terminal is mid-handoff and stderr may be
-        // broken. `eprintln!` would panic on that write, and the active hook
-        // (ratatui's, before this fix) would double-panic → abort — the
-        // federation-switch crash. `writeln!` just drops the diagnostic.
-        let _ = writeln!(io::stderr(), "flock: {err}");
+        // A clean switch or detach is an EXPECTED exit, not a diagnostic. The
+        // terminal is already released by this point, so anything written here
+        // lands at whatever cursor position the host shell happens to be in —
+        // "flock: switching server" injected into the middle of the user's
+        // scrollback (#126). Say nothing; the switch popup (slots) or the next
+        // leg's first frame is the real feedback.
+        //
+        // Non-panicking for the rest: this runs while the terminal is
+        // mid-handoff and stderr may be broken. `eprintln!` would panic on
+        // that write, and the active hook (ratatui's, before this fix) would
+        // double-panic → abort — the federation-switch crash. `writeln!` just
+        // drops the diagnostic.
+        if !is_clean_exit(&err) {
+            let _ = writeln!(io::stderr(), "flock: {err}");
+        }
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -2584,6 +2593,20 @@ fn degrade_active_or_lost(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Exits the user asked for: a server switch or a detach.
+///
+/// These must print nothing. By the time they reach the exit path the terminal
+/// is already released, so any write lands at whatever cursor position the host
+/// shell happens to be in — which is how "flock: switching server" ended up
+/// injected into the middle of a user's scrollback (#126).
+fn is_clean_exit(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::ServerShutdown { reason: Some(reason) }
+            if reason == "switching" || reason == "detached"
+    )
+}
+
 fn apply_slot_flip(
     new_writer: slots::SlotWriter,
     new_reader_src: UnixStream,
@@ -5021,6 +5044,33 @@ mod tests {
     // succeeds against a real socketpair-backed UnixStream and never panics
     // — the same flow both the warm-flip arm and the cold-dial success arm
     // share.
+    /// #126: a switch or detach is an exit the user asked for. The terminal is
+    /// already released by then, so printing anything injects it at the host
+    /// shell's cursor — the "flock: switching server" text landing mid-scrollback.
+    #[test]
+    fn clean_switch_and_detach_exits_print_nothing() {
+        for reason in ["switching", "detached"] {
+            assert!(
+                is_clean_exit(&ClientError::ServerShutdown {
+                    reason: Some(reason.to_string()),
+                }),
+                "{reason} is an expected exit and must stay silent"
+            );
+        }
+    }
+
+    /// A real failure still has to reach the user — silencing everything would
+    /// turn a dropped connection into an unexplained exit.
+    #[test]
+    fn unexpected_shutdowns_still_report() {
+        assert!(!is_clean_exit(&ClientError::ServerShutdown {
+            reason: None
+        }));
+        assert!(!is_clean_exit(&ClientError::ServerShutdown {
+            reason: Some("upgrade".to_string()),
+        }));
+    }
+
     #[test]
     fn apply_slot_flip_replaces_write_stream_against_socketpair() {
         use std::os::unix::net::UnixStream;
