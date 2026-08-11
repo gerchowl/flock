@@ -202,9 +202,17 @@ pub struct HeadlessServer {
     terminal_attach_owners: HashMap<String, u64>,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
-    /// Shared pane runtime size derived from the foreground client,
-    /// or MIN_COLS × MIN_ROWS when no clients are connected.
+    /// Shared pane runtime size derived from the foreground client, or the
+    /// last size a real client asserted once they all detach (#246).
     effective_size: (u16, u16),
+    /// Size of the most recent foreground client, held across detach so panes
+    /// keep generating output at a width the user will actually come back to.
+    ///
+    /// Collapsing to MIN_COLS on detach made narrow history routine: an agent
+    /// working overnight hard-wrapped every line at 80 columns, and no later
+    /// resize can undo that — the wrap is committed to the byte stream and
+    /// reflow only merges soft wraps (`src/ghostty/mod.rs:2788`).
+    last_client_size: Option<(u16, u16)>,
     /// Flag set when shutdown is initiated.
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
@@ -340,6 +348,7 @@ impl HeadlessServer {
             terminal_attach_owners: HashMap::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
+            last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
             pending_handoff_repaint_nudge: false,
@@ -782,9 +791,18 @@ impl HeadlessServer {
         }
     }
 
+    /// Size to run panes at while nobody is attached: the last real client's
+    /// geometry, falling back to the minimum only before any client has ever
+    /// connected (fresh server, restored session). Never narrower than the
+    /// minimum, so a tiny client can't strand background panes (#246).
+    fn detached_size(&self) -> (u16, u16) {
+        let (cols, rows) = self.last_client_size.unwrap_or((MIN_COLS, MIN_ROWS));
+        (cols.max(MIN_COLS), rows.max(MIN_ROWS))
+    }
+
     fn sync_foreground_client_state(&mut self) {
         let Some(client_id) = self.foreground_client_id else {
-            self.effective_size = (MIN_COLS, MIN_ROWS);
+            self.effective_size = self.detached_size();
             self.app.state.outer_terminal_focus = None;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
@@ -793,7 +811,7 @@ impl HeadlessServer {
         };
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
-            self.effective_size = (MIN_COLS, MIN_ROWS);
+            self.effective_size = self.detached_size();
             self.app.state.outer_terminal_focus = None;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
@@ -812,6 +830,8 @@ impl HeadlessServer {
             .clone();
 
         self.effective_size = terminal_size;
+        // Remember it so detaching holds this width instead of collapsing (#246).
+        self.last_client_size = Some(terminal_size);
         self.app.state.outer_terminal_focus = outer_terminal_focus;
         apply_keybindings(&mut self.app, &keybindings);
         self.sync_visible_server_config_diagnostic(uses_local_keybindings);
@@ -3673,6 +3693,7 @@ mod tests {
             terminal_attach_owners: HashMap::new(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
+            last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
             pending_handoff_repaint_nudge: false,
@@ -3807,6 +3828,55 @@ mod tests {
         server.resize_shared_runtime_to_effective_size();
 
         (server, client_rx, pane_id)
+    }
+
+    /// #246: detaching used to collapse panes to MIN_COLS, so an agent working
+    /// while nobody was attached hard-wrapped every line at 80 columns —
+    /// permanently, since reflow only merges soft wraps. Hold the last real
+    /// client width across detach instead.
+    #[test]
+    fn detach_holds_last_client_width_instead_of_collapsing_to_min_cols() {
+        let mut server = test_headless_server();
+        let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (200, 50),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        assert_eq!(server.effective_size, (200, 50));
+
+        // The client goes away: panes must keep the geometry it asserted.
+        server.clients.remove(&1);
+        server.foreground_client_id = None;
+        server.sync_foreground_client_state();
+        assert_eq!(
+            server.effective_size,
+            (200, 50),
+            "detached panes must keep the last client width, not collapse to \
+             {MIN_COLS} columns"
+        );
+    }
+
+    /// A client narrower than the minimum must not strand background panes
+    /// below MIN_COLS once it detaches.
+    #[test]
+    fn detached_size_never_falls_below_the_minimum() {
+        let mut server = test_headless_server();
+        server.last_client_size = Some((40, 10));
+        assert_eq!(server.detached_size(), (MIN_COLS, MIN_ROWS));
+
+        // Before any client has ever attached there is nothing to hold.
+        server.last_client_size = None;
+        assert_eq!(server.detached_size(), (MIN_COLS, MIN_ROWS));
     }
 
     fn assert_frame_data_eq(actual: &FrameData, expected: &FrameData) {
