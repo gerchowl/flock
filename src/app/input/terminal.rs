@@ -50,7 +50,7 @@ impl App {
     }
 
     /// When the prompt-history panel is open over the focused pane, drive it
-    /// with Esc / PageUp / PageDown / Home / End. Wheel routing is in
+    /// with Esc / PageUp / PageDown / Home / End / Tab. Wheel routing is in
     /// `handle_pane_mouse_only`; this is the keyboard twin. Returns true
     /// when the key was consumed by the panel.
     fn handle_prompt_history_panel_key(&mut self, key: TerminalKey) -> bool {
@@ -102,6 +102,24 @@ impl App {
             KeyCode::End => {
                 self.state
                     .scroll_prompt_history(-(max_offset as i32), max_offset);
+                true
+            }
+            // Tab cycles Reply → Collapsed → Full → Reply (#246). Panel-only:
+            // the handler already gated on "panel is open AND focused", so
+            // Tab still reaches the underlying pane's shell when the panel
+            // is closed. Chosen over a new global binding because a global
+            // key would ship a dead keybind to every user who never opens
+            // the panel; here the affordance discovers itself once open.
+            KeyCode::Tab => {
+                // Held key-repeat would otherwise stack one worker per press,
+                // each re-reading a file that reaches ~15 MB. Swallow the key
+                // while a read is in flight rather than queueing readers.
+                if self.state.transcript_read_in_flight_for_prompt_panel() {
+                    return true;
+                }
+                if let Some(pane_id) = self.state.cycle_prompt_history_detail() {
+                    self.arm_transcript_read_for(pane_id);
+                }
                 true
             }
             _ => false,
@@ -1412,6 +1430,55 @@ mod tests {
             .expect("scroll metrics after PageUp");
         // Forwarded to pane, so test runtime doesn't process it — scroll stays at bottom.
         assert_eq!(end_metrics.offset_from_bottom, 0);
+    }
+
+    /// #246: Tab inside the open panel must never reach the pane's shell —
+    /// it is the level-cycle gesture. When the panel is closed the same
+    /// keystroke forwards to the pane as normal, so tab completion in the
+    /// underlying shell keeps working.
+    #[tokio::test]
+    async fn tab_in_open_prompt_panel_cycles_detail_and_never_reaches_pane() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 60, 20));
+        let (runtime, mut pane_rx) = crate::terminal::TerminalRuntime::test_with_channel(
+            pane_infos[0].inner_rect.width,
+            pane_infos[0].inner_rect.height,
+        );
+        ws.insert_test_runtime(pane_id, runtime);
+        // A pane with prompt history so the panel has a rect to open over.
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("hi".into());
+        app.state.terminals.insert(terminal_id, terminal);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.expanded_prompt_pane = Some(pane_id);
+
+        // Panel open → Tab cycles detail and is not forwarded.
+        assert_eq!(
+            app.state.prompt_history_detail,
+            crate::agent_transcript::TranscriptDetail::Reply
+        );
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(
+            app.state.prompt_history_detail,
+            crate::agent_transcript::TranscriptDetail::Collapsed
+        );
+        assert!(
+            pane_rx.try_recv().is_err(),
+            "Tab was intercepted; pane's shell must not see it"
+        );
+
+        // Panel closed → Tab reaches the pane as usual (encoded per key table).
+        app.state.close_prompt_history_panel();
+        app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Tab, KeyModifiers::empty()));
+        let forwarded = pane_rx.try_recv().expect("Tab now forwards to the pane");
+        assert_eq!(forwarded.as_ref(), b"\t");
     }
 
     #[tokio::test]

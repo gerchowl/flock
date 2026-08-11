@@ -75,6 +75,34 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
 }
 
 impl App {
+    /// Arm and spawn a transcript read for `pane_id` at the currently
+    /// selected panel detail (#246). Idempotent — the terminal's own guard
+    /// short-circuits when the same `(session, detail)` pair is already
+    /// hydrated, so a burst of hooks (or a hook that fires while a re-read
+    /// is in flight) never spawns a reader per event. Off-thread: the file
+    /// reaches ~15 MB and this is the UI task.
+    pub(crate) fn arm_transcript_read_for(&mut self, pane_id: crate::layout::PaneId) {
+        let Some((session_id, detail)) = self.state.take_due_transcript_hydration(pane_id) else {
+            return;
+        };
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        let delivered_session = session_id.clone();
+        crate::agent_transcript::spawn_load(home, session_id, detail, move |turns| {
+            // Always deliver, including the empty/failed case: the receiver
+            // re-arms on empty so a transcript the agent had not written yet
+            // is retried instead of the pane never hydrating again.
+            let _ = event_tx.blocking_send(crate::events::AppEvent::TranscriptHydrated {
+                pane_id,
+                session_id: delivered_session,
+                detail,
+                turns,
+            });
+        });
+    }
+
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
@@ -419,22 +447,7 @@ impl App {
         | crate::events::AppEvent::HookRecapReported { pane_id, .. }
         | crate::events::AppEvent::HookReplyReported { pane_id, .. } = &ev
         {
-            let pane_id = *pane_id;
-            if let Some(session_id) = self.state.take_due_transcript_session(pane_id) {
-                if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-                    let event_tx = self.event_tx.clone();
-                    crate::agent_transcript::spawn_load(home, session_id, move |turns| {
-                        if turns.is_empty() {
-                            return;
-                        }
-                        let _ =
-                            event_tx.blocking_send(crate::events::AppEvent::TranscriptHydrated {
-                                pane_id,
-                                turns,
-                            });
-                    });
-                }
-            }
+            self.arm_transcript_read_for(*pane_id);
         }
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {

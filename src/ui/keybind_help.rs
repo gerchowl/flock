@@ -180,7 +180,8 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(keybind_label(&kb.toggle_float), "toggle floating pane"),
         help_entry(
             keybind_label(&kb.toggle_prompt_expand),
-            "expand the pane header's last prompt",
+            "expand the pane header's last prompt (Tab inside cycles \
+             replies/tool calls/tool output)",
         ),
         help_entry(keybind_label(&kb.resize_mode), "resize mode"),
         help_entry(keybind_label(&kb.toggle_sidebar), "toggle sidebar"),

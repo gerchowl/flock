@@ -601,7 +601,14 @@ pub(super) fn render_prompt_history_panel(
     }
 
     let border_style = Style::default().fg(p.overlay0).bg(bg_color);
-    let title = format!(" prompt history ({}) ", terminal.prompt_history.len());
+    // The detail label doubles as the discovery hint for Tab (#246): the
+    // panel is opened often and cycled rarely, so naming what mode you are
+    // in is more useful than teaching the shortcut in the border.
+    let title = format!(
+        " prompt history ({}) — {} ",
+        terminal.prompt_history.len(),
+        app.prompt_history_detail.label(),
+    );
     let title_truncated = truncate_label(&title, panel.width.saturating_sub(2) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1922,6 +1929,66 @@ mod tests {
         assert!(
             text.contains('\n'),
             "multi-row selection joins with \\n: {text:?}"
+        );
+    }
+
+    /// #246: the detail-level cycle changes the shape of each entry's `text`
+    /// (adding `⚙ ToolName` lines and eventually tool-output blocks), but
+    /// selection extraction reads the same rendered lines the panel painted,
+    /// so a drag over a hydrated Collapsed/Full entry must copy the exact
+    /// on-screen text — tool-call marker included.
+    #[test]
+    fn extract_prompt_panel_selection_copies_tool_call_markers_from_collapsed_entries() {
+        use crate::agent_transcript::{Role, TranscriptDetail};
+        use crate::terminal::PromptHistoryKind;
+
+        let mut app = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("main");
+        let pane_id = ws.focused_pane_id().unwrap();
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        // Simulate what `spawn_load` delivers at Collapsed detail: an
+        // assistant turn whose text carries the tool-call marker inline.
+        terminal.hydrate_prompt_history(&[(
+            Role::Assistant,
+            "working\n\n\u{2699} Edit".to_string(),
+            None,
+        )]);
+        // The entry the panel actually has is now a Reply-kind row with the
+        // marker baked into its text — that is the invariant selection will
+        // walk over.
+        assert!(terminal
+            .prompt_history
+            .iter()
+            .any(|e| e.kind == PromptHistoryKind::Reply && e.text.contains("\u{2699} Edit")));
+
+        app.terminals.insert(terminal_id.clone(), terminal);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.expanded_prompt_pane = Some(pane_id);
+        app.prompt_history_detail = TranscriptDetail::Collapsed;
+
+        let info = pane_info_for(Rect::new(0, 0, 40, 20), pane_id);
+        let terminal_ref = app.terminals.get(&terminal_id).unwrap();
+        let panel =
+            prompt_history_panel_rect(&app, &info, Some(terminal_ref)).expect("panel geometry");
+        let inner = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(panel);
+        let rendered = build_prompt_history_lines(terminal_ref, app.palette.clone(), inner.width);
+        let end = rendered.len() as u16;
+        let start = end.saturating_sub(inner.height);
+        // The bottom rendered row is the tool-call marker line ("  ⚙ Edit").
+        let marker_screen_row = end - start - 1;
+        // Select the whole visible marker line — the extractor stops at end
+        // of content, so overshooting the column is fine.
+        let sel = crate::selection::Selection::range(info.id, marker_screen_row, 0, u16::MAX, None)
+            .with_source(crate::selection::SelectionSource::PromptPanel);
+        let text = extract_prompt_panel_selection(&app, &info, terminal_ref, &sel)
+            .expect("panel selection extracts");
+        assert!(
+            text.contains("\u{2699} Edit"),
+            "tool-call marker must survive select-to-copy: {text:?}"
         );
     }
 
