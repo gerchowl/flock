@@ -2362,6 +2362,30 @@ prunable stale
         run_git(&repo, &["commit", "--quiet", "-m", "solo work"]);
         run_git(&repo, &["push", "--quiet", "-u", "origin", "solo"]);
 
+        // Prove git really does list the refs being filtered, so the
+        // assertions below cannot pass by the helper simply returning nothing.
+        let raw = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &root,
+                "branch",
+                "-a",
+                "--contains",
+                "refs/heads/solo",
+                "--format",
+                "%(refname)",
+            ],
+            None,
+        )
+        .expect("git lists the containing refs");
+        for own in ["refs/heads/solo", "refs/remotes/origin/solo"] {
+            assert!(
+                raw.lines().any(|line| line.trim() == own),
+                "fixture must contain {own} for the filter to be doing work: {raw:?}"
+            );
+        }
+
         let all = refs_containing(&root, "solo", RefScope::All);
         assert!(
             !all.iter().any(|r| r == "solo" || r == "origin/solo"),
