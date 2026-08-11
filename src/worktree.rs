@@ -470,6 +470,9 @@ pub(crate) fn prepare_peer_checkout(
     let status = run_command_capture("git", &["-C", &repo, "status", "--porcelain"], None)?;
     let was_dirty = !status.trim().is_empty();
 
+    // `@{upstream}` resolves a branch NAME, not a ref — `refs/heads/x@{u}` is
+    // rejected outright — so this one stays bare. That is safe: the suffix only
+    // ever consults refs/heads, so a same-named tag cannot capture it.
     let upstream = run_command_capture(
         "git",
         &[
@@ -485,6 +488,9 @@ pub(crate) fn prepare_peer_checkout(
     .filter(|up| !up.is_empty());
     let was_unpushed = match &upstream {
         None => true,
+        // The range endpoint IS a commit-ish, so it must be qualified: a tag
+        // sharing the branch's name counts the wrong commits and reports a
+        // fully-pushed branch as unpushed (#243).
         Some(up) => run_command_capture(
             "git",
             &[
@@ -492,7 +498,7 @@ pub(crate) fn prepare_peer_checkout(
                 &repo,
                 "rev-list",
                 "--count",
-                &format!("{up}..{branch}"),
+                &format!("{up}..refs/heads/{branch}"),
             ],
             None,
         )
@@ -1651,6 +1657,39 @@ mod tests {
         // A second prepare now sees it as already pushed (in sync).
         let again = prepare_peer_checkout(&repo, "feature-x", false).unwrap();
         assert!(!again.was_unpushed);
+    }
+
+    #[test]
+    fn prepare_peer_checkout_ignores_a_tag_sharing_the_branch_name() {
+        // The ahead-count's range endpoint is a commit-ish, so a same-named tag
+        // captures it and the branch is reported unpushed while its upstream is
+        // in sync (#243). `@{upstream}` above is immune — it resolves a branch
+        // name, never a tag — which is why only one of the two is qualified.
+        let (repo, _origin) = create_repo_with_bare_origin("peer-tag-collision");
+        run_git(&repo, &["checkout", "--quiet", "-b", "v1.0"]);
+        let pushed = prepare_peer_checkout(&repo, "v1.0", true).unwrap();
+        assert!(pushed.pushed);
+
+        // A tag named after the branch, pointing at an unrelated commit.
+        run_git(&repo, &["checkout", "--quiet", "-b", "elsewhere"]);
+        std::fs::write(repo.join("other.txt"), "other\n").unwrap();
+        run_git(&repo, &["add", "other.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "unrelated"]);
+        let elsewhere = run_command_capture(
+            "git",
+            &["-C", &repo.display().to_string(), "rev-parse", "HEAD"],
+            None,
+        )
+        .expect("tip");
+        run_git(&repo, &["update-ref", "refs/tags/v1.0", &elsewhere]);
+
+        let again = prepare_peer_checkout(&repo, "v1.0", false).unwrap();
+        assert!(
+            !again.was_unpushed,
+            "the branch is in sync with its upstream; the tag is not the branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
