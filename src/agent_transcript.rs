@@ -308,42 +308,125 @@ fn tool_result_text(value: &serde_json::Value) -> String {
     }
 }
 
-/// Flatten events into the turns a reader actually shows: one entry per
-/// message that carries prose, in file order.
+/// How much of a turn to render.
 ///
-/// Tool calls and results are dropped here — this is the "prompt → reply"
-/// level. Richer levels read the same events without re-reading the file.
-pub fn plain_turns(events: &[TranscriptEvent]) -> Vec<(Role, String, Option<SystemTime>)> {
+/// Three fixed global levels, deliberately: the review round for #246 landed
+/// on "plain text, one wrap style, no per-node state" as the boundary that
+/// holds. Per-node expandable UI turns a view into a tree editor, and every
+/// past attempt to add "just one" per-entry flag has become an iceberg.
+///
+/// Cycling levels re-reads the transcript rather than caching all three
+/// renderings per entry: a 60k-message session would otherwise triple the
+/// memory the panel holds for a mode the user is not looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptDetail {
+    /// Prompt + assistant prose only. What the pre-#246 panel roughly showed.
+    #[default]
+    Reply,
+    /// Adds tool calls as a fixed one-line marker (`⚙ Edit`). Never the
+    /// output — that is the whole point of the "collapsed" step.
+    Collapsed,
+    /// Adds tool call output as well, still capped by [`MAX_BLOCK_BYTES`] per
+    /// block so a 1.4 MB `tool_result` cannot reach the renderer.
+    Full,
+}
+
+impl TranscriptDetail {
+    /// A short label for the panel chrome — matches the on-disk config
+    /// enum variants in kebab so `Debug`-derived strings are never surfaced.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reply => "replies",
+            Self::Collapsed => "with tool calls",
+            Self::Full => "with tool output",
+        }
+    }
+
+    /// Cycle to the next level. Fixed order so muscle memory works: the
+    /// panel's Tab key is a "give me more" gesture and wraps back to Reply
+    /// after Full.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Reply => Self::Collapsed,
+            Self::Collapsed => Self::Full,
+            Self::Full => Self::Reply,
+        }
+    }
+}
+
+/// Flatten events into the turns a reader actually shows: one entry per
+/// message that carries content at `detail`, in file order.
+///
+/// The three levels differ only in which block kinds contribute a line:
+///
+/// * [`TranscriptDetail::Reply`] keeps text blocks
+/// * [`TranscriptDetail::Collapsed`] adds `⚙ ToolName` for each tool_use
+/// * [`TranscriptDetail::Full`] adds the (already-capped) tool_result preview
+///
+/// A user message that ends up carrying only tool_result content is
+/// re-labelled as an assistant turn: it renders in the reply palette rather
+/// than the "you typed this" palette, which is what tool output actually is.
+pub fn turns_at_level(
+    events: &[TranscriptEvent],
+    detail: TranscriptDetail,
+) -> Vec<(Role, String, Option<SystemTime>)> {
     let mut turns = Vec::new();
     for event in events {
         let TranscriptEvent::Message { role, blocks, at } = event else {
             continue;
         };
-        let text = blocks
-            .iter()
-            .filter_map(|block| match block {
-                Block::Text(text) => Some(text.trim()),
-                _ => None,
-            })
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if text.is_empty() {
+        let mut pieces: Vec<String> = Vec::new();
+        let mut only_tool_result = true;
+        for block in blocks {
+            match block {
+                Block::Text(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        pieces.push(trimmed.to_string());
+                    }
+                    only_tool_result = false;
+                }
+                Block::ToolCall { name } if detail != TranscriptDetail::Reply => {
+                    pieces.push(format!("\u{2699} {name}"));
+                    only_tool_result = false;
+                }
+                Block::ToolResult { preview } if detail == TranscriptDetail::Full => {
+                    let trimmed = preview.trim();
+                    if !trimmed.is_empty() {
+                        pieces.push(trimmed.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if pieces.is_empty() {
             continue;
         }
-        turns.push((*role, text, *at));
+        // A user message consisting entirely of tool_result blocks is tool
+        // output surfaced back to the model — attributing it to "the user" in
+        // the panel's palette would misread who spoke.
+        let display_role = if *role == Role::User && only_tool_result {
+            Role::Assistant
+        } else {
+            *role
+        };
+        turns.push((display_role, pieces.join("\n\n"), *at));
     }
     turns
 }
 
 /// Read and flatten a Claude session transcript on a worker thread, handing
-/// the turns back through `deliver`.
+/// the turns (rendered at `detail`) back through `deliver`.
 ///
 /// Transcripts reach ~15 MB, so this must never run on the UI thread. Failure
 /// is silent by design: the panel keeps whatever it already had, and nothing
 /// about the file's *content* is ever logged.
-pub fn spawn_load<F>(home: std::path::PathBuf, session_id: String, deliver: F)
-where
+pub fn spawn_load<F>(
+    home: std::path::PathBuf,
+    session_id: String,
+    detail: TranscriptDetail,
+    deliver: F,
+) where
     F: FnOnce(Vec<(Role, String, Option<SystemTime>)>) + Send + 'static,
 {
     std::thread::spawn(move || {
@@ -357,7 +440,7 @@ where
                         read.writer_version.as_deref().unwrap_or("unknown"),
                     );
                 }
-                deliver(plain_turns(&read.events));
+                deliver(turns_at_level(&read.events, detail));
             }
             Err(err) => crate::logging::transcript_unreadable(&session_id, &format!("{err:?}")),
         }
@@ -608,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_turns_keep_prose_and_drop_tool_traffic() {
+    fn reply_detail_keeps_prose_and_drops_tool_traffic() {
         let out = read(concat!(
             r#"{"type":"user","message":{"role":"user","content":"do the thing"}}"#,
             "\n",
@@ -619,7 +702,7 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking"},{"type":"text","text":"done"}]}}"#,
             "\n"
         ));
-        let turns = plain_turns(&out.events);
+        let turns = turns_at_level(&out.events, TranscriptDetail::Reply);
         assert_eq!(
             turns
                 .iter()
@@ -637,5 +720,94 @@ mod tests {
             "\n"
         ));
         assert!(!out.writer_newer_than_tested);
+    }
+
+    /// The three detail levels are the whole feature; assert directly that
+    /// each admits exactly the right block kinds, or the panel silently
+    /// starts leaking tool traffic into Reply mode again.
+    #[test]
+    fn detail_levels_gate_which_block_kinds_render() {
+        let out = read(concat!(
+            r#"{"type":"user","message":{"role":"user","content":"do the thing"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"},{"type":"tool_use","name":"Edit"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"stdout body"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n"
+        ));
+
+        let reply: Vec<_> = turns_at_level(&out.events, TranscriptDetail::Reply)
+            .into_iter()
+            .map(|(r, t, _)| (r, t))
+            .collect();
+        assert_eq!(
+            reply,
+            vec![
+                (Role::User, "do the thing".into()),
+                (Role::Assistant, "working".into()),
+                (Role::Assistant, "done".into()),
+            ],
+            "Reply must never surface tool traffic"
+        );
+
+        let collapsed: Vec<_> = turns_at_level(&out.events, TranscriptDetail::Collapsed)
+            .into_iter()
+            .map(|(r, t, _)| (r, t))
+            .collect();
+        assert_eq!(
+            collapsed,
+            vec![
+                (Role::User, "do the thing".into()),
+                (Role::Assistant, "working\n\n\u{2699} Edit".into()),
+                (Role::Assistant, "done".into()),
+            ],
+            "Collapsed adds ⚙ tool-call markers but must not include output"
+        );
+
+        let full: Vec<_> = turns_at_level(&out.events, TranscriptDetail::Full)
+            .into_iter()
+            .map(|(r, t, _)| (r, t))
+            .collect();
+        assert_eq!(
+            full,
+            vec![
+                (Role::User, "do the thing".into()),
+                (Role::Assistant, "working\n\n\u{2699} Edit".into()),
+                // Tool_result-only user messages read as assistant output,
+                // not as "the user typed this".
+                (Role::Assistant, "stdout body".into()),
+                (Role::Assistant, "done".into()),
+            ]
+        );
+    }
+
+    /// Full mode reads the same capped preview as the parser produced, so an
+    /// enormous tool_result can never blow up the render buffer by way of a
+    /// detail cycle.
+    #[test]
+    fn full_detail_inherits_the_per_block_byte_cap() {
+        let body = "a".repeat(MAX_BLOCK_BYTES * 2);
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "tool_result", "content": body}]}
+        })
+        .to_string();
+        let out = read(&format!("{line}\n"));
+        let turns = turns_at_level(&out.events, TranscriptDetail::Full);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].1.len() < MAX_BLOCK_BYTES + 128,
+            "Full mode must inherit the block cap, not resurrect the raw body"
+        );
+        assert!(turns[0].1.contains("bytes elided"));
+    }
+
+    #[test]
+    fn detail_next_cycles_through_all_three_and_wraps() {
+        assert_eq!(TranscriptDetail::Reply.next(), TranscriptDetail::Collapsed);
+        assert_eq!(TranscriptDetail::Collapsed.next(), TranscriptDetail::Full);
+        assert_eq!(TranscriptDetail::Full.next(), TranscriptDetail::Reply);
     }
 }

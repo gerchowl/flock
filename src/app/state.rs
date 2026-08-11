@@ -2027,6 +2027,11 @@ pub struct AppState {
     /// or the focused pane changes. Only meaningful when `expanded_prompt_pane`
     /// is `Some`.
     pub prompt_history_scroll: u16,
+    /// The detail level the prompt-history panel renders at (#246). Three
+    /// fixed global levels — deliberately not per-entry — cycled by Tab
+    /// while the panel is open. Global rather than per-pane because it is a
+    /// view mode, not stateful conversation data.
+    pub prompt_history_detail: crate::agent_transcript::TranscriptDetail,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -2776,6 +2781,7 @@ impl AppState {
             system_stats: None,
             expanded_prompt_pane: None,
             prompt_history_scroll: 0,
+            prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,

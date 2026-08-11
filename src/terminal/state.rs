@@ -104,9 +104,11 @@ pub struct TerminalState {
     /// [`MAX_PROMPT_HISTORY_LINES`] rendered lines (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
-    /// Session whose transcript already hydrated `prompt_history`, so a burst
-    /// of hook reports spawns at most one reader per session (#246).
-    hydrated_transcript_session: Option<String>,
+    /// The (session, detail) pair that last hydrated `prompt_history` (#246).
+    /// The pair, not the session alone, so cycling the panel's detail level
+    /// re-arms the reader without touching every hook path — a burst of hook
+    /// reports at the same session+detail still spawns only one reader.
+    hydrated_transcript: Option<(String, crate::agent_transcript::TranscriptDetail)>,
     /// Session-promoted header fields ("chips": containers, progress, custom
     /// KV), insertion-ordered, optionally TTL-expiring. Ephemeral by design —
     /// never persisted into session snapshots.
@@ -166,7 +168,7 @@ impl TerminalState {
             fallback_observed_at: None,
             last_prompt: None,
             prompt_history: Vec::new(),
-            hydrated_transcript_session: None,
+            hydrated_transcript: None,
             header_fields: Vec::new(),
             header_reserved: false,
             state_changed_at: None,
@@ -1036,15 +1038,30 @@ impl TerminalState {
         Some(session_ref.value.clone())
     }
 
-    /// True once for a given session: the caller should read the transcript
-    /// and hydrate. Flips immediately so a burst of hook reports cannot spawn
-    /// a reader per event.
-    pub fn take_transcript_hydration_due(&mut self, session_id: &str) -> bool {
-        if self.hydrated_transcript_session.as_deref() == Some(session_id) {
+    /// True once per `(session_id, detail)` pair: the caller should read the
+    /// transcript and hydrate at that detail. Flips immediately so a burst of
+    /// hook reports cannot spawn a reader per event. Cycling the panel's
+    /// detail level changes the second half of the pair and re-arms it.
+    pub fn take_transcript_hydration_due(
+        &mut self,
+        session_id: &str,
+        detail: crate::agent_transcript::TranscriptDetail,
+    ) -> bool {
+        let target = (session_id.to_string(), detail);
+        if self.hydrated_transcript.as_ref() == Some(&target) {
             return false;
         }
-        self.hydrated_transcript_session = Some(session_id.to_string());
+        self.hydrated_transcript = Some(target);
         true
+    }
+
+    /// The `(session, detail)` a reader is currently in flight (or last
+    /// delivered) for. The delivery path uses this to drop stale results
+    /// arriving after the user cycled level.
+    pub fn expected_transcript_detail(
+        &self,
+    ) -> Option<(String, crate::agent_transcript::TranscriptDetail)> {
+        self.hydrated_transcript.clone()
     }
 
     /// Replace the history ring with the pane's own session transcript (#246).
@@ -1256,6 +1273,27 @@ mod tests {
         );
         // The collapsed header follows the ring it summarises.
         assert_eq!(terminal.last_prompt.as_deref(), Some("second prompt"));
+    }
+
+    /// The guard used to be per-session, which meant cycling the panel's
+    /// detail level could not re-arm the reader and the user would keep
+    /// seeing the previous mode's turns. Assert directly that the same
+    /// session at a different detail re-arms, while the same pair does not.
+    #[test]
+    fn hydration_guard_rearms_on_detail_change_but_not_on_repeat() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut terminal = test_terminal();
+        assert!(terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply));
+        assert!(
+            !terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply),
+            "same (session, detail) must not re-arm"
+        );
+        assert!(
+            terminal.take_transcript_hydration_due("s1", TranscriptDetail::Collapsed),
+            "cycling detail on the same session must re-arm the reader"
+        );
+        assert!(terminal.take_transcript_hydration_due("s2", TranscriptDetail::Collapsed));
     }
 
     /// An unreadable or empty transcript must not blank a panel that hooks had

@@ -165,6 +165,43 @@ impl AppState {
         }
     }
 
+    /// If the panel is open on a pane other than the one currently focused,
+    /// close it (#246). Called at every focus-change chokepoint so the panel
+    /// dismisses whenever focus leaves it — the panel is scoped to the pane
+    /// whose header opened it, and lingering it on a background pane invites
+    /// the user to interact with content that is no longer part of the
+    /// active pane.
+    pub(crate) fn close_prompt_history_on_blur(&mut self) {
+        let Some(expanded) = self.expanded_prompt_pane else {
+            return;
+        };
+        let focused = self
+            .current_pane_focus_target()
+            .map(|target| target.pane_id);
+        if focused != Some(expanded) {
+            self.close_prompt_history_panel();
+        }
+    }
+
+    /// Cycle the prompt-history panel's detail level to the next of
+    /// [`TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
+    /// target whose transcript the caller must re-read at the new level, or
+    /// `None` when the panel is closed or the focused pane has no known
+    /// Claude session yet (#246).
+    ///
+    /// The re-read runs off-thread; this helper only rotates the state and
+    /// tells the caller who to arm. Kept separate from the spawn so the same
+    /// state machine is reachable from tests without an event loop.
+    pub(crate) fn cycle_prompt_history_detail(&mut self) -> Option<PaneId> {
+        let pane_id = self.expanded_prompt_pane?;
+        self.prompt_history_detail = self.prompt_history_detail.next();
+        // The scroll reset matches every other detail-change event in the
+        // panel (open, close, focus change): 0 is "pinned to latest", which
+        // is where the eye expects to be after content changes shape.
+        self.prompt_history_scroll = 0;
+        Some(pane_id)
+    }
+
     /// Scroll the open prompt-history panel by `lines` (positive = older,
     /// negative = newer / toward pinned-at-bottom). Scroll is clamped to
     /// `[0, max_offset]`. Returns whether anything moved.
@@ -270,6 +307,11 @@ impl AppState {
         if previous != current {
             self.previous_pane_focus = previous;
         }
+        // #246: dismiss the prompt-history panel whenever focus lands on a
+        // pane that isn't the one that owns it. `focus_pane_in_workspace`
+        // has its own tail check because its `layout.focus_pane` runs after
+        // this call finishes.
+        self.close_prompt_history_on_blur();
     }
 
     pub(crate) fn focus_pane_in_workspace(&mut self, ws_idx: usize, pane_id: PaneId) -> bool {
@@ -297,6 +339,9 @@ impl AppState {
             tab.layout.focus_pane(pane_id);
             self.previous_pane_focus = previous;
             self.mark_session_dirty();
+            // Blur check after the focus flip lands, or the panel would
+            // linger on the pane the user just navigated away from.
+            self.close_prompt_history_on_blur();
             return true;
         }
         false
@@ -3132,22 +3177,29 @@ impl AppState {
         changed
     }
 
-    /// The session whose transcript still needs reading for `pane_id`, if a
-    /// hook has established one and it has not been read yet (#246).
+    /// The session whose transcript still needs reading for `pane_id` at
+    /// the current panel detail, if a hook has established one and the pair
+    /// has not been read yet (#246).
     ///
-    /// Returns at most once per session: the caller does the (off-thread) read
-    /// and sends `TranscriptHydrated` back.
-    pub fn take_due_transcript_session(&mut self, pane_id: PaneId) -> Option<String> {
-        let mut due_session = None;
+    /// Returns at most once per `(session, detail)`: the caller does the
+    /// (off-thread) read and sends `TranscriptHydrated` back. Cycling the
+    /// panel's detail re-arms this, so the same session reads again at the
+    /// new level.
+    pub fn take_due_transcript_hydration(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Option<(String, crate::agent_transcript::TranscriptDetail)> {
+        let detail = self.prompt_history_detail;
+        let mut due = None;
         let _ = self.update_terminal_state(pane_id, |terminal| {
             if let Some(session_id) = terminal.claude_session_id() {
-                if terminal.take_transcript_hydration_due(&session_id) {
-                    due_session = Some(session_id);
+                if terminal.take_transcript_hydration_due(&session_id, detail) {
+                    due = Some((session_id, detail));
                 }
             }
             None
         });
-        due_session
+        due
     }
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
@@ -3230,8 +3282,21 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
-            AppEvent::TranscriptHydrated { pane_id, turns } => self
+            AppEvent::TranscriptHydrated {
+                pane_id,
+                detail,
+                turns,
+            } => self
                 .update_terminal_state(pane_id, |terminal| {
+                    // A result from a superseded reader (user cycled detail
+                    // mid-flight) must not repaint the panel with the old
+                    // level's content. The guard's detail is authoritative.
+                    if terminal
+                        .expected_transcript_detail()
+                        .is_some_and(|(_, expected)| expected != detail)
+                    {
+                        return None;
+                    }
                     terminal.hydrate_prompt_history(turns.as_slice());
                     None
                 })
@@ -6887,6 +6952,62 @@ mod tests {
         assert_eq!(state.expanded_prompt_pane, None);
         // No-op when nothing is open.
         assert!(!state.scroll_prompt_history(3, 10));
+    }
+
+    /// #246: cycling only makes sense while the panel is open. The scroll
+    /// must reset each hop or content that reshapes underfoot leaves the
+    /// viewport pointing at an offset that no longer means what it did.
+    #[test]
+    fn cycle_prompt_history_detail_rotates_and_resets_scroll_only_when_open() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut state = app_with_workspaces(&["a"]);
+        state.active = Some(0);
+        let pane = state.workspaces[0].focused_pane_id().expect("focused pane");
+
+        // Panel closed → no-op, level unchanged.
+        assert_eq!(state.cycle_prompt_history_detail(), None);
+        assert_eq!(state.prompt_history_detail, TranscriptDetail::Reply);
+
+        state.expanded_prompt_pane = Some(pane);
+        state.prompt_history_scroll = 7;
+        assert_eq!(state.cycle_prompt_history_detail(), Some(pane));
+        assert_eq!(state.prompt_history_detail, TranscriptDetail::Collapsed);
+        assert_eq!(
+            state.prompt_history_scroll, 0,
+            "content reshapes on cycle so the offset must reset to bottom-pinned",
+        );
+
+        assert_eq!(state.cycle_prompt_history_detail(), Some(pane));
+        assert_eq!(state.prompt_history_detail, TranscriptDetail::Full);
+        assert_eq!(state.cycle_prompt_history_detail(), Some(pane));
+        assert_eq!(
+            state.prompt_history_detail,
+            TranscriptDetail::Reply,
+            "Full must wrap back to Reply"
+        );
+    }
+
+    /// #246: without close-on-blur the panel lingers on a background pane
+    /// and the user can end up scrolling through the wrong pane's history.
+    #[test]
+    fn close_prompt_history_on_blur_dismisses_only_when_focus_left_the_owning_pane() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.active = Some(0);
+        let pane_a = state.workspaces[0].focused_pane_id().expect("focused pane");
+        state.expanded_prompt_pane = Some(pane_a);
+        state.prompt_history_scroll = 3;
+
+        // Still focused on the same pane → panel stays open.
+        state.close_prompt_history_on_blur();
+        assert_eq!(state.expanded_prompt_pane, Some(pane_a));
+        assert_eq!(state.prompt_history_scroll, 3);
+
+        // Switch workspaces → focus leaves the pane, panel dismisses and
+        // scroll resets (mirrors the explicit close path).
+        state.switch_workspace(1);
+        assert_eq!(state.expanded_prompt_pane, None);
+        assert_eq!(state.prompt_history_scroll, 0);
     }
 
     // ---- attention: mark-unread + defer-to-next (#122) ---------------------

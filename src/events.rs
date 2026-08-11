@@ -117,9 +117,12 @@ pub enum AppEvent {
     /// the user can scan the conversation, not just their own side of it.
     /// A pane's own session transcript, read off the UI thread and flattened
     /// to renderable turns (#246). Replaces the hook-fed prompt history, which
-    /// only ever held what a hook chose to report.
+    /// only ever held what a hook chose to report. Carries the `detail` the
+    /// worker rendered at, so a result arriving after the user cycled level
+    /// is dropped rather than repainting the panel with stale content.
     TranscriptHydrated {
         pane_id: PaneId,
+        detail: crate::agent_transcript::TranscriptDetail,
         turns: Vec<(
             crate::agent_transcript::Role,
             String,
