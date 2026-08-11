@@ -10,7 +10,7 @@
 //!
 //! Ephemeral by design — never persisted into session snapshots.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Hard cap on history per pane, measured in rendered lines (not entries).
 /// Drop oldest WHOLE entries until the total fits. Sized for ~1000 lines:
@@ -34,6 +34,11 @@ pub struct PromptHistoryEntry {
     pub kind: PromptHistoryKind,
     pub text: String,
     pub recorded_at: Instant,
+    /// Set for entries hydrated from a session transcript (#246). Those are
+    /// historical, so their age must come from the wall clock — a monotonic
+    /// `recorded_at` stamped at hydration would render a month-old prompt as
+    /// "0s ago". Live entries leave this `None` and keep using `recorded_at`.
+    pub wall_clock: Option<SystemTime>,
 }
 
 impl PromptHistoryEntry {
@@ -48,6 +53,13 @@ impl PromptHistoryEntry {
 
     /// Compact "12s ago"-style age string.
     pub fn relative_age(&self, now: Instant) -> String {
+        if let Some(at) = self.wall_clock {
+            // Historical entry: age against the wall clock. A stamp in the
+            // future (clock skew between hosts) reads as "0s ago" rather than
+            // panicking or wrapping.
+            let elapsed = SystemTime::now().duration_since(at).unwrap_or_default();
+            return relative_age_for_duration(elapsed);
+        }
         let elapsed = now.saturating_duration_since(self.recorded_at);
         relative_age_for_duration(elapsed)
     }
@@ -105,6 +117,7 @@ mod tests {
             kind,
             text: text.to_string(),
             recorded_at: Instant::now(),
+            wall_clock: None,
         }
     }
 
