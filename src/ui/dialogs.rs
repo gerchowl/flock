@@ -136,6 +136,27 @@ pub(crate) fn new_linked_worktree_popup_height(has_seed: bool) -> u16 {
     }
 }
 
+/// Smallest inner height the new-worktree dialog can draw without overrunning
+/// itself.
+///
+/// The rows are fixed top-down — header, branch label + input, the seed pair
+/// when present, checkout label + path — and the error area starts right below
+/// them while the buttons stay pinned to `inner.height - 1`. The error needs at
+/// least one row strictly above the buttons, so the first error row (5, or 7
+/// with a seed) must be no lower than `inner.height - 2`.
+///
+/// A single bound of 7 covered the plain dialog but was two short for the seed
+/// variant, whose error row landed on the popup's bottom border and painted
+/// over it (#243). `centered_popup_rect` clamps the popup on short terminals,
+/// so this is reachable by resizing rather than by any state the user picks.
+pub(crate) fn min_inner_height(has_seed: bool) -> u16 {
+    if has_seed {
+        9
+    } else {
+        7
+    }
+}
+
 pub(crate) fn new_linked_worktree_inner_rect(area: Rect, has_seed: bool) -> Option<Rect> {
     centered_popup_rect(area, 68, new_linked_worktree_popup_height(has_seed)).map(|popup| {
         Rect::new(
@@ -299,7 +320,7 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     ) else {
         return;
     };
-    if inner.height < 7 {
+    if inner.height < min_inner_height(has_seed) {
         return;
     }
 
@@ -1311,6 +1332,55 @@ mod tests {
                 rendered.contains("create and open"),
                 "has_seed={has_seed}: the error overran the button row"
             );
+        }
+    }
+
+    #[test]
+    fn a_shrinking_terminal_never_paints_over_the_dialog_border() {
+        // #243: the error row is placed from the top while the buttons are
+        // pinned to the bottom, so a clamped popup let the two meet on the
+        // frame. Sweep every height the popup can be clamped to and require
+        // the box to stay a box — either fully drawn or bailed out of, never
+        // half-drawn through its own border.
+        let explained =
+            crate::worktree::explain_worktree_add_failure("HEAD", "fatal: invalid reference: HEAD");
+
+        for has_seed in [false, true] {
+            for height in 6..=24u16 {
+                let mut app = AppState::test_new();
+                let plan = has_seed.then(claude_fork_plan);
+                let mut create = worktree_create_with(plan, "seed", WorktreeCreateFocus::Branch);
+                create.error = Some(explained.clone());
+                app.worktree_create = Some(create);
+
+                let area = Rect::new(0, 0, 80, height);
+                let mut terminal = Terminal::new(TestBackend::new(80, height))
+                    .expect("test terminal should initialize");
+                terminal
+                    .draw(|frame| render_new_linked_worktree_overlay(&app, frame, area))
+                    .expect("overlay should render");
+                let buffer = terminal.backend().buffer().clone();
+
+                let Some(popup) = super::centered_popup_rect(
+                    area,
+                    68,
+                    super::new_linked_worktree_popup_height(has_seed),
+                ) else {
+                    continue; // too small for a popup at all — nothing drawn
+                };
+
+                // Every cell of the top and bottom border rows must still be a
+                // box-drawing glyph.
+                for y in [popup.y, popup.y + popup.height - 1] {
+                    let row: String = (popup.x..popup.x + popup.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    assert!(
+                        row.chars().all(|c| "┌┐└┘─".contains(c)),
+                        "has_seed={has_seed} height={height}: border row {y} was painted over: {row:?}"
+                    );
+                }
+            }
         }
     }
 

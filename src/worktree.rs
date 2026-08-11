@@ -470,6 +470,9 @@ pub(crate) fn prepare_peer_checkout(
     let status = run_command_capture("git", &["-C", &repo, "status", "--porcelain"], None)?;
     let was_dirty = !status.trim().is_empty();
 
+    // `@{upstream}` resolves a branch NAME, not a ref — `refs/heads/x@{u}` is
+    // rejected outright — so this one stays bare. That is safe: the suffix only
+    // ever consults refs/heads, so a same-named tag cannot capture it.
     let upstream = run_command_capture(
         "git",
         &[
@@ -485,6 +488,9 @@ pub(crate) fn prepare_peer_checkout(
     .filter(|up| !up.is_empty());
     let was_unpushed = match &upstream {
         None => true,
+        // The range endpoint IS a commit-ish, so it must be qualified: a tag
+        // sharing the branch's name counts the wrong commits and reports a
+        // fully-pushed branch as unpushed (#243).
         Some(up) => run_command_capture(
             "git",
             &[
@@ -492,7 +498,7 @@ pub(crate) fn prepare_peer_checkout(
                 &repo,
                 "rev-list",
                 "--count",
-                &format!("{up}..{branch}"),
+                &format!("{up}..refs/heads/{branch}"),
             ],
             None,
         )
@@ -785,16 +791,16 @@ fn branch_ref(branch: &str) -> String {
 /// 3. Remote containment: the branch tip is reachable from another pushed
 ///    remote ref (e.g. merged into a feature branch) — the work is recorded,
 ///    so deleting the local branch loses nothing.
-/// 4. The branch holds no commits of its own (#243).
+/// 4. The branch holds no commits of its own — every commit on it is already
+///    on some other ref, local or remote, so there is nothing to lose (#243).
 ///
 /// Anything inconclusive is NotMerged — deletion needs positive evidence.
 ///
 /// (4) is deliberately last even though it is the only purely-local check and
 /// would short-circuit the `gh` call. A disposable branch is very often *also*
-/// merged or remotely contained, and "merged into main" / "contained in
-/// origin/x" tell the user where their work went; "no commits of its own" does
-/// not. Latency is the cheaper thing to spend here — the gate already runs off
-/// the UI thread behind "checking merge status…".
+/// merged or remotely contained, and "merged into main" says more about where
+/// the work went than (4) can. Latency is the cheaper thing to spend here —
+/// the gate already runs off the UI thread behind "checking merge status…".
 pub(crate) fn branch_merge_gate(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
@@ -867,40 +873,92 @@ pub(crate) fn branch_merge_gate(
 
     // Remote containment: any remote ref other than the branch's own
     // tracking ref that contains the tip.
-    if let Ok(containing) = run_command_capture(
-        "git",
-        &[
-            "-C",
-            &root,
-            "branch",
-            "-r",
-            "--contains",
-            &branch_ref(branch),
-            "--format",
-            "%(refname:short)",
-        ],
-        None,
-    ) {
-        let own_suffix = format!("/{branch}");
-        if let Some(remote_ref) = containing
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .find(|line| !line.ends_with(&own_suffix) && !line.contains("HEAD"))
-        {
-            return WorktreeMergeGate::Merged {
-                evidence: format!("contained in {remote_ref}"),
-            };
-        }
-    }
-
-    if branch_has_no_unique_commits(&root, branch) {
+    if let Some(remote_ref) = refs_containing(&root, branch, RefScope::Remote).first() {
         return WorktreeMergeGate::Merged {
-            evidence: "no commits of its own".to_string(),
+            evidence: format!("contained in {remote_ref}"),
         };
     }
 
+    if branch_has_no_unique_commits(&root, branch) {
+        // Name the ref that holds them where one exists. The unnamed phrasing
+        // is true but tells the user nothing about where their work went. For
+        // the accidental-worktree case it is almost always the base branch the
+        // session was cut from, which is worth saying out loud (#243).
+        //
+        // A zero count does not guarantee a single containing ref — the commits
+        // may be spread over several — so the unnamed phrasing stays as the
+        // fallback rather than being replaced.
+        let evidence = match refs_containing(&root, branch, RefScope::All).first() {
+            Some(holder) => format!("contained in {holder}"),
+            None => "no commits of its own".to_string(),
+        };
+        return WorktreeMergeGate::Merged { evidence };
+    }
+
     WorktreeMergeGate::NotMerged
+}
+
+/// Which refs [`refs_containing`] considers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefScope {
+    /// Remote-tracking refs only — the work is recorded off this machine.
+    Remote,
+    /// Local branches as well; enough to say the commits are not unique to
+    /// this branch, which is all the last evidence source claims.
+    All,
+}
+
+/// Display names of the refs that contain `branch`'s tip, in git's own listing
+/// order (local branches before remote-tracking ones), excluding refs that are
+/// not independent evidence about it:
+///
+/// - the branch's own local ref and its tracking refs on every remote, since a
+///   ref cannot vouch for itself;
+/// - `refs/remotes/<remote>/HEAD`, which is a symbolic pointer at the remote's
+///   default branch and duplicates the branch it names. It has to be filtered
+///   on the *full* refname: `%(refname:short)` renders it as bare `origin`, so
+///   a `contains("HEAD")` filter misses it and the gate reports the meaningless
+///   `contained in origin` (#243).
+fn refs_containing(root: &str, branch: &str, scope: RefScope) -> Vec<String> {
+    let scope_flag = match scope {
+        RefScope::Remote => "-r",
+        RefScope::All => "-a",
+    };
+    let own_remote_suffix = format!("/{branch}");
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "branch",
+            scope_flag,
+            "--contains",
+            &branch_ref(branch),
+            "--format",
+            // Full refnames: the short form is ambiguous exactly where the
+            // filtering has to be precise.
+            "%(refname)",
+        ],
+        None,
+    )
+    .map(|out| {
+        out.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.ends_with("/HEAD"))
+            .filter(|line| {
+                *line != branch_ref(branch)
+                    && !(line.starts_with("refs/remotes/") && line.ends_with(&own_remote_suffix))
+            })
+            .map(|line| {
+                line.strip_prefix("refs/remotes/")
+                    .or_else(|| line.strip_prefix("refs/heads/"))
+                    .unwrap_or(line)
+                    .to_string()
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Upper bound on how long the kill dialog waits for the merge gate before it
@@ -1602,6 +1660,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_peer_checkout_ignores_a_tag_sharing_the_branch_name() {
+        // The ahead-count's range endpoint is a commit-ish, so a same-named tag
+        // captures it and the branch is reported unpushed while its upstream is
+        // in sync (#243). `@{upstream}` above is immune — it resolves a branch
+        // name, never a tag — which is why only one of the two is qualified.
+        let (repo, _origin) = create_repo_with_bare_origin("peer-tag-collision");
+        run_git(&repo, &["checkout", "--quiet", "-b", "v1.0"]);
+        let pushed = prepare_peer_checkout(&repo, "v1.0", true).unwrap();
+        assert!(pushed.pushed);
+
+        // A tag named after the branch, pointing at an unrelated commit.
+        run_git(&repo, &["checkout", "--quiet", "-b", "elsewhere"]);
+        std::fs::write(repo.join("other.txt"), "other\n").unwrap();
+        run_git(&repo, &["add", "other.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "unrelated"]);
+        let elsewhere = run_command_capture(
+            "git",
+            &["-C", &repo.display().to_string(), "rev-parse", "HEAD"],
+            None,
+        )
+        .expect("tip");
+        run_git(&repo, &["update-ref", "refs/tags/v1.0", &elsewhere]);
+
+        let again = prepare_peer_checkout(&repo, "v1.0", false).unwrap();
+        assert!(
+            !again.was_unpushed,
+            "the branch is in sync with its upstream; the tag is not the branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn prepare_peer_checkout_flags_a_dirty_working_tree() {
         let (repo, _origin) = create_repo_with_bare_origin("peer-dirty");
         run_git(&repo, &["checkout", "--quiet", "-b", "feature-x"]);
@@ -2072,10 +2163,12 @@ prunable stale
             ],
         );
 
+        // The evidence names the base the session was cut from, rather than
+        // the bare "no commits of its own" — the user learns where the work is.
         assert_eq!(
             branch_merge_gate(&repo, &checkout, "worktree/fresh"),
             WorktreeMergeGate::Merged {
-                evidence: "no commits of its own".to_string()
+                evidence: "contained in feature/base".to_string()
             }
         );
 
@@ -2213,6 +2306,96 @@ prunable stale
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn containment_evidence_never_names_a_remotes_symbolic_head() {
+        // `%(refname:short)` renders refs/remotes/origin/HEAD as bare `origin`,
+        // so the old `contains("HEAD")` filter missed it and the first match
+        // for an empty branch cut from the default was `contained in origin` —
+        // which names no branch at all (#243).
+        let (repo, origin) = create_repo_with_bare_origin("containment-symbolic-head");
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["push", "--quiet", "-u", "origin", &default]);
+        // A clone is what actually creates refs/remotes/origin/HEAD.
+        let clone = unique_temp_path("containment-symbolic-head-clone");
+        run_git(
+            &repo,
+            &[
+                "clone",
+                "--quiet",
+                &origin.display().to_string(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let clone_root = clone.display().to_string();
+        run_git(
+            &clone,
+            &["branch", "worktree/fresh", &format!("origin/{default}")],
+        );
+
+        let containing = refs_containing(&clone_root, "worktree/fresh", RefScope::Remote);
+        assert!(
+            !containing.iter().any(|r| r == "origin"),
+            "a remote's symbolic HEAD is not a branch name: {containing:?}"
+        );
+        assert!(
+            containing.iter().any(|r| r == &format!("origin/{default}")),
+            "the real remote branch must still be found: {containing:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn refs_containing_excludes_the_branchs_own_refs() {
+        // A ref cannot vouch for itself: neither refs/heads/<branch> nor its
+        // tracking ref on any remote is evidence about <branch>.
+        let (repo, _origin) = create_repo_with_bare_origin("refs-containing-own");
+        let root = repo.display().to_string();
+        run_git(&repo, &["checkout", "--quiet", "-b", "solo"]);
+        std::fs::write(repo.join("solo.txt"), "solo\n").unwrap();
+        run_git(&repo, &["add", "solo.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "solo work"]);
+        run_git(&repo, &["push", "--quiet", "-u", "origin", "solo"]);
+
+        // Prove git really does list the refs being filtered, so the
+        // assertions below cannot pass by the helper simply returning nothing.
+        let raw = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &root,
+                "branch",
+                "-a",
+                "--contains",
+                "refs/heads/solo",
+                "--format",
+                "%(refname)",
+            ],
+            None,
+        )
+        .expect("git lists the containing refs");
+        for own in ["refs/heads/solo", "refs/remotes/origin/solo"] {
+            assert!(
+                raw.lines().any(|line| line.trim() == own),
+                "fixture must contain {own} for the filter to be doing work: {raw:?}"
+            );
+        }
+
+        let all = refs_containing(&root, "solo", RefScope::All);
+        assert!(
+            !all.iter().any(|r| r == "solo" || r == "origin/solo"),
+            "own refs must not appear: {all:?}"
+        );
+        assert!(
+            refs_containing(&root, "solo", RefScope::Remote).is_empty(),
+            "only its own tracking ref contains it, so there is no evidence"
+        );
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 
