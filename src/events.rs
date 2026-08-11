@@ -115,6 +115,17 @@ pub enum AppEvent {
     /// message, captured by the same Stop hook that fires `HookRecapReported`).
     /// Renders distinct from prompts and recaps in the prompt-history float so
     /// the user can scan the conversation, not just their own side of it.
+    /// A pane's own session transcript, read off the UI thread and flattened
+    /// to renderable turns (#246). Replaces the hook-fed prompt history, which
+    /// only ever held what a hook chose to report.
+    TranscriptHydrated {
+        pane_id: PaneId,
+        turns: Vec<(
+            crate::agent_transcript::Role,
+            String,
+            Option<std::time::SystemTime>,
+        )>,
+    },
     HookReplyReported {
         pane_id: PaneId,
         reply: String,

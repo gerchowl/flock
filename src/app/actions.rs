@@ -3132,6 +3132,24 @@ impl AppState {
         changed
     }
 
+    /// The session whose transcript still needs reading for `pane_id`, if a
+    /// hook has established one and it has not been read yet (#246).
+    ///
+    /// Returns at most once per session: the caller does the (off-thread) read
+    /// and sends `TranscriptHydrated` back.
+    pub fn take_due_transcript_session(&mut self, pane_id: PaneId) -> Option<String> {
+        let mut due_session = None;
+        let _ = self.update_terminal_state(pane_id, |terminal| {
+            if let Some(session_id) = terminal.claude_session_id() {
+                if terminal.take_transcript_hydration_due(&session_id) {
+                    due_session = Some(session_id);
+                }
+            }
+            None
+        });
+        due_session
+    }
+
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
             AppEvent::PaneDied { pane_id } => {
@@ -3208,6 +3226,13 @@ impl AppState {
                     // (#96). Both reads share the same chokepoint, so the
                     // headless loop gets the same history.
                     terminal.record_prompt(prompt.clone());
+                    None
+                })
+                .into_iter()
+                .collect(),
+            AppEvent::TranscriptHydrated { pane_id, turns } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.hydrate_prompt_history(turns.as_slice());
                     None
                 })
                 .into_iter()

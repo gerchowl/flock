@@ -348,6 +348,33 @@ pub(crate) fn pane_spawn_started(
     );
 }
 
+/// The transcript writer is newer than the schema kernel was tested against
+/// (#246). Rendering continues leniently; this is a drift signal, not an error.
+pub(crate) fn transcript_writer_newer_than_tested(writer_version: &str) {
+    tracing::warn!(
+        event = "transcript.writer.untested",
+        subsystem = "transcript",
+        outcome = "degraded",
+        writer_version,
+        "session transcript written by an untested agent version"
+    );
+}
+
+/// A transcript could not be read or no longer matches the schema kernel.
+///
+/// Logs the session id and the error shape only — never transcript content,
+/// which contains everything the user typed and every tool result.
+pub(crate) fn transcript_unreadable(session_id: &str, reason: &str) {
+    tracing::debug!(
+        event = "transcript.read.failed",
+        subsystem = "transcript",
+        outcome = "unavailable",
+        session_id,
+        reason,
+        "session transcript unavailable; keeping existing prompt history"
+    );
+}
+
 pub(crate) fn pane_spawned(pane_id: u32, pid: u32) {
     tracing::info!(
         event = "pane.spawned",

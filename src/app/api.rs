@@ -412,6 +412,30 @@ impl App {
             None
         };
         let previous_toast = self.state.toast.clone();
+        // A hook report is the first moment a pane's session id is known, so
+        // it is where the transcript read is armed (#246). Off-thread: these
+        // files reach ~15 MB and this is the UI task.
+        if let crate::events::AppEvent::HookPromptReported { pane_id, .. }
+        | crate::events::AppEvent::HookRecapReported { pane_id, .. }
+        | crate::events::AppEvent::HookReplyReported { pane_id, .. } = &ev
+        {
+            let pane_id = *pane_id;
+            if let Some(session_id) = self.state.take_due_transcript_session(pane_id) {
+                if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+                    let event_tx = self.event_tx.clone();
+                    crate::agent_transcript::spawn_load(home, session_id, move |turns| {
+                        if turns.is_empty() {
+                            return;
+                        }
+                        let _ =
+                            event_tx.blocking_send(crate::events::AppEvent::TranscriptHydrated {
+                                pane_id,
+                                turns,
+                            });
+                    });
+                }
+            }
+        }
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
             self.refresh_new_flock_toast_context_for_update(update, &previous_toast);

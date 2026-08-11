@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // Effective state arbitration is intentionally centralized here. Hooks are the
 // default authority for agent-owned internal state, but a narrow set of strong
@@ -104,6 +104,9 @@ pub struct TerminalState {
     /// [`MAX_PROMPT_HISTORY_LINES`] rendered lines (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
+    /// Session whose transcript already hydrated `prompt_history`, so a burst
+    /// of hook reports spawns at most one reader per session (#246).
+    hydrated_transcript_session: Option<String>,
     /// Session-promoted header fields ("chips": containers, progress, custom
     /// KV), insertion-ordered, optionally TTL-expiring. Ephemeral by design —
     /// never persisted into session snapshots.
@@ -163,6 +166,7 @@ impl TerminalState {
             fallback_observed_at: None,
             last_prompt: None,
             prompt_history: Vec::new(),
+            hydrated_transcript_session: None,
             header_fields: Vec::new(),
             header_reserved: false,
             state_changed_at: None,
@@ -1019,6 +1023,75 @@ impl TerminalState {
         })
     }
 
+    /// The Claude session id for this pane, once a hook has established one.
+    ///
+    /// Only Claude is wired today; other sources get their own
+    /// `TranscriptSource` impl rather than a branch here (#246).
+    pub fn claude_session_id(&self) -> Option<String> {
+        let authority = self.hook_authority.as_ref()?;
+        if authority.source != "flock:claude" {
+            return None;
+        }
+        let session_ref = authority.session_ref.as_ref()?;
+        Some(session_ref.value.clone())
+    }
+
+    /// True once for a given session: the caller should read the transcript
+    /// and hydrate. Flips immediately so a burst of hook reports cannot spawn
+    /// a reader per event.
+    pub fn take_transcript_hydration_due(&mut self, session_id: &str) -> bool {
+        if self.hydrated_transcript_session.as_deref() == Some(session_id) {
+            return false;
+        }
+        self.hydrated_transcript_session = Some(session_id.to_string());
+        true
+    }
+
+    /// Replace the history ring with the pane's own session transcript (#246).
+    ///
+    /// The ring is otherwise fed by lifecycle hooks, which only report what a
+    /// hook chose to emit and only when hooks are installed. The transcript is
+    /// the source of truth and is complete, so it wins wholesale — including
+    /// retroactively, for turns that happened before hooks ever fired.
+    ///
+    /// Hooks keep appending afterwards for liveness: this runs once per pane
+    /// when the session becomes known, not on every turn.
+    pub fn hydrate_prompt_history(
+        &mut self,
+        turns: &[(crate::agent_transcript::Role, String, Option<SystemTime>)],
+    ) {
+        if turns.is_empty() {
+            // Nothing readable — keep whatever hooks already gave us rather
+            // than blanking a panel that had content.
+            return;
+        }
+        let now = Instant::now();
+        self.prompt_history.clear();
+        for (role, text, at) in turns {
+            append_prompt_history_with_cap(
+                &mut self.prompt_history,
+                PromptHistoryEntry {
+                    kind: match role {
+                        crate::agent_transcript::Role::User => PromptHistoryKind::Prompt,
+                        crate::agent_transcript::Role::Assistant => PromptHistoryKind::Reply,
+                    },
+                    text: text.clone(),
+                    recorded_at: now,
+                    wall_clock: *at,
+                },
+            );
+        }
+        // Keep the collapsed header consistent with the ring it summarises.
+        if let Some(last_prompt) = turns
+            .iter()
+            .rev()
+            .find(|(role, _, _)| matches!(role, crate::agent_transcript::Role::User))
+            .map(|(_, text, _)| text.clone())
+        {
+            self.last_prompt = Some(last_prompt);
+        }
+    }
+
     /// Append a user prompt to the history ring and refresh `last_prompt`
     /// (the legacy collapsed-header field). Same as `record_prompt_at` with
     /// `Instant::now()`.
@@ -1034,6 +1107,7 @@ impl TerminalState {
                 kind: PromptHistoryKind::Prompt,
                 text: prompt,
                 recorded_at: now,
+                wall_clock: None,
             },
         );
     }
@@ -1052,6 +1126,7 @@ impl TerminalState {
                 kind: PromptHistoryKind::Recap,
                 text: recap,
                 recorded_at: now,
+                wall_clock: None,
             },
         );
     }
@@ -1071,6 +1146,7 @@ impl TerminalState {
                 kind: PromptHistoryKind::Reply,
                 text: reply,
                 recorded_at: now,
+                wall_clock: None,
             },
         );
     }
@@ -1134,6 +1210,63 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    /// #246: the transcript is complete and authoritative, so it replaces the
+    /// hook-fed ring rather than appending to it — otherwise every turn that
+    /// hooks did report would render twice.
+    #[test]
+    fn hydration_replaces_hook_fed_history_and_keeps_wall_clock_ages() {
+        use crate::agent_transcript::Role;
+
+        let mut terminal = test_terminal();
+        terminal.record_prompt("reported by a hook".into());
+        terminal.record_reply("hook reply".into());
+        assert_eq!(terminal.prompt_history.len(), 2);
+
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3_600);
+        terminal.hydrate_prompt_history(&[
+            (Role::User, "first prompt".into(), Some(an_hour_ago)),
+            (Role::Assistant, "first reply".into(), Some(an_hour_ago)),
+            (Role::User, "second prompt".into(), None),
+        ]);
+
+        assert_eq!(
+            terminal
+                .prompt_history
+                .iter()
+                .map(|e| (e.kind, e.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (PromptHistoryKind::Prompt, "first prompt"),
+                (PromptHistoryKind::Reply, "first reply"),
+                (PromptHistoryKind::Prompt, "second prompt"),
+            ],
+            "hook entries must not survive alongside the transcript"
+        );
+        // Historical entries age from the wall clock, not from hydration time.
+        assert_eq!(
+            terminal.prompt_history[0].relative_age(Instant::now()),
+            "1h ago"
+        );
+        // No stamp falls back to the monotonic clock (just hydrated).
+        assert_eq!(
+            terminal.prompt_history[2].relative_age(Instant::now()),
+            "0s ago"
+        );
+        // The collapsed header follows the ring it summarises.
+        assert_eq!(terminal.last_prompt.as_deref(), Some("second prompt"));
+    }
+
+    /// An unreadable or empty transcript must not blank a panel that hooks had
+    /// already filled.
+    #[test]
+    fn hydration_with_no_turns_keeps_existing_history() {
+        let mut terminal = test_terminal();
+        terminal.record_prompt("kept".into());
+        terminal.hydrate_prompt_history(&[]);
+        assert_eq!(terminal.prompt_history.len(), 1);
+        assert_eq!(terminal.prompt_history[0].text, "kept");
     }
 
     #[test]
