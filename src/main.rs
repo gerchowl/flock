@@ -24,6 +24,7 @@ const NESTED_FLOCK_MESSAGES: [&str; 6] = [
 ];
 
 mod agent_resume;
+mod agent_transcript;
 mod api;
 mod app;
 mod build_info;
