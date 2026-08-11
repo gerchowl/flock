@@ -115,6 +115,10 @@ pub enum AppEvent {
     /// message, captured by the same Stop hook that fires `HookRecapReported`).
     /// Renders distinct from prompts and recaps in the prompt-history float so
     /// the user can scan the conversation, not just their own side of it.
+    HookReplyReported {
+        pane_id: PaneId,
+        reply: String,
+    },
     /// A pane's own session transcript, read off the UI thread and flattened
     /// to renderable turns (#246). Replaces the hook-fed prompt history, which
     /// only ever held what a hook chose to report. Carries the `detail` the
@@ -128,10 +132,6 @@ pub enum AppEvent {
             String,
             Option<std::time::SystemTime>,
         )>,
-    },
-    HookReplyReported {
-        pane_id: PaneId,
-        reply: String,
     },
     /// A session promoted (or refreshed) a header field for its own pane.
     PaneHeaderFieldSet {
