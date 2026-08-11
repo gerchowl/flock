@@ -223,6 +223,20 @@ pub(super) fn render_global_launcher_menu(app: &AppState, frame: &mut Frame) {
         };
         frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), rect);
     }
+
+    // Version footer, below the last item: dim and unselectable, so arrow keys
+    // and clicks still only ever land on real actions.
+    let footer_y = inner.y + items.len() as u16;
+    if footer_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", app.global_menu_version_label()),
+                Style::default().fg(app.palette.overlay1),
+            )))
+            .alignment(Alignment::Left),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
 }
 
 pub(super) fn render_resize_overlay(app: &AppState, frame: &mut Frame, area: Rect) {

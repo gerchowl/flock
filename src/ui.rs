@@ -769,6 +769,27 @@ mod tests {
             .collect()
     }
 
+    /// The keybinds overlay doubles as flock's about screen, so the running
+    /// version has to be legible there — not just available from
+    /// `flk --version`, which means leaving the TUI to answer "what am I on?".
+    #[test]
+    fn the_keybinds_overlay_shows_the_running_version() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::state::Mode::KeybindHelp;
+        let area = Rect::new(0, 0, 120, 30);
+        compute_view(&mut app, area);
+
+        let screen = rendered_rows(&app, area).join("\n");
+        let version = format!("flk v{}", crate::build_info::version());
+        assert!(
+            screen.contains(&version),
+            "expected {version:?} in the keybinds overlay, screen was:\n{screen}"
+        );
+    }
+
     /// Every banner row has to survive a toast stacked below it. The stack used to
     /// offset by a hardcoded single row, so rows 2..N got overdrawn (#239).
     #[test]
