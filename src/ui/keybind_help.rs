@@ -285,9 +285,15 @@ pub(super) fn render_keybind_help_overlay(app: &AppState, frame: &mut Frame) {
             .bg(app.palette.accent)
             .add_modifier(Modifier::BOLD),
     );
+    // This overlay is the closest thing flock has to an "about" screen, so the
+    // running version rides on its subtitle — visible without leaving the TUI
+    // to run `flk --version`.
     frame.render_widget(
-        Paragraph::new(" available commands and configured shortcuts")
-            .style(Style::default().fg(app.palette.overlay1)),
+        Paragraph::new(format!(
+            " available commands and configured shortcuts · flk v{}",
+            crate::build_info::version()
+        ))
+        .style(Style::default().fg(app.palette.overlay1)),
         header_rows[1],
     );
 

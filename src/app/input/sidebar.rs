@@ -228,10 +228,18 @@ impl AppState {
         labels
     }
 
+    /// Version footer for the global menu — the one place a user looks when
+    /// asking "what am I running?". Rendered dim and unselectable, so it never
+    /// enters `global_menu_labels` (which drives highlight and hit-testing).
+    pub(crate) fn global_menu_version_label(&self) -> String {
+        format!("flk v{}", crate::build_info::version())
+    }
+
     pub(crate) fn global_menu_rect(&self) -> Rect {
         let screen = self.screen_rect();
         let launcher = self.global_launcher_rect();
         let labels = self.global_menu_labels();
+        let version = self.global_menu_version_label();
         let content_width = labels
             .iter()
             .map(|label| {
@@ -242,11 +250,13 @@ impl AppState {
                 };
                 label.chars().count() as u16 + badge_width
             })
+            .chain(std::iter::once(version.chars().count() as u16))
             .max()
             .unwrap_or(8)
             .saturating_add(2);
         let menu_w = content_width.saturating_add(2).min(screen.width.max(1));
-        let menu_h = (labels.len() as u16 + 2).min(screen.height.max(1));
+        // +1 row for the version footer on top of the item rows and border.
+        let menu_h = (labels.len() as u16 + 3).min(screen.height.max(1));
         let max_x = screen.x + screen.width.saturating_sub(menu_w);
         let desired_x = launcher.x + launcher.width.saturating_sub(menu_w);
         let x = desired_x.min(max_x);
@@ -608,6 +618,38 @@ mod tests {
         detect::Agent,
         workspace::Workspace,
     };
+
+    /// The menu shows the running version, but only as a footer: it must never
+    /// join `global_menu_labels`, which drives highlight movement and click
+    /// hit-testing — a selectable version row would be a dead menu entry.
+    #[test]
+    fn the_global_menu_shows_the_version_without_making_it_selectable() {
+        let app = app_for_mouse_test();
+
+        let version = app.state.global_menu_version_label();
+        assert!(
+            version.starts_with("flk v") && version.len() > "flk v".len(),
+            "expected a rendered version, got {version:?}"
+        );
+        assert!(
+            !app.state.global_menu_labels().contains(&version.as_str()),
+            "the version footer must not be a selectable menu item"
+        );
+
+        // One row per item, plus the footer, plus the border.
+        let rect = app.state.global_menu_rect();
+        let items = app.state.global_menu_labels().len() as u16;
+        assert_eq!(
+            rect.height,
+            items + 3,
+            "menu must reserve a row for the version footer"
+        );
+        assert!(
+            rect.width as usize >= version.chars().count(),
+            "menu must be wide enough for the version footer, got {} for {version:?}",
+            rect.width
+        );
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {
