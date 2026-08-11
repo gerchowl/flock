@@ -109,6 +109,10 @@ pub struct TerminalState {
     /// re-arms the reader without touching every hook path — a burst of hook
     /// reports at the same session+detail still spawns only one reader.
     hydrated_transcript: Option<(String, crate::agent_transcript::TranscriptDetail)>,
+    /// Ring length when a transcript read was armed. Entries past it arrived
+    /// after the worker opened the file, so hydration carries them over
+    /// instead of replacing them away (#246). `Some` also means "in flight".
+    hydration_arm_index: Option<usize>,
     /// Session-promoted header fields ("chips": containers, progress, custom
     /// KV), insertion-ordered, optionally TTL-expiring. Ephemeral by design —
     /// never persisted into session snapshots.
@@ -169,6 +173,7 @@ impl TerminalState {
             last_prompt: None,
             prompt_history: Vec::new(),
             hydrated_transcript: None,
+            hydration_arm_index: None,
             header_fields: Vec::new(),
             header_reserved: false,
             state_changed_at: None,
@@ -1052,7 +1057,32 @@ impl TerminalState {
             return false;
         }
         self.hydrated_transcript = Some(target);
+        // Hook entries appended from here on are newer than the read that is
+        // about to start, so hydration must not swallow them (see
+        // `hydrate_prompt_history`).
+        self.hydration_arm_index = Some(self.prompt_history.len());
         true
+    }
+
+    /// True while a reader is armed but has not delivered.
+    ///
+    /// Cycling detail re-arms, and each arm spawns a worker over a file that
+    /// reaches ~15 MB. Held key-repeat on the cycle key would otherwise stack
+    /// readers, so the input path skips while one is in flight.
+    pub fn transcript_read_in_flight(&self) -> bool {
+        self.hydration_arm_index.is_some()
+    }
+
+    /// Re-arm hydration after a failed read.
+    ///
+    /// The guard flips before the worker starts so a burst of hook reports
+    /// cannot spawn a reader each. If that read then fails — most likely
+    /// because the agent has not written its transcript yet when the first
+    /// hook fires — the pane would otherwise never hydrate for the rest of
+    /// the session. Clearing it lets the next hook or cycle try again.
+    pub fn rearm_transcript_hydration(&mut self) {
+        self.hydrated_transcript = None;
+        self.hydration_arm_index = None;
     }
 
     /// The `(session, detail)` a reader is currently in flight (or last
@@ -1082,6 +1112,17 @@ impl TerminalState {
             // than blanking a panel that had content.
             return;
         }
+        // Entries appended after the read was armed are NEWER than the file
+        // the worker saw: the turn that triggered hydration is typically not
+        // on disk yet (the agent writes it after the hook fires, and a
+        // half-written last line is deliberately skipped). Replacing the ring
+        // wholesale would drop exactly that turn, so carry the tail over.
+        let live_tail: Vec<PromptHistoryEntry> = self
+            .hydration_arm_index
+            .filter(|index| *index <= self.prompt_history.len())
+            .map(|index| self.prompt_history[index..].to_vec())
+            .unwrap_or_default();
+        self.hydration_arm_index = None;
         let now = Instant::now();
         self.prompt_history.clear();
         for (role, text, at) in turns {
@@ -1098,13 +1139,25 @@ impl TerminalState {
                 },
             );
         }
-        // Keep the collapsed header consistent with the ring it summarises.
-        if let Some(last_prompt) = turns
+        // Turns the worker could not have seen go back on the end, in order.
+        let carried_prompt = live_tail
             .iter()
             .rev()
-            .find(|(role, _, _)| matches!(role, crate::agent_transcript::Role::User))
-            .map(|(_, text, _)| text.clone())
-        {
+            .find(|entry| entry.kind == PromptHistoryKind::Prompt)
+            .map(|entry| entry.text.clone());
+        for entry in live_tail {
+            append_prompt_history_with_cap(&mut self.prompt_history, entry);
+        }
+
+        // Keep the collapsed header consistent with the ring it summarises —
+        // a carried-over live prompt is newer than anything in the file.
+        if let Some(last_prompt) = carried_prompt.or_else(|| {
+            turns
+                .iter()
+                .rev()
+                .find(|(role, _, _)| matches!(role, crate::agent_transcript::Role::User))
+                .map(|(_, text, _)| text.clone())
+        }) {
             self.last_prompt = Some(last_prompt);
         }
     }
@@ -1294,6 +1347,64 @@ mod tests {
             "cycling detail on the same session must re-arm the reader"
         );
         assert!(terminal.take_transcript_hydration_due("s2", TranscriptDetail::Collapsed));
+    }
+
+    /// The turn that ARMS hydration is usually not on disk yet — the agent
+    /// writes it after the hook fires, and a half-written last line is
+    /// deliberately skipped by the reader. Replacing the ring wholesale would
+    /// drop exactly that turn, and no later hook would bring it back.
+    #[test]
+    fn hydration_keeps_turns_that_arrived_after_the_read_was_armed() {
+        use crate::agent_transcript::{Role, TranscriptDetail};
+
+        let mut terminal = test_terminal();
+        terminal.record_prompt("older turn already on disk".into());
+        assert!(terminal.take_transcript_hydration_due("sess-1", TranscriptDetail::Reply));
+        // The hook that armed the read appends AFTER the worker opened the file.
+        terminal.record_prompt("live turn the worker cannot have seen".into());
+
+        terminal.hydrate_prompt_history(&[(Role::User, "older turn already on disk".into(), None)]);
+
+        assert_eq!(
+            terminal
+                .prompt_history
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "older turn already on disk",
+                "live turn the worker cannot have seen",
+            ],
+            "the turn that armed hydration must survive the replace"
+        );
+        assert_eq!(
+            terminal.last_prompt.as_deref(),
+            Some("live turn the worker cannot have seen"),
+            "the collapsed header must follow the newest turn, not the file's"
+        );
+    }
+
+    /// A failed read leaves the guard flipped; without re-arming, a pane whose
+    /// transcript did not exist yet would never hydrate again for that session.
+    #[test]
+    fn a_failed_read_rearms_so_the_next_hook_retries() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut terminal = test_terminal();
+        assert!(terminal.take_transcript_hydration_due("sess-1", TranscriptDetail::Reply));
+        assert!(
+            !terminal.take_transcript_hydration_due("sess-1", TranscriptDetail::Reply),
+            "a burst of hooks must not spawn a reader each"
+        );
+        assert!(terminal.transcript_read_in_flight());
+
+        terminal.rearm_transcript_hydration();
+
+        assert!(!terminal.transcript_read_in_flight());
+        assert!(
+            terminal.take_transcript_hydration_due("sess-1", TranscriptDetail::Reply),
+            "after a failed read the next hook must be able to retry"
+        );
     }
 
     /// An unreadable or empty transcript must not blank a panel that hooks had

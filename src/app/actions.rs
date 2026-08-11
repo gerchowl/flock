@@ -202,6 +202,22 @@ impl AppState {
         Some(pane_id)
     }
 
+    /// Whether the open panel's pane already has a transcript read in flight.
+    ///
+    /// Cycling detail re-reads the file; held key-repeat on the cycle key
+    /// would stack a worker per press over a file that reaches ~15 MB.
+    pub(crate) fn transcript_read_in_flight_for_prompt_panel(&mut self) -> bool {
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return false;
+        };
+        let mut in_flight = false;
+        let _ = self.update_terminal_state(pane_id, |terminal| {
+            in_flight = terminal.transcript_read_in_flight();
+            None
+        });
+        in_flight
+    }
+
     /// Scroll the open prompt-history panel by `lines` (positive = older,
     /// negative = newer / toward pinned-at-bottom). Scroll is clamped to
     /// `[0, max_offset]`. Returns whether anything moved.
@@ -2514,6 +2530,10 @@ impl AppState {
 
         self.selection = None;
         self.selection_autoscroll = None;
+        // Closing the owning pane is a blur the focus-change chokepoints never
+        // see (#246): `close_focused` rewrites the layout directly. Without
+        // this the panel keeps pointing at a pane id that no longer exists.
+        self.close_prompt_history_on_blur();
         self.mark_session_dirty();
         // Name the pane while it still exists (#175 ADR-0005) — after the
         // close there is nothing left to resolve a public id from.
@@ -3284,17 +3304,27 @@ impl AppState {
                 .collect(),
             AppEvent::TranscriptHydrated {
                 pane_id,
+                session_id,
                 detail,
                 turns,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    // A result from a superseded reader (user cycled detail
-                    // mid-flight) must not repaint the panel with the old
-                    // level's content. The guard's detail is authoritative.
+                    // Drop a superseded reader's result. Both halves matter:
+                    // the detail changes when the user cycles level, and the
+                    // session changes when an agent restarts on the same pane
+                    // — comparing detail alone would let a dead session's
+                    // turns flash into the panel.
                     if terminal
                         .expected_transcript_detail()
-                        .is_some_and(|(_, expected)| expected != detail)
+                        .is_none_or(|expected| expected != (session_id.clone(), detail))
                     {
+                        return None;
+                    }
+                    if turns.is_empty() {
+                        // The read failed or found nothing. Keep the existing
+                        // history and re-arm, so a transcript that did not
+                        // exist yet is picked up on the next hook.
+                        terminal.rearm_transcript_hydration();
                         return None;
                     }
                     terminal.hydrate_prompt_history(turns.as_slice());

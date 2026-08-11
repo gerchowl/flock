@@ -111,6 +111,12 @@ impl App {
             // key would ship a dead keybind to every user who never opens
             // the panel; here the affordance discovers itself once open.
             KeyCode::Tab => {
+                // Held key-repeat would otherwise stack one worker per press,
+                // each re-reading a file that reaches ~15 MB. Swallow the key
+                // while a read is in flight rather than queueing readers.
+                if self.state.transcript_read_in_flight_for_prompt_panel() {
+                    return true;
+                }
                 if let Some(pane_id) = self.state.cycle_prompt_history_detail() {
                     self.arm_transcript_read_for(pane_id);
                 }

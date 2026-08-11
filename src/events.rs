@@ -126,6 +126,9 @@ pub enum AppEvent {
     /// is dropped rather than repainting the panel with stale content.
     TranscriptHydrated {
         pane_id: PaneId,
+        /// Session the worker read. Compared on delivery so an agent restart
+        /// on the same pane cannot flash a dead session's turns into the panel.
+        session_id: String,
         detail: crate::agent_transcript::TranscriptDetail,
         turns: Vec<(
             crate::agent_transcript::Role,

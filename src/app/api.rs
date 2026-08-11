@@ -89,12 +89,14 @@ impl App {
             return;
         };
         let event_tx = self.event_tx.clone();
+        let delivered_session = session_id.clone();
         crate::agent_transcript::spawn_load(home, session_id, detail, move |turns| {
-            if turns.is_empty() {
-                return;
-            }
+            // Always deliver, including the empty/failed case: the receiver
+            // re-arms on empty so a transcript the agent had not written yet
+            // is retried instead of the pane never hydrating again.
             let _ = event_tx.blocking_send(crate::events::AppEvent::TranscriptHydrated {
                 pane_id,
+                session_id: delivered_session,
                 detail,
                 turns,
             });

@@ -165,7 +165,16 @@ pub fn read_lines<R: BufRead>(reader: R) -> Result<TranscriptRead, TranscriptErr
         parsed += 1;
 
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
-            if max_version.as_deref().is_none_or(|seen| version > seen) {
+            // Compare parsed tuples: lexicographically "1.9.9" > "10.0.0".
+            let newer = match (
+                parse_version(version),
+                max_version.as_deref().and_then(parse_version),
+            ) {
+                (Some(candidate), Some(seen)) => candidate > seen,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if newer || max_version.is_none() {
                 max_version = Some(version.to_string());
             }
         }
@@ -173,9 +182,6 @@ pub fn read_lines<R: BufRead>(reader: R) -> Result<TranscriptRead, TranscriptErr
         out.events.push(parse_entry(&value));
     }
 
-    if parsed == 0 && failed > 0 {
-        return Err(TranscriptError::FormatMoved { parsed, failed });
-    }
     let total = parsed + failed;
     if total > 0 && (failed as f64 / total as f64) > MAX_UNPARSED_RATIO {
         return Err(TranscriptError::FormatMoved { parsed, failed });
@@ -255,7 +261,14 @@ fn parse_rfc3339_utc(raw: &str) -> Option<SystemTime> {
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next()?.parse().ok()?;
     let second: i64 = time_parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        // 60 is a leap second: real, and not worth rejecting a whole entry's
+        // age over, so it clamps into the minute rather than failing.
+        || !(0..=60).contains(&second)
+    {
         return None;
     }
 
@@ -430,7 +443,13 @@ pub fn spawn_load<F>(
     F: FnOnce(Vec<(Role, String, Option<SystemTime>)>) + Send + 'static,
 {
     std::thread::spawn(move || {
+        // Every path delivers, empty on failure: the receiver treats empty as
+        // "keep what you have and re-arm", so a transcript that does not exist
+        // yet (the first hook can beat the agent's first write) is retried
+        // rather than disabling hydration for the rest of the session.
         let Some(path) = crate::agent_resume::claude_transcript_path(&home, &session_id) else {
+            crate::logging::transcript_unreadable(&session_id, "no transcript on disk");
+            deliver(Vec::new());
             return;
         };
         match ClaudeTranscript.read(&path) {
@@ -442,7 +461,10 @@ pub fn spawn_load<F>(
                 }
                 deliver(turns_at_level(&read.events, detail));
             }
-            Err(err) => crate::logging::transcript_unreadable(&session_id, &format!("{err:?}")),
+            Err(err) => {
+                crate::logging::transcript_unreadable(&session_id, &format!("{err:?}"));
+                deliver(Vec::new());
+            }
         }
     });
 }
