@@ -639,13 +639,7 @@ pub(super) fn render_prompt_history_panel(
     let Some((_, rows)) = app.prompt_panel_rows(info) else {
         return;
     };
-    let rendered = paint_prompt_history_rows(
-        terminal,
-        app.palette.clone(),
-        &rows,
-        Some(&app.prompt_search),
-    );
-    let total_lines = rendered.len() as u16;
+    let total_lines = rows.len() as u16;
     let viewport = inner.height;
 
     // Scroll offset is "lines from the bottom" so 0 keeps the latest pinned.
@@ -656,12 +650,23 @@ pub(super) fn render_prompt_history_panel(
     let end = total_lines.saturating_sub(offset);
     let start = end.saturating_sub(viewport);
 
+    // Only the visible window is painted. Row identity for the whole history
+    // is already known (that is what the layout cache holds), so styling a
+    // full transcript's worth of spans every frame would be pure waste — the
+    // panel shows at most `viewport` of them (#254).
+    let window = &rows[start as usize..(end as usize).min(rows.len())];
+    let rendered = paint_prompt_history_rows(
+        terminal,
+        app.palette.clone(),
+        window,
+        Some(&app.prompt_search),
+        start as usize,
+    );
+
     let buf = frame.buffer_mut();
-    for (row, line_idx) in (start..end).enumerate() {
+    for (row, line) in rendered.iter().enumerate() {
         let y = inner.y + row as u16;
-        if let Some(line) = rendered.get(line_idx as usize) {
-            buf.set_line(inner.x, y, line, inner.width);
-        }
+        buf.set_line(inner.x, y, line, inner.width);
     }
 
     // Selection tint (#115 part 2): only for a PromptPanel-source selection
@@ -711,17 +716,22 @@ fn paint_prompt_history_rows(
     palette: Palette,
     rows: &[crate::ui::PromptRow],
     search: Option<&crate::ui::PromptSearch>,
+    // Index of `rows[0]` within the full layout, so the current-match row is
+    // still identifiable when only the visible window is painted.
+    first_row: usize,
 ) -> Vec<Line<'static>> {
     // The row holding the current match, so it can be distinguished from the
-    // other hits — "which of the 17 am I on" is the question `n` asks.
+    // other hits — "which of the 17 am I on" is the question stepping asks.
     let current_row = search
         .and_then(|search| search.current())
         .and_then(|found| {
-            rows.iter().rposition(|row| {
-                row.entry == found.entry
-                    && row.kind == crate::ui::PromptRowKind::Body
-                    && row.body_offset <= found.body_offset
-            })
+            rows.iter()
+                .rposition(|row| {
+                    row.entry == found.entry
+                        && row.kind == crate::ui::PromptRowKind::Body
+                        && row.body_offset <= found.body_offset
+                })
+                .map(|index| index + first_row)
         });
     let query = search
         .filter(|search| !search.is_empty())
@@ -766,7 +776,7 @@ fn paint_prompt_history_rows(
                 .fg(bg_color)
                 .bg(palette.peach)
                 .add_modifier(Modifier::BOLD);
-            let style = if Some(index) == current_row {
+            let style = if Some(index + first_row) == current_row {
                 current_style
             } else {
                 hit_style
@@ -876,7 +886,7 @@ pub(crate) fn extract_prompt_panel_selection(
 
     // No search styling here: copy takes the row TEXT, which highlighting does
     // not change, and passing it would only risk a different span split.
-    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows, None);
+    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows, None, 0);
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
     let max_offset = total_lines.saturating_sub(viewport);
@@ -1355,7 +1365,7 @@ mod tests {
             width,
             std::time::Instant::now(),
         );
-        paint_prompt_history_rows(terminal, palette, &rows, None)
+        paint_prompt_history_rows(terminal, palette, &rows, None, 0)
     }
 
     #[test]
