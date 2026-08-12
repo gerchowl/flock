@@ -2398,6 +2398,21 @@ mod tests {
         );
     }
 
+    /// An odd viewport splits evenly, so the selection sits dead centre. Paired
+    /// with the even case above, this pins the centring property itself —
+    /// the exhaustive test below only proves the selection stays visible.
+    #[test]
+    fn the_filter_window_centres_evenly_on_an_odd_viewport() {
+        let (start, end) = filter_window(50, 9, 100);
+        assert_eq!((start, end), (46, 55));
+        assert_eq!(50 - start, 4, "rows above");
+        assert_eq!(
+            (end - 1) - 50,
+            4,
+            "rows below — equal, unlike the even case"
+        );
+    }
+
     /// The window must clamp at both ends: the first and last rows have to be
     /// reachable, and no blank space may be shown past the tail.
     #[test]
