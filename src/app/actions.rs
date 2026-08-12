@@ -378,6 +378,61 @@ impl AppState {
         self.refresh_prompt_search();
     }
 
+    /// Flip between the exact Find surface and the fuzzy Filter list (#258),
+    /// carrying the query across, and recompute for the surface now up.
+    pub(crate) fn toggle_prompt_search_surface(&mut self) -> bool {
+        if !self.prompt_search.active {
+            return self.open_prompt_search();
+        }
+        self.prompt_search.toggle_surface();
+        self.refresh_prompt_search();
+        if !self.prompt_search.is_filtering() {
+            self.jump_to_current_prompt_match();
+        }
+        true
+    }
+
+    /// Move the Filter selection.
+    pub(crate) fn step_prompt_filter(&mut self, forward: bool) -> bool {
+        self.prompt_search.step_filter(forward).is_some()
+    }
+
+    /// Take the highlighted Filter row: park the reader on that turn and drop
+    /// back to reading the flow.
+    ///
+    /// The jump goes through the scroll anchor rather than a row offset, so the
+    /// landing survives a later resize like any other anchored position, and a
+    /// hydration that shifts entry indices cannot strand it (#254).
+    pub(crate) fn take_prompt_filter_selection(&mut self) -> bool {
+        let Some(entry) = self
+            .prompt_search
+            .selected_filter_hit()
+            .map(|hit| hit.entry)
+        else {
+            return false;
+        };
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return false;
+        };
+        let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
+            return false;
+        };
+        let at = self
+            .prompt_panel_history(&info)
+            .and_then(|history| history.get(entry))
+            .and_then(|entry| entry.wall_clock);
+        self.prompt_history_anchor = Some(PromptHistoryAnchor {
+            entry,
+            body_offset: 0,
+            at,
+        });
+        self.resolve_prompt_history_anchor();
+        // The pick is the end of the search gesture: close it so the reader is
+        // left reading the flow, not staring at a list they already used.
+        self.prompt_search.close();
+        true
+    }
+
     /// Step to the next/previous match and scroll it into view.
     pub(crate) fn step_prompt_search(&mut self, forward: bool) -> bool {
         if self.prompt_search.step(forward).is_none() {
@@ -7569,6 +7624,68 @@ mod tests {
             visible.iter().any(|row| row.text.contains("xyzzy")),
             "jumping to a match must bring it on screen"
         );
+    }
+
+    /// The Filter surface's whole job: pick a turn, land on it (#258). And the
+    /// landing must go through the anchor, so a later resize keeps it.
+    #[test]
+    fn picking_a_filtered_turn_parks_the_reader_on_it() {
+        let (mut state, pane) = state_with_open_panel(60, 60);
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        // Bury a distinctive turn early in the history.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .prompt_history[3]
+            .text = "the quokka incantation".into();
+
+        state.open_prompt_search();
+        state.toggle_prompt_search_surface();
+        assert!(state.prompt_search.is_filtering());
+        for ch in "quokka".chars() {
+            state.push_prompt_search_char(ch);
+        }
+        assert_eq!(
+            state.prompt_search.filtered.len(),
+            1,
+            "only the buried turn should match"
+        );
+
+        assert!(state.take_prompt_filter_selection(), "the pick must land");
+        assert!(
+            !state.prompt_search.active,
+            "taking a turn ends the search gesture"
+        );
+        assert_eq!(
+            state.prompt_history_anchor.map(|a| a.entry),
+            Some(3),
+            "the reader must be anchored on the picked turn"
+        );
+
+        // It is actually on screen, and stays there across a re-wrap.
+        for width in [60u16, 34] {
+            let rect = ratatui::layout::Rect::new(0, 0, width, 24);
+            state.view.pane_infos[0].rect = rect;
+            state.view.pane_infos[0].inner_rect = rect;
+            state.resolve_prompt_history_anchor();
+            let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+            let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+            let end = rows
+                .len()
+                .saturating_sub(state.prompt_history_scroll as usize);
+            let start = end.saturating_sub(inner.height as usize);
+            assert!(
+                rows[start..end]
+                    .iter()
+                    .any(|row| row.text.contains("quokka")),
+                "the picked turn must be visible at width {width}"
+            );
+        }
     }
 
     /// A miss has to be distinguishable from "scrolled away", or the reader

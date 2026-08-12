@@ -838,6 +838,125 @@ mod tests {
             .collect()
     }
 
+    /// Render just the prompt-history panel over a synthetic pane rect, so the
+    /// assertion is about the panel and not about whether the surrounding pane
+    /// tree happens to lay out in a test harness.
+    fn rendered_prompt_panel(turns: &[&str], query: &str, filtering: bool) -> String {
+        let mut app = crate::app::state::AppState::test_new();
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.focused_pane_id().expect("focused pane");
+        let terminal_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        for turn in turns {
+            terminal.record_prompt((*turn).to_string());
+        }
+        app.terminals.insert(terminal_id.clone(), terminal);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.expanded_prompt_pane = Some(pane_id);
+
+        let rect = Rect::new(0, 0, 60, 14);
+        let info = crate::layout::PaneInfo {
+            id: pane_id,
+            rect,
+            inner_rect: rect,
+            scrollbar_rect: None,
+            header_rect: None,
+            is_focused: true,
+        };
+        app.view.pane_infos = vec![info.clone()];
+
+        app.prompt_search.open();
+        if filtering {
+            app.toggle_prompt_search_surface();
+        }
+        for ch in query.chars() {
+            app.push_prompt_search_char(ch);
+        }
+
+        let terminal_state = app.terminals.get(&terminal_id).expect("terminal");
+        let backend = TestBackend::new(rect.width, rect.height);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            self::panes::render_prompt_history_panel(&app, frame, &info, terminal_state);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        (0..rect.height)
+            .map(|row| buffer_row_text(buffer, Rect::new(0, row, rect.width, 1), row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The Filter surface is new UI (#258): assert it actually paints its rows
+    /// and names its gesture, not merely that the data behind it is right.
+    #[test]
+    fn the_filter_surface_paints_matching_turns_and_names_its_gesture() {
+        let screen = rendered_prompt_panel(
+            &["fix the wrap bug", "unrelated work", "wrapping is done"],
+            "wrap",
+            true,
+        );
+        assert!(
+            screen.contains("filter:") && screen.contains("enter to jump"),
+            "the filter surface must name what it is and how to use it:\n{screen}"
+        );
+        assert!(
+            screen.contains("fix the wrap bug") && screen.contains("wrapping is done"),
+            "both matching turns must be listed:\n{screen}"
+        );
+        assert!(
+            !screen.contains("unrelated work"),
+            "a non-matching turn must not be listed:\n{screen}"
+        );
+    }
+
+    /// Print both surfaces for eyeballing: `cargo test -- --ignored show_panel --nocapture`.
+    #[test]
+    #[ignore = "visual check, run by hand"]
+    fn show_panel_surfaces() {
+        let turns = [
+            "fix the wrap bug in the panel",
+            "unrelated work here",
+            "wrapping is done now",
+        ];
+        let find = rendered_prompt_panel(&turns, "wrap", false);
+        let filter = rendered_prompt_panel(&turns, "wrap", true);
+        eprintln!("--- FIND ---\n{find}\n--- FILTER ---\n{filter}"); // guardrails-ok(no-debug-leftovers): opt-in visual check, the rendered panel IS the result
+    }
+
+    /// A query with no hits must say so rather than painting an empty box that
+    /// reads as "the panel broke".
+    #[test]
+    fn the_filter_surface_says_when_nothing_matches() {
+        let screen = rendered_prompt_panel(&["fix the wrap bug"], "zzzz", true);
+        assert!(
+            screen.contains("no turns match"),
+            "an empty result set must be stated:\n{screen}"
+        );
+    }
+
+    /// The Find surface keeps showing the conversation, with the count in the
+    /// border — the two surfaces must not render as each other.
+    #[test]
+    fn the_find_surface_keeps_the_flow_and_reports_a_count() {
+        let screen =
+            rendered_prompt_panel(&["fix the wrap bug", "wrapping is done"], "wrap", false);
+        assert!(
+            screen.contains("fix the wrap bug"),
+            "find must keep rendering the conversation:\n{screen}"
+        );
+        assert!(
+            screen.contains("/wrap") && screen.contains("1/2"),
+            "find must report the query and the match count:\n{screen}"
+        );
+    }
+
     /// The keybinds overlay doubles as flock's about screen, so the running
     /// version has to be legible there — not just available from
     /// `flk --version`, which means leaving the TUI to answer "what am I on?".
