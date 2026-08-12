@@ -609,8 +609,11 @@ pub(super) fn render_prompt_history_panel(
     // this conversation" and "not on screen", and a reader who just typed a
     // query needs that answer more than the mode label (#254).
     let title = if app.prompt_search.is_empty() {
+        // The detail label doubles as the Tab hint; `ctrl+f` is named outright
+        // because search has no other affordance — nothing on screen suggests
+        // the panel is searchable at all until you know it is.
         format!(
-            " prompt history ({}) — {} ",
+            " prompt history ({}) — {} · ctrl+f to search ",
             terminal.prompt_history.len(),
             app.prompt_history_detail.label(),
         )
