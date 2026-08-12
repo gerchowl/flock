@@ -90,7 +90,8 @@ pub(crate) fn layout_entry(
     now: Instant,
     out: &mut Vec<PromptRow>,
 ) {
-    let body_width = usize::from(width).saturating_sub(PREFIX_COLS);
+    let width = usize::from(width);
+    let body_width = width.saturating_sub(PREFIX_COLS);
 
     let kind_label = match entry.kind {
         PromptHistoryKind::Prompt => "prompt",
@@ -98,23 +99,40 @@ pub(crate) fn layout_entry(
         PromptHistoryKind::Recap => "recap",
     };
     // Chrome is a fixed one-line summary, so it truncates rather than wraps —
-    // wrapping "reply · 3h ago" onto a second row would be noise.
+    // wrapping "reply · 3h ago" onto a second row would be noise. The prefix
+    // itself is subject to the width: at 1 column even `· ` does not fit.
     let chrome = truncate_to_cols(
         &format!("{kind_label} \u{b7} {}", entry.relative_age(now)),
         body_width,
     );
     out.push(PromptRow {
         kind: PromptRowKind::Chrome,
-        text: format!("\u{b7} {chrome}"),
+        text: truncate_to_cols(&format!("\u{b7} {chrome}"), width),
         entry: index,
         body_offset: 0,
     });
 
     for (line_offset, line) in body_lines(&entry.text) {
+        // With no columns left for text, one truncated row per logical line
+        // keeps the row COUNT stable and the panel non-overflowing. Wrapping
+        // into a zero-width budget would either emit the line unwrapped (an
+        // overlong row punching through the border) or one row per character.
+        if body_width == 0 {
+            out.push(PromptRow {
+                kind: PromptRowKind::Body,
+                text: truncate_to_cols("  ", width),
+                entry: index,
+                body_offset: line_offset,
+            });
+            continue;
+        }
         for (segment_offset, segment) in wrap_line(line, body_width) {
             out.push(PromptRow {
                 kind: PromptRowKind::Body,
-                text: format!("  {segment}"),
+                // Last-resort clamp: a single character wider than the whole
+                // budget (a CJK glyph at 1 column) cannot be split any further,
+                // so the row is elided rather than allowed through the border.
+                text: truncate_to_cols(&format!("  {segment}"), width),
                 entry: index,
                 body_offset: line_offset + segment_offset,
             });
@@ -191,11 +209,22 @@ fn wrap_line(line: &str, width: usize) -> Vec<(usize, String)> {
         let token_cols = display_width(token);
 
         // Whitespace at a row break is dropped, as `wrap-ansi` does — a wrapped
-        // row must not begin with the space that caused the wrap.
+        // row must not begin with the space that caused the wrap. But dropping
+        // it must also END the row: a run that does not fit is itself the wrap
+        // point, and skipping it silently would let a shorter following word
+        // fit onto the current row and fuse onto the previous one with no
+        // separator ("| Alpha    | Beta |" → "| Alpha|"), putting text on
+        // screen the agent never wrote — and into the clipboard.
         if token.chars().all(char::is_whitespace) {
-            if current_start.is_some() && current_cols + token_cols <= budget {
-                current.push_str(&expand_tabs(token));
-                current_cols += token_cols;
+            if let Some(start) = current_start {
+                if current_cols + token_cols <= budget {
+                    current.push_str(&expand_tabs(token));
+                    current_cols += token_cols;
+                } else {
+                    rows.push((start, format!("{indent}{}", std::mem::take(&mut current))));
+                    current_start = None;
+                    current_cols = 0;
+                }
             }
             continue;
         }
@@ -427,10 +456,13 @@ mod tests {
             .collect()
     }
 
-    /// The invariant this module exists to hold: what scroll math counts is
-    /// exactly what the renderer draws and what copy can slice.
+    /// Layout is deterministic at a given width — the weak precondition for
+    /// the three consumers agreeing. The invariant that actually matters (the
+    /// scroll-bounds path, the paint window, and copy all seeing the SAME
+    /// rows) is pinned in `app::actions::tests`, where those three call sites
+    /// live; asserting it here could only compare this function to itself.
     #[test]
-    fn row_count_matches_the_rows_laid_out_at_every_width() {
+    fn layout_is_deterministic_at_a_given_width() {
         let history = vec![
             entry(PromptHistoryKind::Prompt, "short"),
             entry(
@@ -442,9 +474,83 @@ mod tests {
         ];
         let now = Instant::now();
         for width in [4u16, 10, 24, 80, 200] {
-            let rows = layout_history(&history, width, now);
-            let counted = layout_history(&history, width, now).len();
-            assert_eq!(counted, rows.len(), "count and layout disagreed at {width}");
+            assert_eq!(
+                layout_history(&history, width, now),
+                layout_history(&history, width, now),
+                "layout must not vary between calls at width {width}"
+            );
+        }
+    }
+
+    /// No row may exceed the panel width at ANY width the panel can reach.
+    /// The pane can be dragged down to an inner width of 4, which leaves zero
+    /// columns for body text after the row prefix — a naive "nothing fits, so
+    /// emit the line unwrapped" would push overlong rows out past the border.
+    #[test]
+    fn no_row_overflows_the_panel_at_any_width() {
+        let history = vec![
+            entry(
+                PromptHistoryKind::Reply,
+                "a line of prose that is far too long",
+            ),
+            entry(
+                PromptHistoryKind::Prompt,
+                "    indented and also rather long",
+            ),
+            entry(
+                PromptHistoryKind::Reply,
+                "unbreakable/path/with/no/spaces/at/all",
+            ),
+            entry(PromptHistoryKind::Reply, "日本語のテキストです"),
+        ];
+        let now = Instant::now();
+        for width in 1u16..=40 {
+            for row in layout_history(&history, width, now) {
+                assert!(
+                    display_width(&row.text) <= usize::from(width),
+                    "row {:?} is {} cols at width {width}",
+                    row.text,
+                    display_width(&row.text)
+                );
+            }
+        }
+    }
+
+    /// A whitespace run that does not fit is itself the wrap point. Dropping it
+    /// without ending the row lets a shorter following word fit onto the
+    /// current row and fuse onto the previous one — putting text on screen the
+    /// agent never wrote, and into the clipboard when that row is copied.
+    #[test]
+    fn a_gap_too_wide_to_fit_breaks_the_row_instead_of_fusing_words() {
+        // Alignment runs like this are everywhere in agent output: tables,
+        // aligned assignments, padded columns.
+        let history = vec![entry(PromptHistoryKind::Reply, "| Alpha    | Beta |")];
+        let rows = layout_history(&history, 12, Instant::now());
+        let bodies = body_text(&rows);
+        for row in &bodies {
+            assert!(
+                !row.contains("Alpha|"),
+                "words fused across a dropped gap: {row:?}"
+            );
+        }
+        let words: Vec<&str> = bodies
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .collect();
+        assert_eq!(words, vec!["|", "Alpha", "|", "Beta", "|"]);
+    }
+
+    /// The same hazard with tabs, which expand to several columns and so are
+    /// far more likely to exceed a remaining budget than a single space.
+    #[test]
+    fn a_tab_gap_that_does_not_fit_also_breaks_the_row() {
+        let history = vec![entry(PromptHistoryKind::Reply, "world\t\thello")];
+        let rows = layout_history(&history, 12, Instant::now());
+        for row in body_text(&rows) {
+            assert!(
+                !row.contains("worldhello"),
+                "tab run was dropped without ending the row: {row:?}"
+            );
         }
     }
 

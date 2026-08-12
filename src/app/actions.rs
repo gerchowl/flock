@@ -7366,6 +7366,168 @@ mod tests {
         );
     }
 
+    /// The invariant the layout refactor exists for: the scroll-bounds path,
+    /// the paint window, and copy must all see the SAME rows. Asserted through
+    /// the three real call sites, not by comparing the layout function to
+    /// itself — a divergence where one of them re-derived its own count is
+    /// exactly what this has to fail on.
+    #[test]
+    fn scroll_bounds_paint_window_and_copy_agree_on_the_same_rows() {
+        for width in [24u16, 40, 60, 100] {
+            let (state, pane) = state_with_open_panel(30, width);
+            let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+
+            let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+            let max_offset = state.prompt_history_max_offset_for(&info);
+
+            // Scroll bounds must describe exactly the rows that exist.
+            assert_eq!(
+                usize::from(max_offset),
+                rows.len().saturating_sub(inner.height as usize),
+                "scroll bounds disagree with the row count at width {width}"
+            );
+
+            // Scrolling to the very top must land the first row on screen: if
+            // the bounds over-counted, the window would run off the start.
+            let mut state = state;
+            state.scroll_prompt_history(i32::from(max_offset), max_offset);
+            let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+            let end = rows
+                .len()
+                .saturating_sub(state.prompt_history_scroll as usize);
+            let start = end.saturating_sub(inner.height as usize);
+            assert_eq!(start, 0, "max scroll must reach the first row at {width}");
+
+            // And copy must be able to address every row in that window.
+            // Drag from the first visible row to the last: the whole window.
+            let mut selection = crate::selection::Selection::anchor(pane, 0, 0, None)
+                .with_source(crate::selection::SelectionSource::PromptPanel);
+            selection.drag(
+                inner.x + inner.width.saturating_sub(1),
+                inner.y + inner.height.saturating_sub(1),
+                inner,
+                None,
+            );
+            let terminal_id = state.workspaces[0]
+                .pane_state(pane)
+                .expect("pane state")
+                .attached_terminal_id
+                .clone();
+            let terminal = state.terminals.get(&terminal_id).expect("terminal");
+            let copied =
+                crate::ui::extract_prompt_panel_selection(&state, &info, terminal, &selection)
+                    .expect("selection over the whole viewport must resolve");
+            assert_eq!(
+                copied.lines().count(),
+                rows[start..end].len(),
+                "copy saw a different number of rows than the paint window at {width}"
+            );
+        }
+    }
+
+    /// Matches are content-addressed precisely so a resize cannot strand them.
+    /// A regression that keyed matches on row indices would pass every other
+    /// search test.
+    #[test]
+    fn a_match_survives_a_resize() {
+        let (mut state, pane) = state_with_open_panel(40, 60);
+        state.open_prompt_search();
+        for ch in "entry-7 ".chars() {
+            state.push_prompt_search_char(ch);
+        }
+        let before = state.prompt_search.current().expect("a match");
+
+        // Re-wrap at a narrower width.
+        let narrow = ratatui::layout::Rect::new(0, 0, 28, 24);
+        state.view.pane_infos[0].rect = narrow;
+        state.view.pane_infos[0].inner_rect = narrow;
+        state.resolve_prompt_history_anchor();
+
+        let after = state.prompt_search.current().expect("match must survive");
+        assert_eq!(before, after, "a resize must not move or drop the match");
+
+        // And it must still be on screen after the re-wrap.
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+        let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+        let end = rows
+            .len()
+            .saturating_sub(state.prompt_history_scroll as usize);
+        let start = end.saturating_sub(inner.height as usize);
+        assert!(
+            rows[start..end]
+                .iter()
+                .any(|row| row.text.contains("entry-7")),
+            "the current match must still be visible after a re-wrap"
+        );
+    }
+
+    /// Cycling detail re-reads the transcript into a differently-shaped ring,
+    /// so the anchor's ENTRY INDEX is meaningless afterwards and the timestamp
+    /// fallback has to carry it. Rebuild the ring the way hydration does and
+    /// assert the reader lands back on the same turn.
+    #[test]
+    fn the_anchor_survives_a_detail_cycle_that_reshapes_the_ring() {
+        use crate::agent_transcript::Role;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let (mut state, pane) = state_with_open_panel(0, 60);
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+
+        // Reply-level ring: 20 turns, each stamped a minute apart.
+        let stamp = |i: u64| Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i * 60));
+        let reply_turns: Vec<_> = (0..20)
+            .map(|i| (Role::User, format!("turn-{i} at reply detail"), stamp(i)))
+            .collect();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .hydrate_prompt_history(&reply_turns);
+
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+        let max_offset = state.prompt_history_max_offset_for(&info);
+        state.scroll_prompt_history(i32::from(max_offset / 2), max_offset);
+        let anchored_stamp = state.prompt_history_anchor.expect("anchored").at;
+        assert!(
+            anchored_stamp.is_some(),
+            "hydrated turns carry a wall clock"
+        );
+
+        // Collapsed level: the same turns with tool-call rows interleaved, so
+        // every index shifts while the timestamps stay put.
+        let mut collapsed_turns = Vec::new();
+        for i in 0..20u64 {
+            collapsed_turns.push((Role::User, format!("turn-{i} at reply detail"), stamp(i)));
+            collapsed_turns.push((Role::Assistant, format!("\u{2699} Edit {i}"), stamp(i)));
+        }
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .hydrate_prompt_history(&collapsed_turns);
+        state.resolve_prompt_history_anchor();
+
+        // The reader must be back on the same turn, found by timestamp.
+        let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+        let end = rows
+            .len()
+            .saturating_sub(state.prompt_history_scroll as usize);
+        let start = end.saturating_sub(inner.height as usize);
+        let history = state.prompt_panel_history(&info).expect("history");
+        let landed = rows
+            .get(start)
+            .and_then(|row| history.get(row.entry))
+            .and_then(|entry| entry.wall_clock);
+        assert_eq!(
+            landed, anchored_stamp,
+            "after the ring was reshaped the reader must be back on the same turn"
+        );
+    }
+
     /// The point of the feature: a term that appears only in the oldest turn
     /// of a long session must be findable and reachable. Under the old
     /// 1000-rendered-line cap this content was not merely off-screen, it had

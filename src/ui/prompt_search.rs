@@ -89,7 +89,9 @@ impl PromptSearch {
             // a case-sensitive scan for those, rather than reporting an offset
             // that slices mid-character.
             if haystack.len() != entry.text.len() {
-                collect_matches(&entry.text, &self.query, index, &mut self.matches);
+                // Trimmed, like the fast path: otherwise a trailing space in the
+                // query would match differently depending on which entry it hit.
+                collect_matches(&entry.text, self.query.trim(), index, &mut self.matches);
                 continue;
             }
             collect_matches(&haystack, &needle, index, &mut self.matches);
