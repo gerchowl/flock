@@ -90,7 +90,15 @@ impl App {
                 KeyCode::Esc => {
                     self.state.close_prompt_search();
                 }
-                KeyCode::Char(ch) => {
+                // ctrl+c dismisses, as it does in every other query line the
+                // muscle knows. Without this it would type a literal `c`.
+                KeyCode::Char('c') if ctrl => {
+                    self.state.close_prompt_search();
+                }
+                // Only unmodified (or shifted) characters are query text.
+                // Otherwise ctrl+f would append an `f` to the query it opened
+                // with, and every other chord would leak literal letters in.
+                KeyCode::Char(ch) if bare => {
                     self.state.push_prompt_search_char(ch);
                 }
                 KeyCode::Backspace => {
@@ -1528,6 +1536,82 @@ mod tests {
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Tab, KeyModifiers::empty()));
         let forwarded = pane_rx.try_recv().expect("Tab now forwards to the pane");
         assert_eq!(forwarded.as_ref(), b"\t");
+    }
+
+    /// #254: the search line owns unmodified typing, but a chord is not query
+    /// text. Without the modifier gate, the very chord that opens search
+    /// appends an `f` to the query it just opened, and ctrl+c types a `c`
+    /// instead of dismissing.
+    #[tokio::test]
+    async fn search_line_takes_typing_but_not_chords() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 60, 20));
+        let (runtime, mut pane_rx) = crate::terminal::TerminalRuntime::test_with_channel(
+            pane_infos[0].inner_rect.width,
+            pane_infos[0].inner_rect.height,
+        );
+        ws.insert_test_runtime(pane_id, runtime);
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("find the wrap bug".into());
+        app.state.terminals.insert(terminal_id, terminal);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.expanded_prompt_pane = Some(pane_id);
+
+        // ctrl+f opens the query line and must not type an `f` into it.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(app.state.prompt_search.active, "ctrl+f opens search");
+        assert_eq!(
+            app.state.prompt_search.query, "",
+            "the chord is not query text"
+        );
+
+        // Unmodified characters are.
+        for ch in "wrap".chars() {
+            app.handle_terminal_key_headless(TerminalKey::new(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+            ));
+        }
+        assert_eq!(app.state.prompt_search.query, "wrap");
+        assert!(
+            !app.state.prompt_search.matches.is_empty(),
+            "the query should have found the prompt"
+        );
+        assert!(
+            pane_rx.try_recv().is_err(),
+            "query text must never reach the pane's shell"
+        );
+
+        // ctrl+c dismisses rather than typing a `c`.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.state.prompt_search.active, "ctrl+c closes the search");
+        assert_eq!(
+            app.state.expanded_prompt_pane,
+            Some(pane_id),
+            "closing the search must leave the panel open"
+        );
+
+        // Panel still open, search closed: printable keys reach the agent
+        // again, which is the whole reason search is modal.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('n'),
+            KeyModifiers::empty(),
+        ));
+        let forwarded = pane_rx.try_recv().expect("typing reaches the pane again");
+        assert_eq!(forwarded.as_ref(), b"n");
     }
 
     #[tokio::test]

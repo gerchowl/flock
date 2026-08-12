@@ -152,9 +152,9 @@ fn collect_matches(haystack: &str, needle: &str, entry: usize, out: &mut Vec<Pro
             body_offset: at,
             len: needle.len(),
         });
-        // Advance past this match; `+ 1` keeps overlapping needles from looping
-        // forever on a zero-width step.
-        from = at + needle.len().max(1);
+        // Advance past this match. `needle` is non-empty (checked above), so
+        // this always makes progress.
+        from = at + needle.len();
         if from >= haystack.len() {
             break;
         }
