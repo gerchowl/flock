@@ -751,6 +751,29 @@ pub(super) fn render_prompt_history_panel(
     }
 }
 
+/// Which slice of the filter list to draw, as `[start, end)`, for `total` rows
+/// through a `viewport`-high panel with `selected` highlighted.
+///
+/// Centres the selection (#260). The previous rule pinned it to the LAST
+/// visible row once the list scrolled, so a reader stepping through results saw
+/// only what they had already passed, and the text moved on every keypress.
+///
+/// Centring rather than a scrolloff margin: scrolloff is defined against the
+/// window's previous position, and this list deliberately carries no scroll
+/// state (#259), so the window is a pure function of `selected`. Any margin
+/// rule would still recompute `start` from `selected` each keypress — it would
+/// change how far the text moves, not whether it moves.
+fn filter_window(selected: usize, viewport: usize, total: usize) -> (usize, usize) {
+    if viewport == 0 || total == 0 {
+        return (0, 0);
+    }
+    // Clamped so the window never runs past either end: a short list starts at
+    // row 0, and near the tail the window stops rather than showing blanks.
+    let last_start = total.saturating_sub(viewport);
+    let start = selected.saturating_sub(viewport / 2).min(last_start);
+    (start, (start + viewport).min(total))
+}
+
 /// Render the Filter surface: one row per matching turn, newest first, with the
 /// selection highlighted (#258).
 ///
@@ -782,10 +805,8 @@ fn render_prompt_filter_rows(
         return;
     }
 
-    // Window the list so the selection is always on screen.
     let selected = app.prompt_search.filter_selected.min(rows.len() - 1);
-    let start = selected.saturating_sub(viewport.saturating_sub(1));
-    let end = (start + viewport).min(rows.len());
+    let (start, end) = filter_window(selected, viewport, rows.len());
 
     let buf = frame.buffer_mut();
     for (offset, hit) in rows[start..end].iter().enumerate() {
@@ -2359,6 +2380,70 @@ mod tests {
             text.contains("\u{2699} Edit"),
             "tool-call marker must survive select-to-copy: {text:?}"
         );
+    }
+
+    /// #260: the window used to pin the selection to the LAST visible row, so
+    /// stepping through results showed only what you had already passed.
+    #[test]
+    fn the_filter_window_centres_the_selection_with_context_below() {
+        // 100 rows through a 10-high panel, selection well past the first screen.
+        let (start, end) = filter_window(50, 10, 100);
+        assert_eq!((start, end), (45, 55));
+        // An even viewport cannot split evenly, so the halves differ by one.
+        assert_eq!(50 - start, 5, "rows above the selection");
+        assert_eq!(
+            (end - 1) - 50,
+            4,
+            "rows must remain visible BELOW the selection — the reported bug"
+        );
+    }
+
+    /// The window must clamp at both ends: the first and last rows have to be
+    /// reachable, and no blank space may be shown past the tail.
+    #[test]
+    fn the_filter_window_clamps_at_both_ends() {
+        assert_eq!(
+            filter_window(0, 10, 100),
+            (0, 10),
+            "the top starts at row 0"
+        );
+        assert_eq!(
+            filter_window(99, 10, 100),
+            (90, 100),
+            "the tail must fill the panel rather than scrolling past it"
+        );
+    }
+
+    /// A list shorter than the panel is drawn whole from row 0.
+    #[test]
+    fn the_filter_window_shows_a_short_list_whole() {
+        assert_eq!(filter_window(2, 10, 3), (0, 3));
+    }
+
+    /// Degenerate geometry must not panic or drop the selection off screen.
+    #[test]
+    fn the_filter_window_survives_degenerate_geometry() {
+        assert_eq!(filter_window(0, 0, 10), (0, 0), "zero-height panel");
+        assert_eq!(filter_window(0, 10, 0), (0, 0), "empty list");
+        assert_eq!(filter_window(7, 1, 10), (7, 8), "a one-row panel");
+    }
+
+    /// The invariant that matters at every index, not just the ones above.
+    #[test]
+    fn the_filter_window_always_contains_the_selection() {
+        for total in [1usize, 2, 3, 7, 10, 11, 100] {
+            for viewport in [1usize, 2, 3, 10, 40] {
+                for selected in 0..total {
+                    let (start, end) = filter_window(selected, viewport, total);
+                    assert!(
+                        start <= selected && selected < end,
+                        "selection {selected} fell outside [{start}, {end}) \
+                         for total={total} viewport={viewport}"
+                    );
+                    assert!(end <= total, "window ran past the end of the list");
+                }
+            }
+        }
     }
 
     #[test]
