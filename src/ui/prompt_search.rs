@@ -29,7 +29,8 @@ pub(crate) struct PromptSearch {
     /// Whether the query line is accepting input.
     pub active: bool,
     pub query: String,
-    /// Every match, oldest first. Rebuilt whenever the query or history moves.
+    /// Every match, NEWEST first (#258). Rebuilt whenever the query or the
+    /// history moves.
     pub matches: Vec<PromptMatch>,
     /// Index into `matches` of the one the view is parked on.
     pub current: usize,
@@ -96,12 +97,22 @@ impl PromptSearch {
             }
             collect_matches(&haystack, &needle, index, &mut self.matches);
         }
+        // Newest first (#258). The panel is bottom-pinned and read
+        // newest-at-bottom, and what a reader is hunting for is almost always
+        // recent — landing them at the top of a 300-turn session and making
+        // them step forward through every older hit inverts the surface they
+        // are looking at. So `1/17` is the most recent match, and "next" walks
+        // backwards in time.
+        self.matches
+            .sort_by_key(|m| std::cmp::Reverse((m.entry, m.body_offset)));
         // Keep the reader on the nearest match to where they were, so typing
-        // another character does not throw them to the top of the file.
+        // another character does not throw them elsewhere in the history. The
+        // comparison follows the sort: descending, so "nearest" is the first
+        // match at or BEFORE where they were.
         self.current = previous
             .and_then(|previous| {
                 self.matches.iter().position(|m| {
-                    (m.entry, m.body_offset) >= (previous.entry, previous.body_offset)
+                    (m.entry, m.body_offset) <= (previous.entry, previous.body_offset)
                 })
             })
             .unwrap_or(0);
@@ -176,8 +187,12 @@ mod tests {
         }
     }
 
+    /// Newest first (#258): the panel is bottom-pinned and read
+    /// newest-at-bottom, so `1/N` must be the most RECENT hit and "next" must
+    /// walk backwards in time. Landing on the oldest match threw the reader to
+    /// the top of a long session.
     #[test]
-    fn finds_every_occurrence_across_entries_in_order() {
+    fn finds_every_occurrence_newest_first() {
         let history = vec![
             entry("the wrap bug is here"),
             entry("nothing"),
@@ -194,9 +209,15 @@ mod tests {
                 .iter()
                 .map(|m| (m.entry, m.body_offset))
                 .collect::<Vec<_>>(),
-            vec![(0, 4), (2, 0), (2, 15)]
+            vec![(2, 15), (2, 0), (0, 4)],
+            "matches must run newest to oldest, latest offset first within a turn"
         );
         assert_eq!(search.status(), "1/3");
+        assert_eq!(
+            search.current().map(|m| m.entry),
+            Some(2),
+            "the reader must land on the most recent turn that matched"
+        );
     }
 
     #[test]
@@ -254,49 +275,64 @@ mod tests {
     }
 
     #[test]
-    fn stepping_wraps_at_both_ends() {
+    fn stepping_walks_backwards_in_time_and_wraps_at_both_ends() {
         let history = vec![entry("wrap wrap wrap")];
         let mut search = PromptSearch {
             query: "wrap".into(),
             ..Default::default()
         };
         search.refresh(&history, 0);
-        assert_eq!(search.current, 0);
+        assert_eq!(
+            search.current().map(|m| m.body_offset),
+            Some(10),
+            "the newest (last) occurrence is where the reader starts"
+        );
         assert_eq!(search.step(true).map(|m| m.body_offset), Some(5));
-        assert_eq!(search.step(true).map(|m| m.body_offset), Some(10));
+        assert_eq!(search.step(true).map(|m| m.body_offset), Some(0));
         assert_eq!(
             search.step(true).map(|m| m.body_offset),
-            Some(0),
-            "forward past the last match wraps to the first"
+            Some(10),
+            "forward past the oldest match wraps to the newest"
         );
         assert_eq!(
             search.step(false).map(|m| m.body_offset),
-            Some(10),
-            "backward past the first wraps to the last"
+            Some(0),
+            "backward past the newest wraps to the oldest"
         );
     }
 
     /// Typing another character must not throw the reader back to the top of
     /// the conversation.
+    /// Typing another character must not throw the reader elsewhere in the
+    /// history. Under newest-first ordering "nearest" is the first match at or
+    /// before where they were, so the comparison has to follow the sort.
     #[test]
     fn refining_a_query_keeps_the_reader_near_their_current_match() {
-        let history = vec![entry("wrapping"), entry("wrap"), entry("wrapped text")];
+        let history = vec![
+            entry("wrapping alpha"),
+            entry("wrap beta"),
+            entry("wrapped gamma"),
+        ];
         let mut search = PromptSearch {
             query: "wrap".into(),
             ..Default::default()
         };
         search.refresh(&history, 0);
+        assert_eq!(search.current().map(|m| m.entry), Some(2), "starts newest");
         search.step(true);
-        search.step(true);
-        assert_eq!(search.current().map(|m| m.entry), Some(2));
+        assert_eq!(
+            search.current().map(|m| m.entry),
+            Some(1),
+            "stepped back one turn in time"
+        );
 
-        // Refine so only the last entry still matches.
-        search.query = "wrapped".into();
+        // Refine so only the turn the reader is standing on still matches.
+        search.query = "wrap b".into();
         search.refresh(&history, 0);
         assert_eq!(
             search.current().map(|m| m.entry),
-            Some(2),
-            "the surviving match near the reader stays selected"
+            Some(1),
+            "the surviving match where the reader already was stays selected"
         );
     }
 

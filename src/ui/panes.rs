@@ -691,21 +691,85 @@ pub(super) fn render_prompt_history_panel(
         );
     }
 
+    // Match markers down the gutter (#258): `3/17` reports a count, this
+    // reports the SHAPE — whether the hits cluster in one recent turn or run
+    // through the whole session — and makes off-screen matches visible rather
+    // than merely counted.
+    let gutter_x = panel.x + panel.width - 1;
+    let buf = frame.buffer_mut();
+    if inner.width >= 1 {
+        for (gutter_row, is_current) in
+            match_gutter_marks(&app.prompt_search, rows.len(), inner.height)
+        {
+            let y = inner.y + gutter_row;
+            buf[(gutter_x, y)].set_symbol(if is_current { "\u{25c6}" } else { "\u{2502}" });
+            buf[(gutter_x, y)].set_style(
+                Style::default()
+                    .fg(if is_current { p.peach } else { p.yellow })
+                    .bg(bg_color),
+            );
+        }
+    }
+
     // Subtle scroll indicators when there is more content above or below.
+    // Drawn AFTER the match marks and in the same column, so at the two rows
+    // where they collide "there is more this way" wins — losing it would strand
+    // the reader with no cue that the panel scrolls at all.
     let has_above = offset < max_offset;
     let has_below = offset > 0;
     let marker_style = Style::default().fg(p.overlay0).bg(bg_color);
-    let buf = frame.buffer_mut();
     if has_above && inner.width >= 1 {
         let top_y = inner.y;
-        buf[(panel.x + panel.width - 1, top_y)].set_symbol("\u{25b4}");
-        buf[(panel.x + panel.width - 1, top_y)].set_style(marker_style);
+        buf[(gutter_x, top_y)].set_symbol("\u{25b4}");
+        buf[(gutter_x, top_y)].set_style(marker_style);
     }
     if has_below && inner.width >= 1 {
         let bot_y = inner.y + inner.height - 1;
-        buf[(panel.x + panel.width - 1, bot_y)].set_symbol("\u{25be}");
-        buf[(panel.x + panel.width - 1, bot_y)].set_style(marker_style);
+        buf[(gutter_x, bot_y)].set_symbol("\u{25be}");
+        buf[(gutter_x, bot_y)].set_style(marker_style);
     }
+}
+
+/// Gutter rows carrying a match, as `(row within the panel, is the current
+/// match)`, for a history of `total_rows` shown through a `viewport`-high lane.
+///
+/// Matches are positioned by their row in the WHOLE history, not the visible
+/// window: the point of the lane is to show where hits sit in the conversation,
+/// including the ones scrolled away.
+///
+/// With more matches than gutter rows several matches quantise onto the same
+/// row, so a mark means "at least one match here", never a count — the count
+/// belongs in the border. The current match always wins its row, so stepping
+/// never loses track of where the reader is.
+fn match_gutter_marks(
+    search: &crate::ui::PromptSearch,
+    total_rows: usize,
+    viewport: u16,
+) -> Vec<(u16, bool)> {
+    if search.is_empty() || search.matches.is_empty() || viewport == 0 || total_rows == 0 {
+        return Vec::new();
+    }
+    let current = search.current();
+    let mut marks: Vec<(u16, bool)> = Vec::new();
+    for found in &search.matches {
+        // Approximate the match's row by its entry's position in the history.
+        // Exact row would need the layout, and the lane is a density cue at
+        // one-row resolution — a wrapped turn occupies far more than one row
+        // anyway, so the extra precision would not survive quantisation.
+        let row = found.entry.min(total_rows.saturating_sub(1));
+        let gutter_row = (row * usize::from(viewport)) / total_rows.max(1);
+        let gutter_row = u16::try_from(gutter_row)
+            .unwrap_or(0)
+            .min(viewport.saturating_sub(1));
+        let is_current =
+            current.is_some_and(|c| c.entry == found.entry && c.body_offset == found.body_offset);
+        match marks.iter_mut().find(|(row, _)| *row == gutter_row) {
+            // The current match wins a shared row.
+            Some(existing) => existing.1 |= is_current,
+            None => marks.push((gutter_row, is_current)),
+        }
+    }
+    marks
 }
 
 /// Paint already-laid-out rows.
@@ -1353,6 +1417,73 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    fn search_with(query: &str, entries: &[&str]) -> crate::ui::PromptSearch {
+        let history: Vec<crate::terminal::PromptHistoryEntry> = entries
+            .iter()
+            .map(|text| crate::terminal::PromptHistoryEntry {
+                kind: crate::terminal::PromptHistoryKind::Prompt,
+                text: (*text).to_string(),
+                recorded_at: std::time::Instant::now(),
+                wall_clock: None,
+            })
+            .collect();
+        let mut search = crate::ui::PromptSearch::default();
+        search.query = query.to_string();
+        search.refresh(&history, 0);
+        search
+    }
+
+    /// The lane exists to show where hits sit in the WHOLE conversation, so a
+    /// match scrolled far out of view must still put a mark on it.
+    #[test]
+    fn gutter_marks_cover_offscreen_matches_and_stay_in_the_lane() {
+        // 100 entries, a hit in the first and the last; only 10 rows of gutter.
+        let mut entries = vec!["needle at the very start"];
+        entries.extend(std::iter::repeat_n("filler", 98));
+        entries.push("needle at the very end");
+        let search = search_with("needle", &entries);
+        assert_eq!(search.matches.len(), 2);
+
+        let marks = match_gutter_marks(&search, entries.len(), 10);
+        assert_eq!(marks.len(), 2, "both hits get a mark, including off-screen");
+        for (row, _) in &marks {
+            assert!(*row < 10, "mark {row} escaped a 10-row lane");
+        }
+        let rows: Vec<u16> = marks.iter().map(|(row, _)| *row).collect();
+        assert!(
+            rows.contains(&0) && rows.contains(&9),
+            "a hit at each end of the history must mark each end of the lane, got {rows:?}"
+        );
+    }
+
+    /// Several matches quantise onto one row when the lane is short. The
+    /// current match must still be distinguishable, or stepping loses the
+    /// reader's position.
+    #[test]
+    fn the_current_match_wins_a_shared_gutter_row() {
+        let entries = ["needle one", "needle two", "needle three"];
+        let mut search = search_with("needle", &entries);
+        // Newest first, so stepping once lands on the middle entry.
+        search.step(true);
+        assert_eq!(search.current().map(|m| m.entry), Some(1));
+
+        // A one-row lane forces all three onto the same row.
+        let marks = match_gutter_marks(&search, entries.len(), 1);
+        assert_eq!(
+            marks,
+            vec![(0, true)],
+            "the shared row must read as current"
+        );
+    }
+
+    #[test]
+    fn no_query_means_no_gutter_marks() {
+        let search = search_with("", &["nothing to find"]);
+        assert!(match_gutter_marks(&search, 1, 10).is_empty());
+        let missing = search_with("absent", &["nothing to find"]);
+        assert!(match_gutter_marks(&missing, 1, 10).is_empty());
     }
 
     /// Lay out then paint, the way the renderer does — tests go through the
