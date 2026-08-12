@@ -262,37 +262,48 @@ impl AppState {
         (inner.width > 0 && inner.height > 0).then_some(inner)
     }
 
+    /// The open panel's wrapped rows over `info`, with its inner rect.
+    ///
+    /// The one place row identity is obtained (#254): renderer, scroll bounds,
+    /// and copy all come through here, so none of them can disagree about how
+    /// many rows exist or what text each holds. Served from
+    /// [`crate::ui::PromptLayoutCache`] when the pre-render pass has already
+    /// laid these rows out, and laid out inline otherwise.
+    pub(crate) fn prompt_panel_rows<'a>(
+        &'a self,
+        info: &crate::layout::PaneInfo,
+    ) -> Option<(
+        ratatui::layout::Rect,
+        std::borrow::Cow<'a, [crate::ui::PromptRow]>,
+    )> {
+        let inner = self.prompt_history_panel_inner_rect_for(info)?;
+        let ws = self.active.and_then(|idx| self.workspaces.get(idx))?;
+        let terminal = ws
+            .pane_state(info.id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))?;
+        let rows = self.prompt_layout.rows(
+            info.id,
+            inner.width,
+            terminal.prompt_history_generation(),
+            &terminal.prompt_history,
+            std::time::Instant::now(),
+        );
+        Some((inner, rows))
+    }
+
     /// Maximum scroll offset (lines from bottom) for the prompt-history panel
-    /// over `info`: `total_rendered_lines - viewport`. Zero when everything
-    /// fits.
+    /// over `info`: `total_rows - viewport`. Zero when everything fits.
     ///
     /// The row count comes from the shared layout (#254), not from summing
     /// `rendered_line_count`. Those agreed only while truncation kept one row
     /// per logical line; once rows are wrapped, a width-independent count
     /// would let the panel scroll past its own content.
     pub(crate) fn prompt_history_max_offset_for(&self, info: &crate::layout::PaneInfo) -> u16 {
-        let Some(panel) = self.prompt_history_panel_rect_for(info) else {
+        let Some((inner, rows)) = self.prompt_panel_rows(info) else {
             return 0;
         };
-        let Some(ws) = self.active.and_then(|idx| self.workspaces.get(idx)) else {
-            return 0;
-        };
-        let Some(terminal) = ws
-            .pane_state(info.id)
-            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
-        else {
-            return 0;
-        };
-        // Inner width/height = panel minus its borders on both axes.
-        let inner_width = panel.width.saturating_sub(2);
-        let viewport = panel.height.saturating_sub(2) as usize;
-        let total = crate::ui::prompt_layout_row_count(
-            &terminal.prompt_history,
-            inner_width,
-            std::time::Instant::now(),
-        );
-        total
-            .saturating_sub(viewport)
+        rows.len()
+            .saturating_sub(inner.height as usize)
             .try_into()
             .unwrap_or(u16::MAX)
     }

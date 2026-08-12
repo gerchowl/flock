@@ -1622,9 +1622,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_history_drops_oldest_whole_entries_past_cap() {
+    /// Retention counts entries, not rendered lines (#254). These 25 entries
+    /// are ~1275 rendered lines between them and were silently clipped under
+    /// the old line budget — losing the oldest turns of any substantial
+    /// session, and with them anything a search could have found.
+    fn prompt_history_retains_long_multi_line_sessions() {
         let (mut app, terminal_id, public_pane_id) = app_with_terminal();
-        // Each entry: chrome + 50 body lines = 51 rendered lines.
         let big_body = (0..50)
             .map(|i| format!("body-{i}"))
             .collect::<Vec<_>>()
@@ -1647,11 +1650,10 @@ mod tests {
             .get(&terminal_id)
             .unwrap()
             .prompt_history;
-        let total: usize = history.iter().map(|e| e.rendered_line_count()).sum();
-        assert!(total <= crate::terminal::state::MAX_PROMPT_HISTORY_LINES);
+        assert_eq!(history.len(), 25, "no entry may be dropped below the cap");
+        assert!(history.first().unwrap().text.starts_with("entry-0\n"));
         assert!(history.last().unwrap().text.starts_with("entry-24\n"));
-        // The earliest entries were dropped.
-        assert!(history.iter().all(|e| !e.text.starts_with("entry-0\n")));
+        assert!(history.len() <= crate::terminal::state::MAX_PROMPT_HISTORY_ENTRIES);
     }
 
     #[test]

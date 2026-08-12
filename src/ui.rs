@@ -49,7 +49,7 @@ pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::panes::{extract_prompt_panel_selection, prompt_history_panel_rect};
-pub(crate) use self::prompt_layout::layout_row_count as prompt_layout_row_count;
+pub(crate) use self::prompt_layout::{PromptLayoutCache, PromptRow, PromptRowKind};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -184,6 +184,53 @@ fn resize_background_tab_panes_to_terminal_area(
     }
 }
 
+/// Re-wrap the open prompt-history panel's rows if its pane, width, or content
+/// changed (#254).
+///
+/// Runs in the pre-render pass, the one place `&mut AppState` is available
+/// before drawing. Wrapping a whole transcript is far too expensive to repeat
+/// per frame, and only one panel can be open at a time, so this is at most one
+/// pane's layout per change — not per visible pane, and not per frame.
+fn refresh_prompt_layout(app: &mut AppState, pane_infos: &[crate::layout::PaneInfo]) {
+    let Some(pane_id) = app.expanded_prompt_pane else {
+        app.prompt_layout.clear();
+        return;
+    };
+    let Some(info) = pane_infos.iter().find(|info| info.id == pane_id) else {
+        app.prompt_layout.clear();
+        return;
+    };
+    let Some(inner) = app.prompt_history_panel_inner_rect_for(info) else {
+        app.prompt_layout.clear();
+        return;
+    };
+    // Destructured so the cache is borrowed mutably while the history it reads
+    // stays borrowed immutably — cloning the history here would copy the whole
+    // transcript every frame, which is the cost this cache exists to avoid.
+    let AppState {
+        prompt_layout,
+        terminals,
+        workspaces,
+        active,
+        ..
+    } = app;
+    let Some(terminal) = active
+        .and_then(|idx| workspaces.get(idx))
+        .and_then(|ws| ws.pane_state(pane_id))
+        .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+    else {
+        prompt_layout.clear();
+        return;
+    };
+    prompt_layout.refresh(
+        pane_id,
+        inner.width,
+        terminal.prompt_history_generation(),
+        &terminal.prompt_history,
+        std::time::Instant::now(),
+    );
+}
+
 fn compute_view_internal(
     app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -300,6 +347,8 @@ fn compute_view_internal(
         );
         resize_float_runtime(app, terminal_runtimes, terminal_area, cell_size);
     }
+
+    refresh_prompt_layout(app, &pane_infos);
 
     let banner_lines = app
         .config_diagnostic

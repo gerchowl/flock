@@ -2032,6 +2032,13 @@ pub struct AppState {
     /// while the panel is open. Global rather than per-pane because it is a
     /// view mode, not stateful conversation data.
     pub prompt_history_detail: crate::agent_transcript::TranscriptDetail,
+    /// Wrapped row layout for the open prompt-history panel (#254).
+    ///
+    /// Refreshed from the pre-render pass and read by the renderer, scroll
+    /// bounds, and copy. Only one panel is open at a time, so this holds one
+    /// pane's rows; a miss falls back to laying out inline, so it is purely an
+    /// optimisation and nothing depends on a render having happened.
+    pub(crate) prompt_layout: crate::ui::PromptLayoutCache,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -2782,6 +2789,7 @@ impl AppState {
             expanded_prompt_pane: None,
             prompt_history_scroll: 0,
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
+            prompt_layout: crate::ui::PromptLayoutCache::default(),
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,

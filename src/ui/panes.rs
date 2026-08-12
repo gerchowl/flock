@@ -621,10 +621,13 @@ pub(super) fn render_prompt_history_panel(
         return;
     }
 
-    // Build the flat list of rendered lines (oldest first → newest last).
-    // Each entry contributes a chrome line (kind marker + relative age) then
-    // its body lines.
-    let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+    // Rows come from the shared layout (#254): oldest first → newest last,
+    // each entry contributing a chrome row (kind marker + relative age) then
+    // its wrapped body rows.
+    let Some((_, rows)) = app.prompt_panel_rows(info) else {
+        return;
+    };
+    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &rows);
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
 
@@ -680,18 +683,17 @@ pub(super) fn render_prompt_history_panel(
     }
 }
 
-/// Paint the laid-out rows for `terminal`'s history at `width`.
+/// Paint already-laid-out rows.
 ///
 /// Row identity — which rows exist, and what text each holds — comes from
 /// [`crate::ui::prompt_layout`], shared with scroll bounds and copy so the
 /// three cannot disagree (#254). This function only chooses colours, and must
 /// never change a row's length: copy slices these strings by column.
-fn build_prompt_history_lines(
+fn paint_prompt_history_rows(
     terminal: &crate::terminal::TerminalState,
     palette: Palette,
-    width: u16,
+    rows: &[crate::ui::PromptRow],
 ) -> Vec<Line<'static>> {
-    let now = std::time::Instant::now();
     // Three glanceable tones: prompt = dim subtext (the user's input is
     // history, not signal), reply = cool blue (the agent's prose), recap =
     // warm mauve accent (the disciplined one-line summary, the signal).
@@ -708,17 +710,20 @@ fn build_prompt_history_lines(
     // filters task-notification blocks at the source.
     let xml_chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
 
-    let rows = crate::ui::prompt_layout::layout_history(&terminal.prompt_history, width, now);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
     for row in rows {
-        let kind = terminal.prompt_history[row.entry].kind;
+        // A row's entry index comes from the same history this paints, but the
+        // cache can outlive a mutation by one frame; skip rather than panic.
+        let Some(kind) = terminal.prompt_history.get(row.entry).map(|e| e.kind) else {
+            continue;
+        };
         let body_style = match kind {
             crate::terminal::PromptHistoryKind::Prompt => prompt_style,
             crate::terminal::PromptHistoryKind::Reply => reply_style,
             crate::terminal::PromptHistoryKind::Recap => recap_style,
         };
-        if row.kind == crate::ui::prompt_layout::PromptRowKind::Chrome {
-            lines.push(Line::from(Span::styled(row.text, chrome_style)));
+        if row.kind == crate::ui::PromptRowKind::Chrome {
+            lines.push(Line::from(Span::styled(row.text.clone(), chrome_style)));
             continue;
         }
 
@@ -740,9 +745,9 @@ fn build_prompt_history_lines(
                 Span::styled(summary.to_string(), body_style),
             ]));
         } else if looks_like_xml_chrome(trimmed) {
-            lines.push(Line::from(Span::styled(row.text, xml_chrome_style)));
+            lines.push(Line::from(Span::styled(row.text.clone(), xml_chrome_style)));
         } else {
-            lines.push(Line::from(Span::styled(row.text, body_style)));
+            lines.push(Line::from(Span::styled(row.text.clone(), body_style)));
         }
     }
     lines
@@ -772,15 +777,12 @@ pub(crate) fn extract_prompt_panel_selection(
     if selection.source != crate::selection::SelectionSource::PromptPanel {
         return None;
     }
-    let panel = prompt_history_panel_rect(app, info, Some(terminal))?;
-    let inner = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .inner(panel);
+    let (inner, panel_rows) = app.prompt_panel_rows(info)?;
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
 
-    let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows);
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
     let max_offset = total_lines.saturating_sub(viewport);
@@ -1244,6 +1246,22 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    /// Lay out then paint, the way the renderer does — tests go through the
+    /// shared layout rather than a parallel line builder, or they would stop
+    /// testing what ships (#254).
+    fn rendered_prompt_lines(
+        terminal: &crate::terminal::TerminalState,
+        palette: Palette,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let rows = super::super::prompt_layout::layout_history(
+            &terminal.prompt_history,
+            width,
+            std::time::Instant::now(),
+        );
+        paint_prompt_history_rows(terminal, palette, &rows)
     }
 
     #[test]
@@ -1742,7 +1760,7 @@ mod tests {
         app.workspaces = vec![ws];
 
         let terminal_ref = app.terminals.get(&terminal_id).unwrap();
-        let lines = build_prompt_history_lines(terminal_ref, app.palette.clone(), 40);
+        let lines = rendered_prompt_lines(terminal_ref, app.palette.clone(), 40);
         assert!(!lines.is_empty(), "recorded prompt should render lines");
 
         let mut saw_panel_bg = false;
@@ -1785,7 +1803,7 @@ mod tests {
             .expect("panel rect");
         let inner_h = panel.height.saturating_sub(2) as usize;
         let terminal_ref = app.terminals.get(&terminal_id).unwrap();
-        let rendered = build_prompt_history_lines(terminal_ref, app.palette.clone(), panel.width);
+        let rendered = rendered_prompt_lines(terminal_ref, app.palette.clone(), panel.width);
         // With scroll = 0 (pinned), the visible window is rendered.last(inner_h).
         let end = rendered.len();
         let start = end.saturating_sub(inner_h);
@@ -1853,7 +1871,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal, app.palette.clone(), inner.width);
         let end = rendered.len() as u16;
         let start = end.saturating_sub(inner.height);
         // Body line for the single entry is the last rendered row.
@@ -1876,7 +1894,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal, app.palette.clone(), inner.width);
         // We recorded two prompt entries: each entry contributes a chrome
         // header row + one body row. So rendered.len() == 4. Panel is pinned
         // to bottom (scroll=0), so the visible window's last row is the
@@ -1958,7 +1976,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal_ref, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal_ref, app.palette.clone(), inner.width);
         let end = rendered.len() as u16;
         let start = end.saturating_sub(inner.height);
         // The bottom rendered row is the tool-call marker line ("  ⚙ Edit").

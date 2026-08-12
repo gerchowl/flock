@@ -12,10 +12,20 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-/// Hard cap on history per pane, measured in rendered lines (not entries).
-/// Drop oldest WHOLE entries until the total fits. Sized for ~1000 lines:
-/// generous for a long session, small enough to bound render cost.
-pub const MAX_PROMPT_HISTORY_LINES: usize = 1000;
+/// Hard cap on history per pane, measured in entries.
+///
+/// Entries, not rendered lines (#254). The old line cap existed because hooks
+/// streamed forever with no natural end, and it bounded render cost back when
+/// one logical line meant one rendered row. Neither holds now: the transcript
+/// is a finite file, and rows are wrapped, so a line budget no longer describes
+/// either the memory held or the work done.
+///
+/// Sized against the transcripts on the development machine — 71 sessions,
+/// longest 170 turns, p95 129 — so a real session is retained whole with an
+/// order of magnitude spare. The ceiling that actually protects memory is
+/// [`crate::agent_transcript::MAX_BLOCK_BYTES`], which caps any single block at
+/// 128 KiB against a measured 1.35 MB `tool_result`.
+pub const MAX_PROMPT_HISTORY_ENTRIES: usize = 2000;
 
 /// What kind of entry this is — each kind renders with its own palette color
 /// so the user can scan the float at a glance: `Prompt` (their input, dim
@@ -42,15 +52,6 @@ pub struct PromptHistoryEntry {
 }
 
 impl PromptHistoryEntry {
-    /// Number of rendered lines this entry will occupy, counting one row per
-    /// non-empty logical line plus a chrome line for the relative timestamp
-    /// header. Empty leading/trailing blank lines are trimmed.
-    pub fn rendered_line_count(&self) -> usize {
-        // Always at least 1 (the chrome line). Logical text adds one row per
-        // non-empty line; an empty body still gets the chrome.
-        1 + trimmed_logical_lines(&self.text).len()
-    }
-
     /// Compact "12s ago"-style age string.
     pub fn relative_age(&self, now: Instant) -> String {
         if let Some(at) = self.wall_clock {
@@ -63,19 +64,6 @@ impl PromptHistoryEntry {
         let elapsed = now.saturating_duration_since(self.recorded_at);
         relative_age_for_duration(elapsed)
     }
-}
-
-fn trimmed_logical_lines(text: &str) -> Vec<&str> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .skip_while(|line| line.is_empty())
-        .collect();
-    let mut lines = lines;
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-    lines
 }
 
 fn relative_age_for_duration(elapsed: Duration) -> String {
@@ -91,20 +79,17 @@ fn relative_age_for_duration(elapsed: Duration) -> String {
     }
 }
 
-/// Append `entry`, then drop oldest WHOLE entries until the total rendered
-/// line count fits within [`MAX_PROMPT_HISTORY_LINES`]. A single new entry
-/// larger than the cap is still kept (it would not fit alone — but losing it
-/// is worse than the temporary overflow), matching the "drop oldest whole"
-/// invariant.
+/// Append `entry`, then drop oldest entries until the history fits within
+/// [`MAX_PROMPT_HISTORY_ENTRIES`]. The newest entry always survives.
+///
+/// `drain` rather than repeated `remove(0)`: hydration replays a whole
+/// transcript through here, and shifting the vector once per dropped entry is
+/// quadratic over a long session.
 pub fn append_with_cap(history: &mut Vec<PromptHistoryEntry>, entry: PromptHistoryEntry) {
     history.push(entry);
-    let mut total: usize = history
-        .iter()
-        .map(PromptHistoryEntry::rendered_line_count)
-        .sum();
-    while total > MAX_PROMPT_HISTORY_LINES && history.len() > 1 {
-        let removed = history.remove(0);
-        total = total.saturating_sub(removed.rendered_line_count());
+    if history.len() > MAX_PROMPT_HISTORY_ENTRIES {
+        let excess = history.len() - MAX_PROMPT_HISTORY_ENTRIES;
+        history.drain(..excess);
     }
 }
 
@@ -134,26 +119,23 @@ mod tests {
     #[test]
     fn append_over_cap_drops_oldest_whole_entries() {
         let mut history = Vec::new();
-        // Each entry: 1 chrome + 50 lines = 51 rendered lines.
-        let big_body = (0..50)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // 21 entries of 51 rows = 1071 rows; cap drops the oldest until <=1000.
-        for i in 0..21 {
-            let mut e = entry(PromptHistoryKind::Prompt, &big_body);
+        for i in 0..MAX_PROMPT_HISTORY_ENTRIES + 5 {
+            let mut e = entry(PromptHistoryKind::Prompt, "body");
             // Give each a distinct text so we can identify which survived.
-            e.text = format!("entry-{i}\n{big_body}");
+            e.text = format!("entry-{i}");
             append_with_cap(&mut history, e);
         }
-        let total: usize = history.iter().map(|e| e.rendered_line_count()).sum();
-        assert!(total <= MAX_PROMPT_HISTORY_LINES);
-        // The newest entry must always survive.
-        assert!(history.last().unwrap().text.starts_with("entry-20"));
-        // The oldest entry must have been dropped.
-        assert!(history.iter().all(|e| !e.text.starts_with("entry-0\n")));
+        assert_eq!(history.len(), MAX_PROMPT_HISTORY_ENTRIES);
+        // The newest entry must always survive; the oldest must be gone.
+        assert_eq!(
+            history.last().unwrap().text,
+            format!("entry-{}", MAX_PROMPT_HISTORY_ENTRIES + 4)
+        );
+        assert_eq!(history.first().unwrap().text, "entry-5");
     }
 
+    /// A single enormous entry is retained whole: the byte ceiling belongs to
+    /// the parser's per-block cap, not to the ring, which counts entries.
     #[test]
     fn append_single_oversized_entry_is_still_kept() {
         let mut history = Vec::new();
@@ -163,13 +145,29 @@ mod tests {
             .join("\n");
         append_with_cap(&mut history, entry(PromptHistoryKind::Prompt, &huge_body));
         assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, huge_body, "content must not be clipped");
     }
 
+    /// A long session must be retained whole: the longest transcript measured
+    /// on the development machine was 170 turns, so a real session sits far
+    /// inside the cap rather than being silently clipped as it was under the
+    /// old 1000-rendered-line budget.
     #[test]
-    fn rendered_line_count_trims_blank_borders() {
-        let e = entry(PromptHistoryKind::Prompt, "\n\nhello\nworld\n\n");
-        // 1 chrome + 2 body lines = 3.
-        assert_eq!(e.rendered_line_count(), 3);
+    fn a_realistically_long_session_is_retained_whole() {
+        let mut history = Vec::new();
+        // 170 turns, each a substantial multi-line reply — well past what the
+        // old line cap admitted (it held roughly 1000 rendered lines total).
+        let body = (0..20)
+            .map(|i| format!("a reasonably long line of agent prose number {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..170 {
+            let mut e = entry(PromptHistoryKind::Reply, &body);
+            e.text = format!("turn-{i}\n{body}");
+            append_with_cap(&mut history, e);
+        }
+        assert_eq!(history.len(), 170, "no turn may be dropped");
+        assert!(history[0].text.starts_with("turn-0"));
     }
 
     #[test]

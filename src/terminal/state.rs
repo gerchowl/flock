@@ -25,7 +25,7 @@ pub use header_fields::{
 #[path = "prompt_history.rs"]
 mod prompt_history;
 #[cfg(test)]
-pub use prompt_history::MAX_PROMPT_HISTORY_LINES;
+pub use prompt_history::MAX_PROMPT_HISTORY_ENTRIES;
 pub use prompt_history::{
     append_with_cap as append_prompt_history_with_cap, PromptHistoryEntry, PromptHistoryKind,
 };
@@ -101,9 +101,16 @@ pub struct TerminalState {
     pub last_prompt: Option<String>,
     /// Per-pane prompt + recap scrollback (issue #96). Chronological,
     /// timestamped entries; capped at
-    /// [`MAX_PROMPT_HISTORY_LINES`] rendered lines (drop oldest whole entries).
+    /// [`MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
+    /// Bumped on every `prompt_history` mutation.
+    ///
+    /// The panel's row layout is cached against this (#254): rows are wrapped,
+    /// so re-deriving them per frame over a full transcript is not viable, and
+    /// a length check would miss an in-place replacement like hydration that
+    /// happens to preserve the count.
+    prompt_history_generation: u64,
     /// The (session, detail) pair that last hydrated `prompt_history` (#246).
     /// The pair, not the session alone, so cycling the panel's detail level
     /// re-arms the reader without touching every hook path — a burst of hook
@@ -172,6 +179,7 @@ impl TerminalState {
             fallback_observed_at: None,
             last_prompt: None,
             prompt_history: Vec::new(),
+            prompt_history_generation: 0,
             hydrated_transcript: None,
             hydration_arm_index: None,
             header_fields: Vec::new(),
@@ -1126,18 +1134,15 @@ impl TerminalState {
         let now = Instant::now();
         self.prompt_history.clear();
         for (role, text, at) in turns {
-            append_prompt_history_with_cap(
-                &mut self.prompt_history,
-                PromptHistoryEntry {
-                    kind: match role {
-                        crate::agent_transcript::Role::User => PromptHistoryKind::Prompt,
-                        crate::agent_transcript::Role::Assistant => PromptHistoryKind::Reply,
-                    },
-                    text: text.clone(),
-                    recorded_at: now,
-                    wall_clock: *at,
+            self.push_prompt_history(PromptHistoryEntry {
+                kind: match role {
+                    crate::agent_transcript::Role::User => PromptHistoryKind::Prompt,
+                    crate::agent_transcript::Role::Assistant => PromptHistoryKind::Reply,
                 },
-            );
+                text: text.clone(),
+                recorded_at: now,
+                wall_clock: *at,
+            });
         }
         // Turns the worker could not have seen go back on the end, in order.
         let carried_prompt = live_tail
@@ -1146,7 +1151,7 @@ impl TerminalState {
             .find(|entry| entry.kind == PromptHistoryKind::Prompt)
             .map(|entry| entry.text.clone());
         for entry in live_tail {
-            append_prompt_history_with_cap(&mut self.prompt_history, entry);
+            self.push_prompt_history(entry);
         }
 
         // Keep the collapsed header consistent with the ring it summarises —
@@ -1169,17 +1174,29 @@ impl TerminalState {
         self.record_prompt_at(prompt, Instant::now());
     }
 
+    /// Append to the history ring and mark the layout cache stale.
+    ///
+    /// Every mutation must go through here — a direct `push` would leave the
+    /// panel rendering rows laid out from the previous content (#254).
+    fn push_prompt_history(&mut self, entry: PromptHistoryEntry) {
+        append_prompt_history_with_cap(&mut self.prompt_history, entry);
+        self.prompt_history_generation = self.prompt_history_generation.wrapping_add(1);
+    }
+
+    /// Monotonic counter over `prompt_history` mutations; the panel's row
+    /// layout cache is keyed on it.
+    pub fn prompt_history_generation(&self) -> u64 {
+        self.prompt_history_generation
+    }
+
     pub fn record_prompt_at(&mut self, prompt: String, now: Instant) {
         self.last_prompt = Some(prompt.clone());
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Prompt,
-                text: prompt,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Prompt,
+            text: prompt,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 
     /// Append a recap entry to the history ring. Recaps render visually
@@ -1190,15 +1207,12 @@ impl TerminalState {
     }
 
     pub fn record_recap_at(&mut self, recap: String, now: Instant) {
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Recap,
-                text: recap,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Recap,
+            text: recap,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 
     /// Append an assistant reply to the history ring. Wired from the Stop
@@ -1210,15 +1224,12 @@ impl TerminalState {
     }
 
     pub fn record_reply_at(&mut self, reply: String, now: Instant) {
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Reply,
-                text: reply,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Reply,
+            text: reply,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 }
 
