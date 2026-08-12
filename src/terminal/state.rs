@@ -25,7 +25,7 @@ pub use header_fields::{
 #[path = "prompt_history.rs"]
 mod prompt_history;
 #[cfg(test)]
-pub use prompt_history::MAX_PROMPT_HISTORY_LINES;
+pub use prompt_history::MAX_PROMPT_HISTORY_ENTRIES;
 pub use prompt_history::{
     append_with_cap as append_prompt_history_with_cap, PromptHistoryEntry, PromptHistoryKind,
 };
@@ -101,14 +101,26 @@ pub struct TerminalState {
     pub last_prompt: Option<String>,
     /// Per-pane prompt + recap scrollback (issue #96). Chronological,
     /// timestamped entries; capped at
-    /// [`MAX_PROMPT_HISTORY_LINES`] rendered lines (drop oldest whole entries).
+    /// [`MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
+    /// Bumped on every `prompt_history` mutation.
+    ///
+    /// The panel's row layout is cached against this (#254): rows are wrapped,
+    /// so re-deriving them per frame over a full transcript is not viable, and
+    /// a length check would miss an in-place replacement like hydration that
+    /// happens to preserve the count.
+    prompt_history_generation: u64,
     /// The (session, detail) pair that last hydrated `prompt_history` (#246).
     /// The pair, not the session alone, so cycling the panel's detail level
     /// re-arms the reader without touching every hook path — a burst of hook
     /// reports at the same session+detail still spawns only one reader.
     hydrated_transcript: Option<(String, crate::agent_transcript::TranscriptDetail)>,
+    /// Generation the last read was armed at, versus the one callers want.
+    /// A counter rather than a flag so a burst of "the file moved" signals
+    /// between reads still collapses to a single pending read (#254).
+    hydrated_transcript_generation: u64,
+    wanted_transcript_generation: u64,
     /// Ring length when a transcript read was armed. Entries past it arrived
     /// after the worker opened the file, so hydration carries them over
     /// instead of replacing them away (#246). `Some` also means "in flight".
@@ -172,7 +184,10 @@ impl TerminalState {
             fallback_observed_at: None,
             last_prompt: None,
             prompt_history: Vec::new(),
+            prompt_history_generation: 0,
             hydrated_transcript: None,
+            hydrated_transcript_generation: 0,
+            wanted_transcript_generation: 0,
             hydration_arm_index: None,
             header_fields: Vec::new(),
             header_reserved: false,
@@ -1043,20 +1058,47 @@ impl TerminalState {
         Some(session_ref.value.clone())
     }
 
-    /// True once per `(session_id, detail)` pair: the caller should read the
-    /// transcript and hydrate at that detail. Flips immediately so a burst of
-    /// hook reports cannot spawn a reader per event. Cycling the panel's
-    /// detail level changes the second half of the pair and re-arms it.
+    /// Ask for a re-read even though the `(session, detail)` pair is unchanged.
+    ///
+    /// The guard below is an *identity* check, which is correct only while
+    /// hydration happens once per session: the same pair can never be due
+    /// twice. That is exactly wrong once re-reads become routine — a new turn
+    /// landing on disk is the same session at the same detail, and would be
+    /// refused forever (#254). Bumping the generation makes the pair due again
+    /// without weakening the burst protection: a hundred hooks between reads
+    /// still bump to one pending generation, so still one reader.
+    pub fn invalidate_transcript_hydration(&mut self) {
+        self.wanted_transcript_generation = self.wanted_transcript_generation.wrapping_add(1);
+    }
+
+    /// True when the caller should read the transcript and hydrate at `detail`.
+    ///
+    /// Due when the `(session, detail)` pair changed, or when
+    /// [`Self::invalidate_transcript_hydration`] has been called since the last
+    /// read. Flips immediately so a burst of hook reports cannot spawn a reader
+    /// per event.
     pub fn take_transcript_hydration_due(
         &mut self,
         session_id: &str,
         detail: crate::agent_transcript::TranscriptDetail,
     ) -> bool {
         let target = (session_id.to_string(), detail);
-        if self.hydrated_transcript.as_ref() == Some(&target) {
+        let pair_changed = self.hydrated_transcript.as_ref() != Some(&target);
+        let generation_stale =
+            self.hydrated_transcript_generation != self.wanted_transcript_generation;
+        if !pair_changed && !generation_stale {
+            return false;
+        }
+        // A re-read of the SAME pair while a reader is already walking the file
+        // would spend a second pass over ~15 MB to deliver the same content.
+        // The pending generation is remembered, so the next poll after this one
+        // lands picks it up. A changed pair still arms immediately: it is a
+        // different request, and the input path throttles key-repeat itself.
+        if !pair_changed && self.hydration_arm_index.is_some() {
             return false;
         }
         self.hydrated_transcript = Some(target);
+        self.hydrated_transcript_generation = self.wanted_transcript_generation;
         // Hook entries appended from here on are newer than the read that is
         // about to start, so hydration must not swallow them (see
         // `hydrate_prompt_history`).
@@ -1083,6 +1125,12 @@ impl TerminalState {
     pub fn rearm_transcript_hydration(&mut self) {
         self.hydrated_transcript = None;
         self.hydration_arm_index = None;
+    }
+
+    /// Whether a re-read is still owed, i.e. the file moved since the last one.
+    #[cfg(test)]
+    pub fn transcript_hydration_pending(&self) -> bool {
+        self.hydrated_transcript_generation != self.wanted_transcript_generation
     }
 
     /// The `(session, detail)` a reader is currently in flight (or last
@@ -1126,18 +1174,15 @@ impl TerminalState {
         let now = Instant::now();
         self.prompt_history.clear();
         for (role, text, at) in turns {
-            append_prompt_history_with_cap(
-                &mut self.prompt_history,
-                PromptHistoryEntry {
-                    kind: match role {
-                        crate::agent_transcript::Role::User => PromptHistoryKind::Prompt,
-                        crate::agent_transcript::Role::Assistant => PromptHistoryKind::Reply,
-                    },
-                    text: text.clone(),
-                    recorded_at: now,
-                    wall_clock: *at,
+            self.push_prompt_history(PromptHistoryEntry {
+                kind: match role {
+                    crate::agent_transcript::Role::User => PromptHistoryKind::Prompt,
+                    crate::agent_transcript::Role::Assistant => PromptHistoryKind::Reply,
                 },
-            );
+                text: text.clone(),
+                recorded_at: now,
+                wall_clock: *at,
+            });
         }
         // Turns the worker could not have seen go back on the end, in order.
         let carried_prompt = live_tail
@@ -1146,7 +1191,7 @@ impl TerminalState {
             .find(|entry| entry.kind == PromptHistoryKind::Prompt)
             .map(|entry| entry.text.clone());
         for entry in live_tail {
-            append_prompt_history_with_cap(&mut self.prompt_history, entry);
+            self.push_prompt_history(entry);
         }
 
         // Keep the collapsed header consistent with the ring it summarises —
@@ -1169,17 +1214,33 @@ impl TerminalState {
         self.record_prompt_at(prompt, Instant::now());
     }
 
+    /// Append to the history ring and mark the layout cache stale.
+    ///
+    /// Every mutation must go through here — a direct `push` would leave the
+    /// panel rendering rows laid out from the previous content (#254).
+    fn push_prompt_history(&mut self, entry: PromptHistoryEntry) {
+        append_prompt_history_with_cap(&mut self.prompt_history, entry);
+        self.prompt_history_generation = self.prompt_history_generation.wrapping_add(1);
+    }
+
+    /// Monotonic counter over `prompt_history` mutations; the panel's row
+    /// layout cache is keyed on it.
+    pub fn prompt_history_generation(&self) -> u64 {
+        self.prompt_history_generation
+    }
+
     pub fn record_prompt_at(&mut self, prompt: String, now: Instant) {
         self.last_prompt = Some(prompt.clone());
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Prompt,
-                text: prompt,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        // The agent just wrote a turn boundary, so the transcript on disk has
+        // moved: mark hydration due so the panel re-reads the authoritative
+        // text rather than living on the hook's summary forever (#254).
+        self.invalidate_transcript_hydration();
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Prompt,
+            text: prompt,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 
     /// Append a recap entry to the history ring. Recaps render visually
@@ -1190,15 +1251,16 @@ impl TerminalState {
     }
 
     pub fn record_recap_at(&mut self, recap: String, now: Instant) {
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Recap,
-                text: recap,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        // The agent just wrote a turn boundary, so the transcript on disk has
+        // moved: mark hydration due so the panel re-reads the authoritative
+        // text rather than living on the hook's summary forever (#254).
+        self.invalidate_transcript_hydration();
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Recap,
+            text: recap,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 
     /// Append an assistant reply to the history ring. Wired from the Stop
@@ -1210,15 +1272,16 @@ impl TerminalState {
     }
 
     pub fn record_reply_at(&mut self, reply: String, now: Instant) {
-        append_prompt_history_with_cap(
-            &mut self.prompt_history,
-            PromptHistoryEntry {
-                kind: PromptHistoryKind::Reply,
-                text: reply,
-                recorded_at: now,
-                wall_clock: None,
-            },
-        );
+        // The agent just wrote a turn boundary, so the transcript on disk has
+        // moved: mark hydration due so the panel re-reads the authoritative
+        // text rather than living on the hook's summary forever (#254).
+        self.invalidate_transcript_hydration();
+        self.push_prompt_history(PromptHistoryEntry {
+            kind: PromptHistoryKind::Reply,
+            text: reply,
+            recorded_at: now,
+            wall_clock: None,
+        });
     }
 }
 
@@ -1347,6 +1410,65 @@ mod tests {
             "cycling detail on the same session must re-arm the reader"
         );
         assert!(terminal.take_transcript_hydration_due("s2", TranscriptDetail::Collapsed));
+    }
+
+    /// #254: the identity guard alone is correct only while hydration happens
+    /// once per session. A new turn is the same session at the same detail, so
+    /// without a generation the panel would never re-read the file again and
+    /// would live on hook summaries for the rest of the session.
+    #[test]
+    fn a_new_turn_makes_the_same_session_due_for_a_re_read() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut terminal = test_terminal();
+        assert!(terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply));
+        assert!(!terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply));
+
+        // Simulate the read landing, then a hook reporting a new turn.
+        terminal.hydrate_prompt_history(&[(
+            crate::agent_transcript::Role::User,
+            "old turn".into(),
+            None,
+        )]);
+        terminal.record_prompt("a brand new turn".into());
+        assert!(
+            terminal.transcript_hydration_pending(),
+            "a reported turn means the file moved"
+        );
+        assert!(
+            terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply),
+            "the same session at the same detail must be due again"
+        );
+    }
+
+    /// A burst of hooks between reads must still collapse to one reader — the
+    /// file reaches ~15 MB and this is not the UI thread's to spend twice.
+    #[test]
+    fn a_burst_of_turns_collapses_to_a_single_pending_read() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut terminal = test_terminal();
+        assert!(terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply));
+        assert!(terminal.transcript_read_in_flight());
+
+        for i in 0..10 {
+            terminal.record_prompt(format!("turn {i}"));
+        }
+        assert!(
+            !terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply),
+            "a second reader must not stack while one is walking the file"
+        );
+
+        // Once the in-flight read lands, the pending work is still owed.
+        terminal.hydrate_prompt_history(&[(
+            crate::agent_transcript::Role::User,
+            "from disk".into(),
+            None,
+        )]);
+        assert!(
+            terminal.take_transcript_hydration_due("s1", TranscriptDetail::Reply),
+            "the deferred re-read must not be lost"
+        );
     }
 
     /// The turn that ARMS hydration is usually not on disk yet — the agent

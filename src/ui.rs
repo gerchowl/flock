@@ -15,6 +15,8 @@ mod mobile;
 mod navigator;
 mod onboarding;
 mod panes;
+mod prompt_layout;
+mod prompt_search;
 mod release_notes;
 pub(crate) mod screensaver;
 mod scrollbar;
@@ -48,6 +50,8 @@ pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::panes::{extract_prompt_panel_selection, prompt_history_panel_rect};
+pub(crate) use self::prompt_layout::{PromptLayoutCache, PromptRow, PromptRowKind};
+pub(crate) use self::prompt_search::PromptSearch;
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -180,6 +184,63 @@ fn resize_background_tab_panes_to_terminal_area(
             resize_tab_panes(app, terminal_runtimes, tab, terminal_area, cell_size);
         }
     }
+}
+
+/// Re-wrap the open prompt-history panel's rows if its pane, width, or content
+/// changed (#254).
+///
+/// Runs in the pre-render pass, the one place `&mut AppState` is available
+/// before drawing. Wrapping a whole transcript is far too expensive to repeat
+/// per frame, and only one panel can be open at a time, so this is at most one
+/// pane's layout per change — not per visible pane, and not per frame.
+fn refresh_prompt_layout(app: &mut AppState) {
+    // An overlay took the screen: the panel is scoped to one pane and would be
+    // left stranded over content the user is no longer working with (#254).
+    app.close_prompt_history_for_overlay();
+    let Some(pane_id) = app.expanded_prompt_pane else {
+        app.prompt_layout.clear();
+        return;
+    };
+    let Some(info) = app.pane_info_by_id(pane_id).cloned() else {
+        app.prompt_layout.clear();
+        return;
+    };
+    let Some(inner) = app.prompt_history_panel_inner_rect_for(&info) else {
+        app.prompt_layout.clear();
+        return;
+    };
+    // Destructured so the cache is borrowed mutably while the history it reads
+    // stays borrowed immutably — cloning the history here would copy the whole
+    // transcript every frame, which is the cost this cache exists to avoid.
+    let AppState {
+        prompt_layout,
+        terminals,
+        workspaces,
+        active,
+        ..
+    } = app;
+    let Some(terminal) = active
+        .and_then(|idx| workspaces.get(idx))
+        .and_then(|ws| ws.pane_state(pane_id))
+        .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+    else {
+        prompt_layout.clear();
+        return;
+    };
+    let generation = terminal.prompt_history_generation();
+    prompt_layout.refresh(
+        pane_id,
+        inner.width,
+        generation,
+        &terminal.prompt_history,
+        std::time::Instant::now(),
+    );
+    // The rows just changed shape — a resize re-wraps the same content into a
+    // different number of them — so re-derive the scroll offset from what the
+    // reader was parked on rather than leaving a stale row count (#254).
+    app.resolve_prompt_history_anchor();
+    // Matches address entry indices, so new turns invalidate them.
+    app.sync_prompt_search(generation);
 }
 
 fn compute_view_internal(
@@ -340,6 +401,10 @@ fn compute_view_internal(
         pane_infos,
         split_borders,
     };
+
+    // After the view lands: pane geometry is now current, so the panel's
+    // rows can be re-wrapped at the width they will actually render at (#254).
+    refresh_prompt_layout(app);
 }
 
 fn compute_mobile_view(
@@ -422,6 +487,10 @@ fn compute_mobile_view(
         pane_infos,
         split_borders,
     };
+
+    // After the view lands: pane geometry is now current, so the panel's
+    // rows can be re-wrapped at the width they will actually render at (#254).
+    refresh_prompt_layout(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.

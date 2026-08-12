@@ -54,7 +54,12 @@ impl App {
     /// `handle_pane_mouse_only`; this is the keyboard twin. Returns true
     /// when the key was consumed by the panel.
     fn handle_prompt_history_panel_key(&mut self, key: TerminalKey) -> bool {
-        if !key.modifiers.is_empty() {
+        // Shift is part of ordinary typing (capitals into the search query), so
+        // it must not disqualify a key the way Ctrl/Alt do. Ctrl is allowed
+        // through for the search opener alone, checked below.
+        let bare = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        if !bare && !ctrl {
             return false;
         }
         let Some(expanded) = self.state.expanded_prompt_pane else {
@@ -74,6 +79,52 @@ impl App {
         let Some(info) = self.state.pane_info_by_id(expanded).cloned() else {
             return false;
         };
+        // Search is modal, and deliberately so. The panel floats over a pane
+        // that stays interactive — rereading history while composing the next
+        // prompt is a primary workflow — so search must not claim printable
+        // keys like `/` or `n` the way a full-screen pager can. While the
+        // query line is open it owns typing; while it is closed every
+        // printable key still reaches the agent.
+        if self.state.prompt_search.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.close_prompt_search();
+                }
+                // ctrl+c dismisses, as it does in every other query line the
+                // muscle knows. Without this it would type a literal `c`.
+                KeyCode::Char('c') if ctrl => {
+                    self.state.close_prompt_search();
+                }
+                // Only unmodified (or shifted) characters are query text.
+                // Otherwise ctrl+f would append an `f` to the query it opened
+                // with, and every other chord would leak literal letters in.
+                KeyCode::Char(ch) if bare => {
+                    self.state.push_prompt_search_char(ch);
+                }
+                KeyCode::Backspace => {
+                    self.state.pop_prompt_search_char();
+                }
+                // Enter and Down step forward, Up steps back — navigation
+                // without leaving the query line, so refining and stepping are
+                // the same gesture.
+                KeyCode::Enter | KeyCode::Down => {
+                    self.state.step_prompt_search(true);
+                }
+                KeyCode::Up => {
+                    self.state.step_prompt_search(false);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        // ctrl+f: a chord, not a printable key, so it cannot collide with
+        // typing into the pane underneath.
+        if ctrl && matches!(key.code, KeyCode::Char('f')) {
+            return self.state.open_prompt_search();
+        }
+        if ctrl {
+            return false;
+        }
         let max_offset = self.state.prompt_history_max_offset_for(&info);
         let viewport = self
             .state
@@ -82,8 +133,14 @@ impl App {
             .unwrap_or(0)
             .max(1);
         match key.code {
+            // Esc unwinds one layer at a time: a standing search first (its
+            // highlights are still on screen), then the panel.
             KeyCode::Esc => {
-                self.state.close_prompt_history_panel();
+                if !self.state.prompt_search.is_empty() {
+                    self.state.close_prompt_search();
+                } else {
+                    self.state.close_prompt_history_panel();
+                }
                 true
             }
             KeyCode::PageUp => {
@@ -1479,6 +1536,82 @@ mod tests {
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Tab, KeyModifiers::empty()));
         let forwarded = pane_rx.try_recv().expect("Tab now forwards to the pane");
         assert_eq!(forwarded.as_ref(), b"\t");
+    }
+
+    /// #254: the search line owns unmodified typing, but a chord is not query
+    /// text. Without the modifier gate, the very chord that opens search
+    /// appends an `f` to the query it just opened, and ctrl+c types a `c`
+    /// instead of dismissing.
+    #[tokio::test]
+    async fn search_line_takes_typing_but_not_chords() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 60, 20));
+        let (runtime, mut pane_rx) = crate::terminal::TerminalRuntime::test_with_channel(
+            pane_infos[0].inner_rect.width,
+            pane_infos[0].inner_rect.height,
+        );
+        ws.insert_test_runtime(pane_id, runtime);
+        let terminal_id = ws.pane_state(pane_id).unwrap().attached_terminal_id.clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.record_prompt("find the wrap bug".into());
+        app.state.terminals.insert(terminal_id, terminal);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.expanded_prompt_pane = Some(pane_id);
+
+        // ctrl+f opens the query line and must not type an `f` into it.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(app.state.prompt_search.active, "ctrl+f opens search");
+        assert_eq!(
+            app.state.prompt_search.query, "",
+            "the chord is not query text"
+        );
+
+        // Unmodified characters are.
+        for ch in "wrap".chars() {
+            app.handle_terminal_key_headless(TerminalKey::new(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+            ));
+        }
+        assert_eq!(app.state.prompt_search.query, "wrap");
+        assert!(
+            !app.state.prompt_search.matches.is_empty(),
+            "the query should have found the prompt"
+        );
+        assert!(
+            pane_rx.try_recv().is_err(),
+            "query text must never reach the pane's shell"
+        );
+
+        // ctrl+c dismisses rather than typing a `c`.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.state.prompt_search.active, "ctrl+c closes the search");
+        assert_eq!(
+            app.state.expanded_prompt_pane,
+            Some(pane_id),
+            "closing the search must leave the panel open"
+        );
+
+        // Panel still open, search closed: printable keys reach the agent
+        // again, which is the whole reason search is modal.
+        app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('n'),
+            KeyModifiers::empty(),
+        ));
+        let forwarded = pane_rx.try_recv().expect("typing reaches the pane again");
+        assert_eq!(forwarded.as_ref(), b"n");
     }
 
     #[tokio::test]

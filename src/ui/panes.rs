@@ -604,11 +604,26 @@ pub(super) fn render_prompt_history_panel(
     // The detail label doubles as the discovery hint for Tab (#246): the
     // panel is opened often and cycled rarely, so naming what mode you are
     // in is more useful than teaching the shortcut in the border.
-    let title = format!(
-        " prompt history ({}) — {} ",
-        terminal.prompt_history.len(),
-        app.prompt_history_detail.label(),
-    );
+    // With a query standing, the border reports the search instead of the
+    // detail level: `3/17` vs `no matches` is the difference between "not in
+    // this conversation" and "not on screen", and a reader who just typed a
+    // query needs that answer more than the mode label (#254).
+    let title = if app.prompt_search.is_empty() {
+        // The detail label doubles as the Tab hint; `ctrl+f` is named outright
+        // because search has no other affordance — nothing on screen suggests
+        // the panel is searchable at all until you know it is.
+        format!(
+            " prompt history ({}) — {} · ctrl+f to search ",
+            terminal.prompt_history.len(),
+            app.prompt_history_detail.label(),
+        )
+    } else {
+        format!(
+            " /{}  {} ",
+            app.prompt_search.query,
+            app.prompt_search.status(),
+        )
+    };
     let title_truncated = truncate_label(&title, panel.width.saturating_sub(2) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -621,11 +636,13 @@ pub(super) fn render_prompt_history_panel(
         return;
     }
 
-    // Build the flat list of rendered lines (oldest first → newest last).
-    // Each entry contributes a chrome line (kind marker + relative age) then
-    // its body lines.
-    let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
-    let total_lines = rendered.len() as u16;
+    // Rows come from the shared layout (#254): oldest first → newest last,
+    // each entry contributing a chrome row (kind marker + relative age) then
+    // its wrapped body rows.
+    let Some((_, rows)) = app.prompt_panel_rows(info) else {
+        return;
+    };
+    let total_lines = rows.len() as u16;
     let viewport = inner.height;
 
     // Scroll offset is "lines from the bottom" so 0 keeps the latest pinned.
@@ -636,12 +653,23 @@ pub(super) fn render_prompt_history_panel(
     let end = total_lines.saturating_sub(offset);
     let start = end.saturating_sub(viewport);
 
+    // Only the visible window is painted. Row identity for the whole history
+    // is already known (that is what the layout cache holds), so styling a
+    // full transcript's worth of spans every frame would be pure waste — the
+    // panel shows at most `viewport` of them (#254).
+    let window = &rows[start as usize..(end as usize).min(rows.len())];
+    let rendered = paint_prompt_history_rows(
+        terminal,
+        app.palette.clone(),
+        window,
+        Some(&app.prompt_search),
+        start as usize,
+    );
+
     let buf = frame.buffer_mut();
-    for (row, line_idx) in (start..end).enumerate() {
+    for (row, line) in rendered.iter().enumerate() {
         let y = inner.y + row as u16;
-        if let Some(line) = rendered.get(line_idx as usize) {
-            buf.set_line(inner.x, y, line, inner.width);
-        }
+        buf.set_line(inner.x, y, line, inner.width);
     }
 
     // Selection tint (#115 part 2): only for a PromptPanel-source selection
@@ -680,12 +708,37 @@ pub(super) fn render_prompt_history_panel(
     }
 }
 
-fn build_prompt_history_lines(
+/// Paint already-laid-out rows.
+///
+/// Row identity — which rows exist, and what text each holds — comes from
+/// [`crate::ui::prompt_layout`], shared with scroll bounds and copy so the
+/// three cannot disagree (#254). This function only chooses colours, and must
+/// never change a row's length: copy slices these strings by column.
+fn paint_prompt_history_rows(
     terminal: &crate::terminal::TerminalState,
     palette: Palette,
-    width: u16,
+    rows: &[crate::ui::PromptRow],
+    search: Option<&crate::ui::PromptSearch>,
+    // Index of `rows[0]` within the full layout, so the current-match row is
+    // still identifiable when only the visible window is painted.
+    first_row: usize,
 ) -> Vec<Line<'static>> {
-    let now = std::time::Instant::now();
+    // The row holding the current match, so it can be distinguished from the
+    // other hits — "which of the 17 am I on" is the question stepping asks.
+    let current_row = search
+        .and_then(|search| search.current())
+        .and_then(|found| {
+            rows.iter()
+                .rposition(|row| {
+                    row.entry == found.entry
+                        && row.kind == crate::ui::PromptRowKind::Body
+                        && row.body_offset <= found.body_offset
+                })
+                .map(|index| index + first_row)
+        });
+    let query = search
+        .filter(|search| !search.is_empty())
+        .map(|search| search.query.trim().to_lowercase());
     // Three glanceable tones: prompt = dim subtext (the user's input is
     // history, not signal), reply = cool blue (the agent's prose), recap =
     // warm mauve accent (the disciplined one-line summary, the signal).
@@ -701,68 +754,108 @@ fn build_prompt_history_lines(
     // dim it so chrome reads as chrome. Defense-in-depth — the hook also
     // filters task-notification blocks at the source.
     let xml_chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
-    let width = width as usize;
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for entry in &terminal.prompt_history {
-        let age = entry.relative_age(now);
-        let (kind_label, body_style) = match entry.kind {
-            crate::terminal::PromptHistoryKind::Prompt => ("prompt", prompt_style),
-            crate::terminal::PromptHistoryKind::Reply => ("reply", reply_style),
-            crate::terminal::PromptHistoryKind::Recap => ("recap", recap_style),
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        // A row's entry index comes from the same history this paints, but the
+        // cache can outlive a mutation by one frame; skip rather than panic.
+        let Some(kind) = terminal.prompt_history.get(row.entry).map(|e| e.kind) else {
+            continue;
         };
-        let chrome_text = format!("{kind_label} \u{b7} {age}");
-        let chrome_text = truncate_label(&chrome_text, width.saturating_sub(2));
-        lines.push(Line::from(Span::styled(
-            format!("\u{b7} {chrome_text}"),
-            chrome_style,
-        )));
+        let body_style = match kind {
+            crate::terminal::PromptHistoryKind::Prompt => prompt_style,
+            crate::terminal::PromptHistoryKind::Reply => reply_style,
+            crate::terminal::PromptHistoryKind::Recap => recap_style,
+        };
 
-        let body_lines: Vec<&str> = entry
-            .text
-            .lines()
-            .map(str::trim_end)
-            .skip_while(|line| line.is_empty())
-            .collect();
-        let mut body_lines = body_lines;
-        while body_lines.last().is_some_and(|line| line.is_empty()) {
-            body_lines.pop();
-        }
-        // Empty bodies contribute only the chrome line (matches
-        // `PromptHistoryEntry::rendered_line_count`).
-        for body in body_lines {
-            let truncated = truncate_label(body, width.saturating_sub(2));
-            let trimmed = truncated.trim_start();
-            // Heuristic re-styling: a recap body line starting with the
-            // `※ recap:` sentinel gets the prefix bolded so the structural
-            // marker reads as chrome; the summary itself stays accent.
-            if matches!(entry.kind, crate::terminal::PromptHistoryKind::Recap)
-                && trimmed.starts_with('\u{203b}')
-            {
-                let lead = truncated.len() - trimmed.len();
-                let (indent, rest) = truncated.split_at(lead);
-                let prefix_end = recap_sentinel_prefix_len(rest);
-                let (prefix, summary) = rest.split_at(prefix_end);
-                let bold = recap_style.add_modifier(Modifier::BOLD);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {indent}"), chrome_style),
-                    Span::styled(prefix.to_string(), bold),
-                    Span::styled(summary.to_string(), body_style),
-                ]));
-            } else if looks_like_xml_chrome(trimmed) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {truncated}"),
-                    xml_chrome_style,
-                )));
+        // A row carrying hits is painted as match spans, which supersedes the
+        // recap/markup styling below — while searching, where the hits are is
+        // the only thing being asked.
+        if let Some(query) = query.as_deref() {
+            // Hits invert against the panel surface; the current hit takes the
+            // warmer accent so it is findable among them at a glance.
+            let hit_style = Style::default().fg(bg_color).bg(palette.yellow);
+            let current_style = Style::default()
+                .fg(bg_color)
+                .bg(palette.peach)
+                .add_modifier(Modifier::BOLD);
+            let style = if Some(index + first_row) == current_row {
+                current_style
             } else {
-                lines.push(Line::from(Span::styled(
-                    format!("  {truncated}"),
-                    body_style,
-                )));
+                hit_style
+            };
+            if let Some(spans) = highlight_row(&row.text, query, body_style, style) {
+                lines.push(Line::from(spans));
+                continue;
             }
+        }
+        if row.kind == crate::ui::PromptRowKind::Chrome {
+            lines.push(Line::from(Span::styled(row.text.clone(), chrome_style)));
+            continue;
+        }
+
+        let trimmed = row.text.trim_start();
+        // Heuristic re-styling: a recap body line starting with the
+        // `※ recap:` sentinel gets the prefix bolded so the structural
+        // marker reads as chrome; the summary itself stays accent.
+        if matches!(kind, crate::terminal::PromptHistoryKind::Recap)
+            && trimmed.starts_with('\u{203b}')
+        {
+            let lead = row.text.len() - trimmed.len();
+            let (indent, rest) = row.text.split_at(lead);
+            let prefix_end = recap_sentinel_prefix_len(rest);
+            let (prefix, summary) = rest.split_at(prefix_end);
+            let bold = recap_style.add_modifier(Modifier::BOLD);
+            lines.push(Line::from(vec![
+                Span::styled(indent.to_string(), chrome_style),
+                Span::styled(prefix.to_string(), bold),
+                Span::styled(summary.to_string(), body_style),
+            ]));
+        } else if looks_like_xml_chrome(trimmed) {
+            lines.push(Line::from(Span::styled(row.text.clone(), xml_chrome_style)));
+        } else {
+            lines.push(Line::from(Span::styled(row.text.clone(), body_style)));
         }
     }
     lines
+}
+
+/// Split `text` into spans with every case-insensitive occurrence of `query`
+/// painted in `hit`. Returns `None` when the row holds no match, so the caller
+/// keeps its normal styling.
+///
+/// Matching is done on the row's own text rather than on the search's content
+/// offsets: rows are wrapped, so a content offset would have to be mapped back
+/// through the wrap to a column. The row text is what is on screen, and it is
+/// what the highlight has to line up with.
+fn highlight_row(text: &str, query: &str, base: Style, hit: Style) -> Option<Vec<Span<'static>>> {
+    if query.is_empty() {
+        return None;
+    }
+    let haystack = text.to_lowercase();
+    // Case folding that changes byte length would invalidate offsets into the
+    // original; skip highlighting rather than slice mid-character.
+    if haystack.len() != text.len() {
+        return None;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = haystack[cursor..].find(query) {
+        let at = cursor + found;
+        if at > cursor {
+            spans.push(Span::styled(text[cursor..at].to_string(), base));
+        }
+        let end = at + query.len();
+        spans.push(Span::styled(text[at..end].to_string(), hit));
+        cursor = end;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_string(), base));
+    }
+    Some(spans)
 }
 
 /// Concat span text in `line` into a plain-text row. Preserves char order.
@@ -789,15 +882,14 @@ pub(crate) fn extract_prompt_panel_selection(
     if selection.source != crate::selection::SelectionSource::PromptPanel {
         return None;
     }
-    let panel = prompt_history_panel_rect(app, info, Some(terminal))?;
-    let inner = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .inner(panel);
+    let (inner, panel_rows) = app.prompt_panel_rows(info)?;
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
 
-    let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+    // No search styling here: copy takes the row TEXT, which highlighting does
+    // not change, and passing it would only risk a different span split.
+    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows, None, 0);
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
     let max_offset = total_lines.saturating_sub(viewport);
@@ -1261,6 +1353,22 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    /// Lay out then paint, the way the renderer does — tests go through the
+    /// shared layout rather than a parallel line builder, or they would stop
+    /// testing what ships (#254).
+    fn rendered_prompt_lines(
+        terminal: &crate::terminal::TerminalState,
+        palette: Palette,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let rows = super::super::prompt_layout::layout_history(
+            &terminal.prompt_history,
+            width,
+            std::time::Instant::now(),
+        );
+        paint_prompt_history_rows(terminal, palette, &rows, None, 0)
     }
 
     #[test]
@@ -1759,7 +1867,7 @@ mod tests {
         app.workspaces = vec![ws];
 
         let terminal_ref = app.terminals.get(&terminal_id).unwrap();
-        let lines = build_prompt_history_lines(terminal_ref, app.palette.clone(), 40);
+        let lines = rendered_prompt_lines(terminal_ref, app.palette.clone(), 40);
         assert!(!lines.is_empty(), "recorded prompt should render lines");
 
         let mut saw_panel_bg = false;
@@ -1802,7 +1910,7 @@ mod tests {
             .expect("panel rect");
         let inner_h = panel.height.saturating_sub(2) as usize;
         let terminal_ref = app.terminals.get(&terminal_id).unwrap();
-        let rendered = build_prompt_history_lines(terminal_ref, app.palette.clone(), panel.width);
+        let rendered = rendered_prompt_lines(terminal_ref, app.palette.clone(), panel.width);
         // With scroll = 0 (pinned), the visible window is rendered.last(inner_h).
         let end = rendered.len();
         let start = end.saturating_sub(inner_h);
@@ -1870,7 +1978,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal, app.palette.clone(), inner.width);
         let end = rendered.len() as u16;
         let start = end.saturating_sub(inner.height);
         // Body line for the single entry is the last rendered row.
@@ -1893,7 +2001,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal, app.palette.clone(), inner.width);
         // We recorded two prompt entries: each entry contributes a chrome
         // header row + one body row. So rendered.len() == 4. Panel is pinned
         // to bottom (scroll=0), so the visible window's last row is the
@@ -1975,7 +2083,7 @@ mod tests {
         let inner = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .inner(panel);
-        let rendered = build_prompt_history_lines(terminal_ref, app.palette.clone(), inner.width);
+        let rendered = rendered_prompt_lines(terminal_ref, app.palette.clone(), inner.width);
         let end = rendered.len() as u16;
         let start = end.saturating_sub(inner.height);
         // The bottom rendered row is the tool-call marker line ("  ⚙ Edit").
