@@ -718,11 +718,8 @@ pub(super) fn render_prompt_history_panel(
     let gutter_x = panel.x + panel.width - 1;
     let buf = frame.buffer_mut();
     if inner.width >= 1 {
-        for (gutter_row, is_current) in match_gutter_marks(
-            &app.prompt_search,
-            terminal.prompt_history.len(),
-            inner.height,
-        ) {
+        for (gutter_row, is_current) in match_gutter_marks(&app.prompt_search, &rows, inner.height)
+        {
             let y = inner.y + gutter_row;
             // Not `│`: the gutter IS the border column, so a box-drawing glyph
             // would be indistinguishable from the border it overwrites.
@@ -819,34 +816,46 @@ fn render_prompt_filter_rows(
 }
 
 /// Gutter rows carrying a match, as `(row within the panel, is the current
-/// match)`, for `total_entries` turns shown through a `viewport`-high lane.
+/// match)`, for a laid-out history shown through a `viewport`-high lane.
 ///
-/// Positions are in ENTRY space, not rendered-row space: a match knows which
-/// turn it is in, and every turn wraps to a different number of rows, so
-/// dividing an entry index by a row count would mix units and scatter the
-/// marks. Turn position is also the honest resolution for a density cue.
+/// A match is placed at the first ROW of the turn it belongs to, scaled into
+/// the lane. Two regimes, because they want different things:
 ///
-/// Matches are positioned across the WHOLE history, not the visible window:
-/// the point of the lane is to show where hits sit in the conversation,
-/// including the ones scrolled away.
+/// * everything fits (`rows <= viewport`) — the mark sits on the turn's actual
+///   row, so it points AT the matching text rather than at a proportional
+///   position that lands on the blank space below it
+/// * it does not fit — marks scale into the lane as a density cue, showing
+///   where hits sit in the whole conversation including the scrolled-away
+///   ones, which is the thing the `3/17` count cannot say
 ///
-/// With more matches than gutter rows several matches quantise onto the same
-/// row, so a mark means "at least one match here", never a count — the count
-/// belongs in the border. The current match always wins its row, so stepping
-/// never loses track of where the reader is.
+/// With more matches than lane rows several quantise onto the same row, so a
+/// mark means "at least one match here", never a count — the count belongs in
+/// the border. The current match always wins its row, so stepping never loses
+/// track of where the reader is.
 fn match_gutter_marks(
     search: &crate::ui::PromptSearch,
-    total_entries: usize,
+    rows: &[crate::ui::PromptRow],
     viewport: u16,
 ) -> Vec<(u16, bool)> {
-    if search.is_empty() || search.matches.is_empty() || viewport == 0 || total_entries == 0 {
+    if search.is_empty() || search.matches.is_empty() || viewport == 0 || rows.is_empty() {
         return Vec::new();
     }
+    let total = rows.len();
+    let fits = total <= usize::from(viewport);
     let current = search.current();
     let mut marks: Vec<(u16, bool)> = Vec::new();
     for found in &search.matches {
-        let entry = found.entry.min(total_entries.saturating_sub(1));
-        let gutter_row = (entry * usize::from(viewport)) / total_entries.max(1);
+        // Rows are emitted in entry order, so the turn's first row is a
+        // partition point rather than a scan — a long history with many
+        // matches would otherwise be quadratic per frame.
+        let row = rows
+            .partition_point(|row| row.entry < found.entry)
+            .min(total.saturating_sub(1));
+        let gutter_row = if fits {
+            row
+        } else {
+            (row * usize::from(viewport)) / total.max(1)
+        };
         let gutter_row = u16::try_from(gutter_row)
             .unwrap_or(0)
             .min(viewport.saturating_sub(1));
@@ -1508,8 +1517,8 @@ mod tests {
             .collect()
     }
 
-    fn search_with(query: &str, entries: &[&str]) -> crate::ui::PromptSearch {
-        let history: Vec<crate::terminal::PromptHistoryEntry> = entries
+    fn history_of(entries: &[&str]) -> Vec<crate::terminal::PromptHistoryEntry> {
+        entries
             .iter()
             .map(|text| crate::terminal::PromptHistoryEntry {
                 kind: crate::terminal::PromptHistoryKind::Prompt,
@@ -1517,11 +1526,23 @@ mod tests {
                 recorded_at: std::time::Instant::now(),
                 wall_clock: None,
             })
-            .collect();
+            .collect()
+    }
+
+    fn search_with(query: &str, entries: &[&str]) -> crate::ui::PromptSearch {
         let mut search = crate::ui::PromptSearch::default();
-        search.query = query.to_string();
-        search.refresh(&history, 0);
+        search.set_query_for_test(query);
+        search.refresh(&history_of(entries), 0);
         search
+    }
+
+    /// Lay out a history the way the renderer does, for gutter positioning.
+    fn rows_of(entries: &[&str], width: u16) -> Vec<crate::ui::PromptRow> {
+        super::super::prompt_layout::layout_history(
+            &history_of(entries),
+            width,
+            std::time::Instant::now(),
+        )
     }
 
     /// The lane exists to show where hits sit in the WHOLE conversation, so a
@@ -1535,7 +1556,7 @@ mod tests {
         let search = search_with("needle", &entries);
         assert_eq!(search.matches.len(), 2);
 
-        let marks = match_gutter_marks(&search, entries.len(), 10);
+        let marks = match_gutter_marks(&search, &rows_of(&entries, 60), 10);
         assert_eq!(marks.len(), 2, "both hits get a mark, including off-screen");
         for (row, _) in &marks {
             assert!(*row < 10, "mark {row} escaped a 10-row lane");
@@ -1559,7 +1580,7 @@ mod tests {
         assert_eq!(search.current().map(|m| m.entry), Some(1));
 
         // A one-row lane forces all three onto the same row.
-        let marks = match_gutter_marks(&search, entries.len(), 1);
+        let marks = match_gutter_marks(&search, &rows_of(&entries, 60), 1);
         assert_eq!(
             marks,
             vec![(0, true)],
@@ -1577,19 +1598,22 @@ mod tests {
         // would land halfway up.
         let entries = ["filler", "filler", "filler", "the needle"];
         let search = search_with("needle", &entries);
+        // 4 turns × 2 rows each = 8 rows through a 4-row lane: the newest
+        // turn starts at row 6, which scales to lane row 3.
         assert_eq!(
-            match_gutter_marks(&search, entries.len(), 4),
+            match_gutter_marks(&search, &rows_of(&entries, 60), 4),
             vec![(3, true)],
-            "a hit in the newest of four turns belongs on the last lane row"
+            "a hit in the newest of four turns belongs at the end of the lane"
         );
     }
 
     #[test]
     fn no_query_means_no_gutter_marks() {
         let search = search_with("", &["nothing to find"]);
-        assert!(match_gutter_marks(&search, 1, 10).is_empty());
+        let rows = rows_of(&["nothing to find"], 60);
+        assert!(match_gutter_marks(&search, &rows, 10).is_empty());
         let missing = search_with("absent", &["nothing to find"]);
-        assert!(match_gutter_marks(&missing, 1, 10).is_empty());
+        assert!(match_gutter_marks(&missing, &rows, 10).is_empty());
     }
 
     /// Lay out then paint, the way the renderer does — tests go through the

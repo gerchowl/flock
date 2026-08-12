@@ -132,6 +132,14 @@ impl PromptSearch {
         self.filtered.get(self.filter_selected)
     }
 
+    /// Set the query directly. Tests in sibling modules cannot build the
+    /// struct literally — the staleness key is private — and going through the
+    /// per-character input path just to seed a query is noise.
+    #[cfg(test)]
+    pub(crate) fn set_query_for_test(&mut self, query: &str) {
+        self.query = query.to_string();
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.query.trim().is_empty()
     }
