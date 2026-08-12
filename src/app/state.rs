@@ -2079,6 +2079,9 @@ pub struct AppState {
     /// pane's rows; a miss falls back to laying out inline, so it is purely an
     /// optimisation and nothing depends on a render having happened.
     pub(crate) prompt_layout: crate::ui::PromptLayoutCache,
+    /// Search over the open panel's history (#254). Scoped to the whole
+    /// retained transcript, not the rendered window.
+    pub(crate) prompt_search: crate::ui::PromptSearch,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -2831,6 +2834,7 @@ impl AppState {
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
             prompt_layout: crate::ui::PromptLayoutCache::default(),
             prompt_history_anchor: None,
+            prompt_search: crate::ui::PromptSearch::default(),
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,

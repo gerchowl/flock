@@ -649,6 +649,7 @@ impl App {
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
             prompt_layout: crate::ui::PromptLayoutCache::default(),
             prompt_history_anchor: None,
+            prompt_search: crate::ui::PromptSearch::default(),
             sidebar_width_source,
             sidebar_width_auto: false,
             sidebar_collapsed: false,

@@ -604,11 +604,23 @@ pub(super) fn render_prompt_history_panel(
     // The detail label doubles as the discovery hint for Tab (#246): the
     // panel is opened often and cycled rarely, so naming what mode you are
     // in is more useful than teaching the shortcut in the border.
-    let title = format!(
-        " prompt history ({}) — {} ",
-        terminal.prompt_history.len(),
-        app.prompt_history_detail.label(),
-    );
+    // With a query standing, the border reports the search instead of the
+    // detail level: `3/17` vs `no matches` is the difference between "not in
+    // this conversation" and "not on screen", and a reader who just typed a
+    // query needs that answer more than the mode label (#254).
+    let title = if app.prompt_search.is_empty() {
+        format!(
+            " prompt history ({}) — {} ",
+            terminal.prompt_history.len(),
+            app.prompt_history_detail.label(),
+        )
+    } else {
+        format!(
+            " /{}  {} ",
+            app.prompt_search.query,
+            app.prompt_search.status(),
+        )
+    };
     let title_truncated = truncate_label(&title, panel.width.saturating_sub(2) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -627,7 +639,12 @@ pub(super) fn render_prompt_history_panel(
     let Some((_, rows)) = app.prompt_panel_rows(info) else {
         return;
     };
-    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &rows);
+    let rendered = paint_prompt_history_rows(
+        terminal,
+        app.palette.clone(),
+        &rows,
+        Some(&app.prompt_search),
+    );
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
 
@@ -693,7 +710,22 @@ fn paint_prompt_history_rows(
     terminal: &crate::terminal::TerminalState,
     palette: Palette,
     rows: &[crate::ui::PromptRow],
+    search: Option<&crate::ui::PromptSearch>,
 ) -> Vec<Line<'static>> {
+    // The row holding the current match, so it can be distinguished from the
+    // other hits — "which of the 17 am I on" is the question `n` asks.
+    let current_row = search
+        .and_then(|search| search.current())
+        .and_then(|found| {
+            rows.iter().rposition(|row| {
+                row.entry == found.entry
+                    && row.kind == crate::ui::PromptRowKind::Body
+                    && row.body_offset <= found.body_offset
+            })
+        });
+    let query = search
+        .filter(|search| !search.is_empty())
+        .map(|search| search.query.trim().to_lowercase());
     // Three glanceable tones: prompt = dim subtext (the user's input is
     // history, not signal), reply = cool blue (the agent's prose), recap =
     // warm mauve accent (the disciplined one-line summary, the signal).
@@ -711,7 +743,7 @@ fn paint_prompt_history_rows(
     let xml_chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         // A row's entry index comes from the same history this paints, but the
         // cache can outlive a mutation by one frame; skip rather than panic.
         let Some(kind) = terminal.prompt_history.get(row.entry).map(|e| e.kind) else {
@@ -722,6 +754,28 @@ fn paint_prompt_history_rows(
             crate::terminal::PromptHistoryKind::Reply => reply_style,
             crate::terminal::PromptHistoryKind::Recap => recap_style,
         };
+
+        // A row carrying hits is painted as match spans, which supersedes the
+        // recap/markup styling below — while searching, where the hits are is
+        // the only thing being asked.
+        if let Some(query) = query.as_deref() {
+            // Hits invert against the panel surface; the current hit takes the
+            // warmer accent so it is findable among them at a glance.
+            let hit_style = Style::default().fg(bg_color).bg(palette.yellow);
+            let current_style = Style::default()
+                .fg(bg_color)
+                .bg(palette.peach)
+                .add_modifier(Modifier::BOLD);
+            let style = if Some(index) == current_row {
+                current_style
+            } else {
+                hit_style
+            };
+            if let Some(spans) = highlight_row(&row.text, query, body_style, style) {
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
         if row.kind == crate::ui::PromptRowKind::Chrome {
             lines.push(Line::from(Span::styled(row.text.clone(), chrome_style)));
             continue;
@@ -753,6 +807,44 @@ fn paint_prompt_history_rows(
     lines
 }
 
+/// Split `text` into spans with every case-insensitive occurrence of `query`
+/// painted in `hit`. Returns `None` when the row holds no match, so the caller
+/// keeps its normal styling.
+///
+/// Matching is done on the row's own text rather than on the search's content
+/// offsets: rows are wrapped, so a content offset would have to be mapped back
+/// through the wrap to a column. The row text is what is on screen, and it is
+/// what the highlight has to line up with.
+fn highlight_row(text: &str, query: &str, base: Style, hit: Style) -> Option<Vec<Span<'static>>> {
+    if query.is_empty() {
+        return None;
+    }
+    let haystack = text.to_lowercase();
+    // Case folding that changes byte length would invalidate offsets into the
+    // original; skip highlighting rather than slice mid-character.
+    if haystack.len() != text.len() {
+        return None;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = haystack[cursor..].find(query) {
+        let at = cursor + found;
+        if at > cursor {
+            spans.push(Span::styled(text[cursor..at].to_string(), base));
+        }
+        let end = at + query.len();
+        spans.push(Span::styled(text[at..end].to_string(), hit));
+        cursor = end;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_string(), base));
+    }
+    Some(spans)
+}
+
 /// Concat span text in `line` into a plain-text row. Preserves char order.
 fn line_plain_text(line: &ratatui::text::Line<'_>) -> String {
     let mut out = String::new();
@@ -782,7 +874,9 @@ pub(crate) fn extract_prompt_panel_selection(
         return None;
     }
 
-    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows);
+    // No search styling here: copy takes the row TEXT, which highlighting does
+    // not change, and passing it would only risk a different span split.
+    let rendered = paint_prompt_history_rows(terminal, app.palette.clone(), &panel_rows, None);
     let total_lines = rendered.len() as u16;
     let viewport = inner.height;
     let max_offset = total_lines.saturating_sub(viewport);
@@ -1261,7 +1355,7 @@ mod tests {
             width,
             std::time::Instant::now(),
         );
-        paint_prompt_history_rows(terminal, palette, &rows)
+        paint_prompt_history_rows(terminal, palette, &rows, None)
     }
 
     #[test]

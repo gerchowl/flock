@@ -185,6 +185,32 @@ impl AppState {
         }
     }
 
+    /// Dismiss the panel when an overlay takes over the screen (#254).
+    ///
+    /// The panel floats over one pane and is scoped to it, so a navigator,
+    /// modal, settings sheet, or copy-mode overlay leaves it stranded on top of
+    /// content the user is no longer working with.
+    ///
+    /// Checked centrally rather than at each of the ~118 places `mode` is
+    /// assigned: a per-transition call would be missed by the next new overlay,
+    /// and this runs once per frame regardless.
+    ///
+    /// Deliberately NOT dismiss-on-type. Rereading history while composing the
+    /// next prompt is a primary workflow — the panel is a reading surface over
+    /// a pane that stays live — so typing keeps it open and Esc closes it.
+    pub(crate) fn close_prompt_history_for_overlay(&mut self) {
+        if self.expanded_prompt_pane.is_none() {
+            return;
+        }
+        // Terminal is the ordinary mode; Prefix is a transient chord that can
+        // itself toggle the panel, so neither counts as an overlay.
+        if matches!(self.mode, Mode::Terminal | Mode::Prefix) {
+            return;
+        }
+        self.close_prompt_search();
+        self.close_prompt_history_panel();
+    }
+
     /// Cycle the prompt-history panel's detail level to the next of
     /// [`TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
     /// target whose transcript the caller must re-read at the new level, or
@@ -274,6 +300,119 @@ impl AppState {
                 .and_then(|e| e.wall_clock),
         });
         self.prompt_history_anchor = anchor;
+    }
+
+    /// Open the panel's search line. No-op when the panel is closed.
+    pub(crate) fn open_prompt_search(&mut self) -> bool {
+        if self.expanded_prompt_pane.is_none() {
+            return false;
+        }
+        self.prompt_search.open();
+        self.refresh_prompt_search();
+        true
+    }
+
+    /// Close the search line, dropping matches and highlights.
+    pub(crate) fn close_prompt_search(&mut self) -> bool {
+        if !self.prompt_search.active {
+            return false;
+        }
+        self.prompt_search.close();
+        true
+    }
+
+    /// Edit the query, then re-run it over the whole retained history.
+    pub(crate) fn push_prompt_search_char(&mut self, ch: char) {
+        if !self.prompt_search.active {
+            return;
+        }
+        self.prompt_search.query.push(ch);
+        self.refresh_prompt_search();
+        self.jump_to_current_prompt_match();
+    }
+
+    pub(crate) fn pop_prompt_search_char(&mut self) {
+        if !self.prompt_search.active {
+            return;
+        }
+        self.prompt_search.query.pop();
+        self.refresh_prompt_search();
+        self.jump_to_current_prompt_match();
+    }
+
+    /// Re-run the current query over the open pane's history.
+    ///
+    /// Scoped to everything retained, not the rendered window: a search that
+    /// covered only what is on screen would report a miss for content that is
+    /// merely scrolled away (#254).
+    pub(crate) fn refresh_prompt_search(&mut self) {
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return;
+        };
+        let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
+            return;
+        };
+        let Some((history, generation)) = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .and_then(|ws| ws.pane_state(info.id))
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .map(|terminal| {
+                (
+                    terminal.prompt_history.clone(),
+                    terminal.prompt_history_generation(),
+                )
+            })
+        else {
+            return;
+        };
+        self.prompt_search.refresh(&history, generation);
+    }
+
+    /// Re-run the query only when the history moved under it, so a standing
+    /// search survives new turns without costing a full scan per frame.
+    pub(crate) fn sync_prompt_search(&mut self, generation: u64) {
+        if !self.prompt_search.is_stale(generation) {
+            return;
+        }
+        self.refresh_prompt_search();
+    }
+
+    /// Step to the next/previous match and scroll it into view.
+    pub(crate) fn step_prompt_search(&mut self, forward: bool) -> bool {
+        if self.prompt_search.step(forward).is_none() {
+            return false;
+        }
+        self.jump_to_current_prompt_match();
+        true
+    }
+
+    /// Park the viewport on the current match.
+    ///
+    /// Reuses the scroll anchor rather than computing a row offset directly:
+    /// the match is in content coordinates, so it survives the re-wrap that a
+    /// resize triggers, and resolution is the one place row offsets are
+    /// derived (#254).
+    pub(crate) fn jump_to_current_prompt_match(&mut self) {
+        let Some(found) = self.prompt_search.current() else {
+            return;
+        };
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return;
+        };
+        let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
+            return;
+        };
+        let at = self
+            .prompt_panel_history(&info)
+            .and_then(|history| history.get(found.entry))
+            .and_then(|entry| entry.wall_clock);
+        self.prompt_history_anchor = Some(PromptHistoryAnchor {
+            entry: found.entry,
+            body_offset: found.body_offset,
+            at,
+        });
+        self.resolve_prompt_history_anchor();
     }
 
     /// The history ring behind the open panel over `info`.
@@ -7227,6 +7366,81 @@ mod tests {
         );
     }
 
+    /// The point of the feature: a term that appears only in the oldest turn
+    /// of a long session must be findable and reachable. Under the old
+    /// 1000-rendered-line cap this content was not merely off-screen, it had
+    /// been dropped from memory entirely.
+    #[test]
+    fn search_reaches_the_oldest_turn_of_a_long_session() {
+        let (mut state, pane) = state_with_open_panel(300, 60);
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        // Put a unique term in the very first turn, then bury it.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .prompt_history[0]
+            .text = "the xyzzy incantation".into();
+
+        state.open_prompt_search();
+        for ch in "xyzzy".chars() {
+            state.push_prompt_search_char(ch);
+        }
+
+        assert_eq!(state.prompt_search.matches.len(), 1, "must find the hit");
+        assert_eq!(state.prompt_search.matches[0].entry, 0);
+        assert_eq!(state.prompt_search.status(), "1/1");
+
+        // And the viewport must actually be parked on it, not merely aware.
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+        let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+        let end = rows
+            .len()
+            .saturating_sub(state.prompt_history_scroll as usize);
+        let top = end.saturating_sub(inner.height as usize);
+        let visible = &rows[top..end.min(rows.len())];
+        assert!(
+            visible.iter().any(|row| row.text.contains("xyzzy")),
+            "jumping to a match must bring it on screen"
+        );
+    }
+
+    /// A miss has to be distinguishable from "scrolled away", or the reader
+    /// concludes the conversation never contained the term.
+    #[test]
+    fn a_query_with_no_hits_says_so() {
+        let (mut state, _pane) = state_with_open_panel(20, 60);
+        state.open_prompt_search();
+        for ch in "definitely-absent".chars() {
+            state.push_prompt_search_char(ch);
+        }
+        assert!(state.prompt_search.matches.is_empty());
+        assert_eq!(state.prompt_search.status(), "no matches");
+    }
+
+    /// Closing search must not also close the panel, and must drop highlights.
+    #[test]
+    fn closing_search_leaves_the_panel_open() {
+        let (mut state, pane) = state_with_open_panel(10, 60);
+        state.open_prompt_search();
+        for ch in "entry".chars() {
+            state.push_prompt_search_char(ch);
+        }
+        assert!(!state.prompt_search.matches.is_empty());
+
+        assert!(state.close_prompt_search());
+        assert!(state.prompt_search.matches.is_empty(), "highlights dropped");
+        assert_eq!(
+            state.expanded_prompt_pane,
+            Some(pane),
+            "closing the search must not close the panel underneath it"
+        );
+    }
+
     /// Pinned-to-latest is a state, not an anchor on the newest entry: new
     /// turns must keep the view at the bottom.
     #[test]
@@ -7244,6 +7458,34 @@ mod tests {
             state.prompt_history_anchor, None,
             "back at the bottom means pinned-to-latest, not anchored on the last turn"
         );
+    }
+
+    /// #254: an overlay taking the screen strands the panel over a pane the
+    /// user is no longer working with. Typing must NOT dismiss it, though —
+    /// rereading history while composing the next prompt is the workflow the
+    /// panel exists for.
+    #[test]
+    fn overlays_dismiss_the_panel_but_ordinary_typing_does_not() {
+        let (mut state, pane) = state_with_open_panel(10, 60);
+
+        // Ordinary terminal mode: the panel stays, search included.
+        state.open_prompt_search();
+        state.mode = Mode::Terminal;
+        state.close_prompt_history_for_overlay();
+        assert_eq!(state.expanded_prompt_pane, Some(pane));
+        assert!(state.prompt_search.active);
+
+        // A prefix chord can itself toggle the panel, so it is not an overlay.
+        state.mode = Mode::Prefix;
+        state.close_prompt_history_for_overlay();
+        assert_eq!(state.expanded_prompt_pane, Some(pane));
+
+        // Any real overlay dismisses both the search and the panel.
+        state.mode = Mode::Navigator;
+        state.close_prompt_history_for_overlay();
+        assert_eq!(state.expanded_prompt_pane, None);
+        assert!(!state.prompt_search.active);
+        assert!(state.prompt_search.matches.is_empty());
     }
 
     /// #246: without close-on-blur the panel lingers on a background pane

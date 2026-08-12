@@ -54,7 +54,12 @@ impl App {
     /// `handle_pane_mouse_only`; this is the keyboard twin. Returns true
     /// when the key was consumed by the panel.
     fn handle_prompt_history_panel_key(&mut self, key: TerminalKey) -> bool {
-        if !key.modifiers.is_empty() {
+        // Shift is part of ordinary typing (capitals into the search query), so
+        // it must not disqualify a key the way Ctrl/Alt do. Ctrl is allowed
+        // through for the search opener alone, checked below.
+        let bare = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        if !bare && !ctrl {
             return false;
         }
         let Some(expanded) = self.state.expanded_prompt_pane else {
@@ -74,6 +79,44 @@ impl App {
         let Some(info) = self.state.pane_info_by_id(expanded).cloned() else {
             return false;
         };
+        // Search is modal, and deliberately so. The panel floats over a pane
+        // that stays interactive — rereading history while composing the next
+        // prompt is a primary workflow — so search must not claim printable
+        // keys like `/` or `n` the way a full-screen pager can. While the
+        // query line is open it owns typing; while it is closed every
+        // printable key still reaches the agent.
+        if self.state.prompt_search.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.close_prompt_search();
+                }
+                KeyCode::Char(ch) => {
+                    self.state.push_prompt_search_char(ch);
+                }
+                KeyCode::Backspace => {
+                    self.state.pop_prompt_search_char();
+                }
+                // Enter and Down step forward, Up steps back — navigation
+                // without leaving the query line, so refining and stepping are
+                // the same gesture.
+                KeyCode::Enter | KeyCode::Down => {
+                    self.state.step_prompt_search(true);
+                }
+                KeyCode::Up => {
+                    self.state.step_prompt_search(false);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        // ctrl+f: a chord, not a printable key, so it cannot collide with
+        // typing into the pane underneath.
+        if ctrl && matches!(key.code, KeyCode::Char('f')) {
+            return self.state.open_prompt_search();
+        }
+        if ctrl {
+            return false;
+        }
         let max_offset = self.state.prompt_history_max_offset_for(&info);
         let viewport = self
             .state
@@ -82,8 +125,14 @@ impl App {
             .unwrap_or(0)
             .max(1);
         match key.code {
+            // Esc unwinds one layer at a time: a standing search first (its
+            // highlights are still on screen), then the panel.
             KeyCode::Esc => {
-                self.state.close_prompt_history_panel();
+                if !self.state.prompt_search.is_empty() {
+                    self.state.close_prompt_search();
+                } else {
+                    self.state.close_prompt_history_panel();
+                }
                 true
             }
             KeyCode::PageUp => {

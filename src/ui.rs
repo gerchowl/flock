@@ -16,6 +16,7 @@ mod navigator;
 mod onboarding;
 mod panes;
 mod prompt_layout;
+mod prompt_search;
 mod release_notes;
 pub(crate) mod screensaver;
 mod scrollbar;
@@ -50,6 +51,7 @@ use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::panes::{extract_prompt_panel_selection, prompt_history_panel_rect};
 pub(crate) use self::prompt_layout::{PromptLayoutCache, PromptRow, PromptRowKind};
+pub(crate) use self::prompt_search::PromptSearch;
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -192,6 +194,9 @@ fn resize_background_tab_panes_to_terminal_area(
 /// per frame, and only one panel can be open at a time, so this is at most one
 /// pane's layout per change — not per visible pane, and not per frame.
 fn refresh_prompt_layout(app: &mut AppState) {
+    // An overlay took the screen: the panel is scoped to one pane and would be
+    // left stranded over content the user is no longer working with (#254).
+    app.close_prompt_history_for_overlay();
     let Some(pane_id) = app.expanded_prompt_pane else {
         app.prompt_layout.clear();
         return;
@@ -222,10 +227,11 @@ fn refresh_prompt_layout(app: &mut AppState) {
         prompt_layout.clear();
         return;
     };
+    let generation = terminal.prompt_history_generation();
     prompt_layout.refresh(
         pane_id,
         inner.width,
-        terminal.prompt_history_generation(),
+        generation,
         &terminal.prompt_history,
         std::time::Instant::now(),
     );
@@ -233,6 +239,8 @@ fn refresh_prompt_layout(app: &mut AppState) {
     // different number of them — so re-derive the scroll offset from what the
     // reader was parked on rather than leaving a stale row count (#254).
     app.resolve_prompt_history_anchor();
+    // Matches address entry indices, so new turns invalidate them.
+    app.sync_prompt_search(generation);
 }
 
 fn compute_view_internal(
