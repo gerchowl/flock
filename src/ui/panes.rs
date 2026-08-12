@@ -680,6 +680,12 @@ pub(super) fn render_prompt_history_panel(
     }
 }
 
+/// Paint the laid-out rows for `terminal`'s history at `width`.
+///
+/// Row identity — which rows exist, and what text each holds — comes from
+/// [`crate::ui::prompt_layout`], shared with scroll bounds and copy so the
+/// three cannot disagree (#254). This function only chooses colours, and must
+/// never change a row's length: copy slices these strings by column.
 fn build_prompt_history_lines(
     terminal: &crate::terminal::TerminalState,
     palette: Palette,
@@ -701,65 +707,42 @@ fn build_prompt_history_lines(
     // dim it so chrome reads as chrome. Defense-in-depth — the hook also
     // filters task-notification blocks at the source.
     let xml_chrome_style = Style::default().fg(palette.overlay0).bg(bg_color);
-    let width = width as usize;
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for entry in &terminal.prompt_history {
-        let age = entry.relative_age(now);
-        let (kind_label, body_style) = match entry.kind {
-            crate::terminal::PromptHistoryKind::Prompt => ("prompt", prompt_style),
-            crate::terminal::PromptHistoryKind::Reply => ("reply", reply_style),
-            crate::terminal::PromptHistoryKind::Recap => ("recap", recap_style),
+    let rows = crate::ui::prompt_layout::layout_history(&terminal.prompt_history, width, now);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind = terminal.prompt_history[row.entry].kind;
+        let body_style = match kind {
+            crate::terminal::PromptHistoryKind::Prompt => prompt_style,
+            crate::terminal::PromptHistoryKind::Reply => reply_style,
+            crate::terminal::PromptHistoryKind::Recap => recap_style,
         };
-        let chrome_text = format!("{kind_label} \u{b7} {age}");
-        let chrome_text = truncate_label(&chrome_text, width.saturating_sub(2));
-        lines.push(Line::from(Span::styled(
-            format!("\u{b7} {chrome_text}"),
-            chrome_style,
-        )));
-
-        let body_lines: Vec<&str> = entry
-            .text
-            .lines()
-            .map(str::trim_end)
-            .skip_while(|line| line.is_empty())
-            .collect();
-        let mut body_lines = body_lines;
-        while body_lines.last().is_some_and(|line| line.is_empty()) {
-            body_lines.pop();
+        if row.kind == crate::ui::prompt_layout::PromptRowKind::Chrome {
+            lines.push(Line::from(Span::styled(row.text, chrome_style)));
+            continue;
         }
-        // Empty bodies contribute only the chrome line (matches
-        // `PromptHistoryEntry::rendered_line_count`).
-        for body in body_lines {
-            let truncated = truncate_label(body, width.saturating_sub(2));
-            let trimmed = truncated.trim_start();
-            // Heuristic re-styling: a recap body line starting with the
-            // `※ recap:` sentinel gets the prefix bolded so the structural
-            // marker reads as chrome; the summary itself stays accent.
-            if matches!(entry.kind, crate::terminal::PromptHistoryKind::Recap)
-                && trimmed.starts_with('\u{203b}')
-            {
-                let lead = truncated.len() - trimmed.len();
-                let (indent, rest) = truncated.split_at(lead);
-                let prefix_end = recap_sentinel_prefix_len(rest);
-                let (prefix, summary) = rest.split_at(prefix_end);
-                let bold = recap_style.add_modifier(Modifier::BOLD);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {indent}"), chrome_style),
-                    Span::styled(prefix.to_string(), bold),
-                    Span::styled(summary.to_string(), body_style),
-                ]));
-            } else if looks_like_xml_chrome(trimmed) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {truncated}"),
-                    xml_chrome_style,
-                )));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    format!("  {truncated}"),
-                    body_style,
-                )));
-            }
+
+        let trimmed = row.text.trim_start();
+        // Heuristic re-styling: a recap body line starting with the
+        // `※ recap:` sentinel gets the prefix bolded so the structural
+        // marker reads as chrome; the summary itself stays accent.
+        if matches!(kind, crate::terminal::PromptHistoryKind::Recap)
+            && trimmed.starts_with('\u{203b}')
+        {
+            let lead = row.text.len() - trimmed.len();
+            let (indent, rest) = row.text.split_at(lead);
+            let prefix_end = recap_sentinel_prefix_len(rest);
+            let (prefix, summary) = rest.split_at(prefix_end);
+            let bold = recap_style.add_modifier(Modifier::BOLD);
+            lines.push(Line::from(vec![
+                Span::styled(indent.to_string(), chrome_style),
+                Span::styled(prefix.to_string(), bold),
+                Span::styled(summary.to_string(), body_style),
+            ]));
+        } else if looks_like_xml_chrome(trimmed) {
+            lines.push(Line::from(Span::styled(row.text, xml_chrome_style)));
+        } else {
+            lines.push(Line::from(Span::styled(row.text, body_style)));
         }
     }
     lines

@@ -15,6 +15,7 @@ mod mobile;
 mod navigator;
 mod onboarding;
 mod panes;
+mod prompt_layout;
 mod release_notes;
 pub(crate) mod screensaver;
 mod scrollbar;
@@ -48,6 +49,7 @@ pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::panes::{extract_prompt_panel_selection, prompt_history_panel_rect};
+pub(crate) use self::prompt_layout::layout_row_count as prompt_layout_row_count;
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,

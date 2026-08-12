@@ -265,6 +265,11 @@ impl AppState {
     /// Maximum scroll offset (lines from bottom) for the prompt-history panel
     /// over `info`: `total_rendered_lines - viewport`. Zero when everything
     /// fits.
+    ///
+    /// The row count comes from the shared layout (#254), not from summing
+    /// `rendered_line_count`. Those agreed only while truncation kept one row
+    /// per logical line; once rows are wrapped, a width-independent count
+    /// would let the panel scroll past its own content.
     pub(crate) fn prompt_history_max_offset_for(&self, info: &crate::layout::PaneInfo) -> u16 {
         let Some(panel) = self.prompt_history_panel_rect_for(info) else {
             return 0;
@@ -278,13 +283,14 @@ impl AppState {
         else {
             return 0;
         };
-        let total: usize = terminal
-            .prompt_history
-            .iter()
-            .map(crate::terminal::PromptHistoryEntry::rendered_line_count)
-            .sum();
-        // Viewport = panel inner height = panel.height - 2 (borders).
+        // Inner width/height = panel minus its borders on both axes.
+        let inner_width = panel.width.saturating_sub(2);
         let viewport = panel.height.saturating_sub(2) as usize;
+        let total = crate::ui::prompt_layout_row_count(
+            &terminal.prompt_history,
+            inner_width,
+            std::time::Instant::now(),
+        );
         total
             .saturating_sub(viewport)
             .try_into()
