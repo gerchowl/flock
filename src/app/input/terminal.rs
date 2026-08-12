@@ -86,7 +86,13 @@ impl App {
         // query line is open it owns typing; while it is closed every
         // printable key still reaches the agent.
         if self.state.prompt_search.active {
+            let filtering = self.state.prompt_search.is_filtering();
             match key.code {
+                // ctrl+f flips Find ↔ Filter, carrying the query (#258).
+                // Checked before the `Char` arms so it never becomes text.
+                KeyCode::Char('f') if ctrl => {
+                    self.state.toggle_prompt_search_surface();
+                }
                 KeyCode::Esc => {
                     self.state.close_prompt_search();
                 }
@@ -104,9 +110,18 @@ impl App {
                 KeyCode::Backspace => {
                     self.state.pop_prompt_search_char();
                 }
-                // Enter and Down step forward, Up steps back — navigation
-                // without leaving the query line, so refining and stepping are
-                // the same gesture.
+                // On Filter, Enter TAKES the highlighted turn — the list exists
+                // to be picked from. On Find there is nothing to take, so Enter
+                // steps, keeping refine-and-step one gesture.
+                KeyCode::Enter if filtering => {
+                    self.state.take_prompt_filter_selection();
+                }
+                KeyCode::Down if filtering => {
+                    self.state.step_prompt_filter(true);
+                }
+                KeyCode::Up if filtering => {
+                    self.state.step_prompt_filter(false);
+                }
                 KeyCode::Enter | KeyCode::Down => {
                     self.state.step_prompt_search(true);
                 }

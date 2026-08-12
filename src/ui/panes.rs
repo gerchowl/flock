@@ -608,7 +608,19 @@ pub(super) fn render_prompt_history_panel(
     // detail level: `3/17` vs `no matches` is the difference between "not in
     // this conversation" and "not on screen", and a reader who just typed a
     // query needs that answer more than the mode label (#254).
-    let title = if app.prompt_search.is_empty() {
+    let title = if app.prompt_search.is_filtering() {
+        // The Filter surface names its own gesture: a list you cannot tell is
+        // pickable is just a worse version of the flow (#258).
+        format!(
+            " filter: {}  {} turns · enter to jump ",
+            if app.prompt_search.query.is_empty() {
+                "(all)"
+            } else {
+                app.prompt_search.query.as_str()
+            },
+            app.prompt_search.filtered.len(),
+        )
+    } else if app.prompt_search.is_empty() {
         // The detail label doubles as the Tab hint; `ctrl+f` is named outright
         // because search has no other affordance — nothing on screen suggests
         // the panel is searchable at all until you know it is.
@@ -619,7 +631,7 @@ pub(super) fn render_prompt_history_panel(
         )
     } else {
         format!(
-            " /{}  {} ",
+            " /{}  {} · ctrl+f to filter ",
             app.prompt_search.query,
             app.prompt_search.status(),
         )
@@ -633,6 +645,14 @@ pub(super) fn render_prompt_history_panel(
     frame.render_widget(block, panel);
 
     if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // The Filter surface replaces the flow with its results (#258): the reader
+    // is choosing a turn, not reading one, so showing the conversation behind a
+    // list they are picking from would only compete for the same rows.
+    if app.prompt_search.is_filtering() {
+        render_prompt_filter_rows(app, frame, inner, bg_color);
         return;
     }
 
@@ -691,21 +711,163 @@ pub(super) fn render_prompt_history_panel(
         );
     }
 
+    // Match markers down the gutter (#258): `3/17` reports a count, this
+    // reports the SHAPE — whether the hits cluster in one recent turn or run
+    // through the whole session — and makes off-screen matches visible rather
+    // than merely counted.
+    let gutter_x = panel.x + panel.width - 1;
+    let buf = frame.buffer_mut();
+    if inner.width >= 1 {
+        for (gutter_row, is_current) in match_gutter_marks(&app.prompt_search, &rows, inner.height)
+        {
+            let y = inner.y + gutter_row;
+            // Not `│`: the gutter IS the border column, so a box-drawing glyph
+            // would be indistinguishable from the border it overwrites.
+            buf[(gutter_x, y)].set_symbol(if is_current { "\u{25c6}" } else { "\u{25aa}" });
+            buf[(gutter_x, y)].set_style(
+                Style::default()
+                    .fg(if is_current { p.peach } else { p.yellow })
+                    .bg(bg_color),
+            );
+        }
+    }
+
     // Subtle scroll indicators when there is more content above or below.
+    // Drawn AFTER the match marks and in the same column, so at the two rows
+    // where they collide "there is more this way" wins — losing it would strand
+    // the reader with no cue that the panel scrolls at all.
     let has_above = offset < max_offset;
     let has_below = offset > 0;
     let marker_style = Style::default().fg(p.overlay0).bg(bg_color);
-    let buf = frame.buffer_mut();
     if has_above && inner.width >= 1 {
         let top_y = inner.y;
-        buf[(panel.x + panel.width - 1, top_y)].set_symbol("\u{25b4}");
-        buf[(panel.x + panel.width - 1, top_y)].set_style(marker_style);
+        buf[(gutter_x, top_y)].set_symbol("\u{25b4}");
+        buf[(gutter_x, top_y)].set_style(marker_style);
     }
     if has_below && inner.width >= 1 {
         let bot_y = inner.y + inner.height - 1;
-        buf[(panel.x + panel.width - 1, bot_y)].set_symbol("\u{25be}");
-        buf[(panel.x + panel.width - 1, bot_y)].set_style(marker_style);
+        buf[(gutter_x, bot_y)].set_symbol("\u{25be}");
+        buf[(gutter_x, bot_y)].set_style(marker_style);
     }
+}
+
+/// Render the Filter surface: one row per matching turn, newest first, with the
+/// selection highlighted (#258).
+///
+/// Scrolls to keep the selection visible rather than carrying its own scroll
+/// state — the list is transient and driven entirely by Up/Down, so a second
+/// scroll position to maintain (and invalidate) would be state without a job.
+fn render_prompt_filter_rows(
+    app: &AppState,
+    frame: &mut Frame,
+    inner: ratatui::layout::Rect,
+    bg_color: Color,
+) {
+    let p = &app.palette;
+    let rows = &app.prompt_search.filtered;
+    let viewport = inner.height as usize;
+    if viewport == 0 || inner.width == 0 {
+        return;
+    }
+
+    if rows.is_empty() {
+        let buf = frame.buffer_mut();
+        buf.set_stringn(
+            inner.x,
+            inner.y,
+            "  no turns match",
+            inner.width as usize,
+            Style::default().fg(p.overlay0).bg(bg_color),
+        );
+        return;
+    }
+
+    // Window the list so the selection is always on screen.
+    let selected = app.prompt_search.filter_selected.min(rows.len() - 1);
+    let start = selected.saturating_sub(viewport.saturating_sub(1));
+    let end = (start + viewport).min(rows.len());
+
+    let buf = frame.buffer_mut();
+    for (offset, hit) in rows[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let style = if is_selected {
+            Style::default()
+                .fg(p.text)
+                .bg(p.surface1)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0).bg(bg_color)
+        };
+        let marker = if is_selected { "\u{276f} " } else { "  " };
+        let text = format!("{marker}{}", hit.summary);
+        let text = crate::ui::prompt_layout::truncate_to_cols(&text, inner.width as usize);
+        // Pad so the selection highlight spans the full row rather than
+        // stopping at the end of a short summary.
+        let padded = format!("{text:<width$}", width = inner.width as usize);
+        buf.set_stringn(
+            inner.x,
+            inner.y + offset as u16,
+            padded,
+            inner.width as usize,
+            style,
+        );
+    }
+}
+
+/// Gutter rows carrying a match, as `(row within the panel, is the current
+/// match)`, for a laid-out history shown through a `viewport`-high lane.
+///
+/// A match is placed at the first ROW of the turn it belongs to, scaled into
+/// the lane. Two regimes, because they want different things:
+///
+/// * everything fits (`rows <= viewport`) — the mark sits on the turn's actual
+///   row, so it points AT the matching text rather than at a proportional
+///   position that lands on the blank space below it
+/// * it does not fit — marks scale into the lane as a density cue, showing
+///   where hits sit in the whole conversation including the scrolled-away
+///   ones, which is the thing the `3/17` count cannot say
+///
+/// With more matches than lane rows several quantise onto the same row, so a
+/// mark means "at least one match here", never a count — the count belongs in
+/// the border. The current match always wins its row, so stepping never loses
+/// track of where the reader is.
+fn match_gutter_marks(
+    search: &crate::ui::PromptSearch,
+    rows: &[crate::ui::PromptRow],
+    viewport: u16,
+) -> Vec<(u16, bool)> {
+    if search.is_empty() || search.matches.is_empty() || viewport == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+    let total = rows.len();
+    let fits = total <= usize::from(viewport);
+    let current = search.current();
+    let mut marks: Vec<(u16, bool)> = Vec::new();
+    for found in &search.matches {
+        // Rows are emitted in entry order, so the turn's first row is a
+        // partition point rather than a scan — a long history with many
+        // matches would otherwise be quadratic per frame.
+        let row = rows
+            .partition_point(|row| row.entry < found.entry)
+            .min(total.saturating_sub(1));
+        let gutter_row = if fits {
+            row
+        } else {
+            (row * usize::from(viewport)) / total.max(1)
+        };
+        let gutter_row = u16::try_from(gutter_row)
+            .unwrap_or(0)
+            .min(viewport.saturating_sub(1));
+        let is_current =
+            current.is_some_and(|c| c.entry == found.entry && c.body_offset == found.body_offset);
+        match marks.iter_mut().find(|(row, _)| *row == gutter_row) {
+            // The current match wins a shared row.
+            Some(existing) => existing.1 |= is_current,
+            None => marks.push((gutter_row, is_current)),
+        }
+    }
+    marks
 }
 
 /// Paint already-laid-out rows.
@@ -1353,6 +1515,105 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    fn history_of(entries: &[&str]) -> Vec<crate::terminal::PromptHistoryEntry> {
+        entries
+            .iter()
+            .map(|text| crate::terminal::PromptHistoryEntry {
+                kind: crate::terminal::PromptHistoryKind::Prompt,
+                text: (*text).to_string(),
+                recorded_at: std::time::Instant::now(),
+                wall_clock: None,
+            })
+            .collect()
+    }
+
+    fn search_with(query: &str, entries: &[&str]) -> crate::ui::PromptSearch {
+        let mut search = crate::ui::PromptSearch::default();
+        search.set_query_for_test(query);
+        search.refresh(&history_of(entries), 0);
+        search
+    }
+
+    /// Lay out a history the way the renderer does, for gutter positioning.
+    fn rows_of(entries: &[&str], width: u16) -> Vec<crate::ui::PromptRow> {
+        super::super::prompt_layout::layout_history(
+            &history_of(entries),
+            width,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// The lane exists to show where hits sit in the WHOLE conversation, so a
+    /// match scrolled far out of view must still put a mark on it.
+    #[test]
+    fn gutter_marks_cover_offscreen_matches_and_stay_in_the_lane() {
+        // 100 entries, a hit in the first and the last; only 10 rows of gutter.
+        let mut entries = vec!["needle at the very start"];
+        entries.extend(std::iter::repeat_n("filler", 98));
+        entries.push("needle at the very end");
+        let search = search_with("needle", &entries);
+        assert_eq!(search.matches.len(), 2);
+
+        let marks = match_gutter_marks(&search, &rows_of(&entries, 60), 10);
+        assert_eq!(marks.len(), 2, "both hits get a mark, including off-screen");
+        for (row, _) in &marks {
+            assert!(*row < 10, "mark {row} escaped a 10-row lane");
+        }
+        let rows: Vec<u16> = marks.iter().map(|(row, _)| *row).collect();
+        assert!(
+            rows.contains(&0) && rows.contains(&9),
+            "a hit at each end of the history must mark each end of the lane, got {rows:?}"
+        );
+    }
+
+    /// Several matches quantise onto one row when the lane is short. The
+    /// current match must still be distinguishable, or stepping loses the
+    /// reader's position.
+    #[test]
+    fn the_current_match_wins_a_shared_gutter_row() {
+        let entries = ["needle one", "needle two", "needle three"];
+        let mut search = search_with("needle", &entries);
+        // Newest first, so stepping once lands on the middle entry.
+        search.step(true);
+        assert_eq!(search.current().map(|m| m.entry), Some(1));
+
+        // A one-row lane forces all three onto the same row.
+        let marks = match_gutter_marks(&search, &rows_of(&entries, 60), 1);
+        assert_eq!(
+            marks,
+            vec![(0, true)],
+            "the shared row must read as current"
+        );
+    }
+
+    /// Marks are positioned in ENTRY space. Feeding a rendered-ROW count would
+    /// mix units — every turn wraps to several rows — and scatter the marks
+    /// away from the turns they belong to.
+    #[test]
+    fn gutter_marks_are_positioned_by_turn_not_by_rendered_row() {
+        // 4 turns, a hit only in the last. In a 4-row lane it must land on the
+        // last row; if a row count (say 8 rendered rows) were used instead, it
+        // would land halfway up.
+        let entries = ["filler", "filler", "filler", "the needle"];
+        let search = search_with("needle", &entries);
+        // 4 turns × 2 rows each = 8 rows through a 4-row lane: the newest
+        // turn starts at row 6, which scales to lane row 3.
+        assert_eq!(
+            match_gutter_marks(&search, &rows_of(&entries, 60), 4),
+            vec![(3, true)],
+            "a hit in the newest of four turns belongs at the end of the lane"
+        );
+    }
+
+    #[test]
+    fn no_query_means_no_gutter_marks() {
+        let search = search_with("", &["nothing to find"]);
+        let rows = rows_of(&["nothing to find"], 60);
+        assert!(match_gutter_marks(&search, &rows, 10).is_empty());
+        let missing = search_with("absent", &["nothing to find"]);
+        assert!(match_gutter_marks(&missing, &rows, 10).is_empty());
     }
 
     /// Lay out then paint, the way the renderer does — tests go through the
