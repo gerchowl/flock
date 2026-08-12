@@ -191,16 +191,16 @@ fn resize_background_tab_panes_to_terminal_area(
 /// before drawing. Wrapping a whole transcript is far too expensive to repeat
 /// per frame, and only one panel can be open at a time, so this is at most one
 /// pane's layout per change — not per visible pane, and not per frame.
-fn refresh_prompt_layout(app: &mut AppState, pane_infos: &[crate::layout::PaneInfo]) {
+fn refresh_prompt_layout(app: &mut AppState) {
     let Some(pane_id) = app.expanded_prompt_pane else {
         app.prompt_layout.clear();
         return;
     };
-    let Some(info) = pane_infos.iter().find(|info| info.id == pane_id) else {
+    let Some(info) = app.pane_info_by_id(pane_id).cloned() else {
         app.prompt_layout.clear();
         return;
     };
-    let Some(inner) = app.prompt_history_panel_inner_rect_for(info) else {
+    let Some(inner) = app.prompt_history_panel_inner_rect_for(&info) else {
         app.prompt_layout.clear();
         return;
     };
@@ -229,6 +229,10 @@ fn refresh_prompt_layout(app: &mut AppState, pane_infos: &[crate::layout::PaneIn
         &terminal.prompt_history,
         std::time::Instant::now(),
     );
+    // The rows just changed shape — a resize re-wraps the same content into a
+    // different number of them — so re-derive the scroll offset from what the
+    // reader was parked on rather than leaving a stale row count (#254).
+    app.resolve_prompt_history_anchor();
 }
 
 fn compute_view_internal(
@@ -348,8 +352,6 @@ fn compute_view_internal(
         resize_float_runtime(app, terminal_runtimes, terminal_area, cell_size);
     }
 
-    refresh_prompt_layout(app, &pane_infos);
-
     let banner_lines = app
         .config_diagnostic
         .as_deref()
@@ -391,6 +393,10 @@ fn compute_view_internal(
         pane_infos,
         split_borders,
     };
+
+    // After the view lands: pane geometry is now current, so the panel's
+    // rows can be re-wrapped at the width they will actually render at (#254).
+    refresh_prompt_layout(app);
 }
 
 fn compute_mobile_view(
@@ -473,6 +479,10 @@ fn compute_mobile_view(
         pane_infos,
         split_borders,
     };
+
+    // After the view lands: pane geometry is now current, so the panel's
+    // rows can be re-wrapped at the width they will actually render at (#254).
+    refresh_prompt_layout(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.

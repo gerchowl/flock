@@ -1836,6 +1836,34 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// Where the reader is parked in the prompt-history panel, in content
+/// coordinates rather than rows (#254).
+///
+/// Rows are wrapped, so a row offset is only meaningful at the width and
+/// detail level that produced it. Resizing the pane, cycling detail, or (once
+/// #255 lands) expanding a turn all re-lay the same content into a different
+/// number of rows; an offset held across that lands somewhere arbitrary, and
+/// the panel's previous answer was to give up and jump to the newest turn.
+///
+/// The anchor addresses the entry and byte offset visible at the TOP of the
+/// viewport — the reader's eye position — and is resolved back to a row offset
+/// after every relayout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptHistoryAnchor {
+    /// Index into the history ring.
+    pub entry: usize,
+    /// Byte offset into that entry's text.
+    pub body_offset: usize,
+    /// Wall-clock stamp of the anchored entry, when it has one.
+    ///
+    /// The index alone is not enough across a *detail* change: cycling
+    /// Reply → Collapsed → Full re-reads the transcript into a different set of
+    /// entries, so index 40 is a different turn afterwards. A turn's timestamp
+    /// survives that, so resolution prefers it and falls back to the index for
+    /// entries the writer gave no stamp.
+    pub at: Option<std::time::SystemTime>,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -2022,11 +2050,23 @@ pub struct AppState {
     pub system_stats: Option<crate::system_stats::SystemStats>,
     /// Pane whose header prompt is click-expanded to the full text.
     pub expanded_prompt_pane: Option<PaneId>,
-    /// Scroll position of the open prompt-history panel, in lines FROM THE
+    /// Scroll position of the open prompt-history panel, in rows FROM THE
     /// BOTTOM (0 = pinned to latest). Reset to 0 whenever the panel closes
     /// or the focused pane changes. Only meaningful when `expanded_prompt_pane`
     /// is `Some`.
+    ///
+    /// This is a *derived* position: the durable one is
+    /// [`Self::prompt_history_anchor`]. Row offsets do not survive a relayout
+    /// (#254) — re-wrapping at a new width, or cycling detail, changes how many
+    /// rows the same content occupies, so an offset held across one lands
+    /// somewhere arbitrary.
     pub prompt_history_scroll: u16,
+    /// What the reader is parked on, in content coordinates.
+    ///
+    /// `None` means "pinned to latest", which is a state rather than an anchor
+    /// on the newest entry: new turns should keep the view at the bottom, not
+    /// hold it on what used to be last.
+    pub(crate) prompt_history_anchor: Option<PromptHistoryAnchor>,
     /// The detail level the prompt-history panel renders at (#246). Three
     /// fixed global levels — deliberately not per-entry — cycled by Tab
     /// while the panel is open. Global rather than per-pane because it is a
@@ -2790,6 +2830,7 @@ impl AppState {
             prompt_history_scroll: 0,
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
             prompt_layout: crate::ui::PromptLayoutCache::default(),
+            prompt_history_anchor: None,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,

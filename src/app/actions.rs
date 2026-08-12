@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::state::{
     text_matches_query, AppState, Mode, NavigatorRow, NavigatorStateFilter, NavigatorTarget,
-    PaneFocusTarget, ToastKind, ToastNotification, ToastTarget, ViewLayout,
+    PaneFocusTarget, PromptHistoryAnchor, ToastKind, ToastNotification, ToastTarget, ViewLayout,
 };
 
 fn public_tab_id_for_index(ws: &crate::workspace::Workspace, tab_idx: usize) -> Option<String> {
@@ -151,6 +151,7 @@ impl AppState {
             Some(pane_id)
         };
         self.prompt_history_scroll = 0;
+        self.prompt_history_anchor = None;
     }
 
     /// Close the prompt-history scrollback panel if it is open. Used by Esc
@@ -159,6 +160,7 @@ impl AppState {
         if self.expanded_prompt_pane.is_some() {
             self.expanded_prompt_pane = None;
             self.prompt_history_scroll = 0;
+            self.prompt_history_anchor = None;
             true
         } else {
             false
@@ -195,10 +197,11 @@ impl AppState {
     pub(crate) fn cycle_prompt_history_detail(&mut self) -> Option<PaneId> {
         let pane_id = self.expanded_prompt_pane?;
         self.prompt_history_detail = self.prompt_history_detail.next();
-        // The scroll reset matches every other detail-change event in the
-        // panel (open, close, focus change): 0 is "pinned to latest", which
-        // is where the eye expects to be after content changes shape.
-        self.prompt_history_scroll = 0;
+        // The anchor is deliberately NOT cleared: cycling detail re-reads the
+        // transcript into a differently-shaped ring, and throwing the reader
+        // back to the newest turn every time they asked for more (or less)
+        // detail was the panel's worst habit (#254). The anchor is resolved
+        // against the new content when the re-read lands.
         Some(pane_id)
     }
 
@@ -221,6 +224,11 @@ impl AppState {
     /// Scroll the open prompt-history panel by `lines` (positive = older,
     /// negative = newer / toward pinned-at-bottom). Scroll is clamped to
     /// `[0, max_offset]`. Returns whether anything moved.
+    ///
+    /// Also re-anchors: the row offset is transient, so every deliberate move
+    /// records what content the reader landed on (#254). Scrolling back to the
+    /// bottom clears the anchor rather than pinning the newest entry, so new
+    /// turns keep the view at the bottom.
     pub(crate) fn scroll_prompt_history(&mut self, lines: i32, max_offset: u16) -> bool {
         if self.expanded_prompt_pane.is_none() {
             return false;
@@ -231,7 +239,109 @@ impl AppState {
             return false;
         }
         self.prompt_history_scroll = next as u16;
+        self.reanchor_prompt_history();
         true
+    }
+
+    /// Record what the top visible row is showing, so the position survives the
+    /// next relayout. A scroll offset of 0 means "pinned to latest" and clears
+    /// the anchor instead of recording one.
+    pub(crate) fn reanchor_prompt_history(&mut self) {
+        if self.prompt_history_scroll == 0 {
+            self.prompt_history_anchor = None;
+            return;
+        }
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return;
+        };
+        let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
+            return;
+        };
+        let Some((inner, rows)) = self.prompt_panel_rows(&info) else {
+            return;
+        };
+        // The window shown is [start, end); anchor on its first row.
+        let end = rows
+            .len()
+            .saturating_sub(self.prompt_history_scroll as usize);
+        let start = end.saturating_sub(inner.height as usize);
+        let history = self.prompt_panel_history(&info);
+        let anchor = rows.get(start).map(|row| PromptHistoryAnchor {
+            entry: row.entry,
+            body_offset: row.body_offset,
+            at: history
+                .and_then(|h| h.get(row.entry))
+                .and_then(|e| e.wall_clock),
+        });
+        self.prompt_history_anchor = anchor;
+    }
+
+    /// The history ring behind the open panel over `info`.
+    fn prompt_panel_history(
+        &self,
+        info: &crate::layout::PaneInfo,
+    ) -> Option<&Vec<crate::terminal::PromptHistoryEntry>> {
+        let ws = self.active.and_then(|idx| self.workspaces.get(idx))?;
+        ws.pane_state(info.id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .map(|terminal| &terminal.prompt_history)
+    }
+
+    /// Re-derive the row offset from the anchor after a relayout.
+    ///
+    /// Called whenever the same content can occupy a different number of rows:
+    /// a width change, a detail cycle, or a history mutation. Without this the
+    /// reader drifts on every resize and is thrown to the newest turn on every
+    /// detail change.
+    pub(crate) fn resolve_prompt_history_anchor(&mut self) {
+        let Some(anchor) = self.prompt_history_anchor else {
+            // Pinned to latest: stay there.
+            self.prompt_history_scroll = 0;
+            return;
+        };
+        let Some(pane_id) = self.expanded_prompt_pane else {
+            return;
+        };
+        let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
+            return;
+        };
+        let Some((inner, rows)) = self.prompt_panel_rows(&info) else {
+            return;
+        };
+        // Prefer the timestamp: after a detail cycle the ring holds a different
+        // set of entries, so the recorded index points at a different turn,
+        // while the turn's own stamp still identifies it. Fall back to the
+        // index for live entries, which carry no wall clock.
+        let history = self.prompt_panel_history(&info);
+        let anchored_entry = match (anchor.at, history) {
+            (Some(at), Some(history)) => history
+                .iter()
+                .position(|entry| entry.wall_clock.is_some_and(|stamp| stamp >= at))
+                .unwrap_or(anchor.entry),
+            _ => anchor.entry,
+        };
+        // Best match: the last row at or before the anchored offset within the
+        // anchored entry. Wrapping can split the anchored text differently, so
+        // an exact offset match is not guaranteed — landing on the row that
+        // *contains* it keeps the same text on screen.
+        let target = rows
+            .iter()
+            .rposition(|row| {
+                row.entry < anchored_entry
+                    || (row.entry == anchored_entry && row.body_offset <= anchor.body_offset)
+            })
+            .unwrap_or(0);
+        // The anchored row sits at the top of the viewport, so the offset from
+        // the bottom is everything below it minus one screen.
+        let viewport = inner.height as usize;
+        let offset = rows.len().saturating_sub(target + viewport);
+        let max_offset = rows.len().saturating_sub(viewport);
+        self.prompt_history_scroll = offset.min(max_offset).try_into().unwrap_or(u16::MAX);
+        // Scrolled back into the pinned position: drop the anchor so new turns
+        // keep the view at the bottom.
+        if self.prompt_history_scroll == 0 {
+            self.prompt_history_anchor = None;
+        }
     }
 
     /// Geometry for the open prompt-history panel over `info`. Mirrors the
@@ -7001,11 +7111,11 @@ mod tests {
         assert!(!state.scroll_prompt_history(3, 10));
     }
 
-    /// #246: cycling only makes sense while the panel is open. The scroll
-    /// must reset each hop or content that reshapes underfoot leaves the
-    /// viewport pointing at an offset that no longer means what it did.
+    /// #246/#254: cycling only makes sense while the panel is open. The scroll
+    /// offset is NOT reset any more — the anchor survives the re-read, so
+    /// asking for more detail no longer throws the reader to the newest turn.
     #[test]
-    fn cycle_prompt_history_detail_rotates_and_resets_scroll_only_when_open() {
+    fn cycle_prompt_history_detail_rotates_and_keeps_the_reader_in_place() {
         use crate::agent_transcript::TranscriptDetail;
 
         let mut state = app_with_workspaces(&["a"]);
@@ -7018,11 +7128,22 @@ mod tests {
 
         state.expanded_prompt_pane = Some(pane);
         state.prompt_history_scroll = 7;
+        state.prompt_history_anchor = Some(PromptHistoryAnchor {
+            entry: 3,
+            body_offset: 0,
+            at: None,
+        });
         assert_eq!(state.cycle_prompt_history_detail(), Some(pane));
         assert_eq!(state.prompt_history_detail, TranscriptDetail::Collapsed);
         assert_eq!(
-            state.prompt_history_scroll, 0,
-            "content reshapes on cycle so the offset must reset to bottom-pinned",
+            state.prompt_history_anchor,
+            Some(PromptHistoryAnchor {
+                entry: 3,
+                body_offset: 0,
+                at: None
+            }),
+            "the anchor must survive the cycle — it is what puts the reader \
+             back on the same turn once the re-read lands",
         );
 
         assert_eq!(state.cycle_prompt_history_detail(), Some(pane));
@@ -7032,6 +7153,96 @@ mod tests {
             state.prompt_history_detail,
             TranscriptDetail::Reply,
             "Full must wrap back to Reply"
+        );
+    }
+
+    /// Build a state with an open panel over a pane whose history holds
+    /// `count` numbered multi-line entries, laid out into `view.pane_infos` at
+    /// `width` so the panel geometry resolves.
+    fn state_with_open_panel(count: usize, width: u16) -> (AppState, PaneId) {
+        let mut state = app_with_workspaces(&["a"]);
+        state.active = Some(0);
+        let pane = state.workspaces[0].focused_pane_id().expect("focused pane");
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        for i in 0..count {
+            terminal.record_prompt(format!(
+                "entry-{i} with enough words in it that the row wraps at a narrow width"
+            ));
+        }
+        state.terminals.insert(terminal_id, terminal);
+        state.expanded_prompt_pane = Some(pane);
+
+        let rect = ratatui::layout::Rect::new(0, 0, width, 24);
+        state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane,
+            rect,
+            inner_rect: rect,
+            scrollbar_rect: None,
+            header_rect: None,
+            is_focused: true,
+        }];
+        (state, pane)
+    }
+
+    /// #254: a row offset is only meaningful at the width that produced it.
+    /// Re-wrapping at a new width must keep the same turn under the reader's
+    /// eye rather than sliding them through the history.
+    #[test]
+    fn resizing_keeps_the_reader_on_the_same_turn() {
+        let (mut state, pane) = state_with_open_panel(40, 60);
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+
+        // Park in the middle of the history and record what is on top.
+        let max_offset = state.prompt_history_max_offset_for(&info);
+        assert!(max_offset > 0, "history must overflow the panel");
+        state.scroll_prompt_history((max_offset / 2) as i32, max_offset);
+        let anchor = state.prompt_history_anchor.expect("scrolling anchors");
+
+        // Narrow the pane: the same content now needs more rows.
+        let narrow = ratatui::layout::Rect::new(0, 0, 30, 24);
+        state.view.pane_infos[0].rect = narrow;
+        state.view.pane_infos[0].inner_rect = narrow;
+        state.resolve_prompt_history_anchor();
+
+        assert_eq!(
+            state.prompt_history_anchor.map(|a| a.entry),
+            Some(anchor.entry),
+            "the anchored turn must not change under a resize"
+        );
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+        let (inner, rows) = state.prompt_panel_rows(&info).expect("panel rows");
+        let end = rows
+            .len()
+            .saturating_sub(state.prompt_history_scroll as usize);
+        let top = end.saturating_sub(inner.height as usize);
+        assert_eq!(
+            rows.get(top).map(|row| row.entry),
+            Some(anchor.entry),
+            "the anchored turn must still be the top visible row after re-wrap"
+        );
+    }
+
+    /// Pinned-to-latest is a state, not an anchor on the newest entry: new
+    /// turns must keep the view at the bottom.
+    #[test]
+    fn scrolling_back_to_the_bottom_clears_the_anchor() {
+        let (mut state, pane) = state_with_open_panel(40, 60);
+        let info = state.pane_info_by_id(pane).cloned().expect("pane info");
+        let max_offset = state.prompt_history_max_offset_for(&info);
+
+        state.scroll_prompt_history(5, max_offset);
+        assert!(state.prompt_history_anchor.is_some(), "scrolling anchors");
+
+        state.scroll_prompt_history(-(max_offset as i32), max_offset);
+        assert_eq!(state.prompt_history_scroll, 0);
+        assert_eq!(
+            state.prompt_history_anchor, None,
+            "back at the bottom means pinned-to-latest, not anchored on the last turn"
         );
     }
 
