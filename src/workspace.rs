@@ -15,7 +15,7 @@ use crate::pane::PaneState;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 mod aggregate;
-mod git;
+pub(crate) mod git;
 mod tab;
 
 #[cfg(test)]
@@ -187,8 +187,41 @@ pub struct Workspace {
     pub(crate) next_public_tab_number: usize,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Memoized `worktree_space_here` repo-family verdict (#262). See
+    /// `SameRepoFamilyVerdict`.
+    pub(crate) same_repo_family_memo: std::cell::RefCell<Option<SameRepoFamilyVerdict>>,
+    /// Memoized cwd-derived display label (#262). See `Workspace::label_for_cwd`.
+    pub(crate) display_label_memo: std::cell::RefCell<Option<DisplayLabelMemo>>,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
+}
+
+/// One remembered answer to "does my worktree membership name the same repo
+/// family as live git?" (#262).
+///
+/// The question is settled by canonicalizing two paths, which is two
+/// `realpath(2)` calls. `worktree_space_here` is on the sidebar's per-row,
+/// per-section path, so answering it from the filesystem every frame cost
+/// thousands of syscalls per frame and saturated the server's main thread.
+///
+/// Keying on both key strings means the memo invalidates itself whenever either
+/// side changes — a `cd` into another repo, a fresh git probe, a membership
+/// rewrite — without every writer of those `pub` fields having to remember to
+/// clear it. `epoch` covers the residual case where the strings hold still but
+/// the filesystem under them moves.
+#[derive(Debug, Clone)]
+pub(crate) struct DisplayLabelMemo {
+    cwd: PathBuf,
+    epoch: u64,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SameRepoFamilyVerdict {
+    membership_key: String,
+    live_key: String,
+    epoch: u64,
+    same_repo_family: bool,
 }
 
 impl Deref for Workspace {
@@ -316,6 +349,8 @@ impl Workspace {
                 next_public_tab_number: 2,
                 tabs: vec![tab],
                 active_tab: 0,
+                same_repo_family_memo: std::cell::RefCell::new(None),
+                display_label_memo: std::cell::RefCell::new(None),
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
             },
@@ -764,6 +799,8 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }
@@ -818,8 +855,35 @@ impl Workspace {
         }
 
         self.resolved_identity_cwd()
-            .map(|cwd| derive_label_from_cwd(&cwd))
+            .map(|cwd| self.label_for_cwd(&cwd))
             .unwrap_or_else(|| "workspace".into())
+    }
+
+    /// `derive_label_from_cwd`, remembered (#262).
+    ///
+    /// Deriving a label means finding the repo root, which walks up the tree
+    /// `stat`-ing for a valid `.git` at every level. The agent panel asks for
+    /// one label per workspace per frame, so on a 30-workspace node this was
+    /// the second-largest block of filesystem work in the render path after
+    /// the repo-family probe (438 of 3,299 main-thread samples in the #262
+    /// profile). Keyed on the cwd it was derived from, so a pane that `cd`s
+    /// re-derives immediately; the topology epoch (bumped every git-status
+    /// round) covers a repo appearing or moving under an unchanged cwd.
+    fn label_for_cwd(&self, cwd: &std::path::Path) -> String {
+        let epoch = self::git::path_canonicalization_epoch();
+        let mut memo = self.display_label_memo.borrow_mut();
+        if let Some(remembered) = memo.as_ref() {
+            if remembered.epoch == epoch && remembered.cwd == cwd {
+                return remembered.label.clone();
+            }
+        }
+        let label = derive_label_from_cwd(cwd);
+        *memo = Some(DisplayLabelMemo {
+            cwd: cwd.to_path_buf(),
+            epoch,
+            label: label.clone(),
+        });
+        label
     }
 
     pub fn display_name_from(
@@ -832,7 +896,7 @@ impl Workspace {
         }
 
         self.resolved_identity_cwd_from(terminals, terminal_runtimes)
-            .map(|cwd| derive_label_from_cwd(&cwd))
+            .map(|cwd| self.label_for_cwd(&cwd))
             .unwrap_or_else(|| "workspace".into())
     }
 
@@ -902,10 +966,41 @@ impl Workspace {
         let Some(live_space) = self.cached_git_space.as_ref() else {
             return Some(membership);
         };
+        self.same_repo_family(&membership.key, &live_space.key)
+            .then_some(membership)
+    }
+
+    /// The canonicalized-key comparison behind `worktree_space_here`, answered
+    /// from memory rather than from the filesystem wherever possible (#262).
+    /// See `SameRepoFamilyVerdict` for why.
+    fn same_repo_family(&self, membership_key: &str, live_key: &str) -> bool {
+        // Byte-identical keys are the overwhelmingly common case and are the
+        // same family by construction — no filesystem needed to say so.
+        if membership_key == live_key {
+            return true;
+        }
+
+        let epoch = self::git::path_canonicalization_epoch();
+        let mut memo = self.same_repo_family_memo.borrow_mut();
+        if let Some(remembered) = memo.as_ref() {
+            if remembered.epoch == epoch
+                && remembered.membership_key == membership_key
+                && remembered.live_key == live_key
+            {
+                return remembered.same_repo_family;
+            }
+        }
+
         let same_repo_family =
-            self::git::canonicalize_best_effort_path(std::path::Path::new(&membership.key))
-                == self::git::canonicalize_best_effort_path(std::path::Path::new(&live_space.key));
-        same_repo_family.then_some(membership)
+            self::git::canonicalize_best_effort_path(std::path::Path::new(membership_key))
+                == self::git::canonicalize_best_effort_path(std::path::Path::new(live_key));
+        *memo = Some(SameRepoFamilyVerdict {
+            membership_key: membership_key.to_owned(),
+            live_key: live_key.to_owned(),
+            epoch,
+            same_repo_family,
+        });
+        same_repo_family
     }
 
     /// Reconcile the cached worktree `checkout_path` against live git (#125).
@@ -1149,6 +1244,8 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
             test_runtimes: HashMap::new(),
         }
     }
@@ -1336,6 +1433,84 @@ mod tests {
         ws.cached_git_space = None;
         assert!(ws.worktree_space_here().is_some());
         assert!(ws.is_linked_checkout());
+    }
+
+    /// #262: the repo-family probe behind `worktree_space_here` is two
+    /// `realpath(2)` calls, and the sidebar asks for it per row, per section,
+    /// per frame — 4,618 syscalls to paint one frame of a 32-workspace fleet,
+    /// which pegged a server core indefinitely. The verdict must be answered
+    /// from memory once it has been settled.
+    ///
+    /// Proven by moving the filesystem under a settled answer: the memo must
+    /// keep answering the old way (it did not look), and must adopt the new
+    /// truth the moment the topology epoch is bumped.
+    #[test]
+    fn repo_family_verdict_is_memoized_and_epoch_invalidated() {
+        let root = self::git::test_support_temp_dir("same-repo-family-memo");
+        let real = root.join("real.git");
+        let other = root.join("other.git");
+        let link = root.join("link.git");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(WorktreeSpaceMembership {
+            key: link.to_string_lossy().into_owned(),
+            label: "flock".into(),
+            repo_root: real.clone(),
+            checkout_path: real.clone(),
+            is_linked_worktree: true,
+        });
+        let mut space = linked_space_meta(real.to_str().unwrap());
+        space.key = real.to_string_lossy().into_owned();
+        ws.cached_git_space = Some(space);
+
+        // The symlink and its target canonicalize to the same repo family.
+        assert!(ws.worktree_space_here().is_some());
+
+        // Repoint the symlink at an unrelated repo. A fresh probe would now
+        // disagree — the memoized one must not, because it never looked.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert!(
+            ws.worktree_space_here().is_some(),
+            "settled verdict must be answered from memory, not from the filesystem"
+        );
+
+        // A worktree op bumps the epoch, and the next ask re-derives.
+        self::git::invalidate_path_canonicalization();
+        assert!(
+            ws.worktree_space_here().is_none(),
+            "epoch bump must force the verdict to be re-derived"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #262: byte-identical keys are the same family by construction, so the
+    /// common case must not reach the filesystem even once. Paths that do not
+    /// exist would canonicalize to themselves anyway; the point here is that
+    /// the answer is structural.
+    #[test]
+    fn identical_repo_keys_agree_without_probing() {
+        let mut ws = Workspace::test_new("main");
+        ws.worktree_space = Some(WorktreeSpaceMembership {
+            key: "/repo/flock/.git".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: "/repo/flock".into(),
+            is_linked_worktree: false,
+        });
+        let mut space = linked_space_meta("/repo/flock");
+        space.key = "/repo/flock/.git".into();
+        ws.cached_git_space = Some(space);
+
+        assert!(ws.worktree_space_here().is_some());
+        assert!(
+            ws.same_repo_family_memo.borrow().is_none(),
+            "equal keys must short-circuit before the memo, and before any syscall"
+        );
     }
 
     /// #102 part 3: tabs render in `(display_name, tab.number)` order, so

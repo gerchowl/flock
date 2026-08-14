@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) fn temp_test_dir(name: &str) -> PathBuf {
+pub(crate) fn temp_test_dir(name: &str) -> PathBuf {
     let unique = format!(
         "flock-workspace-tests-{}-{}-{}",
         name,

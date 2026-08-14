@@ -209,6 +209,9 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
         .map_err(|err| err.to_string())?;
 
     if output.status.success() {
+        // A worktree add/remove/move relocates repo paths on disk, so every
+        // memoized path canonicalization must be re-derived (#262).
+        crate::workspace::git::invalidate_path_canonicalization();
         return Ok(());
     }
 
@@ -1156,6 +1159,9 @@ pub(crate) fn quarantine_worktree(
             dst.display()
         )
     })?;
+    // The checkout just moved on disk; memoized canonicalizations of its old
+    // path are now wrong (#262).
+    crate::workspace::git::invalidate_path_canonicalization();
 
     // Recovery breadcrumb. Deliberately Markdown so `less` renders cleanly.
     // A write failure here must NOT fail the quarantine: the worktree is
@@ -1186,7 +1192,7 @@ pub(crate) fn unquarantine_worktree(quarantined: &Path, dst: &Path) -> Result<()
         &["-C", &src_str, "worktree", "move", &src_str, &dst_str],
         None,
     )
-    .map(|_| ())
+    .map(|_| crate::workspace::git::invalidate_path_canonicalization())
     .map_err(|err| format!("git worktree move (unquarantine) failed: {err}"))
 }
 
