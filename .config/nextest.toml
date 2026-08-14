@@ -39,33 +39,13 @@ retries = 2
 filter = 'kind(test)'
 retries = 2
 
-# Determinism pins for the test PROCESS environment.
+# NOTE: nextest IGNORES a top-level `[env]` table — it warns "ignoring unknown
+# configuration keys: env" and carries on, so pinning the test environment here
+# looks like it works and does nothing. Verified against cargo-nextest 0.9.133.
 #
-# These were previously only exported from the justfile, so they applied to
-# `just test` / `just check` and to nothing else. A plain `cargo nextest run`
-# — what you reach for when narrowing to one failing test — silently dropped
-# them, and tests that depend on them failed in ways that look like real
-# breakage. `outgoing_fleet_snapshot_from_hub_merges_relayed_cache_into_wire`
-# did exactly that on a machine whose real hostname matched a fixture peer.
+# Determinism therefore lives in two places that actually take effect:
+#   * the justfile exports (`just test` / `just check`), and
+#   * the test code itself — git is invoked with explicit `-c` overrides so a
+#     developer's global/system git config cannot change the outcome (#268).
 #
-# Declaring them here makes every nextest invocation carry them, however it was
-# started. The justfile keeps its own exports because they also cover
-# `cargo test` and the maintenance-script suites.
-[env]
-# Short, deterministic hostname: sidebar layout tests derive column offsets from
-# `short_host_name()`, and it must not collide with a real machine's name.
-FLOCK_HOST_NAME = "host"
-# `git init` defaults to `main` everywhere, regardless of the host's git config
-# — the federation suite waits on an indented `:main` workspace row.
-GIT_CONFIG_COUNT = "3"
-GIT_CONFIG_KEY_0 = "init.defaultBranch"
-GIT_CONFIG_VALUE_0 = "main"
-# Commit/tag signing off: the suite runs git under a temp HOME, so a developer
-# whose global config signs commits (ssh or gpg) hits "Couldn't load public key
-# …: No such file or directory" and the worktree/fork tests fail — on main, for
-# anyone with signing enabled. Test commits are throwaway; they need no
-# provenance.
-GIT_CONFIG_KEY_1 = "commit.gpgsign"
-GIT_CONFIG_VALUE_1 = "false"
-GIT_CONFIG_KEY_2 = "tag.gpgsign"
-GIT_CONFIG_VALUE_2 = "false"
+# The second is the one that survives a bare `cargo nextest run`.

@@ -517,6 +517,7 @@ mod tests {
         let root = temp_test_dir("reftable-branch");
         let root_arg = root.to_string_lossy().to_string();
         let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
             .output()
             .unwrap();
@@ -739,6 +740,7 @@ mod tests {
         let root = temp_test_dir("reftable-ref-oid");
         let root_arg = root.to_string_lossy().to_string();
         let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
             .output()
             .unwrap();

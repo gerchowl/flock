@@ -71,6 +71,7 @@ mod tests {
 
     fn init_repo(path: &std::path::Path) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "-q"])
             .current_dir(path)
             .status()

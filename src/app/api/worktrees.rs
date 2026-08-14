@@ -1270,6 +1270,7 @@ mod tests {
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -1304,6 +1305,7 @@ mod tests {
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
         std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args([
