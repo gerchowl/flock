@@ -661,14 +661,23 @@ pub struct SpaceHeaderArea {
 /// switch_home keybind; consumed by both the monolithic and headless loops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerSwitchRequest {
-    /// A config-owned peer: (peer_idx, ws_idx) into `peer_summaries`.
-    ConfigPeer { peer_idx: usize, ws_idx: usize },
+    /// A config-owned peer: `peer_idx` into `peer_summaries`.
+    ConfigPeer {
+        peer_idx: usize,
+        ws_idx: Option<usize>,
+    },
     /// A carried fleet-snapshot row: index into `fleet_snapshot.peers`.
-    SnapshotPeer { entry_idx: usize },
+    SnapshotPeer {
+        entry_idx: usize,
+        ws_idx: Option<usize>,
+    },
     /// A relayed-cache row (#101 gossip v3 part 4): keyed by lowercased host
     /// into `state.relayed_fleet_cache`. Resolves the target and any stamped
     /// ProxyJump identity from the cached entry.
-    RelayedPeer { host_key: String },
+    RelayedPeer {
+        host_key: String,
+        ws_idx: Option<usize>,
+    },
     /// A row from the origin (hub) server's OWN summary (#66): re-attach home
     /// via the reserved target, carrying the selected workspace as the
     /// post-attach focus target so the hub lands on that space.
@@ -701,10 +710,11 @@ pub enum RemotePeerRef {
     Config { peer_idx: usize },
     /// Index into `state.fleet_snapshot.peers`.
     Snapshot { entry_idx: usize },
-    /// Lowercased-host key into `state.relayed_fleet_cache` (#101 gossip v3).
-    /// Constructed by a follow-up that materialises PeerSummaryState from the
-    /// relayed cache so it can render on the local sidebar. Reserved slot in
-    /// A node a hub relayed to us, keyed by its lowercased host.
+    /// Lowercased-host key into `state.relayed_fleet_cache` (#101 gossip v3):
+    /// a two-hop peer, known to us only because one of our peers relayed it.
+    /// Renders like any other remote row (`REMOTE_ROW_RANK_RELAYED`, losing to
+    /// a locally-polled entry about the same host); switching to one dials via
+    /// the relaying hub's stamped `proxy_jump`.
     Relayed { host_key: String },
     /// The carried origin (hub) server's OWN summary (#66): its workspaces
     /// fold into the spaces list like any peer, but selecting one switches
@@ -713,11 +723,22 @@ pub enum RemotePeerRef {
 }
 
 impl RemotePeerRef {
-    /// The switch request selecting this peer's row emits. Config peers
-    /// carry the workspace index for the best-effort remote pre-focus;
-    /// snapshot rows reuse the band's plain pass-through switch; origin rows
-    /// land home with the workspace as the post-attach focus target.
+    /// The switch request selecting one of this peer's WORKSPACE rows emits:
+    /// switch to that server AND land on that space. Every source carries the
+    /// workspace — a gossiped row that dropped it (as snapshot and relayed
+    /// rows used to) puts you on whatever space that machine was last looking
+    /// at, which is never what clicking a named space meant.
     pub(crate) fn switch_request(&self, ws_idx: usize) -> PeerSwitchRequest {
+        self.switch_request_for(Some(ws_idx))
+    }
+
+    /// The switch request a SERVER row emits: switch to that server, no
+    /// opinion about which space (it keeps its own focus).
+    pub(crate) fn server_switch_request(&self) -> PeerSwitchRequest {
+        self.switch_request_for(None)
+    }
+
+    fn switch_request_for(&self, ws_idx: Option<usize>) -> PeerSwitchRequest {
         match self {
             Self::Config { peer_idx } => PeerSwitchRequest::ConfigPeer {
                 peer_idx: *peer_idx,
@@ -725,11 +746,19 @@ impl RemotePeerRef {
             },
             Self::Snapshot { entry_idx } => PeerSwitchRequest::SnapshotPeer {
                 entry_idx: *entry_idx,
+                ws_idx,
             },
             Self::Relayed { host_key } => PeerSwitchRequest::RelayedPeer {
                 host_key: host_key.clone(),
+                ws_idx,
             },
-            Self::Origin => PeerSwitchRequest::OriginWorkspace { ws_idx },
+            // The origin is reached by going home, so "no particular space"
+            // means the home leg's own focus — which is workspace-less by
+            // construction. Only a workspace row can produce this variant.
+            Self::Origin => match ws_idx {
+                Some(ws_idx) => PeerSwitchRequest::OriginWorkspace { ws_idx },
+                None => PeerSwitchRequest::Home,
+            },
         }
     }
 }
@@ -2385,7 +2414,12 @@ impl AppState {
         // last attached). This is what makes the FULL fleet visible on the
         // polling hub's own sidebar, not just on a spoke that attached
         // through it (#101 acceptance criterion 1).
-        candidates.extend(self.relayed_fleet_cache.iter().map(|(host_key, entry)| {
+        //
+        // Ordered by host key: the cache is a HashMap, and iterating it
+        // directly reshuffles these rows between renders.
+        let mut relayed: Vec<_> = self.relayed_fleet_cache.iter().collect();
+        relayed.sort_by_key(|(host_key, _)| *host_key);
+        candidates.extend(relayed.into_iter().map(|(host_key, entry)| {
             (
                 REMOTE_ROW_RANK_RELAYED,
                 RemotePeerRef::Relayed {
@@ -2411,6 +2445,35 @@ impl AppState {
             }
         }
         candidates
+    }
+
+    /// The peers the current server-visibility selection SHOWS, in
+    /// [`remote_peers`](Self::remote_peers) order.
+    ///
+    /// One place decides what "visible" means, because more than one surface
+    /// has to agree: the spaces list, the agents panel, the navigator, and the
+    /// attention cycle. When they each re-derived it, filtering to one server
+    /// narrowed some surfaces and not others — and the cycle would happily jump
+    /// to an agent whose row you had explicitly filtered away.
+    pub(crate) fn visible_remote_peers(
+        &self,
+    ) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
+        match self.server_filter.as_ref() {
+            Some(ServerFilter::Local) => Vec::new(),
+            Some(ServerFilter::Peer { ssh_target }) => self
+                .remote_peers()
+                .into_iter()
+                .filter(|(_, peer)| peer.ssh_target == *ssh_target)
+                .collect(),
+            None => self.remote_peers(),
+        }
+    }
+
+    /// Whether the LOCAL server's own rows are part of the visible selection.
+    /// Narrowing to a peer hides them, exactly as the spaces list does when it
+    /// swaps the merged stream for that one peer's rows.
+    pub(crate) fn local_server_visible(&self) -> bool {
+        !matches!(self.server_filter.as_ref(), Some(ServerFilter::Peer { .. }))
     }
 
     /// Resolve a remote-row peer reference back to its cached summary.

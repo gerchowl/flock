@@ -68,6 +68,15 @@ use serde::{Deserialize, Serialize};
 /// the servers band (fixing viewer-relative naming). Only an ASCII name travels
 /// — the receiver maps it to a glyph. Additive with `#[serde(default)]`;
 /// positional wire so a deliberate bump is required.
+/// v25 also carries `ClientMessage::FocusWorkspace` (#80): a server switch can
+/// now say WHICH space to land on, in band, on the connection that just became
+/// active. Selecting another machine's space used to leave the target to a
+/// side-channel `ssh … flk workspace focus` that raced the attach — and the
+/// slots client dropped it entirely — so you arrived on whatever space that
+/// server was last looking at. Additive enum variant appended at the END of
+/// `ClientMessage` (existing variant indices unchanged on the positional
+/// wire); folded into the still-unreleased v25 rather than taking a number of
+/// its own, since the released protocol is older than the source's.
 pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Refusal notice sent to clients while a live update handoff is in
@@ -427,6 +436,25 @@ pub enum ClientMessage {
     SetFrameSubscription {
         /// True to (re)subscribe and trigger a full redraw; false to pause.
         enabled: bool,
+    },
+
+    /// Focus a workspace on the server this connection is attached to (#80).
+    /// Sent by a client that arrived here via a server switch which
+    /// named a target space — a sidebar row for another machine's workspace,
+    /// or the attention cycle landing on a remote agent.
+    ///
+    /// In band on purpose: the previous design fired `ssh <peer> flk workspace
+    /// focus` from the leaving server and hoped it won the race against the
+    /// attach. Under warm slots the flip is instant, so it usually lost; for
+    /// peers reachable only via ProxyJump it could not connect at all; and for
+    /// gossiped (snapshot/relayed) rows no target was ever sent. Unknown ids
+    /// are ignored — the space may have closed while the switch was in flight.
+    ///
+    /// Appended at the end of the enum so existing positional variant indices
+    /// are unchanged.
+    FocusWorkspace {
+        /// Server-assigned workspace id (e.g. `ws_3`) on the receiving server.
+        workspace_id: String,
     },
 }
 
@@ -1882,6 +1910,7 @@ mod tests {
             ClientMessage::AttachTerminal { .. } => {}
             ClientMessage::AttachScroll { .. } => {}
             ClientMessage::SetFrameSubscription { .. } => {}
+            ClientMessage::FocusWorkspace { .. } => {}
         }
     }
 

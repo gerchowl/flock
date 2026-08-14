@@ -92,6 +92,23 @@ impl App {
         }
     }
 
+    /// Focus a workspace by its public id, reporting whether anything moved.
+    ///
+    /// Shared by the JSON API and the in-band `FocusWorkspace` message a
+    /// client sends when it arrives via a workspace-targeted server switch
+    /// (#80) — one resolution path, so "focus ws_3" means the same thing
+    /// however it was asked for.
+    pub(crate) fn focus_workspace_by_public_id(&mut self, workspace_id: &str) -> bool {
+        let Some(index) = self.parse_workspace_id(workspace_id) else {
+            return false;
+        };
+        if self.state.workspaces.get(index).is_none() || self.state.active == Some(index) {
+            return false;
+        }
+        self.state.switch_workspace(index);
+        true
+    }
+
     pub(super) fn handle_workspace_focus(&mut self, id: String, target: WorkspaceTarget) -> String {
         let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
             return workspace_not_found(id, &target.workspace_id);

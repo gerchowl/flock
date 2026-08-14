@@ -476,10 +476,10 @@ impl AppState {
             Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
                 self.remote_peer(&crate::app::state::RemotePeerRef::Config { peer_idx })
             }
-            Some(PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
+            Some(PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
                 self.remote_peer(&crate::app::state::RemotePeerRef::Snapshot { entry_idx })
             }
-            Some(PeerSwitchRequest::RelayedPeer { host_key }) => {
+            Some(PeerSwitchRequest::RelayedPeer { host_key, .. }) => {
                 // Resolve via the relayed cache: derive the ssh_target for the
                 // server-scope filter, then fall through.
                 return self

@@ -2273,6 +2273,24 @@ impl HeadlessServer {
                     false
                 }
             }
+            ServerEvent::ClientFocusWorkspace {
+                client_id,
+                workspace_id,
+            } => {
+                // Land the arriving client on the space its switch named
+                // (#80). An id we don't recognise is ignored rather than
+                // treated as an error: the space may have closed while the
+                // switch was in flight, and the client is already attached —
+                // showing it wherever we are beats tearing anything down.
+                let focused = self.app.focus_workspace_by_public_id(&workspace_id);
+                if !focused {
+                    info!(
+                        client_id,
+                        workspace_id, "switch-focus target not applied (unknown or already active)"
+                    );
+                }
+                focused
+            }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
                 self.remove_client_and_resize_if_needed(client_id);

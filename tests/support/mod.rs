@@ -9,6 +9,8 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod fleet;
+
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static INIT: Once = Once::new();

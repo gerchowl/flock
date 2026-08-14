@@ -51,6 +51,14 @@ A blocked agent makes its pane, tab, and workspace look blocked. A working agent
 
 This is the main Flock workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.
 
+## Jumping to the agent that needs you
+
+`focus_attention` (and `focus_attention_defer`, `ctrl+shift+a`) steps through the agents that want something: blocked ones first, oldest first, then the ones that finished while you were away.
+
+The queue is over **agents, not machines**. If another server in your fleet has a blocked agent, the cycle reaches it and switches you there — landing on that server *and* on that agent's space.
+
+What the cycle can reach is exactly what the sidebar shows. Narrowing the servers band to a single server (right-click a server row) narrows the cycle to that server's agents; showing everything cycles the whole visible fleet. The cycle never jumps past a filter you set.
+
 ## Direct integrations
 
 Install integrations for agents that expose hooks or plugins:

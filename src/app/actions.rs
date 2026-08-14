@@ -118,6 +118,59 @@ pub struct PaneStateUpdate {
     pub presentation: crate::terminal::EffectivePresentation,
 }
 
+/// Where an agent the attention cycle can visit actually lives. A local pane
+/// is focused in place; a remote one is reached by the same server switch its
+/// sidebar row performs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VisibleAgentTarget {
+    Local {
+        ws_idx: usize,
+        pane_id: PaneId,
+    },
+    Remote {
+        peer: crate::app::state::RemotePeerRef,
+        peer_ws_idx: usize,
+    },
+}
+
+/// One agent in the visible set, with just enough state to rank it.
+#[derive(Debug, Clone)]
+pub(crate) struct VisibleAgent {
+    pub(crate) target: VisibleAgentTarget,
+    pub(crate) state: AgentState,
+    pub(crate) seen: bool,
+    /// How long this agent has been in its current state. `None` when the
+    /// state predates tracking (or a peer reported no age) — treated as the
+    /// oldest, which is how the queue has always read a missing timestamp.
+    pub(crate) age: Option<std::time::Duration>,
+}
+
+impl VisibleAgent {
+    /// Attention priority: blocked first, then done-but-unseen. `None` means
+    /// this agent is not asking for anything.
+    fn attention_group(&self) -> Option<u8> {
+        match (self.state, self.seen) {
+            (AgentState::Blocked, _) => Some(0),
+            (AgentState::Idle, false) => Some(1),
+            _ => None,
+        }
+    }
+}
+
+/// Order two ages oldest-first. Larger elapsed = older; an unknown age is
+/// treated as the oldest of all.
+fn older_first(
+    a: Option<std::time::Duration>,
+    b: Option<std::time::Duration>,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => y.cmp(&x),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Navigator operations
 // ---------------------------------------------------------------------------
@@ -788,22 +841,9 @@ impl AppState {
         query_kind: NavigatorQueryKind,
         query: &str,
     ) -> Vec<NavigatorRow> {
-        use crate::app::state::{NavigatorTarget, ServerFilter};
+        use crate::app::state::NavigatorTarget;
         let mut rows = Vec::new();
-        if matches!(self.server_filter.as_ref(), Some(ServerFilter::Local)) {
-            return rows;
-        }
-        let peer_ssh_filter = match self.server_filter.as_ref() {
-            Some(ServerFilter::Peer { ssh_target }) => Some(ssh_target.clone()),
-            _ => None,
-        };
-        for (peer_ref, peer) in self.remote_peers() {
-            if peer_ssh_filter
-                .as_ref()
-                .is_some_and(|ssh_target| &peer.ssh_target != ssh_target)
-            {
-                continue;
-            }
+        for (peer_ref, peer) in self.visible_remote_peers() {
             for (peer_ws_idx, summary) in peer.workspaces.iter().enumerate() {
                 let label = crate::ui::grammar::solo_remote_label(self.server_label, peer, summary);
                 let (status, seen) = crate::ui::status::remote_state(summary.status);
@@ -1126,17 +1166,11 @@ impl AppState {
                 false
             }
             NavigatorTarget::RemoteWorkspace { peer, peer_ws_idx } => {
-                // Reuse the servers-band switch path (same as clicking a remote
-                // sidebar row): request the peer switch, close the navigator.
-                // `Relayed` peers can't source a navigator row today (they're
-                // never rendered — `remote_peer()` returns None for them), so
-                // their switch/detail paths are untested; guard the assumption
-                // so a future gossip-v3 relay wiring trips this instead of
-                // silently blanking the detail pane.
-                debug_assert!(
-                    !matches!(peer, crate::app::state::RemotePeerRef::Relayed { .. }),
-                    "navigator RemoteWorkspace should never hold a Relayed peer ref yet"
-                );
+                // Reuse the sidebar's switch path (same as clicking a remote
+                // row): request the peer switch, close the navigator. Relayed
+                // (two-hop) peers reach here now that they render like any
+                // other remote row (#80) — their switch resolves through the
+                // relaying hub's stamped `proxy_jump`.
                 self.request_peer_switch = Some(peer.switch_request(peer_ws_idx));
                 self.mode = Mode::Terminal;
                 true
@@ -2273,75 +2307,162 @@ impl AppState {
     }
 
     fn focus_attention_agent_in_direction(&mut self, forward: bool, project_only: bool) {
-        let mut attention: Vec<(usize, crate::layout::PaneId, u8, Option<std::time::Instant>)> =
-            Vec::new();
-        let project_scope = if project_only {
-            Some(self.project_scope_indices())
-        } else {
-            None
-        };
-        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
-            if let Some(scope) = &project_scope {
-                if !scope.contains(&ws_idx) {
-                    continue;
-                }
-            }
-            for detail in ws.pane_details(&self.terminals) {
-                let group = match (detail.state, detail.seen) {
-                    (AgentState::Blocked, _) => Some(0u8),
-                    (AgentState::Idle, false) => Some(1u8),
-                    _ => None,
-                };
-                if let Some(group) = group {
-                    attention.push((ws_idx, detail.pane_id, group, detail.state_changed_at));
-                }
-            }
-        }
+        let agents = self.visible_agents(project_only);
+        let mut attention: Vec<&VisibleAgent> = agents
+            .iter()
+            .filter(|agent| agent.attention_group().is_some())
+            .collect();
         attention.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| match (a.3, b.3) {
-                    // No timestamp means the state predates tracking: oldest.
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(x), Some(y)) => x.cmp(&y),
-                })
-                .then_with(|| a.0.cmp(&b.0))
+            a.attention_group()
+                .cmp(&b.attention_group())
+                .then_with(|| older_first(a.age, b.age))
         });
 
         if attention.is_empty() {
-            if let Some(scope) = project_scope {
-                self.cycle_agent_in_scope(&scope, forward);
-            } else {
-                if !self.attention_all_clear_chimed {
-                    self.attention_all_clear_chimed = true;
-                    self.pending_attention_chime = true;
-                }
-                self.cycle_agent_entry(forward);
+            // Nothing wants attention: fall back to plain cycling over the
+            // same visible set, so a press still moves rather than doing
+            // nothing. The chime says "all clear" and must not fire for a
+            // scoped query — a quiet project says nothing about the fleet.
+            let order: Vec<VisibleAgentTarget> =
+                agents.iter().map(|agent| agent.target.clone()).collect();
+            if !project_only && !self.attention_all_clear_chimed {
+                self.attention_all_clear_chimed = true;
+                self.pending_attention_chime = true;
             }
+            self.step_visible_agents(&order, forward);
             return;
         }
         if !project_only {
             self.attention_all_clear_chimed = false;
         }
 
+        let order: Vec<VisibleAgentTarget> = attention
+            .into_iter()
+            .map(|agent| agent.target.clone())
+            .collect();
+        self.step_visible_agents(&order, forward);
+    }
+
+    /// Move one step through `order` from wherever the focus currently sits,
+    /// and go there. A remote target is "gone to" by requesting the switch its
+    /// row would — the cycle is fleet-wide, so landing on another machine's
+    /// agent is a normal outcome, not a dead end.
+    fn step_visible_agents(&mut self, order: &[VisibleAgentTarget], forward: bool) {
+        if order.is_empty() {
+            return;
+        }
         let focused = self
             .active
             .and_then(|idx| self.workspaces.get(idx))
-            .and_then(crate::workspace::Workspace::focused_pane_id);
-        let target = match focused
-            .and_then(|pane_id| attention.iter().position(|entry| entry.1 == pane_id))
-        {
-            Some(idx) if forward => attention[(idx + 1) % attention.len()],
-            Some(idx) => attention[(idx + attention.len() - 1) % attention.len()],
-            None => attention[0],
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            .zip(self.active);
+        let current = focused.and_then(|(pane_id, ws_idx)| {
+            order.iter().position(|target| {
+                matches!(target, VisibleAgentTarget::Local { ws_idx: w, pane_id: p }
+                    if *w == ws_idx && *p == pane_id)
+            })
+        });
+        let target = match current {
+            Some(idx) if forward => &order[(idx + 1) % order.len()],
+            Some(idx) => &order[(idx + order.len() - 1) % order.len()],
+            None if forward => &order[0],
+            None => &order[order.len() - 1],
         };
-        if self.focus_pane_in_workspace(target.0, target.1) {
-            let entries = crate::ui::agent_panel_entries(self);
-            if let Some(idx) = entries.iter().position(|entry| entry.pane_id == target.1) {
-                self.ensure_agent_panel_entry_visible(idx);
+        self.focus_visible_agent(target);
+    }
+
+    fn focus_visible_agent(&mut self, target: &VisibleAgentTarget) {
+        match target {
+            VisibleAgentTarget::Local { ws_idx, pane_id } => {
+                if self.focus_pane_in_workspace(*ws_idx, *pane_id) {
+                    let entries = crate::ui::agent_panel_entries(self);
+                    if let Some(idx) = entries.iter().position(|entry| entry.pane_id == *pane_id) {
+                        self.ensure_agent_panel_entry_visible(idx);
+                    }
+                }
+            }
+            VisibleAgentTarget::Remote { peer, peer_ws_idx } => {
+                self.request_peer_switch = Some(peer.switch_request(*peer_ws_idx));
             }
         }
+    }
+
+    /// Every agent the current server-visibility selection makes VISIBLE —
+    /// local panes and remote (gossiped) agents in ONE list, in a fleet-stable
+    /// order.
+    ///
+    /// This is what "cycle through the agents" has to mean once a server is a
+    /// row like any other: the unit is an agent, not a machine. Filtering to
+    /// one server narrows the cycle to that server's agents; showing
+    /// everything cycles the whole fleet, not just the box you happen to be
+    /// attached to.
+    ///
+    /// `project_only` narrows to the active workspace's project: the local
+    /// repo family, plus remote workspaces sharing its machine-independent
+    /// project key.
+    fn visible_agents(&self, project_only: bool) -> Vec<VisibleAgent> {
+        let mut agents = Vec::new();
+        let local_scope = project_only.then(|| self.project_scope_indices());
+        let project_key = project_only
+            .then(|| {
+                self.active
+                    .and_then(|idx| self.workspaces.get(idx))
+                    .and_then(crate::workspace::Workspace::project_key)
+                    .map(str::to_string)
+            })
+            .flatten();
+
+        if self.local_server_visible() {
+            for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+                if let Some(scope) = &local_scope {
+                    if !scope.contains(&ws_idx) {
+                        continue;
+                    }
+                }
+                for detail in ws.pane_details(&self.terminals) {
+                    agents.push(VisibleAgent {
+                        target: VisibleAgentTarget::Local {
+                            ws_idx,
+                            pane_id: detail.pane_id,
+                        },
+                        state: detail.state,
+                        seen: detail.seen,
+                        // Local ages keep sub-second resolution — two panes
+                        // that changed state in the same second still order.
+                        age: detail.state_changed_at.map(|at| at.elapsed()),
+                    });
+                }
+            }
+        }
+
+        for (peer_ref, peer) in self.visible_remote_peers() {
+            for (peer_ws_idx, summary) in peer.workspaces.iter().enumerate() {
+                // Only workspaces actually running an agent are cycle stops.
+                if summary.agent.is_none() {
+                    continue;
+                }
+                // A workspace with no resolved project identity is not "this
+                // project" — it is unknown, so a scoped cycle skips it rather
+                // than pairing every unidentified row with every other.
+                if project_only
+                    && (project_key.is_none()
+                        || summary.project_key.as_deref() != project_key.as_deref())
+                {
+                    continue;
+                }
+                let (state, seen) = crate::ui::status::remote_state(summary.status);
+                agents.push(VisibleAgent {
+                    target: VisibleAgentTarget::Remote {
+                        peer: peer_ref.clone(),
+                        peer_ws_idx,
+                    },
+                    state,
+                    seen,
+                    age: summary.status_age_secs.map(std::time::Duration::from_secs),
+                });
+            }
+        }
+        agents
     }
 
     pub fn previous_agent(&mut self) {
@@ -2350,10 +2471,17 @@ impl AppState {
 
     pub fn focus_agent_entry(&mut self, idx: usize) -> bool {
         let entries = crate::ui::agent_panel_entries(self);
-        let target = entries.get(idx).filter(|entry| entry.remote.is_none());
-        let Some(target) = target else {
+        let Some(target) = entries.get(idx) else {
             return false;
         };
+        // A remote row is selected the way clicking it selects it (#62): by
+        // requesting its server switch. Refusing here used to WEDGE the plain
+        // agent cycle — the step landed on a remote row, nothing happened, and
+        // the next press recomputed the same target forever.
+        if let Some((peer, peer_ws_idx)) = target.remote.clone() {
+            self.request_peer_switch = Some(peer.switch_request(peer_ws_idx));
+            return true;
+        }
         let ws_idx = target.ws_idx;
         let pane_id = target.pane_id;
 
@@ -2381,38 +2509,6 @@ impl AppState {
             return false;
         };
         self.focus_agent_entry(idx)
-    }
-
-    /// Cycle through AGENT panes across the given workspaces. The unit is
-    /// agents, not panes — shells are skipped, and a single agent in scope
-    /// correctly has nowhere to go.
-    fn cycle_agent_in_scope(&mut self, scope: &[usize], forward: bool) {
-        let mut panes: Vec<(usize, crate::layout::PaneId)> = Vec::new();
-        for &ws_idx in scope {
-            if let Some(ws) = self.workspaces.get(ws_idx) {
-                panes.extend(
-                    ws.pane_details(&self.terminals)
-                        .into_iter()
-                        .map(|detail| (ws_idx, detail.pane_id)),
-                );
-            }
-        }
-        if panes.is_empty() {
-            return;
-        }
-        let focused = self
-            .active
-            .and_then(|idx| self.workspaces.get(idx))
-            .and_then(crate::workspace::Workspace::focused_pane_id)
-            .zip(self.active);
-        let current =
-            focused.and_then(|(pane, ws_idx)| panes.iter().position(|p| *p == (ws_idx, pane)));
-        let target = match current {
-            Some(idx) if forward => panes[(idx + 1) % panes.len()],
-            Some(idx) => panes[(idx + panes.len() - 1) % panes.len()],
-            None => panes[0],
-        };
-        self.focus_pane_in_workspace(target.0, target.1);
     }
 
     fn cycle_agent_entry(&mut self, forward: bool) {
@@ -4492,6 +4588,119 @@ mod tests {
         assert!(!state.pending_attention_chime);
     }
 
+    /// The same peer, with its agent BLOCKED for a good while — the oldest
+    /// thing in the fleet that wants attention.
+    fn fleet_peer_blocked(status_age_secs: u64) -> crate::peers::PeerSummaryState {
+        let mut peer = fleet_peer_flock_main();
+        peer.workspaces[0].status = crate::api::schema::AgentStatus::Blocked;
+        peer.workspaces[0].status_age_secs = Some(status_age_secs);
+        peer
+    }
+
+    #[test]
+    fn focus_attention_reaches_a_blocked_agent_on_another_server() {
+        // The cycle is over AGENTS, not over this machine's agents. A peer's
+        // blocked agent outranks a local unseen-done one, and landing on it
+        // requests the switch its sidebar row would.
+        let mut state = app_with_workspaces(&["local"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.peer_summaries = vec![fleet_peer_blocked(600)];
+
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let tid = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        state.workspaces[0].panes.get_mut(&pane).unwrap().seen = false;
+
+        state.focus_attention_agent();
+        assert!(
+            matches!(
+                state.request_peer_switch,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: Some(0)
+                })
+            ),
+            "blocked peer agent outranks a local done one: {:?}",
+            state.request_peer_switch
+        );
+    }
+
+    #[test]
+    fn focus_attention_honors_a_single_server_filter() {
+        // Narrowed to one peer, the cycle must not jump past the filter — in
+        // either direction. Local agents are not visible under a peer filter,
+        // so a local blocked pane is not a stop even though it is closer.
+        let mut state = app_with_workspaces(&["local"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.peer_summaries = vec![fleet_peer_blocked(30)];
+
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let tid = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        let terminal = state.terminals.get_mut(&tid).unwrap();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+        // Blocked longer than the peer's agent, so it leads the queue on
+        // merit — the filter, not the ranking, is what this test is about.
+        terminal.state_changed_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(300));
+
+        // Unfiltered, the cycle is fleet-wide: standing on the local blocked
+        // pane, one press moves on to the peer's blocked agent.
+        state.focus_attention_agent();
+        assert!(
+            state.request_peer_switch.is_some(),
+            "an unfiltered cycle should reach the peer's blocked agent"
+        );
+        state.request_peer_switch = None;
+
+        // Filtered to the peer: the local pane is not visible, so the only
+        // stop left is the peer's agent.
+        state.server_filter = Some(crate::app::state::ServerFilter::Peer {
+            ssh_target: "sage".into(),
+        });
+        state.focus_attention_agent();
+        assert!(
+            matches!(
+                state.request_peer_switch,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer { peer_idx: 0, .. })
+            ),
+            "filtered cycle must reach the visible peer: {:?}",
+            state.request_peer_switch
+        );
+
+        // And with the local server selected instead, the peer is invisible:
+        // the cycle stays home rather than jumping past the filter.
+        state.request_peer_switch = None;
+        state.server_filter = Some(crate::app::state::ServerFilter::Local);
+        state.focus_attention_agent();
+        assert!(
+            state.request_peer_switch.is_none(),
+            "a Local filter must not cycle onto a peer"
+        );
+    }
+
+    #[test]
+    fn agent_cycle_steps_through_remote_rows_instead_of_wedging() {
+        // The plain agent cycle used to compute a remote row as its next stop
+        // and then refuse to go there: the press did nothing, and the next
+        // press recomputed the same stop. Forever.
+        let mut state = app_with_workspaces(&["local"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.peer_summaries = vec![fleet_peer_flock_main()];
+
+        state.next_agent();
+        assert!(
+            state.request_peer_switch.is_some(),
+            "cycling past the last local agent should reach the peer's agent"
+        );
+    }
+
     #[test]
     fn focus_attention_previous_walks_queue_backwards() {
         let mut state = app_with_workspaces(&["a", "b"]);
@@ -4928,7 +5137,7 @@ mod tests {
             state.request_peer_switch,
             Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0
+                ws_idx: Some(0)
             })
         ));
         assert_eq!(state.mode, Mode::Terminal);
