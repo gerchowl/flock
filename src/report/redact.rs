@@ -197,8 +197,13 @@ fn labeled_secret_re() -> &'static Regex {
         // `access_token`, `client_secret`, `github_token`. `\b` does not help
         // there — `_` is a word character, so there is no boundary before
         // `token` in `refresh_token` and the rule never fires.
+        //
+        // The value may be preceded by an auth SCHEME word. `\S+` alone stops
+        // at the first space, so `authorization: Bearer ab12…` masked only
+        // "Bearer" and emitted the credential itself in the clear. Consume the
+        // scheme and the token that follows it as one value.
         Regex::new(
-            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*\S+",
+            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
         )
         .expect("static labeled-secret pattern")
     })
@@ -265,12 +270,23 @@ fn ipv6_re() -> &'static Regex {
 /// The `user@host` rule only fires when there is a `user@`, and `err` strings
 /// overwhelmingly carry a bare FQDN instead ("Could not resolve hostname
 /// bastion.internal.acme.corp"). Two shapes are masked: anything under an
-/// unambiguously private suffix, and any name of three or more labels that is
+/// unambiguously private suffix, and any name of four or more labels that is
 /// not on the public allowlist.
 ///
-/// Three labels is the threshold on purpose — it keeps `flock-server.log` and
-/// `bug.yml` intact, and requiring an alphabetic final label keeps version
-/// strings like `0.6.8-fork.85ce040` from being mistaken for hosts.
+/// The generic rule needs FOUR labels, and an alphabetic final label, so
+/// version strings like `0.6.8-fork.85ce040` are not mistaken for hosts. A
+/// consequence worth knowing: `git.acme.com` is three labels and is NOT masked
+/// by that rule.
+///
+/// The private-suffix rule, by contrast, fires wherever the suffix appears —
+/// including mid-string. `config.local.toml` therefore scrubs to
+/// `<host>.toml`, because `config.local` ends in `local`. That is a false
+/// positive on a filename, and it costs a little diagnostic value in reports.
+/// It is left in place deliberately: the failure direction is over-masking,
+/// which is the safe one for a scrubber, and the `regex` crate has no
+/// lookahead, so pinning the suffix to the final label means restructuring the
+/// static (pattern, replacement) table this shares with every other rule.
+/// Tracked separately rather than rushed in alongside the feature.
 fn private_host_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -633,6 +649,41 @@ mod tests {
         let masked = bare.scrub("spawned for ops@int.acme.corp from /home/someone/x");
         assert!(!masked.contains("acme"), "{masked}");
         assert!(!masked.contains("someone"), "{masked}");
+    }
+
+    #[test]
+    fn attack_labeled_secret_consumes_the_auth_scheme_and_its_token() {
+        // `\S+` stops at the first space, so the scheme word ate the whole
+        // match and the credential after it went out in the clear.
+        for line in [
+            "authorization: Bearer ghp_AbCdEf0123456789xyzXYZ",
+            "Authorization=Basic dXNlcjpwYXNzd29yZA==",
+            "x-api-key: Token 0123456789abcdef0123",
+        ] {
+            let masked = scrubber().scrub(line);
+            assert!(
+                !masked.contains("ghp_")
+                    && !masked.contains("dXNlcjpwYXNzd29yZA")
+                    && !masked.contains("0123456789abcdef"),
+                "credential survived: {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_suffix_rule_over_masks_mid_string_and_that_is_pinned() {
+        // KNOWN false positive, pinned so a future rework is a deliberate
+        // choice and not a surprise: the private-suffix rule fires wherever
+        // the suffix sits, so flock's own `config.local.toml` scrubs to
+        // `<host>.toml`. Over-masking is the safe direction; the cost is a
+        // little diagnostic value in a report.
+        let masked = scrubber().scrub("failed to parse config.local.toml at line 3");
+        assert_eq!(masked, "failed to parse <host>.toml at line 3");
+
+        // The generic four-label rule genuinely does not reach three-label
+        // public names — the other half of the same trade.
+        let public = scrubber().scrub("cloning from git.acme.com now");
+        assert!(public.contains("git.acme.com"), "{public}");
     }
 
     #[test]
