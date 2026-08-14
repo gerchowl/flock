@@ -57,6 +57,15 @@ retries = 2
 FLOCK_HOST_NAME = "host"
 # `git init` defaults to `main` everywhere, regardless of the host's git config
 # — the federation suite waits on an indented `:main` workspace row.
-GIT_CONFIG_COUNT = "1"
+GIT_CONFIG_COUNT = "3"
 GIT_CONFIG_KEY_0 = "init.defaultBranch"
 GIT_CONFIG_VALUE_0 = "main"
+# Commit/tag signing off: the suite runs git under a temp HOME, so a developer
+# whose global config signs commits (ssh or gpg) hits "Couldn't load public key
+# …: No such file or directory" and the worktree/fork tests fail — on main, for
+# anyone with signing enabled. Test commits are throwaway; they need no
+# provenance.
+GIT_CONFIG_KEY_1 = "commit.gpgsign"
+GIT_CONFIG_VALUE_1 = "false"
+GIT_CONFIG_KEY_2 = "tag.gpgsign"
+GIT_CONFIG_VALUE_2 = "false"

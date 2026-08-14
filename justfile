@@ -12,9 +12,15 @@ export FLOCK_HOST_NAME := "host"
 # never matched and the test timed out — deterministic, not flaky. These
 # GIT_CONFIG_* env keys make all git invocations (and the spawned binary's)
 # default to `main` regardless of the host's git config.
-export GIT_CONFIG_COUNT := "1"
+export GIT_CONFIG_COUNT := "3"
 export GIT_CONFIG_KEY_0 := "init.defaultBranch"
 export GIT_CONFIG_VALUE_0 := "main"
+# Commit/tag signing off — the suite runs git under a temp HOME, so a global
+# signing config makes git fail on a key that isn't there. See nextest.toml.
+export GIT_CONFIG_KEY_1 := "commit.gpgsign"
+export GIT_CONFIG_VALUE_1 := "false"
+export GIT_CONFIG_KEY_2 := "tag.gpgsign"
+export GIT_CONFIG_VALUE_2 := "false"
 
 # Run tests
 test:
