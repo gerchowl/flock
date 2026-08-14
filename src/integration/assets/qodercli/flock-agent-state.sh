@@ -3,112 +3,24 @@
 # managed by flock; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=qodercli
-# FLOCK_INTEGRATION_VERSION=1
+# FLOCK_INTEGRATION_VERSION=2
 #
-# Reports qodercli agent state changes to flock. Registered as a Command hook
-# in ~/.qoder/settings.json by `flk integration install qodercli` and
-# invoked by qodercli's hook system on lifecycle events.
+# Thin stub (#158, #238). The hook body — validate the pane env, build the
+# pane.report_* request, and speak the flock socket — lives in the flk binary
+# at `flk hook qodercli <action>`, the single source of truth shared by every agent
+# integration. This forwards the action ($1) and stdin (the hook JSON, if the
+# host sends any) and stays out of the way.
 #
-# qodercli (per https://docs.qoder.com/zh/cli/hooks) sends a JSON payload on
-# stdin describing the hook event. The event name is read from the stdin
-# payload's `hook_event_name` field, the same way
-# `assets/claude/flock-agent-state.sh` already consumes claude code's stdin
-# payload. No environment variable is consulted for the event identity.
+# Actions: working|idle|blocked|release
+#
+# Replaces an embedded python3 heredoc. python3 was a hard dependency resolved
+# from ambient PATH, and its absence was indistinguishable from "not running
+# under flock" — the shim exited 0 either way (#238). flk is already stamped
+# into the pane env, so the dependency is now gone rather than merely pinned.
+#
+# FLOCK_BIN is stamped into the pane env by flock (falls back to `flk` on PATH).
+# A hook must never fail the parent agent, so a missing binary or any error is
+# a silent no-op: we swallow stderr and always exit 0.
 
-set -eu
-
-action="${1:-}"
-hook_input_file="$(mktemp "${TMPDIR:-/tmp}/flock-qodercli-hook.XXXXXX")" || exit 0
-trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
-cat >"$hook_input_file" 2>/dev/null || true
-
-case "$action" in
-  working|idle|blocked|release) ;;
-  *) exit 0 ;;
-esac
-
-[ "${FLOCK_ENV:-}" = "1" ] || exit 0
-[ -n "${FLOCK_SOCKET_PATH:-}" ] || exit 0
-[ -n "${FLOCK_PANE_ID:-}" ] || exit 0
-command -v python3 >/dev/null 2>&1 || exit 0
-
-FLOCK_ACTION="$action" FLOCK_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
-import json
-import os
-import random
-import socket
-import time
-
-source = "flock:qodercli"
-action = os.environ.get("FLOCK_ACTION", "")
-pane_id = os.environ.get("FLOCK_PANE_ID")
-socket_path = os.environ.get("FLOCK_SOCKET_PATH")
-hook_input_file = os.environ.get("FLOCK_HOOK_INPUT_FILE")
-
-if not pane_id or not socket_path:
-    raise SystemExit(0)
-
-hook_input = {}
-if hook_input_file:
-    try:
-        with open(hook_input_file, encoding="utf-8") as handle:
-            content = handle.read()
-        if content.strip():
-            hook_input = json.loads(content)
-    except Exception:
-        hook_input = {}
-
-# Per docs.qoder.com/zh/cli/hooks the payload always carries `hook_event_name`.
-hook_event_name = str(hook_input.get("hook_event_name") or "")
-is_subagent = bool(hook_input.get("agent_id"))
-if hook_event_name == "SubagentStop":
-    # SubagentStop is a completion event; never let it revive an idle pane the
-    # way the parallel claude integration does.
-    raise SystemExit(0)
-if is_subagent and action in ("idle", "release"):
-    # Subagent completion must not make the parent pane look done early.
-    raise SystemExit(0)
-
-request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}"
-report_seq = time.time_ns()
-session_id = hook_input.get("session_id")
-agent_session_id = session_id if isinstance(session_id, str) and session_id else None
-if action == "release":
-    request = {
-        "id": request_id,
-        "method": "pane.release_agent",
-        "params": {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": "qodercli",
-            "seq": report_seq,
-        },
-    }
-else:
-    request = {
-        "id": request_id,
-        "method": "pane.report_agent",
-        "params": {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": "qodercli",
-            "state": action,
-            "seq": report_seq,
-        },
-    }
-    if agent_session_id:
-        request["params"]["agent_session_id"] = agent_session_id
-
-try:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(0.5)
-    client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        client.recv(4096)
-    except Exception:
-        pass
-    client.close()
-except Exception:
-    pass
-PY
+"${FLOCK_BIN:-flk}" hook qodercli "${1:-}" 2>/dev/null
+exit 0
