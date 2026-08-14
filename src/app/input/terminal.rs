@@ -1221,7 +1221,7 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
-        app.state.default_shell = "/usr/bin/true".into();
+        app.state.default_shell = crate::test_support::no_op_program();
         let (workspace, terminal, runtime) = Workspace::new(
             // Any existing directory; this test asserts about panes, not paths.
             std::env::temp_dir(),

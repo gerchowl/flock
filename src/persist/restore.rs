@@ -1167,7 +1167,7 @@ mod tests {
             24,
             80,
             0,
-            "/usr/bin/true",
+            &crate::test_support::no_op_program(),
             crate::config::ShellModeConfig::NonLogin,
             false,
             events,
