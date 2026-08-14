@@ -1108,7 +1108,9 @@ mod tests {
 
     #[tokio::test]
     async fn restore_carries_persisted_agent_session_metadata() {
-        let cwd = std::env::current_dir().unwrap();
+        // Deterministic, existing directory: restore only needs the path to
+        // resolve, and nothing here asserts on which directory it is.
+        let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1193,7 +1195,9 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
-        let cwd = std::env::current_dir().unwrap();
+        // Deterministic, existing directory: restore only needs the path to
+        // resolve, and nothing here asserts on which directory it is.
+        let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1379,7 +1383,8 @@ mod tests {
     }
 
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        // Deterministic, existing directory (see above).
+        let cwd = std::env::temp_dir();
         let mut panes = HashMap::new();
         panes.insert(
             0,

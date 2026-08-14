@@ -70,6 +70,18 @@ Run `just check` before committing unless Can explicitly accepts narrower valida
 
 Unit tests live next to the code (`#[cfg(test)] mod tests`). New `AppState` or `Workspace` behavior should be testable with `AppState::test_new()` and `Workspace::test_new()` without PTYs.
 
+### A green `just check` on macOS is not full coverage
+
+A slice of `tests/` is `#[cfg(not(target_os = "macos"))]` — at least 70 tests, and the measured delta between the ubuntu and macos CI jobs on one commit was 97. Those tests are not skipped on a Mac, they are **compiled out**: a green local run is not weak evidence about them, it is no evidence. `just check` prints what it withheld at the end of the run.
+
+They cover the headless server's render/stream loop, PTY sizing and pane geometry, and the socket API's pane read/write surface. **If you touch `src/server/headless.rs`, the render loop, or pane sizing, verify on Linux before landing** — otherwise CI is the first thing that runs them. This is not hypothetical: #262 shipped a render-loop change that was green on macOS and broke `api_ping::workspace_list_and_create_round_trip` on Linux only (#269).
+
+### Tests must not assert against ambient machine state
+
+A test that reads the process cwd, the machine's hostname, or a hardcoded FHS path is asserting about your laptop rather than about flock — it passes for you and fails confusingly for everyone else. The `hermetic-tests` gate enforces this over `tests/` and `#[cfg(test)]` regions; use `guardrails-ok(hermetic): <reason>` for fixture DATA that is parsed rather than executed.
+
+Concretely: derive fixture paths from the fixture's own name (`Workspace::test_new` does this), use `std::env::temp_dir()` when a test just needs *a* directory, pick fixture hostnames that cannot collide with real machines (RFC 2606 reserves `.invalid`), and prefer `/bin/sh` — it is the only `/bin` path POSIX guarantees, and NixOS ships nothing else there. Determinism pins for the test environment belong in `.config/nextest.toml`'s `[env]`, so a bare `cargo nextest run` gets them too, not only `just`.
+
 ## Vendored libghostty-vt
 
 `vendor/libghostty-vt.vendor.json` records the upstream source commit currently vendored.

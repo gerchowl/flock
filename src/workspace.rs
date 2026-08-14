@@ -1115,7 +1115,14 @@ impl Workspace {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
-        let identity_cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+        // Derived from the fixture's own name, never from the process cwd
+        // (#268). `sort_family_key()` is the lowercased BASENAME of this path,
+        // so inheriting `current_dir()` made every ordering assertion secretly
+        // depend on what the checkout directory happens to be called — passing
+        // in `~/Projects/flock`, failing in a worktree whose name began with a
+        // digit. Keying it to `name` also makes the sort key equal the fixture
+        // name, which is what a reader expects `test_new("mmm")` to sort as.
+        let identity_cwd = PathBuf::from(format!("/flock-test/{name}"));
         let (layout, root_id) = TileLayout::new();
         let terminal_id = TerminalId::alloc();
         let mut panes = HashMap::new();

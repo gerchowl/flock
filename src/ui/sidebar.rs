@@ -6288,6 +6288,8 @@ mod tests {
         // unit-testable here because `short_host_name()` caches in a OnceLock.
         let order_with = |aaa_first: bool| {
             let mut app = crate::app::state::AppState::test_new();
+            // Sorts as "mmm" because `Workspace::test_new` pins identity_cwd
+            // to the fixture name (#268) — not because of the checkout dir.
             let local = Workspace::test_new("mmm");
             let pane = local.tabs[0].root_pane;
             app.workspaces = vec![local];

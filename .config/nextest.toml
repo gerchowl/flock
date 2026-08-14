@@ -38,3 +38,25 @@ retries = 2
 # them run in parallel but retry to ride out timing hiccups under CI load.
 filter = 'kind(test)'
 retries = 2
+
+# Determinism pins for the test PROCESS environment.
+#
+# These were previously only exported from the justfile, so they applied to
+# `just test` / `just check` and to nothing else. A plain `cargo nextest run`
+# — what you reach for when narrowing to one failing test — silently dropped
+# them, and tests that depend on them failed in ways that look like real
+# breakage. `outgoing_fleet_snapshot_from_hub_merges_relayed_cache_into_wire`
+# did exactly that on a machine whose real hostname matched a fixture peer.
+#
+# Declaring them here makes every nextest invocation carry them, however it was
+# started. The justfile keeps its own exports because they also cover
+# `cargo test` and the maintenance-script suites.
+[env]
+# Short, deterministic hostname: sidebar layout tests derive column offsets from
+# `short_host_name()`, and it must not collide with a real machine's name.
+FLOCK_HOST_NAME = "host"
+# `git init` defaults to `main` everywhere, regardless of the host's git config
+# — the federation suite waits on an indented `:main` workspace row.
+GIT_CONFIG_COUNT = "1"
+GIT_CONFIG_KEY_0 = "init.defaultBranch"
+GIT_CONFIG_VALUE_0 = "main"
