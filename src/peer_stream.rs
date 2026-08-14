@@ -288,10 +288,18 @@ pub fn retain_configured(peers: &[PeerConfig]) {
         };
         // A slot that never connected has an empty target and no stream to
         // invalidate; keep it so its backoff still applies.
-        let Ok(slot) = slot.lock() else {
-            return false;
-        };
-        slot.stream.is_none() || slot.target == peer.ssh_target()
+        //
+        // `try_lock`, not `lock`: the per-peer lock is held for the whole of a
+        // request, so blocking here would stall the config reload — and with
+        // it the loop that calls it — for up to REQUEST_TIMEOUT per wedged
+        // peer, serially. Reconciliation is not urgent: a slot busy right now
+        // is by definition connected to somewhere, and if that somewhere is
+        // stale its next request fails and re-spawns against the new target.
+        match slot.try_lock() {
+            Ok(slot) => slot.stream.is_none() || slot.target == peer.ssh_target(),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
     });
 }
 
@@ -343,6 +351,42 @@ mod tests {
         // it vanishing into the push slot where nobody would ever see it.
         assert!(!line_is_push("not json at all"));
         assert!(!line_is_push(""));
+    }
+
+    /// A config reload must not wait on a peer that is mid-request. The
+    /// per-peer lock is held for the whole of a request, so blocking here cost
+    /// up to REQUEST_TIMEOUT (15s) per wedged peer, serially, on the loop that
+    /// triggers the reload.
+    #[test]
+    fn a_reload_does_not_wait_on_a_peer_that_is_mid_request() {
+        let peer = peer("reload-busy-slot");
+        // Materialize the slot, then hold its lock the way an in-flight
+        // request does.
+        let slot = {
+            let mut registry = registry().lock().expect("registry");
+            Arc::clone(registry.entry(peer.name.clone()).or_default())
+        };
+        let held = slot.lock().expect("hold the slot like a live request");
+
+        let started = std::time::Instant::now();
+        retain_configured(std::slice::from_ref(&peer));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "reload blocked on a busy slot for {:?}",
+            started.elapsed()
+        );
+
+        // The busy slot is retained rather than silently dropped — dropping it
+        // would tear down a live connection mid-request.
+        drop(held);
+        assert!(
+            registry()
+                .lock()
+                .expect("registry")
+                .contains_key(&peer.name),
+            "a busy slot must survive the reload"
+        );
+        retain_configured(&[]);
     }
 
     #[test]
