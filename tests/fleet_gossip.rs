@@ -66,9 +66,13 @@ fn selecting_a_remote_space_carries_it_through_the_switch() {
         .expect("clicking a remote space should yield SwitchServer");
     assert_eq!(target, "nodeb");
 
-    let focus = fleet::switch_focus_workspace(&tail);
-    assert!(
-        focus.is_some(),
+    // The space that was CLICKED, not merely some space: nodeb is focused on
+    // its second workspace, so a switch that carried the peer's own focus (or
+    // a hardcoded first row) would look identical without this.
+    let beta_id = fleet::workspace_id_by_label(node_b, "beta");
+    assert_eq!(
+        fleet::switch_focus_workspace(&tail).as_deref(),
+        Some(beta_id.as_str()),
         "the switch must name the space that was clicked, not just the server"
     );
 }

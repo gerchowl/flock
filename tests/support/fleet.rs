@@ -593,6 +593,32 @@ pub fn workspace_ids(node: &Node) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The id of the space whose label contains `needle`, for asserting that a
+/// switch named the space that was actually clicked rather than merely some
+/// space.
+pub fn workspace_id_by_label(node: &Node, needle: &str) -> String {
+    let response = node.api(r#"{"id":"test:ls","method":"workspace.list","params":{}}"#);
+    let value: serde_json::Value = serde_json::from_str(&response)
+        .unwrap_or_else(|e| panic!("workspace.list should parse ({e}): {response}"));
+    let rows = value["result"]["workspaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    rows.iter()
+        .find(|ws| {
+            ws["label"]
+                .as_str()
+                .is_some_and(|label| label.contains(needle))
+        })
+        .and_then(|ws| ws["workspace_id"].as_str().map(str::to_string))
+        .unwrap_or_else(|| {
+            panic!(
+                "no space labelled like {needle:?} on {}: {response}",
+                node.name
+            )
+        })
+}
+
 /// Whether `workspace_id` is the focused space on `node`.
 pub fn workspace_focused(node: &Node, workspace_id: &str) -> bool {
     let response = node.api(r#"{"id":"test:ls","method":"workspace.list","params":{}}"#);
