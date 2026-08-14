@@ -704,8 +704,7 @@ pub enum RemotePeerRef {
     /// Lowercased-host key into `state.relayed_fleet_cache` (#101 gossip v3).
     /// Constructed by a follow-up that materialises PeerSummaryState from the
     /// relayed cache so it can render on the local sidebar. Reserved slot in
-    /// the ranked dedup today (`REMOTE_ROW_RANK_RELAYED`).
-    #[allow(dead_code)]
+    /// A node a hub relayed to us, keyed by its lowercased host.
     Relayed { host_key: String },
     /// The carried origin (hub) server's OWN summary (#66): its workspaces
     /// fold into the spaces list like any peer, but selecting one switches
@@ -1934,8 +1933,7 @@ pub struct AppState {
     /// one row with the freshest wins. Never re-relayed — the answering
     /// server's own `peers.summary` only relays its OWN polled peers,
     /// bounding hop count to one.
-    pub relayed_fleet_cache:
-        std::collections::HashMap<String, crate::api::schema::RelayedFleetPeer>,
+    pub relayed_fleet_cache: std::collections::HashMap<String, crate::peers::RelayedEntry>,
     /// Fleet snapshot carried by the attached client's handshake
     /// (hub-and-spoke down-gossip): origin/home label + render-only peer
     /// rows. None when the client attached locally — no home row then.
@@ -2331,6 +2329,29 @@ impl AppState {
             .collect()
     }
 
+    /// Drop relay-cache rows that have aged out of usefulness (#101).
+    ///
+    /// The cache was insert-only: a host that left the fleet, was renamed, or
+    /// re-addressed kept its row for the process lifetime, kept rendering, and
+    /// kept riding outgoing snapshots to other servers. Growth was unbounded
+    /// even though the snapshot TRANSPORT is capped
+    /// (`FLEET_SNAPSHOT_MAX_PEERS`) — the cache feeding it was not.
+    ///
+    /// Eviction is keyed to the same freshness the rows already render by, so
+    /// there is one notion of "too old" rather than a second timeout to keep in
+    /// step. A row is kept well past the point it starts rendering `Down` — a
+    /// node that just went away is exactly what an operator wants to see — and
+    /// dropped once it is telling you nothing you did not already know.
+    ///
+    /// This only became meaningful once carried freshness actually decayed;
+    /// against a frozen reading every entry would have been immortal.
+    pub(crate) fn evict_expired_relayed_entries(&mut self) {
+        let stale_after = self.config.gossip.stale_after().as_secs();
+        let ttl = stale_after.saturating_mul(RELAYED_ENTRY_TTL_STALE_MULTIPLE);
+        self.relayed_fleet_cache
+            .retain(|_, entry| entry.peer.carried_age_secs().is_none_or(|age| age <= ttl));
+    }
+
     /// All candidate remote-row sources with their dedup rank (lower =
     /// higher priority). Consumed by [`remote_peers`](Self::remote_peers)
     /// and any other surface that must render the same deduped set.
@@ -2349,11 +2370,21 @@ impl AppState {
                     )
                 }),
         );
-        // Rank 1 (relayed cache) is reserved for a follow-up: rendering
-        // requires a materialised `PeerSummaryState`, so relayed entries
-        // ride the outgoing snapshot path today but do not render on the
-        // LOCAL sidebar. The `RelayedPeer` switch variant and this rank slot
-        // exist so that future rendering is a pure additive change.
+        // Rank 1: relayed cache — nodes a hub told us about. They lose to a
+        // peer we poll ourselves (rank 0, first-hand) and beat a carried
+        // snapshot row (rank 2, which is a reading from whenever the client
+        // last attached). This is what makes the FULL fleet visible on the
+        // polling hub's own sidebar, not just on a spoke that attached
+        // through it (#101 acceptance criterion 1).
+        candidates.extend(self.relayed_fleet_cache.iter().map(|(host_key, entry)| {
+            (
+                REMOTE_ROW_RANK_RELAYED,
+                RemotePeerRef::Relayed {
+                    host_key: host_key.clone(),
+                },
+                &entry.peer,
+            )
+        }));
         if let Some(snapshot) = self.fleet_snapshot.as_ref() {
             // Rank 2: carried snapshot peers.
             candidates.extend(snapshot.peers.iter().enumerate().map(|(entry_idx, entry)| {
@@ -2383,16 +2414,22 @@ impl AppState {
             RemotePeerRef::Snapshot { entry_idx } => {
                 self.fleet_snapshot.as_ref()?.peers.get(*entry_idx)
             }
-            RemotePeerRef::Relayed { .. } => None,
+            RemotePeerRef::Relayed { host_key } => {
+                self.relayed_fleet_cache.get(host_key).map(|e| &e.peer)
+            }
             RemotePeerRef::Origin => self.fleet_snapshot.as_ref()?.origin_summary.as_ref(),
         }
     }
 }
 
+/// How far past `[gossip] stale_after` a relayed row is kept before the cache
+/// drops it. Generous on purpose: a node that has just gone quiet is exactly
+/// what an operator wants to see, and only a long-departed one is noise.
+const RELAYED_ENTRY_TTL_STALE_MULTIPLE: u64 = 10;
+
 /// Consolidated dedup ranks for remote rows (#101 gossip v3 part 4).
 /// LOWER wins — a locally-polled config peer beats a carried snapshot row.
 const REMOTE_ROW_RANK_CONFIG: u8 = 0;
-#[allow(dead_code)]
 const REMOTE_ROW_RANK_RELAYED: u8 = 1;
 const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
 const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
@@ -2923,6 +2960,117 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    /// Build a relay-cache entry as if a hub had told us about `host`,
+    /// with the origin having polled it `origin_secs` ago and the row having
+    /// sat here `dwell_secs`.
+    fn relayed(host: &str, origin_secs: u64, dwell_secs: u64) -> crate::peers::RelayedEntry {
+        let mut entry =
+            crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                name: host.into(),
+                ssh_target: format!("lars@{host}"),
+                host: Some(host.into()),
+                version: None,
+                protocol: None,
+                system: None,
+                latency_ms: Some(10),
+                workspaces: Vec::new(),
+                age_secs: Some(origin_secs),
+                error: None,
+                origin: "hub".into(),
+                origin_last_ok_secs: Some(origin_secs),
+                proxy_jump: Some("hub".into()),
+                icon: None,
+            });
+        entry.peer.ingested_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(dwell_secs));
+        entry
+    }
+
+    /// #101 acceptance criterion 1: the FULL fleet must be visible, including
+    /// on the hub that does the polling. Relayed rows used to ride the outgoing
+    /// snapshot only — a spoke attached through the hub saw them, the hub
+    /// itself did not.
+    #[test]
+    fn relayed_entries_render_as_rows_ranked_below_locally_polled_peers() {
+        let mut state = AppState::test_new();
+        state
+            .relayed_fleet_cache
+            .insert("spoke2.invalid".into(), relayed("spoke2.invalid", 5, 0));
+
+        let hosts: Vec<String> = state
+            .remote_peers()
+            .into_iter()
+            .map(|(_, peer)| peer.host.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["spoke2.invalid".to_string()],
+            "a relayed node must render on this server's own sidebar"
+        );
+
+        // A peer we poll ourselves is first-hand, so it wins the same host.
+        let mut local = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        local.host = Some("spoke2.invalid".into());
+        local.last_ok = Some(std::time::Instant::now());
+        state.peer_summaries = vec![local];
+
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1, "one host must not produce two rows");
+        assert!(
+            matches!(rows[0].0, RemotePeerRef::Config { .. }),
+            "locally polled data outranks a relayed reading: {:?}",
+            rows[0].0
+        );
+    }
+
+    /// The relay cache was insert-only, so a departed host kept its row for
+    /// the process lifetime — rendering, and riding outgoing snapshots to
+    /// other servers. Eviction is keyed to the same freshness the rows render
+    /// by, so there is one notion of "too old".
+    #[test]
+    fn relayed_entries_are_evicted_once_far_past_stale_after() {
+        let mut state = AppState::test_new();
+        let stale_after = state.config.gossip.stale_after().as_secs();
+
+        // Just gone quiet: past stale_after, so it renders Down — but keeping
+        // it is the point, that is what an operator wants to see.
+        state.relayed_fleet_cache.insert(
+            "recent.invalid".into(),
+            relayed("recent.invalid", 0, stale_after + 5),
+        );
+        // Long departed: nothing has refreshed it for many multiples.
+        state.relayed_fleet_cache.insert(
+            "gone.invalid".into(),
+            relayed(
+                "gone.invalid",
+                0,
+                stale_after * (RELAYED_ENTRY_TTL_STALE_MULTIPLE + 2),
+            ),
+        );
+
+        state.evict_expired_relayed_entries();
+
+        let mut kept: Vec<&String> = state.relayed_fleet_cache.keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![&"recent.invalid".to_string()],
+            "a node that just went quiet stays; a long-departed one is dropped"
+        );
+        assert!(
+            state
+                .relayed_fleet_cache
+                .get("recent.invalid")
+                .expect("kept")
+                .peer
+                .is_stale_with(stale_after),
+            "the kept row still renders as stale — kept is not the same as alive"
+        );
+    }
 
     #[test]
     fn panel_scopes_read_from_state_config_not_mirror_fields() {

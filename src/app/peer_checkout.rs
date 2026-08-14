@@ -385,6 +385,7 @@ mod tests {
             last_ok: Some(std::time::Instant::now()),
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         }

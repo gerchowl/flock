@@ -263,16 +263,15 @@ impl App {
                             // origin_summary path.
                             continue;
                         }
-                        // Freshest-wins: replace an older cached entry using
-                        // the origin's own assertion (`origin_last_ok_secs`,
-                        // #101 part 2) so cross-hub ties resolve honestly,
-                        // falling back to `age_secs` for a v(N-1) origin.
-                        let existing_freshness = |peer: &crate::api::schema::RelayedFleetPeer| {
-                            peer.origin_last_ok_secs.or(peer.age_secs)
-                        };
+                        // Freshest-wins across hubs. Compared on the LIVE age
+                        // (origin's reading plus however long it has sat here),
+                        // not the capture-time reading, so a hub that has gone
+                        // quiet cannot keep winning against one still polling.
+                        let materialised = crate::peers::relayed_entry_from_wire(entry);
+                        let challenger_age = materialised.peer.carried_age_secs();
                         let insert = match self.state.relayed_fleet_cache.get(&host_key) {
                             Some(existing) => {
-                                match (existing_freshness(existing), existing_freshness(&entry)) {
+                                match (existing.peer.carried_age_secs(), challenger_age) {
                                     (Some(cur), Some(new)) => new <= cur,
                                     (None, Some(_)) => true,
                                     (Some(_), None) => false,
@@ -282,7 +281,9 @@ impl App {
                             None => true,
                         };
                         if insert {
-                            self.state.relayed_fleet_cache.insert(host_key, entry);
+                            self.state
+                                .relayed_fleet_cache
+                                .insert(host_key, materialised);
                         }
                     }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
@@ -321,6 +322,13 @@ impl App {
                 }
                 Err(error) => summary.error = Some(error),
             }
+            // Drop relay rows nothing has refreshed for long enough that they
+            // carry no information (#101). Without this the cache only ever
+            // grows: a host that leaves the fleet, is renamed, or is
+            // re-addressed keeps its row for the process lifetime, keeps
+            // rendering, and keeps riding outgoing snapshots to other servers.
+            // Only meaningful now that carried freshness decays.
+            self.state.evict_expired_relayed_entries();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;

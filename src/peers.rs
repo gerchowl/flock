@@ -142,12 +142,19 @@ pub struct PeerSummaryState {
     /// Last poll error, cleared on success.
     pub error: Option<String>,
     /// Gossip v3 (#101 part 2): the ORIGIN's report age at CAPTURE time, in
-    /// seconds. FROZEN — receiver dwell does NOT tick it up. Set from a wire
+    /// seconds. Set from a wire
     /// [`crate::protocol::FleetPeer::origin_last_ok_secs`] on snapshot ingest
     /// and from a relayed entry's field on cache merge. `None` for locally
     /// polled config peers, where `last_ok` (a real Instant) carries the
     /// freshness and staleness falls back to the local-dwell path.
+    ///
+    /// This is the age AT CAPTURE and does not move on its own; freshness is
+    /// this plus [`Self::ingested_at`]'s dwell. See `is_stale_with`.
     pub origin_last_ok_secs: Option<u64>,
+    /// When a carried/relayed entry landed here — the clock that turns
+    /// [`Self::origin_last_ok_secs`] from a fixed capture-time reading into a
+    /// live age. `None` for locally polled peers, which have a real `last_ok`.
+    pub ingested_at: Option<Instant>,
     /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
     /// peer. Set by the hub on relay so a receiver dialing a snapshot row
     /// routes through the hub instead of trying the target directly. `None`
@@ -174,6 +181,7 @@ impl PeerSummaryState {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         }
@@ -185,19 +193,42 @@ impl PeerSummaryState {
 
     /// Config-aware staleness (#96): uses the caller-supplied threshold.
     ///
-    /// Gossip v3 (#101 part 2): a carried / relayed entry judges freshness
-    /// against the ORIGIN's report age at capture — FROZEN, not the receiver's
-    /// dwell — so a snapshot entry that the origin polled 5s before capture
-    /// stays fresh even after 90s of local dwell. Locally-polled entries
-    /// (`origin_last_ok_secs = None`) keep the pre-v3 last_ok.elapsed() path.
+    /// A carried / relayed entry is judged on the ORIGIN's report age at
+    /// capture PLUS the time it has since sat here. Both halves matter:
+    ///
+    /// * without the origin's age, a snapshot entry decays against the
+    ///   receiver's own clock as though the receiver had polled it, which is
+    ///   the 60s-dwell ghost cliff #101 part 2 set out to kill;
+    /// * without dwell, the reading is frozen at capture and never moves —
+    ///   so when the relaying hub itself goes away and nothing refreshes
+    ///   these rows again, every node it relayed renders Live forever.
+    ///
+    /// The second is the worse failure. flock exists so the fleet view can be
+    /// trusted; a node that stopped answering must stop looking alive, and an
+    /// unbounded confident lie is strictly worse than showing it as gone.
+    ///
+    /// Locally-polled entries (`origin_last_ok_secs = None`) keep the
+    /// `last_ok.elapsed()` path — there `last_ok` is a real local Instant and
+    /// already carries both halves.
     pub fn is_stale_with(&self, stale_after_secs: u64) -> bool {
-        if let Some(origin_secs) = self.origin_last_ok_secs {
-            return origin_secs > stale_after_secs;
+        if let Some(age) = self.carried_age_secs() {
+            return age > stale_after_secs;
         }
         match self.last_ok {
             Some(at) => at.elapsed().as_secs() > stale_after_secs,
             None => true,
         }
+    }
+
+    /// Live age of a carried/relayed entry: the origin's age at capture plus
+    /// local dwell. `None` for a locally polled peer.
+    pub fn carried_age_secs(&self) -> Option<u64> {
+        let origin_secs = self.origin_last_ok_secs?;
+        let dwell = self
+            .ingested_at
+            .map(|at| at.elapsed().as_secs())
+            .unwrap_or(0);
+        Some(origin_secs.saturating_add(dwell))
     }
 
     /// The name to DISPLAY for this node (#42): the configured `[[peers]]`
@@ -299,6 +330,51 @@ impl FleetSnapshotState {
 /// `to_wire`). Far above any realistic personal fleet.
 pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
 
+/// One entry in the relay cache: a peer some hub told us about.
+///
+/// Holds a materialised [`PeerSummaryState`] rather than the wire shape, so the
+/// sidebar can render a relayed node exactly like any other peer instead of the
+/// row existing only to be forwarded onward (#101 part 1 follow-up).
+///
+/// The wire entry's `origin` is deliberately NOT carried: it is consumed at
+/// merge time, where loop prevention drops rows this server itself originated,
+/// and nothing downstream needs to know which hub a row arrived through. The
+/// reachable identity a receiver does need travels separately, on the peer's
+/// own `proxy_jump`.
+#[derive(Debug, Clone)]
+pub struct RelayedEntry {
+    /// The relayed peer, in the same shape as a locally polled one.
+    pub peer: PeerSummaryState,
+}
+
+/// Materialise a relayed wire entry into the shape every rendering surface
+/// already understands.
+pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> RelayedEntry {
+    RelayedEntry {
+        peer: PeerSummaryState {
+            peer: entry.name,
+            ssh_target: entry.ssh_target,
+            host: entry.host,
+            version: entry.version,
+            protocol: entry.protocol,
+            system: entry.system,
+            latency_ms: entry.latency_ms,
+            workspaces: entry.workspaces,
+            last_ok: entry
+                .age_secs
+                .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
+            error: entry.error,
+            // Prefer the explicit origin assertion; fall back to `age_secs` for
+            // a v(N-1) hub that does not send one.
+            origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
+            // Dwell starts now — this is when the reading entered this server.
+            ingested_at: Some(Instant::now()),
+            proxy_jump: entry.proxy_jump,
+            icon: entry.icon,
+        },
+    }
+}
+
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
@@ -317,8 +393,10 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         // the source was a snapshot / relay entry that already carried it.
         // Otherwise the local-poll last_ok IS the origin and doubles as the
         // frozen assertion at capture time (age_secs).
+        // Carry the age INCLUDING our dwell, so a second hop inherits an
+        // honest reading rather than the capture-time one we were handed.
         origin_last_ok_secs: peer
-            .origin_last_ok_secs
+            .carried_age_secs()
             .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
         proxy_jump: peer.proxy_jump.clone(),
         icon: peer.icon.clone(),
@@ -348,6 +426,8 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         // pre-v22 wires so an entry from an older peer still gets the
         // origin-honest staleness path instead of decaying against dwell.
         origin_last_ok_secs: peer.origin_last_ok_secs.or(peer.age_secs),
+        // Dwell starts now: this is the moment the reading entered this server.
+        ingested_at: Some(Instant::now()),
         proxy_jump: peer.proxy_jump,
         icon: peer.icon,
     }
@@ -739,6 +819,7 @@ mod tests {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         };
@@ -803,6 +884,7 @@ mod tests {
                 .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         }
@@ -1108,48 +1190,87 @@ Last login: banner noise
     }
 
     #[test]
-    fn carried_entry_fresh_by_origin_survives_dwell_past_stale_after() {
-        // Gossip v3 (#101) part 2 (RED): the 60s-dwell ghost cliff dies.
-        // A carried snapshot entry whose local `last_ok` is far past the
-        // configured `stale_after` still renders Live when the ORIGIN's
-        // frozen assertion (`origin_last_ok_secs`) says fresh. Without
-        // origin_last_ok_secs, this test fails because is_stale_with falls
-        // through to last_ok.elapsed() and cliffs the row.
-        let mut peer = PeerSummaryState::new(&PeerConfig {
-            name: "sage".into(),
-            ..Default::default()
-        });
-        // Dwell = 90s (past stale_after = 60), but origin polled sage 5s ago.
-        peer.last_ok = Instant::now().checked_sub(std::time::Duration::from_secs(90));
-        peer.origin_last_ok_secs = Some(5);
-        peer.latency_ms = Some(20);
+    fn carried_entry_is_judged_on_origin_age_plus_local_dwell() {
+        // #101 part 2 killed the 60s-dwell ghost cliff: a carried entry must
+        // not be cliffed by the RECEIVER's clock as though the receiver had
+        // polled it. That half still holds — a short dwell on top of a fresh
+        // origin reading stays Live.
+        //
+        // But it was implemented by FREEZING the origin's reading, which never
+        // moves. When the relaying hub itself goes away, nothing refreshes
+        // these rows again and every node it relayed renders Live forever.
+        // flock exists so the fleet view can be trusted, so freshness is now
+        // origin-age-at-capture PLUS dwell: honest at capture, and it decays.
+        let carried = |origin_secs: u64, dwell_secs: u64| {
+            let mut peer = PeerSummaryState::new(&PeerConfig {
+                name: "spoke2.invalid".into(),
+                ..Default::default()
+            });
+            // Far past stale_after, to prove the local clock is NOT the input.
+            peer.last_ok = Instant::now().checked_sub(Duration::from_secs(900));
+            peer.origin_last_ok_secs = Some(origin_secs);
+            peer.ingested_at = Instant::now().checked_sub(Duration::from_secs(dwell_secs));
+            peer.latency_ms = Some(20);
+            peer
+        };
 
+        // Origin polled it 5s before capture; it has sat here 10s. 15 < 60.
+        let fresh = carried(5, 10);
         assert!(
-            !peer.is_stale_with(60),
-            "origin-fresh entry must not cliff at local dwell = 90s"
+            !fresh.is_stale_with(60),
+            "a fresh origin reading must not cliff on the receiver's own clock"
+        );
+        assert_eq!(fresh.reachability_with(60, 200), PeerReachability::Live);
+
+        // Same origin reading, but nothing has refreshed it for 90s. The node
+        // has not been heard from in ~95s: it must stop looking alive.
+        let stale = carried(5, 90);
+        assert!(
+            stale.is_stale_with(60),
+            "a carried reading must decay — a dead hub cannot leave rows Live forever"
         );
         assert_eq!(
-            peer.reachability_with(60, 200),
-            PeerReachability::Live,
-            "dwell past stale_after cannot ghost an origin-fresh row"
-        );
-
-        // The FROZEN origin assertion also blocks Down: if the origin's
-        // assertion says stale (origin_last_ok_secs > stale_after), we ARE
-        // stale regardless of what a fresh local last_ok would say.
-        peer.last_ok = Some(Instant::now());
-        peer.origin_last_ok_secs = Some(120);
-        assert!(
-            peer.is_stale_with(60),
-            "origin-stale entry must render Down"
-        );
-        assert_eq!(
-            peer.reachability_with(60, 200),
+            stale.reachability_with(60, 200),
             PeerReachability::Down,
-            "origin's stale assertion wins over fresh local last_ok"
+            "unbounded confident Live is the one thing the fleet view must not show"
+        );
+
+        // The origin's own reading still dominates a fresh local last_ok.
+        let mut origin_stale = carried(120, 0);
+        origin_stale.last_ok = Some(Instant::now());
+        assert!(origin_stale.is_stale_with(60));
+        assert_eq!(
+            origin_stale.reachability_with(60, 200),
+            PeerReachability::Down,
+            "the origin's stale assertion wins over a fresh local last_ok"
         );
     }
 
+    /// Re-relaying must hand on the age INCLUDING our dwell, or each hop
+    /// resets the clock and a long chain launders a stale reading into a fresh
+    /// one. `FleetSnapshotState::to_wire` has always documented this ("ages are
+    /// recomputed so time spent on this server keeps counting"); now it is true.
+    #[test]
+    fn re_relayed_age_accumulates_dwell_rather_than_resetting() {
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        peer.origin_last_ok_secs = Some(10);
+        peer.ingested_at = Instant::now().checked_sub(Duration::from_secs(30));
+
+        let wire = peer_to_wire(&peer);
+        let carried = wire.origin_last_ok_secs.expect("age rides the wire");
+        assert!(
+            (40..=42).contains(&carried),
+            "expected origin 10s + 30s dwell, got {carried}"
+        );
+
+        // And the next hop starts its own dwell from that accumulated age.
+        let landed = peer_from_wire(wire);
+        assert_eq!(landed.origin_last_ok_secs, Some(carried));
+        assert!(landed.ingested_at.is_some(), "dwell restarts on ingest");
+    }
     #[test]
     fn fleet_peer_wire_missing_origin_last_ok_falls_back_to_age_secs() {
         // Mixed-version safety (#101 part 2): a pre-v22 wire has
