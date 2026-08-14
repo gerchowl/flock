@@ -1221,9 +1221,10 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
-        app.state.default_shell = "/usr/bin/true".into();
+        app.state.default_shell = crate::test_support::no_op_program();
         let (workspace, terminal, runtime) = Workspace::new(
-            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            // Any existing directory; this test asserts about panes, not paths.
+            std::env::temp_dir(),
             24,
             80,
             app.state.pane_scrollback_limit_bytes,

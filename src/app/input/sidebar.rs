@@ -486,7 +486,7 @@ impl AppState {
                     .relayed_fleet_cache
                     .get(&host_key)
                     .map(|entry| ServerFilter::Peer {
-                        ssh_target: entry.ssh_target.clone(),
+                        ssh_target: entry.peer.ssh_target.clone(),
                     });
             }
             // Origin-workspace rows are spaces-list folds, never band slots,

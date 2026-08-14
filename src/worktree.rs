@@ -209,6 +209,9 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
         .map_err(|err| err.to_string())?;
 
     if output.status.success() {
+        // A worktree add/remove/move relocates repo paths on disk, so every
+        // memoized path canonicalization must be re-derived (#262).
+        crate::workspace::git::invalidate_path_canonicalization();
         return Ok(());
     }
 
@@ -1156,6 +1159,9 @@ pub(crate) fn quarantine_worktree(
             dst.display()
         )
     })?;
+    // The checkout just moved on disk; memoized canonicalizations of its old
+    // path are now wrong (#262).
+    crate::workspace::git::invalidate_path_canonicalization();
 
     // Recovery breadcrumb. Deliberately Markdown so `less` renders cleanly.
     // A write failure here must NOT fail the quarantine: the worktree is
@@ -1186,7 +1192,7 @@ pub(crate) fn unquarantine_worktree(quarantined: &Path, dst: &Path) -> Result<()
         &["-C", &src_str, "worktree", "move", &src_str, &dst_str],
         None,
     )
-    .map(|_| ())
+    .map(|_| crate::workspace::git::invalidate_path_canonicalization())
     .map_err(|err| format!("git worktree move (unquarantine) failed: {err}"))
 }
 
@@ -1571,6 +1577,7 @@ mod tests {
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -1722,6 +1729,7 @@ mod tests {
         // The hub has its OWN clone of the same origin, with no feature-x yet.
         let hub = unique_temp_path("xchk-hub");
         let clone_ok = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args([
                 "clone",
                 "--quiet",
@@ -2053,6 +2061,7 @@ prunable stale
 
         assert!(checkout.join("README.md").exists());
         let branch_name = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(&checkout)
             .args(["branch", "--show-current"])
@@ -2465,6 +2474,7 @@ prunable stale
         run_git(&repo, &["branch", "feature/done"]);
         delete_local_branch(&repo, "feature/done").expect("branch delete should succeed");
         let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args([
                 "-C",
                 repo.to_str().unwrap(),

@@ -29,6 +29,7 @@ fn unique_test_dir() -> PathBuf {
 
 fn run_git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .arg("-C")
         .arg(repo)
         .args(args)

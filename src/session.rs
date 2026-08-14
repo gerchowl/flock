@@ -591,6 +591,7 @@ mod tests {
             "start".to_string(),
             "repro".to_string(),
             "--".to_string(),
+            // guardrails-ok(hermetic): argv fixture parsed by configure_from_args, never spawned
             "/bin/echo".to_string(),
             "--session".to_string(),
             "child-session".to_string(),
@@ -616,6 +617,7 @@ mod tests {
             "start".to_string(),
             "repro".to_string(),
             "--".to_string(),
+            // guardrails-ok(hermetic): argv fixture parsed by configure_from_args, never spawned
             "/bin/echo".to_string(),
             "--session=child-session".to_string(),
         ];

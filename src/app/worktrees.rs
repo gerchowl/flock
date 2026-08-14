@@ -1738,6 +1738,7 @@ mod tests {
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -3303,6 +3304,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let out = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
                 .args([
                     "-C",
                     repo.to_str().unwrap(),
@@ -3354,6 +3356,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(200));
         let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args([
                 "-C",
                 repo.to_str().unwrap(),

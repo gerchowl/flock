@@ -945,6 +945,7 @@ mod tests {
     #[test]
     fn procargs2_argv_excludes_environment_entries() {
         let buf = build_procargs2(
+            // guardrails-ok(hermetic): process-name parsing fixture, never executed
             "/usr/bin/node",
             &["node", "/Users/can/.local/bin/pi"],
             &[

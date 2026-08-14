@@ -1270,6 +1270,7 @@ mod tests {
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -1304,6 +1305,7 @@ mod tests {
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
         std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args([
@@ -1674,7 +1676,7 @@ mod tests {
         let repo = create_committed_repo("api-worktree-open-source-repo");
         let event_hub = crate::api::EventHub::default();
         let mut app = test_app_with_event_hub(event_hub.clone());
-        app.state.default_shell = "/usr/bin/true".into();
+        app.state.default_shell = crate::test_support::no_op_program();
 
         let response = app.handle_api_request(Request {
             id: "req".into(),

@@ -19,7 +19,7 @@ export GIT_CONFIG_VALUE_0 := "main"
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
-    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt
+    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_hermetic_tests scripts.test_platform_test_gap
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
@@ -43,7 +43,8 @@ ci filter='all()': lint
 
 # Check formatting + run unit tests + maintenance script tests
 check: ci
-    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt
+    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_hermetic_tests scripts.test_platform_test_gap
+    @python3 scripts/platform_test_gap.py
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 # Install the guardrails git hooks (gates + conventional-commit check) via prek.
