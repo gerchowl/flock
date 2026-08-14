@@ -1863,6 +1863,24 @@ pub(crate) struct PromptHistoryAnchor {
     pub at: Option<std::time::SystemTime>,
 }
 
+/// The sidebar's project-section grouping, remembered between calls (#262).
+///
+/// `project_section_keys` is a pure function of the workspaces' git identity,
+/// but the sidebar asks for it around twenty times per frame — once per section
+/// row and once per `workspace_list_entries` call — and every rebuild sweeps
+/// the whole fleet and allocates a `String` per workspace. `fingerprint` hashes
+/// exactly the inputs the grouping reads, so the memo re-derives itself the
+/// moment any of them moves and no writer has to remember to invalidate it.
+///
+/// Both vectors are `Rc` so handing a caller the grouping costs a refcount
+/// bump rather than a fleet-sized clone.
+#[derive(Debug, Clone)]
+pub(crate) struct SectionGroupingMemo {
+    pub(crate) fingerprint: u64,
+    pub(crate) section_keys: std::rc::Rc<Vec<Option<String>>>,
+    pub(crate) sort_ids: std::rc::Rc<Vec<Option<String>>>,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -2132,6 +2150,8 @@ pub struct AppState {
     pub sheep_wipe_until: Option<std::time::Instant>,
     /// Persistent state for the stage-2 sidebar screensaver simulation.
     pub(crate) screensaver_sim: std::cell::RefCell<crate::ui::screensaver::ScreensaverSim>,
+    /// Memoized project-section grouping (#262). See `SectionGroupingMemo`.
+    pub(crate) section_grouping_memo: std::cell::RefCell<Option<SectionGroupingMemo>>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -2913,6 +2933,7 @@ impl AppState {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
+            section_grouping_memo: std::cell::RefCell::new(None),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {

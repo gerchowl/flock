@@ -119,6 +119,14 @@ impl App {
         } = ev
         {
             self.git_refresh_in_flight = false;
+            // #262: the periodic probe is flock's freshness contract for every
+            // other git fact it shows, so it is also the right cadence for the
+            // memoized filesystem answers the render path reads (repo-family
+            // verdicts, cwd-derived labels). Re-deriving them once per round
+            // costs O(workspaces) syscalls per 1.5s instead of per frame, and
+            // keeps a `git init` or a hand-moved checkout from being invisible
+            // until the next worktree op.
+            crate::workspace::git::invalidate_path_canonicalization();
             for (key, entry) in cache_updates {
                 self.git_status_cache.insert(key, entry);
             }
