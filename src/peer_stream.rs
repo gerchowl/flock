@@ -71,6 +71,19 @@ struct PeerStream {
     latest_push: Arc<Mutex<Option<String>>>,
 }
 
+/// Whether a relay line is an unsolicited push rather than a response.
+///
+/// Decided on the parsed object's top-level `push` member, never on the
+/// serialized text. A substring test cannot tell a `push` KEY from a `push`
+/// VALUE, and the summary payload carries arbitrary user-controlled strings —
+/// workspace labels, branch names, agent statuses. A branch named `push` was
+/// enough to route that peer's summary RESPONSE into the push slot, stranding
+/// the caller until `REQUEST_TIMEOUT` and tearing the connection down into its
+/// reconnect backoff, every round, for as long as the name existed.
+fn line_is_push(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value.get("push").is_some())
+}
+
 impl PeerStream {
     fn spawn(peer: &PeerConfig) -> Result<Self, String> {
         let mut child = crate::process::TracedCommand::new("ssh", "peers")
@@ -108,7 +121,7 @@ impl PeerStream {
                 // A push carries `push` where a response carries `id`, so
                 // routing needs no guessing. Anything else is a response and
                 // belongs to whoever is waiting on the channel.
-                if line.contains("\"push\"") {
+                if line_is_push(&line) {
                     if let Ok(mut slot) = push_slot.lock() {
                         *slot = Some(line);
                     }
@@ -291,6 +304,45 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A response must never be mistaken for a push just because the peer's
+    /// own data mentions one. The summary payload is full of user-controlled
+    /// strings, and a workspace or branch named `push` used to strand every
+    /// response from that peer: the caller waited out `REQUEST_TIMEOUT`, the
+    /// stream was torn down, and the peer fell back to one-shot ssh with a
+    /// 15s stall per poll for as long as the name existed.
+    #[test]
+    fn a_response_mentioning_push_is_not_routed_as_a_push() {
+        let push = r#"{"push":"peers.summary","result":{"host":"anvil","workspaces":[]}}"#;
+        assert!(line_is_push(push), "the emitter's push shape must route");
+
+        // The poisoned response: a workspace labelled `push`, which serializes
+        // to the very substring the old check looked for.
+        let response = r#"{"id":"stream-1","result":{"host":"anvil","workspaces":[{"label":"push","branch":"main"}]}}"#;
+        assert!(
+            !line_is_push(response),
+            "a `push` VALUE in the payload is not a push KEY"
+        );
+
+        // A branch named `push` is the same trap by another route.
+        let branch =
+            r#"{"id":"stream-2","result":{"workspaces":[{"label":"api","branch":"push"}]}}"#;
+        assert!(!line_is_push(branch));
+
+        // `peers.checkout_prepare` answers carry a genuine `push` field. It
+        // rides one-shot ssh today, but if it ever moves onto the stream it
+        // must not self-route.
+        let checkout = r#"{"id":"stream-3","result":{"branch":"main","push":true,"pushed":true}}"#;
+        assert!(
+            !line_is_push(checkout),
+            "a nested `push` field is not a top-level push envelope"
+        );
+
+        // Garbage stays a response: the caller's parse reports it, rather than
+        // it vanishing into the push slot where nobody would ever see it.
+        assert!(!line_is_push("not json at all"));
+        assert!(!line_is_push(""));
     }
 
     #[test]
