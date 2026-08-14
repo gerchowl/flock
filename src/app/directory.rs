@@ -99,8 +99,9 @@ impl App {
                 }
             }
         }
-        for peer in self.state.relayed_fleet_cache.values() {
-            let host = peer.host.clone().unwrap_or_else(|| peer.name.clone());
+        for entry in self.state.relayed_fleet_cache.values() {
+            let peer = &entry.peer;
+            let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             // A relayed entry is reachable only via the origin that relayed
             // it; we have no direct edge, so there is no route of our own.
             let route: Option<String> = None;

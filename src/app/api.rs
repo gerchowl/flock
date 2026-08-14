@@ -119,6 +119,14 @@ impl App {
         } = ev
         {
             self.git_refresh_in_flight = false;
+            // #262: the periodic probe is flock's freshness contract for every
+            // other git fact it shows, so it is also the right cadence for the
+            // memoized filesystem answers the render path reads (repo-family
+            // verdicts, cwd-derived labels). Re-deriving them once per round
+            // costs O(workspaces) syscalls per 1.5s instead of per frame, and
+            // keeps a `git init` or a hand-moved checkout from being invisible
+            // until the next worktree op.
+            crate::workspace::git::invalidate_path_canonicalization();
             for (key, entry) in cache_updates {
                 self.git_status_cache.insert(key, entry);
             }
@@ -217,7 +225,19 @@ impl App {
                 }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let fetch = crate::peers::fetch_peer_summary(&peer);
+                    // The in-flight guard is released only by the event this
+                    // sends, so the fetch must not be able to unwind past it
+                    // (see `fetch_with_panic_guard`).
+                    //
+                    // Note what this does NOT recover: a panic raised while
+                    // `peer_stream::request` held the peer's slot mutex leaves
+                    // that slot poisoned, so the held connection is dropped and
+                    // the peer falls back to one-shot ssh. That is handled
+                    // where the poison is observed, in `peer_stream::request`.
+                    let peer_name = peer.name.clone();
+                    let fetch = crate::peers::fetch_with_panic_guard(&peer_name, || {
+                        crate::peers::fetch_peer_summary(&peer)
+                    });
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });
             }
@@ -263,16 +283,15 @@ impl App {
                             // origin_summary path.
                             continue;
                         }
-                        // Freshest-wins: replace an older cached entry using
-                        // the origin's own assertion (`origin_last_ok_secs`,
-                        // #101 part 2) so cross-hub ties resolve honestly,
-                        // falling back to `age_secs` for a v(N-1) origin.
-                        let existing_freshness = |peer: &crate::api::schema::RelayedFleetPeer| {
-                            peer.origin_last_ok_secs.or(peer.age_secs)
-                        };
+                        // Freshest-wins across hubs. Compared on the LIVE age
+                        // (origin's reading plus however long it has sat here),
+                        // not the capture-time reading, so a hub that has gone
+                        // quiet cannot keep winning against one still polling.
+                        let materialised = crate::peers::relayed_entry_from_wire(entry);
+                        let challenger_age = materialised.peer.carried_age_secs();
                         let insert = match self.state.relayed_fleet_cache.get(&host_key) {
                             Some(existing) => {
-                                match (existing_freshness(existing), existing_freshness(&entry)) {
+                                match (existing.peer.carried_age_secs(), challenger_age) {
                                     (Some(cur), Some(new)) => new <= cur,
                                     (None, Some(_)) => true,
                                     (Some(_), None) => false,
@@ -282,7 +301,9 @@ impl App {
                             None => true,
                         };
                         if insert {
-                            self.state.relayed_fleet_cache.insert(host_key, entry);
+                            self.state
+                                .relayed_fleet_cache
+                                .insert(host_key, materialised);
                         }
                     }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
@@ -321,6 +342,13 @@ impl App {
                 }
                 Err(error) => summary.error = Some(error),
             }
+            // Drop relay rows nothing has refreshed for long enough that they
+            // carry no information (#101). Without this the cache only ever
+            // grows: a host that leaves the fleet, is renamed, or is
+            // re-addressed keeps its row for the process lifetime, keeps
+            // rendering, and keeps riding outgoing snapshots to other servers.
+            // Only meaningful now that carried freshness decays.
+            self.state.evict_expired_relayed_entries();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;
@@ -1260,6 +1288,7 @@ mod tests {
 
     fn init_repo(path: &std::path::Path) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "-q"])
             .current_dir(path)
             .status()

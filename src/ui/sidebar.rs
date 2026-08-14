@@ -436,7 +436,7 @@ fn workspace_row_height(_ws: &crate::workspace::Workspace) -> u16 {
 /// Member workspaces of one project section (#33), by section key.
 fn section_member_indices(app: &AppState, key: &str) -> Vec<usize> {
     app.project_section_keys()
-        .into_iter()
+        .iter()
         .enumerate()
         .filter(|(_, section)| section.as_deref() == Some(key))
         .map(|(ws_idx, _)| ws_idx)
@@ -6288,6 +6288,8 @@ mod tests {
         // unit-testable here because `short_host_name()` caches in a OnceLock.
         let order_with = |aaa_first: bool| {
             let mut app = crate::app::state::AppState::test_new();
+            // Sorts as "mmm" because `Workspace::test_new` pins identity_cwd
+            // to the fixture name (#268) — not because of the checkout dir.
             let local = Workspace::test_new("mmm");
             let pane = local.tabs[0].root_pane;
             app.workspaces = vec![local];

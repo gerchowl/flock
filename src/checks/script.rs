@@ -295,6 +295,20 @@ mod tests {
         }
     }
 
+    /// A check whose script may call out to real binaries.
+    ///
+    /// `run_script` deliberately `env_clear()`s, so a script it runs has no
+    /// `PATH`. On an FHS distro `/bin/sh` still finds `sleep` or `dd` through
+    /// its compiled-in fallback (`/bin:/usr/bin`); on NixOS that fallback
+    /// resolves to nothing and the script dies "command not found". Pass
+    /// `PATH` the way a real check with an `env` block would.
+    fn script_with_path(program: PathBuf, timeout_secs: u64) -> ScriptCheck {
+        let mut check = script(program, timeout_secs);
+        let (key, value) = crate::test_support::path_env_pair();
+        check.env.insert(key, value);
+        check
+    }
+
     #[test]
     fn exit_zero_fires() {
         let dir = temp_dir("fires");
@@ -319,7 +333,7 @@ mod tests {
         // sleep well past a 1s timeout — the watchdog SIGTERMs, then
         // (well within the 5s grace) the child dies and try_wait returns.
         let script_path = write_script(&dir, "sleep.sh", "#!/bin/sh\nsleep 10\n");
-        let (outcome, _output) = run_script(&script(script_path, 1));
+        let (outcome, _output) = run_script(&script_with_path(script_path, 1));
         match outcome {
             Outcome::Error(reason) => assert!(
                 reason.contains("timed out"),
@@ -360,7 +374,7 @@ mod tests {
                 (OUTPUT_CAP_BYTES / 1024) * 4
             ),
         );
-        let (outcome, output) = run_script(&script(script_path, 5));
+        let (outcome, output) = run_script(&script_with_path(script_path, 5));
         assert_eq!(outcome, Outcome::Fire);
         assert!(output.stdout.len() <= OUTPUT_CAP_BYTES);
         assert!(

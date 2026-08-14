@@ -38,3 +38,14 @@ retries = 2
 # them run in parallel but retry to ride out timing hiccups under CI load.
 filter = 'kind(test)'
 retries = 2
+
+# NOTE: nextest IGNORES a top-level `[env]` table — it warns "ignoring unknown
+# configuration keys: env" and carries on, so pinning the test environment here
+# looks like it works and does nothing. Verified against cargo-nextest 0.9.133.
+#
+# Determinism therefore lives in two places that actually take effect:
+#   * the justfile exports (`just test` / `just check`), and
+#   * the test code itself — git is invoked with explicit `-c` overrides so a
+#     developer's global/system git config cannot change the outcome (#268).
+#
+# The second is the one that survives a bare `cargo nextest run`.

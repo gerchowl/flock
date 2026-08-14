@@ -142,12 +142,19 @@ pub struct PeerSummaryState {
     /// Last poll error, cleared on success.
     pub error: Option<String>,
     /// Gossip v3 (#101 part 2): the ORIGIN's report age at CAPTURE time, in
-    /// seconds. FROZEN — receiver dwell does NOT tick it up. Set from a wire
+    /// seconds. Set from a wire
     /// [`crate::protocol::FleetPeer::origin_last_ok_secs`] on snapshot ingest
     /// and from a relayed entry's field on cache merge. `None` for locally
     /// polled config peers, where `last_ok` (a real Instant) carries the
     /// freshness and staleness falls back to the local-dwell path.
+    ///
+    /// This is the age AT CAPTURE and does not move on its own; freshness is
+    /// this plus [`Self::ingested_at`]'s dwell. See `is_stale_with`.
     pub origin_last_ok_secs: Option<u64>,
+    /// When a carried/relayed entry landed here — the clock that turns
+    /// [`Self::origin_last_ok_secs`] from a fixed capture-time reading into a
+    /// live age. `None` for locally polled peers, which have a real `last_ok`.
+    pub ingested_at: Option<Instant>,
     /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching this
     /// peer. Set by the hub on relay so a receiver dialing a snapshot row
     /// routes through the hub instead of trying the target directly. `None`
@@ -174,6 +181,7 @@ impl PeerSummaryState {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         }
@@ -185,19 +193,61 @@ impl PeerSummaryState {
 
     /// Config-aware staleness (#96): uses the caller-supplied threshold.
     ///
-    /// Gossip v3 (#101 part 2): a carried / relayed entry judges freshness
-    /// against the ORIGIN's report age at capture — FROZEN, not the receiver's
-    /// dwell — so a snapshot entry that the origin polled 5s before capture
-    /// stays fresh even after 90s of local dwell. Locally-polled entries
-    /// (`origin_last_ok_secs = None`) keep the pre-v3 last_ok.elapsed() path.
+    /// A carried / relayed entry is judged on the ORIGIN's report age at
+    /// capture PLUS the time it has since sat here. Both halves matter:
+    ///
+    /// * without the origin's age, a snapshot entry decays against the
+    ///   receiver's own clock as though the receiver had polled it, which is
+    ///   the 60s-dwell ghost cliff #101 part 2 set out to kill;
+    /// * without dwell, the reading is frozen at capture and never moves —
+    ///   so when the relaying hub itself goes away and nothing refreshes
+    ///   these rows again, every node it relayed renders Live forever.
+    ///
+    /// The second is the worse failure. flock exists so the fleet view can be
+    /// trusted; a node that stopped answering must stop looking alive, and an
+    /// unbounded confident lie is strictly worse than showing it as gone.
+    ///
+    /// Locally-polled entries (`origin_last_ok_secs = None`) keep the
+    /// `last_ok.elapsed()` path — there `last_ok` is a real local Instant and
+    /// already carries both halves.
+    /// Reads the clock. See [`Self::is_stale_at`] for the decision itself.
     pub fn is_stale_with(&self, stale_after_secs: u64) -> bool {
-        if let Some(origin_secs) = self.origin_last_ok_secs {
-            return origin_secs > stale_after_secs;
+        self.is_stale_at(Instant::now(), stale_after_secs)
+    }
+
+    /// Staleness as of `now` — the whole decision, with no ambient clock.
+    ///
+    /// Time enters this module here and in [`Self::carried_age_secs_at`], and
+    /// nowhere else. That is what lets a test advance the clock by ninety
+    /// seconds and assert on the result, rather than back-dating a field and
+    /// hoping the arithmetic underneath matches. It also matches how the
+    /// headless loop already works, where `now` is sampled once per pass and
+    /// threaded into `can_render_now`, `unattended_render_due` and the
+    /// scheduled-task handlers.
+    pub fn is_stale_at(&self, now: Instant, stale_after_secs: u64) -> bool {
+        if let Some(age) = self.carried_age_secs_at(now) {
+            return age > stale_after_secs;
         }
         match self.last_ok {
-            Some(at) => at.elapsed().as_secs() > stale_after_secs,
+            Some(at) => now.saturating_duration_since(at).as_secs() > stale_after_secs,
             None => true,
         }
+    }
+
+    /// Reads the clock. See [`Self::carried_age_secs_at`].
+    pub fn carried_age_secs(&self) -> Option<u64> {
+        self.carried_age_secs_at(Instant::now())
+    }
+
+    /// Live age of a carried/relayed entry as of `now`: the origin's age at
+    /// capture plus local dwell. `None` for a locally polled peer.
+    pub fn carried_age_secs_at(&self, now: Instant) -> Option<u64> {
+        let origin_secs = self.origin_last_ok_secs?;
+        let dwell = self
+            .ingested_at
+            .map(|at| now.saturating_duration_since(at).as_secs())
+            .unwrap_or(0);
+        Some(origin_secs.saturating_add(dwell))
     }
 
     /// The name to DISPLAY for this node (#42): the configured `[[peers]]`
@@ -215,12 +265,23 @@ impl PeerSummaryState {
 
     /// Config-aware reachability (#96) — the live-config path. The zero-arg
     /// twin above stays for the fleet-snapshot rendering seam (#101).
+    /// Reads the clock. See [`Self::reachability_at`].
     pub fn reachability_with(
         &self,
         stale_after_secs: u64,
         slow_threshold_ms: u64,
     ) -> PeerReachability {
-        if self.is_stale_with(stale_after_secs) || self.error.is_some() {
+        self.reachability_at(Instant::now(), stale_after_secs, slow_threshold_ms)
+    }
+
+    /// Reachability as of `now`.
+    pub fn reachability_at(
+        &self,
+        now: Instant,
+        stale_after_secs: u64,
+        slow_threshold_ms: u64,
+    ) -> PeerReachability {
+        if self.is_stale_at(now, stale_after_secs) || self.error.is_some() {
             PeerReachability::Down
         } else if self.latency_ms.is_some_and(|ms| ms > slow_threshold_ms) {
             PeerReachability::Slow
@@ -299,9 +360,60 @@ impl FleetSnapshotState {
 /// `to_wire`). Far above any realistic personal fleet.
 pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
 
+/// One entry in the relay cache: a peer some hub told us about.
+///
+/// Holds a materialised [`PeerSummaryState`] rather than the wire shape, so the
+/// sidebar can render a relayed node exactly like any other peer instead of the
+/// row existing only to be forwarded onward (#101 part 1 follow-up).
+///
+/// The wire entry's `origin` is deliberately NOT carried: it is consumed at
+/// merge time, where loop prevention drops rows this server itself originated,
+/// and nothing downstream needs to know which hub a row arrived through. The
+/// reachable identity a receiver does need travels separately, on the peer's
+/// own `proxy_jump`.
+#[derive(Debug, Clone)]
+pub struct RelayedEntry {
+    /// The relayed peer, in the same shape as a locally polled one.
+    pub peer: PeerSummaryState,
+}
+
+/// Materialise a relayed wire entry into the shape every rendering surface
+/// already understands.
+pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> RelayedEntry {
+    RelayedEntry {
+        peer: PeerSummaryState {
+            peer: entry.name,
+            ssh_target: entry.ssh_target,
+            host: entry.host,
+            version: entry.version,
+            protocol: entry.protocol,
+            system: entry.system,
+            latency_ms: entry.latency_ms,
+            workspaces: entry.workspaces,
+            last_ok: entry
+                .age_secs
+                .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
+            error: entry.error,
+            // Prefer the explicit origin assertion; fall back to `age_secs` for
+            // a v(N-1) hub that does not send one.
+            origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
+            // Dwell starts now — this is when the reading entered this server.
+            ingested_at: Some(Instant::now()),
+            proxy_jump: entry.proxy_jump,
+            icon: entry.icon,
+        },
+    }
+}
+
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
+    peer_to_wire_at(Instant::now(), peer)
+}
+
+/// Encode as of `now`, so the ages that ride the wire are testable without
+/// waiting for real seconds to pass.
+pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
     crate::protocol::FleetPeer {
         name: peer.peer.clone(),
         ssh_target: peer.ssh_target.clone(),
@@ -311,15 +423,20 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         system: peer.system.clone().map(Into::into),
         latency_ms: peer.latency_ms,
         workspaces: peer.workspaces.iter().cloned().map(Into::into).collect(),
-        age_secs: peer.last_ok.map(|at| at.elapsed().as_secs()),
+        age_secs: peer
+            .last_ok
+            .map(|at| now.saturating_duration_since(at).as_secs()),
         error: peer.error.clone(),
         // Gossip v3 (#101 part 2): forward the frozen origin assertion when
         // the source was a snapshot / relay entry that already carried it.
         // Otherwise the local-poll last_ok IS the origin and doubles as the
         // frozen assertion at capture time (age_secs).
-        origin_last_ok_secs: peer
-            .origin_last_ok_secs
-            .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
+        // Carry the age INCLUDING our dwell, so a second hop inherits an
+        // honest reading rather than the capture-time one we were handed.
+        origin_last_ok_secs: peer.carried_age_secs_at(now).or_else(|| {
+            peer.last_ok
+                .map(|at| now.saturating_duration_since(at).as_secs())
+        }),
         proxy_jump: peer.proxy_jump.clone(),
         icon: peer.icon.clone(),
     }
@@ -348,6 +465,8 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         // pre-v22 wires so an entry from an older peer still gets the
         // origin-honest staleness path instead of decaying against dwell.
         origin_last_ok_secs: peer.origin_last_ok_secs.or(peer.age_secs),
+        // Dwell starts now: this is the moment the reading entered this server.
+        ingested_at: Some(Instant::now()),
         proxy_jump: peer.proxy_jump,
         icon: peer.icon,
     }
@@ -376,6 +495,30 @@ pub struct PeerSummaryPayload {
 pub struct PeerSummaryFetch {
     pub peer: String,
     pub result: Result<PeerSummaryPayload, String>,
+}
+
+/// Run a peer fetch so that a panic becomes a failed poll instead of a lost
+/// completion event.
+///
+/// `PeerPollTracker::should_poll_now` marks a peer in-flight before its worker
+/// is spawned, and the ONLY release is the `PeerSummaryFetched` the worker
+/// sends back. A worker that unwound sent nothing, so that peer was never
+/// polled again for the rest of the process lifetime — with no symptom but a
+/// row that quietly went stale while every other peer kept updating.
+///
+/// Takes the fetch as a closure so the guard is testable without a reachable
+/// peer: the dispatcher passes the real SSH fetch, a test passes one that
+/// panics.
+pub fn fetch_with_panic_guard<F>(peer_name: &str, fetch: F) -> PeerSummaryFetch
+where
+    F: FnOnce() -> PeerSummaryFetch,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch)).unwrap_or_else(|_| {
+        PeerSummaryFetch {
+            peer: peer_name.to_string(),
+            result: Err("peer summary fetch panicked".to_string()),
+        }
+    })
 }
 
 /// Fetch a peer's summary over SSH (blocking; run off the UI thread). The
@@ -739,6 +882,7 @@ mod tests {
             last_ok: None,
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         };
@@ -803,6 +947,7 @@ mod tests {
                 .and_then(|secs| Instant::now().checked_sub(std::time::Duration::from_secs(secs))),
             error: None,
             origin_last_ok_secs: None,
+            ingested_at: None,
             proxy_jump: None,
             icon: None,
         }
@@ -1108,48 +1253,120 @@ Last login: banner noise
     }
 
     #[test]
-    fn carried_entry_fresh_by_origin_survives_dwell_past_stale_after() {
-        // Gossip v3 (#101) part 2 (RED): the 60s-dwell ghost cliff dies.
-        // A carried snapshot entry whose local `last_ok` is far past the
-        // configured `stale_after` still renders Live when the ORIGIN's
-        // frozen assertion (`origin_last_ok_secs`) says fresh. Without
-        // origin_last_ok_secs, this test fails because is_stale_with falls
-        // through to last_ok.elapsed() and cliffs the row.
+    fn carried_entry_is_judged_on_origin_age_plus_local_dwell() {
+        // #101 part 2 killed the 60s-dwell ghost cliff: a carried entry must
+        // not be cliffed by the RECEIVER's clock as though the receiver had
+        // polled it. That half still holds — a short dwell on top of a fresh
+        // origin reading stays Live.
+        //
+        // But it was implemented by FREEZING the origin's reading, which never
+        // moves. When the relaying hub itself goes away, nothing refreshes
+        // these rows again and every node it relayed renders Live forever.
+        // flock exists so the fleet view can be trusted, so freshness is now
+        // origin-age-at-capture PLUS dwell: honest at capture, and it decays.
+        //
+        // Time is a PARAMETER here, not a fact about when the test ran: the
+        // entry is stamped once and the clock is advanced, which is what the
+        // production path actually does.
+        let ingested = Instant::now();
         let mut peer = PeerSummaryState::new(&PeerConfig {
-            name: "sage".into(),
+            name: "spoke2.invalid".into(),
             ..Default::default()
         });
-        // Dwell = 90s (past stale_after = 60), but origin polled sage 5s ago.
-        peer.last_ok = Instant::now().checked_sub(std::time::Duration::from_secs(90));
+        // Deliberately ancient, to prove the local clock is NOT the input.
+        peer.last_ok = ingested.checked_sub(Duration::from_secs(900));
         peer.origin_last_ok_secs = Some(5);
+        peer.ingested_at = Some(ingested);
         peer.latency_ms = Some(20);
 
+        // 10s later: origin polled it 5s before capture, so ~15s known age.
+        let soon = ingested + Duration::from_secs(10);
+        assert_eq!(peer.carried_age_secs_at(soon), Some(15));
         assert!(
-            !peer.is_stale_with(60),
-            "origin-fresh entry must not cliff at local dwell = 90s"
+            !peer.is_stale_at(soon, 60),
+            "a fresh origin reading must not cliff on the receiver's own clock"
+        );
+        assert_eq!(peer.reachability_at(soon, 60, 200), PeerReachability::Live);
+
+        // 90s later, nothing having refreshed it: ~95s unheard-from.
+        let later = ingested + Duration::from_secs(90);
+        assert_eq!(peer.carried_age_secs_at(later), Some(95));
+        assert!(
+            peer.is_stale_at(later, 60),
+            "a carried reading must decay — a dead hub cannot leave rows Live forever"
         );
         assert_eq!(
-            peer.reachability_with(60, 200),
-            PeerReachability::Live,
-            "dwell past stale_after cannot ghost an origin-fresh row"
+            peer.reachability_at(later, 60, 200),
+            PeerReachability::Down,
+            "unbounded confident Live is the one thing the fleet view must not show"
         );
 
-        // The FROZEN origin assertion also blocks Down: if the origin's
-        // assertion says stale (origin_last_ok_secs > stale_after), we ARE
-        // stale regardless of what a fresh local last_ok would say.
-        peer.last_ok = Some(Instant::now());
-        peer.origin_last_ok_secs = Some(120);
-        assert!(
-            peer.is_stale_with(60),
-            "origin-stale entry must render Down"
-        );
+        // The origin's own reading still dominates a fresh local last_ok.
+        let mut origin_stale = peer.clone();
+        origin_stale.origin_last_ok_secs = Some(120);
+        origin_stale.last_ok = Some(ingested);
+        assert!(origin_stale.is_stale_at(ingested, 60));
         assert_eq!(
-            peer.reachability_with(60, 200),
+            origin_stale.reachability_at(ingested, 60, 200),
             PeerReachability::Down,
-            "origin's stale assertion wins over fresh local last_ok"
+            "the origin's stale assertion wins over a fresh local last_ok"
         );
     }
 
+    /// The ambient wrapper must not drift from the decision it delegates to.
+    /// A seam is only worth having if the production path goes through it.
+    #[test]
+    fn ambient_clock_wrappers_agree_with_the_at_now_core() {
+        let ingested = Instant::now();
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        peer.origin_last_ok_secs = Some(3);
+        peer.ingested_at = Some(ingested);
+        peer.latency_ms = Some(10);
+
+        // `Instant::now()` is a hair past `ingested`, so the ambient reading
+        // must equal the explicit one taken at this moment.
+        assert_eq!(
+            peer.carried_age_secs(),
+            peer.carried_age_secs_at(Instant::now())
+        );
+        assert_eq!(peer.is_stale_with(60), peer.is_stale_at(Instant::now(), 60));
+        assert_eq!(
+            peer.reachability_with(60, 200),
+            peer.reachability_at(Instant::now(), 60, 200)
+        );
+    }
+
+    /// Re-relaying must hand on the age INCLUDING our dwell, or each hop
+    /// resets the clock and a long chain launders a stale reading into a fresh
+    /// one. `FleetSnapshotState::to_wire` has always documented this ("ages are
+    /// recomputed so time spent on this server keeps counting"); now it is true.
+    #[test]
+    fn re_relayed_age_accumulates_dwell_rather_than_resetting() {
+        let ingested = Instant::now();
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        peer.origin_last_ok_secs = Some(10);
+        peer.ingested_at = Some(ingested);
+
+        // Exactly 30s of dwell — no tolerance window needed now that the
+        // clock is an argument rather than whatever the test machine did.
+        let wire = peer_to_wire_at(ingested + Duration::from_secs(30), &peer);
+        assert_eq!(
+            wire.origin_last_ok_secs,
+            Some(40),
+            "origin's 10s at capture plus 30s of dwell here"
+        );
+
+        // And the next hop starts its own dwell from that accumulated age.
+        let landed = peer_from_wire(wire);
+        assert_eq!(landed.origin_last_ok_secs, Some(40));
+        assert!(landed.ingested_at.is_some(), "dwell restarts on ingest");
+    }
     #[test]
     fn fleet_peer_wire_missing_origin_last_ok_falls_back_to_age_secs() {
         // Mixed-version safety (#101 part 2): a pre-v22 wire has
@@ -1216,6 +1433,47 @@ Last login: banner noise
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["name"], "sage");
         assert_eq!(value["origin_last_ok_secs"], 3);
+    }
+
+    /// A fetch worker that panics must still produce a completion, or the
+    /// peer's in-flight guard is never released and it is silently never
+    /// polled again for the rest of the process lifetime.
+    ///
+    /// Drives `fetch_with_panic_guard` with a panicking fetch — remove the
+    /// guard and this test unwinds instead of asserting. An earlier version
+    /// called `mark_finished` directly on a synthetic `Err`, which passed just
+    /// as well against the UNGUARDED code: `mark_finished` never looks at the
+    /// result, so it proved nothing about the panic path.
+    #[test]
+    fn a_panicking_fetch_still_completes_and_frees_the_peer_to_poll_again() {
+        // The panic is deliberate; keep the default hook from printing a
+        // backtrace that makes a passing test read like a failing one.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let fetched = fetch_with_panic_guard("anvil", || panic!("summary parser blew up"));
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(fetched.peer, "anvil", "the completion names the right peer");
+        assert!(
+            fetched.result.is_err(),
+            "a panicked fetch reports as a failed poll, not a success"
+        );
+
+        // And that completion is what frees the peer: the dispatcher hands it
+        // to the tracker exactly like any other result.
+        let mut tracker = PeerPollTracker::new();
+        let now = Instant::now();
+        assert!(tracker.should_poll_now(&fetched.peer, now, Duration::from_secs(15)));
+        assert!(tracker.in_flight("anvil"));
+        tracker.mark_finished(&fetched.peer);
+        assert!(
+            tracker.should_poll_now(
+                "anvil",
+                now + Duration::from_secs(15),
+                Duration::from_secs(15)
+            ),
+            "the peer must be polled again on the next round"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitSpaceMetadata {
@@ -245,6 +246,30 @@ fn host_is_case_insensitive(host: &str) -> bool {
 
 pub(crate) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Generation counter for memoized path canonicalizations (#262).
+///
+/// `Workspace::worktree_space_here` decides repo-family sameness by
+/// `realpath(2)`-ing two keys — a syscall the sidebar used to run per
+/// workspace, per section, per frame (4,618 of them to paint one frame of a
+/// 32-workspace fleet, which pegged a core). The verdict is now memoized on the
+/// workspace, keyed by the two key strings, so a change to either key
+/// recomputes on its own.
+///
+/// This epoch covers the one case that keying cannot: the key strings stay
+/// identical while the filesystem underneath them moves. Bump it from anything
+/// that relocates a repo path on disk and every memo recomputes.
+static PATH_CANONICALIZATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn path_canonicalization_epoch() -> u64 {
+    PATH_CANONICALIZATION_EPOCH.load(Ordering::Relaxed)
+}
+
+/// Invalidate every memoized canonicalization. Call after any operation that
+/// can move a repo path on disk (worktree add/remove/move, quarantine).
+pub(crate) fn invalidate_path_canonicalization() {
+    PATH_CANONICALIZATION_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 fn git_common_dir_for_git_dir(git_dir: &Path) -> PathBuf {
@@ -517,6 +542,7 @@ mod tests {
         let root = temp_test_dir("reftable-branch");
         let root_arg = root.to_string_lossy().to_string();
         let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
             .output()
             .unwrap();
@@ -739,6 +765,7 @@ mod tests {
         let root = temp_test_dir("reftable-ref-oid");
         let root_arg = root.to_string_lossy().to_string();
         let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
             .output()
             .unwrap();
