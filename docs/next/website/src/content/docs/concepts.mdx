@@ -44,9 +44,9 @@ A session is a persistent Flock server namespace. The default `flock` command at
 Named sessions are separate runtime namespaces:
 
 ```bash
-flock session list
-flock session attach work
-flock session attach side-project
+flk session list
+flk session attach work
+flk session attach side-project
 ```
 
 Use workspaces first. Use named sessions when you need completely separate panes, sockets, and persisted runtime state.
@@ -62,7 +62,7 @@ Detach the client with `ctrl+b q`. The server and agents continue running.
 If you want to end the session and stop its panes, stop the server:
 
 ```bash
-flock server stop
+flk server stop
 ```
 
 ## Modes
