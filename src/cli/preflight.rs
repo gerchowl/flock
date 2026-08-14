@@ -15,6 +15,10 @@
 //! Deliberately offline. Preflight runs inside an activation, so it must never
 //! dial a peer or fetch: it cannot be allowed to hang an apply. Peer
 //! reachability belongs to `flk status`, on a different clock.
+//!
+//! That promise covers network DIALS, not all I/O — the checks stat paths and
+//! read the config, so a `worktrees.directory` on a wedged network mount can
+//! still block. Anything with an unbounded wait would need its own timeout.
 
 use std::path::Path;
 
@@ -61,7 +65,19 @@ pub(super) fn run_preflight_command(args: &[String]) -> std::io::Result<i32> {
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--require" => match rest.next() {
-                Some(target) => required.push(target.to_ascii_lowercase()),
+                Some(target) => {
+                    let target = target.to_ascii_lowercase();
+                    // A typo must not pass quietly. `--require clude` would
+                    // match no target, silently demoting the blocking check
+                    // the deployment asked for back to advisory — defeating
+                    // the gate this flag exists to be.
+                    if !known_targets().iter().any(|known| known == &target) {
+                        eprintln!("flk preflight: unknown --require target {target:?}");
+                        eprintln!("known targets: {}", known_targets().join(", "));
+                        return Ok(super::CONFIG_CHECK_PARSE_FAILURE);
+                    }
+                    required.push(target);
+                }
                 None => {
                     eprintln!("flk preflight: --require needs a target (e.g. claude)");
                     return Ok(super::CONFIG_CHECK_PARSE_FAILURE);
@@ -256,7 +272,10 @@ fn check_worktree_dir() -> Check {
 
 fn is_writable(path: &Path) -> bool {
     let probe = path.join(".flk-preflight-probe");
-    match std::fs::File::create(&probe) {
+    // create_new: never truncate something already there. A leftover probe from
+    // a killed run would then read as "not writable" — wrong, but it fails
+    // SAFE (an unnecessary warning, never a false all-clear).
+    match std::fs::File::create_new(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true
@@ -275,7 +294,7 @@ fn check_external_tools() -> Vec<Check> {
     ]
     .into_iter()
     .map(|(tool, missing_severity)| {
-        if which(tool) {
+        if crate::integration::command_available(tool) {
             Check {
                 name: "tools",
                 severity: Severity::Ok,
@@ -295,13 +314,11 @@ fn check_external_tools() -> Vec<Check> {
     .collect()
 }
 
-/// PATH lookup without spawning anything: preflight runs inside an activation,
-/// where a process spawn per tool is both slow and a hang risk.
-fn which(tool: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(tool).is_file())
+fn known_targets() -> Vec<String> {
+    crate::integration::installed_integration_statuses()
+        .into_iter()
+        .map(|status| crate::integration::integration_target_label(status.target).to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -369,47 +386,61 @@ mod tests {
     }
 
     /// A host that deliberately runs without a hook is correctly configured,
-    /// not broken: flock must not fail its apply on its own judgement.
+    /// not broken: flock must not fail its apply on its own judgement. Asserted
+    /// on the decision directly — an earlier version zipped the optional and
+    /// required check lists, which misaligns precisely when `--require`
+    /// promotes a silent target into a reported one, so it could pass without
+    /// ever exercising the promotion it was named for.
     #[test]
     fn a_missing_hook_is_advisory_until_the_deployment_says_it_is_required() {
-        let optional = check_integrations(&[]);
-        let required = check_integrations(&["claude".to_string()]);
+        let optional =
+            classify_integration("claude", IntegrationStatusKind::NotInstalled, true, false)
+                .expect("an installed agent with no hook is worth reporting");
+        assert_eq!(optional.severity, Severity::Advisory);
 
-        // Whatever this host's real state, requiring a target can only ever
-        // raise severity, never lower it.
-        for (opt, req) in optional.iter().zip(required.iter()) {
-            assert!(
-                req.severity >= opt.severity,
-                "--require must not soften a check: {} vs {}",
-                opt.detail,
-                req.detail
-            );
-        }
+        let required =
+            classify_integration("claude", IntegrationStatusKind::NotInstalled, true, true)
+                .expect("a required target is always reported");
+        assert_eq!(required.severity, Severity::Blocking);
     }
 
-    /// Every failing check has to name a command, or the reader is left with a
-    /// symptom and no next step.
+    /// Every reported problem has to name the command that fixes it, or the
+    /// reader is left holding a symptom. Asserted against the actual install
+    /// command rather than "contains some word", which an earlier version did
+    /// loosely enough that a garbage detail string would have passed.
     #[test]
-    fn failing_checks_name_the_fix() {
-        for check in collect_checks(&[]) {
-            if check.severity == Severity::Ok {
-                continue;
-            }
+    fn a_reported_integration_problem_names_the_install_command() {
+        use IntegrationStatusKind::{NotInstalled, Outdated};
+        for (state, available, required) in [
+            (Outdated, true, false),
+            (Outdated, false, false),
+            (NotInstalled, true, false),
+            (NotInstalled, false, true),
+        ] {
+            let check = classify_integration("claude", state, available, required)
+                .expect("these combinations are all reportable");
             assert!(
-                check.detail.contains("flk ")
-                    || check.detail.contains("required")
-                    || check.detail.contains("not writable")
-                    || check.detail.contains("missing"),
-                "{} gave no actionable detail: {}",
-                check.name,
+                check.detail.contains("flk integration install claude"),
+                "{state:?} (available={available}, required={required}) gave no \
+                 runnable fix: {}",
                 check.detail
             );
         }
     }
 
+    /// `--require` is how a deployment states intent, so a typo must be loud:
+    /// silently matching nothing would demote the blocking check it asked for
+    /// back to advisory.
     #[test]
-    fn which_finds_a_tool_that_exists_and_misses_one_that_does_not() {
-        assert!(which("sh"), "sh must be on PATH in any sane environment");
-        assert!(!which("flk-preflight-definitely-not-a-real-binary"));
+    fn known_targets_are_lowercase_labels_so_require_matching_works() {
+        let targets = known_targets();
+        assert!(
+            targets.iter().any(|t| t == "claude"),
+            "claude must be a known target, got {targets:?}"
+        );
+        assert!(
+            targets.iter().all(|t| t == &t.to_ascii_lowercase()),
+            "labels must be lowercase — --require lowercases its input before comparing"
+        );
     }
 }

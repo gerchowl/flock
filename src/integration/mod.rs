@@ -691,7 +691,7 @@ pub(crate) fn integration_target_available(target: crate::api::schema::Integrati
     command_available(integration_target_command(target))
 }
 
-fn command_available(command: &str) -> bool {
+pub(crate) fn command_available(command: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
