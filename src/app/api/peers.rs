@@ -708,8 +708,10 @@ mod tests {
     #[tokio::test]
     async fn config_peer_switch_from_hub_stamps_own_origin_and_peers() {
         let mut app = test_app();
-        app.state.peer_summaries =
-            vec![summary("anvil", "lars@anvil"), summary("sage", "lars@sage")];
+        app.state.peer_summaries = vec![
+            summary("anvil", "lars@anvil"),
+            summary("spoke2.invalid", "lars@spoke2.invalid"),
+        ];
 
         let prepared = app
             .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
@@ -717,7 +719,7 @@ mod tests {
                 ws_idx: 0,
             })
             .expect("config peer resolves");
-        assert_eq!(prepared.ssh_target, "lars@sage");
+        assert_eq!(prepared.ssh_target, "lars@spoke2.invalid");
         let fleet = prepared.fleet.expect("hub leap stamps a fresh snapshot");
         assert_eq!(fleet.origin, crate::app::short_host_name());
         // The hop target is excluded from its own snapshot.
@@ -784,11 +786,11 @@ mod tests {
         let mut app = test_app();
         app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
         app.state.relayed_fleet_cache.insert(
-            "sage".to_string(),
+            "spoke2.invalid".to_string(),
             crate::api::schema::RelayedFleetPeer {
-                name: "sage".into(),
-                ssh_target: "lars@sage".into(),
-                host: Some("sage".into()),
+                name: "spoke2.invalid".into(),
+                ssh_target: "lars@spoke2.invalid".into(),
+                host: Some("spoke2.invalid".into()),
                 version: Some("0.9.0".into()),
                 protocol: None,
                 system: None,
@@ -818,7 +820,7 @@ mod tests {
             .map(|peer| peer.ssh_target.as_str())
             .collect();
         assert!(
-            targets.contains(&"lars@sage"),
+            targets.contains(&"lars@spoke2.invalid"),
             "relayed peer must ride the wire: {targets:?}"
         );
         assert!(
@@ -837,11 +839,11 @@ mod tests {
         app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
         // Simulate anvil having relayed sage to us on a prior poll.
         app.state.relayed_fleet_cache.insert(
-            "sage".to_string(),
+            "spoke2.invalid".to_string(),
             crate::api::schema::RelayedFleetPeer {
-                name: "sage".into(),
-                ssh_target: "lars@sage".into(),
-                host: Some("sage".into()),
+                name: "spoke2.invalid".into(),
+                ssh_target: "lars@spoke2.invalid".into(),
+                host: Some("spoke2.invalid".into()),
                 version: None,
                 protocol: None,
                 system: None,

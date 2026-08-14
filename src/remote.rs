@@ -2746,6 +2746,7 @@ mod tests {
     #[test]
     fn parse_client_status_json_reads_protocol() {
         assert_eq!(
+            // guardrails-ok(hermetic): JSON fixture text, never executed
             parse_client_status_json(r#"{"version":"x","protocol":8,"binary":"/bin/flock"}"#)
                 .map(|status| status.protocol),
             Some(8)

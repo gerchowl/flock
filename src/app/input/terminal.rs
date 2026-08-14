@@ -1223,7 +1223,8 @@ mod tests {
         );
         app.state.default_shell = "/usr/bin/true".into();
         let (workspace, terminal, runtime) = Workspace::new(
-            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            // Any existing directory; this test asserts about panes, not paths.
+            std::env::temp_dir(),
             24,
             80,
             app.state.pane_scrollback_limit_bytes,

@@ -3175,7 +3175,10 @@ mod tests {
         let mut app = app_for_mouse_test();
         app.state.default_shell = "/usr/bin/true".into();
         let (workspace, terminal, runtime) = Workspace::new(
-            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            // Any existing directory will do — this test asserts about runtime
+            // retention, not about paths. `current_dir()` dragged the repo
+            // checkout in (and with it whatever git state it has), for no gain.
+            std::env::temp_dir(),
             24,
             80,
             app.state.pane_scrollback_limit_bytes,

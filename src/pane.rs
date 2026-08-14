@@ -2196,7 +2196,8 @@ mod tests {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
         cmd.arg(format!("{command} > '{}'", output_path.display()));
-        cmd.cwd(std::env::current_dir().unwrap());
+        // Any existing directory; nothing here asserts on the path.
+        cmd.cwd(std::env::temp_dir());
         cmd.env("TERM", "xterm-ghostty");
         cmd.env("COLORTERM", "falsecolor");
         apply_pane_terminal_env(&mut cmd);
@@ -2216,6 +2217,7 @@ mod tests {
     #[test]
     fn pane_shell_prefers_configured_shell() {
         assert_eq!(
+            // guardrails-ok(hermetic): shell-config parsing input, never executed
             pane_shell_from("/usr/bin/nu", Some("/bin/bash".to_string())),
             "/usr/bin/nu"
         );
@@ -2224,7 +2226,9 @@ mod tests {
     #[test]
     fn pane_shell_falls_back_to_shell_env() {
         assert_eq!(
+            // guardrails-ok(hermetic): shell-config parsing input, never executed
             pane_shell_from("", Some("/bin/bash".to_string())),
+            // guardrails-ok(hermetic): expected parse result, never executed
             "/bin/bash"
         );
     }

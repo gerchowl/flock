@@ -199,6 +199,7 @@ pub(crate) fn git_ahead_behind(cwd: &Path) -> Option<(usize, usize)> {
     super::discovery::git_repo_root(cwd)?;
 
     let output = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .arg("-C")
         .arg(cwd)
         .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
@@ -397,6 +398,7 @@ mod tests {
         let root = temp_test_dir("reftable-fingerprint");
         let root_arg = root.to_string_lossy().to_string();
         let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
             .output()
             .unwrap();

@@ -1573,6 +1573,7 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("create nested dir");
         std::fs::create_dir_all(&other).expect("create other dir");
         std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(&repo)
             .arg("init")

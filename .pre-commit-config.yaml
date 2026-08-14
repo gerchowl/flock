@@ -43,6 +43,19 @@ repos:
         entry: env GUARDRAILS_TRACE_ALLOW_GLOBS=*/logging.rs guardrails-no-raw-trace-fields
         language: system
         pass_filenames: true
+      # Tests that read the process cwd, the machine's hostname, or a hardcoded
+      # FHS path assert about the developer's laptop rather than about flock —
+      # they pass for whoever wrote them and fail confusingly everywhere else,
+      # long after the change that exposed them (#268). Scope is test code only:
+      # `tests/` plus `#[cfg(test)]` regions. Per-line `guardrails-ok(hermetic)`
+      # for the cases that are fixture DATA rather than something executed.
+      - id: hermetic-tests
+        name: "tests don't assert against ambient machine state"
+        entry: python3 scripts/hermetic_tests.py
+        language: system
+        files: \.rs$
+        pass_filenames: true
+
       # Deterministic, no escape hatch by design: a conflicted merge CAN be
       # committed (git records it and `git status` is clean afterwards).
       - id: no-conflict-markers

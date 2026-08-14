@@ -1571,6 +1571,7 @@ mod tests {
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -1722,6 +1723,7 @@ mod tests {
         // The hub has its OWN clone of the same origin, with no feature-x yet.
         let hub = unique_temp_path("xchk-hub");
         let clone_ok = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args([
                 "clone",
                 "--quiet",
@@ -2053,6 +2055,7 @@ prunable stale
 
         assert!(checkout.join("README.md").exists());
         let branch_name = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .arg("-C")
             .arg(&checkout)
             .args(["branch", "--show-current"])
@@ -2465,6 +2468,7 @@ prunable stale
         run_git(&repo, &["branch", "feature/done"]);
         delete_local_branch(&repo, "feature/done").expect("branch delete should succeed");
         let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args([
                 "-C",
                 repo.to_str().unwrap(),

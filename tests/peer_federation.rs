@@ -102,12 +102,14 @@ impl Drop for SpawnedFlock {
 fn init_repo_with_origin(path: &Path, origin: &str) {
     fs::create_dir_all(path).unwrap();
     let status = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .args(["init", "-q"])
         .current_dir(path)
         .status()
         .unwrap();
     assert!(status.success(), "git init failed for {}", path.display());
     let status = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .args(["remote", "add", "origin", origin])
         .current_dir(path)
         .status()
@@ -516,6 +518,7 @@ fn folded_remote_member_row_click_switches_server() {
     let repo_b = base.join("shared-b");
     init_repo_with_origin(&repo_b, shared_origin);
     let status = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .args(["checkout", "-q", "-b", "peerwork"])
         .current_dir(&repo_b)
         .status()

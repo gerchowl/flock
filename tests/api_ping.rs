@@ -608,7 +608,13 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
 
-    let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/bash");
+    // `/bin/sh`, not `/bin/bash`: NixOS ships `/bin/sh` and nothing else in
+    // `/bin`, so bash here made the whole test unrunnable there — the pane's
+    // shell failed to spawn, `workspace.create` returned no `root_pane`, and
+    // this unwrapped on a missing field. Nothing below needs bash semantics:
+    // the pane shell only has to accept a typed command line, and the work is
+    // done by the `/bin/sh -c` it launches.
+    let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
