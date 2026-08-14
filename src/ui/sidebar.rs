@@ -240,6 +240,14 @@ fn agent_panel_entries_with_runtimes(
     let local_server = super::grammar::local_server_name();
     match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
+            // The server filter outranks the scope toggle (#80): narrowed to a
+            // peer, this server's rows are not part of the visible set, and
+            // "current workspace" names one of them. The panel is empty rather
+            // than showing agents the spaces list has already filtered away —
+            // one narrowing, applied servers → spaces → agents.
+            if !app.local_server_visible() {
+                return Vec::new();
+            }
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
                 return Vec::new();
             };

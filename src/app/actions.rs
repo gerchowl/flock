@@ -789,9 +789,19 @@ impl AppState {
         let query_kind = navigator_query_kind(&query, self.navigator.state_filter);
         let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let mut rows = Vec::new();
+        // Server visibility narrows this list too (#80): filtering to a peer
+        // hides the local rows here exactly as it does in the spaces list and
+        // the agents panel. One filter, applied at the top — servers, then
+        // spaces, then agents — rather than a per-list quirk.
+        //
         // #121: group by project + fleet-stable order, matching the sidebar,
         // instead of raw storage order.
-        for ws_idx in self.project_grouped_workspace_order() {
+        let local_order = if self.local_server_visible() {
+            self.project_grouped_workspace_order()
+        } else {
+            Vec::new()
+        };
+        for ws_idx in local_order {
             let ws = &self.workspaces[ws_idx];
             // Use the sidebar's label grammar (#62), not the bare cwd basename:
             // every flat navigator row reads self-contained `owner/repo · host:branch`,
@@ -5312,6 +5322,59 @@ mod tests {
         assert!(
             remote_labels[0].contains("sage") && !remote_labels[0].contains("anvil"),
             "kept sage, dropped anvil: {remote_labels:?}"
+        );
+        // The same filter hides the LOCAL rows: it narrows to one server, and
+        // this is not that server (#80).
+        assert!(
+            !state.navigator_rows().iter().any(|row| matches!(
+                row.target,
+                crate::app::state::NavigatorTarget::Workspace { .. }
+            )),
+            "a Peer filter must hide this server's own rows too"
+        );
+    }
+
+    #[test]
+    fn a_peer_filter_narrows_every_list_not_just_some() {
+        // One narrowing, applied servers -> spaces -> agents. The agents panel
+        // used to keep local rows in `current` scope while the spaces list had
+        // already swapped them out, so the same filter meant two things
+        // depending on which list you were reading.
+        let mut state = app_with_workspaces(&["local"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.selected = 0;
+        state.peer_summaries = vec![fleet_peer_flock_main()];
+        // A pane only counts as an agent once one is detected in it.
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let tid = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        // Unfiltered: this server's agent is listed in both scopes.
+        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        assert!(
+            !crate::ui::agent_panel_entries(&state).is_empty(),
+            "unfiltered current scope lists the local agent"
+        );
+
+        state.server_filter = Some(crate::app::state::ServerFilter::Peer {
+            ssh_target: "sage".into(),
+        });
+        assert!(
+            crate::ui::agent_panel_entries(&state).is_empty(),
+            "a Peer filter hides local agents in current scope too"
+        );
+
+        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::All;
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert!(
+            !entries.is_empty() && entries.iter().all(|entry| entry.remote.is_some()),
+            "all scope keeps only the filtered peer's agents: {} entries",
+            entries.len()
         );
     }
 

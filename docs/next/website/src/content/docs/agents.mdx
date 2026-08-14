@@ -57,7 +57,9 @@ This is the main Flock workflow: start several agents, let them work in parallel
 
 The queue is over **agents, not machines**. If another server in your fleet has a blocked agent, the cycle reaches it and switches you there — landing on that server *and* on that agent's space.
 
-What the cycle can reach is exactly what the sidebar shows. Narrowing the servers band to a single server (right-click a server row) narrows the cycle to that server's agents; showing everything cycles the whole visible fleet. The cycle never jumps past a filter you set.
+What the cycle can reach is exactly what the sidebar shows, because server visibility is one narrowing applied top-down: **servers → spaces → agents**. Right-click a server row to narrow to that server, and the spaces list, the agents panel (in either scope), the navigator and the attention cycle all follow it together. Showing everything cycles the whole fleet. The cycle never jumps past a filter you set.
+
+The servers band itself keeps showing the whole fleet while a filter is active — it is how you get back.
 
 ## Direct integrations
 
