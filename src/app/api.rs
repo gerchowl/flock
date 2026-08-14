@@ -225,7 +225,19 @@ impl App {
                 }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let fetch = crate::peers::fetch_peer_summary(&peer);
+                    // The in-flight guard is released only by the event this
+                    // sends, so the fetch must not be able to unwind past it
+                    // (see `fetch_with_panic_guard`).
+                    //
+                    // Note what this does NOT recover: a panic raised while
+                    // `peer_stream::request` held the peer's slot mutex leaves
+                    // that slot poisoned, so the held connection is dropped and
+                    // the peer falls back to one-shot ssh. That is handled
+                    // where the poison is observed, in `peer_stream::request`.
+                    let peer_name = peer.name.clone();
+                    let fetch = crate::peers::fetch_with_panic_guard(&peer_name, || {
+                        crate::peers::fetch_peer_summary(&peer)
+                    });
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });
             }
