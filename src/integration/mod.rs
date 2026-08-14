@@ -687,7 +687,7 @@ fn integration_target_command(target: crate::api::schema::IntegrationTarget) -> 
     }
 }
 
-fn integration_target_available(target: crate::api::schema::IntegrationTarget) -> bool {
+pub(crate) fn integration_target_available(target: crate::api::schema::IntegrationTarget) -> bool {
     command_available(integration_target_command(target))
 }
 
