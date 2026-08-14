@@ -44,8 +44,8 @@ use crate::server::client_accept::{
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
-    events_include_interaction, has_render_targets, latest_app_client, render_targets,
-    terminal_attach_client_ids, ClientConnection, ClientConnectionMode,
+    events_include_interaction, latest_app_client, render_targets, terminal_attach_client_ids,
+    ClientConnection, ClientConnectionMode,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -176,14 +176,6 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How often an unattended server still refreshes `state.view` (#262).
-///
-/// With no client subscribed to frames a render streams nothing; the only
-/// reason to run one is to keep pane geometry current for API clients. At the
-/// 16 ms frame cap that was a continuous full render for no viewer, which is
-/// how a busy node came to burn a core with nobody attached.
-const UNATTENDED_RENDER_INTERVAL: Duration = Duration::from_secs(1);
-
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
@@ -200,11 +192,6 @@ pub struct HeadlessServer {
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
     foreground_client_id: Option<u64>,
-    /// A structural change arrived while no client was subscribed to frames
-    /// (#262), so the deferred unattended render owes a full pass rather than
-    /// a retained one. Carried because `needs_full_render` is loop-local and
-    /// gets cleared when a pass is skipped.
-    unattended_full_render_pending: bool,
     /// Server-owned keybindings, restored when foreground clients use server mode.
     server_keybindings: crate::config::LiveKeybindConfig,
     /// Full server config warning shown to clients that use server keybindings.
@@ -355,7 +342,6 @@ impl HeadlessServer {
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
-            unattended_full_render_pending: false,
             server_keybindings,
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
@@ -615,37 +601,6 @@ impl HeadlessServer {
             // Idle flock animates only while a client is watching this server.
             self.app.has_foreground_viewer = self.foreground_client_id.is_some();
             self.app.sync_headless_animation_timer(now);
-
-            // #262: with nobody subscribed to frames, a render streams
-            // nothing — its only durable effect is refreshing `state.view`
-            // geometry for API clients. Doing that at the 16 ms frame cap
-            // meant a busy unattended node ran a continuous full render for
-            // an audience of nobody. Drop to a slow cadence instead.
-            //
-            // `needs_full_render` cannot gate this: every drain category in
-            // this loop sets it unconditionally, so PTY output alone raises
-            // it. What a deferred pass owes is carried in
-            // `unattended_full_render_pending` and reinstated when the
-            // cadence comes round, and the loop wakes at least every
-            // CLIENT_ACCEPT_POLL_INTERVAL, so nothing waits longer than
-            // UNATTENDED_RENDER_INTERVAL. An attaching client re-enters the
-            // normal path with a full render of its own.
-            if needs_render && !has_render_targets(&self.clients) {
-                self.unattended_full_render_pending |= needs_full_render;
-                let due = self
-                    .app
-                    .last_render_at
-                    .is_none_or(|at| now.duration_since(at) >= UNATTENDED_RENDER_INTERVAL);
-                if due {
-                    needs_full_render = self.unattended_full_render_pending;
-                    self.unattended_full_render_pending = false;
-                } else {
-                    self.app.render_dirty.store(false, Ordering::Release);
-                    needs_render = false;
-                    needs_full_render = false;
-                    crate::render_prof::event("render.defer.no_frame_subscriber");
-                }
-            }
 
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
@@ -3732,7 +3687,6 @@ mod tests {
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
-            unattended_full_render_pending: false,
             server_keybindings,
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,

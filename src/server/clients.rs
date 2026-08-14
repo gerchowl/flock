@@ -214,6 +214,7 @@ pub(crate) fn terminal_attach_client_ids(
 /// Whether anyone is actually waiting on a frame — `render_targets` without
 /// building the vector (#262). The render loop asks this every pass to decide
 /// whether a wakeup is worth drawing for at all.
+#[allow(dead_code)]
 pub(crate) fn has_render_targets(clients: &HashMap<u64, ClientConnection>) -> bool {
     clients.values().any(|client| {
         client.writer.is_some()

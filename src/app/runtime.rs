@@ -323,12 +323,7 @@ impl App {
         // while someone is watching.
         let flock_on_screen = self.has_foreground_viewer
             && (self.state.flock_phase().is_some() || self.state.screensaver_phase().is_some());
-        // #262: the agent spinner is a rendered artefact too. Arming its tick
-        // with no viewer attached forces a full render every 128 ms forever on
-        // a fleet node that always has some agent working, for frames nobody
-        // receives. Attaching a client re-arms it on the next loop pass.
-        let spinner_on_screen = self.has_foreground_viewer && self.agent_panel_has_animation();
-        if spinner_on_screen || flock_on_screen {
+        if self.agent_panel_has_animation() || flock_on_screen {
             self.next_animation_tick.get_or_insert(now + interval);
         } else if self.has_foreground_viewer {
             // Nothing animating yet, but an idle stage may wander in — wake the
