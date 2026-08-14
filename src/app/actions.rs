@@ -2318,21 +2318,26 @@ impl AppState {
                 .then_with(|| older_first(a.age, b.age))
         });
 
+        // The chime asserts the whole fleet is clear, so it may only fire for a
+        // query that could actually have seen all of it: not a scoped one (a
+        // quiet project says nothing about the rest), and not one narrowed by
+        // the server filter (the servers you hid are exactly where the blocked
+        // agent would be hiding).
+        let saw_everything = !project_only && self.server_filter.is_none();
         if attention.is_empty() {
             // Nothing wants attention: fall back to plain cycling over the
             // same visible set, so a press still moves rather than doing
-            // nothing. The chime says "all clear" and must not fire for a
-            // scoped query — a quiet project says nothing about the fleet.
+            // nothing.
             let order: Vec<VisibleAgentTarget> =
                 agents.iter().map(|agent| agent.target.clone()).collect();
-            if !project_only && !self.attention_all_clear_chimed {
+            if saw_everything && !self.attention_all_clear_chimed {
                 self.attention_all_clear_chimed = true;
                 self.pending_attention_chime = true;
             }
             self.step_visible_agents(&order, forward);
             return;
         }
-        if !project_only {
+        if saw_everything {
             self.attention_all_clear_chimed = false;
         }
 
@@ -4880,6 +4885,30 @@ mod tests {
             !state.pending_attention_chime,
             "repeat presses stay silent until the queue refills"
         );
+    }
+
+    #[test]
+    fn focus_attention_stays_silent_when_a_server_filter_hides_part_of_the_fleet() {
+        // The chime means "the fleet is clear". Narrowed to one server, this
+        // press could not have seen the rest of it — and the servers you hid
+        // are exactly where a blocked agent would be hiding.
+        let mut state = app_with_workspaces(&["a"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        state.workspaces[0].panes.get_mut(&pane).unwrap().seen = true;
+        state.server_filter = Some(crate::app::state::ServerFilter::Local);
+
+        state.focus_attention_agent();
+        assert!(
+            !state.pending_attention_chime,
+            "a filtered all-clear must not claim the whole fleet is quiet"
+        );
+
+        // Clearing the filter restores the fleet-wide claim.
+        state.server_filter = None;
+        state.focus_attention_agent();
+        assert!(state.pending_attention_chime, "unfiltered all-clear chimes");
     }
 
     #[test]
