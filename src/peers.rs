@@ -210,23 +210,42 @@ impl PeerSummaryState {
     /// Locally-polled entries (`origin_last_ok_secs = None`) keep the
     /// `last_ok.elapsed()` path — there `last_ok` is a real local Instant and
     /// already carries both halves.
+    /// Reads the clock. See [`Self::is_stale_at`] for the decision itself.
     pub fn is_stale_with(&self, stale_after_secs: u64) -> bool {
-        if let Some(age) = self.carried_age_secs() {
+        self.is_stale_at(Instant::now(), stale_after_secs)
+    }
+
+    /// Staleness as of `now` — the whole decision, with no ambient clock.
+    ///
+    /// Time enters this module here and in [`Self::carried_age_secs_at`], and
+    /// nowhere else. That is what lets a test advance the clock by ninety
+    /// seconds and assert on the result, rather than back-dating a field and
+    /// hoping the arithmetic underneath matches. It also matches how the
+    /// headless loop already works, where `now` is sampled once per pass and
+    /// threaded into `can_render_now`, `unattended_render_due` and the
+    /// scheduled-task handlers.
+    pub fn is_stale_at(&self, now: Instant, stale_after_secs: u64) -> bool {
+        if let Some(age) = self.carried_age_secs_at(now) {
             return age > stale_after_secs;
         }
         match self.last_ok {
-            Some(at) => at.elapsed().as_secs() > stale_after_secs,
+            Some(at) => now.saturating_duration_since(at).as_secs() > stale_after_secs,
             None => true,
         }
     }
 
-    /// Live age of a carried/relayed entry: the origin's age at capture plus
-    /// local dwell. `None` for a locally polled peer.
+    /// Reads the clock. See [`Self::carried_age_secs_at`].
     pub fn carried_age_secs(&self) -> Option<u64> {
+        self.carried_age_secs_at(Instant::now())
+    }
+
+    /// Live age of a carried/relayed entry as of `now`: the origin's age at
+    /// capture plus local dwell. `None` for a locally polled peer.
+    pub fn carried_age_secs_at(&self, now: Instant) -> Option<u64> {
         let origin_secs = self.origin_last_ok_secs?;
         let dwell = self
             .ingested_at
-            .map(|at| at.elapsed().as_secs())
+            .map(|at| now.saturating_duration_since(at).as_secs())
             .unwrap_or(0);
         Some(origin_secs.saturating_add(dwell))
     }
@@ -246,12 +265,23 @@ impl PeerSummaryState {
 
     /// Config-aware reachability (#96) — the live-config path. The zero-arg
     /// twin above stays for the fleet-snapshot rendering seam (#101).
+    /// Reads the clock. See [`Self::reachability_at`].
     pub fn reachability_with(
         &self,
         stale_after_secs: u64,
         slow_threshold_ms: u64,
     ) -> PeerReachability {
-        if self.is_stale_with(stale_after_secs) || self.error.is_some() {
+        self.reachability_at(Instant::now(), stale_after_secs, slow_threshold_ms)
+    }
+
+    /// Reachability as of `now`.
+    pub fn reachability_at(
+        &self,
+        now: Instant,
+        stale_after_secs: u64,
+        slow_threshold_ms: u64,
+    ) -> PeerReachability {
+        if self.is_stale_at(now, stale_after_secs) || self.error.is_some() {
             PeerReachability::Down
         } else if self.latency_ms.is_some_and(|ms| ms > slow_threshold_ms) {
             PeerReachability::Slow
@@ -378,6 +408,12 @@ pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> R
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
+    peer_to_wire_at(Instant::now(), peer)
+}
+
+/// Encode as of `now`, so the ages that ride the wire are testable without
+/// waiting for real seconds to pass.
+pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
     crate::protocol::FleetPeer {
         name: peer.peer.clone(),
         ssh_target: peer.ssh_target.clone(),
@@ -387,7 +423,9 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         system: peer.system.clone().map(Into::into),
         latency_ms: peer.latency_ms,
         workspaces: peer.workspaces.iter().cloned().map(Into::into).collect(),
-        age_secs: peer.last_ok.map(|at| at.elapsed().as_secs()),
+        age_secs: peer
+            .last_ok
+            .map(|at| now.saturating_duration_since(at).as_secs()),
         error: peer.error.clone(),
         // Gossip v3 (#101 part 2): forward the frozen origin assertion when
         // the source was a snapshot / relay entry that already carried it.
@@ -395,9 +433,10 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
         // frozen assertion at capture time (age_secs).
         // Carry the age INCLUDING our dwell, so a second hop inherits an
         // honest reading rather than the capture-time one we were handed.
-        origin_last_ok_secs: peer
-            .carried_age_secs()
-            .or_else(|| peer.last_ok.map(|at| at.elapsed().as_secs())),
+        origin_last_ok_secs: peer.carried_age_secs_at(now).or_else(|| {
+            peer.last_ok
+                .map(|at| now.saturating_duration_since(at).as_secs())
+        }),
         proxy_jump: peer.proxy_jump.clone(),
         icon: peer.icon.clone(),
     }
@@ -1201,48 +1240,78 @@ Last login: banner noise
         // these rows again and every node it relayed renders Live forever.
         // flock exists so the fleet view can be trusted, so freshness is now
         // origin-age-at-capture PLUS dwell: honest at capture, and it decays.
-        let carried = |origin_secs: u64, dwell_secs: u64| {
-            let mut peer = PeerSummaryState::new(&PeerConfig {
-                name: "spoke2.invalid".into(),
-                ..Default::default()
-            });
-            // Far past stale_after, to prove the local clock is NOT the input.
-            peer.last_ok = Instant::now().checked_sub(Duration::from_secs(900));
-            peer.origin_last_ok_secs = Some(origin_secs);
-            peer.ingested_at = Instant::now().checked_sub(Duration::from_secs(dwell_secs));
-            peer.latency_ms = Some(20);
-            peer
-        };
+        //
+        // Time is a PARAMETER here, not a fact about when the test ran: the
+        // entry is stamped once and the clock is advanced, which is what the
+        // production path actually does.
+        let ingested = Instant::now();
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        // Deliberately ancient, to prove the local clock is NOT the input.
+        peer.last_ok = ingested.checked_sub(Duration::from_secs(900));
+        peer.origin_last_ok_secs = Some(5);
+        peer.ingested_at = Some(ingested);
+        peer.latency_ms = Some(20);
 
-        // Origin polled it 5s before capture; it has sat here 10s. 15 < 60.
-        let fresh = carried(5, 10);
+        // 10s later: origin polled it 5s before capture, so ~15s known age.
+        let soon = ingested + Duration::from_secs(10);
+        assert_eq!(peer.carried_age_secs_at(soon), Some(15));
         assert!(
-            !fresh.is_stale_with(60),
+            !peer.is_stale_at(soon, 60),
             "a fresh origin reading must not cliff on the receiver's own clock"
         );
-        assert_eq!(fresh.reachability_with(60, 200), PeerReachability::Live);
+        assert_eq!(peer.reachability_at(soon, 60, 200), PeerReachability::Live);
 
-        // Same origin reading, but nothing has refreshed it for 90s. The node
-        // has not been heard from in ~95s: it must stop looking alive.
-        let stale = carried(5, 90);
+        // 90s later, nothing having refreshed it: ~95s unheard-from.
+        let later = ingested + Duration::from_secs(90);
+        assert_eq!(peer.carried_age_secs_at(later), Some(95));
         assert!(
-            stale.is_stale_with(60),
+            peer.is_stale_at(later, 60),
             "a carried reading must decay — a dead hub cannot leave rows Live forever"
         );
         assert_eq!(
-            stale.reachability_with(60, 200),
+            peer.reachability_at(later, 60, 200),
             PeerReachability::Down,
             "unbounded confident Live is the one thing the fleet view must not show"
         );
 
         // The origin's own reading still dominates a fresh local last_ok.
-        let mut origin_stale = carried(120, 0);
-        origin_stale.last_ok = Some(Instant::now());
-        assert!(origin_stale.is_stale_with(60));
+        let mut origin_stale = peer.clone();
+        origin_stale.origin_last_ok_secs = Some(120);
+        origin_stale.last_ok = Some(ingested);
+        assert!(origin_stale.is_stale_at(ingested, 60));
         assert_eq!(
-            origin_stale.reachability_with(60, 200),
+            origin_stale.reachability_at(ingested, 60, 200),
             PeerReachability::Down,
             "the origin's stale assertion wins over a fresh local last_ok"
+        );
+    }
+
+    /// The ambient wrapper must not drift from the decision it delegates to.
+    /// A seam is only worth having if the production path goes through it.
+    #[test]
+    fn ambient_clock_wrappers_agree_with_the_at_now_core() {
+        let ingested = Instant::now();
+        let mut peer = PeerSummaryState::new(&PeerConfig {
+            name: "spoke2.invalid".into(),
+            ..Default::default()
+        });
+        peer.origin_last_ok_secs = Some(3);
+        peer.ingested_at = Some(ingested);
+        peer.latency_ms = Some(10);
+
+        // `Instant::now()` is a hair past `ingested`, so the ambient reading
+        // must equal the explicit one taken at this moment.
+        assert_eq!(
+            peer.carried_age_secs(),
+            peer.carried_age_secs_at(Instant::now())
+        );
+        assert_eq!(peer.is_stale_with(60), peer.is_stale_at(Instant::now(), 60));
+        assert_eq!(
+            peer.reachability_with(60, 200),
+            peer.reachability_at(Instant::now(), 60, 200)
         );
     }
 
@@ -1252,23 +1321,26 @@ Last login: banner noise
     /// recomputed so time spent on this server keeps counting"); now it is true.
     #[test]
     fn re_relayed_age_accumulates_dwell_rather_than_resetting() {
+        let ingested = Instant::now();
         let mut peer = PeerSummaryState::new(&PeerConfig {
             name: "spoke2.invalid".into(),
             ..Default::default()
         });
         peer.origin_last_ok_secs = Some(10);
-        peer.ingested_at = Instant::now().checked_sub(Duration::from_secs(30));
+        peer.ingested_at = Some(ingested);
 
-        let wire = peer_to_wire(&peer);
-        let carried = wire.origin_last_ok_secs.expect("age rides the wire");
-        assert!(
-            (40..=42).contains(&carried),
-            "expected origin 10s + 30s dwell, got {carried}"
+        // Exactly 30s of dwell — no tolerance window needed now that the
+        // clock is an argument rather than whatever the test machine did.
+        let wire = peer_to_wire_at(ingested + Duration::from_secs(30), &peer);
+        assert_eq!(
+            wire.origin_last_ok_secs,
+            Some(40),
+            "origin's 10s at capture plus 30s of dwell here"
         );
 
         // And the next hop starts its own dwell from that accumulated age.
         let landed = peer_from_wire(wire);
-        assert_eq!(landed.origin_last_ok_secs, Some(carried));
+        assert_eq!(landed.origin_last_ok_secs, Some(40));
         assert!(landed.ingested_at.is_some(), "dwell restarts on ingest");
     }
     #[test]

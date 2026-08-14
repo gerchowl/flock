@@ -2346,10 +2346,19 @@ impl AppState {
     /// This only became meaningful once carried freshness actually decayed;
     /// against a frozen reading every entry would have been immortal.
     pub(crate) fn evict_expired_relayed_entries(&mut self) {
+        self.evict_expired_relayed_entries_at(std::time::Instant::now());
+    }
+
+    /// Eviction as of `now` — the decision, with no ambient clock.
+    pub(crate) fn evict_expired_relayed_entries_at(&mut self, now: std::time::Instant) {
         let stale_after = self.config.gossip.stale_after().as_secs();
         let ttl = stale_after.saturating_mul(RELAYED_ENTRY_TTL_STALE_MULTIPLE);
-        self.relayed_fleet_cache
-            .retain(|_, entry| entry.peer.carried_age_secs().is_none_or(|age| age <= ttl));
+        self.relayed_fleet_cache.retain(|_, entry| {
+            entry
+                .peer
+                .carried_age_secs_at(now)
+                .is_none_or(|age| age <= ttl)
+        });
     }
 
     /// All candidate remote-row sources with their dedup rank (lower =
@@ -2960,11 +2969,16 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use std::time::Duration;
 
-    /// Build a relay-cache entry as if a hub had told us about `host`,
-    /// with the origin having polled it `origin_secs` ago and the row having
-    /// sat here `dwell_secs`.
-    fn relayed(host: &str, origin_secs: u64, dwell_secs: u64) -> crate::peers::RelayedEntry {
+    /// Build a relay-cache entry as if a hub had told us about `host`, with
+    /// the origin having polled it `origin_secs` before capture, ingested at
+    /// `ingested`. Dwell is supplied by the caller's clock, not by back-dating.
+    fn relayed(
+        host: &str,
+        origin_secs: u64,
+        ingested: std::time::Instant,
+    ) -> crate::peers::RelayedEntry {
         let mut entry =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 name: host.into(),
@@ -2982,8 +2996,7 @@ mod tests {
                 proxy_jump: Some("hub".into()),
                 icon: None,
             });
-        entry.peer.ingested_at =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(dwell_secs));
+        entry.peer.ingested_at = Some(ingested);
         entry
     }
 
@@ -2994,9 +3007,10 @@ mod tests {
     #[test]
     fn relayed_entries_render_as_rows_ranked_below_locally_polled_peers() {
         let mut state = AppState::test_new();
-        state
-            .relayed_fleet_cache
-            .insert("spoke2.invalid".into(), relayed("spoke2.invalid", 5, 0));
+        state.relayed_fleet_cache.insert(
+            "spoke2.invalid".into(),
+            relayed("spoke2.invalid", 5, std::time::Instant::now()),
+        );
 
         let hosts: Vec<String> = state
             .remote_peers()
@@ -3035,27 +3049,42 @@ mod tests {
     fn relayed_entries_are_evicted_once_far_past_stale_after() {
         let mut state = AppState::test_new();
         let stale_after = state.config.gossip.stale_after().as_secs();
+        let ttl = stale_after * RELAYED_ENTRY_TTL_STALE_MULTIPLE;
+        let t0 = std::time::Instant::now();
 
-        // Just gone quiet: past stale_after, so it renders Down — but keeping
-        // it is the point, that is what an operator wants to see.
+        // Both rows land at the same moment; only the clock separates them.
+        state
+            .relayed_fleet_cache
+            .insert("recent.invalid".into(), relayed("recent.invalid", 0, t0));
+        state
+            .relayed_fleet_cache
+            .insert("gone.invalid".into(), relayed("gone.invalid", 0, t0));
+
+        // Past stale_after but well inside the TTL: both render Down, and
+        // both stay. A node that just went quiet is exactly what an operator
+        // wants to see — eviction is for long-departed hosts, not bad news.
+        state.evict_expired_relayed_entries_at(t0 + Duration::from_secs(stale_after + 5));
+        assert_eq!(
+            state.relayed_fleet_cache.len(),
+            2,
+            "a row that only just went stale must not be dropped"
+        );
+
+        // `recent`'s hub refreshes it once more at the TTL boundary; nothing
+        // ever refreshes `gone` again.
+        let refreshed_at = t0 + Duration::from_secs(ttl);
         state.relayed_fleet_cache.insert(
             "recent.invalid".into(),
-            relayed("recent.invalid", 0, stale_after + 5),
-        );
-        // Long departed: nothing has refreshed it for many multiples.
-        state.relayed_fleet_cache.insert(
-            "gone.invalid".into(),
-            relayed(
-                "gone.invalid",
-                0,
-                stale_after * (RELAYED_ENTRY_TTL_STALE_MULTIPLE + 2),
-            ),
+            relayed("recent.invalid", 0, refreshed_at),
         );
 
-        state.evict_expired_relayed_entries();
+        // Just past one stale_after later: `gone` has been unheard-from for
+        // ttl + stale_after (past the TTL); `recent` for only stale_after + 1,
+        // which is stale (the threshold is strict) but well inside the TTL.
+        let long_gone = refreshed_at + Duration::from_secs(stale_after + 1);
+        state.evict_expired_relayed_entries_at(long_gone);
 
-        let mut kept: Vec<&String> = state.relayed_fleet_cache.keys().collect();
-        kept.sort();
+        let kept: Vec<&String> = state.relayed_fleet_cache.keys().collect();
         assert_eq!(
             kept,
             vec![&"recent.invalid".to_string()],
@@ -3067,7 +3096,7 @@ mod tests {
                 .get("recent.invalid")
                 .expect("kept")
                 .peer
-                .is_stale_with(stale_after),
+                .is_stale_at(long_gone, stale_after),
             "the kept row still renders as stale — kept is not the same as alive"
         );
     }
