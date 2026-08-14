@@ -218,9 +218,13 @@ fn wire_host_key(peer: &crate::protocol::FleetPeer) -> String {
 ///
 /// Capped like the carried snapshot itself: the list rides an env var between
 /// attach legs, and an unbounded fleet could brush ARG_MAX and kill the leg.
+/// Callers pass their FIRST-HAND rows as `first` for that reason — the cap
+/// truncates the tail, so on a fleet large enough to hit it the rows that
+/// survive should be the ones this server actually polled, not the stalest
+/// entries of a list it was handed.
 fn merge_fleet_peers(
-    base: Vec<crate::protocol::FleetPeer>,
-    extra: Vec<crate::protocol::FleetPeer>,
+    first: Vec<crate::protocol::FleetPeer>,
+    rest: Vec<crate::protocol::FleetPeer>,
     exclude_ssh_target: &str,
     origin: &str,
 ) -> Vec<crate::protocol::FleetPeer> {
@@ -228,7 +232,7 @@ fn merge_fleet_peers(
     let origin_lower = origin.to_ascii_lowercase();
     let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
     let mut by_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for peer in base.into_iter().chain(extra) {
+    for peer in first.into_iter().chain(rest) {
         let key = wire_host_key(&peer);
         if key == exclude_lower
             || key == origin_lower
@@ -444,11 +448,11 @@ impl App {
                 // stamp as `proxy_jump` for peers only routable through us.
                 ours.push(self.self_peer_entry(&us));
                 snapshot.peers =
-                    merge_fleet_peers(snapshot.peers, ours, exclude_ssh_target, &snapshot.origin);
+                    merge_fleet_peers(ours, snapshot.peers, exclude_ssh_target, &snapshot.origin);
                 snapshot
             }
             None => crate::protocol::FleetSnapshot {
-                peers: merge_fleet_peers(Vec::new(), ours, exclude_ssh_target, &us),
+                peers: merge_fleet_peers(ours, Vec::new(), exclude_ssh_target, &us),
                 origin: us,
                 // The hub is not its own peer; embed its own workspaces so
                 // the spoke can see the way-home spaces, not just peers (#66).
