@@ -683,6 +683,7 @@ impl App {
             screensaver_sim: std::cell::RefCell::new(
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
+            section_grouping_memo: std::cell::RefCell::new(None),
             palette: resolve_palette(config),
             theme_name: config
                 .theme

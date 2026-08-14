@@ -71,6 +71,53 @@ struct PeerStream {
     latest_push: Arc<Mutex<Option<String>>>,
 }
 
+/// Whether a relay line is an unsolicited push rather than a response.
+///
+/// Decided on the parsed object's top-level `push` member, never on the
+/// serialized text. A substring test cannot tell a `push` KEY from a `push`
+/// VALUE, and the summary payload carries arbitrary user-controlled strings —
+/// workspace labels, branch names, agent statuses. A branch named `push` was
+/// enough to route that peer's summary RESPONSE into the push slot, stranding
+/// the caller until `REQUEST_TIMEOUT` and tearing the connection down into its
+/// reconnect backoff, every round, for as long as the name existed.
+fn line_is_push(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|value| value.get("push").is_some_and(|push| !push.is_null()))
+}
+
+/// Split the relay's inbound lines: pushes to the single-slot buffer, every
+/// other line to whoever is waiting on a response.
+///
+/// Extracted from the reader thread so the ROUTING is reachable from a test,
+/// not just the classifier. A test that only exercises `line_is_push` would
+/// still pass if this call site regressed to matching the raw text.
+///
+/// Returns on EOF, which is exactly how ssh reports the connection is gone.
+/// The dropped sender then disconnects the channel and every later request
+/// fails fast rather than waiting out the timeout.
+fn route_relay_lines<R: BufRead>(
+    reader: R,
+    responses: &std::sync::mpsc::Sender<String>,
+    push_slot: &Arc<Mutex<Option<String>>>,
+) {
+    for line in reader.lines().map_while(Result::ok) {
+        // A push carries `push` where a response carries `id`, so routing
+        // needs no guessing. Anything else is a response and belongs to
+        // whoever is waiting on the channel — including a line that is not
+        // JSON at all, which surfaces to the caller as a parse error rather
+        // than disappearing into the push slot where nobody would see it.
+        if line_is_push(&line) {
+            if let Ok(mut slot) = push_slot.lock() {
+                *slot = Some(line);
+            }
+            continue;
+        }
+        if responses.send(line).is_err() {
+            break;
+        }
+    }
+}
+
 impl PeerStream {
     fn spawn(peer: &PeerConfig) -> Result<Self, String> {
         let mut child = crate::process::TracedCommand::new("ssh", "peers")
@@ -101,23 +148,7 @@ impl PeerStream {
         let latest_push = Arc::new(Mutex::new(None));
         let push_slot = Arc::clone(&latest_push);
         std::thread::spawn(move || {
-            // Ends on EOF, which is exactly how ssh reports the connection is
-            // gone. The dropped sender then disconnects the channel and every
-            // later request fails fast rather than waiting out the timeout.
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                // A push carries `push` where a response carries `id`, so
-                // routing needs no guessing. Anything else is a response and
-                // belongs to whoever is waiting on the channel.
-                if line.contains("\"push\"") {
-                    if let Ok(mut slot) = push_slot.lock() {
-                        *slot = Some(line);
-                    }
-                    continue;
-                }
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
+            route_relay_lines(BufReader::new(stdout), &tx, &push_slot);
         });
 
         Ok(Self {
@@ -212,12 +243,36 @@ pub fn request(
         let mut registry = registry().lock().map_err(|_| "registry poisoned")?;
         Arc::clone(registry.entry(peer.name.clone()).or_default())
     };
-    let mut slot = slot.lock().map_err(|_| "peer slot poisoned")?;
+    // A caller that panicked mid-request poisons this slot. Nothing in `Slot`
+    // is left inconsistent by that — the worst case is a held stream whose
+    // request/response pairing is no longer known, which is exactly the state
+    // where dropping the stream is the right move. Recover and reconnect
+    // rather than returning an error for the rest of the process lifetime:
+    // otherwise the panic guard on the fetch worker would only trade "this
+    // peer is never polled again" for "this peer is stuck on one-shot ssh
+    // forever", which is not the recovery it claims to be.
+    let mut slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => {
+            let mut slot = poisoned.into_inner();
+            slot.stream = None;
+            slot
+        }
+    };
 
     if let Some(retry_after) = slot.retry_after {
         if std::time::Instant::now() < retry_after {
             return Err("connection backing off".into());
         }
+    }
+
+    // The peer's ssh destination can move under a slot that was busy when the
+    // config reload swept through, and `retain_configured` deliberately does
+    // not wait for it. Check at the point of use, where the lock is already
+    // held: without this, a still-reachable OLD target would keep answering
+    // indefinitely because nothing forces the stream to be re-spawned.
+    if slot.stream.is_some() && slot.target != peer.ssh_target() {
+        slot.stream = None;
     }
 
     if slot.stream.is_none() {
@@ -275,10 +330,19 @@ pub fn retain_configured(peers: &[PeerConfig]) {
         };
         // A slot that never connected has an empty target and no stream to
         // invalidate; keep it so its backoff still applies.
-        let Ok(slot) = slot.lock() else {
-            return false;
-        };
-        slot.stream.is_none() || slot.target == peer.ssh_target()
+        //
+        // `try_lock`, not `lock`: the per-peer lock is held for the whole of a
+        // request, so blocking here would stall the config reload — and with
+        // it the loop that calls it — for up to REQUEST_TIMEOUT per wedged
+        // peer, serially. A busy slot is left for `request` to reconcile: it
+        // re-checks `target` against config under the lock it already holds,
+        // so a moved peer reconnects there rather than waiting for the old
+        // stream to happen to die.
+        match slot.try_lock() {
+            Ok(slot) => slot.stream.is_none() || slot.target == peer.ssh_target(),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
     });
 }
 
@@ -291,6 +355,162 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A response must never be mistaken for a push just because the peer's
+    /// own data mentions one. The summary payload is full of user-controlled
+    /// strings, and a workspace or branch named `push` used to strand every
+    /// response from that peer: the caller waited out `REQUEST_TIMEOUT`, the
+    /// stream was torn down, and the peer fell back to one-shot ssh with a
+    /// 15s stall per poll for as long as the name existed.
+    #[test]
+    fn a_response_mentioning_push_is_not_routed_as_a_push() {
+        let push = r#"{"push":"peers.summary","result":{"host":"anvil","workspaces":[]}}"#;
+        assert!(line_is_push(push), "the emitter's push shape must route");
+
+        // The poisoned response: a workspace labelled `push`, which serializes
+        // to the very substring the old check looked for.
+        let response = r#"{"id":"stream-1","result":{"host":"anvil","workspaces":[{"label":"push","branch":"main"}]}}"#;
+        assert!(
+            !line_is_push(response),
+            "a `push` VALUE in the payload is not a push KEY"
+        );
+
+        // A branch named `push` is the same trap by another route.
+        let branch =
+            r#"{"id":"stream-2","result":{"workspaces":[{"label":"api","branch":"push"}]}}"#;
+        assert!(!line_is_push(branch));
+
+        // `peers.checkout_prepare` answers carry a genuine `push` field. It
+        // rides one-shot ssh today, but if it ever moves onto the stream it
+        // must not self-route.
+        let checkout = r#"{"id":"stream-3","result":{"branch":"main","push":true,"pushed":true}}"#;
+        assert!(
+            !line_is_push(checkout),
+            "a nested `push` field is not a top-level push envelope"
+        );
+
+        // Garbage stays a response: the caller's parse reports it, rather than
+        // it vanishing into the push slot where nobody would ever see it.
+        assert!(!line_is_push("not json at all"));
+        assert!(!line_is_push(""));
+
+        // A null-valued `push` is not an envelope. Not emitable today, but the
+        // classifier should not reroute on a sentinel someone adds later.
+        assert!(!line_is_push(r#"{"push":null,"result":{}}"#));
+    }
+
+    /// The ordering invariant the whole module rests on: requests and
+    /// responses pair up one-for-one, and a push may arrive at ANY point —
+    /// including between a request being written and its response coming
+    /// back. The push must not consume the response's slot in the channel,
+    /// and the response must not overwrite the push.
+    ///
+    /// Drives `route_relay_lines` rather than `line_is_push`, so a call site
+    /// that regressed to matching raw text fails here even with the
+    /// classifier left intact.
+    #[test]
+    fn a_push_interleaved_with_a_response_disturbs_neither() {
+        use std::io::Cursor;
+
+        let (tx, responses) = std::sync::mpsc::channel();
+        let push_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // As the relay would emit it: a push lands between the two responses,
+        // and one of the responses mentions `push` in its payload.
+        let wire = concat!(
+            r#"{"id":"stream-1","result":{"workspaces":[{"label":"push"}]}}"#,
+            "\n",
+            r#"{"push":"peers.summary","result":{"host":"anvil"}}"#,
+            "\n",
+            r#"{"id":"stream-2","result":{"host":"anvil"}}"#,
+            "\n",
+        );
+        route_relay_lines(Cursor::new(wire), &tx, &push_slot);
+        drop(tx);
+
+        let routed: Vec<String> = responses.iter().collect();
+        assert_eq!(
+            routed.len(),
+            2,
+            "both responses must reach the requester, and only those: {routed:?}"
+        );
+        assert!(
+            routed[0].contains("stream-1"),
+            "order preserved: {routed:?}"
+        );
+        assert!(
+            routed[1].contains("stream-2"),
+            "order preserved: {routed:?}"
+        );
+
+        let pushed = push_slot.lock().expect("push slot").take();
+        assert_eq!(
+            pushed.as_deref(),
+            Some(r#"{"push":"peers.summary","result":{"host":"anvil"}}"#),
+            "the push is delivered exactly once, to the push slot"
+        );
+    }
+
+    /// A line that is not JSON reaches the requester, where its parse failure
+    /// is reported. Before the classifier was parsed rather than substring
+    /// matched, a bogus line that happened to contain the text `"push"` was
+    /// swallowed into the push slot and the caller waited out the timeout.
+    #[test]
+    fn a_malformed_line_reaches_the_requester_rather_than_vanishing() {
+        use std::io::Cursor;
+
+        let (tx, responses) = std::sync::mpsc::channel();
+        let push_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        route_relay_lines(
+            Cursor::new("ssh: connect to host anvil port 22: \"push\"\n"),
+            &tx,
+            &push_slot,
+        );
+        drop(tx);
+
+        assert_eq!(responses.iter().count(), 1, "the caller sees the bad line");
+        assert!(
+            push_slot.lock().expect("push slot").is_none(),
+            "noise must not masquerade as a push"
+        );
+    }
+
+    /// A config reload must not wait on a peer that is mid-request. The
+    /// per-peer lock is held for the whole of a request, so blocking here cost
+    /// up to REQUEST_TIMEOUT (15s) per wedged peer, serially, on the loop that
+    /// triggers the reload.
+    #[test]
+    fn a_reload_does_not_wait_on_a_peer_that_is_mid_request() {
+        let peer = peer("reload-busy-slot");
+        // Materialize the slot, then hold its lock the way an in-flight
+        // request does.
+        let slot = {
+            let mut registry = registry().lock().expect("registry");
+            Arc::clone(registry.entry(peer.name.clone()).or_default())
+        };
+        let held = slot.lock().expect("hold the slot like a live request");
+
+        let started = std::time::Instant::now();
+        retain_configured(std::slice::from_ref(&peer));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "reload blocked on a busy slot for {:?}",
+            started.elapsed()
+        );
+
+        // The busy slot is retained rather than silently dropped — dropping it
+        // would tear down a live connection mid-request.
+        drop(held);
+        assert!(
+            registry()
+                .lock()
+                .expect("registry")
+                .contains_key(&peer.name),
+            "a busy slot must survive the reload"
+        );
+        retain_configured(&[]);
     }
 
     #[test]

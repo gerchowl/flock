@@ -323,7 +323,12 @@ impl App {
         // while someone is watching.
         let flock_on_screen = self.has_foreground_viewer
             && (self.state.flock_phase().is_some() || self.state.screensaver_phase().is_some());
-        if self.agent_panel_has_animation() || flock_on_screen {
+        // #262: the agent spinner is a rendered artefact too. Arming its tick
+        // with no viewer attached forces a full render every 128 ms forever on
+        // a fleet node that always has some agent working, for frames nobody
+        // receives. Attaching a client re-arms it on the next loop pass.
+        let spinner_on_screen = self.has_foreground_viewer && self.agent_panel_has_animation();
+        if spinner_on_screen || flock_on_screen {
             self.next_animation_tick.get_or_insert(now + interval);
         } else if self.has_foreground_viewer {
             // Nothing animating yet, but an idle stage may wander in — wake the
@@ -1492,6 +1497,49 @@ mod tests {
     use crate::app::state;
     use crate::workspace::Workspace;
     use std::path::PathBuf;
+
+    /// #262: a working agent armed the 128 ms spinner tick regardless of
+    /// whether anyone was attached, and every tick forced a full render. On a
+    /// fleet node where something is always working that is a permanent
+    /// render loop producing frames with no recipient. The spinner is a
+    /// rendered artefact: no viewer, no tick.
+    #[test]
+    fn spinner_tick_is_not_armed_without_a_viewer() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces.push(Workspace::test_new("busy"));
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        for terminal in app.state.terminals.values_mut() {
+            terminal.state = crate::detect::AgentState::Working;
+        }
+        assert!(
+            app.agent_panel_has_animation(),
+            "test fixture must actually have a working pane"
+        );
+
+        let now = Instant::now();
+        app.has_foreground_viewer = false;
+        app.next_animation_tick = None;
+        app.sync_headless_animation_timer(now);
+        assert_eq!(
+            app.next_animation_tick, None,
+            "an unwatched server must not schedule spinner frames"
+        );
+
+        // A client attaching re-arms it on the next pass.
+        app.has_foreground_viewer = true;
+        app.sync_headless_animation_timer(now);
+        assert!(
+            app.next_animation_tick.is_some(),
+            "an attached viewer must get the spinner animated again"
+        );
+    }
 
     /// #197: the scheduled reap runs unattended and takes its whole plan —
     /// checkout, repo_root, the dirty/merge probes — from the membership. A

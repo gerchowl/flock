@@ -441,7 +441,7 @@ fn workspace_row_height(_ws: &crate::workspace::Workspace) -> u16 {
 /// Member workspaces of one project section (#33), by section key.
 fn section_member_indices(app: &AppState, key: &str) -> Vec<usize> {
     app.project_section_keys()
-        .into_iter()
+        .iter()
         .enumerate()
         .filter(|(_, section)| section.as_deref() == Some(key))
         .map(|(ws_idx, _)| ws_idx)

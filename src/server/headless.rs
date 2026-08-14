@@ -44,8 +44,8 @@ use crate::server::client_accept::{
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
-    events_include_interaction, latest_app_client, render_targets, terminal_attach_client_ids,
-    ClientConnection, ClientConnectionMode,
+    events_include_interaction, has_render_targets, latest_app_client, render_targets,
+    terminal_attach_client_ids, ClientConnection, ClientConnectionMode,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -176,6 +176,32 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Whether an unattended server owes a render pass now (#262).
+///
+/// `geometry_unestablished` is the override that matters: with no client
+/// attached, `render_and_stream` resizes panes exactly when `view.pane_infos`
+/// is empty, so that pass is the one that sizes a freshly created workspace's
+/// panes down from `estimate_pane_size`'s 24-row guess to the real pane rect.
+/// It must never be deferred — the delay is invisible in a frame but plainly
+/// visible to an API client, because `pane.read --source recent` counts back
+/// from the LAST row and so silently drops the top of the output.
+fn unattended_render_due(
+    geometry_unestablished: bool,
+    last_render_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    geometry_unestablished
+        || last_render_at.is_none_or(|at| now.duration_since(at) >= UNATTENDED_RENDER_INTERVAL)
+}
+
+/// How often an unattended server still refreshes `state.view` (#262).
+///
+/// With no client subscribed to frames a render streams nothing; the only
+/// reason to run one is to keep pane geometry current for API clients. At the
+/// 16 ms frame cap that was a continuous full render for no viewer, which is
+/// how a busy node came to burn a core with nobody attached.
+const UNATTENDED_RENDER_INTERVAL: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
@@ -192,6 +218,11 @@ pub struct HeadlessServer {
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
     foreground_client_id: Option<u64>,
+    /// A structural change arrived while no client was subscribed to frames
+    /// (#262), so the deferred unattended render owes a full pass rather than
+    /// a retained one. Carried because `needs_full_render` is loop-local and
+    /// gets cleared when a pass is skipped.
+    unattended_full_render_pending: bool,
     /// Server-owned keybindings, restored when foreground clients use server mode.
     server_keybindings: crate::config::LiveKeybindConfig,
     /// Full server config warning shown to clients that use server keybindings.
@@ -342,6 +373,7 @@ impl HeadlessServer {
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
+            unattended_full_render_pending: false,
             server_keybindings,
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
@@ -601,6 +633,48 @@ impl HeadlessServer {
             // Idle flock animates only while a client is watching this server.
             self.app.has_foreground_viewer = self.foreground_client_id.is_some();
             self.app.sync_headless_animation_timer(now);
+
+            // #262: with nobody subscribed to frames, a render streams
+            // nothing — a PTY-output wakeup has no audience. Doing it at the
+            // 16 ms frame cap meant a busy unattended node ran a continuous
+            // full render for nobody. Drop to a slow cadence instead.
+            //
+            // `needs_full_render` cannot gate this: every drain category in
+            // this loop sets it unconditionally, so PTY output alone raises
+            // it. What a deferred pass owes is carried in
+            // `unattended_full_render_pending` and reinstated when the
+            // cadence comes round, and the loop wakes at least every
+            // CLIENT_ACCEPT_POLL_INTERVAL, so nothing waits longer than
+            // UNATTENDED_RENDER_INTERVAL. An attaching client re-enters the
+            // normal path with a full render of its own.
+            //
+            // The one pass that must NEVER be deferred is the one that
+            // establishes pane geometry. With no client attached
+            // `render_and_stream` resizes panes exactly when
+            // `view.pane_infos` is empty, so that pass is what sizes a freshly
+            // created workspace's panes down from `estimate_pane_size`'s
+            // 24-row guess to the real pane rect. Deferring it leaves the PTY
+            // a few rows too tall for up to a second — invisible in a frame,
+            // but plainly visible to an API client, because `pane.read
+            // --source recent` counts back from the LAST row and so silently
+            // drops the top of the output (#262 CI regression).
+            if needs_render && !has_render_targets(&self.clients) {
+                self.unattended_full_render_pending |= needs_full_render;
+                let due = unattended_render_due(
+                    self.app.state.view.pane_infos.is_empty(),
+                    self.app.last_render_at,
+                    now,
+                );
+                if due {
+                    needs_full_render = self.unattended_full_render_pending;
+                    self.unattended_full_render_pending = false;
+                } else {
+                    self.app.render_dirty.store(false, Ordering::Release);
+                    needs_render = false;
+                    needs_full_render = false;
+                    crate::render_prof::event("render.defer.no_frame_subscriber");
+                }
+            }
 
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
@@ -3710,6 +3784,7 @@ mod tests {
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
+            unattended_full_render_pending: false,
             server_keybindings,
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
@@ -5895,6 +5970,40 @@ next_tab = ""
                 b: 0x56,
             })
         );
+    }
+
+    /// #262: an unattended server renders at a slow cadence because nothing is
+    /// consuming frames — but the pass that establishes pane geometry is not
+    /// optional, and deferring it is observable to API clients.
+    ///
+    /// With no client attached, `render_and_stream` resizes panes exactly when
+    /// `view.pane_infos` is empty. That is the pass which sizes a freshly
+    /// created workspace's panes from `estimate_pane_size`'s 24-row guess down
+    /// to the real pane rect. Deferring it by up to a second left the PTY a few
+    /// rows too tall, and `pane.read --source recent` counts back from the LAST
+    /// row — so a caller reading 20 lines of a 24-row grid silently lost the
+    /// top of the output. That is the CI regression this guard exists for.
+    #[test]
+    fn unattended_geometry_bootstrap_is_never_deferred() {
+        let now = Instant::now();
+        let just_rendered = Some(now - Duration::from_millis(10));
+
+        assert!(
+            unattended_render_due(true, just_rendered, now),
+            "a pass that would size panes must run even inside the slow cadence"
+        );
+
+        // Once geometry exists the cadence applies: a repaint-only wakeup waits.
+        assert!(
+            !unattended_render_due(false, just_rendered, now),
+            "with geometry established, an unattended repaint defers"
+        );
+        assert!(
+            unattended_render_due(false, Some(now - UNATTENDED_RENDER_INTERVAL), now),
+            "and comes due once the interval elapses"
+        );
+        // Nothing rendered yet is always due, whatever the geometry says.
+        assert!(unattended_render_due(false, None, now));
     }
 
     #[test]
