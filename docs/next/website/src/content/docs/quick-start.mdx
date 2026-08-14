@@ -6,12 +6,12 @@ description: Create your first Flock workspace and run agents in persistent term
 Start Flock from any project directory:
 
 ```bash
-flock
+flk
 ```
 
 Flock launches or attaches to your default background session. You do not manage sockets. If you detach, agents keep running.
 
-For the local, SSH, and `flock --remote` workflows, see [How to work with Flock](/docs/how-to-work/).
+For the local, SSH, and `flk --remote` workflows, see [How to work with Flock](/docs/how-to-work/).
 
 ## Create a workspace
 
@@ -64,11 +64,11 @@ Press `prefix+[` to enter copy mode for the focused pane. Use `h/j/k/l`, `w/b/e`
 Named sessions are separate Flock server namespaces. Use them when you want fully separate runtime state.
 
 ```bash
-flock session list
-flock session attach work
-flock session attach side-project
-flock session stop work
-flock session delete side-project
+flk session list
+flk session attach work
+flk session attach side-project
+flk session stop work
+flk session delete side-project
 ```
 
 Workspaces are usually enough. Use named sessions when you need isolation between sets of panes, sockets, and persistent state.
@@ -79,14 +79,14 @@ Run Flock where the work lives. If the code and credentials are on a server, eit
 
 ```bash
 ssh you@server
-flock
+flk
 ```
 
 Or attach from your local terminal through SSH:
 
 ```bash
-flock --remote workbox
-flock --remote ssh://you@server:2222
+flk --remote workbox
+flk --remote ssh://you@server:2222
 ```
 
 For repeat targets, put the host in your SSH config. See [How to work with Flock](/docs/how-to-work/) for the full model.

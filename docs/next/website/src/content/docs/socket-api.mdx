@@ -35,32 +35,32 @@ The socket API can:
 Create a workspace:
 
 ```bash
-flock workspace create --cwd ~/project --label api
+flk workspace create --cwd ~/project --label api
 ```
 
 Create a tab:
 
 ```bash
-flock tab create --label logs
+flk tab create --label logs
 ```
 
 Split a pane and run a command:
 
 ```bash
-flock pane split 1-1 --direction right
-flock pane run 1-2 "npm test"
+flk pane split 1-1 --direction right
+flk pane run 1-2 "npm test"
 ```
 
 Wait for an agent:
 
 ```bash
-flock wait agent-status 1-1 --status done
+flk wait agent-status 1-1 --status done
 ```
 
 Read pane output:
 
 ```bash
-flock pane read 1-2 --source recent --lines 50
+flk pane read 1-2 --source recent --lines 50
 ```
 
 ## Raw methods
@@ -80,7 +80,7 @@ Raw socket method names use dot notation:
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
-Some CLI commands are conveniences around these methods. For example, `flock agent wait` resolves an agent target and then subscribes to pane agent state events.
+Some CLI commands are conveniences around these methods. For example, `flk agent wait` resolves an agent target and then subscribes to pane agent state events.
 
 Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
 
@@ -284,9 +284,9 @@ Use `events.wait` when you want one matching event and then a response.
 Use `pane.read` through the CLI unless you are writing a protocol client.
 
 ```bash
-flock pane read 1-1 --source visible --lines 80
-flock pane read 1-1 --source recent --lines 120
-flock pane read 1-1 --source recent-unwrapped --lines 120
+flk pane read 1-1 --source visible --lines 80
+flk pane read 1-1 --source recent --lines 120
+flk pane read 1-1 --source recent-unwrapped --lines 120
 ```
 
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
@@ -296,8 +296,8 @@ flock pane read 1-1 --source recent-unwrapped --lines 120
 Use waits to coordinate agents and scripts.
 
 ```bash
-flock wait agent-status 1-1 --status done
-flock wait agent-status 1-1 --status blocked
+flk wait agent-status 1-1 --status done
+flk wait agent-status 1-1 --status blocked
 ```
 
 Agent waits observe semantic state, not arbitrary command completion.
@@ -340,4 +340,4 @@ Errors look like this:
 
 Flock has a protocol version for client/server compatibility. Protocol changes are reviewed with release compatibility in mind.
 
-Check the server protocol with `ping` or `flock status` before depending on new behavior. Handle unknown fields gracefully.
+Check the server protocol with `ping` or `flk status` before depending on new behavior. Handle unknown fields gracefully.
