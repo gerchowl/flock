@@ -2219,6 +2219,7 @@ mod tests {
         assert_eq!(
             // guardrails-ok(hermetic): shell-config parsing input, never executed
             pane_shell_from("/usr/bin/nu", Some("/bin/bash".to_string())),
+            // guardrails-ok(hermetic): shell-config parsing input, never executed
             "/usr/bin/nu"
         );
     }

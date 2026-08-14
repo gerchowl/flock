@@ -73,7 +73,7 @@ mod tests {
     fn portable_pty_setup_leaves_one_parent_pty_fd() {
         let _guard = pty_fd_test_lock().lock().expect("pty fd test lock");
         let before = parent_pty_fd_count();
-        let mut cmd = CommandBuilder::new("/bin/cat");
+        let mut cmd = CommandBuilder::new(crate::test_support::program_path("cat"));
         cmd.env(crate::FLOCK_ENV_VAR, crate::FLOCK_ENV_VALUE);
 
         let mut spawned =

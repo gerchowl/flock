@@ -63,6 +63,8 @@ mod raw_input;
 mod release_notes;
 mod remote;
 mod render_prof;
+#[cfg(test)]
+mod test_support;
 // #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.
 mod revert;
 mod selection;
