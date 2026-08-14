@@ -211,6 +211,18 @@ pub(crate) fn terminal_attach_client_ids(
         .collect()
 }
 
+/// Whether anyone is actually waiting on a frame — `render_targets` without
+/// building the vector (#262). The render loop asks this every pass to decide
+/// whether a wakeup is worth drawing for at all.
+pub(crate) fn has_render_targets(clients: &HashMap<u64, ClientConnection>) -> bool {
+    clients.values().any(|client| {
+        client.writer.is_some()
+            && client.frame_subscription
+            && (client.is_full_app_client()
+                || matches!(client.mode, ClientConnectionMode::TerminalAttach { .. }))
+    })
+}
+
 pub(crate) fn render_targets(
     clients: &HashMap<u64, ClientConnection>,
     foreground_client_id: Option<u64>,
@@ -274,5 +286,29 @@ mod tests {
         // Resume client 2: targeted again.
         clients.get_mut(&2).unwrap().frame_subscription = true;
         assert_eq!(render_targets(&clients, Some(1)).len(), 2);
+    }
+
+    /// #262: the render loop skips PTY-only wakeups when nothing is subscribed
+    /// to frames, so this predicate has to agree with `render_targets` exactly
+    /// — a false positive costs a wasted full render, a false negative drops a
+    /// frame a client was waiting for.
+    #[test]
+    fn has_render_targets_agrees_with_render_targets() {
+        let mut clients = HashMap::new();
+        assert!(!has_render_targets(&clients));
+
+        clients.insert(1, app_client_with_writer());
+        clients.insert(2, app_client_with_writer());
+        assert!(has_render_targets(&clients));
+
+        // A paused slot is not an audience.
+        clients.get_mut(&1).unwrap().frame_subscription = false;
+        assert!(has_render_targets(&clients));
+        clients.get_mut(&2).unwrap().frame_subscription = false;
+        assert!(!has_render_targets(&clients));
+        assert!(render_targets(&clients, Some(1)).is_empty());
+
+        clients.get_mut(&2).unwrap().frame_subscription = true;
+        assert!(has_render_targets(&clients));
     }
 }

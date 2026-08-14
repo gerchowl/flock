@@ -13,7 +13,8 @@ use unicode_width::UnicodeWidthChar;
 
 use super::state::{
     text_matches_query, AppState, Mode, NavigatorRow, NavigatorStateFilter, NavigatorTarget,
-    PaneFocusTarget, PromptHistoryAnchor, ToastKind, ToastNotification, ToastTarget, ViewLayout,
+    PaneFocusTarget, PromptHistoryAnchor, SectionGroupingMemo, ToastKind, ToastNotification,
+    ToastTarget, ViewLayout,
 };
 
 fn public_tab_id_for_index(ws: &crate::workspace::Workspace, tab_idx: usize) -> Option<String> {
@@ -1392,7 +1393,69 @@ impl AppState {
     ///   on it stays stable across restarts AND across the moment metadata
     ///   resolves mid-session.
     /// - `None` = no git identity (pending probe or resolved non-git).
-    pub(crate) fn project_section_keys(&self) -> Vec<Option<String>> {
+    ///
+    /// Memoized (#262). The sidebar asks for this grouping around twenty times
+    /// per frame — once per section row, plus once per `workspace_list_entries`
+    /// call — and each rebuild sweeps every workspace and allocates a `String`
+    /// per row. The result is a pure function of the workspaces' git identity,
+    /// so it is cached behind a fingerprint of exactly those inputs and shared
+    /// as an `Rc` instead of being rebuilt per caller.
+    pub(crate) fn project_section_keys(&self) -> std::rc::Rc<Vec<Option<String>>> {
+        std::rc::Rc::clone(&self.section_grouping().section_keys)
+    }
+
+    /// Machine-INDEPENDENT sort identity per workspace (#85), memoized
+    /// alongside `project_section_keys` — same inputs, same lifetime.
+    pub(crate) fn project_section_sort_ids(&self) -> std::rc::Rc<Vec<Option<String>>> {
+        std::rc::Rc::clone(&self.section_grouping().sort_ids)
+    }
+
+    /// The memoized grouping, rebuilt only when the workspaces' git identity
+    /// actually changes.
+    fn section_grouping(&self) -> SectionGroupingMemo {
+        let fingerprint = self.section_grouping_fingerprint();
+        {
+            let memo = self.section_grouping_memo.borrow();
+            if let Some(memo) = memo.as_ref() {
+                if memo.fingerprint == fingerprint {
+                    return memo.clone();
+                }
+            }
+        }
+
+        let rebuilt = SectionGroupingMemo {
+            fingerprint,
+            section_keys: std::rc::Rc::new(self.compute_project_section_keys()),
+            sort_ids: std::rc::Rc::new(self.compute_project_section_sort_ids()),
+        };
+        *self.section_grouping_memo.borrow_mut() = Some(rebuilt.clone());
+        rebuilt
+    }
+
+    /// Hash of every input the grouping reads. Cheap relative to a rebuild: it
+    /// hashes a handful of short strings per workspace and allocates nothing,
+    /// where a rebuild allocates two hash maps and a `String` per workspace.
+    fn section_grouping_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.workspaces.len().hash(&mut hasher);
+        for ws in &self.workspaces {
+            ws.repo_group_key().hash(&mut hasher);
+            match ws.git_space() {
+                Some(space) => {
+                    space.key.hash(&mut hasher);
+                    space.project_key.hash(&mut hasher);
+                }
+                None => 0u8.hash(&mut hasher),
+            }
+            ws.worktree_space_here()
+                .map(|membership| &membership.key)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn compute_project_section_keys(&self) -> Vec<Option<String>> {
         // Machine-local repo family per workspace: membership key first,
         // then the cached git common dir (`repo_group_key`).
         let families: Vec<Option<&str>> = self
@@ -1457,7 +1520,7 @@ impl AppState {
     /// project key where available (shared across the fleet -- origin URLs),
     /// else the local family key. Sections sort by this so the sidebar order
     /// is identical on every server, instead of each server's storage order.
-    pub(crate) fn project_section_sort_ids(&self) -> Vec<Option<String>> {
+    fn compute_project_section_sort_ids(&self) -> Vec<Option<String>> {
         let families: Vec<Option<&str>> = self
             .workspaces
             .iter()
@@ -1496,7 +1559,7 @@ impl AppState {
 
     /// The section key of one workspace's project group, if it has one.
     pub(crate) fn project_section_key(&self, ws_idx: usize) -> Option<String> {
-        self.project_section_keys().into_iter().nth(ws_idx)?
+        self.project_section_keys().get(ws_idx)?.clone()
     }
 
     /// Keys of every project section rendered as a collapsible sidebar group:
@@ -1588,7 +1651,7 @@ impl AppState {
     /// labelled "Close local checkout" rather than the misleading "Close group".
     pub(crate) fn local_section_member_count(&self, key: &str) -> usize {
         self.project_section_keys()
-            .into_iter()
+            .iter()
             .filter(|section| section.as_deref() == Some(key))
             .count()
     }
@@ -1605,8 +1668,12 @@ impl AppState {
         if self.collapsed_space_keys.is_empty() {
             return;
         }
-        let live: std::collections::HashSet<String> =
-            self.project_section_keys().into_iter().flatten().collect();
+        let live: std::collections::HashSet<String> = self
+            .project_section_keys()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
         let before = self.collapsed_space_keys.len();
         self.collapsed_space_keys.retain(|key| live.contains(key));
         if self.collapsed_space_keys.len() != before {
@@ -6976,6 +7043,43 @@ mod tests {
             state.terminal_runtime_shutdowns.contains(&float_tid),
             "float PTY scheduled for shutdown"
         );
+    }
+
+    /// #262: the sidebar asks for the project-section grouping around twenty
+    /// times per frame. Rebuilding it each time swept the whole fleet and
+    /// allocated a `String` per row; at 32 workspaces that plus the git probe
+    /// behind it took ~67 ms per sidebar frame, so the 16 ms frame cap could
+    /// never idle and the server burned a core. Repeat asks must be answered
+    /// from the memo — same allocation, not an equal one.
+    #[test]
+    fn project_section_grouping_is_shared_until_git_identity_moves() {
+        let mut state = app_with_workspaces(&["parent", "child"]);
+        mark_parent_worktree(&mut state, 0);
+        mark_linked_worktree(&mut state, 1);
+
+        let first = state.project_section_keys();
+        let second = state.project_section_keys();
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &second),
+            "a repeat ask must reuse the memo, not rebuild the grouping"
+        );
+        let first_ids = state.project_section_sort_ids();
+        assert!(
+            std::rc::Rc::ptr_eq(&first_ids, &state.project_section_sort_ids()),
+            "sort ids share the memo's lifetime with the section keys"
+        );
+
+        // Git identity moving is exactly what the memo keys on, so the next
+        // ask must rebuild rather than serve a stale grouping.
+        state.workspaces[1].cached_git_space = None;
+        state.workspaces[1].worktree_space = None;
+        let after = state.project_section_keys();
+        assert!(
+            !std::rc::Rc::ptr_eq(&first, &after),
+            "a git-identity change must invalidate the memo"
+        );
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1], None, "the de-identified workspace has no section");
     }
 
     #[test]
