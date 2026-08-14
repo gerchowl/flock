@@ -330,6 +330,51 @@ impl FleetSnapshotState {
 /// `to_wire`). Far above any realistic personal fleet.
 pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
 
+/// One entry in the relay cache: a peer some hub told us about.
+///
+/// Holds a materialised [`PeerSummaryState`] rather than the wire shape, so the
+/// sidebar can render a relayed node exactly like any other peer instead of the
+/// row existing only to be forwarded onward (#101 part 1 follow-up).
+///
+/// The wire entry's `origin` is deliberately NOT carried: it is consumed at
+/// merge time, where loop prevention drops rows this server itself originated,
+/// and nothing downstream needs to know which hub a row arrived through. The
+/// reachable identity a receiver does need travels separately, on the peer's
+/// own `proxy_jump`.
+#[derive(Debug, Clone)]
+pub struct RelayedEntry {
+    /// The relayed peer, in the same shape as a locally polled one.
+    pub peer: PeerSummaryState,
+}
+
+/// Materialise a relayed wire entry into the shape every rendering surface
+/// already understands.
+pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> RelayedEntry {
+    RelayedEntry {
+        peer: PeerSummaryState {
+            peer: entry.name,
+            ssh_target: entry.ssh_target,
+            host: entry.host,
+            version: entry.version,
+            protocol: entry.protocol,
+            system: entry.system,
+            latency_ms: entry.latency_ms,
+            workspaces: entry.workspaces,
+            last_ok: entry
+                .age_secs
+                .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
+            error: entry.error,
+            // Prefer the explicit origin assertion; fall back to `age_secs` for
+            // a v(N-1) hub that does not send one.
+            origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
+            // Dwell starts now — this is when the reading entered this server.
+            ingested_at: Some(Instant::now()),
+            proxy_jump: entry.proxy_jump,
+            icon: entry.icon,
+        },
+    }
+}
+
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {

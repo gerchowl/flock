@@ -183,27 +183,13 @@ impl App {
 /// down-gossip fleet snapshot (#101). Origin-honest freshness rides
 /// through unchanged so the receiver's staleness check reads the ORIGIN's
 /// assertion, not our dwell.
-fn relayed_peer_to_wire(entry: &RelayedFleetPeer) -> crate::protocol::FleetPeer {
-    crate::protocol::FleetPeer {
-        name: entry.name.clone(),
-        ssh_target: entry.ssh_target.clone(),
-        host: entry.host.clone(),
-        version: entry.version.clone(),
-        protocol: entry.protocol,
-        system: entry.system.clone().map(Into::into),
-        latency_ms: entry.latency_ms,
-        workspaces: entry.workspaces.iter().cloned().map(Into::into).collect(),
-        age_secs: entry.age_secs,
-        error: entry.error.clone(),
-        // Prefer the explicit origin field; fall back to age_secs so a v(N-1)
-        // origin's implicit freshness assertion still rides the snapshot wire.
-        origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
-        // The polling peer stamped its own reachable identity — carry it
-        // through so the client's next-hop bridge can ProxyJump.
-        proxy_jump: entry.proxy_jump.clone(),
-        // #164: carry the relayed peer's self-declared icon into the snapshot.
-        icon: entry.icon.clone(),
-    }
+/// Re-encode a relayed row for an outgoing snapshot.
+///
+/// `peer_to_wire` already carries the accumulated age (origin's reading plus
+/// our dwell), so a receiver inherits an honest reading rather than the
+/// capture-time one this hub was handed.
+fn relayed_peer_to_wire(entry: &crate::peers::RelayedEntry) -> crate::protocol::FleetPeer {
+    crate::peers::peer_to_wire(&entry.peer)
 }
 
 /// Map the local status-line stats sampler onto the federated summary shape.
@@ -280,9 +266,13 @@ impl App {
             }
             PeerSwitchRequest::RelayedPeer { host_key } => {
                 let entry = self.state.relayed_fleet_cache.get(&host_key)?;
-                let ssh_target = entry.ssh_target.clone();
-                let label = entry.host.clone().unwrap_or_else(|| entry.name.clone());
-                let proxy_jump = entry.proxy_jump.clone();
+                let ssh_target = entry.peer.ssh_target.clone();
+                let label = entry
+                    .peer
+                    .host
+                    .clone()
+                    .unwrap_or_else(|| entry.peer.peer.clone());
+                let proxy_jump = entry.peer.proxy_jump.clone();
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
@@ -368,16 +358,17 @@ impl App {
                 let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
                 for entry in self.state.relayed_fleet_cache.values() {
                     let host_lower = entry
+                        .peer
                         .host
                         .as_deref()
                         .filter(|host| !host.is_empty())
-                        .unwrap_or(&entry.ssh_target)
+                        .unwrap_or(&entry.peer.ssh_target)
                         .to_ascii_lowercase();
                     if host_lower == origin_lower || host_lower == exclude_lower {
                         continue;
                     }
                     if own_hosts.contains(&host_lower)
-                        || own_hosts.contains(&entry.ssh_target.to_ascii_lowercase())
+                        || own_hosts.contains(&entry.peer.ssh_target.to_ascii_lowercase())
                     {
                         continue;
                     }
@@ -788,7 +779,7 @@ mod tests {
         app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
-            crate::api::schema::RelayedFleetPeer {
+            crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 name: "spoke2.invalid".into(),
                 ssh_target: "lars@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
@@ -803,7 +794,7 @@ mod tests {
                 origin_last_ok_secs: Some(4),
                 proxy_jump: Some("anvil".into()),
                 icon: None,
-            },
+            }),
         );
 
         let prepared = app
@@ -841,7 +832,7 @@ mod tests {
         // Simulate anvil having relayed sage to us on a prior poll.
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
-            crate::api::schema::RelayedFleetPeer {
+            crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 name: "spoke2.invalid".into(),
                 ssh_target: "lars@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
@@ -856,7 +847,7 @@ mod tests {
                 origin_last_ok_secs: Some(3),
                 proxy_jump: Some("anvil".into()),
                 icon: None,
-            },
+            }),
         );
 
         let entries = app.own_relayed_fleet();
