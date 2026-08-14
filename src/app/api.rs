@@ -13,7 +13,7 @@ pub(crate) mod peers;
 mod responses;
 mod revert;
 mod tabs;
-mod workspaces;
+pub(crate) mod workspaces;
 mod worktrees;
 
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};

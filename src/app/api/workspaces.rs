@@ -8,6 +8,18 @@ use crate::app::App;
 
 use super::responses::{encode_error, encode_success};
 
+/// What happened to a switch's post-attach focus request (#80). The three
+/// cases are worth telling apart in a log: landing where you asked is the
+/// normal path, being there already is a benign warm-slot outcome, and an id
+/// nothing answers to means the space went away while the switch was in
+/// flight — the only one that says something went wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceFocusOutcome {
+    Focused,
+    AlreadyActive,
+    Unknown,
+}
+
 impl App {
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
         encode_success(
@@ -92,21 +104,29 @@ impl App {
         }
     }
 
-    /// Focus a workspace by its public id, reporting whether anything moved.
+    /// Focus the workspace a switch named (#80), by EXACT id.
     ///
-    /// Shared by the JSON API and the in-band `FocusWorkspace` message a
-    /// client sends when it arrives via a workspace-targeted server switch
-    /// (#80) — one resolution path, so "focus ws_3" means the same thing
-    /// however it was asked for.
-    pub(crate) fn focus_workspace_by_public_id(&mut self, workspace_id: &str) -> bool {
-        let Some(index) = self.parse_workspace_id(workspace_id) else {
-            return false;
+    /// Deliberately stricter than [`Self::parse_workspace_id`], which the JSON
+    /// API uses: that accepts a bare ordinal (`"5"` → the fifth workspace) for
+    /// CLI ergonomics, which is the wrong contract for a machine-supplied id
+    /// arriving off the wire. A gossiped `PeerWorkspaceSummary.id` is always
+    /// the server-assigned `ws.id`, so an id that matches nothing here means
+    /// the space is gone — not "try it as an index" and silently land on an
+    /// unrelated workspace.
+    pub(crate) fn focus_workspace_by_id(&mut self, workspace_id: &str) -> WorkspaceFocusOutcome {
+        let index = self
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == workspace_id);
+        let Some(index) = index else {
+            return WorkspaceFocusOutcome::Unknown;
         };
-        if self.state.workspaces.get(index).is_none() || self.state.active == Some(index) {
-            return false;
+        if self.state.active == Some(index) {
+            return WorkspaceFocusOutcome::AlreadyActive;
         }
         self.state.switch_workspace(index);
-        true
+        WorkspaceFocusOutcome::Focused
     }
 
     pub(super) fn handle_workspace_focus(&mut self, id: String, target: WorkspaceTarget) -> String {

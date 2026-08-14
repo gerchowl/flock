@@ -446,6 +446,8 @@ impl App {
                 // so a leap never loses the server it just left. Best-effort
                 // target: our short host name — the same identity we already
                 // stamp as `proxy_jump` for peers only routable through us.
+                // (When we ARE the carried origin, the merge drops this again:
+                // the home row already stands for us over there.)
                 ours.push(self.self_peer_entry(&us));
                 snapshot.peers =
                     merge_fleet_peers(ours, snapshot.peers, exclude_ssh_target, &snapshot.origin);

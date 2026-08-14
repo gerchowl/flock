@@ -2282,14 +2282,19 @@ impl HeadlessServer {
                 // treated as an error: the space may have closed while the
                 // switch was in flight, and the client is already attached —
                 // showing it wherever we are beats tearing anything down.
-                let focused = self.app.focus_workspace_by_public_id(&workspace_id);
-                if !focused {
-                    info!(
-                        client_id,
-                        workspace_id, "switch-focus target not applied (unknown or already active)"
-                    );
+                use crate::app::WorkspaceFocusOutcome;
+                match self.app.focus_workspace_by_id(&workspace_id) {
+                    WorkspaceFocusOutcome::Focused => true,
+                    // Normal under a warm-slot switch: nothing to say.
+                    WorkspaceFocusOutcome::AlreadyActive => false,
+                    WorkspaceFocusOutcome::Unknown => {
+                        info!(
+                            client_id,
+                            workspace_id, "switch-focus target no longer exists"
+                        );
+                        false
+                    }
                 }
-                focused
             }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");

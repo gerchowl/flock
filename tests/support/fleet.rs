@@ -563,6 +563,14 @@ pub fn switch_focus_workspace(tail: &[u8]) -> Option<String> {
 /// Split one trailing bincode `Option<String>` off `tail`: `None` is a single
 /// `0x00`; `Some` is `0x01`, a one-byte length varint (ids are short), then the
 /// utf8 bytes.
+///
+/// KNOWN LIMIT: `Some("")` encodes as `0x01 0x00` and is read here as `None` —
+/// a trailing `0x00` is taken as the None tag without looking further back,
+/// because in general the preceding byte is indistinguishable from payload.
+/// Safe for the fields this parses: a workspace id is never empty (the emit
+/// side filters blank ids out), and a ProxyJump identity never is either.
+/// Anything else that can legitimately be an empty string needs a real decode,
+/// not this.
 fn trailing_option_string(tail: &[u8]) -> (Option<String>, &[u8]) {
     if tail.last() == Some(&0) {
         return (None, &tail[..tail.len() - 1]);

@@ -142,6 +142,14 @@ pub(crate) struct VisibleAgent {
     /// How long this agent has been in its current state. `None` when the
     /// state predates tracking (or a peer reported no age) — treated as the
     /// oldest, which is how the queue has always read a missing timestamp.
+    ///
+    /// Precision differs by source and deliberately isn't normalised away: a
+    /// local pane measures its own transition to sub-second resolution, while
+    /// a peer reports whole seconds captured at its last poll. Ranking is
+    /// therefore accurate to about a second across machines — immaterial for a
+    /// queue about who has been waiting longest, and the alternative (rounding
+    /// local ages down to match) would make two local panes that changed in
+    /// the same second unorderable, which is the case the resolution is for.
     pub(crate) age: Option<std::time::Duration>,
 }
 
