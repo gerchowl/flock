@@ -1411,6 +1411,38 @@ Last login: banner noise
         assert_eq!(value["origin_last_ok_secs"], 3);
     }
 
+    /// The in-flight guard is set eagerly at dispatch and released ONLY by a
+    /// `PeerSummaryFetched` event. A fetch worker that panicked used to send
+    /// nothing, freezing that peer's polling for the rest of the process
+    /// lifetime with no symptom but a row quietly going stale. The dispatcher
+    /// now converts a panic into an ordinary failed poll — this pins the half
+    /// that matters here: a failure result releases the guard exactly like a
+    /// success, so the next round dispatches again.
+    #[test]
+    fn a_failed_poll_releases_the_in_flight_guard_like_a_successful_one() {
+        let mut tracker = PeerPollTracker::new();
+        let now = Instant::now();
+        assert!(tracker.should_poll_now("anvil", now, Duration::from_secs(15)));
+        assert!(tracker.in_flight("anvil"));
+
+        // The shape the dispatcher synthesizes when a worker unwinds.
+        let panicked = PeerSummaryFetch {
+            peer: "anvil".to_string(),
+            result: Err("peer summary fetch panicked".to_string()),
+        };
+        tracker.mark_finished(&panicked.peer);
+
+        assert!(!tracker.in_flight("anvil"), "the guard must be released");
+        assert!(
+            tracker.should_poll_now(
+                "anvil",
+                now + Duration::from_secs(15),
+                Duration::from_secs(15)
+            ),
+            "a peer whose poll failed must be polled again next round"
+        );
+    }
+
     #[test]
     fn peer_poll_tracker_dispatches_first_call_and_arms_next_due() {
         // First call on a fresh peer: always dispatch, mark in-flight.

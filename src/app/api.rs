@@ -225,7 +225,21 @@ impl App {
                 }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let fetch = crate::peers::fetch_peer_summary(&peer);
+                    // The tracker marked this peer in-flight before the spawn,
+                    // and `PeerSummaryFetched` is the ONLY thing that releases
+                    // it. A panic in here would therefore freeze this peer's
+                    // polling for the rest of the process lifetime, with no
+                    // symptom but a row that quietly goes stale. Turn it into
+                    // an ordinary poll failure: the guard is released and the
+                    // peer renders its error like any other unreachable node.
+                    let peer_name = peer.name.clone();
+                    let fetch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::peers::fetch_peer_summary(&peer)
+                    }))
+                    .unwrap_or_else(|_| crate::peers::PeerSummaryFetch {
+                        peer: peer_name,
+                        result: Err("peer summary fetch panicked".to_string()),
+                    });
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });
             }
