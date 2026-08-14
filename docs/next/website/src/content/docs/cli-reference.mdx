@@ -69,6 +69,48 @@ flock config check --path ./config.toml || exit 1
 
 Base and `config.local.toml` layering resolves exactly as it does at runtime. This is unrelated to `flock checks`, which runs the health-check runner.
 
+## Preflight
+
+```bash
+flock preflight [--require TARGET]...
+```
+
+Answers one question: **is flock functional on THIS host right now?** `config check` proves the config parses; preflight also asks whether the things that config switches on are actually wired here. It exits on the same three-way code, so an activation or deploy can gate on it:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | ready |
+| `1` | works, but something wants attention |
+| `2` | a configured feature is broken here |
+
+It checks the config (by running `config check`), each agent integration, that the worktree directory is writable, and that `git` / `ssh` / `gh` are on `PATH`. Failures name the fix rather than the symptom.
+
+**It never touches the network.** Preflight is built to run inside a Home Manager activation, so it cannot be allowed to hang one — peer reachability belongs to `flock status`, on a different clock.
+
+### Why `--require`
+
+An integration that is missing might be a deliberate opt-out, so flock will not fail your deploy over it on its own judgement:
+
+| Hook state | Agent on this host | Result |
+| --- | --- | --- |
+| current | — | `0` |
+| stale | — | `2` — it was wired and is now broken |
+| missing | yes | `1` — might be intentional |
+| missing | no | silent — not this host's business |
+
+`--require TARGET` (repeatable) says *this deployment meant to have that one*, turning a missing hook into a `2`. flock cannot infer intent; the thing that deploys it can. A required target whose agent has vanished entirely still fails — passing quietly there would hide exactly the breakage this catches.
+
+```bash
+# In an activation: fail loudly if the Claude hook did not install.
+flock preflight --require claude || exit 1
+```
+
+This matters because a half-wired host is silent by nature. Before the prompt-history panel read session transcripts it was fed purely by lifecycle hooks, so a host whose integration never installed showed an *empty panel* — indistinguishable from having no history yet.
+
+:::note
+A debug build reads `~/.config/flock-dev/config.toml`, so a debug-built preflight checks a different file than an installed one.
+:::
+
 ## Sessions
 
 ```bash

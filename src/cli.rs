@@ -25,6 +25,7 @@ mod msg;
 mod notification;
 mod pane;
 mod peers;
+mod preflight;
 mod revert;
 mod server;
 mod status;
@@ -66,6 +67,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "peers" => peers::run_peers_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
+        "preflight" => preflight::run_preflight_command(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
