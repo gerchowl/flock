@@ -13,13 +13,15 @@ Three live instances motivated this gate (#268):
   "zzz", so it failed in a worktree whose name began with a digit;
 * a fleet-snapshot test used a fixture peer named after a real machine in the
   fleet, and the self-exclusion filter dropped it when run on that machine;
-* an integration test hardcoded ``/bin/bash``, which does not exist on NixOS.
+* an integration test hardcoded ``/bin/bash``, which does not exist on NixOS,
+  and nine more reached for ``/usr/bin/true`` and ``/bin/cat`` the same way.
 
 What is flagged, in test code only:
 
 ``std::env::current_dir``   the cwd is whatever directory you happen to be in
 ``gethostname``/``hostname``  the real machine name leaks into assertions
 ``/bin/<x>`` for x != sh    only ``/bin/sh`` is guaranteed by POSIX
+``/usr/bin/<x>``            NixOS has no ``/usr/bin`` at all
 
 Scope is deliberately narrow: ``tests/`` plus ``#[cfg(test)]`` regions of ``.rs``
 sources. Production code legitimately reads all three.
@@ -56,9 +58,10 @@ PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "fhs-path",
-        re.compile(r"""["'](/bin/[A-Za-z0-9._-]+)["']"""),
-        "hardcodes an FHS path that not every distribution provides "
-        "(NixOS ships only /bin/sh)",
+        re.compile(r"""["']((?:/usr)?/bin/[A-Za-z0-9._-]+)["']"""),
+        "hardcodes an FHS binary path that not every distribution provides "
+        "(NixOS ships only /bin/sh and has no /usr/bin) — resolve it through "
+        "PATH instead, e.g. crate::test_support::program_path(\"cat\")",
     ),
 ]
 

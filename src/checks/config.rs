@@ -543,6 +543,7 @@ LC_ALL = "C"
     fn action_spec_event_variant_parses() {
         let toml = r#"
 name = "custom"
+# guardrails-ok(hermetic): check-config parsing fixture, never spawned
 program = "/usr/bin/true"
 
 [on_fire.event]
@@ -572,6 +573,7 @@ label = "custom-fired"
             scripts: vec![
                 ScriptCheck {
                     name: String::new(),
+                    // guardrails-ok(hermetic): check-config parsing fixture, never spawned
                     program: PathBuf::from("/usr/bin/true"),
                     ..ScriptCheck::default()
                 },
@@ -582,11 +584,13 @@ label = "custom-fired"
                 },
                 ScriptCheck {
                     name: "dup".into(),
+                    // guardrails-ok(hermetic): check-config parsing fixture, never spawned
                     program: PathBuf::from("/usr/bin/true"),
                     ..ScriptCheck::default()
                 },
                 ScriptCheck {
                     name: "dup".into(),
+                    // guardrails-ok(hermetic): check-config parsing fixture, never spawned
                     program: PathBuf::from("/usr/bin/true"),
                     ..ScriptCheck::default()
                 },
@@ -597,6 +601,7 @@ label = "custom-fired"
                 },
                 ScriptCheck {
                     name: "fast".into(),
+                    // guardrails-ok(hermetic): check-config parsing fixture, never spawned
                     program: PathBuf::from("/usr/bin/true"),
                     interval_secs: 0,
                     timeout_secs: 0,
@@ -732,7 +737,9 @@ expr = "@daily"
     #[test]
     fn accepted_program_path_handles_absolute_and_tilde() {
         assert_eq!(
+            // guardrails-ok(hermetic): check-config parsing fixture, never spawned
             accepted_program_path(std::path::Path::new("/usr/bin/true")),
+            // guardrails-ok(hermetic): check-config parsing fixture, never spawned
             Some(PathBuf::from("/usr/bin/true"))
         );
         // Set HOME to a deterministic value for the tilde expansion.

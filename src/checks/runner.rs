@@ -502,6 +502,7 @@ mod tests {
             min_tick_secs: 1,
             scripts: vec![ScriptCheck {
                 name: name.into(),
+                // guardrails-ok(hermetic): runner fixture, the program is never spawned in this test
                 program: PathBuf::from("/usr/bin/true"),
                 interval_secs,
                 timeout_secs: 5,
@@ -623,6 +624,7 @@ mod tests {
             scripts: (0..3)
                 .map(|i| ScriptCheck {
                     name: format!("s{i}"),
+                    // guardrails-ok(hermetic): runner fixture, the program is never spawned in this test
                     program: PathBuf::from("/usr/bin/true"),
                     interval_secs: 10,
                     timeout_secs: 5,
@@ -748,6 +750,7 @@ mod tests {
         let mut config = cron_config("nightly", "* * * * *");
         config.scripts.push(super::ScriptCheck {
             name: "later".into(),
+            // guardrails-ok(hermetic): runner fixture, the program is never spawned in this test
             program: std::path::PathBuf::from("/usr/bin/true"),
             interval_secs: 3_600,
             timeout_secs: 5,
@@ -773,6 +776,7 @@ mod tests {
             scripts: vec![
                 ScriptCheck {
                     name: "a".into(),
+                    // guardrails-ok(hermetic): runner fixture, the program is never spawned in this test
                     program: PathBuf::from("/usr/bin/true"),
                     interval_secs: 30,
                     timeout_secs: 5,
@@ -781,6 +785,7 @@ mod tests {
                 },
                 ScriptCheck {
                     name: "b".into(),
+                    // guardrails-ok(hermetic): runner fixture, the program is never spawned in this test
                     program: PathBuf::from("/usr/bin/true"),
                     interval_secs: 60,
                     timeout_secs: 5,
