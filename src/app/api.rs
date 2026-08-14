@@ -225,20 +225,18 @@ impl App {
                 }
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    // The tracker marked this peer in-flight before the spawn,
-                    // and `PeerSummaryFetched` is the ONLY thing that releases
-                    // it. A panic in here would therefore freeze this peer's
-                    // polling for the rest of the process lifetime, with no
-                    // symptom but a row that quietly goes stale. Turn it into
-                    // an ordinary poll failure: the guard is released and the
-                    // peer renders its error like any other unreachable node.
+                    // The in-flight guard is released only by the event this
+                    // sends, so the fetch must not be able to unwind past it
+                    // (see `fetch_with_panic_guard`).
+                    //
+                    // Note what this does NOT recover: a panic raised while
+                    // `peer_stream::request` held the peer's slot mutex leaves
+                    // that slot poisoned, so the held connection is dropped and
+                    // the peer falls back to one-shot ssh. That is handled
+                    // where the poison is observed, in `peer_stream::request`.
                     let peer_name = peer.name.clone();
-                    let fetch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let fetch = crate::peers::fetch_with_panic_guard(&peer_name, || {
                         crate::peers::fetch_peer_summary(&peer)
-                    }))
-                    .unwrap_or_else(|_| crate::peers::PeerSummaryFetch {
-                        peer: peer_name,
-                        result: Err("peer summary fetch panicked".to_string()),
                     });
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });

@@ -243,12 +243,36 @@ pub fn request(
         let mut registry = registry().lock().map_err(|_| "registry poisoned")?;
         Arc::clone(registry.entry(peer.name.clone()).or_default())
     };
-    let mut slot = slot.lock().map_err(|_| "peer slot poisoned")?;
+    // A caller that panicked mid-request poisons this slot. Nothing in `Slot`
+    // is left inconsistent by that — the worst case is a held stream whose
+    // request/response pairing is no longer known, which is exactly the state
+    // where dropping the stream is the right move. Recover and reconnect
+    // rather than returning an error for the rest of the process lifetime:
+    // otherwise the panic guard on the fetch worker would only trade "this
+    // peer is never polled again" for "this peer is stuck on one-shot ssh
+    // forever", which is not the recovery it claims to be.
+    let mut slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => {
+            let mut slot = poisoned.into_inner();
+            slot.stream = None;
+            slot
+        }
+    };
 
     if let Some(retry_after) = slot.retry_after {
         if std::time::Instant::now() < retry_after {
             return Err("connection backing off".into());
         }
+    }
+
+    // The peer's ssh destination can move under a slot that was busy when the
+    // config reload swept through, and `retain_configured` deliberately does
+    // not wait for it. Check at the point of use, where the lock is already
+    // held: without this, a still-reachable OLD target would keep answering
+    // indefinitely because nothing forces the stream to be re-spawned.
+    if slot.stream.is_some() && slot.target != peer.ssh_target() {
+        slot.stream = None;
     }
 
     if slot.stream.is_none() {
@@ -310,9 +334,10 @@ pub fn retain_configured(peers: &[PeerConfig]) {
         // `try_lock`, not `lock`: the per-peer lock is held for the whole of a
         // request, so blocking here would stall the config reload — and with
         // it the loop that calls it — for up to REQUEST_TIMEOUT per wedged
-        // peer, serially. Reconciliation is not urgent: a slot busy right now
-        // is by definition connected to somewhere, and if that somewhere is
-        // stale its next request fails and re-spawns against the new target.
+        // peer, serially. A busy slot is left for `request` to reconcile: it
+        // re-checks `target` against config under the lock it already holds,
+        // so a moved peer reconnects there rather than waiting for the old
+        // stream to happen to die.
         match slot.try_lock() {
             Ok(slot) => slot.stream.is_none() || slot.target == peer.ssh_target(),
             Err(std::sync::TryLockError::WouldBlock) => true,

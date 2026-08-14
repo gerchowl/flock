@@ -497,6 +497,30 @@ pub struct PeerSummaryFetch {
     pub result: Result<PeerSummaryPayload, String>,
 }
 
+/// Run a peer fetch so that a panic becomes a failed poll instead of a lost
+/// completion event.
+///
+/// `PeerPollTracker::should_poll_now` marks a peer in-flight before its worker
+/// is spawned, and the ONLY release is the `PeerSummaryFetched` the worker
+/// sends back. A worker that unwound sent nothing, so that peer was never
+/// polled again for the rest of the process lifetime — with no symptom but a
+/// row that quietly went stale while every other peer kept updating.
+///
+/// Takes the fetch as a closure so the guard is testable without a reachable
+/// peer: the dispatcher passes the real SSH fetch, a test passes one that
+/// panics.
+pub fn fetch_with_panic_guard<F>(peer_name: &str, fetch: F) -> PeerSummaryFetch
+where
+    F: FnOnce() -> PeerSummaryFetch,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch)).unwrap_or_else(|_| {
+        PeerSummaryFetch {
+            peer: peer_name.to_string(),
+            result: Err("peer summary fetch panicked".to_string()),
+        }
+    })
+}
+
 /// Fetch a peer's summary over SSH (blocking; run off the UI thread). The
 /// round-trip wall time doubles as a free latency probe — no separate ping.
 pub fn fetch_peer_summary(peer: &PeerConfig) -> PeerSummaryFetch {
@@ -1411,35 +1435,44 @@ Last login: banner noise
         assert_eq!(value["origin_last_ok_secs"], 3);
     }
 
-    /// The in-flight guard is set eagerly at dispatch and released ONLY by a
-    /// `PeerSummaryFetched` event. A fetch worker that panicked used to send
-    /// nothing, freezing that peer's polling for the rest of the process
-    /// lifetime with no symptom but a row quietly going stale. The dispatcher
-    /// now converts a panic into an ordinary failed poll — this pins the half
-    /// that matters here: a failure result releases the guard exactly like a
-    /// success, so the next round dispatches again.
+    /// A fetch worker that panics must still produce a completion, or the
+    /// peer's in-flight guard is never released and it is silently never
+    /// polled again for the rest of the process lifetime.
+    ///
+    /// Drives `fetch_with_panic_guard` with a panicking fetch — remove the
+    /// guard and this test unwinds instead of asserting. An earlier version
+    /// called `mark_finished` directly on a synthetic `Err`, which passed just
+    /// as well against the UNGUARDED code: `mark_finished` never looks at the
+    /// result, so it proved nothing about the panic path.
     #[test]
-    fn a_failed_poll_releases_the_in_flight_guard_like_a_successful_one() {
+    fn a_panicking_fetch_still_completes_and_frees_the_peer_to_poll_again() {
+        // The panic is deliberate; keep the default hook from printing a
+        // backtrace that makes a passing test read like a failing one.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let fetched = fetch_with_panic_guard("anvil", || panic!("summary parser blew up"));
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(fetched.peer, "anvil", "the completion names the right peer");
+        assert!(
+            fetched.result.is_err(),
+            "a panicked fetch reports as a failed poll, not a success"
+        );
+
+        // And that completion is what frees the peer: the dispatcher hands it
+        // to the tracker exactly like any other result.
         let mut tracker = PeerPollTracker::new();
         let now = Instant::now();
-        assert!(tracker.should_poll_now("anvil", now, Duration::from_secs(15)));
+        assert!(tracker.should_poll_now(&fetched.peer, now, Duration::from_secs(15)));
         assert!(tracker.in_flight("anvil"));
-
-        // The shape the dispatcher synthesizes when a worker unwinds.
-        let panicked = PeerSummaryFetch {
-            peer: "anvil".to_string(),
-            result: Err("peer summary fetch panicked".to_string()),
-        };
-        tracker.mark_finished(&panicked.peer);
-
-        assert!(!tracker.in_flight("anvil"), "the guard must be released");
+        tracker.mark_finished(&fetched.peer);
         assert!(
             tracker.should_poll_now(
                 "anvil",
                 now + Duration::from_secs(15),
                 Duration::from_secs(15)
             ),
-            "a peer whose poll failed must be polled again next round"
+            "the peer must be polled again on the next round"
         );
     }
 
