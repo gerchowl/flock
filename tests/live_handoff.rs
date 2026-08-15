@@ -345,6 +345,22 @@ fn wait_for_server_ptmx_fd_count(pid: u32, expected: usize, timeout: Duration) {
     panic!("server pid {pid} had {last_count} /dev/ptmx fds; expected {expected}");
 }
 
+/// Take ownership of the server the handoff spawned.
+///
+/// A live handoff replaces the server with a NEW process that this harness did
+/// not spawn: `SpawnedFlock::drop` only kills its own child, so without this
+/// the replacement is a grandchild nobody reaps. `register_spawned_flock_pid`
+/// puts it under the same atexit / panic / ctrl-c hooks as a spawned server,
+/// which is what makes cleanup survive an abnormal exit too.
+///
+/// The runtime-dir sweep in `support` would otherwise be the safety net, but it
+/// enumerates `/proc` and so is inert on macOS — a leaked server there simply
+/// runs until the machine is rebooted. One was found alive after 11 hours.
+fn adopt_replacement_server(pid: u32) -> u32 {
+    support::register_spawned_flock_pid(Some(pid));
+    pid
+}
+
 #[cfg(target_os = "linux")]
 fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
     let deadline = Instant::now() + timeout;
@@ -352,7 +368,7 @@ fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Du
     while Instant::now() < deadline {
         last_pids = support::flock_server_pids_for_runtime_dir(runtime_dir).unwrap_or_default();
         if let Some(pid) = last_pids.iter().copied().find(|pid| *pid != old_pid) {
-            return pid;
+            return adopt_replacement_server(pid);
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -382,7 +398,7 @@ fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: D
                     continue;
                 };
                 if pid != old_pid {
-                    return pid;
+                    return adopt_replacement_server(pid);
                 }
             }
         }
