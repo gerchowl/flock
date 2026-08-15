@@ -36,7 +36,7 @@ mise use -g flock
 Start Flock:
 
 ```bash
-flock
+flk
 ```
 
 If your shell cannot find `flock`, restart the terminal or check that the install directory is on your PATH.
@@ -46,36 +46,36 @@ If your shell cannot find `flock`, restart the terminal or check that the instal
 Flock checks for new releases and notifies you in the app. You can update manually:
 
 ```bash
-flock update
+flk update
 ```
 
-`flock update` is for installs managed by Flock's own installer. Homebrew, mise, and Nix installs are updated through those package managers instead.
+`flk update` is for installs managed by Flock's own installer. Homebrew, mise, and Nix installs are updated through those package managers instead.
 
 Flock uses the stable update channel by default. To opt into preview builds from `main`, set the channel:
 
 ```bash
-flock channel set preview
+flk channel set preview
 ```
 
 Switch back to stable the same way:
 
 ```bash
-flock channel set stable
+flk channel set stable
 ```
 
-For direct installs, changing channels also checks that channel and installs its latest binary. If that update fails, run `flock update` to retry from the configured channel.
+For direct installs, changing channels also checks that channel and installs its latest binary. If that update fails, run `flk update` to retry from the configured channel.
 
 Preview builds are GitHub prereleases published from the current development branch. They are useful when you want fixes before the next stable release, but they can regress. Homebrew, mise, and Nix installs do not use the preview channel.
 
-By default, `flock update` installs the new binary and leaves compatible running sessions alone. If an update changes Flock's client/server protocol, Flock asks whether to stop the old server after installing. Stop the old server to use the new version. Stopping exits pane processes. For the default session, run `flock server stop`, then run `flock` again. For a named session, run `flock session stop <name>`, then run `flock session attach <name>` again.
+By default, `flk update` installs the new binary and leaves compatible running sessions alone. If an update changes Flock's client/server protocol, Flock asks whether to stop the old server after installing. Stop the old server to use the new version. Stopping exits pane processes. For the default session, run `flk server stop`, then run `flock` again. For a named session, run `flk session stop <name>`, then run `flk session attach <name>` again.
 
 To opt into experimental live server handoff for supported running sessions, run:
 
 ```bash
-flock update --handoff
+flk update --handoff
 ```
 
-Live handoff does not apply to Homebrew, mise, or Nix package-manager updates. For those installs, update with the package manager, then restart that Flock session when you are ready to use the new server. If a running session still uses the old server, stop it with `flock server stop` or `flock session stop <name>`, then run Flock again.
+Live handoff does not apply to Homebrew, mise, or Nix package-manager updates. For those installs, update with the package manager, then restart that Flock session when you are ready to use the new server. If a running session still uses the old server, stop it with `flk server stop` or `flk session stop <name>`, then run Flock again.
 
 ## Install with Nix
 

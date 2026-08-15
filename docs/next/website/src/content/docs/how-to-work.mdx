@@ -12,7 +12,7 @@ Flock is a background session server plus one or more terminal clients. Panes ke
 Start Flock from the project directory:
 
 ```bash
-flock
+flk
 ```
 
 Flock starts or attaches to your local background session automatically. You do not manage sockets. Run shells, servers, tests, and agents normally inside panes.
@@ -22,13 +22,13 @@ Detach the client with `ctrl+b q`. Your panes keep running.
 Reattach later:
 
 ```bash
-flock
+flk
 ```
 
 If you want to end the session and stop its panes, stop the server:
 
 ```bash
-flock server stop
+flk server stop
 ```
 
 ## Remote work through normal SSH
@@ -37,7 +37,7 @@ SSH to the machine that has the code and credentials, then run Flock there:
 
 ```bash
 ssh you@server
-flock
+flk
 ```
 
 This works like a terminal multiplexer. Your shell is remote. The Flock server is remote. The agents and panes run on the remote machine. Detach with `ctrl+b q`, disconnect, then SSH back and run `flock` again.
@@ -50,7 +50,7 @@ You do not need a Flock mobile app or a web dashboard. Install any SSH client on
 
 ```bash
 ssh you@server
-flock
+flk
 ```
 
 The same persistent Flock session opens in your phone terminal. The TUI adapts to narrow screens, so you can inspect agents, switch workspaces, and check panes without leaving SSH.
@@ -73,8 +73,8 @@ On iPhone, apps like [moshi](https://getmoshi.app/) work well.
 Attach through SSH without opening a shell first:
 
 ```bash
-flock --remote workbox
-flock --remote ssh://you@server:2222
+flk --remote workbox
+flk --remote ssh://you@server:2222
 ```
 
 Your local Flock acts as a thin client. It connects over SSH, starts or attaches to the remote Flock server, and streams the UI back to your local terminal.
@@ -93,11 +93,11 @@ Host workbox
 Then attach with:
 
 ```bash
-flock --remote workbox
+flk --remote workbox
 ```
 
 ## Which path to use
 
-Use `flock` for local work. Use `ssh you@server` then `flock` when you want Flock to behave like tmux on that remote shell or when you are using a phone SSH client. Use `flock --remote <host>` when you want a local thin client for a remote session, including local clipboard image paste bridging.
+Use `flock` for local work. Use `ssh you@server` then `flock` when you want Flock to behave like tmux on that remote shell or when you are using a phone SSH client. Use `flk --remote <host>` when you want a local thin client for a remote session, including local clipboard image paste bridging.
 
 For remote bootstrap details, named remote sessions, custom binaries, direct terminal attach, and `--no-session`, see [Persistence and remote access](/docs/persistence-remote/).
