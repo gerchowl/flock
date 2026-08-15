@@ -611,12 +611,27 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     }
 }
 
+/// Test-spawned flock servers visible on this machine.
+///
+/// LINUX ONLY, by construction: this walks `/proc`, and every caller's
+/// behaviour degrades to a no-op elsewhere. That is deliberate but was silent —
+/// on macOS `read_dir("/proc")` is `NotFound`, so this returned an empty list
+/// and `terminate_servers_for_runtime_dirs` swept nothing, successfully. Any
+/// server the harness did not explicitly register therefore leaked, and a
+/// leaked process fails no test.
+///
+/// So the REGISTRY is the cross-platform guarantee, not this sweep: anything
+/// that must be reaped has to go through `register_spawned_flock_pid`, which
+/// is wired to the atexit / panic / ctrl-c hooks. This stays as a Linux-only
+/// belt-and-braces pass for servers whose runtime dir outlived their owner.
 fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
     let mut pids = Vec::new();
 
     let proc_entries = match fs::read_dir("/proc") {
         Ok(entries) => entries,
+        // No /proc (macOS): nothing to enumerate. See the doc comment — the
+        // registry, not this sweep, is what guarantees cleanup here.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
