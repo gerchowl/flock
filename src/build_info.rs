@@ -10,6 +10,17 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("FLOCK_BUILD_ID"))
 }
 
+/// The commit this binary was built from, when the build set it.
+///
+/// Declared as a rerun trigger in `build.rs` and set by the release and
+/// preview workflows and by `nix/package.nix`. This is the field that answers
+/// "which code actually ran" during triage: on the preview/`latest` channels
+/// many revisions share one `BASE_VERSION`, so [`version`] alone cannot
+/// distinguish them. Consumed by the report provenance block (#233).
+pub fn commit() -> Option<&'static str> {
+    non_empty(option_env!("FLOCK_BUILD_COMMIT"))
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),
@@ -18,6 +29,20 @@ pub fn version() -> String {
             None => format!("{BASE_VERSION}-{channel}"),
         },
     }
+}
+
+/// The target triple this binary was built for, e.g. `aarch64-apple-darwin`.
+///
+/// Not derivable at runtime: `std::env::consts` gives OS and arch but not the
+/// libc flavour, so it cannot tell a musl build from a gnu one.
+pub fn target() -> &'static str {
+    non_empty(option_env!("FLOCK_BUILD_TARGET")).unwrap_or("unknown")
+}
+
+/// `debug` or `release`. A debug build explains a whole class of "flock is
+/// slow" reports without any further investigation.
+pub fn profile() -> &'static str {
+    non_empty(option_env!("FLOCK_BUILD_PROFILE")).unwrap_or("unknown")
 }
 
 pub fn is_preview() -> bool {
