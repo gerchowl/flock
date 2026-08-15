@@ -81,8 +81,48 @@ pub fn cleanup_test_base(base: &Path) {
     let runtime_dirs = HashSet::from([runtime_dir.clone()]);
 
     terminate_servers_for_runtime_dirs(&runtime_dirs);
+    terminate_servers_under_base(base);
     unregister_runtime_dir(&runtime_dir);
     let _ = fs::remove_dir_all(base);
+}
+
+/// Kill anything still running out of `base`, matched on its command line.
+///
+/// The pid registry only knows servers this harness SPAWNED. A live handoff
+/// replaces the server with a NEW process, and of the twelve
+/// `server.live_handoff` calls in the suite only one looks that pid up (it
+/// needs it for an fd assertion) — the other eleven leave a
+/// `flk server --handoff-import <base>/...` behind that nothing owns.
+///
+/// `terminate_servers_for_runtime_dirs` would be the backstop, but it walks
+/// `/proc`, so on macOS it enumerates nothing and reports success.
+///
+/// Matching on the base path is what makes this reliable without every call
+/// site having to remember: `base` is a unique per-test temp dir, so any
+/// process still referencing it belongs to this test. Cheap to run
+/// unconditionally at teardown, and a no-op when nothing leaked.
+#[allow(clippy::disallowed_methods)] // Test teardown shells out to pgrep — TracedCommand polices product code.
+fn terminate_servers_under_base(base: &Path) {
+    let Some(base) = base.to_str() else {
+        return;
+    };
+    // `pgrep -f` matches the whole command line, which is where the base path
+    // shows up (`--handoff-import <base>/config/...`).
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", base])
+        .output()
+    else {
+        return;
+    };
+    let own_pid = std::process::id();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid != own_pid {
+            terminate_pid(pid);
+        }
+    }
 }
 
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
