@@ -222,6 +222,26 @@ pub const SWITCH_NOTICE_ENV_VAR: &str = "FLOCK_SWITCH_NOTICE";
 /// host terminal instead of leaving the user stranded behind the frozen frame.
 pub const HELD_TERMINAL_ENV_VAR: &str = "FLOCK_TERMINAL_HELD";
 
+/// Env var the launcher sets on a leg chained in by a switch that named a
+/// SPACE (#80): the workspace id to focus once this leg attaches.
+/// The slots client sends `FocusWorkspace` on the flip instead — this covers
+/// the legacy exit-and-relaunch path (slots disabled, or a home leg), where
+/// the next leg is a new process and the target has to survive the handoff.
+/// Consumed once, so a #38 handshake retry does not re-focus after the user
+/// has moved on.
+pub const FOCUS_WORKSPACE_ENV_VAR: &str = "FLOCK_FOCUS_WORKSPACE";
+
+/// Take the launcher's one-shot post-attach focus target, if set.
+pub fn take_focus_workspace() -> Option<String> {
+    let workspace = std::env::var(FOCUS_WORKSPACE_ENV_VAR)
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    if workspace.is_some() {
+        std::env::remove_var(FOCUS_WORKSPACE_ENV_VAR);
+    }
+    workspace
+}
+
 /// Take the launcher's one-shot attach notice, if set, clearing it so a later
 /// in-leg handshake retry (#38 live-handoff) does not repeat it.
 fn take_attach_notice() -> Option<String> {
@@ -1272,6 +1292,17 @@ fn run_attach_attempt(
             .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionLost(err)))?;
     }
 
+    // This leg was chained in by a switch that named a space (#80):
+    // land on it. Sent after the handshake, so "the server is up" is already
+    // proven rather than retried against — which is what the old home-focus
+    // helper had to do by polling the local socket, and what a peer-bound
+    // `ssh … flk workspace focus` could never do at all.
+    if let Some(workspace_id) = take_focus_workspace() {
+        let focus = ClientMessage::FocusWorkspace { workspace_id };
+        write_to_server(&mut stream, &focus)
+            .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionLost(err)))?;
+    }
+
     // Now set up the terminal. This must happen AFTER the handshake succeeds,
     // so we don't leave the terminal in raw mode if the server rejects us.
     let _guard = if direct_attach {
@@ -2020,13 +2051,12 @@ async fn run_client_loop(
                         // slots-DISABLED branch only — every touchpoint guards
                         // on `slot_manager` being `Some` (the #76 discipline).
                         //
-                        // `focus_workspace`: today the slots path has no
-                        // client→server FocusWorkspace message, so we drop it
-                        // here with a note. The legacy legs path keeps focus
-                        // support; the gap closes when the protocol grows a
-                        // focus-after-attach message (tracked alongside #75).
+                        // `focus_workspace` (#80): the switch may name
+                        // the space to land on. It rides the flip in band —
+                        // sent on the slot the moment it becomes active — so a
+                        // warm flip lands on the right space instead of
+                        // wherever that server was last looking.
                         if let Some(manager) = slot_manager.as_mut() {
-                            let _ = &focus_workspace;
                             let target = slots::SlotTarget::from_key(&ssh_target);
                             match manager.flip_to(&target) {
                                 Ok(Some((new_writer, new_reader_src))) => {
@@ -2042,6 +2072,7 @@ async fn run_client_loop(
                                         &event_tx,
                                         &should_quit,
                                         max_frame_size,
+                                        focus_workspace.as_deref(),
                                     )?;
                                     switch_timing =
                                         Some((switch_received, slot_display_label(&target), true));
@@ -2056,8 +2087,18 @@ async fn run_client_loop(
                                 }
                                 Ok(None) => {
                                     // Cold/unknown OR already-active. Already-active
-                                    // is a no-op (registry returned AlreadyActive).
+                                    // is a no-op for the connection — but if the
+                                    // switch named a space we still owe the
+                                    // server that focus (#80).
                                     if manager.registry.is_active(&target) {
+                                        if let Some(workspace_id) = focus_workspace.as_deref() {
+                                            let focus = ClientMessage::FocusWorkspace {
+                                                workspace_id: workspace_id.to_string(),
+                                            };
+                                            if let Err(e) = active_writer.send(focus) {
+                                                return Err(ClientError::ConnectionLost(e));
+                                            }
+                                        }
                                         continue;
                                     }
                                     // Arm a cancellable cold dial under the popup.
@@ -2076,6 +2117,7 @@ async fn run_client_loop(
                                         target_display,
                                         started_at: Instant::now(),
                                         outcome_beat: None,
+                                        focus_workspace: focus_workspace.clone(),
                                     });
                                     let geometry = (
                                         state.reported_size.0,
@@ -2121,6 +2163,7 @@ async fn run_client_loop(
                                             beat_until,
                                             format!("switch to {target_display} failed: {err}"),
                                         )),
+                                        focus_workspace: None,
                                     });
                                     next_dial_gen = next_dial_gen.wrapping_add(1);
                                     if let Some(p) = pending_switch.as_ref() {
@@ -2285,6 +2328,11 @@ async fn run_client_loop(
                                 let cold_timing = pending_switch
                                     .as_ref()
                                     .map(|p| (p.started_at, p.target_display.clone()));
+                                // Capture the named space before the popup
+                                // teardown drops the pending switch (#80).
+                                let cold_focus = pending_switch
+                                    .as_ref()
+                                    .and_then(|p| p.focus_workspace.clone());
                                 pending_switch = None;
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
@@ -2299,6 +2347,7 @@ async fn run_client_loop(
                                     &event_tx,
                                     &should_quit,
                                     max_frame_size,
+                                    cold_focus.as_deref(),
                                 )?;
                                 // #43: cold-dial switch — time from request to next paint.
                                 if let Some((t0, to)) = cold_timing {
@@ -2586,6 +2635,9 @@ fn degrade_active_or_lost(
                 event_tx,
                 should_quit,
                 max_frame_size,
+                // Degrading to home is a recovery, not a chosen destination:
+                // it never carries a space to land on.
+                None,
             )
         }
         _ => Err(ClientError::ConnectionLost(err)),
@@ -2618,6 +2670,7 @@ fn apply_slot_flip(
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     max_frame_size: usize,
+    focus_workspace: Option<&str>,
 ) -> Result<(), ClientError> {
     active_reader_quit.store(true, Ordering::Release);
     let new_quit = Arc::new(AtomicBool::new(false));
@@ -2648,6 +2701,18 @@ fn apply_slot_flip(
     };
     if let Err(e) = active_writer.send(resize) {
         return Err(ClientError::ConnectionLost(e));
+    }
+    // The switch named a space (#80): tell the server we just made
+    // active to land there. In band on the slot we are already holding, so
+    // there is no race to lose — the old side-channel ssh reliably arrived
+    // after the flip had already painted the wrong workspace.
+    if let Some(workspace_id) = focus_workspace {
+        let focus = ClientMessage::FocusWorkspace {
+            workspace_id: workspace_id.to_string(),
+        };
+        if let Err(e) = active_writer.send(focus) {
+            return Err(ClientError::ConnectionLost(e));
+        }
     }
     state.request_full_redraw();
     Ok(())
@@ -2684,6 +2749,12 @@ struct PendingSwitch {
     /// popup shows briefly before clearing. When set, the popup repaints this
     /// instead of the live title until `until` passes.
     outcome_beat: Option<(Instant, String)>,
+    /// Workspace to focus once this dial lands (#80). Set when the
+    /// switch named a space — a sidebar row for another machine's workspace,
+    /// or the attention cycle stepping onto a remote agent. A cold dial can
+    /// take seconds, so the target has to survive the wait rather than being
+    /// re-derived from state that has moved on.
+    focus_workspace: Option<String>,
 }
 
 /// How often the popup is allowed to repaint. Bounded so a busy loop never
@@ -4808,6 +4879,7 @@ mod tests {
             target_display: target_key.to_string(),
             started_at: Instant::now(),
             outcome_beat: None,
+            focus_workspace: None,
         }
     }
 
@@ -5119,6 +5191,7 @@ mod tests {
             &event_tx,
             &should_quit,
             MAX_FRAME_SIZE,
+            None,
         )
         .expect("flip should succeed against a live socketpair");
 
