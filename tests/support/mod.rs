@@ -83,8 +83,48 @@ pub fn cleanup_test_base(base: &Path) {
     let runtime_dirs = HashSet::from([runtime_dir.clone()]);
 
     terminate_servers_for_runtime_dirs(&runtime_dirs);
+    terminate_servers_under_base(base);
     unregister_runtime_dir(&runtime_dir);
     let _ = fs::remove_dir_all(base);
+}
+
+/// Kill anything still running out of `base`, matched on its command line.
+///
+/// The pid registry only knows servers this harness SPAWNED. A live handoff
+/// replaces the server with a NEW process, and of the twelve
+/// `server.live_handoff` calls in the suite only one looks that pid up (it
+/// needs it for an fd assertion) — the other eleven leave a
+/// `flk server --handoff-import <base>/...` behind that nothing owns.
+///
+/// `terminate_servers_for_runtime_dirs` would be the backstop, but it walks
+/// `/proc`, so on macOS it enumerates nothing and reports success.
+///
+/// Matching on the base path is what makes this reliable without every call
+/// site having to remember: `base` is a unique per-test temp dir, so any
+/// process still referencing it belongs to this test. Cheap to run
+/// unconditionally at teardown, and a no-op when nothing leaked.
+#[allow(clippy::disallowed_methods)] // Test teardown shells out to pgrep — TracedCommand polices product code.
+fn terminate_servers_under_base(base: &Path) {
+    let Some(base) = base.to_str() else {
+        return;
+    };
+    // `pgrep -f` matches the whole command line, which is where the base path
+    // shows up (`--handoff-import <base>/config/...`).
+    let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-f", base])
+        .output()
+    else {
+        return;
+    };
+    let own_pid = std::process::id();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid != own_pid {
+            terminate_pid(pid);
+        }
+    }
 }
 
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
@@ -613,12 +653,27 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     }
 }
 
+/// Test-spawned flock servers visible on this machine.
+///
+/// LINUX ONLY, by construction: this walks `/proc`, and every caller's
+/// behaviour degrades to a no-op elsewhere. That is deliberate but was silent —
+/// on macOS `read_dir("/proc")` is `NotFound`, so this returned an empty list
+/// and `terminate_servers_for_runtime_dirs` swept nothing, successfully. Any
+/// server the harness did not explicitly register therefore leaked, and a
+/// leaked process fails no test.
+///
+/// So the REGISTRY is the cross-platform guarantee, not this sweep: anything
+/// that must be reaped has to go through `register_spawned_flock_pid`, which
+/// is wired to the atexit / panic / ctrl-c hooks. This stays as a Linux-only
+/// belt-and-braces pass for servers whose runtime dir outlived their owner.
 fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
     let mut pids = Vec::new();
 
     let proc_entries = match fs::read_dir("/proc") {
         Ok(entries) => entries,
+        // No /proc (macOS): nothing to enumerate. See the doc comment — the
+        // registry, not this sweep, is what guarantees cleanup here.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };

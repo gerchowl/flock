@@ -66,6 +66,16 @@ fn main() {
         .trim()
         .to_string();
 
+    // Build shape, for the report provenance block (#233). "this is a debug
+    // build" explains a whole class of performance reports on its own, and the
+    // target triple distinguishes a musl binary from a gnu one — neither is
+    // derivable from `std::env::consts` at runtime.
+    println!("cargo:rustc-env=FLOCK_BUILD_TARGET={target}");
+    println!(
+        "cargo:rustc-env=FLOCK_BUILD_PROFILE={}",
+        env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
+    );
+
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
     let system_dir = env::var("LIBGHOSTTY_VT_ZIG_SYSTEM_DIR").ok();
 

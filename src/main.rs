@@ -63,6 +63,7 @@ mod raw_input;
 mod release_notes;
 mod remote;
 mod render_prof;
+mod report;
 #[cfg(test)]
 mod test_support;
 // #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.
@@ -439,6 +440,7 @@ fn main() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
+        println!("       flk report bug [--file <path>] [--open]");
         println!("       flk web [--bind <addr>] (requires the `web` feature)");
         println!();
         println!("Common commands:");
@@ -493,6 +495,10 @@ fn main() -> io::Result<()> {
             (
                 "flk pane <subcommand>",
                 "Pane control helpers over the socket API",
+            ),
+            (
+                "flk report bug",
+                "File a bug with version, environment and logs filled in",
             ),
             (
                 "flk wait <subcommand>",

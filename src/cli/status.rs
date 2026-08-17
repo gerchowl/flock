@@ -74,8 +74,13 @@ fn parse_status_scope_args(
     }
 }
 
+/// Live server identity as seen from the client.
+///
+/// `pub(crate)` because `crate::report` builds its provenance block from the
+/// same read rather than issuing its own status call — one seam for "what is
+/// the server running", not one per caller (#233).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ServerRuntimeStatus {
+pub(crate) enum ServerRuntimeStatus {
     Running {
         version: Option<String>,
         protocol: Option<u32>,
@@ -157,7 +162,7 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     }
 }
 
-fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
+pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
     match ApiClient::local().status() {
         Ok(status) => Ok(ServerRuntimeStatus::Running {
             version: status.version,
@@ -304,7 +309,7 @@ fn update_status_json(server: &ServerRuntimeStatus) -> UpdateStatusJson {
     }
 }
 
-fn restart_needed_bool(server: &ServerRuntimeStatus) -> Option<bool> {
+pub(crate) fn restart_needed_bool(server: &ServerRuntimeStatus) -> Option<bool> {
     match server {
         ServerRuntimeStatus::Running { version, .. } => match version.as_deref() {
             Some(version) if version == crate::build_info::version() => Some(false),
@@ -320,7 +325,7 @@ fn print_json(value: &impl Serialize) -> std::io::Result<()> {
     Ok(())
 }
 
-fn current_exe_label() -> String {
+pub(crate) fn current_exe_label() -> String {
     std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|err| format!("unknown ({err})"))

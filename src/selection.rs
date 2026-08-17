@@ -336,7 +336,10 @@ fn should_prefer_osc52_for_env(
     ssh_connection.is_some() || ssh_tty.is_some() || wsl
 }
 
-fn should_prefer_osc52() -> bool {
+/// `pub(crate)` for `crate::cli::report`, which must not launch a browser on a
+/// host the reporter is only SSH'd into — the same signal that decides whether
+/// the clipboard write has to travel back over the wire (#233).
+pub(crate) fn should_prefer_osc52() -> bool {
     should_prefer_osc52_for_env(
         std::env::var_os("SSH_CONNECTION").as_deref(),
         std::env::var_os("SSH_TTY").as_deref(),

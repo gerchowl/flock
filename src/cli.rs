@@ -26,9 +26,10 @@ mod notification;
 mod pane;
 mod peers;
 mod preflight;
+mod report;
 mod revert;
 mod server;
-mod status;
+pub(crate) mod status;
 mod tab;
 mod workspace;
 mod worktree;
@@ -65,6 +66,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "peers" => peers::run_peers_command(&args[2..])?,
+        "report" => report::run_report_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "preflight" => preflight::run_preflight_command(&args[2..])?,

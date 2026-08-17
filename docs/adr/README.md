@@ -19,6 +19,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0007](0007-peer-io-isolation.md) | Peer I/O isolation: no blocking syscall or Drop on the client render loop | Accepted |
 | [0008](0008-agent-message-delivery.md) | Agent-to-agent messages ride the tool surface, not the keyboard | Proposed |
 | [0009](0009-fleet-transport.md) | Fleet transport: one held SSH connection per peer, not a replicated log | Proposed |
+| [0010](0010-report-composition.md) | Bug reports compose locally and are submitted by a human, never by the binary | Proposed |
 | [0011](0011-conversation-first-gui.md) | A conversation-first GUI: surfaces, transports, and the write model | Proposed |
 | [0012](0012-conversation-read-model.md) | The conversation read model: canonical entries and a derived index | Proposed |
 
