@@ -95,6 +95,19 @@ impl Agent {
             Self::Qodercli => "qodercli",
         }
     }
+
+    /// Whether this agent's host speaks the STATE vocabulary
+    /// (`working`/`idle`/`blocked`/`release`) rather than the lifecycle one.
+    ///
+    /// This is a per-agent capability, not a global one. Claude derives its own
+    /// state from lifecycle events and must ignore a state action outright —
+    /// `claude_hook_ignores_state_actions` in `tests/cli_wrapper.rs` pins it,
+    /// because honouring one would let a Notification hook (or a SUBAGENT's)
+    /// drive the parent pane's state directly, which is the bug the claude
+    /// integration is built to avoid.
+    fn reports_state(self) -> bool {
+        matches!(self, Self::Kimi | Self::Qodercli)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +219,10 @@ fn plan(
             Agent::Claude => plan_stop(agent, input, pane_id, pending_messages),
             _ => HookOutcome::default(),
         },
+        // Only the state-reporting hosts may drive state directly; for every
+        // other agent a state action is not part of its contract and is
+        // ignored, exactly as an unknown action was before it existed.
+        Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
         Action::State(state) => plan_state(agent, state, input, pane_id),
         Action::Release => plan_release(agent, input, pane_id),
     }
@@ -689,6 +706,36 @@ mod tests {
             let outcome = plan(agent, Action::Stop, &json!({}), "Stop", "p_1", 3);
             assert!(outcome.reports.is_empty());
             assert!(outcome.stdout.is_none(), "a nudge would be Claude-only");
+        }
+    }
+
+    /// The state vocabulary is per-agent, not global. Adding it to the shared
+    /// `Action::parse` made it valid for EVERY agent, which let
+    /// `flk hook claude working` drive claude's pane state directly — caught by
+    /// `claude_hook_ignores_state_actions` in tests/cli_wrapper.rs. Pinned here
+    /// too so the unit layer fails first and names the reason.
+    #[test]
+    fn only_state_reporting_agents_honour_the_state_vocabulary() {
+        for agent in [Agent::Claude, Agent::Opencode, Agent::Codex] {
+            for raw in ["working", "idle", "blocked", "release"] {
+                let outcome = plan(agent, Action::parse(raw).unwrap(), &json!({}), "", "p_1", 0);
+                assert!(
+                    outcome.reports.is_empty(),
+                    "{} must ignore `{raw}`",
+                    agent.agent()
+                );
+            }
+        }
+        for agent in [Agent::Kimi, Agent::Qodercli] {
+            let outcome = plan(
+                agent,
+                Action::parse("working").unwrap(),
+                &json!({}),
+                "",
+                "p_1",
+                0,
+            );
+            assert_eq!(outcome.reports.len(), 1, "{} reports state", agent.agent());
         }
     }
 
