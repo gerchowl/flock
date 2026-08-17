@@ -240,6 +240,14 @@ fn agent_panel_entries_with_runtimes(
     let local_server = super::grammar::local_server_name();
     match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
+            // The server filter outranks the scope toggle (#80): narrowed to a
+            // peer, this server's rows are not part of the visible set, and
+            // "current workspace" names one of them. The panel is empty rather
+            // than showing agents the spaces list has already filtered away —
+            // one narrowing, applied servers → spaces → agents.
+            if !app.local_server_visible() {
+                return Vec::new();
+            }
             let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
                 return Vec::new();
             };
@@ -274,8 +282,16 @@ fn agent_panel_entries_with_runtimes(
                 .collect()
         }
         AgentPanelScope::AllWorkspaces => {
-            let mut entries: Vec<AgentPanelEntry> = app
-                .workspaces
+            // Server visibility is ONE selection (#80): narrowing to a peer
+            // hides the local rows here exactly as it swaps them out of the
+            // spaces list, so the panel and the attention cycle can't disagree
+            // about which agents exist.
+            let locals: &[crate::workspace::Workspace] = if app.local_server_visible() {
+                &app.workspaces
+            } else {
+                &[]
+            };
+            let mut entries: Vec<AgentPanelEntry> = locals
                 .iter()
                 .enumerate()
                 .flat_map(|(ws_idx, ws)| {
@@ -366,19 +382,8 @@ fn agent_panel_sort_key(entry: &AgentPanelEntry) -> (String, String, String) {
 /// placeholders (remote rows are selected by their peer switch, not a local
 /// pane focus).
 fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
-    use crate::app::state::ServerFilter;
-    let peers: Vec<_> = match app.server_filter.as_ref() {
-        Some(ServerFilter::Local) => return Vec::new(),
-        Some(ServerFilter::Peer { ssh_target }) => app
-            .remote_peers()
-            .into_iter()
-            .filter(|(_, peer)| peer.ssh_target == *ssh_target)
-            .collect(),
-        None => app.remote_peers(),
-    };
-
     let mut entries = Vec::new();
-    for (peer_ref, peer) in peers {
+    for (peer_ref, peer) in app.visible_remote_peers() {
         let server = peer.display_name().to_string();
         for (ws_idx, summary) in peer.workspaces.iter().enumerate() {
             // Only workspaces actually running an agent surface here.
@@ -1148,7 +1153,10 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
         if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
             continue;
         }
-        peers.push(Some(peer_ref.switch_request(0)));
+        // A BAND row is a server, not a space: switch there and let it keep
+        // its own focus. (It used to pin workspace 0, which quietly retargeted
+        // the peer's first space every time you clicked its server row.)
+        peers.push(Some(peer_ref.server_switch_request()));
     }
     // Stable order across peers so band layout does not shuffle: sort by the
     // shared host key (lowercased reported host).
@@ -1168,11 +1176,15 @@ fn server_slot_sort_key(
 ) -> String {
     use crate::app::state::PeerSwitchRequest;
     let summary = match slot {
-        Some(PeerSwitchRequest::SnapshotPeer { entry_idx }) => app
+        Some(PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => app
             .fleet_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.peers.get(*entry_idx)),
         Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => app.peer_summaries.get(*peer_idx),
+        Some(PeerSwitchRequest::RelayedPeer { host_key, .. }) => app
+            .relayed_fleet_cache
+            .get(host_key)
+            .map(|entry| &entry.peer),
         _ => None,
     };
     summary
@@ -1884,7 +1896,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 };
                 home_server_rows(snapshot, p, app.server_label)
             }
-            Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx }) => {
+            Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
                 let Some(peer) = app
                     .fleet_snapshot
                     .as_ref()
@@ -1900,12 +1912,18 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 };
                 peer_server_rows(peer, p, app.server_label)
             }
-            Some(crate::app::state::PeerSwitchRequest::RelayedPeer { .. }) => {
-                // Rendering relayed cache rows on the LOCAL band is deferred
-                // (#101 gossip v3 part 4): the RelayedPeer switch variant
-                // exists for a follow-up that materialises PeerSummaryState
-                // from the relayed cache. Skip for now — no band row.
-                continue;
+            Some(crate::app::state::PeerSwitchRequest::RelayedPeer { ref host_key, .. }) => {
+                // A two-hop peer, known to us only because one of our peers
+                // relayed it. It reads exactly like a directly-polled row —
+                // the band shows the FLEET, not our routing table.
+                let Some(peer) = app
+                    .relayed_fleet_cache
+                    .get(host_key)
+                    .map(|entry| &entry.peer)
+                else {
+                    continue;
+                };
+                peer_server_rows(peer, p, app.server_label)
             }
             // Origin-workspace rows fold into the spaces list rather than the band —
             // the home row already stands for the origin server here.
@@ -3284,7 +3302,7 @@ mod tests {
             cards[0].target,
             crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0,
+                ws_idx: None,
             }
         );
         assert_eq!(cards[0].rect.y, header.y + 1 + SERVER_ROW_LINES);
@@ -3297,7 +3315,7 @@ mod tests {
             cards[1].target,
             crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 1,
-                ws_idx: 0,
+                ws_idx: None,
             }
         );
         assert_eq!(cards[1].rect.y, cards[0].rect.y + SERVER_ROW_LINES);
@@ -3338,11 +3356,17 @@ mod tests {
             vec![
                 Some(PeerSwitchRequest::Home),
                 None, // self — no switch hit-area
-                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }),
-                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 1 }),
+                Some(PeerSwitchRequest::SnapshotPeer {
+                    entry_idx: 0,
+                    ws_idx: None
+                }),
+                Some(PeerSwitchRequest::SnapshotPeer {
+                    entry_idx: 1,
+                    ws_idx: None
+                }),
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 0,
-                    ws_idx: 0,
+                    ws_idx: None,
                 }),
             ]
         );
@@ -3358,7 +3382,10 @@ mod tests {
         assert_eq!(cards[0].rect.y, header.y + 1);
         assert_eq!(
             cards[1].target,
-            PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }
+            PeerSwitchRequest::SnapshotPeer {
+                entry_idx: 0,
+                ws_idx: None
+            }
         );
         assert_eq!(cards[1].rect.y, header.y + 1 + 2 * SERVER_ROW_LINES);
     }
@@ -3381,16 +3408,22 @@ mod tests {
             server_band_slots(&app),
             vec![
                 Some(PeerSwitchRequest::Home),
-                None,                                                   // self
-                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 1 }), // anvil
+                None, // self
+                Some(PeerSwitchRequest::SnapshotPeer {
+                    entry_idx: 1,
+                    ws_idx: None
+                }), // anvil
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 1, // beta
-                    ws_idx: 0,
+                    ws_idx: None,
                 }),
-                Some(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 }), // ksb
+                Some(PeerSwitchRequest::SnapshotPeer {
+                    entry_idx: 0,
+                    ws_idx: None
+                }), // ksb
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 0, // zeta
-                    ws_idx: 0,
+                    ws_idx: None,
                 }),
             ]
         );
@@ -4984,7 +5017,7 @@ mod tests {
             server_band_slot_at(&app, area, cards[0].rect.x + 2, cards[0].rect.y),
             Some(Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0,
+                ws_idx: None,
             }))
         );
         // The header row itself is no server row.

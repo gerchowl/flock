@@ -2156,9 +2156,12 @@ mod tests {
         ));
         assert_eq!(
             app.state.request_peer_switch,
+            // A BAND row is the SERVER, so it names no space (#80): the peer
+            // keeps whatever it was looking at. Only a spaces/agents row
+            // carries a workspace.
             Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0,
+                ws_idx: None,
             })
         );
     }
@@ -2208,7 +2211,10 @@ mod tests {
     }
 
     /// Issue #46: a snapshot-fed remote row in the spaces list reuses the
-    /// band's pass-through switch — carried ssh address, fleet attached.
+    /// band's pass-through switch — carried ssh address, fleet attached — and
+    /// (#80) names the SPACE it stands for. Gossiped rows used to drop the
+    /// workspace on the floor, so clicking one landed you on whatever space
+    /// that server was last looking at.
     #[tokio::test]
     async fn snapshot_remote_row_click_requests_switch_with_carried_address() {
         let mut app = app_for_mouse_test();
@@ -2238,7 +2244,10 @@ mod tests {
         ));
         assert_eq!(
             app.state.request_peer_switch,
-            Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx: 0 })
+            Some(crate::app::state::PeerSwitchRequest::SnapshotPeer {
+                entry_idx: 0,
+                ws_idx: Some(0)
+            })
         );
 
         // The shared switch path resolves the carried address and keeps the
@@ -2290,7 +2299,7 @@ mod tests {
             app.state.request_peer_switch,
             Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0,
+                ws_idx: Some(0),
             }),
             "folded config-peer row must request the switch (issue #63)"
         );

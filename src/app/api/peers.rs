@@ -179,10 +179,90 @@ impl App {
     }
 }
 
-/// Convert a relayed JSON peer entry into the bincode wire shape used by the
-/// down-gossip fleet snapshot (#101). Origin-honest freshness rides
-/// through unchanged so the receiver's staleness check reads the ORIGIN's
-/// assertion, not our dwell.
+/// Switch popup label: the server, plus the space when the switch names one.
+fn switch_label(server: &str, target: Option<&PeerWorkspaceSummary>) -> String {
+    match target {
+        Some(ws) => format!("{server}:{}", ws.workspace),
+        None => server.to_string(),
+    }
+}
+
+/// The workspace id the arriving client should focus, if the switch named a
+/// space that still carries one. A server-assigned id is `ws_<n>`; an empty id
+/// (a peer too old to report one) means "no target", not "focus nothing".
+fn focus_target(target: Option<&PeerWorkspaceSummary>) -> Option<String> {
+    target
+        .map(|ws| ws.id.clone())
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Host key a fleet entry dedupes under: the host it reports about itself,
+/// falling back to its ssh target, lowercased. Mirrors the receiving end's
+/// `row_host_key`, so emit-side and render-side collapse the same rows.
+fn wire_host_key(peer: &crate::protocol::FleetPeer) -> String {
+    peer.host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(&peer.ssh_target)
+        .to_ascii_lowercase()
+}
+
+/// Union two fleet peer lists into the one a leg carries.
+///
+/// Entries about the hop target (it becomes the self row over there) and about
+/// the snapshot's origin (the home row owns that slot) are dropped. Otherwise
+/// one entry survives per host: the FRESHER by `origin_last_ok_secs` (the
+/// origin's reading plus however long it has since sat somewhere), ties going
+/// to the earlier list — the same quantity `AppState::remote_peers` ranks on
+/// when it renders them, so a row can't win here and lose there.
+///
+/// Capped like the carried snapshot itself: the list rides an env var between
+/// attach legs, and an unbounded fleet could brush ARG_MAX and kill the leg.
+/// Callers pass their FIRST-HAND rows as `first` for that reason — the cap
+/// truncates the tail, so on a fleet large enough to hit it the rows that
+/// survive should be the ones this server actually polled, not the stalest
+/// entries of a list it was handed.
+fn merge_fleet_peers(
+    first: Vec<crate::protocol::FleetPeer>,
+    rest: Vec<crate::protocol::FleetPeer>,
+    exclude_ssh_target: &str,
+    origin: &str,
+) -> Vec<crate::protocol::FleetPeer> {
+    let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
+    let origin_lower = origin.to_ascii_lowercase();
+    let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
+    let mut by_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for peer in first.into_iter().chain(rest) {
+        let key = wire_host_key(&peer);
+        if key == exclude_lower
+            || key == origin_lower
+            || peer.ssh_target.eq_ignore_ascii_case(exclude_ssh_target)
+        {
+            continue;
+        }
+        match by_host.get(&key) {
+            Some(&idx) => {
+                // Smaller age = fresher; a known age beats an unknown.
+                let current = merged[idx].origin_last_ok_secs;
+                let replace = match (current, peer.origin_last_ok_secs) {
+                    (Some(cur), Some(new)) => new < cur,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if replace {
+                    merged[idx] = peer;
+                }
+            }
+            None => {
+                by_host.insert(key, merged.len());
+                merged.push(peer);
+            }
+        }
+    }
+    merged.truncate(crate::peers::FLEET_SNAPSHOT_MAX_PEERS);
+    merged
+}
+
 /// Re-encode a relayed row for an outgoing snapshot.
 ///
 /// `peer_to_wire` already carries the accumulated age (origin's reading plus
@@ -211,10 +291,11 @@ pub(crate) struct PreparedServerSwitch {
     pub(crate) ssh_target: String,
     pub(crate) label: String,
     pub(crate) fleet: Option<crate::protocol::FleetSnapshot>,
-    /// Workspace id to focus once the next leg attaches (#66). Set only for
-    /// origin-workspace rows: a spoke selecting one of the hub's spaces lands
-    /// home with that space focused. The launcher carries it through the
-    /// switch file and fires `workspace focus` against the local server.
+    /// Workspace id to focus once the next leg attaches. Set whenever the
+    /// switch names a SPACE rather than just a server (#80) — any remote
+    /// workspace row, or an origin-workspace row landing home. The client
+    /// delivers it in band with `ClientMessage::FocusWorkspace` once it is
+    /// attached, so it cannot lose a race with the attach.
     pub(crate) focus_workspace: Option<String>,
     /// Gossip v3 (#101 part 3): SSH ProxyJump identity for reaching
     /// `ssh_target` — set only for snapshot-derived rows the launcher cannot
@@ -234,22 +315,28 @@ impl App {
         use crate::app::state::PeerSwitchRequest;
         match request {
             PeerSwitchRequest::ConfigPeer { peer_idx, ws_idx } => {
-                let (ssh_target, label) = self.prepare_peer_switch(peer_idx, ws_idx)?;
+                let peer = self.state.peer_summaries.get(peer_idx)?;
+                let ssh_target = peer.ssh_target.clone();
+                let target = ws_idx.and_then(|ws_idx| peer.workspaces.get(ws_idx));
+                let label = switch_label(peer.display_name(), target);
+                let focus_workspace = focus_target(target);
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
                     label,
                     fleet,
-                    focus_workspace: None,
+                    focus_workspace,
                     // Config peer: launcher's box already has a direct SSH
                     // route (that's the definition of a `[[peers]]` entry).
                     proxy_jump: None,
                 })
             }
-            PeerSwitchRequest::SnapshotPeer { entry_idx } => {
+            PeerSwitchRequest::SnapshotPeer { entry_idx, ws_idx } => {
                 let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
                 let ssh_target = entry.ssh_target.clone();
-                let label = entry.display_name().to_string();
+                let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
+                let label = switch_label(entry.display_name(), target);
+                let focus_workspace = focus_target(target);
                 // Gossip v3 (#101 part 3): the snapshot entry was stamped by
                 // the hub that emitted it — use its ProxyJump identity so the
                 // client dials via that hub instead of trying `ssh_target`
@@ -260,25 +347,24 @@ impl App {
                     ssh_target,
                     label,
                     fleet,
-                    focus_workspace: None,
+                    focus_workspace,
                     proxy_jump,
                 })
             }
-            PeerSwitchRequest::RelayedPeer { host_key } => {
-                let entry = self.state.relayed_fleet_cache.get(&host_key)?;
-                let ssh_target = entry.peer.ssh_target.clone();
-                let label = entry
-                    .peer
-                    .host
-                    .clone()
-                    .unwrap_or_else(|| entry.peer.peer.clone());
-                let proxy_jump = entry.peer.proxy_jump.clone();
+            PeerSwitchRequest::RelayedPeer { host_key, ws_idx } => {
+                let entry = &self.state.relayed_fleet_cache.get(&host_key)?.peer;
+                let ssh_target = entry.ssh_target.clone();
+                let name = entry.host.clone().unwrap_or_else(|| entry.peer.clone());
+                let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
+                let label = switch_label(&name, target);
+                let focus_workspace = focus_target(target);
+                let proxy_jump = entry.proxy_jump.clone();
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
                     label,
                     fleet,
-                    focus_workspace: None,
+                    focus_workspace,
                     proxy_jump,
                 })
             }
@@ -311,115 +397,83 @@ impl App {
         }
     }
 
-    /// The fleet snapshot the next attach leg carries. Pass-through, never
-    /// re-stamp: a server that itself received a snapshot forwards it with
-    /// the ORIGINAL origin (nested leaps keep the real home); only a server
-    /// the client reached directly (the hub) stamps a fresh snapshot from
-    /// its own identity and polled peer summaries. The hop target is
-    /// excluded — it becomes the self row on the receiving end.
+    /// The fleet snapshot the next attach leg carries.
+    ///
+    /// The ORIGIN is pass-through and never re-stamped: a nested leap keeps
+    /// the client's real home, so the way back is always the way it came. The
+    /// PEER LIST is not — every leg unions in what THIS server can see (its
+    /// own polled peers, the entries relayed to it, and itself). Forwarding a
+    /// carried snapshot verbatim was the reason the fleet looked different
+    /// from every machine: the chain could only ever propagate what the first
+    /// hub happened to know, so a server two hops out saw a strictly smaller
+    /// fleet than the one it was standing next to.
+    ///
+    /// The hop target is excluded throughout — it becomes the self row on the
+    /// receiving end.
     fn outgoing_fleet_snapshot(&self, exclude_ssh_target: &str) -> crate::protocol::FleetSnapshot {
+        let us = short_host_name();
+        // Gossip v3 (#101 part 3): stamp our own reachable identity on every
+        // peer we contribute — the client's next-leg bridge uses it as
+        // `-o ProxyJump=<us>` to reach peers only routable through this hub.
+        let stamp_proxy_jump = |mut peer: crate::protocol::FleetPeer| {
+            peer.proxy_jump.get_or_insert_with(|| us.clone());
+            peer
+        };
+        // Our own view, in dedup priority order: peers we polled ourselves
+        // (first-hand, real-time age) ahead of entries relayed to us.
+        let mut ours: Vec<crate::protocol::FleetPeer> = self
+            .state
+            .peer_summaries
+            .iter()
+            .map(crate::peers::peer_to_wire)
+            .map(stamp_proxy_jump)
+            .collect();
+        let mut relayed: Vec<_> = self.state.relayed_fleet_cache.iter().collect();
+        relayed.sort_by_key(|(host_key, _)| *host_key);
+        ours.extend(
+            relayed
+                .into_iter()
+                .map(|(_, entry)| relayed_peer_to_wire(entry))
+                .map(stamp_proxy_jump),
+        );
+
         match self.state.fleet_snapshot.as_ref() {
-            Some(snapshot) => snapshot.to_wire(exclude_ssh_target),
-            None => {
-                let origin = short_host_name();
-                // Gossip v3 (#101 part 3): stamp our own reachable identity
-                // on every peer we emit — the client's next-leg bridge uses
-                // it as `-o ProxyJump=<origin>` to reach peers only routable
-                // through this hub.
-                let stamp_proxy_jump = |mut peer: crate::protocol::FleetPeer| {
-                    peer.proxy_jump.get_or_insert_with(|| origin.clone());
-                    peer
-                };
-                let mut peers: Vec<crate::protocol::FleetPeer> = self
-                    .state
-                    .peer_summaries
-                    .iter()
-                    .filter(|peer| peer.ssh_target != exclude_ssh_target)
-                    .map(crate::peers::peer_to_wire)
-                    .map(stamp_proxy_jump)
-                    .collect();
-                // Gossip v3 (#101): merge relayed entries so a spoke attaching
-                // to this hub sees the FULL fleet, not just this hub's direct
-                // peers. Skip anything already covered by our own polled peers
-                // (they win — locally-polled is fresher) and the hop target
-                // (it becomes the self row on the receiving end).
-                let own_hosts: std::collections::HashSet<String> = peers
-                    .iter()
-                    .flat_map(|peer| {
-                        peer.host
-                            .as_deref()
-                            .filter(|host| !host.is_empty())
-                            .map(str::to_ascii_lowercase)
-                            .into_iter()
-                            .chain(std::iter::once(peer.ssh_target.to_ascii_lowercase()))
-                    })
-                    .collect();
-                let origin_lower = origin.to_ascii_lowercase();
-                let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
-                for entry in self.state.relayed_fleet_cache.values() {
-                    let host_lower = entry
-                        .peer
-                        .host
-                        .as_deref()
-                        .filter(|host| !host.is_empty())
-                        .unwrap_or(&entry.peer.ssh_target)
-                        .to_ascii_lowercase();
-                    if host_lower == origin_lower || host_lower == exclude_lower {
-                        continue;
-                    }
-                    if own_hosts.contains(&host_lower)
-                        || own_hosts.contains(&entry.peer.ssh_target.to_ascii_lowercase())
-                    {
-                        continue;
-                    }
-                    peers.push(stamp_proxy_jump(relayed_peer_to_wire(entry)));
-                }
-                crate::protocol::FleetSnapshot {
-                    origin,
-                    peers,
-                    // The hub is not its own peer; embed its own workspaces so
-                    // the spoke can see the way-home spaces, not just peers (#66).
-                    origin_summary: Some(Box::new(self.origin_self_summary())),
-                }
+            Some(carried) => {
+                let mut snapshot = carried.to_wire(exclude_ssh_target);
+                // Nothing else in the chain carries US: the origin slot belongs
+                // to the client's home, and the hub that told us about our
+                // peers excluded us from the snapshot it sent. Emit ourselves
+                // so a leap never loses the server it just left. Best-effort
+                // target: our short host name — the same identity we already
+                // stamp as `proxy_jump` for peers only routable through us.
+                // (When we ARE the carried origin, the merge drops this again:
+                // the home row already stands for us over there.)
+                ours.push(self.self_peer_entry(&us));
+                snapshot.peers =
+                    merge_fleet_peers(ours, snapshot.peers, exclude_ssh_target, &snapshot.origin);
+                snapshot
             }
+            None => crate::protocol::FleetSnapshot {
+                peers: merge_fleet_peers(ours, Vec::new(), exclude_ssh_target, &us),
+                origin: us,
+                // The hub is not its own peer; embed its own workspaces so
+                // the spoke can see the way-home spaces, not just peers (#66).
+                origin_summary: Some(Box::new(self.origin_self_summary())),
+            },
         }
     }
 
-    /// Resolve a requested peer switch: returns the SSH target for the
-    /// client's next attach leg and a display label, and best-effort
-    /// pre-focuses the chosen workspace on the peer (off-thread).
-    pub(crate) fn prepare_peer_switch(
-        &mut self,
-        peer_idx: usize,
-        ws_idx: usize,
-    ) -> Option<(String, String)> {
-        let peer = self.state.peer_summaries.get(peer_idx)?;
-        let ssh_target = peer.ssh_target.clone();
-        let label = peer.display_name().to_string();
-        if let Some(remote_ws) = peer.workspaces.get(ws_idx) {
-            let label = format!("{label}:{}", remote_ws.workspace);
-            // Workspace ids are server-assigned ("ws_3"); refuse anything
-            // that could escape the remote shell command.
-            let id = remote_ws.id.clone();
-            if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                let target = ssh_target.clone();
-                std::thread::spawn(move || {
-                    let _ = crate::process::TracedCommand::new("ssh", "peers")
-                        .args([
-                            "-o",
-                            "BatchMode=yes",
-                            "-o",
-                            "ConnectTimeout=5",
-                            &target,
-                            &format!("sh -lc 'flk workspace focus --workspace {id}'"),
-                        ])
-                        .stdin(std::process::Stdio::null())
-                        .output_traced();
-                });
-            }
-            return Some((ssh_target, label));
+    /// This server as a PEER entry for a pass-through snapshot — unlike
+    /// [`Self::origin_self_summary`], which claims the origin slot and dials
+    /// via the reserved home sentinel, this one is dialled like any other
+    /// server (by host name, no ProxyJump: the client is attached to us right
+    /// now, so it has a route).
+    fn self_peer_entry(&self, us: &str) -> crate::protocol::FleetPeer {
+        crate::protocol::FleetPeer {
+            ssh_target: us.to_string(),
+            proxy_jump: None,
+            ..self.origin_self_summary()
         }
-        Some((ssh_target, label))
     }
 }
 
@@ -686,15 +740,40 @@ mod tests {
         app.state.fleet_snapshot = Some(carried_snapshot());
 
         let prepared = app
-            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer { entry_idx: 0 })
+            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer {
+                entry_idx: 0,
+                ws_idx: None,
+            })
             .expect("snapshot row resolves");
         assert_eq!(prepared.ssh_target, "lars@anvil");
         let fleet = prepared.fleet.expect("nested leap carries the snapshot");
         // Pass-through, not re-stamp: the ORIGINAL origin survives, and the
         // hop target drops out (it becomes the self row over there).
         assert_eq!(fleet.origin, "mba22");
-        assert_eq!(fleet.peers.len(), 1);
-        assert_eq!(fleet.peers[0].ssh_target, "lars@ksb");
+        let targets: Vec<&str> = fleet
+            .peers
+            .iter()
+            .map(|peer| peer.ssh_target.as_str())
+            .collect();
+        assert!(
+            targets.contains(&"lars@ksb"),
+            "carried peers survive: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&"lars@anvil"),
+            "hop target excluded: {targets:?}"
+        );
+        // #80: the leg also carries THIS server, so the next hop can see the
+        // machine the client just came through. Nothing else in the chain
+        // holds it — the origin slot belongs to home, and the hub that sent us
+        // this snapshot excluded us from it.
+        assert!(
+            fleet
+                .peers
+                .iter()
+                .any(|peer| peer.host.as_deref() == Some(crate::app::short_host_name().as_str())),
+            "the forwarded fleet must include the server forwarding it: {targets:?}"
+        );
     }
 
     #[tokio::test]
@@ -708,7 +787,7 @@ mod tests {
         let prepared = app
             .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
                 peer_idx: 1,
-                ws_idx: 0,
+                ws_idx: Some(0),
             })
             .expect("config peer resolves");
         assert_eq!(prepared.ssh_target, "lars@spoke2.invalid");
@@ -764,14 +843,20 @@ mod tests {
         let mut app = test_app();
         app.state.fleet_snapshot = Some(carried_snapshot());
         assert!(app
-            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer { entry_idx: 99 })
+            .prepare_switch_server(PeerSwitchRequest::SnapshotPeer {
+                entry_idx: 99,
+                ws_idx: None,
+            })
             .is_none());
     }
 
     #[tokio::test]
     async fn outgoing_fleet_snapshot_from_hub_merges_relayed_cache_into_wire() {
-        // Gossip v3 (#101) part 1 (RED): hub polls anvil, anvil relays sage
-        // (sage lives one hop past anvil). anvil's spoke1 attaches to hub —
+        // Gossip v3 (#101) part 1 (RED): hub polls anvil, anvil relays twohop
+        // (twohop lives one hop past anvil). The fixture host is deliberately
+        // not a real machine name: an entry about the host RUNNING the test is
+        // dropped as "that's us", so a peer named after the developer's box
+        // failed here for reasons that had nothing to do with the relay. anvil's spoke1 attaches to hub —
         // hub's outgoing_fleet_snapshot must include sage in its `peers`
         // vector so the FULL fleet is visible on spoke1. Without the relay
         // merge this test fails (only anvil appears).
@@ -800,7 +885,7 @@ mod tests {
         let prepared = app
             .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
-                ws_idx: 0,
+                ws_idx: Some(0),
             })
             .expect("hub stamps a snapshot on switch to anvil");
         let fleet = prepared.fleet.expect("hub leap carries a snapshot");

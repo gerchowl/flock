@@ -105,6 +105,12 @@ pub(crate) enum ServerEvent {
     /// slot pauses frames with `enabled: false`; flipping active resumes with
     /// `enabled: true` and a full redraw.
     ClientSetFrameSubscription { client_id: u64, enabled: bool },
+    /// A client that arrived via a workspace-targeted server switch asked to
+    /// land on that workspace (#80).
+    ClientFocusWorkspace {
+        client_id: u64,
+        workspace_id: String,
+    },
     /// A client detached gracefully.
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
@@ -472,6 +478,10 @@ fn client_read_loop(
             ClientMessage::SetFrameSubscription { enabled } => {
                 ServerEvent::ClientSetFrameSubscription { client_id, enabled }
             }
+            ClientMessage::FocusWorkspace { workspace_id } => ServerEvent::ClientFocusWorkspace {
+                client_id,
+                workspace_id,
+            },
             ClientMessage::Detach => ServerEvent::ClientDetach { client_id },
             ClientMessage::AttachTerminal {
                 terminal_id,
