@@ -43,11 +43,11 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
 const CLAUDE_HOOK_TIMEOUT: u64 = 10;
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 5;
+const CODEX_INTEGRATION_VERSION: u32 = 6;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/flock-agent-state.sh");
-const KIMI_INTEGRATION_VERSION: u32 = 1;
+const KIMI_INTEGRATION_VERSION: u32 = 2;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> flock kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< flock kimi integration";
@@ -79,7 +79,7 @@ const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py")
 const HERMES_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/flock-agent-state.sh");
-const QODERCLI_INTEGRATION_VERSION: u32 = 1;
+const QODERCLI_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
 const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
@@ -3773,7 +3773,9 @@ mod tests {
 
         assert_eq!(codex.path, hook_path);
         assert_eq!(codex.installed_version, Some(2));
-        assert_eq!(codex.expected_version, 5);
+        // Against the constant, not a literal: the point of this test is that an
+        // older install reads as outdated, which a version bump must not break.
+        assert_eq!(codex.expected_version, CODEX_INTEGRATION_VERSION);
         assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4473,15 +4475,26 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(CODEX_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
-        assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
-        assert!(CODEX_HOOK_ASSET.contains("pane.report_agent_session"));
-        assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
-        assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(KIMI_HOOK_ASSET.contains("source = \"flock:kimi\""));
-        assert!(KIMI_HOOK_ASSET.contains("pane.report_agent"));
-        assert!(KIMI_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(!KIMI_HOOK_ASSET.contains("agent_session_id"));
+        // Codex, kimi and qodercli are thin stubs now too (#238): their bodies
+        // were an embedded python3 heredoc and now live in `flk hook <agent>`
+        // (cli::hook::tests). The stubs only delegate — and crucially no longer
+        // need an interpreter resolved from ambient PATH.
+        assert!(CODEX_HOOK_ASSET.contains("hook codex"));
+        assert!(!CODEX_HOOK_ASSET.contains("pane.report_agent_session"));
+        assert!(KIMI_HOOK_ASSET.contains("hook kimi"));
+        assert!(!KIMI_HOOK_ASSET.contains("pane.report_agent"));
+        assert!(QODERCLI_HOOK_ASSET.contains("hook qodercli"));
+        assert!(!QODERCLI_HOOK_ASSET.contains("pane.report_agent"));
+        for (name, asset) in [
+            ("codex", CODEX_HOOK_ASSET),
+            ("kimi", KIMI_HOOK_ASSET),
+            ("qodercli", QODERCLI_HOOK_ASSET),
+        ] {
+            assert!(
+                !asset.contains("command -v python3"),
+                "{name} still guards on an ambient python3 (#238)"
+            );
+        }
         assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
         assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
         assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
@@ -4496,12 +4509,12 @@ mod tests {
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("agent_session_id"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("pane.report_agent\","));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("pane.release_agent"));
-        // Qoder hook reads the event from the stdin JSON payload (per
-        // https://docs.qoder.com/zh/cli/hooks). Make sure the bundled script
-        // never reaches for a QODER_HOOK_EVENT environment variable.
-        assert!(QODERCLI_HOOK_ASSET.contains("FLOCK_HOOK_INPUT_FILE"));
-        assert!(QODERCLI_HOOK_ASSET.contains("hook_event_name"));
-        assert!(QODERCLI_HOOK_ASSET.contains("agent_session_id"));
+        // Qoder reads the event from the stdin JSON payload (per
+        // https://docs.qoder.com/zh/cli/hooks), never from an environment
+        // variable. The stub forwards stdin untouched, so the payload contract
+        // is now asserted where it is implemented — see
+        // `cli::hook::tests::a_subagents_completion_does_not_settle_the_parent_pane`
+        // and `state_actions_attach_the_session_id_when_the_payload_carries_one`.
         assert!(!QODERCLI_HOOK_ASSET.contains("QODER_HOOK_EVENT"));
     }
 

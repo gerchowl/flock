@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    Method, PaneReportAgentSessionParams, PaneReportPromptParams, PaneReportRecapParams,
+    Method, PaneAgentState, PaneReleaseAgentParams, PaneReportAgentParams,
+    PaneReportAgentSessionParams, PaneReportPromptParams, PaneReportRecapParams,
     PaneReportReplyParams, Request,
 };
 
@@ -58,6 +59,9 @@ const SYSTEM_REMINDER_PREFIXES: [&str; 8] = [
 enum Agent {
     Claude,
     Opencode,
+    Codex,
+    Kimi,
+    Qodercli,
 }
 
 impl Agent {
@@ -65,6 +69,9 @@ impl Agent {
         match raw {
             "claude" => Some(Self::Claude),
             "opencode" => Some(Self::Opencode),
+            "codex" => Some(Self::Codex),
+            "kimi" => Some(Self::Kimi),
+            "qodercli" => Some(Self::Qodercli),
             _ => None,
         }
     }
@@ -73,6 +80,9 @@ impl Agent {
         match self {
             Self::Claude => "flock:claude",
             Self::Opencode => "flock:opencode",
+            Self::Codex => "flock:codex",
+            Self::Kimi => "flock:kimi",
+            Self::Qodercli => "flock:qodercli",
         }
     }
 
@@ -80,7 +90,23 @@ impl Agent {
         match self {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
+            Self::Codex => "codex",
+            Self::Kimi => "kimi",
+            Self::Qodercli => "qodercli",
         }
+    }
+
+    /// Whether this agent's host speaks the STATE vocabulary
+    /// (`working`/`idle`/`blocked`/`release`) rather than the lifecycle one.
+    ///
+    /// This is a per-agent capability, not a global one. Claude derives its own
+    /// state from lifecycle events and must ignore a state action outright —
+    /// `claude_hook_ignores_state_actions` in `tests/cli_wrapper.rs` pins it,
+    /// because honouring one would let a Notification hook (or a SUBAGENT's)
+    /// drive the parent pane's state directly, which is the bug the claude
+    /// integration is built to avoid.
+    fn reports_state(self) -> bool {
+        matches!(self, Self::Kimi | Self::Qodercli)
     }
 }
 
@@ -89,6 +115,14 @@ enum Action {
     Session,
     Prompt,
     Stop,
+    /// Direct state reports (#238). Agents whose host emits a state rather than
+    /// a lifecycle event — kimi, qodercli — call these instead of
+    /// session/prompt/stop. The state is the argument, not something inferred
+    /// from the payload; the payload is still read for the session id and the
+    /// subagent guard, when the host sends one at all (qoder does, kimi does
+    /// not).
+    State(PaneAgentState),
+    Release,
 }
 
 impl Action {
@@ -97,6 +131,10 @@ impl Action {
             "session" => Some(Self::Session),
             "prompt" => Some(Self::Prompt),
             "stop" => Some(Self::Stop),
+            "working" => Some(Self::State(PaneAgentState::Working)),
+            "idle" => Some(Self::State(PaneAgentState::Idle)),
+            "blocked" => Some(Self::State(PaneAgentState::Blocked)),
+            "release" => Some(Self::Release),
             _ => None,
         }
     }
@@ -112,7 +150,7 @@ struct HookOutcome {
 
 pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: flk hook <agent> <session|prompt|stop>");
+        eprintln!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
         return Ok(2);
     };
 
@@ -179,8 +217,67 @@ fn plan(
         // Only Claude carries a scrapable transcript + nudge protocol on Stop.
         Action::Stop => match agent {
             Agent::Claude => plan_stop(agent, input, pane_id, pending_messages),
-            Agent::Opencode => HookOutcome::default(),
+            _ => HookOutcome::default(),
         },
+        // Only the state-reporting hosts may drive state directly; for every
+        // other agent a state action is not part of its contract and is
+        // ignored, exactly as an unknown action was before it existed.
+        Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
+        Action::State(state) => plan_state(agent, state, input, pane_id),
+        Action::Release => plan_release(agent, input, pane_id),
+    }
+}
+
+/// A subagent's completion, identified by `agent_id` on the payload. Qoder
+/// emits the parent pane's own hooks for these, so forwarding an `idle` or a
+/// release would make the pane look done while the parent turn is still
+/// running. Carried over from the shim verbatim — the `SubagentStop` half of
+/// the same guard lives in [`run_hook_command`], which every action shares.
+fn is_subagent(input: &serde_json::Value) -> bool {
+    str_field(input, "agent_id").is_some_and(|id| !id.is_empty())
+}
+
+/// A host-reported state (#238). The state is the argument, so nothing is
+/// inferred from the payload — but the payload is still consulted for the two
+/// things the shims took from it: the session id to attach, and whether this
+/// is a subagent whose completion must not settle the parent pane.
+fn plan_state(
+    agent: Agent,
+    state: PaneAgentState,
+    input: &serde_json::Value,
+    pane_id: &str,
+) -> HookOutcome {
+    if matches!(state, PaneAgentState::Idle) && is_subagent(input) {
+        return HookOutcome::default();
+    }
+    HookOutcome {
+        reports: vec![Method::PaneReportAgent(PaneReportAgentParams {
+            pane_id: pane_id.to_string(),
+            source: agent.source().to_string(),
+            agent: agent.agent().to_string(),
+            state,
+            message: None,
+            custom_status: None,
+            seq: Some(seq()),
+            agent_session_id: str_field(input, "session_id").filter(|id| !id.is_empty()),
+            agent_session_path: None,
+        })],
+        stdout: None,
+    }
+}
+
+fn plan_release(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOutcome {
+    if is_subagent(input) {
+        return HookOutcome::default();
+    }
+    HookOutcome {
+        reports: vec![Method::PaneReleaseAgent(PaneReleaseAgentParams {
+            pane_id: pane_id.to_string(),
+            source: agent.source().to_string(),
+            agent: agent.agent().to_string(),
+            seq: Some(seq()),
+        })],
+        stdout: None,
     }
 }
 
@@ -459,8 +556,203 @@ mod tests {
             Method::PaneReportPrompt(_) => "report_prompt",
             Method::PaneReportReply(_) => "report_reply",
             Method::PaneReportRecap(_) => "report_recap",
+            Method::PaneReportAgent(_) => "report_agent",
+            Method::PaneReleaseAgent(_) => "release_agent",
             _ => "other",
         }
+    }
+
+    // --- #238: the state-reporting agents whose shims were python3 ------
+
+    /// The shims built this JSON by hand in an embedded heredoc. Pin the shape
+    /// they produced so the port is parity, not a rewrite.
+    #[test]
+    fn state_actions_report_the_state_verbatim() {
+        for (raw, expected) in [
+            ("working", PaneAgentState::Working),
+            ("idle", PaneAgentState::Idle),
+            ("blocked", PaneAgentState::Blocked),
+        ] {
+            let action = Action::parse(raw).expect("state action parses");
+            let outcome = plan(Agent::Kimi, action, &json!({}), "", "p_23", 0);
+            assert_eq!(outcome.reports.len(), 1, "{raw}");
+            let Method::PaneReportAgent(params) = &outcome.reports[0] else {
+                panic!(
+                    "expected report_agent for {raw}, got {}",
+                    method_name(&outcome.reports[0])
+                );
+            };
+            assert_eq!(params.state, expected, "{raw}");
+            assert_eq!(params.pane_id, "p_23");
+            assert_eq!(params.source, "flock:kimi");
+            assert_eq!(params.agent, "kimi");
+            assert!(
+                params.seq.is_some(),
+                "seq is what orders concurrent reports"
+            );
+            assert!(outcome.stdout.is_none(), "only Claude's Stop writes stdout");
+        }
+    }
+
+    #[test]
+    fn release_action_releases_rather_than_reporting_a_state() {
+        let outcome = plan(
+            Agent::Qodercli,
+            Action::parse("release").unwrap(),
+            &json!({}),
+            "",
+            "p_7",
+            0,
+        );
+        let Method::PaneReleaseAgent(params) = &outcome.reports[0] else {
+            panic!(
+                "expected release_agent, got {}",
+                method_name(&outcome.reports[0])
+            );
+        };
+        assert_eq!(params.source, "flock:qodercli");
+        assert_eq!(params.agent, "qodercli");
+    }
+
+    /// The state is the argument, but the payload still supplies the session
+    /// id when the host sends one (qoder does; kimi sends nothing at all).
+    #[test]
+    fn state_actions_attach_the_session_id_when_the_payload_carries_one() {
+        let with_id = plan(
+            Agent::Qodercli,
+            Action::parse("working").unwrap(),
+            &json!({"session_id": "sess-1"}),
+            "",
+            "p_1",
+            0,
+        );
+        let Method::PaneReportAgent(params) = &with_id.reports[0] else {
+            panic!("expected report_agent");
+        };
+        assert_eq!(params.agent_session_id.as_deref(), Some("sess-1"));
+
+        // kimi's host sends no payload at all — absent, not empty-string.
+        let bare = plan(
+            Agent::Kimi,
+            Action::parse("working").unwrap(),
+            &json!({}),
+            "",
+            "p_1",
+            0,
+        );
+        let Method::PaneReportAgent(params) = &bare.reports[0] else {
+            panic!("expected report_agent");
+        };
+        assert!(params.agent_session_id.is_none());
+    }
+
+    /// Regression guard: a subagent finishing must not settle the PARENT pane.
+    /// The shim guarded this and a naive port drops it — the pane would read as
+    /// idle while the parent turn was still running.
+    #[test]
+    fn a_subagents_completion_does_not_settle_the_parent_pane() {
+        let sub = json!({"agent_id": "sub-1", "session_id": "sess-1"});
+        for raw in ["idle", "release"] {
+            let outcome = plan(
+                Agent::Qodercli,
+                Action::parse(raw).unwrap(),
+                &sub,
+                "",
+                "p_1",
+                0,
+            );
+            assert!(
+                outcome.reports.is_empty(),
+                "{raw} from a subagent must be dropped"
+            );
+        }
+        // `working` from a subagent is still real activity — only the settling
+        // states are suppressed.
+        let working = plan(
+            Agent::Qodercli,
+            Action::parse("working").unwrap(),
+            &sub,
+            "",
+            "p_1",
+            0,
+        );
+        assert_eq!(working.reports.len(), 1);
+    }
+
+    /// Codex's shim only ever handled `session`, and its body was exactly what
+    /// plan_session already does — that is why it needed no new action.
+    #[test]
+    fn codex_session_reports_the_agent_session_id() {
+        let outcome = plan(
+            Agent::Codex,
+            Action::parse("session").unwrap(),
+            &json!({"session_id": "sess-abc"}),
+            "SessionStart",
+            "p_9",
+            0,
+        );
+        let Method::PaneReportAgentSession(params) = &outcome.reports[0] else {
+            panic!("expected report_agent_session");
+        };
+        assert_eq!(params.agent_session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(params.source, "flock:codex");
+        // Only Claude may forward SessionStart's `source`; codex must not.
+        assert!(params.session_start_source.is_none());
+    }
+
+    #[test]
+    fn stop_is_a_no_op_for_the_non_claude_agents() {
+        for agent in [Agent::Codex, Agent::Kimi, Agent::Qodercli] {
+            let outcome = plan(agent, Action::Stop, &json!({}), "Stop", "p_1", 3);
+            assert!(outcome.reports.is_empty());
+            assert!(outcome.stdout.is_none(), "a nudge would be Claude-only");
+        }
+    }
+
+    /// The state vocabulary is per-agent, not global. Adding it to the shared
+    /// `Action::parse` made it valid for EVERY agent, which let
+    /// `flk hook claude working` drive claude's pane state directly — caught by
+    /// `claude_hook_ignores_state_actions` in tests/cli_wrapper.rs. Pinned here
+    /// too so the unit layer fails first and names the reason.
+    #[test]
+    fn only_state_reporting_agents_honour_the_state_vocabulary() {
+        for agent in [Agent::Claude, Agent::Opencode, Agent::Codex] {
+            for raw in ["working", "idle", "blocked", "release"] {
+                let outcome = plan(agent, Action::parse(raw).unwrap(), &json!({}), "", "p_1", 0);
+                assert!(
+                    outcome.reports.is_empty(),
+                    "{} must ignore `{raw}`",
+                    agent.agent()
+                );
+            }
+        }
+        for agent in [Agent::Kimi, Agent::Qodercli] {
+            let outcome = plan(
+                agent,
+                Action::parse("working").unwrap(),
+                &json!({}),
+                "",
+                "p_1",
+                0,
+            );
+            assert_eq!(outcome.reports.len(), 1, "{} reports state", agent.agent());
+        }
+    }
+
+    #[test]
+    fn every_ported_agent_parses_and_keeps_its_identity() {
+        for (raw, source, agent) in [
+            ("codex", "flock:codex", "codex"),
+            ("kimi", "flock:kimi", "kimi"),
+            ("qodercli", "flock:qodercli", "qodercli"),
+        ] {
+            let parsed = Agent::parse(raw).expect("agent parses");
+            assert_eq!(parsed.source(), source);
+            assert_eq!(parsed.agent(), agent);
+        }
+        // copilot still ships its own shim (its event state machine is not
+        // ported yet) — it must NOT resolve here and silently do nothing.
+        assert!(Agent::parse("copilot").is_none());
     }
 
     // --- run_hook_command guards (all trip before stdin is read) ---------

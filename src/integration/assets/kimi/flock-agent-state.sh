@@ -3,74 +3,24 @@
 # managed by flock; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=kimi
-# FLOCK_INTEGRATION_VERSION=1
+# FLOCK_INTEGRATION_VERSION=2
+#
+# Thin stub (#158, #238). The hook body — validate the pane env, build the
+# pane.report_* request, and speak the flock socket — lives in the flk binary
+# at `flk hook kimi <action>`, the single source of truth shared by every agent
+# integration. This forwards the action ($1) and stdin (the hook JSON, if the
+# host sends any) and stays out of the way.
+#
+# Actions: working|idle|blocked|release
+#
+# Replaces an embedded python3 heredoc. python3 was a hard dependency resolved
+# from ambient PATH, and its absence was indistinguishable from "not running
+# under flock" — the shim exited 0 either way (#238). flk is already stamped
+# into the pane env, so the dependency is now gone rather than merely pinned.
+#
+# FLOCK_BIN is stamped into the pane env by flock (falls back to `flk` on PATH).
+# A hook must never fail the parent agent, so a missing binary or any error is
+# a silent no-op: we swallow stderr and always exit 0.
 
-set -eu
-
-action="${1:-}"
-cat >/dev/null 2>/dev/null || true
-
-case "$action" in
-  working|idle|blocked|release) ;;
-  *) exit 0 ;;
-esac
-
-[ "${FLOCK_ENV:-}" = "1" ] || exit 0
-[ -n "${FLOCK_SOCKET_PATH:-}" ] || exit 0
-[ -n "${FLOCK_PANE_ID:-}" ] || exit 0
-command -v python3 >/dev/null 2>&1 || exit 0
-
-FLOCK_ACTION="$action" python3 - <<'PY'
-import json
-import os
-import random
-import socket
-import time
-
-source = "flock:kimi"
-action = os.environ.get("FLOCK_ACTION", "")
-pane_id = os.environ.get("FLOCK_PANE_ID")
-socket_path = os.environ.get("FLOCK_SOCKET_PATH")
-
-if not pane_id or not socket_path:
-    raise SystemExit(0)
-
-request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}"
-report_seq = time.time_ns()
-if action == "release":
-    request = {
-        "id": request_id,
-        "method": "pane.release_agent",
-        "params": {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": "kimi",
-            "seq": report_seq,
-        },
-    }
-else:
-    request = {
-        "id": request_id,
-        "method": "pane.report_agent",
-        "params": {
-            "pane_id": pane_id,
-            "source": source,
-            "agent": "kimi",
-            "state": action,
-            "seq": report_seq,
-        },
-    }
-
-try:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(0.5)
-    client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        client.recv(4096)
-    except Exception:
-        pass
-    client.close()
-except Exception:
-    pass
-PY
+"${FLOCK_BIN:-flk}" hook kimi "${1:-}" 2>/dev/null
+exit 0
