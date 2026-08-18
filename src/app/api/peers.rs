@@ -23,8 +23,42 @@ impl App {
                 // never the cache we received via relay ourselves. That bounds
                 // hop count to one and precludes gossip loops.
                 relayed_fleet: self.own_relayed_fleet(),
+                pollers: Some(self.poller_health()),
             },
         )
+    }
+
+    /// Health of this server's periodic external pollers (#295).
+    ///
+    /// Thresholds come from the configured gossip staleness window rather than
+    /// fresh constants, so "stale" means the same thing here as it does for a
+    /// peer that stopped answering.
+    fn poller_health(&self) -> crate::api::schema::PollerHealthSummary {
+        let now = std::time::Instant::now();
+        let health = &self.pr_poll_health;
+        let stale_after = self.state.config.gossip.stale_after().as_secs();
+        let status = match health.status_at(
+            now,
+            stale_after,
+            crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE,
+        ) {
+            crate::pr_poll::PrPollStatus::Ok => "ok",
+            crate::pr_poll::PrPollStatus::Degraded => "degraded",
+            crate::pr_poll::PrPollStatus::Broken => "broken",
+        };
+        crate::api::schema::PollerHealthSummary {
+            pr: crate::api::schema::PollerHealth {
+                status: status.to_string(),
+                last_success_age_secs: health.last_success_age_secs(now),
+                consecutive_failures: health.consecutive_failures,
+                in_flight: health.in_flight_since.is_some(),
+                in_flight_age_secs: health
+                    .in_flight_since
+                    .map(|at| now.saturating_duration_since(at).as_secs()),
+                skipped_rounds: health.skipped_rounds,
+                last_error: health.last_error.clone(),
+            },
+        }
     }
 
     /// One-hop relay payload: THIS server's own polled peers as

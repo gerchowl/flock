@@ -74,7 +74,11 @@ pub enum AppEvent {
     /// The slow PR-state poll interval elapsed; collect targets and query gh.
     PrStatePollDue,
     /// Background gh results: per-workspace PR state for worktree branches.
-    PrStatesUpdated(Vec<(String, Option<crate::worktree::PrStateInfo>)>),
+    /// Outcome of one batched PR-poll round (#294). `Err` is a ROUND failure
+    /// (no token, transport down, GraphQL error) and must not be confused with
+    /// a successful round that simply found no PRs — the first means the data
+    /// is stale, the second means it is accurate and empty.
+    PrStatesUpdated(Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, String>),
     /// The peer-summary poll interval elapsed; spawn SSH fetches per peer.
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).

@@ -55,6 +55,7 @@ mod peer_stream;
 mod peers;
 mod persist;
 mod platform;
+mod pr_poll;
 mod process;
 mod product_announcements;
 mod protocol;

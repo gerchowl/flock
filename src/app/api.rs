@@ -74,6 +74,55 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
     targets
 }
 
+/// One batched PR-poll round (#294).
+///
+/// Two spawns per target became one HTTP request for the whole round. The
+/// origin remote is resolved once per REPO rather than once per target — it is
+/// static for a session, and it was previously the second of the two execs
+/// nobody counted.
+fn run_pr_poll_round(
+    targets: Vec<PrPollTarget>,
+) -> Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, String> {
+    use std::collections::HashMap;
+
+    let mut repo_for_root: HashMap<std::path::PathBuf, Option<String>> = HashMap::new();
+    let mut queries: Vec<crate::pr_poll::PrQuery> = Vec::new();
+    // Index alongside the queries so one query's answer can fan out to every
+    // workspace sharing that (repo, branch).
+    let mut fanout: Vec<(crate::pr_poll::PrQuery, Vec<String>)> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for target in targets {
+        let repo = repo_for_root
+            .entry(target.repo_root.clone())
+            .or_insert_with(|| crate::worktree::github_repo_for_root(&target.repo_root))
+            .clone();
+        match repo {
+            Some(repo) => {
+                let query = crate::pr_poll::PrQuery {
+                    repo,
+                    branch: target.branch.clone(),
+                };
+                queries.push(query.clone());
+                fanout.push((query, target.workspace_ids));
+            }
+            // Not a GitHub remote: report no PR, exactly as before. This is a
+            // per-target fact, never a round failure.
+            None => unresolved.extend(target.workspace_ids),
+        }
+    }
+
+    let found = crate::pr_poll::fetch_batch(&queries)?;
+
+    let mut results: Vec<(String, Option<crate::worktree::PrStateInfo>)> = Vec::new();
+    for (query, workspace_ids) in fanout {
+        let state = found.get(&query).copied();
+        results.extend(workspace_ids.into_iter().map(|id| (id, state)));
+    }
+    results.extend(unresolved.into_iter().map(|id| (id, None)));
+    Ok(results)
+}
+
 impl App {
     /// Arm and spawn a transcript read for `pane_id` at the currently
     /// selected panel detail (#246). Idempotent — the terminal's own guard
@@ -159,33 +208,42 @@ impl App {
         }
 
         if let AppEvent::PrStatePollDue = ev {
+            // Overlap guard (#294): a round already running means the previous
+            // tick has not drained. Skip rather than spawn a second — piling
+            // rounds up is precisely what turned a slow host into a collapsing
+            // one. Mirrors the peer poller, which has had this all along.
+            if self.pr_poll_health.in_flight_since.is_some() {
+                self.pr_poll_health.mark_skipped();
+                return;
+            }
             let targets = pr_poll_targets(&self.state);
             if !targets.is_empty() {
                 let event_tx = self.event_tx.clone();
+                self.pr_poll_health.mark_started(std::time::Instant::now());
                 std::thread::spawn(move || {
-                    let results: Vec<_> = targets
-                        .into_iter()
-                        .flat_map(|target| {
-                            // One gh call per unique (repo, branch); the
-                            // result fans out to every workspace on it.
-                            let pr_state = crate::worktree::query_pr_state(
-                                &target.repo_root,
-                                &target.checkout,
-                                &target.branch,
-                            );
-                            target
-                                .workspace_ids
-                                .into_iter()
-                                .map(move |id| (id, pr_state))
-                        })
-                        .collect();
-                    let _ = event_tx.blocking_send(AppEvent::PrStatesUpdated(results));
+                    let outcome = run_pr_poll_round(targets);
+                    let _ = event_tx.blocking_send(AppEvent::PrStatesUpdated(outcome));
                 });
             }
             return;
         }
 
-        if let AppEvent::PrStatesUpdated(results) = ev {
+        if let AppEvent::PrStatesUpdated(outcome) = ev {
+            let now = std::time::Instant::now();
+            // A failed ROUND leaves the previous values in place rather than
+            // clearing them: the data is stale, not known-absent, and blanking
+            // every badge on a transient network blip would be a worse lie
+            // than showing the last known state marked degraded.
+            let results = match outcome {
+                Ok(results) => {
+                    self.pr_poll_health.mark_success(now);
+                    results
+                }
+                Err(err) => {
+                    self.pr_poll_health.mark_failure(now, err);
+                    return;
+                }
+            };
             let mut changed = false;
             for (workspace_id, pr_state) in results {
                 if let Some(ws) = self
@@ -1821,13 +1879,13 @@ mod tests {
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("wt")];
         let id = app.state.workspaces[0].id.clone();
 
-        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(vec![(
+        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(vec![(
             id,
             Some(crate::worktree::PrStateInfo {
                 state: crate::worktree::PrState::Merged,
                 number: 6,
             }),
-        )]));
+        )])));
 
         assert_eq!(
             app.state.workspaces[0].pr_state(),
