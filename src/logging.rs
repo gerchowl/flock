@@ -1339,6 +1339,50 @@ pub(crate) fn notification_sound_forwarded(sound: &str) {
     );
 }
 
+/// The arbitration decision behind every effective agent-state change (#309).
+///
+/// At DEFAULT level on purpose. A live capture caught a pane sitting in `Idle`
+/// — the settled green checkmark — for ten seconds while its agent was blocked
+/// on a permission dialog, and the only reason that was diagnosable at all was
+/// a bespoke 0.4s capture rig: the pre-existing state log is DEBUG-only, so a
+/// server log with 9346 lines carried zero state events. Naming the deciding
+/// authority is the point — "which source won, and how stale was it" is the
+/// question every report in this class needs answered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pane_effective_state_changed(
+    pane_id: u32,
+    agent: Option<&str>,
+    prev_state: &str,
+    new_state: &str,
+    authority: &str,
+    hook_state: Option<&str>,
+    hook_age_ms: Option<u128>,
+    hook_expired: bool,
+    screen_state: &str,
+    visible_blocker: bool,
+    visible_idle: bool,
+    visible_working: bool,
+) {
+    tracing::info!(
+        event = "pane.state.effective",
+        subsystem = "detect",
+        outcome = "changed",
+        pane_id,
+        agent = agent.unwrap_or("-"),
+        prev_state,
+        new_state,
+        authority,
+        hook_state = hook_state.unwrap_or("-"),
+        hook_age_ms = hook_age_ms.map(|age| age as u64).unwrap_or(0),
+        hook_expired,
+        screen_state,
+        visible_blocker,
+        visible_idle,
+        visible_working,
+        "effective agent state changed"
+    );
+}
+
 pub(crate) fn pane_state_change_detected(
     ws_idx: usize,
     pane_id: u32,
