@@ -193,6 +193,30 @@ pub(crate) fn solo_remote_label(
     }
 }
 
+/// The SERVER segment of a space-joined location string, per the viewer's
+/// `server_label` mode (#164): `name` = the bare hostname (the pre-icon look),
+/// `both` = `<glyph> <host>`, `icon` = the glyph alone. A node that declared no
+/// usable icon falls back to its hostname in every mode, so the segment is
+/// never empty and never renders a raw/unresolvable name.
+///
+/// This is the space-joined twin of [`member_label_moded`]: member rows read
+/// `<glyph> \u{00b7} <branch>` because their grammar is `<server>:<target>`,
+/// while a location is already `<server> <proj> <target>` and needs no
+/// separator. Feed the result to [`agent_location_label`] as its `server`.
+pub(crate) fn server_field_label(
+    mode: crate::config::ServerLabelConfig,
+    icon_name: Option<&str>,
+    host: &str,
+) -> String {
+    use crate::config::ServerLabelConfig;
+    let glyph = icon_name.and_then(crate::server_icons::resolve);
+    match (mode, glyph) {
+        (ServerLabelConfig::Name, _) | (_, None) => host.to_string(),
+        (ServerLabelConfig::Both, Some(glyph)) => format!("{glyph} {host}"),
+        (ServerLabelConfig::Icon, Some(glyph)) => glyph.to_string(),
+    }
+}
+
 /// The agents-panel single-row location string (#62), matching the spaces
 /// grammar: `<server> <proj> <target>` (e.g. `mba22 flock keyboard-shorcuts`).
 /// Under width pressure the location truncates right-to-left: the branch/target
@@ -425,6 +449,47 @@ mod tests {
             member_label_moded(ServerLabelConfig::Name, Some("anvil"), "anvil", "fix/pty"),
             "anvil:fix/pty"
         );
+    }
+
+    #[test]
+    fn server_field_label_follows_the_server_label_mode() {
+        use crate::config::ServerLabelConfig;
+        let glyph = crate::server_icons::glyph("toad").unwrap();
+        // `name` keeps the bare hostname even when an icon is declared.
+        assert_eq!(
+            server_field_label(ServerLabelConfig::Name, Some("toad"), "sage"),
+            "sage"
+        );
+        // `both` = the glyph, then the hostname, space-joined like the rest of
+        // the location string.
+        assert_eq!(
+            server_field_label(ServerLabelConfig::Both, Some("toad"), "sage"),
+            format!("{glyph} sage")
+        );
+        // `icon` = the symbol standing in for the host.
+        assert_eq!(
+            server_field_label(ServerLabelConfig::Icon, Some("toad"), "sage"),
+            glyph
+        );
+    }
+
+    #[test]
+    fn server_field_label_falls_back_to_the_host_without_a_usable_icon() {
+        use crate::config::ServerLabelConfig;
+        for mode in [
+            ServerLabelConfig::Name,
+            ServerLabelConfig::Both,
+            ServerLabelConfig::Icon,
+        ] {
+            // No icon at all, and a name the registry does not know (a
+            // version-skewed or hostile peer) both fall back to the host —
+            // the raw name never reaches the screen.
+            assert_eq!(server_field_label(mode, None, "ksb"), "ksb");
+            assert_eq!(
+                server_field_label(mode, Some("no-such-icon-name"), "ksb"),
+                "ksb"
+            );
+        }
     }
 
     #[test]
