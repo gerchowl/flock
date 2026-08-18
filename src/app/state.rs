@@ -2529,7 +2529,7 @@ impl AppState {
 /// How far past `[gossip] stale_after` a relayed row is kept before the cache
 /// drops it. Generous on purpose: a node that has just gone quiet is exactly
 /// what an operator wants to see, and only a long-departed one is noise.
-const RELAYED_ENTRY_TTL_STALE_MULTIPLE: u64 = 10;
+pub(crate) const RELAYED_ENTRY_TTL_STALE_MULTIPLE: u64 = 10;
 
 /// Consolidated dedup ranks for remote rows (#101 gossip v3 part 4).
 /// LOWER wins — a locally-polled config peer beats a carried snapshot row.

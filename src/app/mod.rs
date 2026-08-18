@@ -203,6 +203,9 @@ pub struct App {
     /// Per-peer round-dispatch bookkeeping (#96): the overlap-safety guard
     /// that keeps a slow ProxyJump peer from stacking concurrent SSH polls.
     pub(crate) peer_poll_tracker: crate::peers::PeerPollTracker,
+    /// Source-scoped health for the batched PR poller (#294/#295). One row for
+    /// one poller — see `PrPollHealth` for why this is not per-workspace.
+    pub(crate) pr_poll_health: crate::pr_poll::PrPollHealth,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -817,6 +820,7 @@ impl App {
             config_reloaded_from_disk: false,
             gossip_poll_interval_secs,
             peer_poll_tracker: crate::peers::PeerPollTracker::new(),
+            pr_poll_health: crate::pr_poll::PrPollHealth::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         // Sync the render-facing pause banner from the persisted state so
