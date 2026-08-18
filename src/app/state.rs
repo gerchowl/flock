@@ -2093,6 +2093,18 @@ pub struct AppState {
     pub status_line: bool,
     /// Latest sampler snapshot for the status line.
     pub system_stats: Option<crate::system_stats::SystemStats>,
+    /// Arrival `Instant` of the sample currently held in [`Self::system_stats`],
+    /// stamped by the [`crate::events::AppEvent::SystemStatsUpdated`] handler.
+    ///
+    /// Used by [`Self::system_stats_fresh_at`] to hide the last snapshot once
+    /// the sampler thread stops delivering — otherwise a dead poller leaves
+    /// the status line rendering old CPU / memory / battery values as if they
+    /// were current, which is the failure mode `src/peers.rs:196` calls
+    /// "an unbounded confident lie". Kept as a sibling `Option` (not packed
+    /// into `system_stats`) so the many test setters that build a snapshot
+    /// without a clock still compile — a missing timestamp reads as "never
+    /// sampled" and falls through the freshness check.
+    pub system_stats_at: Option<std::time::Instant>,
     /// Pane whose header prompt is click-expanded to the full text.
     pub expanded_prompt_pane: Option<PaneId>,
     /// Scroll position of the open prompt-history panel, in rows FROM THE
@@ -2517,7 +2529,7 @@ impl AppState {
 /// How far past `[gossip] stale_after` a relayed row is kept before the cache
 /// drops it. Generous on purpose: a node that has just gone quiet is exactly
 /// what an operator wants to see, and only a long-departed one is noise.
-const RELAYED_ENTRY_TTL_STALE_MULTIPLE: u64 = 10;
+pub(crate) const RELAYED_ENTRY_TTL_STALE_MULTIPLE: u64 = 10;
 
 /// Consolidated dedup ranks for remote rows (#101 gossip v3 part 4).
 /// LOWER wins — a locally-polled config peer beats a carried snapshot row.
@@ -2570,6 +2582,36 @@ impl AppState {
 
     pub fn sound_enabled(&self) -> bool {
         self.config.ui.sound.enabled
+    }
+
+    /// The last system-stats snapshot, but only while it is still current.
+    ///
+    /// Returns `None` when the sample was never delivered, or when it is
+    /// older than three sample intervals. The status line uses this to
+    /// render a neutral placeholder instead of the frozen numbers once the
+    /// sampler thread stops answering — the same doctrine `src/peers.rs:196`
+    /// states for peers: "a node that stopped answering must stop looking
+    /// alive… an unbounded confident lie is strictly worse than showing it
+    /// as gone".
+    ///
+    /// The threshold is `3 × SAMPLE_INTERVAL` (6s at the current 2s cadence):
+    /// one missed interval is jitter, three in a row is a dead poller.
+    /// Callers pass their frame's `now` so this check never adds a clock
+    /// syscall to the render path (the render-path hardening from #262/#265).
+    pub(crate) fn system_stats_fresh_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<&crate::system_stats::SystemStats> {
+        let sampled_at = self.system_stats_at?;
+        let max_age = 3 * crate::system_stats::SAMPLE_INTERVAL;
+        // saturating_ so a clock that briefly went backwards under load reads
+        // as fresh (age 0), not as an ~584-year overflow that also reads as
+        // fresh — the intent is explicit either way.
+        if now.saturating_duration_since(sampled_at) <= max_age {
+            self.system_stats.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Blank rows between sidebar list entries, clamped to the supported
@@ -2958,6 +3000,7 @@ impl AppState {
             pane_header: true,
             status_line: true,
             system_stats: None,
+            system_stats_at: None,
             expanded_prompt_pane: None,
             prompt_history_scroll: 0,
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
@@ -3628,5 +3671,51 @@ mod tests {
             !state.workspace_branchable(7),
             "out-of-range ws_idx is not branchable"
         );
+    }
+
+    /// Freshness gate hides the snapshot once no update has landed for more
+    /// than three sample intervals — the same doctrine the peers module
+    /// applies at `src/peers.rs:196`. Without this the status line would
+    /// render the last CPU/memory/battery reading forever if the sampler
+    /// thread died. The threshold is derived from `SAMPLE_INTERVAL`, not
+    /// hard-coded, so a cadence change carries through.
+    #[test]
+    fn system_stats_hidden_once_sample_older_than_three_intervals() {
+        use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
+        let mut app = AppState::test_new();
+        let sampled_at = std::time::Instant::now();
+        app.system_stats = Some(SystemStats {
+            cpu_percent: Some(42.0),
+            ..Default::default()
+        });
+        app.system_stats_at = Some(sampled_at);
+
+        // A sample that landed one interval ago is still fresh.
+        let recent = sampled_at + SAMPLE_INTERVAL;
+        assert!(app.system_stats_fresh_at(recent).is_some());
+        // Exactly at 3× the interval is still current — the boundary
+        // belongs to fresh, so a routine sample cycle stays visible.
+        let boundary = sampled_at + 3 * SAMPLE_INTERVAL;
+        assert!(app.system_stats_fresh_at(boundary).is_some());
+        // One tick past the boundary and the sampler is presumed dead —
+        // no numbers, so the status line stops confidently lying.
+        let past_boundary = sampled_at + 3 * SAMPLE_INTERVAL + Duration::from_millis(1);
+        assert!(app.system_stats_fresh_at(past_boundary).is_none());
+    }
+
+    /// Freshness cannot be inferred without a stamp: a snapshot with no
+    /// arrival time reads as "never sampled", which the status line surfaces
+    /// as the warming-up placeholder rather than the numbers. Guards the
+    /// test-fixture path (many setters build a snapshot without a clock)
+    /// from silently upgrading itself to a "fresh" reading.
+    #[test]
+    fn system_stats_without_timestamp_reads_as_never_sampled() {
+        use crate::system_stats::SystemStats;
+        let mut app = AppState::test_new();
+        app.system_stats = Some(SystemStats::default());
+        // system_stats_at deliberately left None.
+        assert!(app
+            .system_stats_fresh_at(std::time::Instant::now())
+            .is_none());
     }
 }

@@ -1820,6 +1820,12 @@ pub(crate) fn server_band_slot_at(
 
 fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
+    // One clock read per frame for the whole band. `self_server_rows`
+    // reads through `AppState::system_stats_fresh_at(now)` so a dead
+    // sampler thread stops leaving the self row rendering a frozen
+    // CPU/mem/battery reading next to PEER rows whose staleness IS
+    // handled — the `src/peers.rs:196` doctrine, applied here.
+    let now = std::time::Instant::now();
     // #96: the header down-count is the ONE sidebar consumer that has
     // AppState reach and therefore the live [gossip] thresholds. The shared
     // peer/snapshot row builders below still use the const-default reachability
@@ -1889,7 +1895,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         let is_current = target.is_none();
         let build = match target {
             // The local server: no hit-area, anchors the band.
-            None => self_server_rows(app),
+            None => self_server_rows(app, now),
             Some(crate::app::state::PeerSwitchRequest::Home) => {
                 let Some(snapshot) = app.fleet_snapshot.as_ref() else {
                     continue;
@@ -2126,7 +2132,7 @@ fn server_name_spans(
     }
 }
 
-fn self_server_rows(app: &AppState) -> ServerRowBuild {
+fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
     use super::status::{band_battery_style, battery_icon, format_net_io, push_band_metric};
     let p = &app.palette;
     // No self marker (user: redundant) — the current-row highlight fill and
@@ -2143,7 +2149,12 @@ fn self_server_rows(app: &AppState) -> ServerRowBuild {
 
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     let mut health: Vec<Span<'static>> = Vec::new();
-    if let Some(stats) = app.system_stats.as_ref() {
+    // Freshness gate shared with the status line (`AppState::system_stats_fresh_at`).
+    // Past 3× SAMPLE_INTERVAL the snapshot is treated as gone: title_rest
+    // and health stay empty, so the self row falls back to the hostname
+    // alone. That reads as "no reading" next to the peer rows in the same
+    // band, rather than a confident-looking frozen number.
+    if let Some(stats) = app.system_stats_fresh_at(now) {
         if let Some(percent) = stats.battery_percent {
             title_rest.push(Span::styled(
                 battery_icon(percent, stats.battery_charging).to_string(),
@@ -3835,7 +3846,11 @@ mod tests {
             gpu_percent: Some(8),
             ..Default::default()
         });
-        let row = self_server_rows(&app);
+        // Stamp now so the freshness gate treats this snapshot as current —
+        // otherwise `self_server_rows` would hide the health values and this
+        // test would silently pass for the wrong reason.
+        app.system_stats_at = Some(std::time::Instant::now());
+        let row = self_server_rows(&app, std::time::Instant::now());
         // The self row always joins the local agent states (none here).
         assert_eq!(row.tally, Some(tally_states([])));
         let name = spans_text(&row.name);
@@ -3882,14 +3897,92 @@ mod tests {
             cpu_percent: Some(42.0),
             ..Default::default()
         });
-        let row = self_server_rows(&app);
+        // Same stamping rationale as `self_server_rows_show_local_identity_and_glyph_health`:
+        // without a stamp the freshness gate would return None and the empty
+        // health/title_rest here would be the empty-because-stale case, not
+        // the empty-because-only-cpu-was-sampled case the test protects.
+        app.system_stats_at = Some(std::time::Instant::now());
+        let row = self_server_rows(&app, std::time::Instant::now());
         let health = line_text(&row.health);
+        // Cpu was sampled, so the health line still carries its glyph.
+        assert!(health.contains("\u{f0ee0}"), "{health}");
         assert!(
             row.title_rest.is_empty(),
             "{:?}",
             spans_text(&row.title_rest)
         );
         assert!(!health.contains("\u{f08ae}"), "{health}");
+    }
+
+    /// The behaviour this change exists to protect on the servers band:
+    /// once the sampler thread stops delivering, the self row does not keep
+    /// rendering its last CPU / memory / battery / net glyphs. It falls back
+    /// to the hostname alone — matching how a peer that stopped answering
+    /// reads in the same band. Frozen self row next to freshness-aware peer
+    /// rows was the specific misleading surface the sidebar-only path let
+    /// through, so this test asserts the numbers are GONE, not that they
+    /// merely differ.
+    #[test]
+    fn self_server_row_hides_health_once_sample_is_stale() {
+        use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
+        const G: u64 = 1024 * 1024 * 1024;
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(SystemStats {
+            cpu_percent: Some(42.0),
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            battery_percent: Some(85),
+            battery_charging: Some(false),
+            net_rx_per_sec: Some(1500),
+            net_tx_per_sec: Some(512),
+            gpu_percent: Some(8),
+            ..Default::default()
+        });
+        let stamped_at =
+            std::time::Instant::now() - 3 * SAMPLE_INTERVAL - std::time::Duration::from_secs(1);
+        app.system_stats_at = Some(stamped_at);
+
+        let row = self_server_rows(&app, std::time::Instant::now());
+        let rest = spans_text(&row.title_rest);
+        let health = line_text(&row.health);
+        // No battery glyph, no net glyph — those are the frozen-looking
+        // indicators next to peer rows that make the self row read as
+        // authoritative when it is not.
+        assert!(row.title_rest.is_empty(), "{rest}");
+        // No cpu/mem/gpu number, no health glyphs at all.
+        assert!(health.is_empty(), "{health}");
+        assert!(!health.contains("42%"), "{health}");
+        assert!(!health.contains("13G/16G"), "{health}");
+    }
+
+    /// Pairs with `self_server_row_hides_health_once_sample_is_stale`: proves
+    /// the gate returns the values once a fresh stamp is present, so the
+    /// difference between the two tests is exactly the age of the sample.
+    #[test]
+    fn self_server_row_shows_health_when_sample_is_fresh() {
+        use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
+        const G: u64 = 1024 * 1024 * 1024;
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(SystemStats {
+            cpu_percent: Some(42.0),
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            battery_percent: Some(85),
+            battery_charging: Some(false),
+            net_rx_per_sec: Some(1500),
+            net_tx_per_sec: Some(512),
+            gpu_percent: Some(8),
+            ..Default::default()
+        });
+        // One interval old — the sampler cadence, well inside the 3× ceiling.
+        app.system_stats_at = Some(std::time::Instant::now() - SAMPLE_INTERVAL);
+
+        let row = self_server_rows(&app, std::time::Instant::now());
+        let rest = spans_text(&row.title_rest);
+        let health = line_text(&row.health);
+        assert!(rest.contains('\u{f0079}'), "{rest}");
+        assert!(health.contains("42%"), "{health}");
+        assert!(health.contains("13G/16G"), "{health}");
     }
 
     #[test]

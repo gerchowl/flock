@@ -18,6 +18,16 @@ use crate::config::PeerConfig;
 /// documented seam for #101 (staleness rework), whose new model will thread
 /// config where reachable and retire the const consumers.
 pub const PEER_POLL_INTERVAL_SECS: u64 = 15;
+
+/// Wall-clock bound on one peer SSH round.
+///
+/// `ConnectTimeout` bounds the CONNECT and `ServerAlive` detects a dead
+/// network, but neither covers the case that matters: a peer that is reachable
+/// and answering TCP while the remote `flk` is wedged. The channel stays
+/// healthy, the command never returns, and `PeerPollTracker` holds that peer's
+/// in-flight slot forever — so the peer silently stops being polled for the
+/// life of the process.
+const PEER_SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// First poll fires shortly after startup so the sidebar populates fast.
 pub const PEER_POLL_INITIAL_DELAY_SECS: u64 = 3;
 /// A peer whose last successful poll is older than this renders as stale.
@@ -52,6 +62,11 @@ struct PeerPollEntry {
     /// when the previous one was dispatched. `None` = no history yet, so the
     /// first `should_poll_now` call always dispatches.
     next_due: Option<Instant>,
+    /// Instant this peer's current fetch was dispatched at. `Some` iff
+    /// `in_flight` — the timestamp the aggregate poller-health snapshot
+    /// projects to answer "how long has the oldest fetch been out?", the
+    /// signal that a peer is wedging rather than merely slow (#295).
+    in_flight_since: Option<Instant>,
 }
 
 impl PeerPollTracker {
@@ -76,6 +91,7 @@ impl PeerPollTracker {
             .or_insert(PeerPollEntry {
                 in_flight: false,
                 next_due: None,
+                in_flight_since: None,
             });
         if entry.in_flight {
             return false;
@@ -86,6 +102,7 @@ impl PeerPollTracker {
             }
         }
         entry.in_flight = true;
+        entry.in_flight_since = Some(now);
         entry.next_due = Some(now + effective_interval);
         true
     }
@@ -96,7 +113,20 @@ impl PeerPollTracker {
     pub fn mark_finished(&mut self, peer_name: &str) {
         if let Some(entry) = self.entries.get_mut(peer_name) {
             entry.in_flight = false;
+            entry.in_flight_since = None;
         }
+    }
+
+    /// The OLDEST `in_flight_since` across all peers, or `None` when nothing
+    /// is out. Projected into `PollerHealth.in_flight_age_secs` so the
+    /// snapshot reports how long the most-behind fetch has been running —
+    /// the rate-of-change signal an operator alerts on. The `in_flight` bit
+    /// on the wire is derived from this being `Some`.
+    pub fn oldest_in_flight_since(&self) -> Option<Instant> {
+        self.entries
+            .values()
+            .filter_map(|entry| entry.in_flight_since)
+            .min()
     }
 
     /// Prune entries for peers no longer in config. Preserves in-flight state
@@ -117,6 +147,23 @@ impl PeerPollTracker {
         self.entries
             .get(peer_name)
             .is_some_and(|entry| entry.in_flight)
+    }
+
+    /// Test seam: pin a peer's `in_flight_since` to a known instant so
+    /// aggregate-age projections can be asserted without racing the wall
+    /// clock through `should_poll_now`'s next-due arming.
+    #[cfg(test)]
+    pub(crate) fn set_in_flight_since_for_test(&mut self, peer_name: &str, at: Instant) {
+        let entry = self
+            .entries
+            .entry(peer_name.to_string())
+            .or_insert(PeerPollEntry {
+                in_flight: false,
+                next_due: None,
+                in_flight_since: None,
+            });
+        entry.in_flight = true;
+        entry.in_flight_since = Some(at);
     }
 }
 
@@ -762,7 +809,7 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
             remote_command,
         ])
         .stdin(std::process::Stdio::null())
-        .output_traced()
+        .output_traced_with_timeout(PEER_SSH_TIMEOUT)
         .map_err(|err| format!("ssh spawn failed: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -647,11 +647,17 @@ pub struct PrStateInfo {
     pub number: u64,
 }
 
-pub(crate) fn parse_pr_state_json(json: &str) -> Option<PrStateInfo> {
-    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
-    let number = value.get("number")?.as_u64()?;
-    let state = match value.get("state")?.as_str()? {
-        "OPEN" if value.get("isDraft").and_then(|v| v.as_bool()) == Some(true) => PrState::Draft,
+/// The state mapping itself, shared by the `gh --json` shape and the batched
+/// GraphQL shape (#294). Both wire formats spell the fields identically
+/// (`state`, `number`, `isDraft`); keeping one mapping is what stops the two
+/// transports drifting on, say, whether a draft counts as open.
+pub(crate) fn parse_pr_state_fields(
+    state: &str,
+    number: u64,
+    is_draft: Option<bool>,
+) -> Option<PrStateInfo> {
+    let state = match state {
+        "OPEN" if is_draft == Some(true) => PrState::Draft,
         "OPEN" => PrState::Open,
         "MERGED" => PrState::Merged,
         "CLOSED" => PrState::Closed,
@@ -660,33 +666,18 @@ pub(crate) fn parse_pr_state_json(json: &str) -> Option<PrStateInfo> {
     Some(PrStateInfo { state, number })
 }
 
-/// Query the PR for `branch` on the checkout's origin repo. Slow (network):
-/// only called from the background PR poller.
-pub(crate) fn query_pr_state(
-    repo_root: &std::path::Path,
-    checkout: &std::path::Path,
-    branch: &str,
-) -> Option<PrStateInfo> {
+/// Resolve `owner/repo` for a checkout's origin remote.
+///
+/// Split out of `query_pr_state` (#294): the batched poller resolves this once
+/// per REPO per round instead of once per target, which removes the second of
+/// the two process spawns each target used to cost. The value is static for a
+/// session — a repo's origin does not move under us.
+pub(crate) fn github_repo_for_root(repo_root: &std::path::Path) -> Option<String> {
     let root = repo_root.to_string_lossy().to_string();
-    let repo = run_command_capture("git", &["-C", &root, "remote", "get-url", "origin"], None)
+    run_command_capture("git", &["-C", &root, "remote", "get-url", "origin"], None)
         .ok()
         .as_deref()
-        .and_then(github_repo_from_remote_url)?;
-    let json = run_command_capture(
-        "gh",
-        &[
-            "pr",
-            "view",
-            branch,
-            "--repo",
-            &repo,
-            "--json",
-            "state,number,isDraft",
-        ],
-        Some(checkout),
-    )
-    .ok()?;
-    parse_pr_state_json(&json)
+        .and_then(github_repo_from_remote_url)
 }
 
 /// Parse "owner/repo" out of a github remote URL (ssh or https).
@@ -2787,34 +2778,34 @@ prunable stale
     #[test]
     fn pr_state_json_parses_all_states() {
         assert_eq!(
-            parse_pr_state_json(r#"{"state":"OPEN","number":7,"isDraft":false}"#),
+            parse_pr_state_fields("OPEN", 7, Some(false)),
             Some(PrStateInfo {
                 state: PrState::Open,
                 number: 7
             })
         );
         assert_eq!(
-            parse_pr_state_json(r#"{"state":"OPEN","number":7,"isDraft":true}"#),
+            parse_pr_state_fields("OPEN", 7, Some(true)),
             Some(PrStateInfo {
                 state: PrState::Draft,
                 number: 7
             })
         );
         assert_eq!(
-            parse_pr_state_json(r#"{"state":"MERGED","number":5,"isDraft":false}"#),
+            parse_pr_state_fields("MERGED", 5, Some(false)),
             Some(PrStateInfo {
                 state: PrState::Merged,
                 number: 5
             })
         );
         assert_eq!(
-            parse_pr_state_json(r#"{"state":"CLOSED","number":2,"isDraft":false}"#),
+            parse_pr_state_fields("CLOSED", 2, Some(false)),
             Some(PrStateInfo {
                 state: PrState::Closed,
                 number: 2
             })
         );
-        assert_eq!(parse_pr_state_json("not json"), None);
-        assert_eq!(parse_pr_state_json(r#"{"state":"WEIRD","number":1}"#), None);
+        assert_eq!(parse_pr_state_fields("", 1, None), None);
+        assert_eq!(parse_pr_state_fields("WEIRD", 1, None), None);
     }
 }

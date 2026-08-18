@@ -139,6 +139,8 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    /// An issue-guard fetch is running off-loop (#302).
+    pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
@@ -203,6 +205,31 @@ pub struct App {
     /// Per-peer round-dispatch bookkeeping (#96): the overlap-safety guard
     /// that keeps a slow ProxyJump peer from stacking concurrent SSH polls.
     pub(crate) peer_poll_tracker: crate::peers::PeerPollTracker,
+    /// Source-scoped health for the batched PR poller (#294/#295). One row for
+    /// one poller — see `PrPollHealth` for why this is not per-workspace.
+    pub(crate) pr_poll_health: crate::pr_poll::PrPollHealth,
+    /// Source-scoped health for the periodic git-status refresh (#295). The
+    /// refresh drives the sidebar's branch / dirty / ahead-behind numbers;
+    /// without a row here "no update fired" is indistinguishable from "the
+    /// worker died" — the incident the whole health surface exists to make
+    /// answerable.
+    pub(crate) git_refresh_health:
+        crate::health::PollerHealthCore<crate::health::GitRefreshErrorKind>,
+    /// Source-scoped health for the `[checks]` runner tick (#175 / #295).
+    /// This is the runner's LIVENESS — did the tick fire? — not the outcome
+    /// of any individual check. A `Broken` verdict here means the app loop's
+    /// checks branch stopped waking, not that a script check failed. Stamped
+    /// on every dispatch call, including the paused early-return, so pause
+    /// does not look identical to a crash.
+    pub(crate) checks_runner_health:
+        crate::health::PollerHealthCore<crate::health::ChecksRunnerErrorKind>,
+    /// Aggregate health for the peer-summary poll (#96 / #295). "Aggregate"
+    /// is deliberate: an individual peer's failure is already visible on its
+    /// row; the question this answers is "is the local peer poller ticking
+    /// at all?". Any successful fetch stamps success; any classified error
+    /// stamps failure. `PeerPollTracker` still owns the per-peer overlap
+    /// guards and the earliest-in-flight instant that surfaces here.
+    pub(crate) peer_poll_health: crate::health::PollerHealthCore<crate::health::PeerPollErrorKind>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -645,6 +672,7 @@ impl App {
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
             system_stats: None,
+            system_stats_at: None,
             expanded_prompt_pane: None,
             prompt_history_scroll: 0,
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
@@ -744,6 +772,7 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
             last_sidebar_divider_click: None,
@@ -816,6 +845,10 @@ impl App {
             config_reloaded_from_disk: false,
             gossip_poll_interval_secs,
             peer_poll_tracker: crate::peers::PeerPollTracker::new(),
+            pr_poll_health: crate::pr_poll::PrPollHealth::default(),
+            git_refresh_health: crate::health::PollerHealthCore::default(),
+            checks_runner_health: crate::health::PollerHealthCore::default(),
+            peer_poll_health: crate::health::PollerHealthCore::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         // Sync the render-facing pause banner from the persisted state so
