@@ -19,11 +19,15 @@
 use std::ffi::OsStr;
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Cap for the `args` log field. Command lines can be long (curl URLs, ssh
 /// bootstrap scripts) — truncate rather than let the audit trail hold arbitrary
 /// user-influenced strings.
+/// How often a timed run checks whether its child has exited. Short enough
+/// that the deadline is honoured closely, long enough not to spin a core.
+const TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 const MAX_ARG_LOG_CHARS: usize = 512;
 const ARG_TRUNCATED_MARKER: &str = "…[truncated]";
 
@@ -143,6 +147,101 @@ impl TracedCommand {
         use std::os::unix::process::CommandExt;
         self.inner.process_group(pgid);
         self
+    }
+
+    /// Run the command with a wall-clock deadline, killing the child if it
+    /// exceeds it. Same tracing contract as [`Self::output_traced`].
+    ///
+    /// `output_traced` is `Command::output()`, which waits forever. That is the
+    /// shape behind every "flock froze" report so far: a subprocess that hangs
+    /// takes its caller with it, and when the caller is the event loop that
+    /// means every pane at once (#302). ssh options and curl flags bound their
+    /// own transports, but nothing bounds `git`, `gh`, `pmset` or `ioreg`.
+    ///
+    /// A timed-out child is reported as an `io::ErrorKind::TimedOut` error, so
+    /// callers treat "took too long" exactly like "failed" rather than needing
+    /// a third case.
+    ///
+    /// Reader threads drain stdout/stderr concurrently rather than after the
+    /// wait: a child that fills a 64 KiB pipe buffer blocks in `write` until
+    /// someone reads, so polling `try_wait` without draining would hang until
+    /// the deadline even for a child that had already finished its work.
+    pub(crate) fn output_traced_with_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
+        use std::io::Read;
+
+        let args = shape_args(&self.inner);
+        let start = Instant::now();
+        self.inner.stdout(std::process::Stdio::piped());
+        self.inner.stderr(std::process::Stdio::piped());
+        let result = (|| -> io::Result<Output> {
+            // Same funnel exemption as `output_traced` — this IS the wrapper.
+            #[allow(clippy::disallowed_methods)]
+            let mut child = self.inner.spawn()?;
+            let mut stdout_pipe = child.stdout.take();
+            let mut stderr_pipe = child.stderr.take();
+            let stdout_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = stdout_pipe.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            });
+            let stderr_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(pipe) = stderr_pipe.as_mut() {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            });
+
+            let deadline = start + timeout;
+            let status = loop {
+                match child.try_wait()? {
+                    Some(status) => break Some(status),
+                    None if Instant::now() >= deadline => {
+                        // SIGKILL, not SIGTERM: this is a probe we already gave
+                        // its full budget, and a child ignoring TERM would just
+                        // extend the stall we are here to bound.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    None => std::thread::sleep(TIMEOUT_POLL_INTERVAL),
+                }
+            };
+
+            // Joins return once the pipes close, which the kill above forces.
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            match status {
+                Some(status) => Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                }),
+                None => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out after {}s", timeout.as_secs()),
+                )),
+            }
+        })();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(output) => crate::logging::process_exec_completed(
+                self.subsystem,
+                &self.program,
+                &args,
+                Some(output.status),
+                duration_ms,
+            ),
+            Err(err) => crate::logging::process_exec_failed(
+                self.subsystem,
+                &self.program,
+                &args,
+                &err.to_string(),
+            ),
+        }
+        result
     }
 
     /// Run the command with `input` written to its stdin, capturing
@@ -387,6 +486,65 @@ mod tests {
         let secret = "y".repeat(16);
         let basic = redact_arg(&format!("AUTHORIZATION: Basic {secret}"));
         assert!(!basic.contains(&secret), "{basic}");
+    }
+
+    /// The whole point: a child that never exits must not take its caller with
+    /// it. `sleep 60` under a 200ms budget has to come back promptly.
+    #[test]
+    fn a_hanging_child_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        let err = TracedCommand::new("sleep", "test")
+            .arg("60")
+            .output_traced_with_timeout(Duration::from_millis(200))
+            .expect_err("a 60s sleep must not satisfy a 200ms budget");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned after {:?} — the deadline did not fire",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_prompt_child_returns_its_output_normally() {
+        let out = TracedCommand::new("echo", "test")
+            .arg("hi")
+            .output_traced_with_timeout(Duration::from_secs(10))
+            .expect("echo is well within budget");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    /// A child writing more than a pipe buffer (~64 KiB) blocks in `write`
+    /// until someone drains it. If the deadline loop polled `try_wait` without
+    /// concurrent readers, this would sit until the timeout and then be
+    /// reported as a hang — turning a healthy command into a false failure.
+    #[test]
+    fn a_child_larger_than_the_pipe_buffer_does_not_deadlock() {
+        let out = TracedCommand::new("sh", "test")
+            .args([
+                "-c",
+                "for i in $(seq 1 5000); do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done",
+            ])
+            .output_traced_with_timeout(Duration::from_secs(20))
+            .expect("a chatty but fast child must not trip the deadline");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.len() > 64 * 1024,
+            "test needs to exceed one pipe buffer, got {} bytes",
+            out.stdout.len()
+        );
+    }
+
+    /// A timed-out run still emits its process.exec event, or a wedge would be
+    /// invisible in the log — the exact blindness this work is fixing.
+    #[test]
+    fn a_timed_out_run_is_still_logged_as_a_failure() {
+        let err = TracedCommand::new("sleep", "test")
+            .arg("30")
+            .output_traced_with_timeout(Duration::from_millis(150))
+            .expect_err("must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]

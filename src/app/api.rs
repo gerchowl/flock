@@ -207,6 +207,14 @@ impl App {
             return;
         }
 
+        if let AppEvent::IssueGuardFetched(fetched) = ev {
+            if self.apply_issue_guard_fetch(fetched) {
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+            }
+            return;
+        }
+
         if let AppEvent::PrStatePollDue = ev {
             // Overlap guard (#294): a round already running means the previous
             // tick has not drained. Skip rather than spawn a second — piling
