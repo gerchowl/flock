@@ -645,6 +645,7 @@ impl App {
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
             system_stats: None,
+            system_stats_at: None,
             expanded_prompt_pane: None,
             prompt_history_scroll: 0,
             prompt_history_detail: crate::agent_transcript::TranscriptDetail::default(),
