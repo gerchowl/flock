@@ -8,6 +8,10 @@ on:
     branches: [main]
     paths-ignore:
       - "website/**"
+  # Required for the merge queue. GitHub runs required checks against the
+  # merge GROUP (the candidate merge commit), not the PR head — without this
+  # trigger those checks never start and every queued PR waits forever.
+  merge_group:
 
 permissions:
   contents: read
@@ -32,7 +36,19 @@ jobs:
 
       - name: Validate PR title
         if: github.event_name == 'pull_request'
-        run: python3 scripts/conventional_commits.py "${{ github.event.pull_request.title }}"
+        # Through the environment, never interpolated into the script body: a
+        # title is user-controlled text. Inline interpolation both allows shell
+        # injection and breaks on ordinary punctuation — a title containing a
+        # double quote used to fail this job for no legitimate reason.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/conventional_commits.py "$PR_TITLE"
+
+      # On `merge_group` neither step above runs: a merge group has no PR title
+      # and no before/after range. That is intentional — the title was already
+      # validated when the PR ran, and the squash subject is taken from it. The
+      # job still reports success so it can stay a required context, which the
+      # queue needs in order to gate on it.
 
   check:
     name: check (${{ matrix.os }})
