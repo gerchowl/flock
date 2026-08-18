@@ -477,6 +477,19 @@ impl App {
             return;
         }
 
+        // Reap a stuck refresh BEFORE deciding to dispatch (#295): if the
+        // previous worker died without delivering `GitStatusRefreshed`, the
+        // `git_refresh_in_flight` guard would latch and every later tick
+        // would silently skip forever. Reaping stamps a `Timeout` and
+        // releases the guard — the same recovery `pr_poll` runs.
+        if self.git_refresh_health.reap_stuck_round(
+            now,
+            crate::health::GIT_REFRESH_MAX_ROUND_SECS,
+            crate::health::GitRefreshErrorKind::Timeout,
+        ) {
+            self.git_refresh_in_flight = false;
+        }
+
         let workspaces = self.workspace_git_refresh_items();
 
         if workspaces.is_empty() {
@@ -485,6 +498,7 @@ impl App {
         }
 
         self.git_refresh_in_flight = true;
+        self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
         let cache = self.git_status_cache.clone();
         std::thread::spawn(move || {
@@ -627,6 +641,15 @@ impl App {
     /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
     /// (headless).
     pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        // Health (#295): stamp the tick BEFORE the pause early-return, so
+        // "paused" does not look identical to "the loop stopped waking".
+        // The runner tick is the app loop's checks branch — its liveness is
+        // the operator's watchdog for the whole scheduler. Only stamp when
+        // checks are enabled at all; a `[checks] enable = false` server
+        // never runs the runner and would report Broken forever otherwise.
+        if self.state.config.checks.enable {
+            self.checks_runner_health.mark_success(now);
+        }
         // US-9 (#175 S3 commit 3): fleet pause halts the scheduler tick.
         // First-line early return — nothing fires, no built-in fold runs,
         // no heartbeat lands. Human agency stays unaffected.

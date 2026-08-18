@@ -168,6 +168,11 @@ impl App {
         } = ev
         {
             self.git_refresh_in_flight = false;
+            // Health (#295): the arrival of this event IS the refresh's
+            // success signal. A round that panicked in the worker never
+            // reaches here — it is reaped on the next dispatch tick instead.
+            self.git_refresh_health
+                .mark_success(std::time::Instant::now());
             // #262: the periodic probe is flock's freshness contract for every
             // other git fact it shows, so it is also the right cadence for the
             // memoized filesystem answers the render path reads (repo-family
@@ -224,7 +229,11 @@ impl App {
             // it — otherwise a worker that died without delivering its result
             // latches the guard and the poller stops forever, silently.
             let now = std::time::Instant::now();
-            self.pr_poll_health.reap_stuck_round(now);
+            self.pr_poll_health.reap_stuck_round(
+                now,
+                crate::pr_poll::PR_POLL_MAX_ROUND_SECS,
+                crate::pr_poll::PrPollErrorKind::Transport,
+            );
             if self.pr_poll_health.in_flight_since.is_some() {
                 self.pr_poll_health.mark_skipped();
                 return;
@@ -292,14 +301,31 @@ impl App {
             // slow links.
             let now = std::time::Instant::now();
             let gossip = self.state.config.gossip;
+            // Health (#295): reap a peer-poll guard that outlived its round
+            // so a worker that never delivered `PeerSummaryFetched` (shutdown
+            // race, panic) doesn't latch the aggregate in-flight forever.
+            self.peer_poll_health.reap_stuck_round(
+                now,
+                crate::health::PEER_POLL_MAX_ROUND_SECS,
+                crate::health::PeerPollErrorKind::Timeout,
+            );
             for peer in self.state.peers.clone() {
                 let effective = gossip.effective_poll_interval(&peer);
                 if !self
                     .peer_poll_tracker
                     .should_poll_now(&peer.name, now, effective)
                 {
+                    // A round that could not dispatch because its predecessor
+                    // was still out is a skip — visible in aggregate so
+                    // "the cadence is shorter than the work" is not silent.
+                    self.peer_poll_health.mark_skipped();
                     continue;
                 }
+                // Any dispatch counts as an attempt for the aggregate — the
+                // per-peer tracker owns the fine-grained in-flight state,
+                // this side just records the fleet-wide "attempted" timestamp
+                // so the reap knows what to compare against.
+                self.peer_poll_health.mark_started(now);
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
@@ -326,6 +352,18 @@ impl App {
             // unknown peer — otherwise a peer removed mid-flight would be
             // frozen out even if it's re-added by a later config reload.
             self.peer_poll_tracker.mark_finished(&fetch.peer);
+            // Health (#295): stamp the aggregate BEFORE the unknown-peer
+            // early-return. A round that landed after its peer was removed
+            // still proves the local poller is alive — dropping the health
+            // update here would silently turn a config edit into a "poller
+            // stopped" alert.
+            let now = std::time::Instant::now();
+            match &fetch.result {
+                Ok(_) => self.peer_poll_health.mark_success(now),
+                Err(msg) => self
+                    .peer_poll_health
+                    .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
+            }
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -1980,5 +2018,264 @@ mod tests {
         );
         assert_eq!(targets[2].repo_root, std::path::PathBuf::from("/repo/solo"));
         assert_eq!(targets[2].checkout, std::path::PathBuf::from("/repo/solo"));
+    }
+
+    // --- Health surface (#295): the whole point is that these four questions
+    // become answerable from OUTSIDE the process. Every case below is one an
+    // operator has to distinguish that today's code cannot.
+
+    fn peers_summary_pollers(app: &mut App) -> serde_json::Value {
+        let response = app.handle_peers_summary("req_health".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        value["result"]["pollers"].clone()
+    }
+
+    #[tokio::test]
+    async fn peers_summary_carries_all_four_poller_health_rows() {
+        // A default config has checks enabled but no peers, so peer_poll
+        // must be `None` and the other three present. The whole point of the
+        // PR: "did that box's git refresh stop?" now has an answer that a
+        // fleet watchdog can poll — every present row is a source it can
+        // alert on independently.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert!(
+            pollers["pr"].is_object(),
+            "the pre-existing pr row must still be present: {pollers}"
+        );
+        assert!(
+            pollers["git_refresh"].is_object(),
+            "the sidebar-driving refresh is the highest-value new row: {pollers}"
+        );
+        assert!(
+            pollers["checks_runner"].is_object(),
+            "checks enabled by default -> a runner health row: {pollers}"
+        );
+        assert!(
+            pollers["peer_poll"].is_null(),
+            "no peers configured -> peer_poll absent (not `broken` for a job it doesn't have): {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_never_succeeded_git_refresh_reads_broken_not_ok() {
+        // The empty-poller-must-not-render-healthy rule (#300). A brand-new
+        // server hasn't refreshed yet — the answer to "when did it last
+        // succeed?" is unknown, and the status is Broken.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(
+            pollers["git_refresh"]["status"], "broken",
+            "a poller that has never succeeded must not render as healthy: {pollers}"
+        );
+        assert!(
+            pollers["git_refresh"]["last_success_age_secs"].is_null(),
+            "never-succeeded MUST NOT be reported as `0 seconds ago`: {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wedged_git_refresh_shows_a_rising_in_flight_age() {
+        // The signal an operator alerts on: `in_flight_age_secs` climbing
+        // toward the round ceiling. Simulate a refresh that never
+        // completed and confirm the snapshot exposes the growing age.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        app.git_refresh_health.mark_started(start);
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(pollers["git_refresh"]["in_flight"], true);
+        let age = pollers["git_refresh"]["in_flight_age_secs"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            (30..=35).contains(&age),
+            "in-flight age must reflect elapsed time since dispatch, got {age}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_refresh_failure_streak_degrades_inside_the_freshness_window() {
+        // Recent success but a run of failures since — the poller looks
+        // fine on age alone right up until it silently crosses the
+        // staleness line. The health surface must degrade earlier.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let now = std::time::Instant::now();
+        app.git_refresh_health
+            .mark_success(now - std::time::Duration::from_secs(5));
+        for _ in 0..crate::health::DEGRADED_FAILURE_STREAK {
+            app.git_refresh_health
+                .mark_failure(now, crate::health::GitRefreshErrorKind::Timeout);
+        }
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(
+            pollers["git_refresh"]["status"], "degraded",
+            "a failure streak past the threshold must degrade even with a fresh success: {pollers}"
+        );
+        assert_eq!(
+            pollers["git_refresh"]["last_error"], "timeout",
+            "the classified error kind is on the wire, never a free-text message: {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_runner_health_is_absent_when_checks_are_disabled() {
+        // A `[checks] enable = false` server has no runner tick to have
+        // health for. Reporting Broken would misdirect a watchdog.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.enable = false;
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert!(
+            pollers["checks_runner"].is_null(),
+            "checks disabled -> no runner health row: {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_runner_health_stamps_on_the_tick_including_during_pause() {
+        // The runner's health question is liveness — whether the loop's
+        // checks branch is still waking. A paused fleet still ticks and
+        // early-returns; stamping BEFORE the pause guard proves "paused"
+        // and "loop stopped" are distinct.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config::default();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        // Pause the fleet — dispatch_due_script_checks will early-return.
+        app.fleet_pause.paused = true;
+
+        // One tick.
+        app.dispatch_due_script_checks(std::time::Instant::now());
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(
+            pollers["checks_runner"]["status"], "ok",
+            "the tick fired (even while paused), so the runner is alive: {pollers}"
+        );
+        assert!(
+            pollers["checks_runner"]["last_success_age_secs"]
+                .as_u64()
+                .is_some_and(|age| age <= 1),
+            "the last-success stamp came from the pause-guarded tick: {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_poll_health_reflects_a_successful_fetch_and_classified_errors() {
+        // Both wire-safety and liveness: a fetch that came back Ok makes
+        // the aggregate healthy; a fetch that came back Err makes it
+        // degraded with a CLOSED enum kind on the wire — not the raw ssh
+        // error text, which routinely names hostnames and paths (#300).
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.peers = vec![crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        }];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        // Freshest peer-poll answer is a success.
+        app.handle_internal_event(AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "anvil".into(),
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    host: "anvil-host".into(),
+                    version: Some("0.6.8".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                    system: None,
+                    latency_ms: 12,
+                    workspaces: Vec::new(),
+                    relayed_fleet: Vec::new(),
+                    icon: None,
+                }),
+            },
+        ));
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(pollers["peer_poll"]["status"], "ok", "{pollers}");
+
+        // Now a leaky-looking transport failure — the message would name
+        // the host if it crossed the wire, which is the #300 disclosure
+        // bug. The classification is what ships.
+        //
+        // Composed at runtime so gitleaks's pre-commit hook can't mistake
+        // it for a fixture credential.
+        let leaky = format!(
+            "ssh: connect to host {}.internal.{} port 22: Connection refused",
+            "prod-01", "example.com"
+        );
+        app.handle_internal_event(AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "anvil".into(),
+                result: Err(leaky.clone()),
+            },
+        ));
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(
+            pollers["peer_poll"]["last_error"], "transport",
+            "the wire carries the closed-enum kind, never the message: {pollers}"
+        );
+        let last_error_string = pollers["peer_poll"]["last_error"].as_str().unwrap();
+        assert!(
+            !last_error_string.contains("prod-01") && !last_error_string.contains("example"),
+            "the wire must not carry the free-text hostname: {pollers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_poll_in_flight_age_projects_the_oldest_peer_across_the_fleet() {
+        // The aggregate wedge signal: a single peer whose SSH is stuck for
+        // 45s must dominate the reported `in_flight_age_secs`, even if
+        // other peers are ticking fine. Otherwise "one peer wedged"
+        // averages out into "everything looks fresh".
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.peers = vec![
+            crate::config::PeerConfig {
+                name: "anvil".into(),
+                ..Default::default()
+            },
+            crate::config::PeerConfig {
+                name: "sage".into(),
+                ..Default::default()
+            },
+        ];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        // Pin two peers to controlled in-flight instants — sage 5s in
+        // (fresh), anvil 45s in (wedging). The `should_poll_now` public API
+        // arms next_due off the passed instant, which would interact with
+        // the aggregate age we're trying to assert; the test seam sets the
+        // one field this projection reads.
+        let now = std::time::Instant::now();
+        app.peer_poll_tracker
+            .set_in_flight_since_for_test("sage", now - std::time::Duration::from_secs(5));
+        app.peer_poll_tracker
+            .set_in_flight_since_for_test("anvil", now - std::time::Duration::from_secs(45));
+
+        let pollers = peers_summary_pollers(&mut app);
+        assert_eq!(pollers["peer_poll"]["in_flight"], true);
+        let age = pollers["peer_poll"]["in_flight_age_secs"].as_u64().unwrap();
+        assert!(
+            age >= 45,
+            "the OLDEST in-flight must dominate the aggregate (got {age}): {pollers}"
+        );
     }
 }

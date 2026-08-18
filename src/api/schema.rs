@@ -2051,11 +2051,37 @@ pub enum PaneAgentState {
 
 /// Machine health for a federated peer's `servers` sidebar row. Sourced from
 /// the peer's existing 2s status-line sampler — no extra measurement.
-/// Health of every periodic external poller on one server (#295).
+/// Health of every periodic in-process poller on one server (#295).
+///
+/// One `PollerHealth` per source, deliberately — the fleet monitor asks "has
+/// this specific poller stopped?" per named source rather than a
+/// whole-server verdict. Every field past `pr` is `Option`, so a peer on the
+/// previous release still deserialises: an older serialiser writes only what
+/// it knows about, and a newer receiver reads `None` for what is missing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealthSummary {
-    /// The batched GitHub PR-state poller (#294).
+    /// The batched GitHub PR-state poller (#294 / #300).
     pub pr: PollerHealth,
+    /// The periodic git working-tree refresh that keeps sidebar branch /
+    /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
+    /// the previous release; `Some` here always, because the refresher runs
+    /// as long as any workspace exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_refresh: Option<PollerHealth>,
+    /// The `[checks]` runner tick — the scheduler that dispatches script /
+    /// blocked-alert / hibernation / issue-guard / reap folds (#175). `None`
+    /// when `[checks] enable = false`, because there is no runner to have
+    /// health for; `Some` otherwise. Answers "did the runner tick fire?" —
+    /// per-check outcomes are their own event stream, not this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_runner: Option<PollerHealth>,
+    /// The peer-summary SSH poll (#96): the cross-machine version of what
+    /// this same monitor probes. `None` when no peers are configured;
+    /// `Some` otherwise. Aggregate across peers — a single peer failing is
+    /// visible in its own row, this answers "is the local poller alive at
+    /// all?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_poll: Option<PollerHealth>,
 }
 
 /// One poller's health.
