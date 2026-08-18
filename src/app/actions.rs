@@ -3783,7 +3783,16 @@ impl AppState {
                 .into_iter()
                 .collect(),
             AppEvent::SystemStatsUpdated(stats) => {
+                // Stamp arrival, not sample-completion inside the sampler
+                // thread: this is the one place the loop applies the update,
+                // and stamping here keeps `system_stats` and `system_stats_at`
+                // moving together without threading a clock through the
+                // sampler. The status line reads both via
+                // `AppState::system_stats_fresh_at` and shows a placeholder
+                // once the pair falls behind — the `src/peers.rs:196`
+                // doctrine applied to the sampler.
                 self.system_stats = Some(stats);
+                self.system_stats_at = Some(std::time::Instant::now());
                 Vec::new()
             }
             // Handled in the shared api.rs preprocessing before reaching here.
@@ -3791,6 +3800,8 @@ impl AppState {
             // match runs in either loop.
             AppEvent::PrStatePollDue
             | AppEvent::PrStatesUpdated(_)
+            // Applied at the App layer, which owns the issue-guard dedupe state.
+            | AppEvent::IssueGuardFetched(_)
             | AppEvent::PeerPollDue
             | AppEvent::PeerSummaryFetched(_)
             // Cross-machine checkout (#125) legs are handled at the App layer

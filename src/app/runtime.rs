@@ -1239,6 +1239,14 @@ impl App {
     /// each body's `flk-trigger` block against the owner gate + dedupe, and
     /// dispatch every `Fire` through the same Notify path script checks
     /// use. On error, post a `gh issue comment` back on the issue.
+    /// Dispatch the issue-guard fetch to a worker thread.
+    ///
+    /// This used to run `gh issue list` inline, serially per repo, on the event
+    /// loop (#302). `gh` is the binary whose exec cost caused #294 — measured at
+    /// 18-164s under Gatekeeper saturation — so a slow one stalled the loop and
+    /// froze EVERY pane, multiplied by repo count. The fetch is now off-loop and
+    /// the results come back as an event; evaluation still happens here, on the
+    /// loop, where the guard state lives.
     pub(crate) fn poll_issue_guard(&mut self, now: Instant) -> bool {
         let config = self.state.config.checks.issue_guard.clone();
         if !config.enable {
@@ -1247,14 +1255,48 @@ impl App {
         if !self.issue_guard.poll_due(now) {
             return false;
         }
+        // Overlap guard: a fetch still running means the previous round has not
+        // drained. Skip rather than stack — that accumulation is what turned a
+        // slow host into a collapsing one in #294.
+        if self.issue_guard_fetch_in_flight {
+            return false;
+        }
         self.issue_guard.arm_next_poll(now, &config);
         if config.repos.is_empty() {
             return false;
         }
 
+        self.issue_guard_fetch_in_flight = true;
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let fetched: Vec<(String, Result<Vec<crate::checks::GhIssue>, String>)> = config
+                .repos
+                .iter()
+                .map(|repo| {
+                    (
+                        repo.clone(),
+                        fetch_open_issues(&config.gh_bin, repo, config.max_issues),
+                    )
+                })
+                .collect();
+            let _ = event_tx.blocking_send(crate::events::AppEvent::IssueGuardFetched(fetched));
+        });
+        false
+    }
+
+    /// Apply a completed issue-guard fetch. Runs on the loop, where the guard's
+    /// dedupe state lives; does no I/O beyond the best-effort error comment,
+    /// which is bounded.
+    pub(crate) fn apply_issue_guard_fetch(
+        &mut self,
+        fetched: Vec<(String, Result<Vec<crate::checks::GhIssue>, String>)>,
+    ) -> bool {
+        self.issue_guard_fetch_in_flight = false;
+        let config = self.state.config.checks.issue_guard.clone();
         let mut changed = false;
-        for repo in &config.repos {
-            let issues = match fetch_open_issues(&config.gh_bin, repo, config.max_issues) {
+        for (repo, result) in fetched {
+            let repo = &repo;
+            let issues = match result {
                 Ok(issues) => issues,
                 Err(err) => {
                     // gh failure surfaces as a `CheckErrored` for the guard —
@@ -1415,7 +1457,7 @@ fn fetch_open_issues(
             "--limit",
             &max_issues.to_string(),
         ])
-        .output_traced()
+        .output_traced_with_timeout(ISSUE_GUARD_GH_TIMEOUT)
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
         return Err(format!(
@@ -1428,6 +1470,13 @@ fn fetch_open_issues(
         .map_err(|err| format!("gh JSON parse failed: {err}"))?;
     Ok(issues)
 }
+
+/// Wall-clock bound on any issue-guard `gh` call.
+///
+/// `gh` is a large signed binary whose exec cost is unbounded under Gatekeeper
+/// saturation — #294 measured `gh --version` at 18-164s. Off-loop execution
+/// (#302) stops that freezing the UI; this stops it wedging the worker.
+const ISSUE_GUARD_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Result<(), String> {
     let body = format!(
@@ -1444,7 +1493,7 @@ fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Res
             "--body",
             &body,
         ])
-        .output_traced()
+        .output_traced_with_timeout(ISSUE_GUARD_GH_TIMEOUT)
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
         return Err(format!(

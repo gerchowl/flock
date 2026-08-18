@@ -18,6 +18,16 @@ use crate::config::PeerConfig;
 /// documented seam for #101 (staleness rework), whose new model will thread
 /// config where reachable and retire the const consumers.
 pub const PEER_POLL_INTERVAL_SECS: u64 = 15;
+
+/// Wall-clock bound on one peer SSH round.
+///
+/// `ConnectTimeout` bounds the CONNECT and `ServerAlive` detects a dead
+/// network, but neither covers the case that matters: a peer that is reachable
+/// and answering TCP while the remote `flk` is wedged. The channel stays
+/// healthy, the command never returns, and `PeerPollTracker` holds that peer's
+/// in-flight slot forever — so the peer silently stops being polled for the
+/// life of the process.
+const PEER_SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// First poll fires shortly after startup so the sidebar populates fast.
 pub const PEER_POLL_INITIAL_DELAY_SECS: u64 = 3;
 /// A peer whose last successful poll is older than this renders as stale.
@@ -799,7 +809,7 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
             remote_command,
         ])
         .stdin(std::process::Stdio::null())
-        .output_traced()
+        .output_traced_with_timeout(PEER_SSH_TIMEOUT)
         .map_err(|err| format!("ssh spawn failed: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
