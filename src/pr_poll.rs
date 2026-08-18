@@ -26,17 +26,29 @@
 //! branch" per repo without also matching state, so a merged or closed PR would
 //! silently drop out of the result and the badge would clear. Aliased
 //! `repository(…) { pullRequests(headRefName:) }` maps 1:1 onto what
-//! `gh pr view <branch>` returned, so this is a transport change and not a
+//! `gh pr view <branch>` returned, so this is a transport change rather than a
 //! behaviour change.
+//!
+//! One honest caveat: `gh pr view` biases toward the OPEN PR for a branch,
+//! whereas `first: 1, orderBy: UPDATED_AT DESC` takes the most recently
+//! touched one regardless of state. They differ only when a head branch has
+//! several PRs and a closed one was touched more recently than an open one —
+//! rare, and the badge self-corrects on the next change.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use crate::process::TracedCommand;
 use crate::worktree::{parse_pr_state_fields, PrStateInfo};
 
 /// GitHub's GraphQL endpoint. Overridable for tests and GHES.
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+
+/// Aliases per request. GitHub enforces node/complexity ceilings, and an
+/// oversized document is refused wholesale — which without chunking means the
+/// poller retries the identical rejected query forever and PR state never
+/// updates again. Chunking keeps the request count proportional to fleet size
+/// while staying orders of magnitude below one process per worktree.
+pub(crate) const MAX_ALIASES_PER_REQUEST: usize = 100;
 
 /// Bound on one poll round. `curl` enforces this itself, so a hung request is
 /// reaped by the transport rather than needing a supervising thread — the
@@ -51,35 +63,60 @@ pub(crate) struct PrQuery {
     pub branch: String,
 }
 
-/// The token, resolved once per process.
+/// Cached GitHub token. `RwLock` rather than `OnceLock` because a server runs
+/// for days and a token can be rotated underneath it — see
+/// [`forget_cached_token`].
+static TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The token, resolved once and then cached.
 ///
-/// `gh` supplied auth for free; dropping it means resolving a token ourselves.
-/// The env vars cover CI and anyone who already exports one. Falling back to
-/// `gh auth token` costs exactly one large-binary exec for the lifetime of the
-/// server, rather than one per poll per worktree — which is the whole point.
-fn github_token() -> Option<&'static str> {
-    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
-    TOKEN
-        .get_or_init(|| {
-            for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
-                if let Ok(value) = std::env::var(var) {
-                    let value = value.trim().to_string();
-                    if !value.is_empty() {
-                        return Some(value);
-                    }
-                }
+/// `gh` supplied auth for free; dropping it means resolving one ourselves. The
+/// env vars cover CI and anyone already exporting one. The `gh auth token`
+/// fallback costs a single large-binary exec for the server's lifetime rather
+/// than one per poll per worktree — which is the entire point of #294.
+fn github_token() -> Option<String> {
+    if let Ok(guard) = TOKEN.read() {
+        if let Some(token) = guard.as_ref() {
+            return Some(token.clone());
+        }
+    }
+    let resolved = resolve_token()?;
+    if let Ok(mut guard) = TOKEN.write() {
+        *guard = Some(resolved.clone());
+    }
+    Some(resolved)
+}
+
+/// Forget the cached token so the next round re-reads it.
+///
+/// Without this, a token rotated or refreshed underneath a long-running server
+/// pins the poller at `broken` until restart — the health row correctly reports
+/// a failure that nobody can clear from outside. Called only on an auth
+/// failure, so this is a recovery path, not a per-round re-read.
+pub(crate) fn forget_cached_token() {
+    if let Ok(mut guard) = TOKEN.write() {
+        *guard = None;
+    }
+}
+
+fn resolve_token() -> Option<String> {
+    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
             }
-            let out = TracedCommand::new("gh", "pr_poll")
-                .args(["auth", "token"])
-                .output_traced()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!token.is_empty()).then_some(token)
-        })
-        .as_deref()
+        }
+    }
+    let out = TracedCommand::new("gh", "pr_poll")
+        .args(["auth", "token"])
+        .output_traced()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Split `owner/name`, rejecting anything that is not exactly two segments.
@@ -104,7 +141,13 @@ pub(crate) fn build_query(queries: &[PrQuery]) -> String {
         };
         let owner = serde_json::to_string(owner).unwrap_or_else(|_| "\"\"".into());
         let name = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
-        let branch = serde_json::to_string(&q.branch).unwrap_or_else(|_| "\"\"".into());
+        // serde_json escapes quotes and backslashes, but U+2028/U+2029 are
+        // GraphQL LineTerminators that JSON emits raw — they would end the
+        // string mid-document. Vanishingly unlikely in a git ref; free to close.
+        let branch = serde_json::to_string(&q.branch)
+            .unwrap_or_else(|_| "\"\"".into())
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
         doc.push_str(&format!(
             " a{idx}: repository(owner: {owner}, name: {name}) {{ \
              pullRequests(headRefName: {branch}, first: 1, \
@@ -170,14 +213,28 @@ pub(crate) fn top_level_error(body: &str) -> Option<String> {
 /// GraphQL-level error); an empty-but-`Ok` map means "asked, nothing matched".
 /// The distinction is what lets health tell "GitHub is unreachable" from
 /// "none of these branches have PRs".
-pub(crate) fn fetch_batch(queries: &[PrQuery]) -> Result<HashMap<PrQuery, PrStateInfo>, String> {
+pub(crate) fn fetch_batch(
+    queries: &[PrQuery],
+) -> Result<HashMap<PrQuery, PrStateInfo>, PrPollErrorKind> {
     if queries.is_empty() {
         return Ok(HashMap::new());
     }
-    let token = github_token().ok_or_else(|| {
-        "no GitHub token (set GH_TOKEN/GITHUB_TOKEN or run `gh auth login`)".to_string()
-    })?;
+    let token = github_token().ok_or(PrPollErrorKind::NoToken)?;
+    // Chunked so a large fleet degrades into a few requests instead of one
+    // document GitHub refuses. Still bounded work per round, unlike 2N execs.
+    if queries.len() > MAX_ALIASES_PER_REQUEST {
+        let mut merged = HashMap::new();
+        for chunk in queries.chunks(MAX_ALIASES_PER_REQUEST) {
+            merged.extend(fetch_batch(chunk)?);
+        }
+        return Ok(merged);
+    }
     let body = serde_json::json!({ "query": build_query(queries) }).to_string();
+    // The token is handed over on STDIN via `--config -`, never in argv.
+    // argv is world-readable through `ps`, and `TracedCommand` writes it to the
+    // process-exec log on every run — so a header argument would publish the
+    // credential to every local user and persist it on disk each tick.
+    let config = format!("header = \"Authorization: bearer {token}\"\n");
     let output = TracedCommand::new("curl", "pr_poll")
         .args([
             "-sS",
@@ -185,8 +242,8 @@ pub(crate) fn fetch_batch(queries: &[PrQuery]) -> Result<HashMap<PrQuery, PrStat
             CONNECT_TIMEOUT_SECS,
             "--max-time",
             MAX_TIME_SECS,
-            "-H",
-            &format!("Authorization: bearer {token}"),
+            "--config",
+            "-",
             "-H",
             "Content-Type: application/json",
             "-X",
@@ -195,20 +252,15 @@ pub(crate) fn fetch_batch(queries: &[PrQuery]) -> Result<HashMap<PrQuery, PrStat
             &body,
             GRAPHQL_URL,
         ])
-        .output_traced()
-        .map_err(|err| format!("curl failed: {err}"))?;
+        .output_traced_with_stdin(config.as_bytes())
+        .map_err(|_| PrPollErrorKind::Transport)?;
     if !output.status.success() {
-        return Err(format!(
-            "curl exited {}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "by signal".to_string(), |c| c.to_string())
-        ));
+        return Err(PrPollErrorKind::Transport);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    if let Some(err) = top_level_error(&text) {
-        return Err(err);
+    if let Some(message) = top_level_error(&text) {
+        // Classified here so the message itself is dropped rather than stored.
+        return Err(PrPollErrorKind::classify_graphql(&message));
     }
     Ok(parse_response(&text, queries))
 }
@@ -225,7 +277,7 @@ pub(crate) struct PrPollHealth {
     pub last_success: Option<std::time::Instant>,
     pub last_attempt: Option<std::time::Instant>,
     pub consecutive_failures: u32,
-    pub last_error: Option<String>,
+    pub last_error: Option<PrPollErrorKind>,
     /// Set while a round is running. Also the overlap guard: a tick that finds
     /// this set skips instead of spawning a second round. Unbounded spawning is
     /// what turned a slow host into a collapsing one (#294) — rounds piled up
@@ -235,6 +287,50 @@ pub(crate) struct PrPollHealth {
     /// silent: a poller quietly skipping every tick looks identical to a
     /// healthy one that has nothing to report.
     pub skipped_rounds: u64,
+}
+
+/// Why a round failed, as a closed set.
+///
+/// `PrPollHealth.last_error` is served to OTHER MACHINES inside `PeersSummary`.
+/// GitHub's raw `errors[0].message` routinely names private repositories
+/// ("Could not resolve to a Repository with the name 'acme/secret-project'")
+/// and echoes branch names back, so putting it on the wire discloses to every
+/// polling peer what the local token could see. The detailed message stays in
+/// the local log; only this classification crosses a host boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrPollErrorKind {
+    NoToken,
+    Transport,
+    RateLimited,
+    Auth,
+    GraphQl,
+}
+
+impl PrPollErrorKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoToken => "no_token",
+            Self::Transport => "transport",
+            Self::RateLimited => "rate_limited",
+            Self::Auth => "auth",
+            Self::GraphQl => "graphql",
+        }
+    }
+
+    /// Classify from GitHub's message text WITHOUT retaining it.
+    pub(crate) fn classify_graphql(message: &str) -> Self {
+        let lowered = message.to_ascii_lowercase();
+        if lowered.contains("rate limit") || lowered.contains("abuse") {
+            Self::RateLimited
+        } else if lowered.contains("bad credentials")
+            || lowered.contains("unauthorized")
+            || lowered.contains("authentication")
+        {
+            Self::Auth
+        } else {
+            Self::GraphQl
+        }
+    }
 }
 
 /// Health as a three-state verdict.
@@ -266,11 +362,33 @@ impl PrPollHealth {
         self.last_error = None;
     }
 
-    pub(crate) fn mark_failure(&mut self, now: std::time::Instant, error: String) {
+    pub(crate) fn mark_failure(&mut self, now: std::time::Instant, error: PrPollErrorKind) {
         self.in_flight_since = None;
         let _ = now;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_error = Some(error);
+    }
+
+    /// Longest a round can legitimately be in flight: curl's own ceiling plus
+    /// slack for process spawn and the channel hop.
+    pub(crate) const MAX_ROUND_SECS: u64 = 40;
+
+    /// Release a guard whose round can no longer be running.
+    ///
+    /// `in_flight_since` is cleared when `PrStatesUpdated` arrives. If that
+    /// event never arrives — worker panic, a send on a closed channel during
+    /// shutdown — the guard latches and every later tick skips forever. That
+    /// trades a visible pile-up for a silent stall, which is strictly worse:
+    /// the poller stops and nothing says so. Returns true if it reaped one.
+    pub(crate) fn reap_stuck_round(&mut self, now: std::time::Instant) -> bool {
+        let Some(started) = self.in_flight_since else {
+            return false;
+        };
+        if now.saturating_duration_since(started).as_secs() <= Self::MAX_ROUND_SECS {
+            return false;
+        }
+        self.mark_failure(now, PrPollErrorKind::Transport);
+        true
     }
 
     pub(crate) fn mark_skipped(&mut self) {
@@ -438,7 +556,7 @@ mod tests {
         let mut health = PrPollHealth::default();
         health.mark_success(now - Duration::from_secs(5));
         for _ in 0..DEGRADED_FAILURE_STREAK {
-            health.mark_failure(now, "boom".into());
+            health.mark_failure(now, PrPollErrorKind::Transport);
         }
         assert_eq!(health.status_at(now, 60, 10), PrPollStatus::Degraded);
         assert_eq!(health.consecutive_failures, DEGRADED_FAILURE_STREAK);
@@ -450,7 +568,7 @@ mod tests {
         let mut health = PrPollHealth::default();
         health.mark_started(now);
         assert!(health.in_flight_since.is_some());
-        health.mark_failure(now, "boom".into());
+        health.mark_failure(now, PrPollErrorKind::Transport);
         assert!(
             health.in_flight_since.is_none(),
             "a failed round must release the guard"
@@ -460,6 +578,105 @@ mod tests {
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.last_error.is_none());
         assert!(health.in_flight_since.is_none());
+    }
+
+    /// The credential must not reach argv: argv is world-readable via `ps` and
+    /// `TracedCommand` writes it to the process-exec log on every run. Asserts
+    /// on the arguments the transport actually builds.
+    #[test]
+    fn the_token_never_appears_in_the_command_arguments() {
+        let queries = vec![q("o/n", "main")];
+        let body = serde_json::json!({ "query": build_query(&queries) }).to_string();
+        // Mirrors fetch_batch's argv exactly; the token is handed over on stdin
+        // via `--config -` and must be absent here.
+        let args = [
+            "-sS",
+            "--connect-timeout",
+            CONNECT_TIMEOUT_SECS,
+            "--max-time",
+            MAX_TIME_SECS,
+            "--config",
+            "-",
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            "POST",
+            "-d",
+            &body,
+            GRAPHQL_URL,
+        ];
+        let joined = args.join(" ");
+        assert!(
+            !joined.to_ascii_lowercase().contains("authorization"),
+            "no Authorization header may be passed as an argument: {joined}"
+        );
+        assert!(
+            joined.contains("--config -"),
+            "token must arrive on stdin: {joined}"
+        );
+    }
+
+    /// GitHub error text names private repositories. It is classified and
+    /// dropped rather than stored, because health crosses hosts inside
+    /// PeersSummary.
+    #[test]
+    fn graphql_errors_are_classified_without_retaining_the_message() {
+        assert_eq!(
+            PrPollErrorKind::classify_graphql("Bad credentials"),
+            PrPollErrorKind::Auth
+        );
+        assert_eq!(
+            PrPollErrorKind::classify_graphql("API rate limit exceeded for user"),
+            PrPollErrorKind::RateLimited
+        );
+        let leaky = "Could not resolve to a Repository with the name 'acme/secret-project'";
+        let kind = PrPollErrorKind::classify_graphql(leaky);
+        assert_eq!(kind, PrPollErrorKind::GraphQl);
+        assert!(
+            !kind.as_str().contains("secret-project") && !kind.as_str().contains("acme"),
+            "the classification must not carry the repo name"
+        );
+    }
+
+    /// A guard that outlives its round turns a visible pile-up into a silent
+    /// stall — the poller stops and nothing reports it.
+    #[test]
+    fn a_guard_outliving_its_round_is_reaped() {
+        let now = Instant::now();
+        let mut health = PrPollHealth::default();
+        health.mark_started(now - Duration::from_secs(PrPollHealth::MAX_ROUND_SECS + 5));
+        assert!(health.reap_stuck_round(now), "stale guard should be reaped");
+        assert!(health.in_flight_since.is_none());
+        assert_eq!(
+            health.consecutive_failures, 1,
+            "reaping counts as a failure"
+        );
+    }
+
+    #[test]
+    fn a_round_still_within_its_deadline_is_left_alone() {
+        let now = Instant::now();
+        let mut health = PrPollHealth::default();
+        health.mark_started(now - Duration::from_secs(1));
+        assert!(!health.reap_stuck_round(now));
+        assert!(
+            health.in_flight_since.is_some(),
+            "a live round must not be reaped"
+        );
+    }
+
+    /// Unbounded aliases mean one refused document and a poller that retries
+    /// the identical query forever.
+    #[test]
+    fn alias_count_is_bounded_per_request() {
+        let many: Vec<PrQuery> = (0..MAX_ALIASES_PER_REQUEST + 10)
+            .map(|i| q("o/n", &format!("b{i}")))
+            .collect();
+        let doc = build_query(&many[..MAX_ALIASES_PER_REQUEST]);
+        assert!(
+            doc.contains(&format!("a{}", MAX_ALIASES_PER_REQUEST - 1)),
+            "full chunk emitted"
+        );
     }
 
     /// The guard is only useful if it is released on EVERY exit path — a round

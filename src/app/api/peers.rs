@@ -56,7 +56,7 @@ impl App {
                     .in_flight_since
                     .map(|at| now.saturating_duration_since(at).as_secs()),
                 skipped_rounds: health.skipped_rounds,
-                last_error: health.last_error.clone(),
+                last_error: health.last_error.map(|kind| kind.as_str().to_string()),
             },
         }
     }

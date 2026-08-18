@@ -78,7 +78,12 @@ pub enum AppEvent {
     /// (no token, transport down, GraphQL error) and must not be confused with
     /// a successful round that simply found no PRs — the first means the data
     /// is stale, the second means it is accurate and empty.
-    PrStatesUpdated(Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, String>),
+    PrStatesUpdated(
+        Result<
+            Vec<(String, Option<crate::worktree::PrStateInfo>)>,
+            crate::pr_poll::PrPollErrorKind,
+        >,
+    ),
     /// The peer-summary poll interval elapsed; spawn SSH fetches per peer.
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).

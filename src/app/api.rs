@@ -82,7 +82,7 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
 /// nobody counted.
 fn run_pr_poll_round(
     targets: Vec<PrPollTarget>,
-) -> Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, String> {
+) -> Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, crate::pr_poll::PrPollErrorKind> {
     use std::collections::HashMap;
 
     let mut repo_for_root: HashMap<std::path::PathBuf, Option<String>> = HashMap::new();
@@ -212,6 +212,11 @@ impl App {
             // tick has not drained. Skip rather than spawn a second — piling
             // rounds up is precisely what turned a slow host into a collapsing
             // one. Mirrors the peer poller, which has had this all along.
+            // Reap a guard whose round cannot still be running before honouring
+            // it — otherwise a worker that died without delivering its result
+            // latches the guard and the poller stops forever, silently.
+            let now = std::time::Instant::now();
+            self.pr_poll_health.reap_stuck_round(now);
             if self.pr_poll_health.in_flight_since.is_some() {
                 self.pr_poll_health.mark_skipped();
                 return;
@@ -240,6 +245,12 @@ impl App {
                     results
                 }
                 Err(err) => {
+                    // An auth failure is the one error a restart would fix, so
+                    // drop the cached token and let the next round re-read it
+                    // rather than pinning at `broken` until someone notices.
+                    if matches!(err, crate::pr_poll::PrPollErrorKind::Auth) {
+                        crate::pr_poll::forget_cached_token();
+                    }
                     self.pr_poll_health.mark_failure(now, err);
                     return;
                 }
