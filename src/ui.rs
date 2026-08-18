@@ -1234,6 +1234,11 @@ mod tests {
             cpu_percent: Some(42.0),
             ..Default::default()
         });
+        // Stamp the sample so the sidebar's freshness gate treats it as
+        // current — without this the self-row health assertion below would
+        // pass for the wrong reason (empty because stale, not because it
+        // rendered the cpu glyph).
+        app.system_stats_at = Some(std::time::Instant::now());
 
         let area = Rect::new(0, 0, 80, 30);
         compute_view(&mut app, area);
