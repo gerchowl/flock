@@ -385,7 +385,14 @@ fn system_summary(stats: &crate::system_stats::SystemStats) -> PeerSystemSummary
         // shipped; until this bump it stopped at the box, so every viewer saw
         // a blank GPU column on every row but its own.
         gpu_percent: stats.gpu_percent,
-        thermal: stats.thermal.clone(),
+        // #298: sanitize on the way OUT too. Every RECEIVE path normalizes a
+        // peer's declaration; once a host reporter writes this field locally
+        // we are the peer, and our own broken reporter must not be the one
+        // thing that escapes the clamp.
+        thermal: stats
+            .thermal
+            .clone()
+            .map(crate::api::schema::ThermalReport::sanitized),
     }
 }
 

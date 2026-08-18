@@ -346,6 +346,19 @@ fn load_live_config_from_table(
         }
     }
 
+    // #298 thermal reporter: a top-level scalar like `icon`. Same trap as
+    // #164 — a field only in the model parses nowhere, so the live-config
+    // source would hand the sampler None forever and no node would ever
+    // declare thermal health.
+    if let Some(value) = table.get("thermal_command") {
+        match value.clone().try_into::<String>() {
+            Ok(command) => config.thermal_command = Some(command),
+            Err(err) => diagnostics.push(format!(
+                "invalid thermal_command setting: {err}; keeping current thermal command"
+            )),
+        }
+    }
+
     load_live_section(
         &table,
         "theme",

@@ -2572,35 +2572,6 @@ fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
     Line::from(out)
 }
 
-/// Compact keyhint for the spaces quick-jump ordinals (#114 part 2), derived
-/// from the first bound `switch_space` chord. The indexed bindings carry
-/// per-digit labels (`prefix+shift+1` … `prefix+shift+9`); collapse the trailing
-/// digit to `N` so the header reads `prefix+shift+N`. `None` when unbound, which
-/// is also when no ordinals render.
-/// Collapse an indexed keybind label (`prefix+shift+1`) to a compact keyhint
-/// (`prefix+shift+N`) by replacing a single trailing digit with `N`.
-fn collapse_index_label(label: &str) -> String {
-    match label.strip_suffix(|c: char| c.is_ascii_digit()) {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}N"),
-        _ => label.to_string(),
-    }
-}
-
-fn spaces_jump_keyhint(app: &AppState) -> Option<String> {
-    Some(collapse_index_label(
-        &app.keybinds.switch_space.first()?.label,
-    ))
-}
-
-/// Keyhint for the agents-band quick-jump ordinals (#114 part 2 / #147), from
-/// the first bound `focus_agent` chord. `None` when unbound — the same gate as
-/// the ordinals, so the header affordance and the row numbers agree.
-fn agents_jump_keyhint(app: &AppState) -> Option<String> {
-    Some(collapse_index_label(
-        &app.keybinds.focus_agent.first()?.label,
-    ))
-}
-
 fn render_workspace_list(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2620,20 +2591,10 @@ fn render_workspace_list(
             Some(server) => format!(" spaces · only {server}"),
             None => " spaces".to_string(),
         };
-        let mut header_spans = vec![Span::styled(
+        let header_spans = vec![Span::styled(
             header_label,
             Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
         )];
-        // #114 part 2: keyhint for the quick-jump ordinals rendered on the
-        // section rows below — shown only when `switch_space` is actually bound
-        // (same gate as the ordinals), so the affordance and the numbers always
-        // agree and the unbound default stays uncluttered.
-        if let Some(hint) = spaces_jump_keyhint(app) {
-            header_spans.push(Span::styled(
-                format!("  {hint}"),
-                Style::default().fg(p.overlay0),
-            ));
-        }
         frame.render_widget(
             Paragraph::new(clamp_line(Line::from(header_spans), area.width)),
             header_rect,
@@ -3080,18 +3041,10 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let mut agents_header_spans = vec![Span::styled(
+    let agents_header_spans = vec![Span::styled(
         " agents",
         Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
     )];
-    // #147: keyhint for the row jump-ordinals below, shown only when
-    // `focus_agent` is bound (same gate as the ordinals).
-    if let Some(hint) = agents_jump_keyhint(app) {
-        agents_header_spans.push(Span::styled(
-            format!("  {hint}"),
-            Style::default().fg(p.overlay0),
-        ));
-    }
     frame.render_widget(
         Paragraph::new(clamp_line(Line::from(agents_header_spans), area.width)),
         Rect::new(area.x, area.y + 1, area.width, 1),
@@ -6620,15 +6573,6 @@ mod tests {
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
     }
 
-    #[test]
-    fn collapse_index_label_replaces_trailing_digit_with_n() {
-        assert_eq!(collapse_index_label("prefix+shift+1"), "prefix+shift+N");
-        assert_eq!(collapse_index_label("alt+9"), "alt+N");
-        // No trailing digit (or a bare digit): left as-is.
-        assert_eq!(collapse_index_label("prefix+a"), "prefix+a");
-        assert_eq!(collapse_index_label("1"), "1");
-    }
-
     fn app_with_two_agents() -> AppState {
         let mut app = AppState::test_new();
         let first = Workspace::test_new("one");
@@ -6672,17 +6616,20 @@ mod tests {
     }
 
     #[test]
-    fn agents_band_numbers_rows_and_shows_keyhint_when_focus_agent_bound() {
-        // #147: with `focus_agent` bound, the header advertises the chord and
-        // each local row carries its 1-based jump ordinal (matching
-        // `focus_agent_entry`, which indexes this same list).
+    fn agents_band_numbers_rows_without_a_header_keyhint() {
+        // #147 numbered the rows; #299 dropped the header chord that restated
+        // them. The ordinals ARE the affordance — the header spends no columns
+        // teaching a chord the numbers below it already show.
         let mut app = app_with_two_agents();
         let config: crate::config::Config =
             toml::from_str("[keys]\nfocus_agent = \"alt+1..9\"\n").unwrap();
         app.keybinds = config.keybinds();
 
         let (header, first_row) = agents_band_rows(&app);
-        assert!(header.contains("alt+N"), "header keyhint: {header:?}");
+        assert!(
+            !header.contains("alt+N"),
+            "header must carry no chord keyhint: {header:?}"
+        );
         assert!(
             first_row.trim_start().starts_with('1'),
             "first agent row should be numbered 1: {first_row:?}"
@@ -7560,10 +7507,11 @@ mod tests {
     }
 
     #[test]
-    fn spaces_header_shows_jump_keyhint_when_switch_space_bound() {
-        // #114 part 2: the header advertises the quick-jump chord (collapsed to
-        // `N`) exactly when `switch_space` is bound — the same gate as the row
-        // ordinals, so affordance and numbers agree.
+    fn spaces_header_omits_jump_keyhint_even_when_switch_space_bound() {
+        // #299: the header used to advertise the quick-jump chord whenever
+        // `switch_space` was bound. It no longer does — the row ordinals carry
+        // the affordance, and the header columns are worth more than a chord
+        // restated directly above the numbers.
         let mut app = AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.ensure_test_terminals();
@@ -7576,8 +7524,8 @@ mod tests {
 
         let header_text = spaces_header_text(&app, 50);
         assert!(
-            header_text.contains("prefix+shift+N"),
-            "expected jump keyhint in {header_text:?}"
+            !header_text.contains("prefix+shift+N"),
+            "header must carry no chord keyhint: {header_text:?}"
         );
     }
 

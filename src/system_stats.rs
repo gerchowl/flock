@@ -25,10 +25,9 @@ pub struct SystemStats {
     /// Best-effort GPU utilization, 0..=100 (macOS IOAccelerator).
     pub gpu_percent: Option<u8>,
     /// Host-declared thermal health (#291), gossiped to the fleet and rendered
-    /// as a tint on the band's metric glyphs. Always `None` today: the wire,
-    /// relay and render paths land first, and the host-side reporter that
-    /// fills this in is the follow-up. Nothing here samples a sensor — the
-    /// host owns calibration, flock owns transport and colour.
+    /// as a tint on the band's metric glyphs. Filled from the node's own
+    /// `thermal_command` (#298) on a slow tick. Nothing here reads a sensor —
+    /// the host owns calibration, flock owns transport and colour.
     pub thermal: Option<crate::api::schema::ThermalReport>,
 }
 
@@ -42,6 +41,30 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 /// most. Deliberately shorter than the interval so a slow sample is dropped
 /// rather than overlapping the next one.
 const SAMPLER_EXEC_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Wall-clock bound on one thermal reporter run (#298). Longer than
+/// [`SAMPLER_EXEC_TIMEOUT`] because a reporter may legitimately shell out to
+/// `nvidia-smi`, which re-initialises NVML at ~200-800ms — but still well
+/// under the thermal cadence, so a slow reporter cannot overlap its own next
+/// run.
+const THERMAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sampler ticks between thermal reads (#298). Temperature moves slowly and a
+/// reporter forks a process — `nvidia-smi` alone re-initialises NVML at
+/// ~200-800ms — so it must NOT ride the 2s cadence the cheap in-process
+/// metrics use. 15 ticks ≈ 30s.
+const THERMAL_STRIDE: u32 = 15;
+
+/// Consecutive reporter failures before the WARN fires. A single failed read
+/// is usually transient (fork contention, a device wake); complaining at the
+/// first one would be noise.
+const THERMAL_FAILURES_BEFORE_WARN: u32 = 5;
+
+/// Ceiling on the backoff a failing reporter is pushed to, in sampler ticks.
+/// Never disabled permanently — `nvidia-smi` returns after a driver restart
+/// and `pmset` after a device wake, and a box that recovers should light back
+/// up without a flock restart.
+const THERMAL_MAX_BACKOFF_TICKS: u32 = 150;
 
 /// Resolve which path's volume the disk stat reports (#50): the configured
 /// `ui.disk_path` when set (any path — its containing mount is matched), else
@@ -61,6 +84,7 @@ pub(crate) fn resolve_disk_target(disk_path: Option<&str>) -> Option<std::path::
 pub fn spawn_sampler(
     event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     disk_path: Option<String>,
+    thermal_command: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("system-stats".into())
@@ -74,6 +98,8 @@ pub fn spawn_sampler(
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
 
             let mut disks = disks;
+            let mut thermal = ThermalSampler::new(thermal_command);
+            let mut tick: u32 = 0;
             loop {
                 system.refresh_cpu_usage();
                 system.refresh_memory();
@@ -103,6 +129,8 @@ pub fn spawn_sampler(
 
                 let (battery_percent, battery_charging) = read_battery();
                 let gpu_percent = read_gpu_percent();
+                let thermal_report = thermal.sample(tick);
+                tick = tick.wrapping_add(1);
 
                 let stats = SystemStats {
                     host: Some(crate::app::short_host_name()),
@@ -115,7 +143,7 @@ pub fn spawn_sampler(
                     net_rx_per_sec,
                     net_tx_per_sec,
                     gpu_percent,
-                    thermal: None,
+                    thermal: thermal_report,
                 };
                 if event_tx
                     .blocking_send(crate::events::AppEvent::SystemStatsUpdated(stats))
@@ -127,6 +155,117 @@ pub fn spawn_sampler(
             }
         })
         .expect("system stats sampler thread should spawn")
+}
+
+/// Runs the node's configured `thermal_command` on a slow tick and turns its
+/// stdout into a [`ThermalReport`](crate::api::schema::ThermalReport) (#298).
+///
+/// flock reads no sensors. The host declares what runs hot and how hot counts,
+/// because the answer differs per box — 90 °C is normal on Apple Silicon under
+/// load, an RTX 5090 is fine at 80 °C, and a microVM guest can read nothing at
+/// all. This type only runs the command, bounds it, and parses it.
+struct ThermalSampler {
+    command: Option<String>,
+    /// Last successful report, held for exactly one thermal tick after a
+    /// failure so a single fluke does not make a hot node's tint flicker off.
+    last: Option<crate::api::schema::ThermalReport>,
+    /// Thermal ticks a held value has survived. Past 1 the value is dropped.
+    held_ticks: u32,
+    /// Consecutive failures, for the WARN threshold and the backoff.
+    failures: u32,
+    /// Sampler ticks to skip before trying again — a failing reporter is
+    /// slowed down, never disabled.
+    backoff_ticks: u32,
+}
+
+impl ThermalSampler {
+    fn new(command: Option<String>) -> Self {
+        let command = command
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty());
+        Self {
+            command,
+            last: None,
+            held_ticks: 0,
+            failures: 0,
+            backoff_ticks: 0,
+        }
+    }
+
+    /// The value to publish on sampler tick `tick`. Between thermal ticks this
+    /// repeats the last reading rather than blanking it — the status line
+    /// samples every 2s and the reporter every ~30s.
+    fn sample(&mut self, tick: u32) -> Option<crate::api::schema::ThermalReport> {
+        self.command.as_ref()?;
+        if !tick.is_multiple_of(THERMAL_STRIDE) {
+            return self.last.clone();
+        }
+        if self.backoff_ticks > 0 {
+            self.backoff_ticks = self.backoff_ticks.saturating_sub(THERMAL_STRIDE);
+            return self.last.clone();
+        }
+        match self.run() {
+            Some(report) => {
+                self.failures = 0;
+                self.backoff_ticks = 0;
+                self.held_ticks = 0;
+                self.last = Some(report);
+            }
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures == THERMAL_FAILURES_BEFORE_WARN {
+                    tracing::warn!(
+                        failures = self.failures,
+                        "thermal_command keeps failing; backing off (node declares no thermal health)"
+                    );
+                }
+                // Grace: one thermal tick of the stale value, then nothing.
+                // Never synthesize a nominal reading from a failed read — that
+                // asserts health nobody observed, which is worst precisely
+                // when the node is critical and the tint is the whole point.
+                if self.last.is_some() && self.held_ticks == 0 {
+                    self.held_ticks = 1;
+                } else {
+                    self.last = None;
+                    self.held_ticks = 0;
+                }
+                if self.failures >= THERMAL_FAILURES_BEFORE_WARN {
+                    let grown = self.backoff_ticks.saturating_mul(2).max(THERMAL_STRIDE * 2);
+                    self.backoff_ticks = grown.min(THERMAL_MAX_BACKOFF_TICKS);
+                }
+            }
+        }
+        self.last.clone()
+    }
+
+    /// One bounded run. Every failure mode collapses to `None`: a node that
+    /// cannot measure declares nothing.
+    fn run(&self) -> Option<crate::api::schema::ThermalReport> {
+        let command = self.command.as_deref()?;
+        let output = crate::process::TracedCommand::new("sh", "stats")
+            .args(["-c", command])
+            .output_traced_with_timeout(THERMAL_TIMEOUT)
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_thermal_report(&output.stdout)
+    }
+}
+
+/// Parse a reporter's stdout: exactly one JSON object, nothing else.
+///
+/// JSON rather than a delimited line because labels legitimately carry spaces
+/// ("fans 45m"), and shell authors get quoting rules wrong. Sanitized here so
+/// the invariant travels with the value from the moment it enters the process.
+fn parse_thermal_report(stdout: &[u8]) -> Option<crate::api::schema::ThermalReport> {
+    let text = std::str::from_utf8(stdout).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<crate::api::schema::ThermalReport>(text)
+        .ok()
+        .map(crate::api::schema::ThermalReport::sanitized)
 }
 
 /// macOS: `pmset -g batt`. Other platforms: None (omitted from the line).
@@ -233,6 +372,127 @@ mod tests {
     fn gpu_parse_rejects_garbage() {
         assert_eq!(parse_gpu_utilization("no gpu here"), None);
         assert_eq!(parse_gpu_utilization("\"Device Utilization %\"=x"), None);
+    }
+
+    fn report(json: &str) -> Option<crate::api::schema::ThermalReport> {
+        parse_thermal_report(json.as_bytes())
+    }
+
+    #[test]
+    fn parses_a_reporter_json_line_and_sanitizes_it() {
+        use crate::api::schema::{ThermalComponent, THERMAL_LABEL_MAX_BYTES, THERMAL_SEVERITY_MAX};
+
+        let ok = report(r#"{"severity":2,"component":"gpu","label":"GPU 84"}"#).unwrap();
+        assert_eq!(ok.severity, 2);
+        assert_eq!(ok.component, ThermalComponent::Gpu);
+        assert_eq!(ok.label, "GPU 84");
+
+        // Trailing newline is what `printf`/`echo` actually emit.
+        assert!(report("{\"severity\":1,\"component\":\"cpu\"}\n").is_some());
+
+        // A broken reporter is clamped here, not trusted downstream.
+        let wild = report(r#"{"severity":99,"component":"cpu","label":"aaaaaaaaaaaaaaaaaaaaaaa"}"#)
+            .unwrap();
+        assert_eq!(wild.severity, THERMAL_SEVERITY_MAX);
+        assert_eq!(wild.label.len(), THERMAL_LABEL_MAX_BYTES);
+    }
+
+    #[test]
+    fn garbage_reporter_output_declares_nothing() {
+        // Fail closed on every shape of nonsense. Never a synthesized nominal:
+        // asserting health nobody measured is worst exactly when the node is
+        // critical and the tint is the whole point.
+        assert!(report("").is_none());
+        assert!(report("   \n").is_none());
+        assert!(report("72°C").is_none());
+        assert!(report("{").is_none());
+        assert!(
+            report(r#"{"component":"cpu"}"#).is_none(),
+            "severity required"
+        );
+        assert!(
+            report(r#"{"severity":2,"component":"toaster"}"#).is_none(),
+            "unknown component must not parse"
+        );
+        assert!(
+            parse_thermal_report(&[0xff, 0xfe]).is_none(),
+            "invalid utf-8"
+        );
+    }
+
+    #[test]
+    fn no_configured_command_never_declares_anything() {
+        let mut sampler = ThermalSampler::new(None);
+        for tick in 0..40 {
+            assert!(sampler.sample(tick).is_none());
+        }
+        // Whitespace-only is treated as unset, like `ui.disk_path`.
+        let mut blank = ThermalSampler::new(Some("   ".into()));
+        assert!(blank.sample(0).is_none());
+        assert!(blank.command.is_none());
+    }
+
+    #[test]
+    fn reporter_runs_on_the_slow_tick_and_repeats_between() {
+        // The status line samples every 2s; forking a reporter that often is
+        // exactly what the stride exists to prevent.
+        let mut sampler = ThermalSampler::new(Some(
+            r#"printf '{"severity":3,"component":"cpu","label":"hot"}'"#.into(),
+        ));
+        let first = sampler.sample(0).expect("stride tick reads");
+        assert_eq!(first.severity, 3);
+        for tick in 1..THERMAL_STRIDE {
+            assert_eq!(
+                sampler.sample(tick).map(|r| r.severity),
+                Some(3),
+                "between strides the last reading repeats"
+            );
+        }
+        assert!(sampler.sample(THERMAL_STRIDE).is_some());
+    }
+
+    #[test]
+    fn a_failing_reporter_holds_one_tick_then_declares_nothing() {
+        let mut sampler = ThermalSampler::new(Some("exit 1".into()));
+        // Seed a good reading, as if the box was healthy a moment ago.
+        sampler.last = Some(crate::api::schema::ThermalReport {
+            severity: 3,
+            component: crate::api::schema::ThermalComponent::Cpu,
+            label: "hot".into(),
+        });
+
+        // One thermal tick of grace: a single fluke must not flicker the tint
+        // off a genuinely hot box.
+        assert!(sampler.sample(0).is_some(), "first failure holds the value");
+        // Then it goes, rather than lingering as an unobserved claim.
+        assert!(
+            sampler.sample(THERMAL_STRIDE).is_none(),
+            "a stale reading must not outlive its grace tick"
+        );
+        assert_eq!(sampler.failures, 2);
+    }
+
+    #[test]
+    fn a_persistently_failing_reporter_backs_off_but_is_never_disabled() {
+        let mut sampler = ThermalSampler::new(Some("exit 1".into()));
+        let mut tick = 0u32;
+        for _ in 0..THERMAL_FAILURES_BEFORE_WARN {
+            sampler.sample(tick);
+            tick = tick.wrapping_add(THERMAL_STRIDE);
+        }
+        assert!(sampler.backoff_ticks > 0, "should have backed off");
+        assert!(
+            sampler.backoff_ticks <= THERMAL_MAX_BACKOFF_TICKS,
+            "backoff is capped so a recovered box lights up again without a restart"
+        );
+
+        // A reporter that starts working again clears the backoff — drivers
+        // restart, devices wake.
+        sampler.command = Some(r#"printf '{"severity":1,"component":"cpu"}'"#.into());
+        sampler.backoff_ticks = 0;
+        assert!(sampler.sample(tick).is_some());
+        assert_eq!(sampler.failures, 0);
+        assert_eq!(sampler.backoff_ticks, 0);
     }
 
     #[test]

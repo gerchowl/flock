@@ -424,6 +424,20 @@ pub struct Config {
     /// to a glyph via a static registry on the RENDERING side, so only an ASCII
     /// name crosses the wire; an unknown name renders no icon. `None` = no icon.
     pub icon: Option<String>,
+    /// Command THIS node runs to declare its own thermal health (#298), the
+    /// dynamic sibling of [`icon`](Self::icon). Run on a slow tick (NOT the 2s
+    /// sampler cadence) with a hard timeout; stdout must be one JSON object
+    /// matching `ThermalReport` (`{"severity":2,"component":"gpu",
+    /// "label":"GPU 84"}`). Anything else — missing binary, non-zero exit,
+    /// unparseable output, timeout — declares NOTHING rather than a
+    /// synthesized nominal reading. `None` = this node declares no thermal
+    /// health, which is the honest answer inside a microVM.
+    ///
+    /// flock deliberately reads no sensors itself: what runs hot and what
+    /// "hot" means differ per box (90 °C is normal on Apple Silicon under
+    /// load; an RTX 5090 is fine at 80 °C), so calibration lives with the
+    /// host. Reporters must not read stdin — it is nulled.
+    pub thermal_command: Option<String>,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
@@ -1250,7 +1264,16 @@ impl Default for UiConfig {
         Self {
             sidebar_width: 26,
             sidebar_min_width: 18,
-            sidebar_max_width: 36,
+            // #299: the ceiling on a drag, raised from 36. The servers band
+            // tops out near 32 columns and truncated at anything narrower, and
+            // #291 pushed peer rows into the same squeeze by gossiping GPU.
+            // 80 clears the band with room left for workspace and branch
+            // names. Terminals at or below `mobile_width_threshold` never
+            // render a sidebar at all, and the main pane holds a
+            // `Constraint::Min(1)` floor, so a wide drag degrades rather than
+            // breaking layout. `sidebar_width` stays 26 on purpose — widening
+            // what is ALLOWED must not relayout every existing screen.
+            sidebar_max_width: 80,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             sidebar_row_gap: DEFAULT_SIDEBAR_ROW_GAP,
             sidebar_pane_gap: DEFAULT_SIDEBAR_PANE_GAP,
@@ -1731,7 +1754,7 @@ cjk_ime_agents = ["claude", "codex"]
     fn sidebar_bounds_default_and_parse() {
         let default_config = Config::default();
         assert_eq!(default_config.ui.sidebar_min_width, 18);
-        assert_eq!(default_config.ui.sidebar_max_width, 36);
+        assert_eq!(default_config.ui.sidebar_max_width, 80);
         assert_eq!(
             default_config.ui.mobile_width_threshold,
             DEFAULT_MOBILE_WIDTH_THRESHOLD
