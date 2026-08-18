@@ -381,6 +381,11 @@ fn system_summary(stats: &crate::system_stats::SystemStats) -> PeerSystemSummary
         mem_used: stats.mem_used,
         mem_total: stats.mem_total,
         disk_free: stats.disk_free,
+        // #291: the sampler has read GPU utilization since the status line
+        // shipped; until this bump it stopped at the box, so every viewer saw
+        // a blank GPU column on every row but its own.
+        gpu_percent: stats.gpu_percent,
+        thermal: stats.thermal.clone(),
     }
 }
 

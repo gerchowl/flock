@@ -77,6 +77,21 @@ use serde::{Deserialize, Serialize};
 /// `ClientMessage` (existing variant indices unchanged on the positional
 /// wire); folded into the still-unreleased v25 rather than taking a number of
 /// its own, since the released protocol is older than the source's.
+///
+/// v25 also carries `FleetSystem.gpu_percent` and `FleetSystem.thermal` (#291),
+/// folded in on the same reasoning as `FocusWorkspace` above: v25 landed on
+/// main 2026-08-03 and the newest release of any kind predates it by six weeks,
+/// so no shipped artifact has ever spoken v25 and there is nothing to stay
+/// compatible with. Two additions because they are the same gap seen twice —
+/// GPU utilization had been sampled locally since the status line shipped but
+/// had no wire field, so every peer row rendered a blank GPU column while the
+/// self row showed a number, and a thermal tint on the GPU glyph would have
+/// coloured that blank. `thermal` is a node's SELF-DECLARED health ordinal
+/// (0 nominal .. 3 critical) plus the glyph it applies to; flock ships no
+/// temperature thresholds, because 90 °C is normal on Apple Silicon under load
+/// and an RTX 5090 is fine at 80 °C — the host owns calibration, flock owns
+/// transport and colour. Additive with `#[serde(default)]`, but the positional
+/// bincode shape still changed, so the pinned golden below moves with it.
 pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Refusal notice sent to clients while a live update handoff is in
@@ -223,6 +238,44 @@ pub struct FleetSystem {
     pub mem_used: Option<u64>,
     pub mem_total: Option<u64>,
     pub disk_free: Option<u64>,
+    /// v26 (#291): GPU utilization, 0..=100. Sampled locally long before it
+    /// had a wire field — see the changelog note on [`PROTOCOL_VERSION`].
+    #[serde(default)]
+    pub gpu_percent: Option<u8>,
+    /// v26 (#291): the node's self-declared thermal health.
+    #[serde(default)]
+    pub thermal: Option<FleetThermal>,
+}
+
+/// Bincode-safe mirror of `api::schema::ThermalReport` (#291) — the schema type
+/// carries `skip_serializing_if` on its label, which a non-self-describing
+/// format cannot round-trip. The component enum has no such attribute and so
+/// rides the wire directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetThermal {
+    pub severity: u8,
+    pub component: crate::api::schema::ThermalComponent,
+    pub label: String,
+}
+
+impl From<crate::api::schema::ThermalReport> for FleetThermal {
+    fn from(thermal: crate::api::schema::ThermalReport) -> Self {
+        Self {
+            severity: thermal.severity,
+            component: thermal.component,
+            label: thermal.label,
+        }
+    }
+}
+
+impl From<FleetThermal> for crate::api::schema::ThermalReport {
+    fn from(thermal: FleetThermal) -> Self {
+        Self {
+            severity: thermal.severity,
+            component: thermal.component,
+            label: thermal.label,
+        }
+    }
 }
 
 impl From<crate::api::schema::PeerSystemSummary> for FleetSystem {
@@ -232,6 +285,8 @@ impl From<crate::api::schema::PeerSystemSummary> for FleetSystem {
             mem_used: system.mem_used,
             mem_total: system.mem_total,
             disk_free: system.disk_free,
+            gpu_percent: system.gpu_percent,
+            thermal: system.thermal.map(Into::into),
         }
     }
 }
@@ -243,7 +298,12 @@ impl From<FleetSystem> for crate::api::schema::PeerSystemSummary {
             mem_used: system.mem_used,
             mem_total: system.mem_total,
             disk_free: system.disk_free,
+            gpu_percent: system.gpu_percent,
+            thermal: system.thermal.map(Into::into),
         }
+        // Inbound from the bincode wire: normalize before the value can reach
+        // a render pass. The JSON `peers.summary` parse sanitizes separately.
+        .sanitized()
     }
 }
 
@@ -1143,6 +1203,15 @@ mod tests {
                     mem_used: Some(13 << 30),
                     mem_total: Some(16 << 30),
                     disk_free: None,
+                    // v26 (#291): populated on purpose — a golden of `None`
+                    // would pin the absence, not the shape of the fields the
+                    // bump exists for.
+                    gpu_percent: Some(97),
+                    thermal: Some(FleetThermal {
+                        severity: 3,
+                        component: crate::api::schema::ThermalComponent::Gpu,
+                        label: "GPU 84".to_owned(),
+                    }),
                 }),
                 latency_ms: Some(34),
                 workspaces: vec![FleetWorkspace {
@@ -1178,6 +1247,10 @@ mod tests {
                     mem_used: Some(8 << 30),
                     mem_total: Some(16 << 30),
                     disk_free: Some(200 << 30),
+                    // The other half of the v26 golden: a node that declares
+                    // no GPU and no thermal, which is every microVM.
+                    gpu_percent: None,
+                    thermal: None,
                 }),
                 latency_ms: None,
                 workspaces: vec![FleetWorkspace {
@@ -1970,7 +2043,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x44513fbb2aa1e54e),
+            ("SwitchServer", 0x2d3af25d23eaadf5),
         ];
 
         if actual.as_slice() != GOLDEN {

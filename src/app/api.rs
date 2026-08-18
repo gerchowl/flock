@@ -1435,6 +1435,8 @@ mod tests {
                         mem_used: Some(48_000_000_000),
                         mem_total: Some(64_000_000_000),
                         disk_free: Some(200_000_000_000),
+                        gpu_percent: None,
+                        thermal: None,
                     }),
                     latency_ms: 34,
                     workspaces: vec![crate::api::schema::PeerWorkspaceSummary {
@@ -1522,6 +1524,8 @@ mod tests {
                 mem_used: None,
                 mem_total: None,
                 disk_free: None,
+                gpu_percent: None,
+                thermal: None,
             })
         };
         let fetch = |system: Option<crate::api::schema::PeerSystemSummary>,

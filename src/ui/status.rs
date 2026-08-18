@@ -353,12 +353,36 @@ pub(super) fn utilization_style(percent: f32, p: &Palette) -> Style {
     }
 }
 
+/// Thermal tint for a metric glyph (#291): the colour a node's SELF-DECLARED
+/// severity rank paints its glyph. `None` below
+/// [`THERMAL_TINT_MIN_SEVERITY`](crate::api::schema::THERMAL_TINT_MIN_SEVERITY)
+/// — a nominal or merely warm fleet renders byte-identically to a fleet that
+/// declares nothing, so the one box in trouble still stands out.
+///
+/// Ranks, not degrees: flock holds no temperature thresholds, since 90 °C is
+/// normal on Apple Silicon under load and an RTX 5090 is fine at 80 °C. Shares
+/// the colour language of [`utilization_style`] so heat and load read alike.
+pub(super) fn thermal_style(severity: u8, p: &Palette) -> Option<Style> {
+    if severity >= crate::api::schema::THERMAL_SEVERITY_MAX {
+        Some(Style::default().fg(p.red))
+    } else if severity >= crate::api::schema::THERMAL_TINT_MIN_SEVERITY {
+        Some(Style::default().fg(p.yellow))
+    } else {
+        None
+    }
+}
+
 /// Append one `label value` metric, separated from any prior spans by `sep`.
-/// The label renders dim; the value carries the caller's style.
+/// `label_style` colours the glyph — dim for every metric that carries no
+/// thermal declaration, tinted when one does (#291). The value carries
+/// `style`, so glyph and value are independent channels: a red glyph beside a
+/// green ` 4%` is a box that is hot while idle, which is cooling failure and
+/// the one state no load metric can show.
 fn push_metric_with_sep(
     spans: &mut Vec<Span<'static>>,
     sep: &str,
     label: &str,
+    label_style: Style,
     value: String,
     style: Style,
     p: &Palette,
@@ -367,7 +391,7 @@ fn push_metric_with_sep(
     if !spans.is_empty() {
         spans.push(Span::styled(sep.to_string(), dim));
     }
-    spans.push(Span::styled(format!("{label} "), dim));
+    spans.push(Span::styled(format!("{label} "), label_style));
     spans.push(Span::styled(value, style));
 }
 
@@ -380,7 +404,8 @@ pub(super) fn push_metric(
     style: Style,
     p: &Palette,
 ) {
-    push_metric_with_sep(spans, " \u{b7} ", label, value, style, p);
+    let dim = Style::default().fg(p.overlay0);
+    push_metric_with_sep(spans, " \u{b7} ", label, dim, value, style, p);
 }
 
 /// The servers-band variant of [`push_metric`]: single-space separated —
@@ -392,7 +417,23 @@ pub(super) fn push_band_metric(
     style: Style,
     p: &Palette,
 ) {
-    push_metric_with_sep(spans, " ", label, value, style, p);
+    let dim = Style::default().fg(p.overlay0);
+    push_metric_with_sep(spans, " ", label, dim, value, style, p);
+}
+
+/// [`push_band_metric`] with a thermally tinted glyph (#291). `tint` of `None`
+/// is byte-identical to [`push_band_metric`] — the band spends no columns and
+/// no colour on a node that is not in trouble.
+pub(super) fn push_band_metric_tinted(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    tint: Option<Style>,
+    value: String,
+    style: Style,
+    p: &Palette,
+) {
+    let glyph = tint.unwrap_or_else(|| Style::default().fg(p.overlay0));
+    push_metric_with_sep(spans, " ", label, glyph, value, style, p);
 }
 
 /// CPU/GPU value in the band's fixed-width discipline: right-aligned

@@ -24,6 +24,12 @@ pub struct SystemStats {
     pub net_tx_per_sec: Option<u64>,
     /// Best-effort GPU utilization, 0..=100 (macOS IOAccelerator).
     pub gpu_percent: Option<u8>,
+    /// Host-declared thermal health (#291), gossiped to the fleet and rendered
+    /// as a tint on the band's metric glyphs. Always `None` today: the wire,
+    /// relay and render paths land first, and the host-side reporter that
+    /// fills this in is the follow-up. Nothing here samples a sensor — the
+    /// host owns calibration, flock owns transport and colour.
+    pub thermal: Option<crate::api::schema::ThermalReport>,
 }
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
@@ -109,6 +115,7 @@ pub fn spawn_sampler(
                     net_rx_per_sec,
                     net_tx_per_sec,
                     gpu_percent,
+                    thermal: None,
                 };
                 if event_tx
                     .blocking_send(crate::events::AppEvent::SystemStatsUpdated(stats))
