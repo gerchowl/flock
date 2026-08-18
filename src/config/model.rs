@@ -95,6 +95,34 @@ impl PanelScopeConfig {
     }
 }
 
+/// Scope of the agents sidebar panel. Extends the servers/spaces
+/// `PanelScopeConfig` pair with agent-state filters: besides "all" and
+/// "current" (the focused workspace), the panel can narrow to the agents that
+/// actually want attention — blocked, done (idle with unseen output), or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelScopeConfig {
+    Current,
+    #[default]
+    All,
+    Blocked,
+    Done,
+    #[serde(rename = "blocked&done")]
+    BlockedAndDone,
+}
+
+impl AgentPanelScopeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::All => "all",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::BlockedAndDone => "blocked&done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
@@ -938,8 +966,9 @@ pub struct UiConfig {
     pub tab_mode: TabModeConfig,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
-    /// Agent sidebar scope. Saved values are "current" or "all". Default: "all".
-    pub agent_panel_scope: PanelScopeConfig,
+    /// Agent sidebar scope. Saved values are "all", "current", "blocked",
+    /// "done", or "blocked&done". Default: "all".
+    pub agent_panel_scope: AgentPanelScopeConfig,
     /// Servers sidebar scope: "all" shows every server row (home/self/
     /// snapshot/config peers), "current" only the current machine (plus the
     /// home row when attached remotely). Default: "all".
@@ -1267,7 +1296,7 @@ impl Default for UiConfig {
             prompt_new_tab_name: true,
             tab_mode: TabModeConfig::default(),
             show_agent_labels_on_pane_borders: false,
-            agent_panel_scope: PanelScopeConfig::All,
+            agent_panel_scope: AgentPanelScopeConfig::All,
             servers_panel_scope: PanelScopeConfig::All,
             spaces_panel_scope: PanelScopeConfig::All,
             server_state_mark: ServerStateMarkConfig::default(),
@@ -1604,7 +1633,24 @@ resume_agents_on_restore = false
 agent_panel_scope = "all"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.ui.agent_panel_scope, PanelScopeConfig::All);
+        assert_eq!(config.ui.agent_panel_scope, AgentPanelScopeConfig::All);
+    }
+
+    #[test]
+    fn agent_panel_scope_config_parses_state_filters() {
+        for (value, expected) in [
+            ("current", AgentPanelScopeConfig::Current),
+            ("all", AgentPanelScopeConfig::All),
+            ("blocked", AgentPanelScopeConfig::Blocked),
+            ("done", AgentPanelScopeConfig::Done),
+            ("blocked&done", AgentPanelScopeConfig::BlockedAndDone),
+        ] {
+            let toml = format!("[ui]\nagent_panel_scope = \"{value}\"\n");
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.ui.agent_panel_scope, expected, "parsing {value:?}");
+            // The writer spells it back exactly as the parser reads it.
+            assert_eq!(expected.as_str(), value);
+        }
     }
 
     #[test]

@@ -360,6 +360,11 @@ impl App {
                 .workspaces
                 .iter()
                 .any(|ws| ws.has_working_pane(&self.state.terminals)),
+            // The state filters keep only blocked/done rows — a working pane
+            // is never listed, so there is no spinner to animate.
+            crate::app::state::AgentPanelScope::Blocked
+            | crate::app::state::AgentPanelScope::Done
+            | crate::app::state::AgentPanelScope::BlockedAndDone => false,
         }
     }
 

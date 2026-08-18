@@ -4,9 +4,8 @@ use ratatui::layout::{Direction, Rect};
 
 use crate::{
     app::state::{
-        AgentPanelScope, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget, MenuListState, Mode,
+        RightClickPassthroughGesture, TabPressState, ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -796,10 +795,8 @@ impl AppState {
                     }
 
                     if self.on_agent_panel_scope_toggle(mouse.column, mouse.row) {
-                        let next = match self.agent_panel_scope() {
-                            AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
-                            AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
-                        };
+                        // all → current → blocked → done → blocked&done → all
+                        let next = self.agent_panel_scope().cycled();
                         self.set_agent_panel_scope(next);
                         self.agent_panel_scroll = 0;
                         self.mark_session_dirty();

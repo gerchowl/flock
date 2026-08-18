@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_agent_panel_toggle_switches_scope() {
+    fn clicking_agent_panel_toggle_cycles_scope() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -978,15 +978,24 @@ mod tests {
             AgentPanelScope::CurrentWorkspace
         );
 
-        // The whole ` agents` header row toggles too (#41) — the title word
-        // sits one row below the section divider.
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            detail_area.x + 1,
-            detail_area.y + 1,
-        ));
+        // The whole ` agents` header row cycles too (#41) — the title word
+        // sits one row below the section divider — and the cycle runs
+        // all → current → blocked → done → blocked&done → all.
+        for expected in [
+            AgentPanelScope::Blocked,
+            AgentPanelScope::Done,
+            AgentPanelScope::BlockedAndDone,
+            AgentPanelScope::AllWorkspaces,
+        ] {
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                detail_area.x + 1,
+                detail_area.y + 1,
+            ));
+            assert_eq!(app.state.agent_panel_scope(), expected);
+        }
         assert_eq!(
-            app.state.agent_panel_scope(),
+            capture_snapshot(&app.state).agent_panel_scope,
             AgentPanelScope::AllWorkspaces
         );
 
