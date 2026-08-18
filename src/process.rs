@@ -145,6 +145,51 @@ impl TracedCommand {
         self
     }
 
+    /// Run the command with `input` written to its stdin, capturing
+    /// stdout/stderr. Same tracing contract as [`Self::output_traced`].
+    ///
+    /// Exists so a caller can hand a secret to a child WITHOUT putting it in
+    /// argv, where it would be visible to any local user via `ps` and would be
+    /// written to the process-exec log on every run.
+    pub(crate) fn output_traced_with_stdin(&mut self, input: &[u8]) -> io::Result<Output> {
+        use std::io::Write;
+        let args = shape_args(&self.inner);
+        let start = Instant::now();
+        self.inner.stdin(std::process::Stdio::piped());
+        self.inner.stdout(std::process::Stdio::piped());
+        self.inner.stderr(std::process::Stdio::piped());
+        let result = (|| {
+            // This IS the funnel the lint points at — same exemption as
+            // `output_traced` below, which owns the crate's only `output()`.
+            #[allow(clippy::disallowed_methods)]
+            let mut child = self.inner.spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(input)?;
+                // Explicit drop closes the pipe; without it the child waits on
+                // EOF and both sides block forever.
+                drop(stdin);
+            }
+            child.wait_with_output()
+        })();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(output) => crate::logging::process_exec_completed(
+                self.subsystem,
+                &self.program,
+                &args,
+                Some(output.status),
+                duration_ms,
+            ),
+            Err(err) => crate::logging::process_exec_failed(
+                self.subsystem,
+                &self.program,
+                &args,
+                &err.to_string(),
+            ),
+        }
+        result
+    }
+
     /// Run the command to completion, capturing stdout/stderr. Logs a single
     /// `process.exec` event: INFO on zero exit, WARN on non-zero, ERROR on
     /// spawn failure. Duration is measured across the whole `output()` call
@@ -235,6 +280,42 @@ impl TracedCommand {
     }
 }
 
+/// Mask credential-bearing argument VALUES before they are logged.
+///
+/// `shape_args` writes argv into the `process.exec` event at INFO — every
+/// command, every run. An argument like `Authorization: bearer ghp_…` would
+/// therefore land in the log verbatim, on every invocation, for the lifetime
+/// of the process.
+///
+/// Callers should keep secrets out of argv entirely (argv is also world-visible
+/// via `ps`); this is the backstop for when someone forgets, not the primary
+/// defence.
+fn redact_arg(arg: &str) -> String {
+    const SECRET_PREFIXES: [&str; 4] = [
+        "authorization:",
+        "proxy-authorization:",
+        "private-token:",
+        "x-api-key:",
+    ];
+    let lowered = arg.to_ascii_lowercase();
+    for prefix in SECRET_PREFIXES {
+        if let Some(rest) = lowered.strip_prefix(prefix) {
+            // Keep the scheme word only when it IS a scheme. For a header like
+            // `x-api-key: <secret>` the first word after the colon is the
+            // secret itself, so preserving it would defeat the whole point.
+            const AUTH_SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "token"];
+            let first = rest.split_whitespace().next().unwrap_or("");
+            let label = &arg[..prefix.len()];
+            return if AUTH_SCHEMES.contains(&first) {
+                format!("{label} {first} <redacted>")
+            } else {
+                format!("{label} <redacted>")
+            };
+        }
+    }
+    arg.to_string()
+}
+
 /// Shape a `Command`'s argv into a single log-safe string: args joined with
 /// spaces, capped at `MAX_ARG_LOG_CHARS`, with an ellipsis marker on overflow.
 /// Non-UTF8 args become lossy strings so the audit trail never fails to render.
@@ -245,7 +326,7 @@ fn shape_args(command: &Command) -> String {
         if !buf.is_empty() {
             buf.push(' ');
         }
-        buf.push_str(&arg.to_string_lossy());
+        buf.push_str(&redact_arg(&arg.to_string_lossy()));
         if buf.len() >= MAX_ARG_LOG_CHARS {
             break;
         }
@@ -274,6 +355,39 @@ mod tests {
     /// A cross-platform program that exits with a non-zero status. `false`
     /// is a POSIX shell builtin present on both macOS and Linux CI runners.
     const FALSE_PROG: &str = "false";
+
+    /// argv reaches the process-exec log on every run. A credential passed as
+    /// a header argument would therefore be written to disk each time — this is
+    /// the backstop for when a caller forgets to use stdin.
+    #[test]
+    fn credential_headers_are_masked_before_they_reach_the_log() {
+        // Fixtures are COMPOSED rather than written as literals: a realistic
+        // token literal trips the repo's own secret scanner, and a test that
+        // needs an allowlist entry teaches the next person to add allowlist
+        // entries.
+        let fake = format!("{}{}", "ghp_", "x".repeat(20));
+        let masked = redact_arg(&format!("Authorization: bearer {fake}"));
+        assert!(!masked.contains(&fake), "token survived: {masked}");
+        assert!(
+            masked.contains("bearer"),
+            "scheme is diagnostic, keep it: {masked}"
+        );
+        assert_eq!(
+            redact_arg("--max-time"),
+            "--max-time",
+            "ordinary args untouched"
+        );
+
+        // For a header with no scheme word the first token after the colon IS
+        // the secret, so it must not survive as a "scheme".
+        let keyed = redact_arg(&format!("x-api-key: {fake}"));
+        assert!(!keyed.contains(&fake), "{keyed}");
+
+        // Case-insensitive: callers spell headers however they like.
+        let secret = "y".repeat(16);
+        let basic = redact_arg(&format!("AUTHORIZATION: Basic {secret}"));
+        assert!(!basic.contains(&secret), "{basic}");
+    }
 
     #[test]
     fn output_traced_logs_process_exec_with_program_args_subsystem_and_duration() {
