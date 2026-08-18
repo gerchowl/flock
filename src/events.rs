@@ -73,6 +73,9 @@ pub enum AppEvent {
     SystemStatsUpdated(crate::system_stats::SystemStats),
     /// The slow PR-state poll interval elapsed; collect targets and query gh.
     PrStatePollDue,
+    /// One issue-guard fetch round, completed off-loop (#302). Per-repo results
+    /// so one unreachable repo cannot discard the others.
+    IssueGuardFetched(Vec<(String, Result<Vec<crate::checks::GhIssue>, String>)>),
     /// Background gh results: per-workspace PR state for worktree branches.
     /// Outcome of one batched PR-poll round (#294). `Err` is a ROUND failure
     /// (no token, transport down, GraphQL error) and must not be confused with

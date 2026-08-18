@@ -3800,6 +3800,8 @@ impl AppState {
             // match runs in either loop.
             AppEvent::PrStatePollDue
             | AppEvent::PrStatesUpdated(_)
+            // Applied at the App layer, which owns the issue-guard dedupe state.
+            | AppEvent::IssueGuardFetched(_)
             | AppEvent::PeerPollDue
             | AppEvent::PeerSummaryFetched(_)
             // Cross-machine checkout (#125) legs are handled at the App layer
