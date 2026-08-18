@@ -42,6 +42,12 @@ pub(crate) struct AgentPanelEntry {
     /// `<server> <proj> <workspace|branch>`. `server` is the local host for
     /// local panes, the peer host for remote ones.
     pub server: String,
+    /// The owning server's self-declared icon NAME (#164, #303) — this node's
+    /// configured icon for local rows, the gossiped one for remote rows.
+    /// Resolved to a glyph at render time by
+    /// [`server_field_label`](super::grammar::server_field_label), so an
+    /// unknown name renders as the plain hostname rather than raw text.
+    pub icon: Option<String>,
     pub project: Option<String>,
     pub target: String,
     /// #102: the workspace's frozen `sort_family_key` (local rows) or a
@@ -238,6 +244,9 @@ fn agent_panel_entries_with_runtimes(
     };
 
     let local_server = super::grammar::local_server_name();
+    // #164: this node's own icon, resolved at render exactly like the band's
+    // self row resolves it — the panel and the band name us the same way.
+    let local_icon = crate::app::configured_node_icon();
     match app.agent_panel_scope() {
         AgentPanelScope::CurrentWorkspace => {
             // The server filter outranks the scope toggle (#80): narrowed to a
@@ -274,6 +283,7 @@ fn agent_panel_entries_with_runtimes(
                     state_labels: detail.state_labels,
                     header_fields: detail.header_fields,
                     server: local_server.clone(),
+                    icon: local_icon.clone(),
                     project: project.clone(),
                     target: target.clone(),
                     sort_family_key: sort_family_key.clone(),
@@ -301,6 +311,7 @@ fn agent_panel_entries_with_runtimes(
                     let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
                     let sort_family_key = ws.sort_family_key();
                     let server = local_server.clone();
+                    let icon = local_icon.clone();
                     ws.pane_details(&app.terminals)
                         .into_iter()
                         .map(move |detail| AgentPanelEntry {
@@ -316,6 +327,7 @@ fn agent_panel_entries_with_runtimes(
                             state_labels: detail.state_labels,
                             header_fields: detail.header_fields,
                             server: server.clone(),
+                            icon: icon.clone(),
                             project: project.clone(),
                             target: target.clone(),
                             sort_family_key: sort_family_key.clone(),
@@ -385,6 +397,9 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     let mut entries = Vec::new();
     for (peer_ref, peer) in app.visible_remote_peers() {
         let server = peer.display_name().to_string();
+        // #164: the peer's gossiped icon — the same value the servers band
+        // renders for this host.
+        let icon = peer.icon.clone();
         for (ws_idx, summary) in peer.workspaces.iter().enumerate() {
             // Only workspaces actually running an agent surface here.
             let Some(agent) = summary.agent.as_deref() else {
@@ -405,6 +420,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                 state_labels: std::collections::HashMap::new(),
                 header_fields: Vec::new(),
                 server: server.clone(),
+                icon: icon.clone(),
                 project: summary
                     .project_key
                     .as_deref()
@@ -1942,6 +1958,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         .map(|(_, _, build)| spans_display_width(&build.name))
         .max()
         .unwrap_or(0);
+    let name_gutter = band_name_gutter(app.server_label);
     for (rect, is_current, build) in prepared {
         if is_current {
             let buf = frame.buffer_mut();
@@ -1960,7 +1977,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
             ratatui::style::Color::Reset
         };
         let rows = match configured_medallion_style(app) {
-            None => name_first_band_row(build, name_width, digit_width, p),
+            None => name_first_band_row(build, name_width, digit_width, name_gutter, p),
             Some(style) => {
                 let ServerRowBuild {
                     name,
@@ -2031,6 +2048,20 @@ struct ServerRowBuild {
     ghosted: bool,
 }
 
+/// Columns between the name field and the count columns, by how the viewer
+/// identifies a server (#303). In `both`/`name` the field ends in a hostname
+/// and one column separates it from the digits plainly enough; in `icon` the
+/// whole field collapses to a single symbol, and one column makes it read as
+/// the head of the state list rather than as the row's identity. Widened only
+/// there — the band already truncates its metrics at the default sidebar width
+/// (#299), so the extra column is spent where it buys something.
+fn band_name_gutter(mode: crate::config::ServerLabelConfig) -> usize {
+    match mode {
+        crate::config::ServerLabelConfig::Icon => 2,
+        crate::config::ServerLabelConfig::Both | crate::config::ServerLabelConfig::Name => 1,
+    }
+}
+
 /// Assemble a band row in the default counts mode, name first:
 /// `<name+marker> <r y g counts> <rest>` over the flush-left health line.
 /// The name field pads to the band-wide max display width so the count
@@ -2040,6 +2071,7 @@ fn name_first_band_row(
     build: ServerRowBuild,
     name_width: usize,
     digit_width: usize,
+    gutter: usize,
     p: &Palette,
 ) -> [Line<'static>; 2] {
     let ServerRowBuild {
@@ -2049,7 +2081,7 @@ fn name_first_band_row(
         tally,
         ghosted,
     } = build;
-    let pad = name_width.saturating_sub(spans_display_width(&name)) + 1;
+    let pad = name_width.saturating_sub(spans_display_width(&name)) + gutter;
     name.push(Span::styled(" ".repeat(pad), Style::default()));
     if let Some(tally) = tally {
         name.extend(leading_count_spans(&tally, digit_width, ghosted, p));
@@ -3096,8 +3128,16 @@ fn render_agent_detail(
         let prefix_cols =
             jump_cols + 4 + agent_code.chars().count() + usize::from(!agent_code.is_empty());
         let location_budget = (body.width as usize).saturating_sub(prefix_cols);
-        let location = super::grammar::agent_location_label(
+        // #303: the server segment follows the viewer's `server_label` mode,
+        // so the panel names a server exactly as the band and the spaces list
+        // do — the glyph in `icon` mode, `<glyph> <host>` in `both`.
+        let server_field = super::grammar::server_field_label(
+            app.server_label,
+            detail.icon.as_deref(),
             &detail.server,
+        );
+        let location = super::grammar::agent_location_label(
+            &server_field,
             detail.project.as_deref(),
             &detail.target,
             location_budget,
@@ -5233,6 +5273,48 @@ mod tests {
     }
 
     #[test]
+    fn servers_band_widens_the_symbol_gutter_in_icon_mode() {
+        use crate::config::ServerLabelConfig;
+        // #303: in `icon` mode the name field IS a single symbol, so one
+        // column makes it read as the head of the state list. Two columns
+        // there, one everywhere else (the hostname already separates identity
+        // from digits, and the band has no columns to spare — #299).
+        assert_eq!(band_name_gutter(ServerLabelConfig::Icon), 2);
+        assert_eq!(band_name_gutter(ServerLabelConfig::Both), 1);
+        assert_eq!(band_name_gutter(ServerLabelConfig::Name), 1);
+
+        let app = crate::app::state::AppState::test_new();
+        let p = &app.palette;
+        let glyph = crate::server_icons::glyph("toad").unwrap();
+        let build = || ServerRowBuild {
+            name: vec![Span::raw(glyph.to_string())],
+            title_rest: Vec::new(),
+            health: Line::from(""),
+            tally: Some(tally_states([StateClass::Blocked])),
+            ghosted: false,
+        };
+        let title_text = |gutter: usize| -> String {
+            let [title, _] = name_first_band_row(build(), 1, 1, gutter, p);
+            title
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            title_text(band_name_gutter(ServerLabelConfig::Icon)),
+            format!("{glyph}  1 0 0 0 "),
+            "icon mode: two columns between the symbol and the blocked count"
+        );
+        assert_eq!(
+            title_text(band_name_gutter(ServerLabelConfig::Both)),
+            format!("{glyph} 1 0 0 0 "),
+            "both/name mode keeps the single-column gutter"
+        );
+    }
+
+    #[test]
     fn servers_band_rows_lead_with_name_then_counts() {
         use crate::api::schema::AgentStatus;
         let mut app = crate::app::state::AppState::test_new();
@@ -6306,6 +6388,85 @@ mod tests {
         let entries = agent_panel_entries(&app);
         assert_eq!(entries[0].primary_label, "bridge");
         assert_eq!(entries[0].agent_label.as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn agent_panel_names_a_remote_server_by_its_icon_per_server_label_mode() {
+        use crate::config::ServerLabelConfig;
+        // #303: the agents panel is the last sidebar list that hard-coded the
+        // hostname. It now follows `server_label` like the band and the spaces
+        // list, so one server reads the same way everywhere.
+        let glyph = crate::server_icons::glyph("toad").unwrap();
+        let row_for = |mode: ServerLabelConfig| -> String {
+            // A local workspace whose identity sorts AFTER the remote one, so
+            // the remote row is the first body row.
+            let mut app = AppState::test_new();
+            let local = Workspace::test_new("zzz");
+            let pane = local.tabs[0].root_pane;
+            app.workspaces = vec![local];
+            app.ensure_test_terminals();
+            let tid = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
+            app.active = Some(0);
+            app.selected = 0;
+            app.mode = crate::app::Mode::Terminal;
+            app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+            app.server_filter = None;
+            app.server_label = mode;
+            let mut peer =
+                peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
+            peer.icon = Some("toad".into());
+            app.peer_summaries = vec![peer];
+            let (_, first_row) = agents_band_rows(&app);
+            first_row
+        };
+
+        // `name`: the pre-icon look, unchanged.
+        let named = row_for(ServerLabelConfig::Name);
+        assert!(named.contains("anvil"), "name mode row: {named:?}");
+        assert!(!named.contains(glyph), "name mode row: {named:?}");
+        // `both`: the glyph leads the hostname, space-joined like the rest of
+        // the location.
+        let both = row_for(ServerLabelConfig::Both);
+        assert!(
+            both.contains(&format!("{glyph} anvil")),
+            "both mode row: {both:?}"
+        );
+        // `icon`: the symbol stands in for the host entirely.
+        let icon = row_for(ServerLabelConfig::Icon);
+        assert!(icon.contains(glyph), "icon mode row: {icon:?}");
+        assert!(!icon.contains("anvil"), "icon mode row: {icon:?}");
+    }
+
+    #[test]
+    fn agent_panel_falls_back_to_the_hostname_for_a_server_without_an_icon() {
+        use crate::config::ServerLabelConfig;
+        // A peer that declared no icon still has to be identifiable, so every
+        // mode falls back to its hostname rather than rendering a blank.
+        let mut app = AppState::test_new();
+        let local = Workspace::test_new("zzz");
+        let pane = local.tabs[0].root_pane;
+        app.workspaces = vec![local];
+        app.ensure_test_terminals();
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Pi);
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        app.server_filter = None;
+        app.server_label = ServerLabelConfig::Icon;
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary("aaa", None, None, None)],
+        )];
+
+        let (_, first_row) = agents_band_rows(&app);
+        assert!(first_row.contains("anvil"), "row: {first_row:?}");
     }
 
     #[test]

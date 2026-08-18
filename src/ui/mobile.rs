@@ -958,6 +958,7 @@ mod tests {
             header_fields: Vec::new(),
             state_labels: std::collections::HashMap::new(),
             server: "mba22".into(),
+            icon: None,
             project: Some("flock".into()),
             target: "main".into(),
             sort_family_key: "flock".into(),
