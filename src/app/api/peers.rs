@@ -28,36 +28,74 @@ impl App {
         )
     }
 
-    /// Health of this server's periodic external pollers (#295).
+    /// Health of this server's periodic in-process pollers (#295).
     ///
-    /// Thresholds come from the configured gossip staleness window rather than
-    /// fresh constants, so "stale" means the same thing here as it does for a
-    /// peer that stopped answering.
+    /// Thresholds come from the configured gossip staleness window rather
+    /// than fresh constants, so "stale" means the same thing here as it does
+    /// for a peer that stopped answering — one operator threshold, applied
+    /// uniformly. The projection is deliberately cheap: no filesystem, no
+    /// network, no per-workspace traversal. This runs on the peers-summary
+    /// path (external monitor over SSH), not the render hot loop, so the
+    /// per-frame realpath rules from #262 / #265 don't apply — but the same
+    /// idea does: read stamped facts, don't compute them here.
     fn poller_health(&self) -> crate::api::schema::PollerHealthSummary {
         let now = std::time::Instant::now();
-        let health = &self.pr_poll_health;
         let stale_after = self.state.config.gossip.stale_after().as_secs();
-        let status = match health.status_at(
+        let broken_mult = crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE;
+
+        let pr = project_poller_health(
+            &self.pr_poll_health,
             now,
             stale_after,
-            crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE,
-        ) {
-            crate::pr_poll::PrPollStatus::Ok => "ok",
-            crate::pr_poll::PrPollStatus::Degraded => "degraded",
-            crate::pr_poll::PrPollStatus::Broken => "broken",
-        };
+            broken_mult,
+            self.pr_poll_health.in_flight_since,
+            |kind| kind.as_str().to_string(),
+        );
+
+        let git_refresh = Some(project_poller_health(
+            &self.git_refresh_health,
+            now,
+            stale_after,
+            broken_mult,
+            self.git_refresh_health.in_flight_since,
+            |kind| kind.as_str().to_string(),
+        ));
+
+        // A `[checks] enable = false` server has no runner tick to have
+        // health for; report `None` rather than a permanent Broken row that
+        // would misdirect a fleet monitor.
+        let checks_runner = self.state.config.checks.enable.then(|| {
+            project_poller_health(
+                &self.checks_runner_health,
+                now,
+                stale_after,
+                broken_mult,
+                self.checks_runner_health.in_flight_since,
+                |kind| kind.as_str().to_string(),
+            )
+        });
+
+        // The peer poller only exists if peers are configured; a server with
+        // no `[[peers]]` should not report a broken poller for a job it does
+        // not have. The aggregate in-flight is projected from the tracker's
+        // per-peer state — it's the fleet-wide "oldest fetch still out",
+        // which is the wedge signal an operator alerts on.
+        let peer_poll = (!self.state.peers.is_empty()).then(|| {
+            project_poller_health(
+                &self.peer_poll_health,
+                now,
+                stale_after,
+                broken_mult,
+                self.peer_poll_tracker.oldest_in_flight_since(),
+                |kind| kind.as_str().to_string(),
+            )
+        });
+
         crate::api::schema::PollerHealthSummary {
-            pr: crate::api::schema::PollerHealth {
-                status: status.to_string(),
-                last_success_age_secs: health.last_success_age_secs(now),
-                consecutive_failures: health.consecutive_failures,
-                in_flight: health.in_flight_since.is_some(),
-                in_flight_age_secs: health
-                    .in_flight_since
-                    .map(|at| now.saturating_duration_since(at).as_secs()),
-                skipped_rounds: health.skipped_rounds,
-                last_error: health.last_error.map(|kind| kind.as_str().to_string()),
-            },
+            pr,
+            git_refresh,
+            checks_runner,
+            peer_poll,
         }
     }
 
@@ -210,6 +248,34 @@ impl App {
             // #164: our OWN self-declared icon, so a spoke's home row shows it.
             icon: configured_node_icon(),
         }
+    }
+}
+
+/// Project a `PollerHealthCore` into the wire `PollerHealth`. Overrides the
+/// core's own `in_flight_since` so aggregate pollers (peer_poll) can supply
+/// the OLDEST across their tracked in-flights while single-round pollers
+/// (pr, git_refresh) just pass their own field through.
+fn project_poller_health<E: Copy + Eq>(
+    health: &crate::health::PollerHealthCore<E>,
+    now: std::time::Instant,
+    stale_after_secs: u64,
+    broken_multiple: u64,
+    in_flight_since_override: Option<std::time::Instant>,
+    err_as_str: impl Fn(&E) -> String,
+) -> crate::api::schema::PollerHealth {
+    let status = health
+        .status_at(now, stale_after_secs, broken_multiple)
+        .as_str()
+        .to_string();
+    crate::api::schema::PollerHealth {
+        status,
+        last_success_age_secs: health.last_success_age_secs(now),
+        consecutive_failures: health.consecutive_failures,
+        in_flight: in_flight_since_override.is_some(),
+        in_flight_age_secs: in_flight_since_override
+            .map(|at| now.saturating_duration_since(at).as_secs()),
+        skipped_rounds: health.skipped_rounds,
+        last_error: health.last_error.as_ref().map(&err_as_str),
     }
 }
 
