@@ -469,6 +469,14 @@ pub(super) fn mem_percent(used: u64, total: u64) -> f32 {
 
 /// One-line machine HUD: cpu · mem · disk · battery · net · gpu. Metrics the
 /// sampler could not read are omitted. Utilization colors shift at 60/85%.
+///
+/// Once the sampler thread stops delivering (dies, wedges), the last snapshot
+/// on AppState would otherwise be rendered indefinitely as if it were now —
+/// the `src/peers.rs:196` "unbounded confident lie" failure mode, on the
+/// most-glanced surface in the app. [`AppState::system_stats_fresh_at`]
+/// hides the snapshot once it is older than three sample intervals; here we
+/// render a dim `–` placeholder in its place so the line stops asserting
+/// values it no longer has.
 pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, area: Rect) {
     if area.height == 0 || area.width < 10 {
         return;
@@ -477,11 +485,22 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     let dim = Style::default().fg(p.overlay0);
     let mut spans: Vec<Span> = Vec::new();
 
-    let Some(stats) = app.system_stats.as_ref() else {
-        frame.render_widget(
-            Paragraph::new(Span::styled(" gathering system stats\u{2026}", dim)),
-            area,
-        );
+    // One clock read per frame, at the top level — never per metric row.
+    // The render path was hardened after a per-frame syscall storm froze
+    // every pane (#262/#265); freshness gets a single `Instant::now()` and
+    // that same `now` gates every metric below.
+    let now = std::time::Instant::now();
+    let Some(stats) = app.system_stats_fresh_at(now) else {
+        // Two failure modes render the same fallback text but distinct
+        // messages: never-sampled is the sampler still warming up; stale is
+        // the sampler no longer answering. Both refuse to render numbers,
+        // which is the whole point.
+        let message = if app.system_stats_at.is_none() {
+            " gathering system stats\u{2026}"
+        } else {
+            " \u{2013}"
+        };
+        frame.render_widget(Paragraph::new(Span::styled(message, dim)), area);
         return;
     };
 
@@ -620,5 +639,93 @@ mod tests {
         assert_eq!(band_battery_style(40, &p).fg, Some(p.peach));
         assert_eq!(band_battery_style(41, &p).fg, Some(p.green));
         assert_eq!(band_battery_style(100, &p).fg, Some(p.green));
+    }
+
+    fn render_status_to_string(app: &crate::app::AppState, width: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let area = Rect::new(0, 0, width, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_status_line(app, frame, area))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (area.x..area.x + area.width)
+            .map(|x| buffer[(x, area.y)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// A fresh sample renders its numbers: the sampler is alive, so the
+    /// user sees the machine's real CPU/memory reading. Pairs with
+    /// [`status_line_replaces_values_with_dash_once_sample_is_stale`] — the
+    /// two together prove the freshness gate is what changes the output,
+    /// not some ambient breakage.
+    #[test]
+    fn status_line_shows_values_when_sample_is_fresh() {
+        use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
+        const G: u64 = 1024 * 1024 * 1024;
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(SystemStats {
+            host: Some("mba22".into()),
+            cpu_percent: Some(42.0),
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            ..Default::default()
+        });
+        // Stamp "now" back one interval to prove the elapsed value is
+        // computed against the caller's clock, not a magic constant.
+        app.system_stats_at = Some(std::time::Instant::now() - SAMPLE_INTERVAL);
+
+        let rendered = render_status_to_string(&app, 80);
+        assert!(rendered.contains("42%"), "{rendered}");
+        assert!(rendered.contains("13G/16G"), "{rendered}");
+        assert!(rendered.contains("mba22"), "{rendered}");
+    }
+
+    /// The behaviour this whole change exists to protect: once the sampler
+    /// thread stops delivering, the last snapshot is not rendered as if it
+    /// were current. The status line drops the numbers and shows a neutral
+    /// placeholder — the `src/peers.rs:196` doctrine applied here.
+    #[test]
+    fn status_line_replaces_values_with_dash_once_sample_is_stale() {
+        use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
+        const G: u64 = 1024 * 1024 * 1024;
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(SystemStats {
+            host: Some("mba22".into()),
+            cpu_percent: Some(42.0),
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            ..Default::default()
+        });
+        // Past the 3× SAMPLE_INTERVAL freshness ceiling: the sampler is
+        // presumed dead. Backdated an extra second so the check clears the
+        // boundary regardless of wall-clock drift in this test.
+        app.system_stats_at = Some(
+            std::time::Instant::now() - 3 * SAMPLE_INTERVAL - std::time::Duration::from_secs(1),
+        );
+
+        let rendered = render_status_to_string(&app, 80);
+        assert!(
+            rendered.contains('\u{2013}'),
+            "expected en-dash placeholder, got {rendered:?}"
+        );
+        // No metric value from the stale snapshot may bleed through — that
+        // would be the exact "unbounded confident lie" this guards against.
+        assert!(!rendered.contains("42%"), "{rendered:?}");
+        assert!(!rendered.contains("13G/16G"), "{rendered:?}");
+        assert!(!rendered.contains("mba22"), "{rendered:?}");
+    }
+
+    /// The "gathering…" fallback still fires before any sample lands, so
+    /// startup does not look like an unavailable-stats event.
+    #[test]
+    fn status_line_shows_gathering_before_first_sample_arrives() {
+        let app = crate::app::state::AppState::test_new();
+        // system_stats and system_stats_at both None — never sampled.
+        let rendered = render_status_to_string(&app, 80);
+        assert!(rendered.contains("gathering system stats"), "{rendered:?}");
     }
 }
