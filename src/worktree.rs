@@ -898,7 +898,72 @@ pub(crate) fn branch_merge_gate(
         return WorktreeMergeGate::Merged { evidence };
     }
 
+    // Squash merges leave no ancestry to find (#287 landed that way and this
+    // gate refused to clean up after it): the content is replayed as ONE new
+    // commit, so no commit of the branch is ever an ancestor of the default
+    // branch, and every source above asks an ancestry question. Ask the
+    // question the gate actually cares about instead — would deleting this
+    // lose work? — by merging the branch into the default branch in memory.
+    if let Some(default_branch) = detect_default_branch(repo_root) {
+        if branch_content_already_in(&root, branch, &default_branch) {
+            return WorktreeMergeGate::Merged {
+                evidence: format!("already in {default_branch} (squashed or rebased)"),
+            };
+        }
+    }
+
     WorktreeMergeGate::NotMerged
+}
+
+/// Would merging `branch` into `base` change anything?
+///
+/// `git merge-tree --write-tree` computes the merged tree without touching the
+/// index or the working tree. When it comes back equal to `base`'s own tree,
+/// the branch contributes nothing base does not already have — which is true
+/// of a squash-merged branch, a rebase-merged one, and a branch whose change
+/// someone else landed by another route. In every one of those cases deleting
+/// the local branch loses no work, which is the only thing this gate is for.
+///
+/// Chosen over the obvious tree comparison, which is wrong in a way that shows
+/// up immediately: diffing the branch against `base` over the paths it touched
+/// reports base's OWN later edits to those files as missing content, so the
+/// check starts failing the moment the default branch moves on.
+///
+/// Anything unusable is NOT evidence, and the branch is kept: a merge that
+/// conflicts (non-zero exit), a git too old for `--write-tree` (< 2.38), an
+/// unreadable ref. Silence here costs a manual cleanup; a false positive costs
+/// someone's work.
+fn branch_content_already_in(root: &str, branch: &str, base: &str) -> bool {
+    let Ok(base_tree) = run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "rev-parse",
+            &format!("{}^{{tree}}", branch_ref(base)),
+        ],
+        None,
+    ) else {
+        return false;
+    };
+    let Ok(merged_tree) = run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "merge-tree",
+            "--write-tree",
+            &branch_ref(base),
+            &branch_ref(branch),
+        ],
+        None,
+    ) else {
+        return false;
+    };
+    // `--write-tree` prints the tree oid on the first line; a conflicted merge
+    // exits non-zero and is already handled above.
+    let merged_tree = merged_tree.lines().next().unwrap_or_default().trim();
+    !base_tree.is_empty() && merged_tree == base_tree
 }
 
 /// Which refs [`refs_containing`] considers.
@@ -2425,6 +2490,112 @@ prunable stale
             "an unreadable repo is not evidence of anything"
         );
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_sees_a_squash_merge() {
+        // The live miss (#287): the PR squash-merged, so the branch's work is
+        // in main while none of its commits is an ancestor of main. Every
+        // ancestry-based source says "no evidence" and the merge-gated kill
+        // refuses to clean up a worktree whose work has fully landed.
+        let repo = create_committed_repo("merge-gate-squash");
+        let checkout = unique_temp_path("merge-gate-squash-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/squashed",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        // Two commits, so the squash is a genuine collapse rather than a
+        // rename of a single one.
+        std::fs::write(checkout.join("new.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "first"]);
+        std::fs::write(checkout.join("new.txt"), "one\ntwo\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "second"]);
+
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "feature/squashed"),
+            WorktreeMergeGate::NotMerged,
+            "unmerged work must keep the branch"
+        );
+
+        // Squash it onto the default branch, exactly as GitHub's squash merge
+        // does: same content, one new commit, no ancestry.
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["merge", "--squash", "feature/squashed"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "feature work (#1)"]);
+        assert!(
+            run_command_capture(
+                "git",
+                &[
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "merge-base",
+                    "--is-ancestor",
+                    "refs/heads/feature/squashed",
+                    &format!("refs/heads/{default}"),
+                ],
+                None,
+            )
+            .is_err(),
+            "a squash must leave the branch tip unreachable from the default branch"
+        );
+
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "feature/squashed"),
+            WorktreeMergeGate::Merged {
+                evidence: format!("already in {default} (squashed or rebased)")
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_keeps_a_branch_whose_squash_left_work_behind() {
+        // The dangerous neighbour of the case above: the branch was squashed,
+        // then gained a commit. Its content is NOT fully in the default branch
+        // any more, and the containment check must not wave it through.
+        let repo = create_committed_repo("merge-gate-squash-extra");
+        let checkout = unique_temp_path("merge-gate-squash-extra-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/squashed-plus",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("new.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "first"]);
+        run_git(&repo, &["merge", "--squash", "feature/squashed-plus"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "squashed (#2)"]);
+
+        // Work that landed after the squash — this is what would be lost.
+        std::fs::write(checkout.join("later.txt"), "unmerged\n").unwrap();
+        run_git(&checkout, &["add", "later.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "after the squash"]);
+
+        assert_eq!(
+            branch_merge_gate(&repo, &checkout, "feature/squashed-plus"),
+            WorktreeMergeGate::NotMerged,
+            "post-squash work must keep the branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
