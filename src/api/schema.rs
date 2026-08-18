@@ -1305,6 +1305,13 @@ pub enum ResponseResult {
         /// Additive with a default so v(N-1) peers degrade gracefully.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relayed_fleet: Vec<RelayedFleetPeer>,
+        /// Health of this server's periodic external pollers (#295). The
+        /// incident this answers had every surface looking healthy while
+        /// nothing worked, so a monitor needs to ask "when did this last
+        /// SUCCEED?" rather than "does the server respond?". Additive and
+        /// optional so older peers degrade gracefully.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pollers: Option<PollerHealthSummary>,
     },
     PeersCheckoutPrepared {
         /// The branch the spoke prepared (resolved from the workspace), so the
@@ -2044,6 +2051,67 @@ pub enum PaneAgentState {
 
 /// Machine health for a federated peer's `servers` sidebar row. Sourced from
 /// the peer's existing 2s status-line sampler — no extra measurement.
+/// Health of every periodic in-process poller on one server (#295).
+///
+/// One `PollerHealth` per source, deliberately — the fleet monitor asks "has
+/// this specific poller stopped?" per named source rather than a
+/// whole-server verdict. Every field past `pr` is `Option`, so a peer on the
+/// previous release still deserialises: an older serialiser writes only what
+/// it knows about, and a newer receiver reads `None` for what is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollerHealthSummary {
+    /// The batched GitHub PR-state poller (#294 / #300).
+    pub pr: PollerHealth,
+    /// The periodic git working-tree refresh that keeps sidebar branch /
+    /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
+    /// the previous release; `Some` here always, because the refresher runs
+    /// as long as any workspace exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_refresh: Option<PollerHealth>,
+    /// The `[checks]` runner tick — the scheduler that dispatches script /
+    /// blocked-alert / hibernation / issue-guard / reap folds (#175). `None`
+    /// when `[checks] enable = false`, because there is no runner to have
+    /// health for; `Some` otherwise. Answers "did the runner tick fire?" —
+    /// per-check outcomes are their own event stream, not this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_runner: Option<PollerHealth>,
+    /// The peer-summary SSH poll (#96): the cross-machine version of what
+    /// this same monitor probes. `None` when no peers are configured;
+    /// `Some` otherwise. Aggregate across peers — a single peer failing is
+    /// visible in its own row, this answers "is the local poller alive at
+    /// all?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_poll: Option<PollerHealth>,
+}
+
+/// One poller's health.
+///
+/// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
+/// numbers so it can alert on rate-of-change (an in-flight age climbing toward
+/// the timeout is the early signal), while a TUI wants a single discriminant to
+/// colour a badge. Making either reconstruct the other guarantees they disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollerHealth {
+    /// `ok` | `degraded` | `broken`.
+    pub status: String,
+    /// Seconds since the last SUCCESSFUL round. `None` = never succeeded,
+    /// which is not the same as "0 seconds ago" and must not render as fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_age_secs: Option<u64>,
+    pub consecutive_failures: u32,
+    /// A round is running right now.
+    pub in_flight: bool,
+    /// How long the current round has been running — the signal that a poller
+    /// is wedging rather than merely failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_age_secs: Option<u64>,
+    /// Rounds skipped because the previous one had not finished. Sustained
+    /// growth means the cadence is shorter than the work.
+    pub skipped_rounds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerSystemSummary {
     /// Global CPU utilization, 0..=100 (rounded; keeps the response `Eq`).

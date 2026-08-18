@@ -43,6 +43,8 @@ mod digest;
 mod events;
 mod ghostty;
 mod handoff_runtime;
+// #295: source-scoped health primitive for periodic in-process pollers.
+mod health;
 mod input;
 mod integration;
 mod ipc;
@@ -55,6 +57,7 @@ mod peer_stream;
 mod peers;
 mod persist;
 mod platform;
+mod pr_poll;
 mod process;
 mod product_announcements;
 mod protocol;

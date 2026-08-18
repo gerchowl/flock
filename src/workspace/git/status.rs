@@ -11,6 +11,14 @@ use super::{
     },
 };
 
+/// Wall-clock bound on a git status subprocess.
+///
+/// This feeds the sidebar refresh, which runs every 1500ms. An unbounded `git`
+/// on a stale network mount leaves `git_refresh_in_flight` set forever: the
+/// sidebar's ahead/behind counts freeze at their last values with no timeout
+/// and no watchdog, and nothing reports that they stopped updating.
+const GIT_STATUS_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatusCacheEntry {
     pub fingerprint: GitStatusFingerprint,
@@ -224,7 +232,7 @@ fn git_ahead_behind_between(
         .arg("-C")
         .arg(cwd)
         .args(["rev-list", "--left-right", "--count", &range])
-        .output_traced()
+        .output_traced_with_timeout(GIT_STATUS_EXEC_TIMEOUT)
         .ok()?;
 
     if !output.status.success() {

@@ -28,6 +28,15 @@ pub struct SystemStats {
 
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Wall-clock bound on a sampler subprocess.
+///
+/// `pmset` and `ioreg` run every SAMPLE_INTERVAL, forever. Unbounded, one hung
+/// call wedges the sampler thread and the status line then renders its last
+/// values as current indefinitely — a confident lie on the surface users read
+/// most. Deliberately shorter than the interval so a slow sample is dropped
+/// rather than overlapping the next one.
+const SAMPLER_EXEC_TIMEOUT: Duration = Duration::from_millis(1500);
+
 /// Resolve which path's volume the disk stat reports (#50): the configured
 /// `ui.disk_path` when set (any path — its containing mount is matched), else
 /// `$HOME`'s volume (the historical default). Empty/whitespace is treated as
@@ -120,7 +129,7 @@ fn read_battery() -> (Option<u8>, Option<bool>) {
     }
     let Ok(output) = crate::process::TracedCommand::new("pmset", "stats")
         .args(["-g", "batt"])
-        .output_traced()
+        .output_traced_with_timeout(SAMPLER_EXEC_TIMEOUT)
     else {
         return (None, None);
     };
@@ -147,7 +156,7 @@ fn read_gpu_percent() -> Option<u8> {
     }
     let output = crate::process::TracedCommand::new("ioreg", "stats")
         .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
-        .output_traced()
+        .output_traced_with_timeout(SAMPLER_EXEC_TIMEOUT)
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     parse_gpu_utilization(&text)
