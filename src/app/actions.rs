@@ -5454,7 +5454,7 @@ mod tests {
             .set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
         // Unfiltered: this server's agent is listed in both scopes.
-        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::Current;
         assert!(
             !crate::ui::agent_panel_entries(&state).is_empty(),
             "unfiltered current scope lists the local agent"
@@ -5468,7 +5468,7 @@ mod tests {
             "a Peer filter hides local agents in current scope too"
         );
 
-        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::All;
+        state.config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::All;
         let entries = crate::ui::agent_panel_entries(&state);
         assert!(
             !entries.is_empty() && entries.iter().all(|entry| entry.remote.is_some()),

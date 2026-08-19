@@ -2356,7 +2356,7 @@ mod tests {
     #[test]
     fn startup_uses_configured_agent_panel_scope() {
         let mut config = Config::default();
-        config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::Current;
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
