@@ -10,36 +10,55 @@ use super::super::{has_confirmation_prompt, has_selection_prompt, AgentState};
 ///   ───────────────────────── (bottom border)
 /// ```
 pub(super) fn detect(content: &str) -> AgentState {
+    // A frame we recognise nothing in still has to name a state for the
+    // legacy callers; `Idle` stays the answer there. Callers that can act on
+    // "no signal" ask [`detect_structural`] instead — see #309.
+    detect_structural(content).unwrap_or(AgentState::Idle)
+}
+
+/// The state this screen *positively evidences*, or `None` when nothing
+/// structural matched at all.
+///
+/// The distinction matters upstream (#309): returning `Idle` for "I saw a
+/// prompt box and no working chrome" and for "I have no idea what this screen
+/// is" makes the two indistinguishable, and the arbitration layer then treats
+/// a shrug as authority to overrule the agent's own hook report. A live
+/// capture had a pane sitting in `Idle` — the settled green checkmark — for
+/// ten seconds while its agent was blocked on a permission dialog.
+///
+/// Every arm below is a positive match on agent-owned chrome. The bare
+/// fallthrough is the only "no evidence" case, and it is now `None`.
+pub(super) fn detect_structural(content: &str) -> Option<AgentState> {
     let lower = content.to_lowercase();
 
     // Search prompt is always idle
     if content.contains("⌕ Search…") {
-        return AgentState::Idle;
+        return Some(AgentState::Idle);
     }
 
     // ctrl+r toggle — don't change state
     // (we return Idle as a safe default since we don't have previous state here)
     if lower.contains("ctrl+r to toggle") {
-        return AgentState::Idle;
+        return Some(AgentState::Idle);
     }
 
     if has_live_blocked_form(content) {
-        return AgentState::Blocked;
+        return Some(AgentState::Blocked);
     }
 
     if has_working_chrome(content) {
-        return AgentState::Working;
+        return Some(AgentState::Working);
     }
 
     if !has_prompt_box(content) && has_claude_blocked_prompt(content, &lower) {
-        return AgentState::Blocked;
+        return Some(AgentState::Blocked);
     }
 
     if has_prompt_box(content) {
-        return AgentState::Idle;
+        return Some(AgentState::Idle);
     }
 
-    AgentState::Idle
+    None
 }
 
 pub(super) fn has_visible_blocker(content: &str) -> bool {
@@ -458,5 +477,127 @@ mod tests {
 
         assert_eq!(detect(&content), AgentState::Idle);
         assert!(!has_working_chrome(&content));
+    }
+
+    // ------------------------------------------------------------------
+    // #309: "no structural evidence" must not masquerade as Idle.
+    // ------------------------------------------------------------------
+
+    /// The whole point of `detect_structural`: a frame we recognise nothing in
+    /// returns `None`, while a frame with a real prompt box returns `Idle`.
+    /// Before #309 both produced `AgentState::Idle` and were indistinguishable.
+    #[test]
+    fn unrecognised_frame_yields_no_signal_but_a_prompt_box_yields_idle() {
+        let idle = concat!(
+            "\u{23fa} #307 merged. Both of mine are in.\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} keep going\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  sage \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
+        );
+        assert_eq!(detect_structural(idle), Some(AgentState::Idle));
+
+        // Mid-scroll transcript with no prompt box and no working chrome.
+        let nothing = "\u{23fa} some output that is neither a prompt box nor a spinner\n";
+        assert_eq!(
+            detect_structural(nothing),
+            None,
+            "no chrome matched, so there is no evidence of any state"
+        );
+        // The legacy entry point still has to name something.
+        assert_eq!(detect(nothing), AgentState::Idle);
+    }
+
+    /// A torn frame — the prompt box's bottom border not yet flushed — used to
+    /// publish `Idle`. `claude_prompt_box_top_border_index` counts rules from
+    /// the bottom, so losing one border re-anchors it onto a rule in the
+    /// streamed output above and the box stops parsing. Now it reports no
+    /// signal, and the arbitration layer holds the last state instead.
+    #[test]
+    fn torn_prompt_box_frame_reports_no_signal_instead_of_idle() {
+        let torn = concat!(
+            "\u{23fa} #307 merged. Both of mine are in.\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} keep going\n",
+            "  sage \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
+        );
+        assert!(
+            !has_prompt_box(torn),
+            "one missing border and the box is gone"
+        );
+        assert_eq!(detect_structural(torn), None);
+    }
+
+    /// Same for a Working pane: the spinner sits ABOVE the box, so a
+    /// re-anchored box clips it away and the working chrome disappears with it.
+    #[test]
+    fn torn_working_frame_reports_no_signal_instead_of_idle() {
+        let working = concat!(
+            "\u{23fa} Editing src/detect/mod.rs\n",
+            "\u{273b} Implementing\u{2026} (esc to interrupt)\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f}\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        );
+        assert_eq!(detect_structural(working), Some(AgentState::Working));
+
+        let torn = concat!(
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{23fa} Editing src/detect/mod.rs\n",
+            "\u{273b} Implementing\u{2026} (esc to interrupt)\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f}\n",
+        );
+        assert!(!has_working_chrome(torn), "the spinner is clipped away");
+        assert_eq!(
+            detect_structural(torn),
+            None,
+            "a torn working frame must not publish Idle"
+        );
+    }
+
+    /// A REAL captured footer from a live pane that had 2 background shells and
+    /// 1 monitor outstanding. Both background-work matchers miss it:
+    /// `is_still_running_status_line` word-matches `N ["shell"|"shells",
+    /// "still","running"]`, but Claude writes "2 shells, 1 monitor still
+    /// running" — the comma is glued to "shells," and "monitor" sits between
+    /// the count and "still running". `has_background_shell_footer` needs
+    /// "to manage", which this footer does not carry.
+    ///
+    /// Documented as-is: the pane has a real prompt box, so this is a genuine
+    /// `Idle` reading, not a no-signal one. Fixing the counters is #309 P2.
+    #[test]
+    fn background_shell_footer_matchers_miss_the_real_footer() {
+        let screen = concat!(
+            "\u{23fa} #296 updated onto main and waiting on checks.\n",
+            "\u{273b} Cooked for 5s \u{b7} 2 shells, 1 monitor still running\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} keep going\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  sage \u{b7} Opus 5 (1M context) \u{b7} ~/Projects/flock main\n",
+            "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 2 shells, 1 monitor \u{b7} \u{2190} for agents\n",
+        );
+        assert!(
+            !has_background_shell_footer(screen),
+            "the footer counter needs \"to manage\", which is absent"
+        );
+        assert!(!has_working_chrome(screen), "so no working chrome is found");
+        assert_eq!(detect_structural(screen), Some(AgentState::Idle));
+    }
+
+    /// How narrow the still-running matcher is: one comma defeats it.
+    #[test]
+    fn still_running_matcher_is_positional() {
+        assert!(is_still_running_status_line(
+            "\u{273b} Cooked for 5s \u{b7} 2 shells still running"
+        ));
+        assert!(
+            !is_still_running_status_line("\u{273b} Cooked for 5s \u{b7} 2 shells, still running"),
+            "one comma defeats it"
+        );
+        // Interleaved survives only because the tail stays positionally intact.
+        assert!(is_still_running_status_line(
+            "\u{273b} Cooked for 5s \u{b7} 1 monitor, 2 shells still running"
+        ));
     }
 }

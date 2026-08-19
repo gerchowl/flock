@@ -1200,14 +1200,24 @@ fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let installed_hooks = parsed.get("hooks").cloned().unwrap_or(Value::Null);
     let expected_hooks = claude_hooks_fragment(&hook_path);
 
+    // SUBSET semantics, matching the installer (#309). `ensure_command_hook`
+    // APPENDS flock's entry and treats the event as satisfied when any entry
+    // already carries flock's command — so a user who keeps their own hook on
+    // the same event has a correct install. Comparing whole arrays for
+    // equality reported that as drift, which permanently closed the reap gate
+    // with no way for the user to satisfy it. Report only what flock owns:
+    // "flock's entry is missing or changed", never "you have extra entries".
     let mut details = Vec::new();
     if let Value::Object(expected_map) = &expected_hooks {
         for (event, expected_entries) in expected_map {
+            let Some(expected_command) = flock_command_in(expected_entries) else {
+                continue;
+            };
             let installed_entries = installed_hooks.get(event).cloned().unwrap_or(Value::Null);
-            if installed_entries != *expected_entries {
+            if !registers_command(&installed_entries, &expected_command) {
                 details.push(format!(
-                    "claude settings.json `hooks.{event}` drift: expected {} entries, found {}",
-                    describe_hook_entries(expected_entries),
+                    "claude settings.json `hooks.{event}` is missing flock's entry \
+                     (`{expected_command}`); {} present",
                     describe_hook_entries(&installed_entries),
                 ));
             }
@@ -1217,6 +1227,48 @@ fn verify_claude_settings_drift() -> Option<Vec<String>> {
         None
     } else {
         Some(details)
+    }
+}
+
+/// The `command` string of the flock hook inside an expected entry array.
+fn flock_command_in(entries: &Value) -> Option<String> {
+    entries.as_array()?.iter().find_map(|entry| {
+        entry
+            .get("hooks")?
+            .as_array()?
+            .iter()
+            .find_map(|hook| hook.get("command")?.as_str().map(str::to_string))
+    })
+}
+
+/// Whether any entry in `entries` registers exactly `command`.
+fn registers_command(entries: &Value, command: &str) -> bool {
+    entries.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("type").and_then(Value::as_str) == Some("command")
+                            && hook.get("command").and_then(Value::as_str) == Some(command)
+                    })
+                })
+        })
+    })
+}
+
+/// Settings drift for `target`, as operator-readable lines. `None` means no
+/// drift (or nothing to compare against). Exposed so `flk integration status`
+/// can surface the same facts the reap gate already acts on (#309) — the
+/// check existed but had exactly one caller, a background job, so a
+/// half-installed integration never reached a human.
+pub(crate) fn settings_drift_details(
+    target: crate::api::schema::IntegrationTarget,
+) -> Option<Vec<String>> {
+    match target {
+        crate::api::schema::IntegrationTarget::Claude => verify_claude_settings_drift(),
+        _ => None,
     }
 }
 
@@ -4720,6 +4772,82 @@ mod tests {
             }
             other => panic!("expected HookHalfState, got {other:?}"),
         }
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #309: the installer uses SUBSET semantics — `ensure_command_hook`
+    /// appends flock's entry and leaves any pre-existing entry alone. The
+    /// verifier used whole-array equality, so a user who keeps their own hook
+    /// on the same event had a correct install reported as permanent drift,
+    /// which held the scheduled reap closed with no way to satisfy it.
+    #[test]
+    fn a_users_own_hook_alongside_flocks_is_not_drift() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("HOME", &home);
+        let _ = install_claude().unwrap();
+
+        // Prepend a personal hook to Stop, keeping flock's entry.
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let flock_entry = settings["hooks"]["Stop"][0].clone();
+        settings["hooks"]["Stop"] = json!([
+            { "hooks": [ { "type": "command", "command": "notify-bell Purr.aiff" } ] },
+            flock_entry,
+        ]);
+        fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        assert_eq!(
+            verify_claude_settings_drift(),
+            None,
+            "flock's entry is present, so there is no drift to report"
+        );
+        assert_eq!(verify_integration_manifest(), ManifestVerdict::Ok);
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// The other half: flock's entry actually missing IS drift, and the
+    /// message names what is missing rather than complaining about extras.
+    #[test]
+    fn a_missing_flock_entry_is_drift_and_names_itself() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var("HOME", &home);
+        let _ = install_claude().unwrap();
+
+        // Replace Stop with only a personal hook — the real-world shape of a
+        // read-only, externally-owned settings.json.
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings["hooks"]["Stop"] = json!([
+            { "hooks": [ { "type": "command", "command": "notify-bell Purr.aiff" } ] }
+        ]);
+        fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let details = verify_claude_settings_drift().expect("missing entry is drift");
+        assert_eq!(details.len(), 1, "only Stop drifted: {details:?}");
+        assert!(details[0].contains("hooks.Stop"), "{details:?}");
+        assert!(
+            details[0].contains("missing flock's entry"),
+            "must name what is missing, not the extras: {details:?}"
+        );
+        assert_eq!(
+            settings_drift_details(crate::api::schema::IntegrationTarget::Claude),
+            Some(details),
+            "the status surface reads the same facts as the reap gate"
+        );
+
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
     }

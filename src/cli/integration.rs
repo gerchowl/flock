@@ -97,6 +97,23 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
             }
         };
         println!("{target}: {state} ({})", status.path.display());
+
+        // #309: the shim's version says nothing about whether the settings
+        // file actually registers it. That half-state (hook script present,
+        // registration missing) is what a read-only, externally-owned
+        // settings.json produces, and it silently pins agent state and holds
+        // the scheduled reap closed. Surface it where a human will see it.
+        if !matches!(
+            status.state,
+            crate::integration::IntegrationStatusKind::NotInstalled
+        ) {
+            if let Some(details) = crate::integration::settings_drift_details(status.target) {
+                for detail in details {
+                    println!("  ! {detail}");
+                }
+                println!("  ! run `flk integration manifest {target}` for the fragment to merge");
+            }
+        }
     }
 
     Ok(0)

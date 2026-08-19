@@ -33,6 +33,22 @@ pub use prompt_history::{
 const CLAUDE_WORKING_HOLD: Duration = Duration::from_millis(1200);
 const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a hook report stays authoritative without fresh traffic (#309).
+///
+/// Hook authority used to be *durable*: it was cleared on process exit, agent
+/// change and respawn, but never on age, and `reported_at` was only ever used
+/// for relative ordering against the screen. A host that registers
+/// `UserPromptSubmit` but not `Stop` — the shape a read-only, externally-owned
+/// `settings.json` produces — therefore pinned every pane to `Working`
+/// forever, and the only route back to `Idle` was the screen veto below.
+///
+/// With a TTL, an authority that has gone quiet simply stops winning and the
+/// screen takes over cleanly, with no veto grace and nothing to flap against.
+/// This is deliberately much longer than a turn boundary: while hooks work,
+/// every prompt and every stop refreshes them, so the TTL never fires. It is a
+/// bound on "this agent stopped talking to us", not a heartbeat.
+const HOOK_AUTHORITY_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookAuthority {
     pub source: String,
@@ -42,6 +58,42 @@ pub struct HookAuthority {
     pub custom_status: Option<String>,
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
+}
+
+/// Which authority decided the effective state on the last recompute (#309).
+///
+/// Carried on every [`EffectiveStateChange`] so the state-change log can name
+/// the deciding source. A ten-second false-`Idle` was only diagnosable with a
+/// bespoke capture rig because nothing recorded this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAuthority {
+    /// A live blocker on screen overruled a non-blocked hook.
+    VisibleBlocker,
+    /// Live working chrome overruled a hook that claimed idle/blocked.
+    VisibleWorking,
+    /// The screen showed idle long enough to stale a hook that claimed
+    /// working/blocked (`STALE_HOOK_IDLE_GRACE`).
+    VisibleIdleVeto,
+    /// A fresh hook report.
+    Hook,
+    /// A hook reported once and went quiet past [`HOOK_AUTHORITY_TTL`], so the
+    /// screen decided instead.
+    HookExpired,
+    /// No hook has ever reported; the screen decided.
+    Screen,
+}
+
+impl StateAuthority {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VisibleBlocker => "visible_blocker",
+            Self::VisibleWorking => "visible_working",
+            Self::VisibleIdleVeto => "visible_idle_veto",
+            Self::Hook => "hook",
+            Self::HookExpired => "hook_expired",
+            Self::Screen => "screen",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +106,8 @@ pub struct EffectiveStateChange {
     pub known_agent: Option<Agent>,
     pub state: AgentState,
     pub presentation: EffectivePresentation,
+    /// Which source decided `state` (#309).
+    pub authority: StateAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -140,6 +194,9 @@ pub struct TerminalState {
     /// when the agent stops working.
     pub live_activity: Option<String>,
     stale_hook_idle_since: Option<Instant>,
+    /// Which authority decided the current `state` (#309); surfaced on every
+    /// change so the log names the source rather than only the outcome.
+    last_state_authority: StateAuthority,
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
@@ -194,6 +251,7 @@ impl TerminalState {
             state_changed_at: None,
             live_activity: None,
             stale_hook_idle_since: None,
+            last_state_authority: StateAuthority::Screen,
             hook_authority: None,
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
@@ -907,6 +965,36 @@ impl TerminalState {
                 })
     }
 
+    /// True when a hook report is present AND still within [`HOOK_AUTHORITY_TTL`].
+    ///
+    /// `None` (never reported) and `Some` past its TTL are different things and
+    /// callers must not conflate them — see [`Self::hook_authority_expired`].
+    fn hook_authority_is_fresh(&self, now: Instant) -> bool {
+        self.hook_authority.as_ref().is_some_and(|authority| {
+            now.checked_duration_since(authority.reported_at)
+                .is_none_or(|age| age < HOOK_AUTHORITY_TTL)
+        })
+    }
+
+    /// Compact hook facts for the state-change log (#309): the reported state
+    /// and its age in ms, or `None` when no hook has ever reported. The log
+    /// must be able to say "expired" as distinct from "absent".
+    pub(crate) fn hook_authority_report(&self, now: Instant) -> Option<(AgentState, u128)> {
+        self.hook_authority.as_ref().map(|authority| {
+            (
+                authority.state,
+                now.checked_duration_since(authority.reported_at)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+        })
+    }
+
+    /// True when a hook reported once and has since gone quiet past its TTL.
+    pub(crate) fn hook_authority_expired(&self, now: Instant) -> bool {
+        self.hook_authority.is_some() && !self.hook_authority_is_fresh(now)
+    }
+
     fn visible_idle_stales_hook(&self, now: Instant) -> bool {
         self.stale_hook_idle_since
             .is_some_and(|since| now.duration_since(since) >= STALE_HOOK_IDLE_GRACE)
@@ -1004,18 +1092,26 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
-        let state = if self.visible_blocker_overrides_hook() {
-            AgentState::Blocked
+        // Precedence is fresh-vs-stale, not source-vs-source (#309): a hook
+        // that has gone quiet past its TTL stops winning, so the screen takes
+        // over without needing the veto grace to fight it every tick.
+        let (state, authority) = if self.visible_blocker_overrides_hook() {
+            (AgentState::Blocked, StateAuthority::VisibleBlocker)
         } else if self.visible_working_overrides_hook() {
-            AgentState::Working
+            (AgentState::Working, StateAuthority::VisibleWorking)
+        } else if self.hook_authority_expired(now) {
+            // Checked BEFORE the veto: the veto exists only to overrule a hook
+            // that is still claiming authority. An expired one has none, so the
+            // screen decides outright rather than having to earn a 2s grace.
+            (self.fallback_state, StateAuthority::HookExpired)
         } else if self.visible_idle_stales_hook(now) {
-            AgentState::Idle
+            (AgentState::Idle, StateAuthority::VisibleIdleVeto)
+        } else if let Some(authority) = self.hook_authority.as_ref() {
+            (authority.state, StateAuthority::Hook)
         } else {
-            self.hook_authority
-                .as_ref()
-                .map(|authority| authority.state)
-                .unwrap_or(self.fallback_state)
+            (self.fallback_state, StateAuthority::Screen)
         };
+        self.last_state_authority = authority;
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
 
@@ -1042,6 +1138,7 @@ impl TerminalState {
             known_agent,
             state,
             presentation,
+            authority,
         })
     }
 
@@ -1285,6 +1382,15 @@ impl TerminalState {
     }
 }
 
+/// Hold a `Working -> Idle` edge for [`CLAUDE_WORKING_HOLD`] so a single
+/// detector frame cannot flip the sidebar.
+///
+/// This used to bail out for every agent except Claude, which left codex,
+/// gemini, cursor, droid and the rest flipping on the raw 300ms tick with no
+/// damping at all (#309). The constant was tuned against Claude's redraw
+/// cadence but the hazard is not Claude-specific: it is "one bad frame", and
+/// every screen-scraped agent has those. `ATTENTION_SETTLE` already applies
+/// the same 1200ms agent-agnostically one layer up.
 pub(crate) fn stabilize_agent_state(
     agent: Option<Agent>,
     previous: AgentState,
@@ -1292,7 +1398,7 @@ pub(crate) fn stabilize_agent_state(
     now: std::time::Instant,
     last_claude_working_at: &mut Option<std::time::Instant>,
 ) -> AgentState {
-    if agent != Some(Agent::Claude) {
+    if agent.is_none() {
         return raw;
     }
 
@@ -3056,5 +3162,170 @@ mod tests {
                 .map(|session| session.session_ref.value.as_str()),
             Some("claude-session"),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #309: hook TTL, and what a blipping screen may no longer do.
+    // ------------------------------------------------------------------
+
+    fn hook_working(terminal: &mut TerminalState, at: Instant) {
+        terminal.set_hook_authority_with_custom_status_at(
+            "flock:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            None,
+            None,
+            None,
+            at,
+        );
+    }
+
+    fn screen(
+        terminal: &mut TerminalState,
+        state: AgentState,
+        visible_idle: bool,
+        at: Instant,
+    ) -> TerminalStateMutation {
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            state,
+            false,
+            visible_idle,
+            false,
+            false,
+            at,
+        )
+    }
+
+    /// The #309 headline. A host that wires `UserPromptSubmit` but not `Stop`
+    /// pins hook authority to `Working` forever. Once the report ages past
+    /// `HOOK_AUTHORITY_TTL` the screen simply wins — no veto grace involved.
+    #[test]
+    fn expired_hook_authority_yields_to_the_screen() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        hook_working(&mut terminal, now);
+
+        // Inside the TTL the hook still owns the pane.
+        screen(
+            &mut terminal,
+            AgentState::Idle,
+            true,
+            now + Duration::from_millis(300),
+        );
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(!terminal.hook_authority_expired(now + Duration::from_millis(300)));
+
+        // Past it, the screen decides and the change names the authority.
+        let after = now + HOOK_AUTHORITY_TTL + Duration::from_secs(1);
+        let change = screen(&mut terminal, AgentState::Idle, true, after);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(terminal.hook_authority_expired(after));
+        assert_eq!(
+            change.effective_state_change.unwrap().authority,
+            StateAuthority::HookExpired
+        );
+    }
+
+    /// Once the hook has expired, a screen blip can no longer hand the pane
+    /// back to it. Before #309 a single `visible_idle == false` frame reset the
+    /// veto window and the pane snapped to `Working` for another full grace.
+    #[test]
+    fn a_blip_cannot_resurrect_an_expired_hook() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        hook_working(&mut terminal, now);
+
+        let settled = now + HOOK_AUTHORITY_TTL + Duration::from_secs(1);
+        screen(&mut terminal, AgentState::Idle, true, settled);
+        assert_eq!(terminal.state, AgentState::Idle);
+
+        // One frame where the prompt box did not parse. Still Idle, and still
+        // the screen's call — the stale hook does not come back.
+        let blip = settled + Duration::from_millis(300);
+        screen(&mut terminal, AgentState::Idle, false, blip);
+        assert_eq!(
+            terminal.state,
+            AgentState::Idle,
+            "an expired hook must not reclaim the pane on a blip"
+        );
+        assert_eq!(terminal.last_state_authority, StateAuthority::HookExpired);
+    }
+
+    /// A fresh hook is still authoritative — the TTL must not quietly disable
+    /// hooks on hosts where they work.
+    #[test]
+    fn fresh_hook_still_outranks_a_contradicting_screen() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        hook_working(&mut terminal, now);
+        let change = screen(
+            &mut terminal,
+            AgentState::Idle,
+            true,
+            now + Duration::from_millis(500),
+        );
+        assert!(change.effective_state_change.is_none());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.last_state_authority, StateAuthority::Hook);
+    }
+
+    /// Never-reported and expired are different things, and the authority
+    /// label distinguishes them for the log.
+    #[test]
+    fn absent_and_expired_hooks_are_distinguishable() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        screen(&mut terminal, AgentState::Idle, true, now);
+        assert!(
+            !terminal.hook_authority_expired(now),
+            "never reported is not expired"
+        );
+        assert_eq!(terminal.last_state_authority, StateAuthority::Screen);
+        assert_eq!(StateAuthority::Screen.label(), "screen");
+        assert_eq!(StateAuthority::HookExpired.label(), "hook_expired");
+    }
+
+    /// The Working->Idle hold is no longer Claude-only (#309 P9 sibling): every
+    /// agent gets the same damping, so a single detector tick cannot flip the
+    /// sidebar for codex/gemini/cursor/droid.
+    #[test]
+    fn working_hold_applies_to_every_agent() {
+        let now = Instant::now();
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Gemini,
+            Agent::Cursor,
+            Agent::Droid,
+        ] {
+            let mut last_working = Some(now);
+            assert_eq!(
+                stabilize_agent_state(
+                    Some(agent),
+                    AgentState::Working,
+                    AgentState::Idle,
+                    now + Duration::from_millis(300),
+                    &mut last_working,
+                ),
+                AgentState::Working,
+                "{agent:?} must hold through a single-frame Idle"
+            );
+            assert_eq!(
+                stabilize_agent_state(
+                    Some(agent),
+                    AgentState::Working,
+                    AgentState::Idle,
+                    now + CLAUDE_WORKING_HOLD + Duration::from_millis(1),
+                    &mut last_working,
+                ),
+                AgentState::Idle,
+                "{agent:?} must still settle once the hold elapses"
+            );
+        }
     }
 }
