@@ -146,6 +146,9 @@ impl Action {
 struct HookOutcome {
     reports: Vec<Method>,
     stdout: Option<String>,
+    /// `(session_id, config_dir)` to persist so a post-restart resume re-selects
+    /// the same Claude account profile. See `agent_resume::record_claude_config_dir`.
+    config_dir_record: Option<(String, String)>,
 }
 
 pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
@@ -189,6 +192,9 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     } else {
         0
     };
+    // The account profile the session is running under (g-fleet's claude-auth):
+    // read here, at the IO edge, so `plan` stays a pure function of its inputs.
+    let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
     let outcome = plan(
         agent,
         action,
@@ -196,6 +202,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         &hook_event_name,
         &pane_id,
         pending_messages,
+        config_dir.as_deref(),
     );
     emit(outcome);
     Ok(0)
@@ -210,9 +217,10 @@ fn plan(
     hook_event_name: &str,
     pane_id: &str,
     pending_messages: usize,
+    config_dir: Option<&str>,
 ) -> HookOutcome {
     match action {
-        Action::Session => plan_session(agent, input, hook_event_name, pane_id),
+        Action::Session => plan_session(agent, input, hook_event_name, pane_id, config_dir),
         Action::Prompt => plan_prompt(agent, input, pane_id),
         // Only Claude carries a scrapable transcript + nudge protocol on Stop.
         Action::Stop => match agent {
@@ -263,6 +271,7 @@ fn plan_state(
             agent_session_path: None,
         })],
         stdout: None,
+        config_dir_record: None,
     }
 }
 
@@ -278,6 +287,7 @@ fn plan_release(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookO
             seq: Some(seq()),
         })],
         stdout: None,
+        config_dir_record: None,
     }
 }
 
@@ -286,6 +296,7 @@ fn plan_session(
     input: &serde_json::Value,
     hook_event_name: &str,
     pane_id: &str,
+    config_dir: Option<&str>,
 ) -> HookOutcome {
     let Some(session_id) = str_field(input, "session_id") else {
         return HookOutcome::default();
@@ -297,6 +308,15 @@ fn plan_session(
         && hook_event_name == "SessionStart")
         .then(|| str_field(input, "source"))
         .flatten();
+
+    // Remember which account profile (CLAUDE_CONFIG_DIR) this Claude session is
+    // running under, so a resume after a flk restart re-selects it instead of
+    // orphaning onto the default ~/.claude account. Claude-only: it's the one
+    // agent whose auth is relocated by an env var.
+    let config_dir_record = matches!(agent, Agent::Claude)
+        .then(|| config_dir.filter(|dir| !dir.is_empty()))
+        .flatten()
+        .map(|dir| (session_id.clone(), dir.to_string()));
 
     HookOutcome {
         reports: vec![Method::PaneReportAgentSession(
@@ -311,6 +331,7 @@ fn plan_session(
             },
         )],
         stdout: None,
+        config_dir_record,
     }
 }
 
@@ -330,6 +351,7 @@ fn plan_prompt(agent: Agent, input: &serde_json::Value, pane_id: &str) -> HookOu
             seq: Some(seq()),
         })],
         stdout: None,
+        config_dir_record: None,
     }
 }
 
@@ -446,6 +468,12 @@ fn pending_message_count(pane_id: &str) -> usize {
 /// Apply a planned outcome: fire each report (swallowing errors) then print any
 /// stdout. The only place this module touches the socket or stdout.
 fn emit(outcome: HookOutcome) {
+    // Persist the account-profile record before the reports: a resume needs it
+    // even if the socket send below fails, and a hook must never fail its parent
+    // agent, so neither leg can be allowed to skip the other.
+    if let Some((session_id, config_dir)) = outcome.config_dir_record.clone() {
+        crate::agent_resume::record_claude_config_dir(&session_id, &config_dir);
+    }
     for method in outcome.reports {
         let request = Request {
             id: format!("flock:hook:{}", seq()),
@@ -574,7 +602,7 @@ mod tests {
             ("blocked", PaneAgentState::Blocked),
         ] {
             let action = Action::parse(raw).expect("state action parses");
-            let outcome = plan(Agent::Kimi, action, &json!({}), "", "p_23", 0);
+            let outcome = plan(Agent::Kimi, action, &json!({}), "", "p_23", 0, None);
             assert_eq!(outcome.reports.len(), 1, "{raw}");
             let Method::PaneReportAgent(params) = &outcome.reports[0] else {
                 panic!(
@@ -603,6 +631,7 @@ mod tests {
             "",
             "p_7",
             0,
+            None,
         );
         let Method::PaneReleaseAgent(params) = &outcome.reports[0] else {
             panic!(
@@ -625,6 +654,7 @@ mod tests {
             "",
             "p_1",
             0,
+            None,
         );
         let Method::PaneReportAgent(params) = &with_id.reports[0] else {
             panic!("expected report_agent");
@@ -639,6 +669,7 @@ mod tests {
             "",
             "p_1",
             0,
+            None,
         );
         let Method::PaneReportAgent(params) = &bare.reports[0] else {
             panic!("expected report_agent");
@@ -660,6 +691,7 @@ mod tests {
                 "",
                 "p_1",
                 0,
+                None,
             );
             assert!(
                 outcome.reports.is_empty(),
@@ -675,6 +707,7 @@ mod tests {
             "",
             "p_1",
             0,
+            None,
         );
         assert_eq!(working.reports.len(), 1);
     }
@@ -690,6 +723,7 @@ mod tests {
             "SessionStart",
             "p_9",
             0,
+            None,
         );
         let Method::PaneReportAgentSession(params) = &outcome.reports[0] else {
             panic!("expected report_agent_session");
@@ -703,7 +737,7 @@ mod tests {
     #[test]
     fn stop_is_a_no_op_for_the_non_claude_agents() {
         for agent in [Agent::Codex, Agent::Kimi, Agent::Qodercli] {
-            let outcome = plan(agent, Action::Stop, &json!({}), "Stop", "p_1", 3);
+            let outcome = plan(agent, Action::Stop, &json!({}), "Stop", "p_1", 3, None);
             assert!(outcome.reports.is_empty());
             assert!(outcome.stdout.is_none(), "a nudge would be Claude-only");
         }
@@ -718,7 +752,15 @@ mod tests {
     fn only_state_reporting_agents_honour_the_state_vocabulary() {
         for agent in [Agent::Claude, Agent::Opencode, Agent::Codex] {
             for raw in ["working", "idle", "blocked", "release"] {
-                let outcome = plan(agent, Action::parse(raw).unwrap(), &json!({}), "", "p_1", 0);
+                let outcome = plan(
+                    agent,
+                    Action::parse(raw).unwrap(),
+                    &json!({}),
+                    "",
+                    "p_1",
+                    0,
+                    None,
+                );
                 assert!(
                     outcome.reports.is_empty(),
                     "{} must ignore `{raw}`",
@@ -734,6 +776,7 @@ mod tests {
                 "",
                 "p_1",
                 0,
+                None,
             );
             assert_eq!(outcome.reports.len(), 1, "{} reports state", agent.agent());
         }
@@ -804,6 +847,7 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
+            None,
         );
         assert_eq!(out.reports.len(), 1);
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
@@ -816,6 +860,58 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_records_config_dir_when_set() {
+        // The account-profile recall: a Claude SessionStart under a
+        // CLAUDE_CONFIG_DIR yields a (session_id, config_dir) record so a
+        // post-restart resume re-selects the same account instead of
+        // orphaning onto the default ~/.claude.
+        let input = json!({"hook_event_name": "SessionStart", "session_id": "sid-9"});
+        let out = plan(
+            Agent::Claude,
+            Action::Session,
+            &input,
+            "SessionStart",
+            "p_1",
+            0,
+            Some("/home/u/.claude-profiles/work"),
+        );
+        assert_eq!(
+            out.config_dir_record,
+            Some(("sid-9".into(), "/home/u/.claude-profiles/work".into()))
+        );
+    }
+
+    #[test]
+    fn session_records_no_config_dir_when_unset_or_non_claude() {
+        // No CLAUDE_CONFIG_DIR (the default account) — nothing to record.
+        let input = json!({"hook_event_name": "SessionStart", "session_id": "sid-9"});
+        assert!(plan(
+            Agent::Claude,
+            Action::Session,
+            &input,
+            "SessionStart",
+            "p_1",
+            0,
+            None,
+        )
+        .config_dir_record
+        .is_none());
+        // Other agents do not relocate auth by env var, so recording one for
+        // them would attach a Claude-shaped fact to a non-Claude session.
+        assert!(plan(
+            Agent::Opencode,
+            Action::Session,
+            &json!({"session_id": "os-1"}),
+            "",
+            "p_1",
+            0,
+            Some("/home/u/.claude-profiles/work"),
+        )
+        .config_dir_record
+        .is_none());
+    }
+
+    #[test]
     fn session_without_id_is_a_noop() {
         let input = json!({"hook_event_name": "SessionStart"});
         let out = plan(
@@ -825,6 +921,7 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
+            None,
         );
         assert!(out.reports.is_empty());
     }
@@ -841,6 +938,7 @@ mod tests {
             "SessionEnd",
             "p_1",
             0,
+            None,
         );
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
             panic!()
@@ -851,7 +949,7 @@ mod tests {
     #[test]
     fn opencode_session_maps_to_report_with_opencode_identity() {
         let input = json!({"session_id": "os-1"});
-        let out = plan(Agent::Opencode, Action::Session, &input, "", "p_1", 0);
+        let out = plan(Agent::Opencode, Action::Session, &input, "", "p_1", 0, None);
         let Method::PaneReportAgentSession(params) = &out.reports[0] else {
             panic!()
         };
@@ -866,7 +964,15 @@ mod tests {
     fn opencode_stop_is_a_noop() {
         // Only claude carries a scrapable transcript + nudge protocol on Stop.
         let input = json!({"hook_event_name": "Stop", "transcript_path": "/whatever"});
-        let out = plan(Agent::Opencode, Action::Stop, &input, "Stop", "p_1", 0);
+        let out = plan(
+            Agent::Opencode,
+            Action::Stop,
+            &input,
+            "Stop",
+            "p_1",
+            0,
+            None,
+        );
         assert!(out.reports.is_empty() && out.stdout.is_none());
     }
 
@@ -875,7 +981,7 @@ mod tests {
     #[test]
     fn prompt_reports_text() {
         let input = json!({"prompt": "fix the bug"});
-        let out = plan(Agent::Claude, Action::Prompt, &input, "", "p_1", 0);
+        let out = plan(Agent::Claude, Action::Prompt, &input, "", "p_1", 0, None);
         let Method::PaneReportPrompt(params) = &out.reports[0] else {
             panic!()
         };
@@ -892,6 +998,7 @@ mod tests {
                 "",
                 "p_1",
                 0,
+                None,
             );
             assert!(out.reports.is_empty(), "expected no report for {p:?}");
         }
@@ -908,6 +1015,7 @@ mod tests {
             "",
             "p_1",
             0,
+            None,
         );
         let Method::PaneReportPrompt(params) = &out.reports[0] else {
             panic!()
@@ -939,7 +1047,7 @@ mod tests {
             r#"{"message":{"role":"assistant","content":[{"type":"text","text":"Did it.\n※ recap: done. Next: ship."}]}}"#,
         ]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0, None);
         let names: Vec<_> = out.reports.iter().map(method_name).collect();
         assert_eq!(names, ["report_reply", "report_recap"]);
         assert!(out.stdout.is_none(), "sentinel present ⇒ no nudge");
@@ -962,14 +1070,14 @@ mod tests {
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
 
         // Clean turn, no mail: nothing to say.
-        let quiet = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        let quiet = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0, None);
         assert!(
             quiet.stdout.is_none(),
             "no mail, sentinel present ⇒ no nudge"
         );
 
         // Clean turn WITH mail: still woken.
-        let woken = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 2);
+        let woken = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 2, None);
         let nudge = woken.stdout.expect("mail must wake a clean turn too");
         assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
         assert!(nudge.contains("2 unread messages"), "{nudge}");
@@ -984,7 +1092,7 @@ mod tests {
         // instructions — never two turns' worth of blocking.
         let path = transcript_with(&[r#"{"type":"assistant","content":"No sentinel here."}"#]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 1);
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 1, None);
         let nudge = out.stdout.expect("expected a nudge");
         assert!(nudge.contains("1 unread message"), "{nudge}");
         assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
@@ -1000,7 +1108,7 @@ mod tests {
             r#"{"type":"assistant","content":"Just did the work, no sentinel."}"#,
         ]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0, None);
         assert_eq!(
             out.reports.iter().map(method_name).collect::<Vec<_>>(),
             ["report_reply"]
@@ -1016,7 +1124,7 @@ mod tests {
         let path =
             transcript_with(&[r#"{"type":"assistant","content":"subagent output, no sentinel"}"#]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap(), "agent_id": "sub-1"});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0, None);
         assert!(out.stdout.is_none(), "subagent must not loop on a nudge");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1037,6 +1145,7 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
+            None,
         );
         assert_eq!(outcome.reports.len(), 1, "precondition: one report to send");
         emit(outcome); // must not panic or block the caller
@@ -1052,7 +1161,7 @@ mod tests {
     #[test]
     fn stop_empty_transcript_is_a_noop() {
         let input = json!({"hook_event_name": "Stop", "transcript_path": "/no/such/path"});
-        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0);
+        let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 0, None);
         assert!(out.reports.is_empty() && out.stdout.is_none());
     }
 
