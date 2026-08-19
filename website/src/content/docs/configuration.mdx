@@ -325,7 +325,7 @@ Common options:
 [ui]
 sidebar_width = 32
 sidebar_min_width = 18
-sidebar_max_width = 36
+sidebar_max_width = 80
 mobile_width_threshold = 64
 mouse_capture = true
 right_click_passthrough_modifier = ""
@@ -340,7 +340,27 @@ sidebar_row_gap = 1
 sidebar_pane_gap = 0
 ```
 
-`sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
+`sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 80. The ceiling is deliberately generous: the servers band's metric line runs to roughly 32 columns on its own, so a narrower sidebar truncates it. `sidebar_width` (the width you actually start at) is unchanged — widen by dragging.
+
+## Fleet thermal health
+
+Each node can declare its own thermal health, which gossips to the fleet and tints the matching metric glyph in the servers band — green stays untouched, a stressed node turns its glyph amber, a critical one red. Nothing is added to the row: the colour *is* the signal.
+
+```toml
+thermal_command = "/etc/flock/thermal-report"
+```
+
+Flock deliberately reads no sensors. What runs hot and what counts as hot differ per machine — 90 °C is normal on Apple silicon under load, an RTX 5090 is fine at 80 °C, and a VM guest can read nothing at all — so the host owns the calibration and Flock only transports and renders the verdict.
+
+The command runs about every 30 seconds with a hard 5-second timeout and must print one JSON object:
+
+```json
+{"severity": 2, "component": "gpu", "label": "GPU 84°"}
+```
+
+`severity` is `0` nominal, `1` fair, `2` serious, `3` critical — only `2` and `3` tint. `component` is `cpu`, `gpu`, or `node` and picks which glyph to colour; if that metric is missing, the severity gets its own thermometer glyph at the head of the row so an alarm is never silently dropped. `label` is a short free-text detail.
+
+Anything else — no such command, a non-zero exit, unparseable output, a timeout — means the node declares **nothing**, rather than a made-up healthy reading. A repeatedly failing reporter is slowed down and logged, never disabled permanently. Reporters must not read stdin.
 
 `mobile_width_threshold` controls the terminal width at or below which Flock uses the mobile single-column layout. The default is 64 columns; increase it for foldables, tablets, or wide phone terminals.
 

@@ -2224,6 +2224,7 @@ fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
             stats.mem_total,
             stats.disk_free,
             stats.gpu_percent.map(f32::from),
+            stats.thermal.as_ref(),
             p,
         );
     }
@@ -2273,7 +2274,8 @@ fn home_server_rows(
                         system.mem_used,
                         system.mem_total,
                         system.disk_free,
-                        None,
+                        system.gpu_percent.map(f32::from),
+                        system.thermal.as_ref(),
                         p,
                     )
                 })
@@ -2377,9 +2379,13 @@ fn peer_server_rows(
                 system.mem_used,
                 system.mem_total,
                 system.disk_free,
-                None,
+                system.gpu_percent.map(f32::from),
+                system.thermal.as_ref(),
                 p,
             );
+            // A ghost row is unreachable, so liveness outranks heat: the flat
+            // dim restyle deliberately flattens any thermal tint too (#291).
+            // A stale reading from a node we cannot reach is not a live alarm.
             for span in &mut health {
                 span.style = Style::default()
                     .fg(p.overlay0)
@@ -2426,14 +2432,17 @@ fn peer_server_rows(
 
     let mut health: Vec<Span<'static>> = Vec::new();
     if let Some(system) = peer.system.as_ref() {
-        // Peer summaries don't carry gpu (or net/battery) — see
-        // `PeerSystemSummary`; the shared formatter simply omits them.
+        // Net and battery are absent from `PeerSystemSummary`, and the shared
+        // formatter simply omits them. GPU they DO carry as of #291 — before
+        // that it was sampled locally and dropped at the box, so this row
+        // rendered a blank GPU column while the self row showed one.
         health = server_health_spans(
             system.cpu_percent.map(f32::from),
             system.mem_used,
             system.mem_total,
             system.disk_free,
-            None,
+            system.gpu_percent.map(f32::from),
+            system.thermal.as_ref(),
             p,
         );
     }
@@ -2458,16 +2467,52 @@ fn server_health_spans(
     mem_total: Option<u64>,
     disk_free: Option<u64>,
     gpu_percent: Option<f32>,
+    thermal: Option<&crate::api::schema::ThermalReport>,
     p: &crate::app::state::Palette,
 ) -> Vec<Span<'static>> {
     use super::status::{
-        format_mem_ratio, format_percent3, mem_percent, push_band_metric, utilization_style,
+        format_mem_ratio, format_percent3, mem_percent, push_band_metric, push_band_metric_tinted,
+        thermal_style, utilization_style,
+    };
+    use crate::api::schema::ThermalComponent;
+    // #291: the node's self-declared heat colours ONE glyph — the one the host
+    // named. Nothing is added to the line: at the band's density (a self row is
+    // already ~30 cols against ~24 at the default sidebar width) an extra
+    // metric would simply truncate, so the glyph's until-now constant colour
+    // carries the signal instead.
+    let tint = thermal.filter(|report| report.tints()).and_then(|report| {
+        thermal_style(report.severity, p).map(|style| (report.component, style))
+    });
+    let tint_for = |component: ThermalComponent| {
+        tint.filter(|(declared, _)| *declared == component)
+            .map(|(_, style)| style)
+    };
+    // A tint needs a glyph to land on, and the declared component may not have
+    // one: a Linux box reports no GPU utilization at all (`read_gpu_percent`
+    // is macOS-only), a pre-#291 peer gossips none, and cpu is briefly absent
+    // before the sampler's first delta. Without this the alarm would silently
+    // vanish on exactly the GPU box the feature exists for.
+    let declared_glyph_exists = match tint.map(|(component, _)| component) {
+        // `Node` has no glyph of its own and rides the CPU metric.
+        Some(ThermalComponent::Cpu | ThermalComponent::Node) => cpu_percent.is_some(),
+        Some(ThermalComponent::Gpu) => gpu_percent.is_some(),
+        None => true,
     };
     let mut spans = Vec::new();
+    if let Some((_, style)) = tint.filter(|_| !declared_glyph_exists) {
+        // Standalone alarm, no number: the severity gets its own glyph rather
+        // than being dropped. LEADS the line because `clamp_line` truncates
+        // from the right — an alarm must never be the first thing cut. Costs
+        // ~2 columns, and only on a node that is actually in trouble.
+        spans.push(Span::styled("\u{f050f}".to_string(), style)); // nf-md-thermometer
+    }
     if let Some(cpu) = cpu_percent {
-        push_band_metric(
+        push_band_metric_tinted(
             &mut spans,
             "\u{f0ee0}", // nf-md-cpu_64_bit
+            // `Node` has no glyph of its own and leads the metric line, so a
+            // whole-box declaration lands here.
+            tint_for(ThermalComponent::Cpu).or_else(|| tint_for(ThermalComponent::Node)),
             format_percent3(cpu),
             utilization_style(cpu, p),
             p,
@@ -2492,9 +2537,10 @@ fn server_health_spans(
         );
     }
     if let Some(gpu) = gpu_percent {
-        push_band_metric(
+        push_band_metric_tinted(
             &mut spans,
             "\u{f08ae}", // nf-md-expansion_card
+            tint_for(ThermalComponent::Gpu),
             format_percent3(gpu),
             utilization_style(gpu, p),
             p,
@@ -2542,35 +2588,6 @@ fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
     Line::from(out)
 }
 
-/// Compact keyhint for the spaces quick-jump ordinals (#114 part 2), derived
-/// from the first bound `switch_space` chord. The indexed bindings carry
-/// per-digit labels (`prefix+shift+1` … `prefix+shift+9`); collapse the trailing
-/// digit to `N` so the header reads `prefix+shift+N`. `None` when unbound, which
-/// is also when no ordinals render.
-/// Collapse an indexed keybind label (`prefix+shift+1`) to a compact keyhint
-/// (`prefix+shift+N`) by replacing a single trailing digit with `N`.
-fn collapse_index_label(label: &str) -> String {
-    match label.strip_suffix(|c: char| c.is_ascii_digit()) {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}N"),
-        _ => label.to_string(),
-    }
-}
-
-fn spaces_jump_keyhint(app: &AppState) -> Option<String> {
-    Some(collapse_index_label(
-        &app.keybinds.switch_space.first()?.label,
-    ))
-}
-
-/// Keyhint for the agents-band quick-jump ordinals (#114 part 2 / #147), from
-/// the first bound `focus_agent` chord. `None` when unbound — the same gate as
-/// the ordinals, so the header affordance and the row numbers agree.
-fn agents_jump_keyhint(app: &AppState) -> Option<String> {
-    Some(collapse_index_label(
-        &app.keybinds.focus_agent.first()?.label,
-    ))
-}
-
 fn render_workspace_list(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2590,20 +2607,10 @@ fn render_workspace_list(
             Some(server) => format!(" spaces · only {server}"),
             None => " spaces".to_string(),
         };
-        let mut header_spans = vec![Span::styled(
+        let header_spans = vec![Span::styled(
             header_label,
             Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
         )];
-        // #114 part 2: keyhint for the quick-jump ordinals rendered on the
-        // section rows below — shown only when `switch_space` is actually bound
-        // (same gate as the ordinals), so the affordance and the numbers always
-        // agree and the unbound default stays uncluttered.
-        if let Some(hint) = spaces_jump_keyhint(app) {
-            header_spans.push(Span::styled(
-                format!("  {hint}"),
-                Style::default().fg(p.overlay0),
-            ));
-        }
         frame.render_widget(
             Paragraph::new(clamp_line(Line::from(header_spans), area.width)),
             header_rect,
@@ -3050,18 +3057,10 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let mut agents_header_spans = vec![Span::styled(
+    let agents_header_spans = vec![Span::styled(
         " agents",
         Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
     )];
-    // #147: keyhint for the row jump-ordinals below, shown only when
-    // `focus_agent` is bound (same gate as the ordinals).
-    if let Some(hint) = agents_jump_keyhint(app) {
-        agents_header_spans.push(Span::styled(
-            format!("  {hint}"),
-            Style::default().fg(p.overlay0),
-        ));
-    }
     frame.render_widget(
         Paragraph::new(clamp_line(Line::from(agents_header_spans), area.width)),
         Rect::new(area.x, area.y + 1, area.width, 1),
@@ -4042,6 +4041,30 @@ mod tests {
     }
 
     #[test]
+    fn self_server_rows_render_own_thermal_tint() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        // The self row shares `server_health_spans` with the peer rows, but it
+        // is the row the host-side reporter will actually drive — pin it.
+        let mut app = crate::app::state::AppState::test_new();
+        app.system_stats = Some(crate::system_stats::SystemStats {
+            cpu_percent: Some(4.0),
+            thermal: Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Cpu,
+                label: "fans 45m".into(),
+            }),
+            ..Default::default()
+        });
+        // #306 gates the self row on sampler freshness — an unstamped snapshot
+        // drops health entirely, tint included, which is the correct behaviour
+        // and would silently hollow out this test.
+        app.system_stats_at = Some(std::time::Instant::now());
+        let p = app.palette.clone();
+        let row = self_server_rows(&app, std::time::Instant::now());
+        assert_eq!(glyph_style(&row.health, "\u{f0ee0}").fg, Some(p.red));
+    }
+
+    #[test]
     fn peer_server_rows_show_configured_name_over_reported_host() {
         // The peer is configured `[[peers]] name = "anvil"` but reports a raw
         // OS hostname; the row must show the configured name (#42).
@@ -4267,6 +4290,8 @@ mod tests {
             mem_used: Some(48 * 1024 * 1024 * 1024),
             mem_total: Some(64 * 1024 * 1024 * 1024),
             disk_free: None,
+            gpu_percent: None,
+            thermal: None,
         });
         let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         let name = spans_text(&row.name);
@@ -4339,6 +4364,8 @@ mod tests {
             mem_used: Some(92 * G),
             mem_total: Some(512 * G),
             disk_free: None,
+            gpu_percent: None,
+            thermal: None,
         });
         let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         let health = line_text(&row.health);
@@ -4346,6 +4373,251 @@ mod tests {
         // width of total so the slash column never jitters.
         assert!(health.contains("\u{f0ee0} 100%"), "{health}");
         assert!(health.contains("\u{f035b}  92G/512G"), "{health}");
+    }
+
+    /// Build a peer row's health line for a node declaring `thermal`.
+    fn health_with_thermal(
+        thermal: Option<crate::api::schema::ThermalReport>,
+        p: &crate::app::state::Palette,
+    ) -> Line<'static> {
+        health_with_thermal_and_metrics(thermal, Some(4), Some(97), p)
+    }
+
+    /// As [`health_with_thermal`], with control over whether the CPU and GPU
+    /// metrics exist at all — the case where a declared component has no glyph
+    /// to tint.
+    fn health_with_thermal_and_metrics(
+        thermal: Option<crate::api::schema::ThermalReport>,
+        cpu_percent: Option<u8>,
+        gpu_percent: Option<u8>,
+        p: &crate::app::state::Palette,
+    ) -> Line<'static> {
+        const G: u64 = 1024 * 1024 * 1024;
+        let mut peer = peer_with_workspaces("anvil", vec![]);
+        peer.host = Some("anvil".into());
+        peer.system = Some(crate::api::schema::PeerSystemSummary {
+            cpu_percent,
+            mem_used: Some(13 * G),
+            mem_total: Some(16 * G),
+            disk_free: None,
+            gpu_percent,
+            thermal,
+        });
+        peer_server_rows(&peer, p, crate::config::ServerLabelConfig::Both).health
+    }
+
+    /// The style of the span carrying the VALUE that follows `glyph`.
+    fn value_style_after(line: &Line<'_>, glyph: &str) -> Style {
+        let at = line
+            .spans
+            .iter()
+            .position(|span| span.content.starts_with(glyph))
+            .unwrap_or_else(|| panic!("no {glyph} span in {}", line_text(line)));
+        line.spans[at + 1].style
+    }
+
+    /// The style of the span carrying `glyph` in a health line.
+    fn glyph_style(line: &Line<'_>, glyph: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.starts_with(glyph))
+            .unwrap_or_else(|| panic!("no {glyph} span in {}", line_text(line)))
+            .style
+    }
+
+    #[test]
+    fn peer_server_rows_gossip_gpu_utilization() {
+        // #291: GPU was sampled locally long before it had a wire field, so a
+        // peer row rendered a blank GPU column while the self row showed a
+        // number. The band's fourth metric is now populated from gossip.
+        let p = crate::app::state::AppState::test_new().palette;
+        let health = line_text(&health_with_thermal(None, &p));
+        assert!(health.contains("\u{f08ae}  97%"), "{health}");
+    }
+
+    #[test]
+    fn thermal_tint_colours_the_declared_glyph_and_spends_no_column() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        let p = crate::app::state::AppState::test_new().palette;
+
+        let quiet = health_with_thermal(None, &p);
+        let hot = health_with_thermal(
+            Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Gpu,
+                label: "GPU 84".into(),
+            }),
+            &p,
+        );
+
+        // The declared glyph goes red; every other glyph stays dim.
+        assert_eq!(glyph_style(&hot, "\u{f08ae}").fg, Some(p.red));
+        assert_eq!(glyph_style(&hot, "\u{f0ee0}").fg, Some(p.overlay0));
+        // The VALUE keeps carrying utilization, independent of the glyph:
+        // a red glyph beside a low percentage is a box hot while idle, which
+        // is cooling failure and the one state load alone cannot show.
+        assert_eq!(glyph_style(&quiet, "\u{f08ae}").fg, Some(p.overlay0));
+
+        // Colour only — the text is byte-identical, so the tint cannot push
+        // the line into `clamp_line`'s ellipsis at any sidebar width.
+        assert_eq!(line_text(&hot), line_text(&quiet));
+
+        // A whole-node declaration has no glyph of its own and lands on the
+        // CPU glyph, which leads the metric line.
+        let node = health_with_thermal(
+            Some(ThermalReport {
+                severity: 2,
+                component: ThermalComponent::Node,
+                label: String::new(),
+            }),
+            &p,
+        );
+        assert_eq!(glyph_style(&node, "\u{f0ee0}").fg, Some(p.yellow));
+        assert_eq!(line_text(&node), line_text(&quiet));
+    }
+
+    #[test]
+    fn nominal_thermal_renders_identically_to_declaring_nothing() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        let p = crate::app::state::AppState::test_new().palette;
+        let quiet = health_with_thermal(None, &p);
+
+        // Ranks below the tint floor must not colour anything: an 8-node fleet
+        // reporting "fine" has to look exactly like today, or the one box in
+        // trouble stops standing out.
+        for severity in [0, 1] {
+            let calm = health_with_thermal(
+                Some(ThermalReport {
+                    severity,
+                    component: ThermalComponent::Cpu,
+                    label: "fans 2m".into(),
+                }),
+                &p,
+            );
+            assert_eq!(line_text(&calm), line_text(&quiet));
+            assert_eq!(
+                calm.spans.iter().map(|s| s.style).collect::<Vec<_>>(),
+                quiet.spans.iter().map(|s| s.style).collect::<Vec<_>>(),
+                "severity {severity} must render byte-identically to a silent node"
+            );
+        }
+    }
+
+    #[test]
+    fn thermal_alarm_survives_a_declared_component_with_no_metric() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        const THERMOMETER: &str = "\u{f050f}";
+        let p = crate::app::state::AppState::test_new().palette;
+
+        // The GPU box this feature exists for: Linux reports no GPU
+        // utilization at all (`read_gpu_percent` is macOS-only), so there is
+        // no GPU glyph to tint. The alarm must NOT disappear.
+        let hot = health_with_thermal_and_metrics(
+            Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Gpu,
+                label: "GPU 84".into(),
+            }),
+            Some(4),
+            None,
+            &p,
+        );
+        assert_eq!(glyph_style(&hot, THERMOMETER).fg, Some(p.red));
+        // ...and it leads the line, because `clamp_line` truncates from the
+        // right: a narrow sidebar must not be able to cut the alarm.
+        assert!(
+            hot.spans[0].content.starts_with(THERMOMETER),
+            "alarm must lead: {}",
+            line_text(&hot)
+        );
+
+        // Same hole for a whole-node declaration before the sampler has
+        // produced its first CPU delta.
+        let no_cpu = health_with_thermal_and_metrics(
+            Some(ThermalReport {
+                severity: 2,
+                component: ThermalComponent::Node,
+                label: String::new(),
+            }),
+            None,
+            None,
+            &p,
+        );
+        assert_eq!(glyph_style(&no_cpu, THERMOMETER).fg, Some(p.yellow));
+
+        // When the declared glyph DOES exist the tint rides it, and no
+        // standalone alarm is spent.
+        let riding = health_with_thermal_and_metrics(
+            Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Gpu,
+                label: String::new(),
+            }),
+            Some(4),
+            Some(97),
+            &p,
+        );
+        assert!(
+            !line_text(&riding).contains(THERMOMETER),
+            "should tint the GPU glyph, not add one: {}",
+            line_text(&riding)
+        );
+    }
+
+    #[test]
+    fn thermal_tint_leaves_the_utilization_value_alone() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        let p = crate::app::state::AppState::test_new().palette;
+        let quiet = health_with_thermal(None, &p);
+        let hot = health_with_thermal(
+            Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Cpu,
+                label: String::new(),
+            }),
+            &p,
+        );
+        // Glyph and value are independent channels: tinting the glyph red must
+        // not repaint the value, or the hot-while-idle divergence that
+        // motivates the whole feature becomes unreadable.
+        assert_eq!(glyph_style(&hot, "\u{f0ee0}").fg, Some(p.red));
+        assert_eq!(
+            value_style_after(&hot, "\u{f0ee0}").fg,
+            value_style_after(&quiet, "\u{f0ee0}").fg
+        );
+    }
+
+    #[test]
+    fn ghost_rows_flatten_a_hot_thermal_tint() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+        const G: u64 = 1024 * 1024 * 1024;
+        let p = crate::app::state::AppState::test_new().palette;
+        let mut peer = peer_with_workspaces("ksb", vec![]);
+        peer.last_ok = None;
+        peer.error = Some("connect timed out".into());
+        peer.system = Some(crate::api::schema::PeerSystemSummary {
+            cpu_percent: Some(42),
+            mem_used: Some(8 * G),
+            mem_total: Some(16 * G),
+            disk_free: None,
+            gpu_percent: Some(97),
+            thermal: Some(ThermalReport {
+                severity: 3,
+                component: ThermalComponent::Cpu,
+                label: "fans 45m".into(),
+            }),
+        });
+        let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
+        // Liveness outranks heat: a stale severity-3 reading from a node we
+        // cannot reach must not render as a live red alarm.
+        assert!(
+            row.health
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(p.overlay0)),
+            "ghost row kept a tint: {:?}",
+            row.health.spans
+        );
     }
 
     #[test]
@@ -4360,6 +4632,8 @@ mod tests {
             mem_used: Some(8 * 1024 * 1024 * 1024),
             mem_total: Some(16 * 1024 * 1024 * 1024),
             disk_free: Some(100 * 1024 * 1024 * 1024),
+            gpu_percent: None,
+            thermal: None,
         });
         let row = peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both);
         // Ghost of the normal row (#42): the struck name LEADS (same
@@ -6319,15 +6593,6 @@ mod tests {
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
     }
 
-    #[test]
-    fn collapse_index_label_replaces_trailing_digit_with_n() {
-        assert_eq!(collapse_index_label("prefix+shift+1"), "prefix+shift+N");
-        assert_eq!(collapse_index_label("alt+9"), "alt+N");
-        // No trailing digit (or a bare digit): left as-is.
-        assert_eq!(collapse_index_label("prefix+a"), "prefix+a");
-        assert_eq!(collapse_index_label("1"), "1");
-    }
-
     fn app_with_two_agents() -> AppState {
         let mut app = AppState::test_new();
         let first = Workspace::test_new("one");
@@ -6371,17 +6636,20 @@ mod tests {
     }
 
     #[test]
-    fn agents_band_numbers_rows_and_shows_keyhint_when_focus_agent_bound() {
-        // #147: with `focus_agent` bound, the header advertises the chord and
-        // each local row carries its 1-based jump ordinal (matching
-        // `focus_agent_entry`, which indexes this same list).
+    fn agents_band_numbers_rows_without_a_header_keyhint() {
+        // #147 numbered the rows; #299 dropped the header chord that restated
+        // them. The ordinals ARE the affordance — the header spends no columns
+        // teaching a chord the numbers below it already show.
         let mut app = app_with_two_agents();
         let config: crate::config::Config =
             toml::from_str("[keys]\nfocus_agent = \"alt+1..9\"\n").unwrap();
         app.keybinds = config.keybinds();
 
         let (header, first_row) = agents_band_rows(&app);
-        assert!(header.contains("alt+N"), "header keyhint: {header:?}");
+        assert!(
+            !header.contains("alt+N"),
+            "header must carry no chord keyhint: {header:?}"
+        );
         assert!(
             first_row.trim_start().starts_with('1'),
             "first agent row should be numbered 1: {first_row:?}"
@@ -7373,10 +7641,11 @@ mod tests {
     }
 
     #[test]
-    fn spaces_header_shows_jump_keyhint_when_switch_space_bound() {
-        // #114 part 2: the header advertises the quick-jump chord (collapsed to
-        // `N`) exactly when `switch_space` is bound — the same gate as the row
-        // ordinals, so affordance and numbers agree.
+    fn spaces_header_omits_jump_keyhint_even_when_switch_space_bound() {
+        // #299: the header used to advertise the quick-jump chord whenever
+        // `switch_space` was bound. It no longer does — the row ordinals carry
+        // the affordance, and the header columns are worth more than a chord
+        // restated directly above the numbers.
         let mut app = AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.ensure_test_terminals();
@@ -7389,8 +7658,8 @@ mod tests {
 
         let header_text = spaces_header_text(&app, 50);
         assert!(
-            header_text.contains("prefix+shift+N"),
-            "expected jump keyhint in {header_text:?}"
+            !header_text.contains("prefix+shift+N"),
+            "header must carry no chord keyhint: {header_text:?}"
         );
     }
 

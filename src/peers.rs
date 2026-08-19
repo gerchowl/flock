@@ -861,13 +861,16 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .get("icon")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // #291: the JSON path does not pass through the bincode `From` impl, so
+    // the host-declared thermal rank/label is normalized here instead.
     let system = result
         .get("system")
         .filter(|system| !system.is_null())
         .cloned()
-        .map(serde_json::from_value)
+        .map(serde_json::from_value::<crate::api::schema::PeerSystemSummary>)
         .transpose()
-        .map_err(|err| format!("summary system parse error: {err}"))?;
+        .map_err(|err| format!("summary system parse error: {err}"))?
+        .map(crate::api::schema::PeerSystemSummary::sanitized);
     let workspaces: Vec<PeerWorkspaceSummary> = result
         .get("workspaces")
         .cloned()
@@ -877,13 +880,21 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         .unwrap_or_default();
     // Gossip v3 (#101): relayed_fleet is additive with a serde default so a
     // v(N-1) peer that never emits the field parses cleanly.
-    let relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer> = result
+    let mut relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer> = result
         .get("relayed_fleet")
         .cloned()
         .map(serde_json::from_value)
         .transpose()
         .map_err(|err| format!("summary relayed_fleet parse error: {err}"))?
         .unwrap_or_default();
+    // #291: a relayed entry is host-authored two hops back — sanitize it on
+    // the same boundary rather than trusting the middle hop to have done it.
+    for entry in &mut relayed_fleet {
+        entry.system = entry
+            .system
+            .take()
+            .map(crate::api::schema::PeerSystemSummary::sanitized);
+    }
     Ok(PeerSummaryPayload {
         host,
         version,
@@ -975,6 +986,8 @@ mod tests {
                 mem_used: Some(13 << 30),
                 mem_total: Some(16 << 30),
                 disk_free: None,
+                gpu_percent: None,
+                thermal: None,
             }),
             latency_ms: Some(34),
             workspaces: vec![crate::api::schema::PeerWorkspaceSummary {
@@ -1048,6 +1061,129 @@ mod tests {
         let mut none = summary_state("sage", "lars@sage", Some(5));
         none.icon = None;
         assert_eq!(peer_from_wire(peer_to_wire(&none)).icon, None);
+    }
+
+    #[test]
+    fn fleet_system_wire_carries_gpu_and_thermal_both_directions() {
+        use crate::api::schema::{ThermalComponent, ThermalReport};
+
+        // #291: GPU utilization and the self-declared thermal report survive
+        // the bincode roundtrip. GPU is the older half of this: it was sampled
+        // locally for a long time with nowhere on the wire to go.
+        let mut state = summary_state("anvil", "lars@anvil", Some(5));
+        state.system.as_mut().unwrap().gpu_percent = Some(96);
+        state.system.as_mut().unwrap().thermal = Some(ThermalReport {
+            severity: 3,
+            component: ThermalComponent::Gpu,
+            label: "GPU 84".to_string(),
+        });
+        let system = peer_from_wire(peer_to_wire(&state)).system.unwrap();
+        assert_eq!(system.gpu_percent, Some(96));
+        let thermal = system.thermal.unwrap();
+        assert_eq!(thermal.severity, 3);
+        assert_eq!(thermal.component, ThermalComponent::Gpu);
+        assert_eq!(thermal.label, "GPU 84");
+
+        // Absent (a node that declares nothing, or any microVM) decodes to
+        // None rather than a synthesized nominal reading.
+        let none = summary_state("sage", "lars@sage", Some(5));
+        let system = peer_from_wire(peer_to_wire(&none)).system.unwrap();
+        assert_eq!(system.gpu_percent, None);
+        assert_eq!(system.thermal, None);
+    }
+
+    #[test]
+    fn thermal_report_from_a_peer_is_clamped_and_truncated_on_receive() {
+        use crate::api::schema::{
+            ThermalComponent, ThermalReport, THERMAL_LABEL_MAX_BYTES, THERMAL_SEVERITY_MAX,
+        };
+
+        // A peer running a broken reporter must not be able to push an
+        // out-of-range rank or an unbounded label into our render pass.
+        let mut state = summary_state("anvil", "lars@anvil", Some(5));
+        state.system.as_mut().unwrap().thermal = Some(ThermalReport {
+            severity: 200,
+            component: ThermalComponent::Cpu,
+            label: "x".repeat(4096),
+        });
+        let thermal = peer_from_wire(peer_to_wire(&state))
+            .system
+            .unwrap()
+            .thermal
+            .unwrap();
+        assert_eq!(thermal.severity, THERMAL_SEVERITY_MAX);
+        assert_eq!(thermal.label.len(), THERMAL_LABEL_MAX_BYTES);
+
+        // Truncation lands on a char boundary — a multi-byte label must not
+        // panic or produce invalid UTF-8 when it straddles the cap.
+        // 3 bytes per char, so the cap at 16 lands MID-character — the case
+        // that makes the char-boundary walk load-bearing. A plain
+        // `String::truncate(16)` would panic here.
+        let mut wide = summary_state("sage", "lars@sage", Some(5));
+        wide.system.as_mut().unwrap().thermal = Some(ThermalReport {
+            severity: 2,
+            component: ThermalComponent::Node,
+            label: "漢".repeat(20),
+        });
+        let thermal = peer_from_wire(peer_to_wire(&wide))
+            .system
+            .unwrap()
+            .thermal
+            .unwrap();
+        assert!(thermal.label.len() <= THERMAL_LABEL_MAX_BYTES);
+        assert!(thermal.label.chars().all(|c| c == '漢'));
+    }
+
+    #[test]
+    fn parse_summary_response_reads_thermal_and_sanitizes_it() {
+        use crate::api::schema::{ThermalComponent, THERMAL_LABEL_MAX_BYTES, THERMAL_SEVERITY_MAX};
+
+        // #291: the JSON path does not pass through the bincode `From` impl,
+        // so it sanitizes independently — regression guard for exactly that.
+        let hot = concat!(
+            r#"{"id":"x","result":{"host":"anvil","system":{"cpu_percent":4,"gpu_percent":97,"#,
+            r#""thermal":{"severity":9,"component":"gpu","label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"#,
+            r#""workspaces":[]}}"#
+        );
+        let system = parse_summary_response(hot, 5).unwrap().system.unwrap();
+        assert_eq!(system.gpu_percent, Some(97));
+        let thermal = system.thermal.unwrap();
+        assert_eq!(thermal.severity, THERMAL_SEVERITY_MAX);
+        assert_eq!(thermal.component, ThermalComponent::Gpu);
+        assert_eq!(thermal.label.len(), THERMAL_LABEL_MAX_BYTES);
+
+        // A node that emits neither field parses cleanly to None — the shape
+        // every pre-#291 peer sends.
+        let quiet =
+            r#"{"id":"x","result":{"host":"sage","system":{"cpu_percent":4},"workspaces":[]}}"#;
+        let system = parse_summary_response(quiet, 5).unwrap().system.unwrap();
+        assert_eq!(system.gpu_percent, None);
+        assert_eq!(system.thermal, None);
+    }
+
+    #[test]
+    fn parse_summary_response_sanitizes_relayed_fleet_thermal() {
+        use crate::api::schema::{THERMAL_LABEL_MAX_BYTES, THERMAL_SEVERITY_MAX};
+
+        // #291: a relayed entry is host-authored two hops back. Sanitizing the
+        // direct `system` block is not enough — without the relayed loop a
+        // hostile rank/label reaches the render pass through the second hop.
+        let relayed = concat!(
+            r#"{"id":"x","result":{"host":"mba22","workspaces":[],"relayed_fleet":[{"#,
+            r#""name":"anvil","ssh_target":"lars@anvil","system":{"cpu_percent":9,"#,
+            r#""thermal":{"severity":250,"component":"cpu","label":"zzzzzzzzzzzzzzzzzzzzzzzzzz"}}"#,
+            r#","origin":"mba22"}]}}"#
+        );
+        let payload = parse_summary_response(relayed, 5).unwrap();
+        let thermal = payload.relayed_fleet[0]
+            .system
+            .as_ref()
+            .unwrap()
+            .thermal
+            .as_ref()
+            .unwrap();
+        assert_eq!(thermal.severity, THERMAL_SEVERITY_MAX);
+        assert_eq!(thermal.label.len(), THERMAL_LABEL_MAX_BYTES);
     }
 
     #[test]

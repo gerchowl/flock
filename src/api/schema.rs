@@ -2124,6 +2124,101 @@ pub struct PeerSystemSummary {
     /// Free space on the volume holding $HOME, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free: Option<u64>,
+    /// Best-effort GPU utilization, 0..=100. Sampled locally since the status
+    /// line shipped, but until #291 it never left the box — every peer row
+    /// rendered a blank GPU column while the self row showed a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_percent: Option<u8>,
+    /// Host-declared thermal health (#291). `None` = the node reports nothing,
+    /// which is the honest answer inside a microVM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<ThermalReport>,
+}
+
+impl PeerSystemSummary {
+    /// Normalize the host-declared parts of a summary arriving from a peer.
+    /// Called on EVERY inbound boundary — the bincode wire conversion and the
+    /// JSON `peers.summary` parse alike — so a node running a broken reporter
+    /// cannot push an out-of-range rank or an unbounded label into a render
+    /// pass. Nothing else in this struct is host-authored free-form.
+    pub fn sanitized(mut self) -> Self {
+        self.thermal = self.thermal.map(ThermalReport::sanitized);
+        self
+    }
+}
+
+/// Which servers-band metric glyph a [`ThermalReport`] colours (#291).
+///
+/// The HOST picks this, because what runs hot differs per box: the die on a
+/// Mac, the card on a GPU box. Flock never infers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThermalComponent {
+    /// Tint the CPU glyph.
+    #[default]
+    Cpu,
+    /// Tint the GPU glyph.
+    Gpu,
+    /// The node as a whole — tints the CPU glyph today, since it leads the
+    /// metric line, but carries a distinct meaning for the detail view.
+    Node,
+}
+
+/// A node's SELF-DECLARED thermal health (#291), gossiped with its identity
+/// exactly like the fleet icon (#164).
+///
+/// Deliberately an ORDINAL, not degrees: 90 °C on Apple Silicon under load is
+/// normal and an RTX 5090 is fine at 80 °C, so a temperature threshold in
+/// flock would false-alarm on every inference run. The host owns calibration —
+/// flock ships no temperature table and colours by rank alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThermalReport {
+    /// 0 nominal / 1 fair / 2 serious / 3 critical. Clamped on receive.
+    pub severity: u8,
+    /// Which band glyph this applies to.
+    #[serde(default)]
+    pub component: ThermalComponent,
+    /// Short host-authored detail for the peer detail view ("fans 45m",
+    /// "GPU 84°"). Truncated to [`THERMAL_LABEL_MAX_BYTES`] on receive; never
+    /// rendered in the band, which spends no columns on this (#291).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// Severity above which the band tints a glyph: `serious` and `critical` show,
+/// `nominal`/`fair` render byte-identically to a node reporting nothing. Keeps
+/// an 8-node fleet from becoming a christmas tree that hides the one hot box.
+pub const THERMAL_TINT_MIN_SEVERITY: u8 = 2;
+
+/// Highest severity rank a peer may assert; anything above clamps to it.
+pub const THERMAL_SEVERITY_MAX: u8 = 3;
+
+/// Byte cap on a gossiped thermal label. `FleetPeer` rides through relayed
+/// snapshots (up to `FLEET_SNAPSHOT_MAX_PEERS`), so an uncapped host-authored
+/// string multiplies against `MAX_FRAME_SIZE`.
+pub const THERMAL_LABEL_MAX_BYTES: usize = 16;
+
+impl ThermalReport {
+    /// Normalize a report arriving from ANY peer: clamp the severity rank and
+    /// truncate the label on a char boundary. Applied on every receive path —
+    /// a peer running a broken reporter must not be able to inject an
+    /// out-of-range rank or an unbounded string into our render pass.
+    pub fn sanitized(mut self) -> Self {
+        self.severity = self.severity.min(THERMAL_SEVERITY_MAX);
+        if self.label.len() > THERMAL_LABEL_MAX_BYTES {
+            let mut end = THERMAL_LABEL_MAX_BYTES;
+            while end > 0 && !self.label.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.label.truncate(end);
+        }
+        self
+    }
+
+    /// Whether this report earns a tint in the servers band.
+    pub fn tints(&self) -> bool {
+        self.severity >= THERMAL_TINT_MIN_SEVERITY
+    }
 }
 
 /// One workspace in a federated peer's `peers.summary` response: just enough
