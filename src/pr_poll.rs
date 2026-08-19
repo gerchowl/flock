@@ -272,22 +272,15 @@ pub(crate) fn fetch_batch(
 /// recording it on each of N workspaces would report one outage as N and
 /// destroy the distinction between "this branch has no PR" and "the poller
 /// wedged", which is exactly the signal the #294 incident lacked.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PrPollHealth {
-    pub last_success: Option<std::time::Instant>,
-    pub last_attempt: Option<std::time::Instant>,
-    pub consecutive_failures: u32,
-    pub last_error: Option<PrPollErrorKind>,
-    /// Set while a round is running. Also the overlap guard: a tick that finds
-    /// this set skips instead of spawning a second round. Unbounded spawning is
-    /// what turned a slow host into a collapsing one (#294) — rounds piled up
-    /// rather than draining.
-    pub in_flight_since: Option<std::time::Instant>,
-    /// Rounds skipped because one was already running. Visible rather than
-    /// silent: a poller quietly skipping every tick looks identical to a
-    /// healthy one that has nothing to report.
-    pub skipped_rounds: u64,
-}
+///
+/// The state machine is shared with the fleet's other periodic pollers via
+/// [`crate::health::PollerHealthCore`]; the type-level fence is the closed
+/// error-kind enum, which each poller owns.
+pub(crate) type PrPollHealth = crate::health::PollerHealthCore<PrPollErrorKind>;
+
+/// Longest a PR-poll round can legitimately be in flight: `curl`'s own
+/// ceiling plus slack for process spawn and the channel hop.
+pub(crate) const PR_POLL_MAX_ROUND_SECS: u64 = 40;
 
 /// Why a round failed, as a closed set.
 ///
@@ -333,96 +326,9 @@ impl PrPollErrorKind {
     }
 }
 
-/// Health as a three-state verdict.
-///
-/// Thresholds are derived from the caller's configured staleness window rather
-/// than invented here, so PR freshness and gossip freshness cannot disagree
-/// about what "stale" means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrPollStatus {
-    Ok,
-    Degraded,
-    Broken,
-}
-
-/// Consecutive failures past which a poller is Degraded even while its last
-/// value is still inside the staleness window.
-pub(crate) const DEGRADED_FAILURE_STREAK: u32 = 3;
-
-impl PrPollHealth {
-    pub(crate) fn mark_started(&mut self, now: std::time::Instant) {
-        self.in_flight_since = Some(now);
-        self.last_attempt = Some(now);
-    }
-
-    pub(crate) fn mark_success(&mut self, now: std::time::Instant) {
-        self.in_flight_since = None;
-        self.last_success = Some(now);
-        self.consecutive_failures = 0;
-        self.last_error = None;
-    }
-
-    pub(crate) fn mark_failure(&mut self, now: std::time::Instant, error: PrPollErrorKind) {
-        self.in_flight_since = None;
-        let _ = now;
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.last_error = Some(error);
-    }
-
-    /// Longest a round can legitimately be in flight: curl's own ceiling plus
-    /// slack for process spawn and the channel hop.
-    pub(crate) const MAX_ROUND_SECS: u64 = 40;
-
-    /// Release a guard whose round can no longer be running.
-    ///
-    /// `in_flight_since` is cleared when `PrStatesUpdated` arrives. If that
-    /// event never arrives — worker panic, a send on a closed channel during
-    /// shutdown — the guard latches and every later tick skips forever. That
-    /// trades a visible pile-up for a silent stall, which is strictly worse:
-    /// the poller stops and nothing says so. Returns true if it reaped one.
-    pub(crate) fn reap_stuck_round(&mut self, now: std::time::Instant) -> bool {
-        let Some(started) = self.in_flight_since else {
-            return false;
-        };
-        if now.saturating_duration_since(started).as_secs() <= Self::MAX_ROUND_SECS {
-            return false;
-        }
-        self.mark_failure(now, PrPollErrorKind::Transport);
-        true
-    }
-
-    pub(crate) fn mark_skipped(&mut self) {
-        self.skipped_rounds = self.skipped_rounds.saturating_add(1);
-    }
-
-    /// Age of the last success, or `None` if it has never succeeded.
-    pub(crate) fn last_success_age_secs(&self, now: std::time::Instant) -> Option<u64> {
-        self.last_success
-            .map(|at| now.saturating_duration_since(at).as_secs())
-    }
-
-    /// `stale_after` is the caller's freshness window; `broken_multiple`
-    /// mirrors gossip's TTL multiple so both subsystems agree on "long gone".
-    pub(crate) fn status_at(
-        &self,
-        now: std::time::Instant,
-        stale_after_secs: u64,
-        broken_multiple: u64,
-    ) -> PrPollStatus {
-        let Some(age) = self.last_success_age_secs(now) else {
-            // Never succeeded is Broken, not Ok — an empty poller that has
-            // never answered must not render as healthy.
-            return PrPollStatus::Broken;
-        };
-        if age > stale_after_secs.saturating_mul(broken_multiple) {
-            return PrPollStatus::Broken;
-        }
-        if age > stale_after_secs || self.consecutive_failures >= DEGRADED_FAILURE_STREAK {
-            return PrPollStatus::Degraded;
-        }
-        PrPollStatus::Ok
-    }
-}
+// The three-state verdict and the degraded-failure-streak threshold moved
+// to `crate::health` as part of the shared health primitive (#295). Callers
+// reach them through that path now.
 
 #[cfg(test)]
 mod tests {
@@ -527,7 +433,7 @@ mod tests {
         let health = PrPollHealth::default();
         assert_eq!(
             health.status_at(Instant::now(), 60, 10),
-            PrPollStatus::Broken,
+            crate::health::PollerStatus::Broken,
             "a poller that has never answered must not render as healthy"
         );
         assert_eq!(health.last_success_age_secs(Instant::now()), None);
@@ -538,13 +444,22 @@ mod tests {
         let now = Instant::now();
         let mut health = PrPollHealth::default();
         health.mark_success(now - Duration::from_secs(30));
-        assert_eq!(health.status_at(now, 60, 10), PrPollStatus::Ok);
+        assert_eq!(
+            health.status_at(now, 60, 10),
+            crate::health::PollerStatus::Ok
+        );
 
         health.mark_success(now - Duration::from_secs(90));
-        assert_eq!(health.status_at(now, 60, 10), PrPollStatus::Degraded);
+        assert_eq!(
+            health.status_at(now, 60, 10),
+            crate::health::PollerStatus::Degraded
+        );
 
         health.mark_success(now - Duration::from_secs(601));
-        assert_eq!(health.status_at(now, 60, 10), PrPollStatus::Broken);
+        assert_eq!(
+            health.status_at(now, 60, 10),
+            crate::health::PollerStatus::Broken
+        );
     }
 
     /// A failure streak degrades even while the last value is still inside the
@@ -555,11 +470,17 @@ mod tests {
         let now = Instant::now();
         let mut health = PrPollHealth::default();
         health.mark_success(now - Duration::from_secs(5));
-        for _ in 0..DEGRADED_FAILURE_STREAK {
+        for _ in 0..crate::health::DEGRADED_FAILURE_STREAK {
             health.mark_failure(now, PrPollErrorKind::Transport);
         }
-        assert_eq!(health.status_at(now, 60, 10), PrPollStatus::Degraded);
-        assert_eq!(health.consecutive_failures, DEGRADED_FAILURE_STREAK);
+        assert_eq!(
+            health.status_at(now, 60, 10),
+            crate::health::PollerStatus::Degraded
+        );
+        assert_eq!(
+            health.consecutive_failures,
+            crate::health::DEGRADED_FAILURE_STREAK
+        );
     }
 
     #[test]
@@ -644,8 +565,11 @@ mod tests {
     fn a_guard_outliving_its_round_is_reaped() {
         let now = Instant::now();
         let mut health = PrPollHealth::default();
-        health.mark_started(now - Duration::from_secs(PrPollHealth::MAX_ROUND_SECS + 5));
-        assert!(health.reap_stuck_round(now), "stale guard should be reaped");
+        health.mark_started(now - Duration::from_secs(PR_POLL_MAX_ROUND_SECS + 5));
+        assert!(
+            health.reap_stuck_round(now, PR_POLL_MAX_ROUND_SECS, PrPollErrorKind::Transport),
+            "stale guard should be reaped"
+        );
         assert!(health.in_flight_since.is_none());
         assert_eq!(
             health.consecutive_failures, 1,
@@ -658,7 +582,7 @@ mod tests {
         let now = Instant::now();
         let mut health = PrPollHealth::default();
         health.mark_started(now - Duration::from_secs(1));
-        assert!(!health.reap_stuck_round(now));
+        assert!(!health.reap_stuck_round(now, PR_POLL_MAX_ROUND_SECS, PrPollErrorKind::Transport));
         assert!(
             health.in_flight_since.is_some(),
             "a live round must not be reaped"
