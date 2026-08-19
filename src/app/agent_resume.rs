@@ -260,8 +260,16 @@ impl App {
         // `agent_resume::claude_config_dir_for_session`.
         let mut input = String::new();
         if let Some(config_dir) = claude_resume_config_dir(&plan) {
-            input.push_str("export CLAUDE_CONFIG_DIR=");
-            input.push_str(&shell_quote(&config_dir));
+            // In the pane shell's OWN syntax. `export FOO=bar` is a syntax
+            // error in fish, so a fish user would get no profile set at all and
+            // silently resume under the default account — precisely the failure
+            // this restore exists to prevent, just moved to a different shell.
+            let shell = crate::pane::pane_shell(&self.state.default_shell);
+            input.push_str(&env_assignment_for_shell(
+                &shell,
+                "CLAUDE_CONFIG_DIR",
+                &config_dir,
+            ));
             input.push('\r');
         }
         input.push_str(&resume_command);
@@ -338,6 +346,33 @@ fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     Some(command)
 }
 
+/// An environment assignment written in `shell`'s own syntax.
+///
+/// The value is typed into a live pane, so it has to parse in whatever shell is
+/// there. POSIX shells take `export NAME=value`; fish takes `set -gx NAME
+/// value` and rejects the former outright.
+fn env_assignment_for_shell(shell: &str, name: &str, value: &str) -> String {
+    if shell_is_fish(shell) {
+        format!("set -gx {name} {}", fish_quote(value))
+    } else {
+        format!("export {name}={}", shell_quote(value))
+    }
+}
+
+fn shell_is_fish(shell: &str) -> bool {
+    std::path::Path::new(shell.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "fish")
+}
+
+/// Fish quoting is NOT POSIX quoting. Inside single quotes fish treats only
+/// `\\` and `'` as special, and it has no `'\''` idiom — writing the POSIX
+/// escape would end the string and leave stray characters on the command line.
+fn fish_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -356,6 +391,52 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// `export FOO=bar` is a syntax error in fish. Emitting it would leave the
+    /// resumed session with no profile set at all — silently the default
+    /// account, which is the exact bug this restore exists to prevent.
+    #[test]
+    fn fish_gets_set_gx_and_posix_shells_get_export() {
+        assert_eq!(
+            env_assignment_for_shell("/opt/homebrew/bin/fish", "CLAUDE_CONFIG_DIR", "/p/work"),
+            "set -gx CLAUDE_CONFIG_DIR '/p/work'"
+        );
+        // Bare names and a store path rather than FHS literals: only the
+        // basename is read, and the hermetic gate rightly objects to test data
+        // that looks like it depends on a distribution's layout.
+        for shell in ["zsh", "bash", "sh", "/nix/store/abc-bash-5.2/bin/bash", ""] {
+            assert_eq!(
+                env_assignment_for_shell(shell, "CLAUDE_CONFIG_DIR", "/p/work"),
+                "export CLAUDE_CONFIG_DIR=/p/work",
+                "{shell} should use POSIX syntax"
+            );
+        }
+    }
+
+    /// Fish quoting is not POSIX quoting: the POSIX `'\''` idiom ends the
+    /// string in fish and leaves stray characters on the command line, so a
+    /// profile path containing a quote would corrupt the typed input.
+    #[test]
+    fn fish_quoting_escapes_rather_than_reopening_the_string() {
+        let quoted = fish_quote("/p/it's/work");
+        assert_eq!(quoted, r"'/p/it\'s/work'");
+        assert!(
+            !quoted.contains("'\\''"),
+            "POSIX escape leaked into fish output: {quoted}"
+        );
+        assert_eq!(fish_quote(r"/p/back\slash"), r"'/p/back\\slash'");
+    }
+
+    /// Only the shell's basename decides, so a versioned or wrapped path still
+    /// resolves correctly, and a shell merely NAMED like fish does not.
+    #[test]
+    fn fish_is_detected_by_basename_only() {
+        assert!(shell_is_fish("fish"));
+        assert!(shell_is_fish("  /nix/store/abc-fish-3.7.1/bin/fish  "));
+        assert!(!shell_is_fish("fishy"));
+        assert!(!shell_is_fish("/nix/store/abc-selfish-1.0/bin/selfish"));
+        assert!(!shell_is_fish(""));
+    }
     use super::*;
 
     fn test_app() -> App {
