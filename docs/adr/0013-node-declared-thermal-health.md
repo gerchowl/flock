@@ -1,4 +1,4 @@
-# ADR 0010 — Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist
+# ADR 0013 — Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist
 
 - Status: Proposed
 - Date: 2026-08-19

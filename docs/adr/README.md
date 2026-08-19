@@ -22,6 +22,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0010](0010-report-composition.md) | Bug reports compose locally and are submitted by a human, never by the binary | Proposed |
 | [0011](0011-conversation-first-gui.md) | A conversation-first GUI: surfaces, transports, and the write model | Proposed |
 | [0012](0012-conversation-read-model.md) | The conversation read model: canonical entries and a derived index | Proposed |
+| [0013](0013-node-declared-thermal-health.md) | Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist | Proposed |
 
 ## Conventions
 
