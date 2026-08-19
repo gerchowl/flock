@@ -1276,11 +1276,88 @@ pub(crate) enum CopyModeSelection {
     Linewise { anchor_row: u32 },
 }
 
+/// Which agents the sidebar's agents panel lists: everything, only the focused
+/// workspace's panes, or one of the attention filters (blocked / done / both)
+/// applied fleet-wide. Cycled by clicking the panel header.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentPanelScope {
     CurrentWorkspace,
     #[default]
     AllWorkspaces,
+    Blocked,
+    Done,
+    BlockedAndDone,
+}
+
+impl AgentPanelScope {
+    /// Click-cycle order, matching the header label sequence:
+    /// `all → current → blocked → done → blocked&done → all`.
+    pub const CYCLE: [Self; 5] = [
+        Self::AllWorkspaces,
+        Self::CurrentWorkspace,
+        Self::Blocked,
+        Self::Done,
+        Self::BlockedAndDone,
+    ];
+
+    pub fn cycled(self) -> Self {
+        let idx = Self::CYCLE
+            .iter()
+            .position(|scope| *scope == self)
+            .unwrap_or(0);
+        Self::CYCLE[(idx + 1) % Self::CYCLE.len()]
+    }
+
+    /// True when the scope keeps only agents in one of the listed states —
+    /// the fleet-wide set narrowed by state rather than by workspace.
+    pub fn state_filter(self) -> Option<AgentPanelStateFilter> {
+        match self {
+            Self::Blocked => Some(AgentPanelStateFilter {
+                blocked: true,
+                done: false,
+            }),
+            Self::Done => Some(AgentPanelStateFilter {
+                blocked: false,
+                done: true,
+            }),
+            Self::BlockedAndDone => Some(AgentPanelStateFilter {
+                blocked: true,
+                done: true,
+            }),
+            Self::CurrentWorkspace | Self::AllWorkspaces => None,
+        }
+    }
+}
+
+/// Config-side spelling of an [`AgentPanelScope`], shared by the live-state
+/// setter and the config-file writer so the two cannot drift.
+pub fn agent_panel_scope_config(scope: AgentPanelScope) -> crate::config::AgentPanelScopeConfig {
+    match scope {
+        AgentPanelScope::CurrentWorkspace => crate::config::AgentPanelScopeConfig::Current,
+        AgentPanelScope::AllWorkspaces => crate::config::AgentPanelScopeConfig::All,
+        AgentPanelScope::Blocked => crate::config::AgentPanelScopeConfig::Blocked,
+        AgentPanelScope::Done => crate::config::AgentPanelScopeConfig::Done,
+        AgentPanelScope::BlockedAndDone => crate::config::AgentPanelScopeConfig::BlockedAndDone,
+    }
+}
+
+/// The agent states an [`AgentPanelScope`] state filter keeps. "done" is an
+/// idle agent whose output has not been seen yet — the same distinction the
+/// panel's status column draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPanelStateFilter {
+    pub blocked: bool,
+    pub done: bool,
+}
+
+impl AgentPanelStateFilter {
+    pub fn matches(self, state: AgentState, seen: bool) -> bool {
+        match state {
+            AgentState::Blocked => self.blocked,
+            AgentState::Idle => self.done && !seen,
+            _ => false,
+        }
+    }
 }
 
 /// Scope of the `servers` and `spaces` sidebar sections: everything, or only
@@ -2670,8 +2747,11 @@ impl AppState {
     /// (ADR-0002 phase (f)).
     pub fn agent_panel_scope(&self) -> AgentPanelScope {
         match self.config.ui.agent_panel_scope {
-            crate::config::PanelScopeConfig::Current => AgentPanelScope::CurrentWorkspace,
-            crate::config::PanelScopeConfig::All => AgentPanelScope::AllWorkspaces,
+            crate::config::AgentPanelScopeConfig::Current => AgentPanelScope::CurrentWorkspace,
+            crate::config::AgentPanelScopeConfig::All => AgentPanelScope::AllWorkspaces,
+            crate::config::AgentPanelScopeConfig::Blocked => AgentPanelScope::Blocked,
+            crate::config::AgentPanelScopeConfig::Done => AgentPanelScope::Done,
+            crate::config::AgentPanelScopeConfig::BlockedAndDone => AgentPanelScope::BlockedAndDone,
         }
     }
 
@@ -2697,10 +2777,7 @@ impl AppState {
     /// the new value immediately. The persisting save_* call still writes to
     /// disk separately (ADR-0002 phase (f)).
     pub fn set_agent_panel_scope(&mut self, scope: AgentPanelScope) {
-        self.config.ui.agent_panel_scope = match scope {
-            AgentPanelScope::CurrentWorkspace => crate::config::PanelScopeConfig::Current,
-            AgentPanelScope::AllWorkspaces => crate::config::PanelScopeConfig::All,
-        };
+        self.config.ui.agent_panel_scope = agent_panel_scope_config(scope);
     }
 
     pub fn set_servers_panel_scope(&mut self, scope: PanelScope) {
@@ -3229,11 +3306,61 @@ mod tests {
     }
 
     #[test]
+    fn agent_panel_scope_cycles_all_current_blocked_done_both() {
+        let mut scope = AgentPanelScope::AllWorkspaces;
+        let mut seen = Vec::new();
+        for _ in 0..AgentPanelScope::CYCLE.len() {
+            scope = scope.cycled();
+            seen.push(scope);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                AgentPanelScope::CurrentWorkspace,
+                AgentPanelScope::Blocked,
+                AgentPanelScope::Done,
+                AgentPanelScope::BlockedAndDone,
+                AgentPanelScope::AllWorkspaces,
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_panel_state_filter_matches_blocked_and_unseen_idle_only() {
+        assert!(AgentPanelScope::AllWorkspaces.state_filter().is_none());
+        assert!(AgentPanelScope::CurrentWorkspace.state_filter().is_none());
+
+        let blocked = AgentPanelScope::Blocked.state_filter().unwrap();
+        assert!(blocked.matches(AgentState::Blocked, true));
+        assert!(!blocked.matches(AgentState::Idle, false));
+
+        let done = AgentPanelScope::Done.state_filter().unwrap();
+        assert!(done.matches(AgentState::Idle, false));
+        assert!(!done.matches(AgentState::Idle, true));
+        assert!(!done.matches(AgentState::Blocked, false));
+
+        let both = AgentPanelScope::BlockedAndDone.state_filter().unwrap();
+        assert!(both.matches(AgentState::Blocked, true));
+        assert!(both.matches(AgentState::Idle, false));
+        assert!(!both.matches(AgentState::Working, false));
+        assert!(!both.matches(AgentState::Unknown, false));
+    }
+
+    #[test]
+    fn agent_panel_scope_round_trips_through_config_spelling() {
+        let mut state = AppState::test_new();
+        for scope in AgentPanelScope::CYCLE {
+            state.set_agent_panel_scope(scope);
+            assert_eq!(state.agent_panel_scope(), scope);
+        }
+    }
+
+    #[test]
     fn panel_scopes_read_from_state_config_not_mirror_fields() {
         // ADR-0002 phase (f): the sidebar's Agent/Servers/Spaces panel scope
         // toggles read state.config.ui.<scope>_panel_scope.
         let mut state = AppState::test_new();
-        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::Current;
         state.config.ui.servers_panel_scope = crate::config::PanelScopeConfig::Current;
         state.config.ui.spaces_panel_scope = crate::config::PanelScopeConfig::Current;
         assert_eq!(state.agent_panel_scope(), AgentPanelScope::CurrentWorkspace);
@@ -3245,7 +3372,7 @@ mod tests {
         state.set_spaces_panel_scope(PanelScope::All);
         assert_eq!(
             state.config.ui.agent_panel_scope,
-            crate::config::PanelScopeConfig::All
+            crate::config::AgentPanelScopeConfig::All
         );
         assert_eq!(state.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
         assert_eq!(state.servers_panel_scope(), PanelScope::All);

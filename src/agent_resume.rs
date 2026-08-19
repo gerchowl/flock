@@ -231,6 +231,82 @@ pub fn claude_fork_session_id(plan: &AgentResumePlan) -> Option<&str> {
     plan.argv.get(resume + 1).map(String::as_str)
 }
 
+/// The session id a Claude resume plan targets — for a plain resume OR a fork
+/// (both carry `claude … --resume <id>`). Used to look up which
+/// `CLAUDE_CONFIG_DIR` (account profile) the session was launched under.
+pub fn claude_resume_session_id(plan: &AgentResumePlan) -> Option<&str> {
+    if plan.argv.first().map(String::as_str) != Some("claude") {
+        return None;
+    }
+    let resume = plan.argv.iter().position(|arg| arg == "--resume")?;
+    plan.argv.get(resume + 1).map(String::as_str)
+}
+
+// --- Claude account-profile (CLAUDE_CONFIG_DIR) recall across a flk restart --
+//
+// `claude-auth <profile>` (the g-fleet account switcher) works by exporting
+// `CLAUDE_CONFIG_DIR` into the interactive shell, so `claude` launched there
+// runs under that account. That env lives ONLY in that shell — but when flk
+// resumes an agent (server restart, reboot, hibernate/resume) it spawns a FRESH
+// login shell and types `claude --resume <id>` into it, with no
+// `CLAUDE_CONFIG_DIR`. The resumed session then falls back to the default
+// `~/.claude` — a different (or logged-out) account — and is orphaned.
+//
+// Fix: the Claude `SessionStart` hook (which runs INSIDE claude, so it sees the
+// live `CLAUDE_CONFIG_DIR`) records `session_id -> config_dir` here, one tiny
+// file per session keyed by the durable session id. At resume, flk reads it
+// back and re-selects the same profile. The records live on disk so they
+// survive a cold restart, one file per session so concurrent agents never race
+// a shared map.
+
+fn claude_config_dir_records_dir() -> std::path::PathBuf {
+    crate::config::state_dir().join("claude-config-dirs")
+}
+
+/// Reject a session id that could escape the records directory or name an unsafe
+/// file. Real Claude session ids are UUIDs, so this only ever trips on garbage.
+fn safe_session_file_name(session_id: &str) -> Option<&str> {
+    let ok = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    ok.then_some(session_id)
+}
+
+/// Record which `CLAUDE_CONFIG_DIR` a Claude session was launched under.
+/// Best-effort and silent: a hook must never fail the parent agent.
+pub fn record_claude_config_dir(session_id: &str, config_dir: &str) {
+    record_claude_config_dir_in(&claude_config_dir_records_dir(), session_id, config_dir);
+}
+
+/// The `CLAUDE_CONFIG_DIR` a Claude session was launched under, if recorded.
+pub fn claude_config_dir_for_session(session_id: &str) -> Option<String> {
+    claude_config_dir_for_session_in(&claude_config_dir_records_dir(), session_id)
+}
+
+// Inner forms take the records dir explicitly so they're testable without
+// mutating process-global env (`state_dir()` reads `XDG_STATE_HOME`/`HOME`).
+fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
+    let Some(name) = safe_session_file_name(session_id) else {
+        return;
+    };
+    if config_dir.is_empty() {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(name), config_dir);
+}
+
+fn claude_config_dir_for_session_in(dir: &Path, session_id: &str) -> Option<String> {
+    let name = safe_session_file_name(session_id)?;
+    let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+    let dir = raw.trim();
+    (!dir.is_empty()).then(|| dir.to_string())
+}
+
 /// Append a one-shot pivot prompt as the forked agent's first turn (#106).
 /// Only applies to a CLAUDE fork (argv starts with `claude` and carries
 /// `--fork-session`); Claude takes a positional prompt as the opening user
@@ -281,6 +357,67 @@ fn valid_session_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_resume_session_id_reads_plain_and_fork_plans() {
+        let plain = plan(
+            "flock:claude",
+            "claude",
+            &AgentSessionRef::id("sid-plain").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude_resume_session_id(&plain), Some("sid-plain"));
+
+        let mut fork = plain.clone();
+        fork.argv.push("--fork-session".into());
+        assert_eq!(claude_resume_session_id(&fork), Some("sid-plain"));
+
+        // Non-claude plans never match.
+        let codex = plan("flock:codex", "codex", &AgentSessionRef::id("c").unwrap()).unwrap();
+        assert_eq!(claude_resume_session_id(&codex), None);
+    }
+
+    #[test]
+    fn safe_session_file_name_rejects_path_traversal_and_junk() {
+        assert_eq!(safe_session_file_name("abc-123_DEF"), Some("abc-123_DEF"));
+        // Anything that could escape the records dir or name an odd file is out.
+        for bad in [
+            "",
+            "../etc/passwd",
+            "a/b",
+            "a b",
+            "a.b",
+            "a\0b",
+            &"x".repeat(129),
+        ] {
+            assert_eq!(safe_session_file_name(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn config_dir_record_round_trips() {
+        // Uses the *_in forms against a temp dir — no process-global env touched.
+        let tmp = std::env::temp_dir().join(format!(
+            "flk-cfgdir-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
+
+        let sid = "session-round-trip";
+        assert_eq!(claude_config_dir_for_session_in(&tmp, sid), None);
+        record_claude_config_dir_in(&tmp, sid, "/home/u/.claude-profiles/work");
+        assert_eq!(
+            claude_config_dir_for_session_in(&tmp, sid).as_deref(),
+            Some("/home/u/.claude-profiles/work")
+        );
+        // An empty config dir is never recorded, and junk ids never look up.
+        record_claude_config_dir_in(&tmp, "blank", "");
+        assert_eq!(claude_config_dir_for_session_in(&tmp, "blank"), None);
+        assert_eq!(claude_config_dir_for_session_in(&tmp, "../escape"), None);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     #[test]
     fn planner_allows_supported_agents() {

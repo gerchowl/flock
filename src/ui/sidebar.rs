@@ -163,6 +163,9 @@ fn agent_panel_toggle_label(scope: AgentPanelScope) -> &'static str {
     match scope {
         AgentPanelScope::CurrentWorkspace => "current",
         AgentPanelScope::AllWorkspaces => "all",
+        AgentPanelScope::Blocked => "blocked",
+        AgentPanelScope::Done => "done",
+        AgentPanelScope::BlockedAndDone => "blocked&done",
     }
 }
 
@@ -195,7 +198,9 @@ pub(crate) fn agent_panel_toggle_rect(area: Rect, scope: AgentPanelScope) -> Rec
     }
 
     let label = agent_panel_toggle_label(scope);
-    let width = label.chars().count() as u16;
+    // Clamp: the state-filter labels ("blocked&done") are longer than the
+    // narrowest sidebar, and an unclamped width would draw past the section.
+    let width = (label.chars().count() as u16).min(area.width);
     Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + 1,
@@ -247,7 +252,8 @@ fn agent_panel_entries_with_runtimes(
     // #164: this node's own icon, resolved at render exactly like the band's
     // self row resolves it — the panel and the band name us the same way.
     let local_icon = crate::app::configured_node_icon();
-    match app.agent_panel_scope() {
+    let scope = app.agent_panel_scope();
+    match scope {
         AgentPanelScope::CurrentWorkspace => {
             // The server filter outranks the scope toggle (#80): narrowed to a
             // peer, this server's rows are not part of the visible set, and
@@ -291,7 +297,14 @@ fn agent_panel_entries_with_runtimes(
                 })
                 .collect()
         }
-        AgentPanelScope::AllWorkspaces => {
+        // The state filters (blocked / done / blocked&done) narrow the SAME
+        // fleet-wide set the all scope builds — an attention view, not a
+        // workspace view — so they share this arm and drop the rows whose
+        // state doesn't match, after the fleet-stable sort.
+        AgentPanelScope::AllWorkspaces
+        | AgentPanelScope::Blocked
+        | AgentPanelScope::Done
+        | AgentPanelScope::BlockedAndDone => {
             // Server visibility is ONE selection (#80): narrowing to a peer
             // hides the local rows here exactly as it swaps them out of the
             // spaces list, so the panel and the attention cycle can't disagree
@@ -348,6 +361,9 @@ fn agent_panel_entries_with_runtimes(
             // local/remote section — depending on which server you view from.
             // Re-key on machine-independent identity instead.
             entries.sort_by_cached_key(agent_panel_sort_key);
+            if let Some(filter) = scope.state_filter() {
+                entries.retain(|entry| filter.matches(entry.state, entry.seen));
+            }
             entries
         }
     }
@@ -6654,6 +6670,120 @@ mod tests {
                 .starts_with(|c: char| c.is_ascii_digit()),
             "unbound first row must not be numbered: {first_row:?}"
         );
+    }
+
+    fn app_with_three_agent_states() -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("blocked-ws"),
+            Workspace::test_new("done-ws"),
+            Workspace::test_new("working-ws"),
+        ];
+        app.ensure_test_terminals();
+        for ws_idx in 0..3 {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let tid = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Claude);
+        }
+        set_pane_state(&mut app, 0, AgentState::Blocked, false);
+        // Idle + unseen is what the panel calls "done"; idle + seen is "idle"
+        // and must NOT survive the done filter.
+        set_pane_state(&mut app, 1, AgentState::Idle, false);
+        set_pane_state(&mut app, 2, AgentState::Working, true);
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app
+    }
+
+    fn agent_panel_labels(app: &AppState) -> Vec<String> {
+        agent_panel_entries(app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect()
+    }
+
+    #[test]
+    fn agent_panel_state_filters_narrow_the_fleet_wide_list() {
+        let mut app = app_with_three_agent_states();
+
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        assert_eq!(agent_panel_labels(&app).len(), 3);
+
+        app.set_agent_panel_scope(AgentPanelScope::Blocked);
+        assert_eq!(agent_panel_labels(&app), vec!["blocked-ws".to_string()]);
+
+        app.set_agent_panel_scope(AgentPanelScope::Done);
+        assert_eq!(agent_panel_labels(&app), vec!["done-ws".to_string()]);
+
+        app.set_agent_panel_scope(AgentPanelScope::BlockedAndDone);
+        assert_eq!(
+            agent_panel_labels(&app),
+            vec!["blocked-ws".to_string(), "done-ws".to_string()]
+        );
+    }
+
+    #[test]
+    fn done_filter_drops_seen_idle_agents() {
+        // "done" is idle with UNSEEN output — the same split
+        // `agent_panel_status_key` draws. A seen idle agent is just "idle".
+        let mut app = app_with_three_agent_states();
+        set_pane_state(&mut app, 1, AgentState::Idle, true);
+
+        app.set_agent_panel_scope(AgentPanelScope::Done);
+        assert!(agent_panel_labels(&app).is_empty());
+
+        app.set_agent_panel_scope(AgentPanelScope::BlockedAndDone);
+        assert_eq!(agent_panel_labels(&app), vec!["blocked-ws".to_string()]);
+    }
+
+    #[test]
+    fn state_filters_ignore_the_focused_workspace() {
+        // Unlike `current`, the state filters are fleet-wide: focusing the
+        // working workspace does not add it back or drop the others.
+        let mut app = app_with_three_agent_states();
+        app.active = Some(2);
+        app.selected = 2;
+
+        app.set_agent_panel_scope(AgentPanelScope::CurrentWorkspace);
+        assert_eq!(agent_panel_labels(&app).len(), 1);
+
+        app.set_agent_panel_scope(AgentPanelScope::BlockedAndDone);
+        assert_eq!(
+            agent_panel_labels(&app),
+            vec!["blocked-ws".to_string(), "done-ws".to_string()]
+        );
+    }
+
+    #[test]
+    fn agents_header_renders_each_scope_label() {
+        let mut app = app_with_two_agents();
+        for (scope, label) in [
+            (AgentPanelScope::AllWorkspaces, "all"),
+            (AgentPanelScope::CurrentWorkspace, "current"),
+            (AgentPanelScope::Blocked, "blocked"),
+            (AgentPanelScope::Done, "done"),
+            (AgentPanelScope::BlockedAndDone, "blocked&done"),
+        ] {
+            app.set_agent_panel_scope(scope);
+            let (header, _) = agents_band_rows(&app);
+            assert!(
+                header.trim_end().ends_with(label),
+                "{scope:?} header should end with {label:?}: {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_panel_toggle_rect_clamps_long_label_to_the_section_width() {
+        // "blocked&done" is wider than a narrow sidebar; the rect must stay
+        // inside the section instead of drawing past its right edge.
+        let area = Rect::new(0, 0, 8, 10);
+        let rect = agent_panel_toggle_rect(area, AgentPanelScope::BlockedAndDone);
+        assert_eq!(rect.x, area.x);
+        assert_eq!(rect.width, area.width);
     }
 
     #[tokio::test]

@@ -39,7 +39,13 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         Agent::Qodercli => qodercli::detect(screen_content),
     };
 
-    let skip_state_update = should_skip_state_update(agent, screen_content);
+    // "Nothing on this screen evidences a state" is NOT Idle (#309). Agents
+    // that can tell the difference report it here, and the detector task
+    // treats it exactly like the transcript-viewer skip: hold last state
+    // rather than publish a guess. Agents without the seam keep the old
+    // behaviour, so this is additive.
+    let skip_state_update = should_skip_state_update(agent, screen_content)
+        || !has_structural_signal(agent, screen_content);
     if skip_state_update {
         return AgentDetection {
             state,
@@ -64,6 +70,18 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         visible_blocker: has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),
         visible_working: has_visible_working(agent, screen_content, state),
+    }
+}
+
+/// Whether this screen positively evidences *any* state for `agent`.
+///
+/// Only agents with a `detect_structural` seam can answer honestly; the rest
+/// return `true` (their detectors always claim a state), which preserves their
+/// current behaviour until each gets the same treatment.
+fn has_structural_signal(agent: Agent, content: &str) -> bool {
+    match agent {
+        Agent::Claude => claude_code::detect_structural(content).is_some(),
+        _ => true,
     }
 }
 

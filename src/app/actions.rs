@@ -3770,7 +3770,7 @@ impl AppState {
             } => self
                 .update_terminal_state(pane_id, |terminal| {
                     terminal.update_live_activity(activity.clone(), state);
-                    Some(terminal.set_detected_state_with_screen_signals_at(
+                    let mutation = terminal.set_detected_state_with_screen_signals_at(
                         agent,
                         state,
                         visible_blocker,
@@ -3778,7 +3778,28 @@ impl AppState {
                         visible_working,
                         process_exited,
                         observed_at,
-                    ))
+                    );
+                    // #309: log at the shared client/headless chokepoint, so
+                    // one line covers both render loops.
+                    if let Some(change) = mutation.effective_state_change.as_ref() {
+                        let hook = terminal.hook_authority_report(observed_at);
+                        let hook_state = hook.map(|(state, _)| format!("{state:?}"));
+                        crate::logging::pane_effective_state_changed(
+                            pane_id.raw(),
+                            change.agent_label.as_deref(),
+                            &format!("{:?}", change.previous_state),
+                            &format!("{:?}", change.state),
+                            change.authority.label(),
+                            hook_state.as_deref(),
+                            hook.map(|(_, age)| age),
+                            terminal.hook_authority_expired(observed_at),
+                            &format!("{state:?}"),
+                            visible_blocker,
+                            visible_idle,
+                            visible_working,
+                        );
+                    }
+                    Some(mutation)
                 })
                 .into_iter()
                 .collect(),
@@ -5433,7 +5454,7 @@ mod tests {
             .set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
         // Unfiltered: this server's agent is listed in both scopes.
-        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::Current;
+        state.config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::Current;
         assert!(
             !crate::ui::agent_panel_entries(&state).is_empty(),
             "unfiltered current scope lists the local agent"
@@ -5447,7 +5468,7 @@ mod tests {
             "a Peer filter hides local agents in current scope too"
         );
 
-        state.config.ui.agent_panel_scope = crate::config::PanelScopeConfig::All;
+        state.config.ui.agent_panel_scope = crate::config::AgentPanelScopeConfig::All;
         let entries = crate::ui::agent_panel_entries(&state);
         assert!(
             !entries.is_empty() && entries.iter().all(|entry| entry.remote.is_some()),

@@ -254,15 +254,17 @@ impl App {
     }
 
     pub(super) fn save_agent_panel_scope(&mut self, scope: crate::app::state::AgentPanelScope) {
-        let value = match scope {
-            crate::app::state::AgentPanelScope::CurrentWorkspace => {
-                crate::config::PanelScopeConfig::Current
-            }
-            crate::app::state::AgentPanelScope::AllWorkspaces => {
-                crate::config::PanelScopeConfig::All
-            }
-        };
-        self.save_ui_panel_scope("agent panel scope", "agent_panel_scope", value);
+        let value = crate::app::state::agent_panel_scope_config(scope).as_str();
+        if self.update_config_file("agent panel scope", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "agent_panel_scope",
+                &format!("\"{value}\""),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
     }
 
     pub(super) fn save_servers_panel_scope(&mut self, scope: crate::app::state::PanelScope) {
