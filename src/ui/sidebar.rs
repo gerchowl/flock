@@ -4039,8 +4039,12 @@ mod tests {
             }),
             ..Default::default()
         });
+        // #306 gates the self row on sampler freshness — an unstamped snapshot
+        // drops health entirely, tint included, which is the correct behaviour
+        // and would silently hollow out this test.
+        app.system_stats_at = Some(std::time::Instant::now());
         let p = app.palette.clone();
-        let row = self_server_rows(&app);
+        let row = self_server_rows(&app, std::time::Instant::now());
         assert_eq!(glyph_style(&row.health, "\u{f0ee0}").fg, Some(p.red));
     }
 
