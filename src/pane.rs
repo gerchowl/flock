@@ -410,6 +410,11 @@ fn spawn_basic_detection_task(
         let mut agent_presence = AgentDetectionPresence::from_agent(None);
         let mut state = AgentState::Unknown;
         let mut last_activity: Option<String> = None;
+        // #309: this task (the live-handoff adoption path) published
+        // `detection.state` raw, so an adopted pane lost the Working->Idle
+        // hold entirely — and `flock server live-handoff` is a documented
+        // deploy step, so it is not a rare path.
+        let mut last_claude_working_at = None;
         let mut last_visible_blocker = false;
         let mut last_visible_idle = false;
         let mut last_visible_working = false;
@@ -428,6 +433,7 @@ fn spawn_basic_detection_task(
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
+                    last_claude_working_at = None;
                     last_visible_blocker = false;
                     last_visible_idle = false;
                     last_visible_working = false;
@@ -521,7 +527,14 @@ fn spawn_basic_detection_task(
             let Some(detection) = detection_update_for_publish(agent, &content, false) else {
                 continue;
             };
-            let new_state = detection.state;
+            let new_state = crate::terminal::state::stabilize_agent_detection(
+                agent,
+                state,
+                detection.clone(),
+                false,
+                now,
+                &mut last_claude_working_at,
+            );
             let visible_blocker = detection.visible_blocker && new_state == AgentState::Blocked;
             let visible_idle = detection.visible_idle && new_state == AgentState::Idle;
             let visible_working = detection.visible_working && new_state == AgentState::Working;
