@@ -32,6 +32,14 @@ test-one filter:
 gates:
     prek run --all-files
 
+# Capture a fresh session log and gate it against log-budgets.toml (#318).
+# The sample is MEASURED, not committed: the gate compares a real event
+# distribution, which is the only way to catch level-vs-frequency defects that
+# a source scan cannot see (the info! sits in a facade, the loop is elsewhere).
+log-budget seconds='60':
+    scripts/capture_log_sample.sh {{seconds}}
+    guardrails-log-budget
+
 # Run fast local lint checks
 lint:
     cargo fmt --check
