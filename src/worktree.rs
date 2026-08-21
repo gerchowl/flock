@@ -306,6 +306,79 @@ pub(crate) fn checkout_is_dirty(checkout: &std::path::Path) -> Option<bool> {
         .map(|status| !status.trim().is_empty())
 }
 
+/// What a kill would actually destroy, beyond the checkout folder (#325).
+///
+/// Every field distinguishes "nothing" from "could not tell". The dialog says
+/// so out loud rather than rendering an unreadable repo as clean — the whole
+/// point of showing this is that the user is authorising a destructive act
+/// against a named set, and an unnamed set is what they had before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KillProbe {
+    /// Uncommitted and untracked paths, as `git status --porcelain` name them.
+    /// `Some(vec![])` is a clean checkout; `None` is "git could not be asked".
+    pub dirty: Option<Vec<String>>,
+    /// Commits on the branch that no remote ref holds — the other thing
+    /// deleting a branch can lose. `None` when it could not be counted.
+    pub unpushed: Option<usize>,
+}
+
+impl KillProbe {
+    /// Is there anything here whose loss is worth a second look? Unknown counts
+    /// as yes: it is the reading that makes the user check.
+    pub fn has_stakes(&self) -> bool {
+        !matches!(self.dirty.as_deref(), Some([])) || self.unpushed.is_none_or(|count| count > 0)
+    }
+}
+
+/// Collect what a kill would destroy in `checkout`, for the branch it holds.
+///
+/// Runs on the caller's thread — the kill dialog calls it from the same worker
+/// that resolves the merge gate, so it inherits that thread and never touches
+/// the UI one. Every failure degrades to `None` (unknown) rather than an empty
+/// answer; see [`KillProbe`].
+///
+/// `-uall` lists untracked files individually instead of collapsing a directory
+/// to `dir/`, because "one untracked directory" is exactly the summary that
+/// hides how much is about to go.
+pub(crate) fn probe_kill_targets(checkout: &std::path::Path, branch: Option<&str>) -> KillProbe {
+    let path = checkout.to_string_lossy().to_string();
+    let dirty = run_command_capture(
+        "git",
+        &["-C", &path, "status", "--porcelain=v1", "-uall"],
+        None,
+    )
+    .ok()
+    .map(|status| {
+        status
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    // `--not --remotes` subtracts every remote-tracking ref, not just this
+    // branch's upstream: work pushed to a fork, or landed on another branch's
+    // remote, is recorded somewhere and is not what this warning is for.
+    let unpushed = branch.and_then(|branch| {
+        run_command_capture(
+            "git",
+            &[
+                "-C",
+                &path,
+                "rev-list",
+                "--count",
+                &branch_ref(branch),
+                "--not",
+                "--remotes",
+            ],
+            None,
+        )
+        .ok()
+        .and_then(|count| count.trim().parse::<usize>().ok())
+    });
+    KillProbe { dirty, unpushed }
+}
+
 /// What the all-worktrees sweep (#81) does to ONE worktree, decided from its
 /// resolved state. Ordered safest → most aggressive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2481,6 +2554,84 @@ prunable stale
             "an unreadable repo is not evidence of anything"
         );
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn probe_kill_targets_names_the_dirty_files_and_counts_unpushed_commits() {
+        // #325: the dialog authorises a destructive act, so the account has to
+        // be a list of paths, not a boolean.
+        let repo = create_committed_repo("kill-probe");
+        let checkout = unique_temp_path("kill-probe-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/probe",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        // Clean, and every commit is on the (remote-less) default branch's
+        // history — but with no remotes at all, nothing is "pushed".
+        let clean = probe_kill_targets(&checkout, Some("feature/probe"));
+        assert_eq!(clean.dirty.as_deref(), Some(&[][..]));
+
+        std::fs::write(checkout.join("tracked.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "tracked.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "a commit"]);
+        std::fs::write(checkout.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::create_dir_all(checkout.join("scratch")).unwrap();
+        std::fs::write(checkout.join("scratch/untracked.txt"), "x\n").unwrap();
+
+        let probe = probe_kill_targets(&checkout, Some("feature/probe"));
+        let dirty = probe
+            .dirty
+            .clone()
+            .expect("a readable checkout reports its state");
+        assert!(
+            dirty.iter().any(|line| line.contains("tracked.txt")),
+            "{dirty:?}"
+        );
+        // `-uall` lists the file, not the directory: "one untracked directory"
+        // is exactly the summary that hides how much is about to go.
+        assert!(
+            dirty
+                .iter()
+                .any(|line| line.contains("scratch/untracked.txt")),
+            "{dirty:?}"
+        );
+        assert_eq!(
+            probe.unpushed,
+            Some(2),
+            "no remote holds either commit of this branch"
+        );
+        assert!(probe.has_stakes());
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn probe_kill_targets_reports_unknown_rather_than_clean() {
+        // An unreadable checkout must not render as "nothing to lose" — the
+        // caller distinguishes the two, and this is where that starts.
+        let missing = unique_temp_path("kill-probe-missing");
+        let probe = probe_kill_targets(&missing, Some("feature/gone"));
+        assert_eq!(probe.dirty, None);
+        assert_eq!(probe.unpushed, None);
+        assert!(
+            probe.has_stakes(),
+            "unknown counts as stakes — it is the reading that makes the user check"
+        );
+
+        // No branch at all (a detached checkout) leaves the count unknown too,
+        // rather than claiming zero.
+        let repo = create_committed_repo("kill-probe-detached");
+        assert_eq!(probe_kill_targets(&repo, None).unpushed, None);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
