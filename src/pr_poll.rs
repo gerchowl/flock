@@ -110,6 +110,7 @@ fn resolve_token() -> Option<String> {
     }
     let out = TracedCommand::new("gh", "pr_poll")
         .args(["auth", "token"])
+        .periodic()
         .output_traced()
         .ok()?;
     if !out.status.success() {
@@ -236,6 +237,7 @@ pub(crate) fn fetch_batch(
     // credential to every local user and persist it on disk each tick.
     let config = format!("header = \"Authorization: bearer {token}\"\n");
     let output = TracedCommand::new("curl", "pr_poll")
+        .periodic()
         .args([
             "-sS",
             "--connect-timeout",

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -633,7 +634,22 @@ pub(crate) fn remote_bridge_started(
     );
 }
 
-pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
+/// An ssh bridge child exited.
+///
+/// `intentional_teardown` is the bridge's own `should_stop` flag, read AFTER
+/// the wait returned. It exists because flock kills its own ssh child on every
+/// ordinary switch home (`Drop for SshStdioBridge`, #176/#193 — the accept
+/// thread parks in `child.wait()`, so the SIGKILL is what bounds a flaky-peer
+/// teardown). SIGKILL means `code()` is `None`, which levelled purely on the
+/// exit code fell into the WARN arm: 46 of 49 bridge WARNs in a measured
+/// client log were flock reporting its own deliberate cleanup as a failure
+/// (#319). `grep WARN` triage is the thing that costs — a level nobody trusts
+/// is a level nobody reads.
+///
+/// The flag is deliberately ANDed with signal-death rather than used alone. A
+/// child that exits with a real status while teardown is in flight raced us
+/// and its status is a genuine fact; only the death WE caused is demoted.
+pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>, intentional_teardown: bool) {
     let status = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
@@ -646,7 +662,20 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
             status,
             "ssh bridge exited"
         );
+    } else if intentional_teardown && code.is_none() {
+        tracing::debug!(
+            event = "remote.bridge.exited",
+            subsystem = "remote",
+            outcome = "torn_down",
+            target,
+            status,
+            "ssh bridge torn down"
+        );
     } else {
+        // Includes UNFLAGGED signal-death: an ssh child killed by something
+        // other than us (OOM killer, an operator's `kill`, a crash) is a real
+        // event and must stay loud. This is a demotion of one known-benign
+        // case, not a blanket suppression of the status.
         tracing::warn!(
             event = "remote.bridge.exited",
             subsystem = "remote",
@@ -658,15 +687,32 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
     }
 }
 
-pub(crate) fn remote_bridge_failed(target: &str, err: &str) {
-    tracing::warn!(
-        event = "remote.bridge.failed",
-        subsystem = "remote",
-        outcome = "error",
-        target,
-        err,
-        "ssh bridge connection failed"
-    );
+/// The bridge's accept loop got an error back from one connection.
+///
+/// Same split as [`remote_bridge_exited`], for the same reason: the
+/// `ConnectionAborted` this reports is the DOWNSTREAM effect of the teardown
+/// SIGKILL, so an ordinary switch home used to emit this WARN too — the second
+/// half of the pair in #319.
+pub(crate) fn remote_bridge_failed(target: &str, err: &str, intentional_teardown: bool) {
+    if intentional_teardown {
+        tracing::debug!(
+            event = "remote.bridge.failed",
+            subsystem = "remote",
+            outcome = "torn_down",
+            target,
+            err,
+            "ssh bridge connection ended by teardown"
+        );
+    } else {
+        tracing::warn!(
+            event = "remote.bridge.failed",
+            subsystem = "remote",
+            outcome = "error",
+            target,
+            err,
+            "ssh bridge connection failed"
+        );
+    }
 }
 
 pub(crate) fn remote_binary_resolved(
@@ -761,28 +807,111 @@ pub(crate) fn remote_install_declined(target: &str, dest: &str) {
 // One traced funnel: every external process flock spawns emits its command
 // line here so the "what did flock actually run?" question is answerable from
 // the log tail. `src/process.rs` owns the invocation sites; this facade owns
-// the schema. Non-zero exit is WARN (a caller's story is broken), zero exit
-// is INFO (routine but audit-worthy), spawn failure is ERROR (the command
-// never ran — the loudest failure to surface).
+// the schema and the LEVEL rule.
+//
+// Level is a function of (cadence, outcome) — never outcome alone (#318).
+// Levelling on the exit code by itself is what made `process.exec` 98.9% of
+// flock-server.log: a 2s sampler exiting 0 forever wrote an INFO every 2s, and
+// a `gh` poll that had been failing since breakfast wrote 6,060 WARNs. Both
+// are per-iteration events wearing a lifecycle level. See `ExecCadence`.
+
+/// Last-reported status per periodic command, keyed `subsystem/program`.
+///
+/// This is what makes a periodic failure EDGE-triggered: a poll that fails
+/// forever is one WARN, not one per tick, and its recovery is the other edge.
+/// Bounded — periodic commands are a small fixed set, but `program` can be a
+/// caller-supplied path, so the map refuses to grow past a sane cap rather
+/// than becoming an unbounded leak on a pathological caller.
+static PERIODIC_LAST_STATUS: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+/// Distinct periodic commands tracked for edge detection. Real call sites
+/// number under a dozen; the cap only ever bites on a caller passing a
+/// varying program path, which then simply reports every run as an edge
+/// (loud, not silent — the safe direction to fail).
+const PERIODIC_TRACKED_MAX: usize = 64;
+
+/// Where one periodic run sits relative to that command's previous run.
+///
+/// `First` and `Changed` are kept apart deliberately. Both are "edges" for a
+/// FAILURE — an initial failure must be heard, so it is not folded into the
+/// quiet arm — but only `Changed` is a RECOVERY. Collapsing them would make
+/// every sampler announce "recovered" on the first tick after startup, which
+/// is a fresh flavour of the noise this is here to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodicEdge {
+    /// Nothing on record for this command yet.
+    First,
+    /// The status string differs from the previous run: failure→success
+    /// recovery, success→failure onset, or one failure mode replacing another
+    /// (exit 1 → exit 128).
+    Changed,
+    /// Same status as last tick. The steady state, and the arm that has to
+    /// stay quiet for any of this to be worth doing.
+    Same,
+}
+
+fn periodic_edge(subsystem: &str, program: &str, status: &str) -> PeriodicEdge {
+    let key = format!("{subsystem}/{program}");
+    let map = PERIODIC_LAST_STATUS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = map.lock() else {
+        // A poisoned lock must not silence the tail. `Changed` is the loud
+        // side of both arms, so a failure still WARNs; the cost is a spurious
+        // "recovered" INFO on a success, which is the cheaper wrong answer.
+        return PeriodicEdge::Changed;
+    };
+    match map.get(&key) {
+        Some(previous) if previous == status => PeriodicEdge::Same,
+        Some(_) => {
+            map.insert(key, status.to_string());
+            PeriodicEdge::Changed
+        }
+        None => {
+            if map.len() < PERIODIC_TRACKED_MAX {
+                map.insert(key, status.to_string());
+            }
+            PeriodicEdge::First
+        }
+    }
+}
 
 /// A child process finished. `status` is `None` if the wrapper never got a
 /// `Wait`ed status (currently unused: `output`/`status` always yield one).
-/// The exit-code component drives level selection so a caller's non-zero exit
-/// lands at WARN in the tail without extra ceremony at the call site.
+///
+/// `cadence` is the call site's declaration of how often this runs, and it —
+/// not the exit code alone — selects the level:
+///
+/// | cadence   | exit 0                      | non-zero                       |
+/// |-----------|-----------------------------|--------------------------------|
+/// | Lifecycle | INFO `ok`                   | WARN `error`                   |
+/// | Periodic  | DEBUG `ok`; INFO `recovered`| WARN `error` on the first tick |
+/// |           | when the previous run FAILED| and on a change; else DEBUG    |
 pub(crate) fn process_exec_completed(
     subsystem: &'static str,
     program: &str,
     args: &str,
     status: Option<std::process::ExitStatus>,
     duration_ms: u64,
+    cadence: crate::process::ExecCadence,
 ) {
     let event = "process.exec";
     let code = status.and_then(|s| s.code());
     let status_str = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
-    if code == Some(0) {
-        tracing::info!(
+    let periodic = cadence == crate::process::ExecCadence::Periodic;
+    // One lookup, before the branches: the edge must be RECORDED on every
+    // periodic run, including the quiet ones, or the next run re-reports the
+    // same status as fresh and the fire hose comes straight back.
+    let edge = periodic.then(|| periodic_edge(subsystem, program, &status_str));
+    let recovered = edge == Some(PeriodicEdge::Changed);
+    let new_failure = matches!(
+        edge,
+        Some(PeriodicEdge::First) | Some(PeriodicEdge::Changed)
+    );
+    match (code == Some(0), periodic, recovered, new_failure) {
+        // One-shot success: routine but audit-worthy.
+        (true, false, _, _) => tracing::info!(
             event,
             subsystem,
             outcome = "ok",
@@ -791,9 +920,33 @@ pub(crate) fn process_exec_completed(
             status = status_str,
             duration_ms,
             "process exec completed"
-        );
-    } else {
-        tracing::warn!(
+        ),
+        // A periodic command that had been failing is working again. Low
+        // frequency by construction (it fires once per outage), so INFO.
+        (true, true, true, _) => tracing::info!(
+            event,
+            subsystem,
+            outcome = "recovered",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec recovered"
+        ),
+        // The steady state of every sampler and poller flock runs.
+        (true, true, false, _) => tracing::debug!(
+            event,
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec completed"
+        ),
+        // A failure that is NEW: a one-shot's, or a periodic command's first
+        // tick in this failure mode. This is the line worth waking up for.
+        (false, false, _, _) | (false, true, _, true) => tracing::warn!(
             event,
             subsystem,
             outcome = "error",
@@ -802,7 +955,20 @@ pub(crate) fn process_exec_completed(
             status = status_str,
             duration_ms,
             "process exec exited non-zero"
-        );
+        ),
+        // Still failing the same way it was last tick. The WARN above already
+        // said so; repeating it per-iteration is what makes `grep WARN`
+        // useless (#318, #319).
+        (false, true, _, false) => tracing::debug!(
+            event,
+            subsystem,
+            outcome = "error",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec still failing"
+        ),
     }
 }
 
@@ -822,17 +988,36 @@ pub(crate) fn process_exec_failed(subsystem: &'static str, program: &str, args: 
 
 /// A child process was spawned (fire-and-follow: the caller wires up its own
 /// wait/kill semantics). The child's later exit is the caller's event, not
-/// this facade's.
-pub(crate) fn process_spawned(subsystem: &'static str, program: &str, args: &str, pid: u32) {
-    tracing::info!(
-        event = "process.spawn",
-        subsystem,
-        outcome = "ok",
-        program,
-        args,
-        pid,
-        "process spawned"
-    );
+/// this facade's. A spawn on a timer is per-iteration and lands at DEBUG for
+/// the same reason its completion does.
+pub(crate) fn process_spawned(
+    subsystem: &'static str,
+    program: &str,
+    args: &str,
+    pid: u32,
+    cadence: crate::process::ExecCadence,
+) {
+    if cadence == crate::process::ExecCadence::Periodic {
+        tracing::debug!(
+            event = "process.spawn",
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            pid,
+            "process spawned"
+        );
+    } else {
+        tracing::info!(
+            event = "process.spawn",
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            pid,
+            "process spawned"
+        );
+    }
 }
 
 /// `Command::spawn` refused: the program isn't executable, isn't on PATH, or
@@ -2268,6 +2453,117 @@ pub(crate) fn client_attach_switch_first_paint(to: &str, warm: bool, elapsed_ms:
     );
 }
 
+/// One measured leg of a server switch (#43, #282).
+///
+/// A cold switch was a single opaque blob: request in, frame out, and a
+/// measured 5.05s in between with nothing to attribute it to. It has four
+/// distinct cost centres — an ssh round trip to find the remote binary, the
+/// bridge listener coming up, the socket connect where ssh dial latency
+/// actually lands, and the protocol handshake — and only one of them is ever
+/// the culprit. Timing the whole thing tells you a switch was slow; timing the
+/// stages tells you WHICH, which is the difference between a number and a fix.
+///
+/// DEBUG for the detail, because there are several per switch and
+/// [`client_slot_flipped`] already carries the one-line INFO summary. A stage
+/// that blows its budget escalates via [`client_switch_stage_slow`] instead —
+/// the same shape as the late-tick WARN: the detail is opt-in, the anomaly
+/// reports itself.
+///
+/// Keeps the `flock::attach` target: `/attach:` is a stable UX surface and the
+/// existing first-paint traces compose with these into one timing view.
+pub(crate) fn client_switch_stage(target: &str, stage: &'static str, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        "attach: switch stage completed"
+    );
+}
+
+/// A switch stage over this is not slow, it is STALLED (#43, #282).
+///
+/// A healthy switch completes every one of its stages in tens of milliseconds;
+/// the stall that motivated this instrumentation was 5.05s. The budget sits
+/// well above legitimate variation — a first ssh connect to a sleeping host, a
+/// cold remote-binary probe — so a breach is a real anomaly and not a WARN
+/// anyone learns to scroll past.
+pub(crate) const SWITCH_STAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Time one leg of a switch, reporting it and escalating if it blew its budget.
+///
+/// Lives here rather than at either call site because the thing being decided
+/// is a LEVEL, and this module owns the level policy. Both switch paths use it:
+/// the in-process slot dial and the launcher's exit-and-relaunch leg, which are
+/// different code but the same question — where did the five seconds go?
+///
+/// Returns the stage's own result untouched: a failing stage is still a timed
+/// stage, and knowing a failure took 5s before it failed is often the whole
+/// diagnosis.
+pub(crate) fn timed_switch_stage<T>(
+    target: &str,
+    stage: &'static str,
+    work: impl FnOnce() -> T,
+) -> T {
+    let started = std::time::Instant::now();
+    let result = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if elapsed >= SWITCH_STAGE_BUDGET {
+        client_switch_stage_slow(
+            target,
+            stage,
+            elapsed_ms,
+            SWITCH_STAGE_BUDGET.as_millis() as u64,
+        );
+    } else {
+        client_switch_stage(target, stage, elapsed_ms);
+    }
+    result
+}
+
+/// A switch stage measured inside the remote layer (#43, #282).
+///
+/// `bridge_start` as the client sees it is two very different things bolted
+/// together: a full ssh round trip to discover the remote flock binary, and a
+/// local socket bind that costs microseconds. When a switch stalls, which of
+/// those it was decides whether you look at the network or at flock — so the
+/// split is reported here rather than left for someone to infer.
+pub(crate) fn remote_switch_stage(target: &str, stage: &'static str, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        "attach: remote switch stage completed"
+    );
+}
+
+/// A switch stage took materially longer than a healthy one ever does (#282).
+///
+/// This is the event that makes a switch stall diagnosable from a DEFAULT-level
+/// tail. Without it, attributing the stall needs someone to have had
+/// `FLOCK_LOG=debug` set before the stall happened — which is exactly the trap
+/// that left #282 uninvestigated since it was filed.
+pub(crate) fn client_switch_stage_slow(
+    target: &str,
+    stage: &'static str,
+    elapsed_ms: u64,
+    budget_ms: u64,
+) {
+    tracing::warn!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        budget_ms,
+        "attach: switch stage exceeded its budget"
+    );
+}
+
 pub(crate) fn client_slot_shutdown_demoted(slot: &str) {
     tracing::debug!(
         event = "client.slot.shutdown",
@@ -2305,13 +2601,70 @@ pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
 /// silence (a frozen loop cannot log, so absence of ticks localizes the freeze).
 /// `active_slot` names the slot currently driving input, so a hang is
 /// attributable to the peer the loop was serving.
+///
+/// DEBUG, not INFO (#318): this is the definition of a per-iteration event and
+/// at INFO it was 93-99% of every client log we have ever captured. The
+/// liveness property it existed for does NOT depend on the level — it depends
+/// on someone READING the stream and noticing a gap, which is exactly the
+/// weakness [`client_render_loop_stalled`] removes by firing on its own.
 pub(crate) fn client_tick(active_slot: &str) {
-    tracing::info!(
+    tracing::debug!(
         event = "client.tick",
         subsystem = "client",
         outcome = "alive",
         active_slot,
         "client render loop heartbeat"
+    );
+}
+
+/// The render loop went quiet for materially longer than its tick cadence and
+/// has just come back (#318).
+///
+/// This is the heartbeat's liveness property, inverted and made self-reporting.
+/// A beacon at INFO only proves a freeze to someone tailing the log at the
+/// time; a WARN on the LATE tick is a positive assertion that the loop stalled,
+/// so it survives `grep WARN` on a log nobody was watching. `tick_age_ms` is
+/// the measured gap and `active_slot` names the peer the loop was serving when
+/// it wedged — the pair that makes a stall attributable (#43, #282).
+///
+/// Only the recovered case can report: a loop that never comes back logs
+/// nothing at all, and the bounded gap after the last DEBUG tick remains the
+/// evidence for that.
+pub(crate) fn client_render_loop_stalled(active_slot: &str, tick_age_ms: u64) {
+    tracing::warn!(
+        event = "client.tick",
+        subsystem = "client",
+        outcome = "stalled",
+        active_slot,
+        tick_age_ms,
+        "client render loop tick was late"
+    );
+}
+
+/// A server switch completed: the client is now driving `to` instead of
+/// `from` (#318).
+///
+/// The load-bearing event the client log did not have. Every other member of
+/// the `client_slot_*` family reports a FAILURE or a background step; the
+/// single most common user operation — switching servers — emitted nothing at
+/// INFO, which is why a 5s connect→handshake stall was invisible in a default
+/// tail (#43, #282). One INFO per switch is by definition low-frequency: it
+/// takes a human keypress to produce one.
+///
+/// `cold` separates the two populations that share this path and have wildly
+/// different budgets: a warm flip is an in-process pointer swap, a cold dial
+/// pays ssh connect + handshake. Comparing `elapsed_ms` across the two without
+/// that flag would average a stall into noise.
+pub(crate) fn client_slot_flipped(from: &str, to: &str, cold: bool, elapsed_ms: u64) {
+    tracing::info!(
+        event = "client.slot.flipped",
+        subsystem = "client_slot",
+        outcome = "ok",
+        from,
+        to,
+        cold,
+        elapsed_ms,
+        "slot flip completed"
     );
 }
 
@@ -2783,6 +3136,24 @@ pub(crate) fn peer_push_consumed(peer: &str) {
         outcome = "ok",
         peer,
         "poll answered from a pushed summary, no round trip"
+    );
+}
+
+/// A pushed summary was discarded for being too old to answer a poll (#4).
+///
+/// The event a "peer row is stale" report needs: it says the hub had a push in
+/// hand, judged it expired, and went to the wire instead. Its ABSENCE while
+/// rows look stale is equally informative — it means the pushes being consumed
+/// were fresh, and the staleness is somewhere else.
+pub(crate) fn peer_push_expired(peer: &str, age_secs: u64) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.push.expired",
+        subsystem = "peers",
+        outcome = "discarded",
+        peer,
+        age_secs,
+        "pushed summary too old to answer this poll; fetching live"
     );
 }
 
@@ -3345,6 +3716,63 @@ pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+/// `capture_logs` for events emitted on OTHER threads.
+///
+/// [`capture_logs`] installs a THREAD-LOCAL default subscriber, so a helper
+/// called from a worker thread — the ssh bridge's accept loop, a reader thread
+/// — writes nowhere and the test silently asserts against an empty string.
+/// This installs a process-global one instead, which is sound here because
+/// nextest runs every test in its own process (AGENTS.md; a bare `cargo test`
+/// shares one, which is why the suite is nextest-only).
+///
+/// The sink keeps accumulating after `f` returns, so callers must join or drop
+/// whatever they are observing BEFORE reading, and should filter the returned
+/// text to lines they can attribute.
+#[cfg(test)]
+pub(crate) fn capture_logs_across_threads(f: impl FnOnce()) -> String {
+    use std::sync::OnceLock;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    static GLOBAL_SINK: OnceLock<Sink> = OnceLock::new();
+    let sink = GLOBAL_SINK
+        .get_or_init(|| {
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            // Ignore a lost race with an already-installed global: the sink is
+            // still the one this closure reads, and the test filters what it
+            // asserts on, so a missing subscriber fails loudly rather than
+            // passing vacuously.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            sink
+        })
+        .clone();
+
+    f();
+    let bytes = sink.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3397,17 +3825,63 @@ mod tests {
 
     #[test]
     fn remote_bridge_exited_is_warn_on_nonzero_debug_on_zero() {
-        let ok = capture_logs(|| remote_bridge_exited("host1", Some(0)));
+        let ok = capture_logs(|| remote_bridge_exited("host1", Some(0), false));
         assert!(ok.contains("DEBUG"), "clean exit is debug noise: {ok}");
         assert!(ok.contains("event=\"remote.bridge.exited\""), "{ok}");
 
-        let bad = capture_logs(|| remote_bridge_exited("host1", Some(3)));
+        let bad = capture_logs(|| remote_bridge_exited("host1", Some(3), false));
         assert!(bad.contains("WARN"), "failed exit must be WARN: {bad}");
         assert!(bad.contains("status=\"3\""), "{bad}");
 
-        let signal = capture_logs(|| remote_bridge_exited("host1", None));
+        let signal = capture_logs(|| remote_bridge_exited("host1", None, false));
         assert!(signal.contains("status=\"signal\""), "{signal}");
         assert!(signal.contains("WARN"), "{signal}");
+    }
+
+    /// #319: 94% of the WARNs in a measured client log were flock reporting
+    /// its own switch-home SIGKILL as a bridge failure. The flag has to split
+    /// that population off WITHOUT taking the genuine failures with it —
+    /// otherwise the fix is just a louder version of the same problem.
+    #[test]
+    fn intentional_teardown_demotes_only_the_signal_death_it_caused() {
+        let torn = capture_logs(|| remote_bridge_exited("host1", None, true));
+        assert!(
+            torn.contains("DEBUG"),
+            "our own SIGKILL is not a failure: {torn}"
+        );
+        assert!(torn.contains("outcome=\"torn_down\""), "{torn}");
+        assert!(
+            torn.contains("status=\"signal\""),
+            "the field that separated the populations must survive: {torn}"
+        );
+
+        // A child that died on its own while teardown happened to be in
+        // flight still carries a real status — demoting that would be the
+        // blanket suppression this fix exists to avoid.
+        let raced = capture_logs(|| remote_bridge_exited("host1", Some(255), true));
+        assert!(
+            raced.contains("WARN"),
+            "a real ssh exit status is never torn_down: {raced}"
+        );
+        assert!(raced.contains("status=\"255\""), "{raced}");
+
+        // Signal-death with NO teardown flag: something else killed our ssh.
+        let unflagged = capture_logs(|| remote_bridge_exited("host1", None, false));
+        assert!(
+            unflagged.contains("WARN"),
+            "unflagged signal-death stays loud: {unflagged}"
+        );
+    }
+
+    #[test]
+    fn bridge_failed_follows_the_same_teardown_split() {
+        let torn = capture_logs(|| remote_bridge_failed("host1", "connection aborted", true));
+        assert!(torn.contains("DEBUG"), "{torn}");
+        assert!(torn.contains("outcome=\"torn_down\""), "{torn}");
+
+        let real = capture_logs(|| remote_bridge_failed("host1", "connection refused", false));
+        assert!(real.contains("WARN"), "{real}");
+        assert!(real.contains("outcome=\"error\""), "{real}");
     }
 
     #[test]
@@ -4279,6 +4753,87 @@ mod tests {
         assert!(out.contains("warm=true"), "{out}");
         assert!(out.contains("elapsed_ms=42"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    /// #318, the SILENCE half: the single most common user operation wrote
+    /// nothing at INFO, so a 5s connect→handshake stall during a switch was
+    /// unobservable in a default-level tail. `elapsed_ms` and `cold` are the
+    /// two fields that make it diagnosable (#43, #282) — without `cold` a warm
+    /// flip's sub-millisecond flip averages a cold dial's stall into noise.
+    #[test]
+    fn client_slot_flipped_is_the_happy_path_info_with_timing() {
+        let warm = capture_logs(|| client_slot_flipped("home", "sage", false, 3));
+        assert!(warm.contains("INFO"), "the happy path must be INFO: {warm}");
+        assert!(warm.contains("event=\"client.slot.flipped\""), "{warm}");
+        assert!(warm.contains("from=\"home\""), "{warm}");
+        assert!(warm.contains("to=\"sage\""), "{warm}");
+        assert!(warm.contains("cold=false"), "{warm}");
+        assert!(warm.contains("elapsed_ms=3"), "{warm}");
+
+        let cold = capture_logs(|| client_slot_flipped("sage", "home", true, 5050));
+        assert!(cold.contains("cold=true"), "{cold}");
+        assert!(cold.contains("elapsed_ms=5050"), "{cold}");
+    }
+
+    /// #318, the NOISE half. The tick was 93-99% of every client log we have
+    /// captured; the liveness property it existed for moves to a WARN that
+    /// fires on its own instead of requiring a reader to notice missing
+    /// beacons.
+    #[test]
+    fn tick_is_debug_but_a_late_tick_reports_the_stall_at_warn() {
+        let tick = capture_logs(|| client_tick("home"));
+        assert!(
+            tick.contains("DEBUG"),
+            "a per-iteration heartbeat is never INFO: {tick}"
+        );
+        assert!(tick.contains("event=\"client.tick\""), "{tick}");
+
+        let stalled = capture_logs(|| client_render_loop_stalled("sage", 21_000));
+        assert!(
+            stalled.contains("WARN"),
+            "a stall must survive `grep WARN`: {stalled}"
+        );
+        assert!(stalled.contains("outcome=\"stalled\""), "{stalled}");
+        assert!(
+            stalled.contains("tick_age_ms=21000"),
+            "the measured gap is the evidence: {stalled}"
+        );
+        assert!(
+            stalled.contains("active_slot=\"sage\""),
+            "a stall is attributable to the peer the loop was serving: {stalled}"
+        );
+    }
+
+    /// #43/#282: the stage traces exist to ATTRIBUTE a stall, so the fields
+    /// that name the stage and the target are the load-bearing ones. A stage
+    /// over budget must escalate to WARN — a stall that only shows up at
+    /// `FLOCK_LOG=debug` needs someone to have predicted it, which is the trap
+    /// that left #282 uninvestigated.
+    #[test]
+    fn switch_stages_are_debug_until_one_blows_its_budget() {
+        let quick = capture_logs(|| client_switch_stage("sage", "handshake", 12));
+        assert!(quick.contains("DEBUG"), "{quick}");
+        assert!(quick.contains("flock::attach"), "{quick}");
+        assert!(quick.contains("stage=\"handshake\""), "{quick}");
+        assert!(quick.contains("to=\"sage\""), "{quick}");
+        assert!(quick.contains("elapsed_ms=12"), "{quick}");
+
+        let stalled = capture_logs(|| client_switch_stage_slow("sage", "bridge_start", 5050, 1500));
+        assert!(
+            stalled.contains("WARN"),
+            "a stalled stage must be visible at default level: {stalled}"
+        );
+        assert!(stalled.contains("stage=\"bridge_start\""), "{stalled}");
+        assert!(
+            stalled.contains("elapsed_ms=5050") && stalled.contains("budget_ms=1500"),
+            "both numbers, so the reader can judge the breach: {stalled}"
+        );
+
+        // The remote-side split is what separates "the network was slow" from
+        // "flock was slow" inside the client's single `bridge_start` leg.
+        let probe = capture_logs(|| remote_switch_stage("sage", "remote_probe", 4900));
+        assert!(probe.contains("stage=\"remote_probe\""), "{probe}");
+        assert!(probe.contains("flock::attach"), "{probe}");
     }
 
     #[test]
