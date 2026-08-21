@@ -4817,6 +4817,107 @@ mod tests {
         );
     }
 
+    /// Review follow-up on #331: the peer-filter render path was flagged as
+    /// unaudited. It is unaffected — `single_peer_entries` emits ONLY
+    /// `Remote` rows and never reaches the block/header machinery the solo
+    /// change touches. Pinned rather than asserted, because "a different
+    /// function builds it" is the kind of claim that quietly stops being
+    /// true.
+    #[test]
+    fn the_peer_filter_path_emits_no_headers_for_a_solo_project() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        app.peer_summaries = vec![peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        )];
+        app.server_filter = Some(crate::app::state::ServerFilter::Peer {
+            ssh_target: "anvil".into(),
+        });
+
+        let entries = workspace_list_entries(&app);
+        assert!(
+            !entries.is_empty(),
+            "the fixture must actually produce peer rows"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| matches!(entry, WorkspaceListEntry::Remote { .. })),
+            "peer-filter mode renders only remote rows: {entries:?}"
+        );
+    }
+
+    /// The transition #331's reviewer worried about, and the one that would
+    /// be worst: a project aggregated by a FRESH peer (#153) can be
+    /// collapsed. When that peer goes stale (#156) the section drops back to
+    /// one member and stops being collapsible — so a stored collapse flag
+    /// must not leave it folded with no affordance to unfold it.
+    #[test]
+    fn a_collapsed_aggregate_does_not_get_stuck_folded_when_its_peer_goes_stale() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        let fresh = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        );
+        app.peer_summaries = vec![fresh];
+        let key = app
+            .collapsible_space_keys()
+            .into_iter()
+            .next()
+            .expect("a fresh peer aggregates the project");
+
+        // Operator collapses it while it is a real aggregate.
+        app.collapsed_space_keys.insert(key.clone());
+
+        // The peer goes stale: the section is a lone local checkout again.
+        let mut stale = peer_with_workspaces(
+            "anvil",
+            vec![remote_summary(
+                "flock",
+                Some("github.com/gerchowl/flock"),
+                Some("flock"),
+                Some("fix/pty"),
+            )],
+        );
+        stale.origin_last_ok_secs = Some(10_000);
+        stale.last_ok = None;
+        app.peer_summaries = vec![stale];
+
+        assert!(
+            app.collapsible_space_keys().is_empty(),
+            "a stale peer must stop propping up the aggregate"
+        );
+        let entries = workspace_list_entries(&app);
+        assert!(
+            entries.iter().any(|entry| matches!(
+                entry,
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true
+                }
+            )),
+            "the local checkout must still render despite the stored collapse flag: {entries:?}"
+        );
+    }
+
     /// #331: the header exists so a header-scoped surface has something to
     /// attach to in the solo case — but the section must stay UNcollapsible,
     /// or folding it would put both rows back into one and take away the
