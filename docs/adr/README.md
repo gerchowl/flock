@@ -23,6 +23,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0011](0011-conversation-first-gui.md) | A conversation-first GUI: surfaces, transports, and the write model | Proposed |
 | [0012](0012-conversation-read-model.md) | The conversation read model: canonical entries and a derived index | Proposed |
 | [0013](0013-node-declared-thermal-health.md) | Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist | Proposed |
+| [0014](0014-agent-initiated-agent-spawn.md) | An agent may start an agent, but only through a narrowed verb with a lineage-aware ceiling | Accepted |
 
 ## Conventions
 
