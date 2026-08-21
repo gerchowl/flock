@@ -2006,6 +2006,21 @@ pub(crate) fn worktree_branch_delete_failed(branch: &str, err: &str) {
     );
 }
 
+/// The child spawned but its terminal could not be found to record the run
+/// id (#332). The env stamp already reached the child, so its commits WILL
+/// carry the `Agent-Run:` trailer while `AgentInfo.run_id` reports nothing —
+/// a silent divergence, which is why it is logged rather than swallowed.
+pub(crate) fn agent_run_id_stamp_missed(run_id: &str, workspace_id: &str) {
+    tracing::warn!(
+        event = "agent.run_id.stamp",
+        subsystem = "agent",
+        outcome = "error",
+        run_id,
+        workspace_id,
+        "spawned child terminal not found; run id recorded in env but not on the agent"
+    );
+}
+
 pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
     tracing::info!(
         event = "worktree.add",

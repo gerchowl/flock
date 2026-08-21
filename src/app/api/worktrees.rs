@@ -333,14 +333,14 @@ impl App {
         // must disarm the id, or the next unrelated pane inherits it and
         // `flk revert-run` would revert that pane's work (US-8).
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
-        let ws_idx = match self.spawn_agent_workspace(
+        let (ws_idx, spawned_pane) = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,
             cols,
             &plan.argv,
             params.focus,
         ) {
-            Ok((ws_idx, _, _)) => ws_idx,
+            Ok((ws_idx, _, pane_id)) => (ws_idx, pane_id),
             Err(err) => {
                 let body = self.agent_start_error_body(err);
                 // P4: fail toward leaking — the created worktree stays on
@@ -357,6 +357,13 @@ impl App {
                 );
             }
         };
+
+        // #332: record the run id on the child's terminal, not only in its
+        // environment. The env stamp is what reaches the commit trailer,
+        // while this is what lets a reader join the running agent back to
+        // those commits without inferring from `cwd`. Stamped after a
+        // successful spawn so a failed fork leaves no agent claiming a run.
+        self.record_spawn_run_id(ws_idx, spawned_pane, &run_id);
 
         // Membership stamping mirrors the TUI confirm path: the source keeps
         // (or gains non-linked) membership; the child is a linked worktree of
@@ -1101,6 +1108,7 @@ impl App {
     ) -> WorktreeInfo {
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
         let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
+        let open_idx = self.open_workspace_idx_for_checkout(&canonical_path);
         WorktreeInfo {
             path: entry.path.display().to_string(),
             branch: entry.branch,
@@ -1108,10 +1116,15 @@ impl App {
             is_detached: entry.is_detached,
             is_prunable: entry.is_prunable,
             is_linked_worktree: canonical_path != repo_root,
-            open_workspace_id: self
-                .open_workspace_idx_for_checkout(&canonical_path)
-                .map(|idx| self.public_workspace_id(idx)),
+            open_workspace_id: open_idx.map(|idx| self.public_workspace_id(idx)),
             label: source.repo_name.clone(),
+            // Only an OPEN workspace has been through the PR poller — a
+            // closed checkout reports None, meaning "not polled" rather
+            // than "no PR" (#332).
+            pr: open_idx
+                .and_then(|idx| self.state.workspaces.get(idx))
+                .and_then(|ws| ws.pr_state())
+                .map(crate::api::schema::PrInfo::from_state),
         }
     }
 
@@ -1133,6 +1146,7 @@ impl App {
             is_linked_worktree: membership.is_linked_worktree,
             open_workspace_id: Some(self.public_workspace_id(ws_idx)),
             label: source.repo_name.clone(),
+            pr: ws.pr_state().map(crate::api::schema::PrInfo::from_state),
         })
     }
 
@@ -2506,6 +2520,20 @@ mod tests {
         assert_eq!(root_pane.workspace_id, workspace.workspace_id);
         assert_eq!(worktree.branch.as_deref(), Some("fork/alt-approach"));
         assert!(Path::new(&worktree.path).join("README.md").exists());
+        // #332: the run id must reach the child's TERMINAL, not only the
+        // response and the child's env. Asserting only the response is what
+        // let the sibling keyboard-fork path ship without the stamp — its
+        // commits carried `Agent-Run:` trailers while the agent reported no
+        // run id at all.
+        let child_pane = app.state.workspaces[1]
+            .focused_pane_id()
+            .expect("child root pane");
+        let child_run_id = app.agent_info(1, child_pane).and_then(|info| info.run_id);
+        assert_eq!(
+            child_run_id.as_deref(),
+            Some(run_id.as_str()),
+            "the forked agent must report the same run id its commits will carry"
+        );
         assert_eq!(app.state.workspaces.len(), 2);
         assert!(
             !app.state.workspaces[0]

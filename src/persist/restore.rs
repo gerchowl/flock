@@ -498,6 +498,10 @@ fn restore_tab(
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
+        // #332: a restored agent keeps the run id it was spawned under. Its
+        // commits keep their `Agent-Run:` trailers across a restart either
+        // way, so an agent that forgot its own run id would strand them.
+        let saved_run_id = saved_pane.and_then(|p| p.run_id.clone());
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_last_prompt = saved_pane.and_then(|p| p.last_prompt.clone());
         let saved_header_reserved = saved_pane.is_some_and(|p| p.header_reserved);
@@ -547,6 +551,7 @@ fn restore_tab(
             if let Some(agent_name) = saved_agent_name {
                 terminal.set_agent_name(agent_name);
             }
+            terminal.run_id = saved_run_id.clone();
             if let Some(agent) = initial_restore_agent {
                 let _ = terminal.set_detected_state_with_screen_signals_at(
                     Some(agent),
@@ -618,6 +623,7 @@ fn restore_tab(
                 if let Some(agent_name) = saved_agent_name {
                     terminal.set_agent_name(agent_name);
                 }
+                terminal.run_id = saved_run_id.clone();
                 if let Some(agent) = initial_restore_agent {
                     let _ = terminal.set_detected_state_with_screen_signals_at(
                         Some(agent),
@@ -1136,6 +1142,7 @@ mod tests {
                             last_prompt: None,
                             header_reserved: false,
                             agent_name: None,
+                            run_id: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:opencode".into(),
                                 agent: "opencode".into(),
@@ -1223,6 +1230,7 @@ mod tests {
                             last_prompt: None,
                             header_reserved: false,
                             agent_name: None,
+                            run_id: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:codex".into(),
                                 agent: "codex".into(),
@@ -1397,6 +1405,7 @@ mod tests {
                 last_prompt: None,
                 header_reserved: false,
                 agent_name: None,
+                run_id: None,
                 agent_session: None,
                 launch_argv: None,
             },

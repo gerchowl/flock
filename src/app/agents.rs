@@ -440,6 +440,7 @@ impl App {
             foreground_cwd: pane.foreground_cwd,
             seen: pane.seen,
             status_age_secs: pane.status_age_secs,
+            run_id: terminal.run_id.clone(),
             revision: pane.revision,
         })
     }

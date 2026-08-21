@@ -208,6 +208,24 @@ pub struct TerminalState {
     session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
+    /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
+    ///
+    /// Minted per scheduler- or agent-initiated spawn, stamped into the
+    /// child's environment, and appended to every commit that child makes
+    /// as an `Agent-Run:` trailer — which is what `flk revert-run` joins
+    /// on. It existed on the `AgentForked` event and in the child's env,
+    /// but nowhere a reader could see it, so joining "this agent" to "these
+    /// commits" to "that PR" meant inferring from `cwd`.
+    ///
+    /// `None` unless the pane was FORKED. Both fork paths mint one — the
+    /// operator's keyboard fork as well as the `agent.fork` verb — because
+    /// what earns a run id is that the child's commits carry an
+    /// `Agent-Run:` trailer, not who pressed the key.
+    ///
+    /// A plain pane (a shell, or an agent the operator started directly)
+    /// has no trailer to join against, and minting an id for it would make
+    /// `flk revert-run` offer to revert work no run produced.
+    pub run_id: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
@@ -264,6 +282,7 @@ impl TerminalState {
             session_ref_hook_confirmed: false,
             manual_label: None,
             agent_name: None,
+            run_id: None,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,

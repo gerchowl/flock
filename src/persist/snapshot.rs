@@ -129,6 +129,12 @@ pub struct PaneSnapshot {
     pub header_reserved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// The run id this pane's agent was spawned under (#332). Persisted so
+    /// the agent→commits→PR join survives a restart: the commits keep their
+    /// `Agent-Run:` trailers either way, and an agent that forgot its own
+    /// run id on restart would strand them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,7 +410,7 @@ fn capture_tab(
                         }
                     })
                 });
-        let (last_prompt, header_reserved, agent_id) = tab
+        let (last_prompt, header_reserved, agent_id, run_id) = tab
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id))
@@ -415,9 +421,10 @@ fn capture_tab(
                     // Persisting this is what makes it an identity rather than
                     // a handle: without it, restart re-addresses every agent.
                     Some(terminal.agent_id.to_string()),
+                    terminal.run_id.clone(),
                 )
             })
-            .unwrap_or((None, false, None));
+            .unwrap_or((None, false, None, None));
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -427,6 +434,7 @@ fn capture_tab(
                 last_prompt,
                 header_reserved,
                 agent_name,
+                run_id,
                 agent_session,
                 launch_argv,
             },
@@ -579,6 +587,63 @@ mod tests {
         state
     }
 
+    /// #332: an agent's run id is the join key between the running agent
+    /// and the commits it made (`Agent-Run:` trailers, consumed by
+    /// `flk revert-run`). A restart must not break that join — the commits
+    /// keep their trailers regardless, so an agent that forgot its own run
+    /// id would strand them.
+    #[test]
+    fn run_id_survives_a_capture() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("main")];
+        state.active = Some(0);
+        state.ensure_test_terminals();
+
+        let pane_id = state.workspaces[0].focused_pane_id().expect("pane");
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .run_id = Some("fork:deadbeef-1234-0".to_string());
+
+        let snapshot = capture_from_state(&state);
+        let persisted = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("one persisted pane");
+        assert_eq!(persisted.run_id.as_deref(), Some("fork:deadbeef-1234-0"));
+    }
+
+    /// A pane the operator started carries no run id, and must not gain a
+    /// fabricated one on the way through the snapshot — `flk revert-run`
+    /// offering to revert the operator's own work is the failure this
+    /// prevents.
+    #[test]
+    fn an_operator_started_pane_persists_no_run_id() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("main")];
+        state.active = Some(0);
+        state.ensure_test_terminals();
+
+        let snapshot = capture_from_state(&state);
+        let persisted = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("one persisted pane");
+        assert_eq!(persisted.run_id, None);
+        // It must also stay off the wire entirely rather than serialising
+        // as an explicit null.
+        let json = serde_json::to_string(&persisted).expect("serialisable");
+        assert!(!json.contains("run_id"), "{json}");
+    }
+
     /// The property that makes an AgentId an identity rather than a handle:
     /// it goes into the snapshot and comes back unchanged. `TerminalId` does
     /// not — it is re-minted every start — which is why an agent had no name
@@ -708,6 +773,7 @@ mod tests {
                 last_prompt: None,
                 header_reserved: false,
                 agent_name: None,
+                run_id: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -721,6 +787,7 @@ mod tests {
                 last_prompt: None,
                 header_reserved: false,
                 agent_name: None,
+                run_id: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -1398,6 +1465,7 @@ mod tests {
                 last_prompt: None,
                 header_reserved: false,
                 agent_name: None,
+                run_id: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -1413,6 +1481,7 @@ mod tests {
                 last_prompt: None,
                 header_reserved: false,
                 agent_name: None,
+                run_id: None,
                 agent_session: None,
                 launch_argv: None,
             },
