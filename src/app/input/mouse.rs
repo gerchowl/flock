@@ -511,6 +511,25 @@ impl AppState {
                             .is_some_and(|remove| remove.force_confirmation || remove.force);
                         let (remove, cancel) =
                             crate::ui::remove_worktree_button_rects(inner, forced);
+                        // #326: the force toggle is a control like the buttons,
+                        // so the mouse reaches it too — a keyboard-only
+                        // affordance in a mouse-first TUI is half a feature.
+                        let force_rect = self
+                            .worktree_remove
+                            .as_ref()
+                            .and_then(|state| crate::ui::remove_worktree_force_rect(inner, state));
+                        if let Some(force_rect) = force_rect {
+                            if rect_contains(force_rect, mouse.column, mouse.row) {
+                                if let Some(state) = self.worktree_remove.as_mut() {
+                                    if !state.removing {
+                                        state.focus =
+                                            crate::app::state::RemoveWorktreeControl::Force;
+                                        state.force = !state.force;
+                                    }
+                                }
+                                return None;
+                            }
+                        }
                         match modal_action_from_buttons(
                             mouse.column,
                             mouse.row,
@@ -520,6 +539,11 @@ impl AppState {
                             ],
                         ) {
                             Some(ModalAction::Confirm) => {
+                                // #326: clicking moves focus too, so a click
+                                // followed by Enter acts on the same control.
+                                if let Some(state) = self.worktree_remove.as_mut() {
+                                    state.focus = crate::app::state::RemoveWorktreeControl::Remove;
+                                }
                                 self.request_submit_worktree_remove = true;
                             }
                             Some(ModalAction::Cancel)
@@ -3069,6 +3093,66 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_force_toggle_arms_it_and_takes_focus() {
+        // #326: a keyboard-only affordance in a mouse-first TUI is half a
+        // feature, and clicking has to leave focus where the click landed so a
+        // following Enter acts on the same control.
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
+            workspace_id: "issue".into(),
+            repo_root: "/repo/flock".into(),
+            path: "/repo/flock-issue".into(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
+            force: false,
+            probe: Some(crate::worktree::KillProbe {
+                dirty: Some(vec!["?? scratch.txt".into()]),
+                unpushed: Some(1),
+            }),
+            delete_branch: true,
+            branch: Some("feature/x".into()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+            branch_protected: false,
+            gate_timed_out: false,
+        });
+        let state = app.state.worktree_remove.as_ref().unwrap();
+        let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect(), state).unwrap();
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let force = crate::ui::remove_worktree_force_rect(inner, state).expect("force row");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            force.x + 2,
+            force.y,
+        ));
+
+        let state = app
+            .state
+            .worktree_remove
+            .as_ref()
+            .expect("dialog stays open");
+        assert!(state.force, "the click arms force");
+        assert_eq!(
+            state.focus,
+            crate::app::state::RemoveWorktreeControl::Force,
+            "and focus follows the click"
+        );
+        assert!(
+            !app.state.request_submit_worktree_remove,
+            "toggling must not also confirm"
+        );
+    }
+
+    #[test]
     fn clicking_remove_worktree_buttons_requests_remove_or_cancels() {
         let mut app = app_for_mouse_test();
         app.state.mode = Mode::ConfirmRemoveWorktree;
@@ -3080,6 +3164,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: false,
@@ -3120,6 +3205,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: false,

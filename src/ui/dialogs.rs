@@ -8,9 +8,13 @@ use ratatui::{
 
 use super::widgets::{
     action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
-    render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
+    render_action_button_focused, render_modal_header, render_modal_shell, render_panel_shell,
+    ActionButtonSpec,
 };
-use crate::app::{state::WorktreeOpenState, AppState, Mode};
+use crate::app::{
+    state::{RemoveWorktreeControl, WorktreeOpenState},
+    AppState, Mode,
+};
 
 fn truncate_text(text: &str, max_width: usize) -> String {
     let len = text.chars().count();
@@ -215,6 +219,25 @@ pub(crate) fn remove_worktree_stakes_rows(remove: &crate::app::state::WorktreeRe
     }
     rows
 }
+
+/// Where the force toggle's line sits inside the dialog (#326), so a click can
+/// reach it. `None` until the probe lands, which is when the toggle is drawn.
+///
+/// Derived from the same two numbers the render uses — the seven fixed rows
+/// above the flexible tail, then the stakes block — so the clickable row and
+/// the drawn row cannot drift apart.
+pub(crate) fn remove_worktree_force_rect(
+    inner: Rect,
+    remove: &crate::app::state::WorktreeRemoveState,
+) -> Option<Rect> {
+    remove.probe.as_ref()?;
+    let y = inner.y + REMOVE_WORKTREE_FIXED_ROWS + remove_worktree_stakes_rows(remove);
+    (y < inner.y + inner.height.saturating_sub(1)).then(|| Rect::new(inner.x, y, inner.width, 1))
+}
+
+/// Rows above the dialog's flexible tail: title, lead-in, path, gate line,
+/// dirty warning, status, spacer.
+pub(crate) const REMOVE_WORKTREE_FIXED_ROWS: u16 = 7;
 
 /// The dialog grows with what it has to account for (#325): the fixed 10-row
 /// box predates it having anything to list.
@@ -587,7 +610,7 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     let forced = remove.force_confirmation || remove.force;
     let (remove_rect, cancel_rect) = remove_worktree_button_rects(inner, forced);
     let remove_label = if forced { "delete anyway" } else { "remove" };
-    render_action_button(
+    render_action_button_focused(
         frame,
         remove_rect,
         Some("↵"),
@@ -596,8 +619,9 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             .fg(panel_contrast_fg(&app.palette))
             .bg(app.palette.red)
             .add_modifier(Modifier::BOLD),
+        remove.focus == RemoveWorktreeControl::Remove,
     );
-    render_action_button(
+    render_action_button_focused(
         frame,
         cancel_rect,
         Some("esc"),
@@ -606,6 +630,7 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             .fg(app.palette.text)
             .bg(app.palette.surface0)
             .add_modifier(Modifier::BOLD),
+        remove.focus == RemoveWorktreeControl::Cancel,
     );
 }
 
@@ -683,7 +708,14 @@ fn remove_worktree_force_line(
     remove: &crate::app::state::WorktreeRemoveState,
     p: &crate::app::state::Palette,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled(" [f] ", Style::default().fg(p.overlay1))];
+    // The ring is a leading marker rather than REVERSED here: this is a line of
+    // text, not a button rect, and swapping a whole row's colours would read as
+    // a selection bar. Width-neutral — it replaces the leading space (#326).
+    let focused = remove.focus == crate::app::state::RemoveWorktreeControl::Force;
+    let mut spans = vec![Span::styled(
+        if focused { "›[f] " } else { " [f] " },
+        Style::default().fg(if focused { p.text } else { p.overlay1 }),
+    )];
     if remove.force {
         spans.push(Span::styled(
             "force ON",
@@ -1379,7 +1411,9 @@ mod tests {
         render_new_linked_worktree_overlay, render_remove_worktree_overlay,
         REMOVE_WORKTREE_MAX_LISTED,
     };
-    use crate::app::state::{WorktreeCreateFocus, WorktreeCreateState, WorktreeRemoveState};
+    use crate::app::state::{
+        RemoveWorktreeControl, WorktreeCreateFocus, WorktreeCreateState, WorktreeRemoveState,
+    };
 
     fn worktree_create_with(
         branch_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -1439,6 +1473,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe,
             delete_branch: true,
@@ -1535,6 +1570,36 @@ mod tests {
             "the old line would now be a lie: {text:?}"
         );
         assert!(text.contains("delete anyway"), "button label: {text:?}");
+    }
+
+    #[test]
+    fn the_focused_control_is_visibly_marked() {
+        // #326: the ring on the force line is a leading marker rather than a
+        // reversed row — width-neutral, so the clickable rect and the drawn
+        // row stay the same width.
+        let mut app = AppState::test_new();
+        let mut remove = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some(vec!["?? scratch.txt".into()]),
+            unpushed: Some(1),
+        }));
+        remove.focus = RemoveWorktreeControl::Force;
+        app.worktree_remove = Some(remove);
+
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("›[f]"), "focused force line: {text:?}");
+
+        let mut app = AppState::test_new();
+        let mut remove = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some(vec!["?? scratch.txt".into()]),
+            unpushed: Some(1),
+        }));
+        remove.focus = RemoveWorktreeControl::Cancel;
+        app.worktree_remove = Some(remove);
+        let text = render_kill_dialog(&app);
+        assert!(
+            !text.contains("›[f]"),
+            "the marker moves with the focus: {text:?}"
+        );
     }
 
     #[test]

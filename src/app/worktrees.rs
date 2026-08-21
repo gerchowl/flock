@@ -5,8 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
     state::{
-        WorktreeCreateState, WorktreeKillAllState, WorktreeKillRow, WorktreeKillRowStatus,
-        WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState,
+        RemoveWorktreeControl, WorktreeCreateState, WorktreeKillAllState, WorktreeKillRow,
+        WorktreeKillRowStatus, WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState,
     },
     App, Mode,
 };
@@ -462,6 +462,7 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: false,
@@ -525,6 +526,7 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -1438,37 +1440,97 @@ impl App {
         });
     }
 
+    /// The kill dialog's focusable controls, in the order they read on screen
+    /// (#326). `Force` joins the list only once the probe has landed, which is
+    /// the same moment the dialog starts rendering the toggle (#325).
+    fn worktree_remove_controls(&self) -> Vec<RemoveWorktreeControl> {
+        let mut controls = Vec::with_capacity(3);
+        if self
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_some_and(|remove| remove.probe.is_some())
+        {
+            controls.push(RemoveWorktreeControl::Force);
+        }
+        controls.push(RemoveWorktreeControl::Remove);
+        controls.push(RemoveWorktreeControl::Cancel);
+        controls
+    }
+
+    fn move_worktree_remove_focus(&mut self, delta: isize) {
+        let controls = self.worktree_remove_controls();
+        let Some(remove) = &mut self.state.worktree_remove else {
+            return;
+        };
+        if remove.removing {
+            return;
+        }
+        remove.focus = crate::ui::focus::step(&controls, remove.focus, delta);
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    /// Act on whatever currently has focus. Bare Enter still confirms, because
+    /// focus starts on `Remove` — the model is additive and costs nobody their
+    /// muscle memory until they press an arrow (#326).
+    fn activate_worktree_remove_focus(&mut self) {
+        let controls = self.worktree_remove_controls();
+        let focus = match self.state.worktree_remove.as_ref() {
+            Some(remove) => {
+                crate::ui::focus::resolve(&controls, remove.focus, RemoveWorktreeControl::Remove)
+            }
+            None => return,
+        };
+        match focus {
+            RemoveWorktreeControl::Force => self.toggle_worktree_remove_force(),
+            RemoveWorktreeControl::Remove => self.start_worktree_remove(),
+            RemoveWorktreeControl::Cancel => self.cancel_worktree_remove(),
+        }
+    }
+
+    pub(crate) fn toggle_worktree_remove_force(&mut self) {
+        let Some(remove) = &mut self.state.worktree_remove else {
+            return;
+        };
+        if remove.removing {
+            return;
+        }
+        remove.force = !remove.force;
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    pub(crate) fn cancel_worktree_remove(&mut self) {
+        if self
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_some_and(|remove| remove.removing)
+        {
+            return;
+        }
+        self.state.worktree_remove = None;
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+    }
+
     pub(crate) fn handle_worktree_remove_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                if self
-                    .state
-                    .worktree_remove
-                    .as_ref()
-                    .is_some_and(|remove| remove.removing)
-                {
-                    return;
-                }
-                self.state.worktree_remove = None;
-                self.state.mode = if self.state.active.is_some() {
-                    Mode::Terminal
-                } else {
-                    Mode::Navigate
-                };
-            }
-            KeyCode::Enter => self.start_worktree_remove(),
+            // Esc still cancels from any focus position — a modal's way out
+            // does not move with the focus ring.
+            KeyCode::Esc => self.cancel_worktree_remove(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate_worktree_remove_focus(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down => self.move_worktree_remove_focus(1),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => self.move_worktree_remove_focus(-1),
             // #325: the same chord the fleet sweep uses for its force toggle,
-            // so the two kill dialogs read as one feature. Inert once the
-            // removal is under way — the flag has already been consumed.
-            KeyCode::Char('f') | KeyCode::Char('F') => {
-                if let Some(remove) = &mut self.state.worktree_remove {
-                    if !remove.removing {
-                        remove.force = !remove.force;
-                        self.render_dirty.store(true, Ordering::Release);
-                        self.render_notify.notify_one();
-                    }
-                }
-            }
+            // so the two kill dialogs read as one feature. Kept as a direct
+            // shortcut alongside the focus path — it is faster than walking to
+            // the control, and the sweep has taught the key already.
+            KeyCode::Char('f') | KeyCode::Char('F') => self.toggle_worktree_remove_force(),
             _ => {}
         }
     }
@@ -2196,6 +2258,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: false,
@@ -2232,6 +2295,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: false,
@@ -3124,6 +3188,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3167,6 +3232,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3276,6 +3342,110 @@ mod tests {
     }
 
     #[test]
+    fn kill_dialog_reaches_cancel_from_the_keyboard() {
+        // #326: the handler used to match exactly two keys, so Enter always
+        // meant the destructive button and `cancel` was mouse-only.
+        let mut app = app_for_worktree_tests();
+        let mut state = kill_dialog_state("feature/x");
+        state.probe = Some(crate::worktree::KillProbe::default());
+        app.state.worktree_remove = Some(state);
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        // Focus starts on `Remove`: bare Enter still means what it always did.
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Remove
+        );
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Cancel
+        );
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            app.state.worktree_remove.is_none(),
+            "Enter on `cancel` cancels, rather than removing"
+        );
+    }
+
+    #[test]
+    fn kill_dialog_focus_wraps_and_reaches_the_force_toggle() {
+        let mut app = app_for_worktree_tests();
+        let mut state = kill_dialog_state("feature/x");
+        state.probe = Some(crate::worktree::KillProbe::default());
+        app.state.worktree_remove = Some(state);
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        // Order reads down the dialog: force, then the button row.
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Force
+        );
+        // Space activates whatever is focused, so it toggles here.
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(app.state.worktree_remove.as_ref().unwrap().force);
+
+        // And it wraps.
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Cancel
+        );
+    }
+
+    #[test]
+    fn kill_dialog_focus_skips_the_force_toggle_until_the_probe_lands() {
+        // The toggle is not drawn while the probe runs, so it must not be
+        // reachable either — focus never lands on a control that is not there.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(kill_dialog_state("feature/x"));
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Cancel
+        );
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Remove
+        );
+    }
+
+    #[test]
+    fn esc_still_cancels_from_any_focus_position() {
+        // A modal's way out does not move with the focus ring.
+        let mut app = app_for_worktree_tests();
+        let mut state = kill_dialog_state("feature/x");
+        state.probe = Some(crate::worktree::KillProbe::default());
+        state.focus = RemoveWorktreeControl::Force;
+        app.state.worktree_remove = Some(state);
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.state.worktree_remove.is_none());
+    }
+
+    #[test]
+    fn focus_does_not_move_once_the_removal_is_under_way() {
+        let mut app = app_for_worktree_tests();
+        let mut state = kill_dialog_state("feature/x");
+        state.probe = Some(crate::worktree::KillProbe::default());
+        state.removing = true;
+        app.state.worktree_remove = Some(state);
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().focus,
+            RemoveWorktreeControl::Remove
+        );
+    }
+
+    #[test]
     fn kill_gate_protects_default_branch_even_when_merge_gate_passes() {
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(WorktreeRemoveState {
@@ -3286,6 +3456,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3332,6 +3503,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3372,6 +3544,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3401,6 +3574,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3452,6 +3626,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
@@ -3510,6 +3685,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
             delete_branch: true,
