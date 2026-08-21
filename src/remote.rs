@@ -2377,11 +2377,18 @@ mod tests {
         let stub_dir = std::env::temp_dir().join(format!("flock-teardown-{}", std::process::id()));
         std::fs::create_dir_all(&stub_dir).expect("stub dir");
         let stub = stub_dir.join("ssh");
-        // A tunnel that stays up until it is killed: `cat` blocks on stdin
-        // forever, exactly like a live `ssh` holding the bridge open. Anything
-        // that EXITS on its own would test the wrong thing — the bug is about
-        // the child WE kill.
-        std::fs::write(&stub, "#!/bin/sh\nexec cat\n").expect("write stub ssh");
+        // A tunnel that stays up until it is KILLED, and dies of nothing else.
+        //
+        // `cat` was the obvious stand-in and is subtly wrong: `drop(client)`
+        // below closes the child's stdin, `cat` reads EOF and exits **0** of
+        // its own accord, and the SIGKILL then lands on a corpse. That is a
+        // real status rather than signal-death, so the labelling under test
+        // correctly declines to call it teardown and the assertion fails —
+        // on macOS, where the EOF beat the signal, while Linux stayed green.
+        //
+        // `sleep` ignores stdin entirely, so the only thing that can end this
+        // child is the signal, which is the case under test.
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 600\n").expect("write stub ssh");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         // Bind under /tmp, not temp_dir(): see `bridge_socket_is_user_only`.
