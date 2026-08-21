@@ -778,13 +778,54 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
                 .as_deref()
                 .map(display_sort_key)
                 .unwrap_or_else(|| display_sort_key(key));
+            // #331/#122: a project with ONE checkout still renders as a
+            // header with its member beneath it, so the organisation model
+            // reads the same at one checkout as at five — and, concretely,
+            // so a header-scoped surface is reachable at all in the solo
+            // case. Gating the header on `grouped_keys` made it unreachable
+            // exactly when there was nothing to fold.
+            //
+            // Header presence and COLLAPSIBILITY are now separate
+            // questions. `grouped_keys` (>= 2 members) still owns the
+            // collapse affordance, so a solo project renders a header that
+            // cannot be collapsed — which is what keeps both its rows
+            // selectable rather than folding one into the other.
+            //
+            // #92 still holds: a section whose project identity has NOT
+            // resolved stays a single flat row. A header showing no
+            // identity would be pure chrome, and its member would read as
+            // belonging to an absent group.
+            if !emitted_groups.insert(key.to_string()) {
+                continue;
+            }
+            // A `dir:<name>` key is a machine-local directory-name fallback,
+            // NOT a shared project identity — `collapsible_space_keys`
+            // already skips them for exactly this reason. A header over one
+            // would restate the directory name above its own member row and
+            // claim an identity that never resolved.
+            let has_project_identity = project_key
+                .as_deref()
+                .is_some_and(|project| !project.starts_with("dir:"));
+            let entries = if has_project_identity {
+                vec![
+                    WorkspaceListEntry::Header {
+                        key: key.to_string(),
+                    },
+                    WorkspaceListEntry::Workspace {
+                        ws_idx,
+                        indented: true,
+                    },
+                ]
+            } else {
+                vec![WorkspaceListEntry::Workspace {
+                    ws_idx,
+                    indented: false,
+                }]
+            };
             blocks.push(SpaceBlock {
                 sort_key,
                 tie: (0, ws_idx),
-                entries: vec![WorkspaceListEntry::Workspace {
-                    ws_idx,
-                    indented: false,
-                }],
+                entries,
                 project_key,
                 is_local: true,
                 focus_ws_indices: vec![ws_idx],
@@ -2952,8 +2993,17 @@ fn render_workspace_list(
             };
             spans.push(Span::styled(format!("{index} "), idx_style));
         }
-        let triangle = if collapsed { "▸" } else { "▾" };
-        spans.push(Span::styled(triangle, Style::default().fg(p.accent)));
+        // #331: a solo project renders a header but is NOT collapsible, so
+        // it must not draw a fold affordance. A triangle on a row that
+        // cannot fold is an invitation to a click that does nothing —
+        // aligned to the same column so the header still lines up with its
+        // collapsible siblings.
+        if app.collapsible_space_keys().contains(key) {
+            let triangle = if collapsed { "▸" } else { "▾" };
+            spans.push(Span::styled(triangle, Style::default().fg(p.accent)));
+        } else {
+            spans.push(Span::styled(" ", Style::default()));
+        }
         spans.push(Span::styled(" ", Style::default()));
         let (state, seen) = space_aggregate_state(app, key);
         let (group_icon, group_style) = agent_icon(state, seen, app.spinner_tick, p);
@@ -4742,9 +4792,12 @@ mod tests {
                     ws_idx: 0,
                     indented: true
                 },
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/other".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
-                    indented: false
+                    indented: true
                 },
             ]
         );
@@ -4759,11 +4812,65 @@ mod tests {
         );
     }
 
+    /// #331: the header exists so a header-scoped surface has something to
+    /// attach to in the solo case — but the section must stay UNcollapsible,
+    /// or folding it would put both rows back into one and take away the
+    /// second selectable path the header was added to provide.
     #[test]
-    fn single_local_with_no_remote_stays_a_solo_leader() {
-        // The contrast to #153: one local checkout with NO federated peer on
-        // the same project renders as a bare unindented row — no header, no
-        // indentation. Aggregation is strictly for >=2 total members.
+    fn a_solo_project_renders_a_header_that_cannot_be_collapsed() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(
+            entries,
+            vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".to_string(),
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true,
+                },
+            ]
+        );
+        assert!(
+            app.collapsible_space_keys().is_empty(),
+            "one member is nothing to fold; the header must not be collapsible"
+        );
+        // The fold affordance is the section HEAD's, and it stays gated on
+        // >= 2 members — so no triangle is offered on a solo header.
+        assert_eq!(workspace_parent_group_state(&app, 0), None);
+    }
+
+    /// Headers are skipped by `visible_workspace_order`, so moving the sole
+    /// checkout beneath one risks making it keyboard-unreachable — the exact
+    /// hazard #155 documents for collapsed single-local aggregates.
+    #[test]
+    fn a_solo_projects_member_stays_keyboard_reachable_under_its_header() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace_with_project_key(
+            "flock",
+            "github.com/gerchowl/flock",
+        )];
+        assert_eq!(
+            app.visible_workspace_order(),
+            vec![0],
+            "the sole checkout must still be reachable once it is indented"
+        );
+    }
+
+    #[test]
+    fn single_local_with_no_remote_renders_its_own_header() {
+        // The contrast to #153 is now about COLLAPSIBILITY, not about having
+        // a header. Since #331 a lone checkout of an identified project still
+        // renders header-then-member — the organisation model reads the same
+        // at one checkout as at five, and a header-scoped surface stays
+        // reachable. What aggregation (>=2 members) still buys is the fold
+        // affordance: this section is not collapsible.
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![workspace_with_project_key(
             "flock",
@@ -4779,15 +4886,18 @@ mod tests {
             )],
         )];
 
-        // Full shape: the local project stays a bare solo leader (no header, no
-        // indent), and the unmatched remote-only project still renders as its
-        // own leader — neither folds into the other.
+        // Full shape: the local project renders header-then-member, and the
+        // unmatched remote-only project still renders as its own leader —
+        // neither folds into the other.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".to_string(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false
+                    indented: true
                 },
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
@@ -4894,9 +5004,12 @@ mod tests {
                     ws_idx: 1,
                     indented: true
                 },
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".into()
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented: false
+                    indented: true
                 },
             ]
         );
@@ -5298,10 +5411,15 @@ mod tests {
         app.server_filter = Some(crate::app::state::ServerFilter::Local);
         assert_eq!(
             workspace_list_entries(&app),
-            vec![WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false
-            }],
+            vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".to_string(),
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented: true,
+                },
+            ],
             "local filter keeps local workspaces and folds no remote rows"
         );
     }
@@ -5414,9 +5532,12 @@ mod tests {
         assert!(cards.is_empty());
         assert_eq!(remote_cards.len(), 1);
 
-        // Local filter: both local cards, no remote ones.
+        // Local filter: both local cards, no remote ones. Each identified
+        // local project contributes a header row as well as its member
+        // (#331), so the filtered stream is four entries, not two — and the
+        // scroll clamp has to follow the ENTRY count, not the card count.
         app.server_filter = Some(crate::app::state::ServerFilter::Local);
-        assert_eq!(normalized_workspace_scroll(&app, area, 99), 1);
+        assert_eq!(normalized_workspace_scroll(&app, area, 99), 3);
         let (cards, remote_cards, _headers) = compute_workspace_list_areas(&app, area);
         assert_eq!(cards.len(), 2);
         assert!(remote_cards.is_empty());
@@ -6145,17 +6266,37 @@ mod tests {
 
         let area = Rect::new(0, 0, 60, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
+
+        // #331: the identity moved UP onto its own header row and the member
+        // keeps the locator, so the two are separately selectable — which is
+        // the whole point, since a header-scoped surface is unreachable when
+        // the two collapse into one row.
+        let header = app
+            .view
+            .space_header_areas
+            .first()
+            .expect("a solo project still renders a header");
+        let header_row = buffer_row_text(&buffer, header.rect, header.rect.y);
+        assert!(
+            header_row.contains("gerchowl/flock"),
+            "the header carries the project identity: {header_row:?}"
+        );
+        // Not collapsible with one member, so it must NOT advertise a fold.
+        assert!(
+            !header_row.contains('\u{25be}') && !header_row.contains('\u{25b8}'),
+            "a non-collapsible header must not draw a fold triangle: {header_row:?}"
+        );
+
         let card = app.view.workspace_card_areas[0];
         assert!(
-            !card.indented,
-            "the solo row is its project's section head, never indented"
+            card.indented,
+            "the sole checkout is a member of its project, not a leader"
         );
         let row = buffer_row_text(&buffer, card.rect, card.rect.y);
         let server = crate::ui::grammar::local_server_name();
-        let expected_tail = format!("gerchowl/flock \u{00b7} {server}:keyboard-shorcuts");
         assert!(
-            row.contains(&expected_tail),
-            "solo local carries identity + member locator: {row:?}"
+            row.contains(&format!("{server}:keyboard-shorcuts")),
+            "the member row keeps the locator: {row:?}"
         );
     }
 
@@ -7910,19 +8051,27 @@ mod tests {
         assert_eq!(
             workspace_list_entries(&app),
             vec![
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/flock".to_string(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 1,
-                    indented: false,
+                    indented: true,
                 },
                 WorkspaceListEntry::Remote {
                     peer: crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
                     ws_idx: 0,
                     indented: false,
                 },
+                WorkspaceListEntry::Header {
+                    key: "github.com/gerchowl/ribes".to_string(),
+                },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 2,
-                    indented: false,
+                    indented: true,
                 },
+                // `notes` has no project identity, so it stays a flat row —
+                // #92's rule survives #331's header change.
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
                     indented: false,
