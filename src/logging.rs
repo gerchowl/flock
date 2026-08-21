@@ -365,14 +365,31 @@ pub(crate) fn transcript_writer_newer_than_tested(writer_version: &str) {
 ///
 /// Logs the session id and the error shape only — never transcript content,
 /// which contains everything the user typed and every tool result.
-pub(crate) fn transcript_unreadable(session_id: &str, reason: &str) {
+/// The transcript has not been written yet. DEBUG on purpose: the first hook
+/// of a session routinely fires before the agent's first write, and the read
+/// re-arms, so this is a normal step in a healthy session (#337).
+pub(crate) fn transcript_absent(session_id: &str) {
     tracing::debug!(
-        event = "transcript.read.failed",
+        event = "transcript.read.absent",
         subsystem = "transcript",
         outcome = "unavailable",
         session_id,
+        "session transcript not on disk yet; keeping existing prompt history"
+    );
+}
+
+/// The transcript EXISTS and the kernel could not read it. WARN, because this
+/// is the shape of the format moving under us and the panel silently keeps
+/// stale content. Previously DEBUG, which is why a panel that never hydrated
+/// produced no diagnostic at the default level (#337).
+pub(crate) fn transcript_unreadable(session_id: &str, reason: &str) {
+    tracing::warn!(
+        event = "transcript.read.failed",
+        subsystem = "transcript",
+        outcome = "degraded",
+        session_id,
         reason,
-        "session transcript unavailable; keeping existing prompt history"
+        "session transcript unreadable; keeping existing prompt history"
     );
 }
 
