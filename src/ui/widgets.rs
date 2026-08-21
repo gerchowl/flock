@@ -180,6 +180,28 @@ pub(super) fn render_action_button(
     label: &str,
     style: Style,
 ) {
+    render_action_button_focused(frame, rect, hint, label, style, false);
+}
+
+/// A button that can carry the keyboard focus ring (#326).
+///
+/// The ring is `REVERSED` rather than an added marker or border: it is
+/// width-neutral, so the focused button occupies exactly the rect the hit-test
+/// computed for it, and it reads on every theme without needing a palette
+/// colour that contrasts with both button backgrounds already in use.
+pub(super) fn render_action_button_focused(
+    frame: &mut Frame,
+    rect: Rect,
+    hint: Option<&str>,
+    label: &str,
+    style: Style,
+    focused: bool,
+) {
+    let style = if focused {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    };
     frame.render_widget(
         Paragraph::new(action_button_text(hint, label))
             .style(style)
