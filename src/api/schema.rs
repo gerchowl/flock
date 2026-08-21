@@ -1581,6 +1581,49 @@ pub struct WorktreeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_workspace_id: Option<String>,
     pub label: String,
+    /// GitHub PR state for this worktree's branch (#332).
+    ///
+    /// The batched poller (`src/pr_poll.rs`) already resolves this per
+    /// `(repo, branch)` for the sidebar badges; before #332 it stopped at
+    /// the TUI, so an API client — including an agent reading
+    /// `flock_worktree_list` — got branches with no idea which were open,
+    /// merged, or closed.
+    ///
+    /// **Known only for worktrees that are OPEN as a workspace.** The
+    /// poller's query set is built from open workspaces, so a checkout
+    /// nobody has open reports `None` — which means "not polled", NOT "no
+    /// PR". Absence is not evidence here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrInfo>,
+}
+
+/// A branch's GitHub PR, as carried on the wire (#332).
+///
+/// Deliberately its own type rather than a serde derive on
+/// `crate::worktree::PrStateInfo`: the internal enum is free to grow
+/// variants for the TUI's benefit, and the wire contract should not change
+/// underneath clients when it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrInfo {
+    pub number: u64,
+    /// `open` | `draft` | `merged` | `closed`.
+    pub state: String,
+}
+
+impl PrInfo {
+    pub(crate) fn from_state(info: crate::worktree::PrStateInfo) -> Self {
+        use crate::worktree::PrState;
+        Self {
+            number: info.number,
+            state: match info.state {
+                PrState::Open => "open",
+                PrState::Draft => "draft",
+                PrState::Merged => "merged",
+                PrState::Closed => "closed",
+            }
+            .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2846,6 +2889,7 @@ mod tests {
                     is_linked_worktree: true,
                     open_workspace_id: Some("w_1".into()),
                     label: "flock".into(),
+                    pr: None,
                 },
             },
         };

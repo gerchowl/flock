@@ -1101,6 +1101,7 @@ impl App {
     ) -> WorktreeInfo {
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
         let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
+        let open_idx = self.open_workspace_idx_for_checkout(&canonical_path);
         WorktreeInfo {
             path: entry.path.display().to_string(),
             branch: entry.branch,
@@ -1108,10 +1109,15 @@ impl App {
             is_detached: entry.is_detached,
             is_prunable: entry.is_prunable,
             is_linked_worktree: canonical_path != repo_root,
-            open_workspace_id: self
-                .open_workspace_idx_for_checkout(&canonical_path)
-                .map(|idx| self.public_workspace_id(idx)),
+            open_workspace_id: open_idx.map(|idx| self.public_workspace_id(idx)),
             label: source.repo_name.clone(),
+            // Only an OPEN workspace has been through the PR poller — a
+            // closed checkout reports None, meaning "not polled" rather
+            // than "no PR" (#332).
+            pr: open_idx
+                .and_then(|idx| self.state.workspaces.get(idx))
+                .and_then(|ws| ws.pr_state())
+                .map(crate::api::schema::PrInfo::from_state),
         }
     }
 
@@ -1133,6 +1139,7 @@ impl App {
             is_linked_worktree: membership.is_linked_worktree,
             open_workspace_id: Some(self.public_workspace_id(ws_idx)),
             label: source.repo_name.clone(),
+            pr: ws.pr_state().map(crate::api::schema::PrInfo::from_state),
         })
     }
 
