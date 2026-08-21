@@ -93,6 +93,10 @@ pub(crate) struct CheckListEntry {
     /// Slots skipped by the most recent asleep-collapse (crons only). The
     /// collapse rule fires ONCE however many slots were missed, which is
     /// surprising unless the count is visible.
+    ///
+    /// Read as a floor, not an exact count: `tick_crons` stops counting at
+    /// `MAX_COLLAPSE` and reports the cap, so a value equal to it means "at
+    /// least this many", not "exactly this many".
     pub missed_fires: u32,
     /// The cron expression text, echoed for crons so `flk checks list`
     /// shows what is actually enrolled rather than just a name.

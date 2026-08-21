@@ -22,6 +22,29 @@ impl App {
         // listing can be compared against each other.
         let now = Instant::now();
         let now_wall_ms = crate::checks::runner::current_wall_ms();
+        // A row's state has to answer "would this fire?", not "is it
+        // configured?". Two switches upstream of every scheduled check can
+        // make the answer no:
+        //
+        // * `[checks] enable = false` disables ALL check work.
+        // * `fleet pause` early-returns the whole tick
+        //   (`dispatch_due_script_checks`), so nothing fires and
+        //   `next_fire_ms` — newly exposed here — would otherwise drift
+        //   silently into the past while the row still claimed `enabled`.
+        //
+        // Reporting `enabled` under either is the confusing lie these rows
+        // exist to prevent, so both fold into every scheduler-owned row.
+        let paused = self.fleet_pause.paused;
+        let checks_enabled = self.state.config.checks.enable;
+        let scheduler_state = |configured_on: bool| -> String {
+            if !configured_on || !checks_enabled {
+                "disabled".to_string()
+            } else if paused {
+                "paused".to_string()
+            } else {
+                "enabled".to_string()
+            }
+        };
         let mut checks: Vec<ChecksListEntry> = self
             .checks_runner
             .list_entries(now, now_wall_ms)
@@ -34,7 +57,7 @@ impl App {
                 } else if matches!(entry.last_outcome, Some("error")) {
                     "errored".into()
                 } else {
-                    "enabled".into()
+                    scheduler_state(true)
                 },
                 consecutive_fails: Some(entry.consecutive_fails),
                 last_outcome: entry.last_outcome.map(str::to_string),
@@ -55,40 +78,40 @@ impl App {
         checks.push(ChecksListEntry {
             name: crate::checks::BLOCKED_ALERT_CHECK_NAME.to_string(),
             kind: "blocked_alert".into(),
-            state: state_label(cfg.blocked_alert.enable),
+            state: scheduler_state(cfg.blocked_alert.enable),
             ..ChecksListEntry::builtin()
         });
         checks.push(ChecksListEntry {
             name: crate::checks::HIBERNATION_CHECK_NAME.to_string(),
             kind: "hibernation".into(),
-            state: state_label(cfg.hibernation.enable),
+            state: scheduler_state(cfg.hibernation.enable),
             ..ChecksListEntry::builtin()
         });
         checks.push(ChecksListEntry {
             name: crate::checks::ISSUE_GUARD_CHECK_NAME.to_string(),
             kind: "issue_guard".into(),
-            state: state_label(cfg.issue_guard.enable && !cfg.issue_guard.repos.is_empty()),
+            state: scheduler_state(cfg.issue_guard.enable && !cfg.issue_guard.repos.is_empty()),
             cadence_secs: Some(cfg.issue_guard.poll_secs),
             ..ChecksListEntry::builtin()
         });
         // Reap (#175 S2) mutates worktrees — it quarantines — so leaving it
         // off this surface was the worst of the omissions (#330). `state`
-        // folds the manifest gate: an enabled reap whose last verdict was
-        // NOT Ok is reporting `gated`, because it yields zero candidates and
-        // "enabled" would be a lie.
-        let reap_gated = self
-            .reap_last_verdict
-            .as_deref()
-            .is_some_and(|verdict| verdict != "Ok");
+        // folds the manifest gate on top of the two scheduler switches: an
+        // enabled reap whose last verdict was NOT Ok reports `gated`,
+        // because it yields zero candidates and "enabled" would be a lie.
         checks.push(ChecksListEntry {
             name: crate::checks::REAP_CHECK_NAME.to_string(),
             kind: "reap".into(),
-            state: if !(cfg.enable && cfg.reap.enable) {
-                "disabled".into()
-            } else if reap_gated {
-                "gated".into()
-            } else {
-                "enabled".into()
+            state: match self.reap_last_verdict.as_deref() {
+                _ if scheduler_state(cfg.reap.enable) != "enabled" => {
+                    scheduler_state(cfg.reap.enable)
+                }
+                // Never ticked. NOT the same as "verified clean" — the gate
+                // has simply not been evaluated yet, and collapsing the two
+                // would report an unverified reap as a verified one.
+                None => "pending".to_string(),
+                Some("Ok") => "enabled".to_string(),
+                Some(_) => "gated".to_string(),
             },
             last_outcome: self.reap_last_verdict.clone(),
             cadence_secs: Some(cfg.reap.cadence_secs),
@@ -133,14 +156,6 @@ impl App {
         }
         self.checks_next_deadline = Some(now);
         encode_success(id, ResponseResult::Ok {})
-    }
-}
-
-fn state_label(enabled: bool) -> String {
-    if enabled {
-        "enabled".to_string()
-    } else {
-        "disabled".to_string()
     }
 }
 
@@ -216,9 +231,10 @@ mod tests {
     }
 
     /// A reap that has never ticked has no verdict. That must not be
-    /// reported as a clean gate — absence of evidence is not Ok.
+    /// reported as a clean gate — absence of evidence is not Ok, and
+    /// `pending` is the state that keeps the two distinguishable.
     #[test]
-    fn reap_with_no_verdict_yet_is_not_reported_as_gated() {
+    fn reap_with_no_verdict_yet_reads_as_pending_not_enabled() {
         let checks = ChecksConfig {
             reap: crate::checks::config::ReapConfig {
                 enable: true,
@@ -229,12 +245,86 @@ mod tests {
         let mut app = app_with_checks(checks);
         let rows = rows(&mut app);
         let reap = row_named(&rows, crate::checks::REAP_CHECK_NAME);
-        assert_eq!(reap["state"], "enabled");
+        assert_eq!(
+            reap["state"], "pending",
+            "never-ticked must not be indistinguishable from verified-clean"
+        );
         assert!(
             reap.get("last_outcome").is_none(),
             "no verdict yet must serialise as absent, not as a fabricated Ok"
         );
         assert_eq!(reap["cadence_secs"], 3_600);
+    }
+
+    /// `[checks] enable = false` disables ALL check work. A row that still
+    /// says `enabled` under it is describing config, not behaviour.
+    #[test]
+    fn master_switch_off_disables_every_scheduler_row() {
+        let checks = ChecksConfig {
+            enable: false,
+            crons: vec![crate::checks::config::CronCheck {
+                name: "nightly".into(),
+                expr: crate::checks::cron::CronExpr::parse("0 3 * * *").unwrap(),
+                tz: crate::checks::CronTz::Utc,
+                on_fire: crate::checks::ActionSpec::Event {
+                    label: "nightly".into(),
+                },
+            }],
+            ..ChecksConfig::default()
+        };
+        let mut app = app_with_checks(checks);
+        let rows = rows(&mut app);
+        for name in [
+            "nightly",
+            crate::checks::BLOCKED_ALERT_CHECK_NAME,
+            crate::checks::REAP_CHECK_NAME,
+        ] {
+            assert_eq!(
+                row_named(&rows, name)["state"],
+                "disabled",
+                "{name} must report disabled when [checks] enable is off"
+            );
+        }
+    }
+
+    /// `fleet pause` early-returns the whole tick, so nothing fires and
+    /// `next_fire_ms` drifts into the past. Before #330 exposed timing that
+    /// was invisible; a row claiming `enabled` next to a stale next-fire is
+    /// exactly the confusion this state prevents.
+    #[test]
+    fn fleet_pause_is_reflected_in_every_scheduler_row() {
+        let checks = ChecksConfig {
+            crons: vec![crate::checks::config::CronCheck {
+                name: "nightly".into(),
+                expr: crate::checks::cron::CronExpr::parse("0 3 * * *").unwrap(),
+                tz: crate::checks::CronTz::Utc,
+                on_fire: crate::checks::ActionSpec::Event {
+                    label: "nightly".into(),
+                },
+            }],
+            reap: crate::checks::config::ReapConfig {
+                enable: true,
+                ..Default::default()
+            },
+            ..ChecksConfig::default()
+        };
+        let mut app = app_with_checks(checks);
+
+        let running = rows(&mut app);
+        assert_eq!(row_named(&running, "nightly")["state"], "enabled");
+
+        app.fleet_pause.paused = true;
+        let paused = rows(&mut app);
+        assert_eq!(row_named(&paused, "nightly")["state"], "paused");
+        assert_eq!(
+            row_named(&paused, crate::checks::BLOCKED_ALERT_CHECK_NAME)["state"],
+            "paused"
+        );
+        assert_eq!(
+            row_named(&paused, crate::checks::REAP_CHECK_NAME)["state"],
+            "paused",
+            "a paused reap must not read as pending — pause outranks the gate"
+        );
     }
 
     /// The end-to-end shape of the #330 fix: a declared cron reaches the

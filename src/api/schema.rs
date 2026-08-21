@@ -245,7 +245,8 @@ pub struct ChecksListEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fire_ms: Option<u64>,
     /// Slots skipped by the most recent asleep-collapse (crons only).
-    /// Omitted when zero so a quiet row stays quiet.
+    /// Omitted when zero so a quiet row stays quiet. A floor rather than an
+    /// exact count — the runner stops counting at its collapse cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missed_fires: Option<u32>,
     /// The enrolled cron expression, echoed so a client can tell WHICH
