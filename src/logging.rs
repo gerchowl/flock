@@ -633,7 +633,22 @@ pub(crate) fn remote_bridge_started(
     );
 }
 
-pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
+/// An ssh bridge child exited.
+///
+/// `intentional_teardown` is the bridge's own `should_stop` flag, read AFTER
+/// the wait returned. It exists because flock kills its own ssh child on every
+/// ordinary switch home (`Drop for SshStdioBridge`, #176/#193 — the accept
+/// thread parks in `child.wait()`, so the SIGKILL is what bounds a flaky-peer
+/// teardown). SIGKILL means `code()` is `None`, which levelled purely on the
+/// exit code fell into the WARN arm: 46 of 49 bridge WARNs in a measured
+/// client log were flock reporting its own deliberate cleanup as a failure
+/// (#319). `grep WARN` triage is the thing that costs — a level nobody trusts
+/// is a level nobody reads.
+///
+/// The flag is deliberately ANDed with signal-death rather than used alone. A
+/// child that exits with a real status while teardown is in flight raced us
+/// and its status is a genuine fact; only the death WE caused is demoted.
+pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>, intentional_teardown: bool) {
     let status = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
@@ -646,7 +661,20 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
             status,
             "ssh bridge exited"
         );
+    } else if intentional_teardown && code.is_none() {
+        tracing::debug!(
+            event = "remote.bridge.exited",
+            subsystem = "remote",
+            outcome = "torn_down",
+            target,
+            status,
+            "ssh bridge torn down"
+        );
     } else {
+        // Includes UNFLAGGED signal-death: an ssh child killed by something
+        // other than us (OOM killer, an operator's `kill`, a crash) is a real
+        // event and must stay loud. This is a demotion of one known-benign
+        // case, not a blanket suppression of the status.
         tracing::warn!(
             event = "remote.bridge.exited",
             subsystem = "remote",
@@ -658,15 +686,32 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>) {
     }
 }
 
-pub(crate) fn remote_bridge_failed(target: &str, err: &str) {
-    tracing::warn!(
-        event = "remote.bridge.failed",
-        subsystem = "remote",
-        outcome = "error",
-        target,
-        err,
-        "ssh bridge connection failed"
-    );
+/// The bridge's accept loop got an error back from one connection.
+///
+/// Same split as [`remote_bridge_exited`], for the same reason: the
+/// `ConnectionAborted` this reports is the DOWNSTREAM effect of the teardown
+/// SIGKILL, so an ordinary switch home used to emit this WARN too — the second
+/// half of the pair in #319.
+pub(crate) fn remote_bridge_failed(target: &str, err: &str, intentional_teardown: bool) {
+    if intentional_teardown {
+        tracing::debug!(
+            event = "remote.bridge.failed",
+            subsystem = "remote",
+            outcome = "torn_down",
+            target,
+            err,
+            "ssh bridge connection ended by teardown"
+        );
+    } else {
+        tracing::warn!(
+            event = "remote.bridge.failed",
+            subsystem = "remote",
+            outcome = "error",
+            target,
+            err,
+            "ssh bridge connection failed"
+        );
+    }
 }
 
 pub(crate) fn remote_binary_resolved(
@@ -3345,6 +3390,63 @@ pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+/// `capture_logs` for events emitted on OTHER threads.
+///
+/// [`capture_logs`] installs a THREAD-LOCAL default subscriber, so a helper
+/// called from a worker thread — the ssh bridge's accept loop, a reader thread
+/// — writes nowhere and the test silently asserts against an empty string.
+/// This installs a process-global one instead, which is sound here because
+/// nextest runs every test in its own process (AGENTS.md; a bare `cargo test`
+/// shares one, which is why the suite is nextest-only).
+///
+/// The sink keeps accumulating after `f` returns, so callers must join or drop
+/// whatever they are observing BEFORE reading, and should filter the returned
+/// text to lines they can attribute.
+#[cfg(test)]
+pub(crate) fn capture_logs_across_threads(f: impl FnOnce()) -> String {
+    use std::sync::OnceLock;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    static GLOBAL_SINK: OnceLock<Sink> = OnceLock::new();
+    let sink = GLOBAL_SINK
+        .get_or_init(|| {
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            // Ignore a lost race with an already-installed global: the sink is
+            // still the one this closure reads, and the test filters what it
+            // asserts on, so a missing subscriber fails loudly rather than
+            // passing vacuously.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            sink
+        })
+        .clone();
+
+    f();
+    let bytes = sink.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3397,17 +3499,63 @@ mod tests {
 
     #[test]
     fn remote_bridge_exited_is_warn_on_nonzero_debug_on_zero() {
-        let ok = capture_logs(|| remote_bridge_exited("host1", Some(0)));
+        let ok = capture_logs(|| remote_bridge_exited("host1", Some(0), false));
         assert!(ok.contains("DEBUG"), "clean exit is debug noise: {ok}");
         assert!(ok.contains("event=\"remote.bridge.exited\""), "{ok}");
 
-        let bad = capture_logs(|| remote_bridge_exited("host1", Some(3)));
+        let bad = capture_logs(|| remote_bridge_exited("host1", Some(3), false));
         assert!(bad.contains("WARN"), "failed exit must be WARN: {bad}");
         assert!(bad.contains("status=\"3\""), "{bad}");
 
-        let signal = capture_logs(|| remote_bridge_exited("host1", None));
+        let signal = capture_logs(|| remote_bridge_exited("host1", None, false));
         assert!(signal.contains("status=\"signal\""), "{signal}");
         assert!(signal.contains("WARN"), "{signal}");
+    }
+
+    /// #319: 94% of the WARNs in a measured client log were flock reporting
+    /// its own switch-home SIGKILL as a bridge failure. The flag has to split
+    /// that population off WITHOUT taking the genuine failures with it —
+    /// otherwise the fix is just a louder version of the same problem.
+    #[test]
+    fn intentional_teardown_demotes_only_the_signal_death_it_caused() {
+        let torn = capture_logs(|| remote_bridge_exited("host1", None, true));
+        assert!(
+            torn.contains("DEBUG"),
+            "our own SIGKILL is not a failure: {torn}"
+        );
+        assert!(torn.contains("outcome=\"torn_down\""), "{torn}");
+        assert!(
+            torn.contains("status=\"signal\""),
+            "the field that separated the populations must survive: {torn}"
+        );
+
+        // A child that died on its own while teardown happened to be in
+        // flight still carries a real status — demoting that would be the
+        // blanket suppression this fix exists to avoid.
+        let raced = capture_logs(|| remote_bridge_exited("host1", Some(255), true));
+        assert!(
+            raced.contains("WARN"),
+            "a real ssh exit status is never torn_down: {raced}"
+        );
+        assert!(raced.contains("status=\"255\""), "{raced}");
+
+        // Signal-death with NO teardown flag: something else killed our ssh.
+        let unflagged = capture_logs(|| remote_bridge_exited("host1", None, false));
+        assert!(
+            unflagged.contains("WARN"),
+            "unflagged signal-death stays loud: {unflagged}"
+        );
+    }
+
+    #[test]
+    fn bridge_failed_follows_the_same_teardown_split() {
+        let torn = capture_logs(|| remote_bridge_failed("host1", "connection aborted", true));
+        assert!(torn.contains("DEBUG"), "{torn}");
+        assert!(torn.contains("outcome=\"torn_down\""), "{torn}");
+
+        let real = capture_logs(|| remote_bridge_failed("host1", "connection refused", false));
+        assert!(real.contains("WARN"), "{real}");
+        assert!(real.contains("outcome=\"error\""), "{real}");
     }
 
     #[test]

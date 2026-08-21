@@ -1677,9 +1677,24 @@ impl SshStdioBridge {
                             thread_ssh_config.as_deref(),
                             thread_proxy_jump.as_deref(),
                             &thread_child_pid,
+                            &thread_stop,
                         ) {
-                            crate::logging::remote_bridge_failed(&target, &err.to_string());
-                            eprintln!("flock: remote bridge failed: {err}");
+                            // The `ConnectionAborted` a teardown produces is
+                            // our own SIGKILL coming back around (#319). It is
+                            // not a failure and it must not reach the user's
+                            // terminal on every switch home — one stderr line
+                            // per ordinary switch is noise the `no-debug-
+                            // leftovers` gate cannot see, because `remote.rs`
+                            // is allowlisted wholesale.
+                            let intentional = thread_stop.load(Ordering::Acquire);
+                            crate::logging::remote_bridge_failed(
+                                &target,
+                                &err.to_string(),
+                                intentional,
+                            );
+                            if !intentional {
+                                eprintln!("flock: remote bridge failed: {err}");
+                            }
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1994,6 +2009,7 @@ fn bridge_connection(
     keepalive_ssh_config: Option<&Path>,
     proxy_jump: Option<&str>,
     active_child_pid: &std::sync::Mutex<Option<u32>>,
+    should_stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut command = TracedCommand::new("ssh", "remote");
     let argv = bridge_dial_argv(
@@ -2045,7 +2061,12 @@ fn bridge_connection(
     let _ = upload.join();
     let _ = download.join();
 
-    crate::logging::remote_bridge_exited(target, status.code());
+    // Read AFTER the wait, never before: `Drop` sets `should_stop` and only
+    // then SIGKILLs the child, so by the time this wait returns because of our
+    // own kill the flag is guaranteed visible (#319). Sampling it earlier would
+    // race the teardown and mislabel it as a failure again.
+    let intentional_teardown = should_stop.load(Ordering::Acquire);
+    crate::logging::remote_bridge_exited(target, status.code(), intentional_teardown);
     if status.success() {
         Ok(())
     } else {
@@ -2290,6 +2311,117 @@ mod tests {
             "ssh opts must be visible: {out}"
         );
         assert!(out.contains("INFO"), "must log at default level: {out}");
+    }
+
+    /// #319: an ordinary switch home must produce ZERO WARN.
+    ///
+    /// End-to-end over the real teardown path — a stub `ssh` standing in for a
+    /// live tunnel, a client connected so the accept thread is parked in
+    /// `child.wait()`, then the drop that SIGKILLs it. That kill is what makes
+    /// `status.code()` `None`, which is what used to fall into the WARN arm and
+    /// account for 46 of 49 bridge WARNs in a measured client log.
+    ///
+    /// The events under test are emitted on the ACCEPT thread, so this needs
+    /// the cross-thread sink; assertions are filtered to this test's unique
+    /// target so nothing else in the process can colour the result.
+    #[test]
+    fn ordinary_teardown_is_not_reported_as_a_bridge_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = "teardown-target";
+        let stub_dir = std::env::temp_dir().join(format!("flock-teardown-{}", std::process::id()));
+        std::fs::create_dir_all(&stub_dir).expect("stub dir");
+        let stub = stub_dir.join("ssh");
+        // A tunnel that stays up until it is killed: `cat` blocks on stdin
+        // forever, exactly like a live `ssh` holding the bridge open. Anything
+        // that EXITS on its own would test the wrong thing — the bug is about
+        // the child WE kill.
+        std::fs::write(&stub, "#!/bin/sh\nexec cat\n").expect("write stub ssh");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Bind under /tmp, not temp_dir(): see `bridge_socket_is_user_only`.
+        let socket = PathBuf::from("/tmp")
+            .join(format!("flock-bridge-teardown-{}.sock", std::process::id()));
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let out = crate::logging::capture_logs_across_threads(|| {
+            // SAFETY: nextest runs each test in its own process, so no other
+            // thread in this process is reading PATH concurrently.
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
+            }
+            let bridge = SshStdioBridge::start(
+                target.to_string(),
+                remote_flock,
+                socket.clone(),
+                "default".to_string(),
+                false,
+                None,
+            )
+            .expect("start bridge listener");
+
+            // Connect so the accept thread spawns the stub and parks in wait().
+            let client = std::os::unix::net::UnixStream::connect(&socket)
+                .expect("connect to the bridge socket");
+            // Without a LIVE child there is no SIGKILL, and the test would
+            // pass by asserting on a teardown that never had anything to tear
+            // down. The published pid is the accept thread's own signal that
+            // it has spawned ssh and is about to park in `child.wait()`.
+            assert!(
+                wait_until(Duration::from_secs(5), || bridge_child_is_live(&bridge)),
+                "the accept thread never published a live ssh child; \
+                 the teardown path under test was never entered"
+            );
+            drop(client);
+            // The drop under test. It joins the accept thread, so every event
+            // this test asserts on has been emitted by the time it returns.
+            drop(bridge);
+        });
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();
+        assert!(
+            ours.iter().any(|l| l.contains("remote.bridge.exited")),
+            "the teardown must still be REPORTED, just not as a failure: {ours:#?}"
+        );
+        assert!(
+            ours.iter().any(|l| l.contains("outcome=\"torn_down\"")),
+            "teardown must be labelled as such: {ours:#?}"
+        );
+        let warns: Vec<&&str> = ours.iter().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns.is_empty(),
+            "an ordinary switch home must produce zero WARN (#319): {warns:#?}"
+        );
+    }
+
+    /// Does the bridge currently hold a live ssh child pid? Used to prove the
+    /// teardown test actually reached the `child.wait()` it means to unblock.
+    fn bridge_child_is_live(bridge: &SshStdioBridge) -> bool {
+        bridge
+            .active_child_pid
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]
