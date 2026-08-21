@@ -2970,6 +2970,11 @@ fn render_workspace_list(
     // icon, and the section number. The active workspace's section gets the
     // same always-on `surface_dim` currency fill as the active row.
     let active_section_key = app.active.and_then(|i| app.project_section_key(i));
+    // Hoisted: this walks every section key and every peer's workspaces and
+    // allocates three maps. Headers are few, so it would not freeze a pane
+    // the way #293's per-ROW canonicalize did — but it is the same
+    // anti-pattern and costs nothing to compute once per frame.
+    let collapsible = app.collapsible_space_keys();
     for header in &app.view.space_header_areas {
         let row_y = header.rect.y;
         if row_y >= list_bottom {
@@ -2998,7 +3003,7 @@ fn render_workspace_list(
         // cannot fold is an invitation to a click that does nothing —
         // aligned to the same column so the header still lines up with its
         // collapsible siblings.
-        if app.collapsible_space_keys().contains(key) {
+        if collapsible.contains(key) {
             let triangle = if collapsed { "▸" } else { "▾" };
             spans.push(Span::styled(triangle, Style::default().fg(p.accent)));
         } else {

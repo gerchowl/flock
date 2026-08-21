@@ -1744,6 +1744,12 @@ pub enum ContextMenuKind {
         /// one local member, so the menu says "Close local checkout" rather
         /// than the misleading "Close group".
         sole_local: bool,
+        /// `false` for a solo project's header (#331), which renders but
+        /// cannot fold. The menu drops its Collapse/Expand entry — offering
+        /// a fold that silently writes latent collapse state is worse than
+        /// not offering it, because the section folds itself later once a
+        /// peer pushes it over the aggregate threshold.
+        collapsible: bool,
     },
     /// A federated peer's workspace row (#125): offers a cross-machine checkout
     /// of that workspace's branch into a local checkout of the same project.
@@ -1884,6 +1890,7 @@ impl ContextMenuState {
             ContextMenuKind::SpaceHeader {
                 collapsed,
                 sole_local,
+                collapsible,
                 ..
             } => {
                 let toggle = if collapsed { "Expand" } else { "Collapse" };
@@ -1894,7 +1901,14 @@ impl ContextMenuState {
                 } else {
                     "Close group"
                 };
-                vec!["New worktree from default branch", toggle, close]
+                // #331: a solo project's header cannot fold, so the menu
+                // must not offer it. Dispatch matches on the LABEL, not the
+                // index, so omitting the entry is safe for the others.
+                if collapsible {
+                    vec!["New worktree from default branch", toggle, close]
+                } else {
+                    vec!["New worktree from default branch", close]
+                }
             }
             ContextMenuKind::PeerWorkspace { .. } => vec!["Check out here"],
         };
@@ -3626,6 +3640,7 @@ mod tests {
                 key: "repo-key".into(),
                 collapsed: false,
                 sole_local: false,
+                collapsible: true,
             },
             x: 0,
             y: 0,
@@ -3645,6 +3660,7 @@ mod tests {
                 key: "repo-key".into(),
                 collapsed: true,
                 sole_local: false,
+                collapsible: true,
             },
             x: 0,
             y: 0,
@@ -3653,6 +3669,37 @@ mod tests {
         assert_eq!(
             collapsed.items(),
             vec!["New worktree from default branch", "Expand", "Close group"]
+        );
+    }
+
+    /// #331: a solo project renders a header that cannot fold. Offering
+    /// Collapse anyway is worse than a no-op — it writes latent state that
+    /// folds the section later, once a federated peer pushes it over the
+    /// aggregate threshold and the >= 2 path starts honouring
+    /// `collapsed_space_keys`.
+    #[test]
+    fn a_non_collapsible_space_header_menu_offers_no_fold() {
+        let solo = ContextMenuState {
+            kind: ContextMenuKind::SpaceHeader {
+                key: "github.com/gerchowl/flock".into(),
+                collapsed: false,
+                sole_local: true,
+                collapsible: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = solo.items();
+        assert!(
+            !items.contains(&"Collapse") && !items.contains(&"Expand"),
+            "a header that cannot fold must not offer one: {items:?}"
+        );
+        // The other entries survive — dispatch matches on the label, so
+        // dropping one entry must not disturb the rest.
+        assert_eq!(
+            items,
+            vec!["New worktree from default branch", "Close local checkout"]
         );
     }
 
@@ -3665,6 +3712,7 @@ mod tests {
                 key: "repo-key".into(),
                 collapsed: false,
                 sole_local: true,
+                collapsible: true,
             },
             x: 0,
             y: 0,
