@@ -1,0 +1,75 @@
+# guardrails log budgets — what flock's session log is allowed to look like.
+#
+# The first gate here that reads a LOG rather than SOURCE, and it exists because
+# the two defects it catches are INVISIBLE to a source scan (#318):
+#
+#   NOISE   — one event drowning the stream. flock routes every event through a
+#             facade in src/logging.rs, so the `info!` sits in a one-line helper
+#             and the loop that calls it is 671 lines away in another file. A
+#             lexical scan scores this repo 100% clean while it writes 15 MB/day.
+#   SILENCE — an operation that emits nothing. A source tree cannot enumerate
+#             "operations that must be observable"; the [require] table below
+#             does, and that is what makes an absence detectable at all.
+#
+# Producing the sample is this repo's job — measured, not inferred:
+#
+#   just log-budget          # capture a fresh session, then gate it
+#
+# The sample is generated, not committed (see logs/ in .gitignore): it is full of
+# one machine's temp paths and would go stale as a fixture. `guardrails-log-budget`
+# skips cleanly when it is absent, so the gate is green-by-skip in CI and real on
+# any machine that has run the capture.
+
+sample = "logs/flock-session.jsonl"
+event_field = "event"
+
+# The capture drives a synthetic workload with roughly a dozen distinct
+# lifecycle events, so each sits near 1/12 of the stream BY CONSTRUCTION. A 5%
+# default would fire on a perfectly healthy log and teach everyone to ignore
+# this gate — the exact failure it was written to fix. Lifecycle events are
+# therefore unconstrained by default, and the ceilings that matter are declared
+# per-event below.
+default_max_pct = 100.0
+
+# --- NOISE: the two events that actually regressed --------------------------
+# Measured on mba22 (2026-08-18, all rotations) BEFORE the #318 fix:
+#   flock-client.log   16,468 records, 93.3% one event: client.tick   (INFO)
+#   flock-server.log    7,965 records, 98.9% process.exec             (INFO)
+# and worse on later rotations — 99.8% / 99.9% of 61,014 / 52,317 records.
+#
+# Both are per-iteration events that were levelled as lifecycle ones. The fix is
+# structural (cadence, not exit code, picks the level; the tick is DEBUG with a
+# late-tick WARN carrying its liveness property), so these ceilings are the
+# REGRESSION test: reinstate either defect and the sampler's ~30 execs per
+# minute, or the tick's one per 5s, blow straight past 5%.
+
+[event."process.exec"]
+max_pct = 5.0
+mode = "gate"
+
+# `client.tick` is deliberately NOT declared here. It is a CLIENT event and the
+# capture drives a headless server, so declaring it would emit a stale-entry
+# advisory on every run — a permanent nag is the same disease as a permanent
+# INFO. Its demotion is pinned by a unit test instead
+# (logging::tests::tick_is_debug_but_a_late_tick_reports_the_stall_at_warn), and
+# for a live client log add:
+#
+#   [event."client.tick"]
+#   max_pct = 5.0
+
+# --- SILENCE: the switch has to be observable -------------------------------
+# A completed slot switch emitted NOTHING at INFO. That is why a measured 5.05s
+# connect→handshake stall was undiagnosable from a default-level tail (#43,
+# #282): nothing bracketed it. `client.slot.flipped` is the happy-path event
+# that fixes it, carrying from/to/cold/elapsed_ms.
+#
+# nudge, not gate: producing this event needs a real SWITCH, which needs a
+# second host. The synthetic single-host capture cannot make one, so gating it
+# would fail every CI run for a reason unrelated to the code. Capture a live
+# two-host session to gate it for real:
+#
+#   GUARDRAILS_LOG_SAMPLE=~/.config/flock/flock-client.log \
+#     GUARDRAILS_LOG_ENFORCE=1 guardrails-log-budget
+[require."client.slot.flipped"]
+min_count = 1
+mode = "nudge"
