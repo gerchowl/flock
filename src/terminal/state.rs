@@ -690,6 +690,19 @@ impl TerminalState {
         if current_value == session_ref.value {
             return false;
         }
+        // An incumbent no live process ever claimed cannot outrank one that
+        // just introduced itself. That is exactly the restored-from-snapshot
+        // case: the pane comes back naming session A, A's process is gone, and
+        // a fresh `claude` reports B with `startup` -- which the whitelist
+        // below refuses, stranding the pane on a dead id (#336). A nested
+        // `claude -p`, the case that whitelist exists for, is unaffected: its
+        // parent reported itself through a hook, so the incumbent IS
+        // confirmed and still wins.
+        let incumbent_is_a_restored_ghost =
+            self.hook_authority.is_none() && !self.session_ref_hook_confirmed;
+        if incumbent_is_a_restored_ghost {
+            return false;
+        }
         !Self::session_start_source_allows_session_replacement(
             source,
             agent_label,
@@ -1534,6 +1547,81 @@ mod tests {
         );
         // The collapsed header follows the ring it summarises.
         assert_eq!(terminal.last_prompt.as_deref(), Some("second prompt"));
+    }
+
+    /// #336: a pane restored from a snapshot must hand its identity over to
+    /// whatever process actually starts in it. The incumbent is a ghost -- no
+    /// live process ever claimed it -- so a fresh `claude` reporting
+    /// `startup` takes the pane, and the panel hydrates from the session the
+    /// user is really talking to.
+    #[test]
+    fn a_live_session_displaces_a_restored_ghost() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: CLAUDE_HOOK_SOURCE.into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("ghost-aaaa").expect("valid id"),
+        });
+
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("live-bbbb"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("live-bbbb"),
+            "the live session must take the pane from the restored ghost",
+        );
+    }
+
+    /// The guard #336 narrows still has to do its original job: a nested
+    /// `claude -p` inherits the pane env and reports its own id at startup,
+    /// and must NOT take the pane from the occupant that reported itself
+    /// through a hook. Confirmed incumbent, so the whitelist still applies.
+    #[test]
+    fn a_nested_claude_still_cannot_steal_a_hook_confirmed_session() {
+        let mut terminal = test_terminal();
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("occupant-aaaa"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("occupant-aaaa")
+        );
+
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("nested-bbbb"),
+            Some(2),
+            Some("startup".into()),
+        );
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("occupant-aaaa"),
+            "a nested `claude -p` must not clobber the pane's real occupant",
+        );
+
+        // A replacement the user actually triggered is still honoured.
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("resumed-cccc"),
+            Some(3),
+            Some("resume".into()),
+        );
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("resumed-cccc"),
+        );
     }
 
     /// #328: a RESTORED session ref names the pane's identity but may point at
