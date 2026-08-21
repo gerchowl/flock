@@ -349,9 +349,26 @@ thread_local! {
         const { std::cell::RefCell::new(false) };
 }
 
+pub(crate) struct PendingCredentialScrubGuard;
+
+impl Drop for PendingCredentialScrubGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_credential_scrub();
+    }
+}
+
 /// Arm credential scrubbing for the NEXT pane spawn on this thread.
-pub(crate) fn set_pending_credential_scrub() {
+///
+/// A guard, not a bare set, for the same reason the run id is one — and with
+/// a worse failure mode if it were not. The flag is consumed inside
+/// `apply_pane_env`, which a failed spawn may never reach; a leaked flag then
+/// lands on whatever pane is spawned next on this thread. That could be the
+/// OPERATOR's own pane, which would silently lose its GitHub token and
+/// ssh-agent with no error to explain it.
+#[must_use = "the guard disarms the scrub; dropping it immediately re-arms nothing"]
+pub(crate) fn set_pending_credential_scrub() -> PendingCredentialScrubGuard {
     SCRUB_AMBIENT_CREDENTIALS.with(|slot| *slot.borrow_mut() = true);
+    PendingCredentialScrubGuard
 }
 
 fn take_pending_credential_scrub() -> bool {
@@ -2974,8 +2991,9 @@ mod tests {
         std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
 
         let mut cmd = CommandBuilder::new("/bin/sh");
-        set_pending_credential_scrub();
+        let guard = set_pending_credential_scrub();
         apply_pane_env(&mut cmd, PaneId::from_raw(11));
+        drop(guard);
         for key in agent_spawn_denied_env() {
             assert_eq!(
                 cmd.get_env(key),
@@ -2988,22 +3006,37 @@ mod tests {
         std::env::remove_var("SSH_AUTH_SOCK");
     }
 
-    /// The scrub is a ONE-SHOT. If it leaked to the next spawn, an operator's
-    /// own pane would silently lose its credentials — a confusing break with
-    /// no error to explain it.
+    /// The scrub is a ONE-SHOT consumed by `apply_pane_env`.
     #[test]
-    fn the_credential_scrub_does_not_leak_to_the_next_pane() {
+    fn the_credential_scrub_is_consumed_by_the_pane_it_was_armed_for() {
         let mut spawned = CommandBuilder::new("/bin/sh");
-        set_pending_credential_scrub();
+        let guard = set_pending_credential_scrub();
         apply_pane_env(&mut spawned, PaneId::from_raw(12));
-
-        // The operator's next pane must be untouched: nothing armed it.
-        let mut operator = CommandBuilder::new("/bin/sh");
-        apply_pane_env(&mut operator, PaneId::from_raw(13));
+        drop(guard);
         assert!(
             !take_pending_credential_scrub(),
             "the one-shot must already be consumed"
         );
+    }
+
+    /// The case the guard exists for: a spawn that fails BEFORE
+    /// `apply_pane_env` runs. Without the guard the flag survives, and the
+    /// next pane on this thread — possibly the operator's own — silently
+    /// loses its GitHub token and ssh-agent with no error to explain it.
+    #[test]
+    fn an_aborted_spawn_does_not_strip_the_next_panes_credentials() {
+        std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+        {
+            let _guard = set_pending_credential_scrub();
+            // Spawn fails here — `apply_pane_env` is never reached.
+        }
+        let mut operator_pane = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut operator_pane, PaneId::from_raw(13));
+        assert!(
+            operator_pane.get_env("GH_TOKEN").is_some(),
+            "an aborted agent spawn must not disarm the operator's own pane"
+        );
+        std::env::remove_var("GH_TOKEN");
     }
 
     #[test]

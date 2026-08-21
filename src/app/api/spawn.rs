@@ -131,7 +131,7 @@ impl App {
         // not inherit the operator's ambient credentials. For an
         // operator-started pane inheriting them is correct — it is their
         // shell — which is exactly why this is armed here and not globally.
-        crate::integration::set_pending_credential_scrub();
+        let _scrub_guard = crate::integration::set_pending_credential_scrub();
 
         let (rows, cols) = self.state.estimate_pane_size();
         let argv = kind.argv(prompt);
