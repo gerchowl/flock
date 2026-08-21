@@ -202,6 +202,19 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
+    /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
+    ///
+    /// Minted per scheduler- or agent-initiated spawn, stamped into the
+    /// child's environment, and appended to every commit that child makes
+    /// as an `Agent-Run:` trailer — which is what `flk revert-run` joins
+    /// on. It existed on the `AgentForked` event and in the child's env,
+    /// but nowhere a reader could see it, so joining "this agent" to "these
+    /// commits" to "that PR" meant inferring from `cwd`.
+    ///
+    /// `None` for an operator-started pane: run ids mark work an agent or
+    /// the scheduler initiated, and minting one for a human's own pane
+    /// would make `flk revert-run` offer to revert the operator's work.
+    pub run_id: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
@@ -257,6 +270,7 @@ impl TerminalState {
             persisted_agent_session: None,
             manual_label: None,
             agent_name: None,
+            run_id: None,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,

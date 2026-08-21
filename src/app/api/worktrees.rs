@@ -333,14 +333,14 @@ impl App {
         // must disarm the id, or the next unrelated pane inherits it and
         // `flk revert-run` would revert that pane's work (US-8).
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
-        let ws_idx = match self.spawn_agent_workspace(
+        let (ws_idx, spawned_pane) = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,
             cols,
             &plan.argv,
             params.focus,
         ) {
-            Ok((ws_idx, _, _)) => ws_idx,
+            Ok((ws_idx, _, pane_id)) => (ws_idx, pane_id),
             Err(err) => {
                 let body = self.agent_start_error_body(err);
                 // P4: fail toward leaking — the created worktree stays on
@@ -357,6 +357,23 @@ impl App {
                 );
             }
         };
+
+        // #332: record the run id on the child's terminal, not only in its
+        // environment. The env stamp is what reaches the commit trailer,
+        // while this is what lets a reader join the running agent back to
+        // those commits without inferring from `cwd`. Stamped after a
+        // successful spawn so a failed fork leaves no agent claiming a run.
+        if let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(spawned_pane))
+            .map(|pane| pane.attached_terminal_id.clone())
+        {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.run_id = Some(run_id.clone());
+            }
+        }
 
         // Membership stamping mirrors the TUI confirm path: the source keeps
         // (or gains non-linked) membership; the child is a linked worktree of

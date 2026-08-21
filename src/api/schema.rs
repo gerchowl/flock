@@ -1677,6 +1677,15 @@ pub struct AgentInfo {
     /// Absent when the pane never reported a state transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// The run id this agent was spawned under (#332), when it was spawned
+    /// by an agent or the scheduler rather than by the operator.
+    ///
+    /// This is the join key an audit needs: the same token is stamped as an
+    /// `Agent-Run:` trailer on every commit the agent makes, so
+    /// `agent → commits → PR` is a lookup rather than an inference from
+    /// `cwd`. `flk revert-run <id>` consumes the same value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub revision: u64,
 }
 
@@ -3086,5 +3095,62 @@ mod tests {
                 agent_status: AgentStatus::Done,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod pr_info_tests {
+    use super::*;
+    use crate::worktree::{PrState, PrStateInfo};
+
+    /// #332: the wire mapping is its own type precisely so the internal
+    /// enum can move without changing the contract. Pin every variant —
+    /// a draft silently collapsing into `open` is exactly the drift the
+    /// shared `parse_pr_state_fields` mapping exists to prevent, and it
+    /// would tell a dispatcher that unfinished work was ready.
+    #[test]
+    fn every_pr_state_maps_to_a_distinct_wire_string() {
+        let cases = [
+            (PrState::Open, "open"),
+            (PrState::Draft, "draft"),
+            (PrState::Merged, "merged"),
+            (PrState::Closed, "closed"),
+        ];
+        for (state, expected) in cases {
+            let info = PrInfo::from_state(PrStateInfo { state, number: 42 });
+            assert_eq!(info.state, expected, "{state:?} must map to {expected}");
+            assert_eq!(info.number, 42);
+        }
+    }
+
+    /// A worktree with no polled PR must omit the field rather than
+    /// serialise a null: absence means "not polled", and a client that
+    /// sees an explicit null will read it as "no PR exists".
+    #[test]
+    fn an_unpolled_worktree_omits_the_pr_field() {
+        let worktree = WorktreeInfo {
+            path: "/w/flock/feature".into(),
+            branch: Some("feature".into()),
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+            is_linked_worktree: true,
+            open_workspace_id: None,
+            label: "flock".into(),
+            pr: None,
+        };
+        let json = serde_json::to_string(&worktree).expect("serialisable");
+        assert!(!json.contains("\"pr\""), "{json}");
+
+        let with_pr = WorktreeInfo {
+            pr: Some(PrInfo {
+                number: 338,
+                state: "merged".into(),
+            }),
+            ..worktree
+        };
+        let json = serde_json::to_string(&with_pr).expect("serialisable");
+        assert!(json.contains("\"pr\""), "{json}");
+        assert!(json.contains("\"merged\""), "{json}");
     }
 }
