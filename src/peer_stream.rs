@@ -72,7 +72,8 @@ struct PeerStream {
     ///
     /// The timestamp is load-bearing, not diagnostic: a push answers a poll in
     /// place of a live request, so an old one in this slot actively SUPPRESSES
-    /// the fetch that would have refreshed everything it cannot carry (#4).
+    /// the fetch that would have refreshed the fields that moved while it sat
+    /// here (#4). See `MAX_PUSH_AGE`.
     latest_push: Arc<Mutex<Option<(std::time::Instant, String)>>>,
 }
 
@@ -304,11 +305,19 @@ pub fn request(
 /// How old a pushed summary may be and still answer a poll (#4).
 ///
 /// A push does not merely arrive early — it REPLACES the request that poll
-/// would otherwise have made. Everything a push cannot carry because nothing
-/// generated an event for it, cpu and memory above all, therefore stops
-/// refreshing for as long as a push keeps pre-empting the fetch. On a busy peer
-/// that is every poll, forever, which is exactly the "system stats are stale"
-/// half of the report.
+/// would otherwise have made. The payload is not the problem: the pusher
+/// re-fetches a full `peers.summary`, system block included, so a push carries
+/// everything a poll would. What it cannot carry is time. A push emitted at t=0
+/// sits in this slot until a poll consumes it, which may be most of a poll
+/// interval later, and the fields that keep moving in the meantime are
+/// delivered as though they were current.
+///
+/// That is why cpu and memory are the half of the report that named itself.
+/// Workspaces and agent state only change when something happens, and something
+/// happening is what emits the next push — so those fields self-correct.
+/// Utilisation drifts continuously and emits nothing, so nothing re-pushes it,
+/// and on a peer busy enough to keep this slot occupied the live fetch that
+/// would have refreshed it never runs.
 ///
 /// Well under the poll interval, so a stale push costs one fresh request rather
 /// than a whole cycle, and comfortably above the push debounce, so a push

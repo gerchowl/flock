@@ -353,8 +353,18 @@ fn start_summary_push(socket: std::path::PathBuf) {
         // reason — the failure mode that hid a rejected subscription until a
         // live run caught it.
         let mut ack = String::new();
-        if reader.read_line(&mut ack).is_err() {
-            return;
+        match reader.read_line(&mut ack) {
+            // EOF with no answer at all: the server closed instead of
+            // acknowledging. Reported rather than treated as success — logging
+            // "subscription active" for a subscription that will never deliver
+            // is the same silent-failure shape this ack check was added to
+            // remove.
+            Ok(0) => {
+                crate::logging::peer_push_subscribe_failed("stream closed without an ack");
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => return,
         }
         if ack.contains("\"error\"") {
             crate::logging::peer_push_subscribe_failed(ack.trim());
@@ -436,6 +446,11 @@ struct PushDebounce {
     /// Events folded into the owed push. Counted, not merely dropped: "5
     /// events became 1 push" is the evidence coalescing works, and its absence
     /// is the evidence it does not.
+    ///
+    /// Deliberately not synchronised with `pending`: a thread preempted between
+    /// the two can attribute one event to the neighbouring push. That is ±1 on
+    /// a diagnostic counter, and paying a lock on every event to make a log
+    /// field exact would be a poor trade.
     coalesced: Arc<AtomicU64>,
 }
 
