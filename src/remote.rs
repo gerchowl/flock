@@ -1878,13 +1878,27 @@ pub(crate) fn start_switch_bridge_noninteractive(
     // path — a cold switch under raw mode cannot prompt the user, and a
     // missing/incompatible remote binary must surface as a dial failure that the
     // popup shows in plain text.
-    let remote_flock = probe_switch_remote_flock(target)?;
+    // The ssh round trip. On a stalled switch this is the leg that is almost
+    // always responsible, and it is invisible from the client side because it
+    // hides inside what the client calls `bridge_start` (#43, #282).
+    let probe_started = Instant::now();
+    let remote_flock = probe_switch_remote_flock(target);
+    crate::logging::remote_switch_stage(
+        target,
+        "remote_probe",
+        probe_started.elapsed().as_millis() as u64,
+    );
+    let remote_flock = remote_flock?;
 
     let manage_ssh_config = crate::config::Config::load()
         .config
         .remote
         .manage_ssh_config;
 
+    // Local bind + thread spawn: microseconds when healthy. Measured anyway so
+    // "the probe was fast, the listener was slow" is a statement the log can
+    // make rather than one someone has to guess at.
+    let listen_started = Instant::now();
     let bridge = SshStdioBridge::start(
         target.to_string(),
         remote_flock,
@@ -1892,8 +1906,13 @@ pub(crate) fn start_switch_bridge_noninteractive(
         session_name,
         manage_ssh_config,
         proxy_jump.map(str::to_string),
-    )?;
-    Ok((bridge, local_socket))
+    );
+    crate::logging::remote_switch_stage(
+        target,
+        "bridge_listen",
+        listen_started.elapsed().as_millis() as u64,
+    );
+    Ok((bridge?, local_socket))
 }
 
 /// Creates a fresh user-only (`0700`) directory under the temp dir for the

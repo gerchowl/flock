@@ -3225,6 +3225,38 @@ fn spawn_warm_bridge_dial(
     );
 }
 
+/// A switch stage over this is not slow, it is STALLED (#43, #282).
+///
+/// A healthy switch on a LAN completes every one of its stages in tens of
+/// milliseconds; the stall that motivated this instrumentation was 5.05s. The
+/// budget sits well above legitimate variation — a first ssh connect to a
+/// sleeping host, a cold remote-binary probe — so a breach is a real anomaly
+/// and not a WARN anyone learns to scroll past.
+const SWITCH_STAGE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Time one leg of a switch, logging it and escalating if it blew its budget.
+///
+/// Returns the stage's own result untouched: a failing stage is still a timed
+/// stage, and knowing a failure took 5s before it failed is often the whole
+/// diagnosis.
+fn timed_switch_stage<T>(target: &str, stage: &'static str, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if elapsed >= SWITCH_STAGE_BUDGET {
+        crate::logging::client_switch_stage_slow(
+            target,
+            stage,
+            elapsed_ms,
+            SWITCH_STAGE_BUDGET.as_millis() as u64,
+        );
+    } else {
+        crate::logging::client_switch_stage(target, stage, elapsed_ms);
+    }
+    result
+}
+
 /// Spawn an on-demand SWITCH dial for a cold slot (#93). Targets with a live
 /// local socket (home, the active ssh leg's bridge) just dial that socket;
 /// bridge-less ssh peers get a NON-INTERACTIVE client-side `SshStdioBridge`
@@ -3256,46 +3288,19 @@ fn spawn_switch_dial(
         // channel receiver is dropped, so a late success drops its stream +
         // bridge (which clean up on drop) rather than racing a stale flip.
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        // The dial thread names the target in its stage traces; the outer
+        // thread still needs `key` for the outcome event it sends afterwards.
+        let dial_key = key.clone();
         std::thread::spawn(move || {
             let dialed: Result<(UnixStream, Option<crate::remote::SshStdioBridge>), ClientError> =
                 (|| {
                     // Path A: the slot already has a live transport (home, or the
                     // active leg's launcher-owned bridge). Just dial it.
                     if let Some(path) = slot_socket_path(&target) {
-                        let mut stream =
-                            UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)?;
-                        do_handshake(
-                            &mut stream,
-                            cols,
-                            rows,
-                            cell_width_px,
-                            cell_height_px,
-                            requested_encoding,
-                            false,
-                            None,
-                            fleet.as_ref(),
-                        )?;
-                        return Ok((stream, None));
-                    }
-                    // Path B: cold ssh peer with no bridge — build one
-                    // non-interactively, then dial the forwarded socket. The
-                    // bridge is returned to the loop and stored on the slot.
-                    match &target {
-                        slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
-                            io::Error::other("home slot has no socket path"),
-                        )),
-                        slots::SlotTarget::Ssh(t) => {
-                            let (bridge, sock) = crate::remote::start_switch_bridge_noninteractive(
-                                t,
-                                proxy_jump.as_deref(),
-                            )
-                            .map_err(ClientError::ConnectionFailed)?;
-                            // The bridge listener may need a moment to be ready
-                            // (it binds synchronously, but ssh dial latency hides
-                            // here on first connect). Retry briefly on connect
-                            // refused to avoid spurious failures.
-                            let mut stream = connect_with_brief_retry(&sock)
-                                .map_err(ClientError::ConnectionFailed)?;
+                        let mut stream = timed_switch_stage(&dial_key, "socket_connect", || {
+                            UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)
+                        })?;
+                        timed_switch_stage(&dial_key, "handshake", || {
                             do_handshake(
                                 &mut stream,
                                 cols,
@@ -3306,7 +3311,52 @@ fn spawn_switch_dial(
                                 false,
                                 None,
                                 fleet.as_ref(),
-                            )?;
+                            )
+                        })?;
+                        return Ok((stream, None));
+                    }
+                    // Path B: cold ssh peer with no bridge — build one
+                    // non-interactively, then dial the forwarded socket. The
+                    // bridge is returned to the loop and stored on the slot.
+                    match &target {
+                        slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
+                            io::Error::other("home slot has no socket path"),
+                        )),
+                        slots::SlotTarget::Ssh(t) => {
+                            // `bridge_start` covers the remote-binary probe (a
+                            // full ssh round trip) plus binding the listener.
+                            // remote.rs splits those two internally; this leg
+                            // is the one the client can attribute on its own.
+                            let (bridge, sock) =
+                                timed_switch_stage(&dial_key, "bridge_start", || {
+                                    crate::remote::start_switch_bridge_noninteractive(
+                                        t,
+                                        proxy_jump.as_deref(),
+                                    )
+                                    .map_err(ClientError::ConnectionFailed)
+                                })?;
+                            // The bridge listener may need a moment to be ready
+                            // (it binds synchronously, but ssh dial latency hides
+                            // here on first connect). Retry briefly on connect
+                            // refused to avoid spurious failures.
+                            let mut stream =
+                                timed_switch_stage(&dial_key, "socket_connect", || {
+                                    connect_with_brief_retry(&sock)
+                                        .map_err(ClientError::ConnectionFailed)
+                                })?;
+                            timed_switch_stage(&dial_key, "handshake", || {
+                                do_handshake(
+                                    &mut stream,
+                                    cols,
+                                    rows,
+                                    cell_width_px,
+                                    cell_height_px,
+                                    requested_encoding,
+                                    false,
+                                    None,
+                                    fleet.as_ref(),
+                                )
+                            })?;
                             Ok((stream, Some(bridge)))
                         }
                     }

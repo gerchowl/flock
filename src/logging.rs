@@ -2453,6 +2453,76 @@ pub(crate) fn client_attach_switch_first_paint(to: &str, warm: bool, elapsed_ms:
     );
 }
 
+/// One measured leg of a server switch (#43, #282).
+///
+/// A cold switch was a single opaque blob: request in, frame out, and a
+/// measured 5.05s in between with nothing to attribute it to. It has four
+/// distinct cost centres — an ssh round trip to find the remote binary, the
+/// bridge listener coming up, the socket connect where ssh dial latency
+/// actually lands, and the protocol handshake — and only one of them is ever
+/// the culprit. Timing the whole thing tells you a switch was slow; timing the
+/// stages tells you WHICH, which is the difference between a number and a fix.
+///
+/// DEBUG for the detail, because there are several per switch and
+/// [`client_slot_flipped`] already carries the one-line INFO summary. A stage
+/// that blows its budget escalates via [`client_switch_stage_slow`] instead —
+/// the same shape as the late-tick WARN: the detail is opt-in, the anomaly
+/// reports itself.
+///
+/// Keeps the `flock::attach` target: `/attach:` is a stable UX surface and the
+/// existing first-paint traces compose with these into one timing view.
+pub(crate) fn client_switch_stage(target: &str, stage: &'static str, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        "attach: switch stage completed"
+    );
+}
+
+/// A switch stage measured inside the remote layer (#43, #282).
+///
+/// `bridge_start` as the client sees it is two very different things bolted
+/// together: a full ssh round trip to discover the remote flock binary, and a
+/// local socket bind that costs microseconds. When a switch stalls, which of
+/// those it was decides whether you look at the network or at flock — so the
+/// split is reported here rather than left for someone to infer.
+pub(crate) fn remote_switch_stage(target: &str, stage: &'static str, elapsed_ms: u64) {
+    tracing::debug!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        "attach: remote switch stage completed"
+    );
+}
+
+/// A switch stage took materially longer than a healthy one ever does (#282).
+///
+/// This is the event that makes a switch stall diagnosable from a DEFAULT-level
+/// tail. Without it, attributing the stall needs someone to have had
+/// `FLOCK_LOG=debug` set before the stall happened — which is exactly the trap
+/// that left #282 uninvestigated since it was filed.
+pub(crate) fn client_switch_stage_slow(
+    target: &str,
+    stage: &'static str,
+    elapsed_ms: u64,
+    budget_ms: u64,
+) {
+    tracing::warn!(
+        target: "flock::attach",
+        side = "client",
+        stage,
+        to = target,
+        elapsed_ms,
+        budget_ms,
+        "attach: switch stage exceeded its budget"
+    );
+}
+
 pub(crate) fn client_slot_shutdown_demoted(slot: &str) {
     tracing::debug!(
         event = "client.slot.shutdown",
@@ -4673,6 +4743,38 @@ mod tests {
             stalled.contains("active_slot=\"sage\""),
             "a stall is attributable to the peer the loop was serving: {stalled}"
         );
+    }
+
+    /// #43/#282: the stage traces exist to ATTRIBUTE a stall, so the fields
+    /// that name the stage and the target are the load-bearing ones. A stage
+    /// over budget must escalate to WARN — a stall that only shows up at
+    /// `FLOCK_LOG=debug` needs someone to have predicted it, which is the trap
+    /// that left #282 uninvestigated.
+    #[test]
+    fn switch_stages_are_debug_until_one_blows_its_budget() {
+        let quick = capture_logs(|| client_switch_stage("sage", "handshake", 12));
+        assert!(quick.contains("DEBUG"), "{quick}");
+        assert!(quick.contains("flock::attach"), "{quick}");
+        assert!(quick.contains("stage=\"handshake\""), "{quick}");
+        assert!(quick.contains("to=\"sage\""), "{quick}");
+        assert!(quick.contains("elapsed_ms=12"), "{quick}");
+
+        let stalled = capture_logs(|| client_switch_stage_slow("sage", "bridge_start", 5050, 1500));
+        assert!(
+            stalled.contains("WARN"),
+            "a stalled stage must be visible at default level: {stalled}"
+        );
+        assert!(stalled.contains("stage=\"bridge_start\""), "{stalled}");
+        assert!(
+            stalled.contains("elapsed_ms=5050") && stalled.contains("budget_ms=1500"),
+            "both numbers, so the reader can judge the breach: {stalled}"
+        );
+
+        // The remote-side split is what separates "the network was slow" from
+        // "flock was slow" inside the client's single `bridge_start` leg.
+        let probe = capture_logs(|| remote_switch_stage("sage", "remote_probe", 4900));
+        assert!(probe.contains("stage=\"remote_probe\""), "{probe}");
+        assert!(probe.contains("flock::attach"), "{probe}");
     }
 
     #[test]
