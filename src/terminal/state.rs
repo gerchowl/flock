@@ -211,9 +211,14 @@ pub struct TerminalState {
     /// but nowhere a reader could see it, so joining "this agent" to "these
     /// commits" to "that PR" meant inferring from `cwd`.
     ///
-    /// `None` for an operator-started pane: run ids mark work an agent or
-    /// the scheduler initiated, and minting one for a human's own pane
-    /// would make `flk revert-run` offer to revert the operator's work.
+    /// `None` unless the pane was FORKED. Both fork paths mint one — the
+    /// operator's keyboard fork as well as the `agent.fork` verb — because
+    /// what earns a run id is that the child's commits carry an
+    /// `Agent-Run:` trailer, not who pressed the key.
+    ///
+    /// A plain pane (a shell, or an agent the operator started directly)
+    /// has no trailer to join against, and minting an id for it would make
+    /// `flk revert-run` offer to revert work no run produced.
     pub run_id: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,

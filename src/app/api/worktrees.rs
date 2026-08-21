@@ -363,17 +363,7 @@ impl App {
         // while this is what lets a reader join the running agent back to
         // those commits without inferring from `cwd`. Stamped after a
         // successful spawn so a failed fork leaves no agent claiming a run.
-        if let Some(terminal_id) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.pane_state(spawned_pane))
-            .map(|pane| pane.attached_terminal_id.clone())
-        {
-            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                terminal.run_id = Some(run_id.clone());
-            }
-        }
+        self.record_spawn_run_id(ws_idx, spawned_pane, &run_id);
 
         // Membership stamping mirrors the TUI confirm path: the source keeps
         // (or gains non-linked) membership; the child is a linked worktree of
@@ -2530,6 +2520,20 @@ mod tests {
         assert_eq!(root_pane.workspace_id, workspace.workspace_id);
         assert_eq!(worktree.branch.as_deref(), Some("fork/alt-approach"));
         assert!(Path::new(&worktree.path).join("README.md").exists());
+        // #332: the run id must reach the child's TERMINAL, not only the
+        // response and the child's env. Asserting only the response is what
+        // let the sibling keyboard-fork path ship without the stamp — its
+        // commits carried `Agent-Run:` trailers while the agent reported no
+        // run id at all.
+        let child_pane = app.state.workspaces[1]
+            .focused_pane_id()
+            .expect("child root pane");
+        let child_run_id = app.agent_info(1, child_pane).and_then(|info| info.run_id);
+        assert_eq!(
+            child_run_id.as_deref(),
+            Some(run_id.as_str()),
+            "the forked agent must report the same run id its commits will carry"
+        );
         assert_eq!(app.state.workspaces.len(), 2);
         assert!(
             !app.state.workspaces[0]

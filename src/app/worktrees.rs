@@ -58,6 +58,46 @@ fn resolve_seed_prompt(seed: &str, branch: &str) -> String {
 /// action), reuse this function to mint the run_id there too — the
 /// trailer hook already keys on `FLOCK_RUN_ID`, so the same env stamp
 /// makes those commits revertable by `flk revert-run`.
+/// Record a freshly spawned child's run id on its terminal (#332).
+///
+/// Both fork paths — the TUI keyboard fork and the `agent.fork` socket verb —
+/// mint a run id, stamp it into the child's ENV (which is what reaches the
+/// `Agent-Run:` commit trailer), and must ALSO record it on the terminal so a
+/// reader can join the running agent back to those commits. The API path had
+/// the stamp and the keyboard path did not, so a keyboard-forked agent's
+/// commits carried trailers while `AgentInfo.run_id` reported nothing.
+///
+/// One helper, called from both, so the two cannot drift again. A miss is
+/// logged rather than swallowed: the env stamp has already gone out by this
+/// point, so a silent failure leaves env and read model disagreeing.
+impl super::App {
+    pub(super) fn record_spawn_run_id(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        run_id: &str,
+    ) {
+        let Some(workspace) = self.state.workspaces.get(ws_idx) else {
+            // `public_workspace_id` INDEXES and would panic on a stale
+            // index, so it is never reached without the bounds check above
+            // — a missed stamp must degrade to a log, not take the process
+            // down with it.
+            crate::logging::agent_run_id_stamp_missed(run_id, &format!("ws#{ws_idx}"));
+            return;
+        };
+        let terminal_id = workspace
+            .pane_state(pane_id)
+            .map(|pane| pane.attached_terminal_id.clone());
+        match terminal_id.and_then(|id| self.state.terminals.get_mut(&id)) {
+            Some(terminal) => terminal.run_id = Some(run_id.to_string()),
+            None => {
+                let workspace_id = self.public_workspace_id(ws_idx);
+                crate::logging::agent_run_id_stamp_missed(run_id, &workspace_id);
+            }
+        }
+    }
+}
+
 pub(super) fn generated_fork_run_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1531,9 +1571,12 @@ impl App {
                     // the id, or the next unrelated pane inherits it and
                     // `flk revert-run` would revert that pane's work (#192).
                     let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
-                    fork_run_id = Some((run_id, seeded));
+                    fork_run_id = Some((run_id.clone(), seeded));
                     self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
-                        .map(|(ws_idx, _, _)| ws_idx)
+                        .map(|(ws_idx, _, pane_id)| {
+                            self.record_spawn_run_id(ws_idx, pane_id, &run_id);
+                            ws_idx
+                        })
                         .map_err(|err| match err {
                             super::agents::AgentStartError::SpawnFailed(message) => message,
                             _ => "agent spawn rejected".to_string(),
@@ -2429,6 +2472,60 @@ mod tests {
         assert_eq!(
             app.state.action_notice.as_deref(),
             Some("branch session: focused pane has no resumable agent session")
+        );
+    }
+
+    /// #332: both fork paths mint a run id and stamp it into the child's
+    /// ENV, which is what reaches the `Agent-Run:` commit trailer. Only the
+    /// API path also recorded it on the terminal, so a keyboard-forked
+    /// agent's commits carried trailers while `AgentInfo.run_id` reported
+    /// nothing — the join from a running agent to its commits was broken for
+    /// every operator fork.
+    ///
+    /// The spawn itself needs a PTY, so what is pinned here is the shared
+    /// helper both paths now funnel through.
+    #[test]
+    fn record_spawn_run_id_stamps_the_child_terminal() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace should have a pane");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        assert_eq!(app.state.terminals[&terminal_id].run_id, None);
+
+        app.record_spawn_run_id(0, pane_id, "fork:abc-1-0");
+        assert_eq!(
+            app.state.terminals[&terminal_id].run_id.as_deref(),
+            Some("fork:abc-1-0")
+        );
+    }
+
+    /// A miss must not panic and must not silently succeed: by the time the
+    /// helper runs, the env stamp has already gone out, so the failure mode
+    /// is env and read model disagreeing — which is why it is logged.
+    #[test]
+    fn record_spawn_run_id_survives_a_missing_pane() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace should have a pane");
+
+        // Out-of-range workspace: no terminal to stamp, no panic either.
+        app.record_spawn_run_id(99, pane_id, "fork:abc-1-0");
+        assert!(
+            app.state
+                .terminals
+                .values()
+                .all(|terminal| terminal.run_id.is_none()),
+            "a missed stamp must not land on an unrelated terminal"
         );
     }
 

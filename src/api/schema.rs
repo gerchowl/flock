@@ -1599,6 +1599,12 @@ pub struct WorktreeInfo {
 
 /// A branch's GitHub PR, as carried on the wire (#332).
 ///
+/// **A cached poll result, not a live read.** The poller refreshes on its own
+/// cadence and a failed round preserves the previous values, so this can lag
+/// reality — a `merged` that was reverted and reopened still reads `merged`
+/// until the next successful round. A caller deciding whether work is
+/// finished should treat this as a strong hint, not proof.
+///
 /// Deliberately its own type rather than a serde derive on
 /// `crate::worktree::PrStateInfo`: the internal enum is free to grow
 /// variants for the TUI's benefit, and the wire contract should not change
