@@ -107,11 +107,18 @@ impl PanedMcp {
         mkfifo(&to_mcp);
         mkfifo(&from_mcp);
 
-        // `exec` so the pane's own child pid IS the MCP server: the ancestry
-        // walk then attests this caller without depending on how many shells
-        // happen to sit in between.
+        // NOT `exec`, deliberately. `exec` would make the pane's own child pid
+        // the MCP server, which reads as tidier — and kills it on Linux. It
+        // replaces every fd the shell holds on the PTY slave with these FIFOs,
+        // so nothing on the child side keeps the slave open, a read of the
+        // master returns EIO, and flock correctly concludes the pane's process
+        // is gone and reaps it. macOS blocks on that read instead of erroring,
+        // which is why the exec'd version passed there and nowhere else.
+        // Keeping the shell means the pane keeps its terminal, and ancestry
+        // still attests the sender: the walk climbs 16 levels, and one shell is
+        // one of them.
         let command = format!(
-            "exec {} mcp serve <{} >{} 2>{}",
+            "{} mcp serve <{} >{} 2>{}",
             env!("CARGO_BIN_EXE_flk"),
             to_mcp.display(),
             from_mcp.display(),
