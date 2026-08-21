@@ -491,19 +491,26 @@ impl AppState {
                 }
 
                 if self.mode == Mode::ConfirmRemoveWorktree {
-                    if let Some(popup) = crate::ui::remove_worktree_popup_rect(self.screen_rect()) {
+                    // The popup is content-sized (#325), so the hit-test has to
+                    // measure it from the same state the render did.
+                    if let Some(popup) = self.worktree_remove.as_ref().and_then(|remove| {
+                        crate::ui::remove_worktree_popup_rect(self.screen_rect(), remove)
+                    }) {
                         let inner = Rect::new(
                             popup.x + 1,
                             popup.y + 1,
                             popup.width.saturating_sub(2),
                             popup.height.saturating_sub(2),
                         );
-                        let force_confirmation = self
+                        // Both forms widen the primary button's label to
+                        // "delete anyway" (#325), so the hit-test must ask the
+                        // same question the render does.
+                        let forced = self
                             .worktree_remove
                             .as_ref()
-                            .is_some_and(|remove| remove.force_confirmation);
+                            .is_some_and(|remove| remove.force_confirmation || remove.force);
                         let (remove, cancel) =
-                            crate::ui::remove_worktree_button_rects(inner, force_confirmation);
+                            crate::ui::remove_worktree_button_rects(inner, forced);
                         match modal_action_from_buttons(
                             mouse.column,
                             mouse.row,
@@ -3073,13 +3080,19 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: false,
             branch: None,
             merge_gate: None,
             branch_protected: false,
             gate_timed_out: false,
         });
-        let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
+        let popup = crate::ui::remove_worktree_popup_rect(
+            app.state.screen_rect(),
+            app.state.worktree_remove.as_ref().unwrap(),
+        )
+        .unwrap();
         let inner = Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -3107,13 +3120,19 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: false,
             branch: None,
             merge_gate: None,
             branch_protected: false,
             gate_timed_out: false,
         });
-        let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
+        let popup = crate::ui::remove_worktree_popup_rect(
+            app.state.screen_rect(),
+            app.state.worktree_remove.as_ref().unwrap(),
+        )
+        .unwrap();
         let inner = Rect::new(
             popup.x + 1,
             popup.y + 1,

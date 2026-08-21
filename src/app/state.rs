@@ -941,6 +941,16 @@ pub struct WorktreeRemoveState {
     pub error: Option<String>,
     pub removing: bool,
     pub force_confirmation: bool,
+    /// User-set force (#325), distinct from [`Self::force_confirmation`], which
+    /// only means "an attempt already failed on dirty files". Set from the
+    /// dialog before the first attempt; overrides BOTH the merge gate (delete
+    /// the branch without evidence) and a dirty checkout (force the removal).
+    /// Never overrides [`Self::branch_protected`] — losing `main` is a
+    /// different risk class from losing a worktree (#121).
+    pub force: bool,
+    /// What the kill would destroy beyond the checkout folder (#325). `None`
+    /// while the probe is still running, like `merge_gate`.
+    pub probe: Option<crate::worktree::KillProbe>,
     /// Kill flow: delete the local branch too once the merge gate passes.
     pub delete_branch: bool,
     pub branch: Option<String>,

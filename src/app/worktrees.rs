@@ -462,6 +462,8 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: false,
             branch: None,
             merge_gate: None,
@@ -523,6 +525,8 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: None,
             merge_gate: None,
@@ -543,6 +547,10 @@ impl App {
                 ),
                 None => (crate::worktree::WorktreeMergeGate::NotMerged, false),
             };
+            // #325: what the kill would destroy, collected on the same worker
+            // that resolved the gate — the dialog holds its confirm until both
+            // land, so the user never authorises an unnamed set.
+            let probe = crate::worktree::probe_kill_targets(&checkout, branch.as_deref());
             let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                 crate::events::WorktreeKillGateResult {
                     workspace_id,
@@ -550,6 +558,7 @@ impl App {
                     branch,
                     gate,
                     timed_out,
+                    probe: Some(probe),
                 },
             ));
         });
@@ -601,6 +610,8 @@ impl App {
         );
         remove.branch = result.branch;
         remove.merge_gate = Some(result.gate);
+        // #325: collected by the same worker, so it lands with the verdict.
+        remove.probe = result.probe;
         // A protected branch — the repo's default, the main/master floor, or a
         // configured `protected_branches` entry (#121, `is_protected_branch`
         // above) — is kept regardless of merge evidence: the gate treats the
@@ -719,6 +730,9 @@ impl App {
                         branch,
                         gate,
                         timed_out,
+                        // The sweep renders per-row tiers, not a file list, and
+                        // would pay the probe once per worktree for it (#325).
+                        probe: None,
                     },
                 ));
             });
@@ -1443,6 +1457,18 @@ impl App {
                 };
             }
             KeyCode::Enter => self.start_worktree_remove(),
+            // #325: the same chord the fleet sweep uses for its force toggle,
+            // so the two kill dialogs read as one feature. Inert once the
+            // removal is under way — the flag has already been consumed.
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                if let Some(remove) = &mut self.state.worktree_remove {
+                    if !remove.removing {
+                        remove.force = !remove.force;
+                        self.render_dirty.store(true, Ordering::Release);
+                        self.render_notify.notify_one();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1461,7 +1487,9 @@ impl App {
         }
         remove.removing = true;
         remove.error = None;
-        let force = remove.force_confirmation;
+        // #325: either the user armed force up front, or an earlier attempt
+        // already failed on dirty files and asked for confirmation.
+        let force = remove.force_confirmation || remove.force;
 
         let command =
             crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
@@ -1647,11 +1675,16 @@ impl App {
                     .worktree_remove
                     .as_ref()
                     .filter(|remove| {
+                        // #325: force stands in for merge evidence. It cannot
+                        // reach a protected branch — `branch_protected` clears
+                        // `delete_branch` when the gate resolves (#121), and
+                        // that is checked first here.
                         remove.delete_branch
-                            && matches!(
-                                remove.merge_gate,
-                                Some(crate::worktree::WorktreeMergeGate::Merged { .. })
-                            )
+                            && (remove.force
+                                || matches!(
+                                    remove.merge_gate,
+                                    Some(crate::worktree::WorktreeMergeGate::Merged { .. })
+                                ))
                     })
                     .and_then(|remove| {
                         remove
@@ -2163,6 +2196,8 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: false,
             branch: None,
             merge_gate: None,
@@ -2197,6 +2232,8 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: false,
             branch: None,
             merge_gate: None,
@@ -3087,6 +3124,8 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: None,
             merge_gate: None,
@@ -3102,6 +3141,7 @@ mod tests {
                 evidence: "PR #7 merged".into(),
             },
             timed_out: false,
+            probe: None,
         });
 
         let remove = app.state.worktree_remove.as_ref().unwrap();
@@ -3118,6 +3158,123 @@ mod tests {
         assert!(!remove.gate_timed_out);
     }
 
+    fn kill_dialog_state(branch: &str) -> WorktreeRemoveState {
+        WorktreeRemoveState {
+            managed: true,
+            workspace_id: "ws".into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            force: false,
+            probe: None,
+            delete_branch: true,
+            branch: Some(branch.into()),
+            merge_gate: None,
+            branch_protected: false,
+            gate_timed_out: false,
+        }
+    }
+
+    #[test]
+    fn force_toggle_lets_the_kill_delete_a_branch_with_no_merge_evidence() {
+        // #325: the gate is deliberately conservative, so it keeps refusing
+        // branches the user can verify by hand (#296, #321 were two such
+        // windows). Before this the only way through was the CLI's --force.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(kill_dialog_state("feature/x"));
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            branch: Some("feature/x".into()),
+            gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            timed_out: false,
+            probe: None,
+        });
+
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert!(!remove.force, "force starts off");
+        assert!(
+            remove.delete_branch,
+            "the offer stands; the gate verdict decides at execution time"
+        );
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(app.state.worktree_remove.as_ref().unwrap().force);
+        // Toggling is symmetric — the same key backs out of it.
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(!app.state.worktree_remove.as_ref().unwrap().force);
+    }
+
+    #[test]
+    fn force_toggle_is_inert_once_the_removal_is_under_way() {
+        // The flag has already been read into the spawned command; flipping it
+        // now would only lie to the user about what is happening.
+        let mut app = app_for_worktree_tests();
+        let mut state = kill_dialog_state("feature/x");
+        state.removing = true;
+        app.state.worktree_remove = Some(state);
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(!app.state.worktree_remove.as_ref().unwrap().force);
+    }
+
+    #[test]
+    fn force_never_reaches_a_protected_branch() {
+        // #121 outranks #325: force is a way past the merge gate, not a way to
+        // delete main. The guard clears `delete_branch` when the gate resolves,
+        // and that is what the execution path checks first.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(kill_dialog_state("main"));
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.handle_worktree_remove_key(KeyEvent::from(KeyCode::Char('f')));
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            branch: Some("main".into()),
+            gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            timed_out: false,
+            probe: None,
+        });
+
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert!(remove.force, "the user did arm force");
+        assert!(
+            !remove.delete_branch,
+            "a protected branch is pinned checkout-only regardless"
+        );
+        assert!(remove.branch_protected);
+    }
+
+    #[test]
+    fn kill_gate_carries_the_probe_into_the_dialog() {
+        // #325: the account of what would be lost lands with the verdict, from
+        // the same worker, so the dialog never renders half of it.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_remove = Some(kill_dialog_state("feature/x"));
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        let probe = crate::worktree::KillProbe {
+            dirty: Some(vec![" M src/lib.rs".into(), "?? scratch.txt".into()]),
+            unpushed: Some(2),
+        };
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            branch: Some("feature/x".into()),
+            gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            timed_out: false,
+            probe: Some(probe.clone()),
+        });
+
+        assert_eq!(
+            app.state.worktree_remove.as_ref().unwrap().probe,
+            Some(probe)
+        );
+    }
+
     #[test]
     fn kill_gate_protects_default_branch_even_when_merge_gate_passes() {
         let mut app = app_for_worktree_tests();
@@ -3129,6 +3286,8 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: None,
             merge_gate: None,
@@ -3147,6 +3306,7 @@ mod tests {
                 evidence: "contained in origin/latest".into(),
             },
             timed_out: false,
+            probe: None,
         });
 
         let remove = app.state.worktree_remove.as_ref().unwrap();
@@ -3172,6 +3332,8 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: None,
             merge_gate: None,
@@ -3187,6 +3349,7 @@ mod tests {
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
             timed_out: true,
+            probe: None,
         });
 
         let remove = app.state.worktree_remove.as_ref().unwrap();
@@ -3209,6 +3372,8 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: None,
             merge_gate: None,
@@ -3236,6 +3401,8 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: Some("feature/x".into()),
             merge_gate: None,
@@ -3285,6 +3452,8 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: Some("feature/done".into()),
             merge_gate: Some(crate::worktree::WorktreeMergeGate::Merged {
@@ -3341,6 +3510,8 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            force: false,
+            probe: None,
             delete_branch: true,
             branch: Some("feature/wip".into()),
             merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),

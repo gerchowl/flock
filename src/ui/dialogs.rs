@@ -187,8 +187,45 @@ pub(crate) fn new_linked_worktree_button_rects(inner: Rect) -> (Rect, Rect) {
     (rects[0], rects[1])
 }
 
-pub(crate) fn remove_worktree_popup_rect(area: Rect) -> Option<Rect> {
-    centered_popup_rect(area, 72, 10)
+/// How many rows the stakes block (#325) needs: one per listed path, plus the
+/// unpushed-commits line, plus the "… and N more" tail. Zero while the probe is
+/// still running or when there is nothing to lose.
+pub(crate) const REMOVE_WORKTREE_MAX_LISTED: usize = 6;
+
+pub(crate) fn remove_worktree_stakes_rows(remove: &crate::app::state::WorktreeRemoveState) -> u16 {
+    let Some(probe) = remove.probe.as_ref() else {
+        return 0;
+    };
+    if !probe.has_stakes() {
+        return 0;
+    }
+    let mut rows = 1u16; // the "this also destroys:" lead-in
+    match probe.dirty.as_deref() {
+        // Unknown collapses to a single line saying so — never a silent zero.
+        None => rows += 1,
+        Some(paths) => {
+            rows += paths.len().min(REMOVE_WORKTREE_MAX_LISTED) as u16;
+            if paths.len() > REMOVE_WORKTREE_MAX_LISTED {
+                rows += 1;
+            }
+        }
+    }
+    if probe.unpushed.is_none_or(|count| count > 0) {
+        rows += 1;
+    }
+    rows
+}
+
+/// The dialog grows with what it has to account for (#325): the fixed 10-row
+/// box predates it having anything to list.
+pub(crate) fn remove_worktree_popup_rect(
+    area: Rect,
+    remove: &crate::app::state::WorktreeRemoveState,
+) -> Option<Rect> {
+    // +1 for the force-toggle line, which is always present once the probe has
+    // landed so the affordance does not appear and disappear under the cursor.
+    let extra = remove_worktree_stakes_rows(remove) + u16::from(remove.probe.is_some());
+    centered_popup_rect(area, 72, 10 + extra)
 }
 
 pub(crate) fn remove_worktree_button_rects(inner: Rect, force_confirmation: bool) -> (Rect, Rect) {
@@ -425,7 +462,7 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     };
 
     super::dim_background(frame, area);
-    let Some(popup) = remove_worktree_popup_rect(area) else {
+    let Some(popup) = remove_worktree_popup_rect(area, remove) else {
         return;
     };
     let Some(inner) = render_panel_shell(frame, popup, app.palette.red, app.palette.panel_bg)
@@ -493,6 +530,17 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
                 ),
                 Style::default().fg(app.palette.green),
             ),
+            // #325: with force armed the branch goes regardless, so the line
+            // has to stop promising it is kept.
+            Some(crate::worktree::WorktreeMergeGate::NotMerged) if remove.force => (
+                format!(
+                    " ! forced — branch {} will be deleted with no merge evidence.",
+                    remove.branch.as_deref().unwrap_or("?")
+                ),
+                Style::default()
+                    .fg(app.palette.red)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Some(crate::worktree::WorktreeMergeGate::NotMerged) if remove.gate_timed_out => (
                 " ⏱ merge status unknown (timed out) — checkout only; the branch is kept."
                     .to_string(),
@@ -530,12 +578,15 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         );
     }
 
-    let (remove_rect, cancel_rect) = remove_worktree_button_rects(inner, remove.force_confirmation);
-    let remove_label = if remove.force_confirmation {
-        "delete anyway"
-    } else {
-        "remove"
-    };
+    // #325: the stakes block and the force toggle share the flexible tail row,
+    // above the button line the button rects pin to `inner.height - 1`.
+    let tail = rows[7];
+    let tail = Rect::new(tail.x, tail.y, tail.width, tail.height.saturating_sub(1));
+    render_remove_worktree_stakes(app, frame, tail, remove);
+
+    let forced = remove.force_confirmation || remove.force;
+    let (remove_rect, cancel_rect) = remove_worktree_button_rects(inner, forced);
+    let remove_label = if forced { "delete anyway" } else { "remove" };
     render_action_button(
         frame,
         remove_rect,
@@ -556,6 +607,104 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             .bg(app.palette.surface0)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+/// What this kill destroys beyond the checkout, and the force toggle read in
+/// that context (#325).
+///
+/// Nothing renders while the probe is still running — the confirm is already
+/// held until the gate lands, and a half-filled account is worse than none.
+/// An unreadable probe says "could not be read", never "clean": the user is
+/// authorising a destructive act, and the difference between an empty set and
+/// an unknown one is the whole reason this block exists.
+fn render_remove_worktree_stakes(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    remove: &crate::app::state::WorktreeRemoveState,
+) {
+    let Some(probe) = remove.probe.as_ref() else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let p = &app.palette;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if probe.has_stakes() {
+        lines.push(Line::from(Span::styled(
+            " this also destroys:",
+            Style::default().fg(p.overlay0),
+        )));
+        match probe.dirty.as_deref() {
+            None => lines.push(Line::from(Span::styled(
+                "   uncommitted changes could not be read — assume there are some",
+                Style::default().fg(p.yellow),
+            ))),
+            Some(paths) => {
+                for path in paths.iter().take(REMOVE_WORKTREE_MAX_LISTED) {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {path}"),
+                        Style::default().fg(p.peach),
+                    )));
+                }
+                if paths.len() > REMOVE_WORKTREE_MAX_LISTED {
+                    lines.push(Line::from(Span::styled(
+                        format!("   … and {} more", paths.len() - REMOVE_WORKTREE_MAX_LISTED),
+                        Style::default().fg(p.overlay0),
+                    )));
+                }
+            }
+        }
+        match probe.unpushed {
+            None => lines.push(Line::from(Span::styled(
+                "   unpushed commits could not be counted",
+                Style::default().fg(p.yellow),
+            ))),
+            Some(count) if count > 0 => lines.push(Line::from(Span::styled(
+                format!(
+                    "   {count} commit{} no remote holds",
+                    if count == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(p.peach),
+            ))),
+            Some(_) => {}
+        }
+    }
+    // The toggle is always offered once the probe has landed, so the
+    // affordance does not appear and vanish under the cursor as the account
+    // above it changes.
+    lines.push(remove_worktree_force_line(remove, p));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The force toggle's own line: what it is, and what turning it on changes.
+fn remove_worktree_force_line(
+    remove: &crate::app::state::WorktreeRemoveState,
+    p: &crate::app::state::Palette,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(" [f] ", Style::default().fg(p.overlay1))];
+    if remove.force {
+        spans.push(Span::styled(
+            "force ON",
+            Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            if remove.branch_protected {
+                " — deletes dirty files; the protected branch is still kept"
+            } else {
+                " — deletes the branch without evidence, and dirty files"
+            },
+            Style::default().fg(p.red),
+        ));
+    } else {
+        spans.push(Span::styled("force off", Style::default().fg(p.overlay0)));
+        spans.push(Span::styled(
+            " — press f to delete anyway",
+            Style::default().fg(p.overlay0),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The fleet-wide kill sweep dialog (#81): a per-worktree dry-run plan + counts,
@@ -1226,9 +1375,11 @@ mod tests {
     use super::confirm_close_overlay_text;
     use super::{
         new_linked_worktree_inner_rect, new_linked_worktree_popup_height,
-        render_new_linked_worktree_overlay,
+        remove_worktree_popup_rect, remove_worktree_stakes_rows,
+        render_new_linked_worktree_overlay, render_remove_worktree_overlay,
+        REMOVE_WORKTREE_MAX_LISTED,
     };
-    use crate::app::state::{WorktreeCreateFocus, WorktreeCreateState};
+    use crate::app::state::{WorktreeCreateFocus, WorktreeCreateState, WorktreeRemoveState};
 
     fn worktree_create_with(
         branch_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -1277,6 +1428,151 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn kill_dialog_state(probe: Option<crate::worktree::KillProbe>) -> WorktreeRemoveState {
+        WorktreeRemoveState {
+            managed: true,
+            workspace_id: "ws".into(),
+            repo_root: "/repo/flock".into(),
+            path: "/repo/flock-issue".into(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            force: false,
+            probe,
+            delete_branch: true,
+            branch: Some("feature/x".into()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+            branch_protected: false,
+            gate_timed_out: false,
+        }
+    }
+
+    fn render_kill_dialog(app: &AppState) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 32)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_remove_worktree_overlay(app, frame, Rect::new(0, 0, 80, 32)))
+            .expect("kill overlay should render");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn kill_dialog_accounts_for_what_the_removal_destroys() {
+        // #325: before this the dialog named the checkout path and the gate
+        // verdict, and asked the user to authorise a destructive act against
+        // an unnamed set of files.
+        let mut app = AppState::test_new();
+        app.worktree_remove = Some(kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some(vec![" M src/lib.rs".into(), "?? scratch.txt".into()]),
+            unpushed: Some(2),
+        })));
+
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("this also destroys"), "{text:?}");
+        assert!(text.contains("src/lib.rs"), "{text:?}");
+        assert!(text.contains("scratch.txt"), "{text:?}");
+        assert!(text.contains("2 commits no remote holds"), "{text:?}");
+        assert!(
+            text.contains("force off"),
+            "the toggle is offered: {text:?}"
+        );
+    }
+
+    #[test]
+    fn kill_dialog_says_unknown_rather_than_clean_when_git_could_not_be_asked() {
+        // The difference between an empty set and an unknown one is the whole
+        // reason the block exists — rendering unknown as clean would be worse
+        // than the silence it replaced.
+        let mut app = AppState::test_new();
+        app.worktree_remove = Some(kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: None,
+            unpushed: None,
+        })));
+
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("could not be read"), "{text:?}");
+        assert!(text.contains("could not be counted"), "{text:?}");
+    }
+
+    #[test]
+    fn kill_dialog_shows_nothing_extra_while_the_probe_is_running() {
+        // The confirm is already held until the gate lands; a half-filled
+        // account is worse than none.
+        let mut app = AppState::test_new();
+        app.worktree_remove = Some(kill_dialog_state(None));
+
+        let text = render_kill_dialog(&app);
+        assert!(!text.contains("this also destroys"), "{text:?}");
+        assert!(!text.contains("force"), "{text:?}");
+    }
+
+    #[test]
+    fn armed_force_restates_the_gate_line_instead_of_promising_the_branch_is_kept() {
+        let mut app = AppState::test_new();
+        let mut remove = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some(Vec::new()),
+            unpushed: Some(0),
+        }));
+        remove.force = true;
+        app.worktree_remove = Some(remove);
+
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("force ON"), "{text:?}");
+        assert!(
+            text.contains("will be deleted with no merge evidence"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("the branch is kept"),
+            "the old line would now be a lie: {text:?}"
+        );
+        assert!(text.contains("delete anyway"), "button label: {text:?}");
+    }
+
+    #[test]
+    fn kill_dialog_grows_with_the_account_and_truncates_a_long_one() {
+        let clean = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some(Vec::new()),
+            unpushed: Some(0),
+        }));
+        assert_eq!(
+            remove_worktree_stakes_rows(&clean),
+            0,
+            "nothing to lose, nothing to show"
+        );
+
+        let many = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: Some((0..20).map(|n| format!("?? file{n}.txt")).collect()),
+            unpushed: Some(1),
+        }));
+        // lead-in + capped list + "… and N more" + the unpushed line.
+        assert_eq!(
+            remove_worktree_stakes_rows(&many),
+            1 + REMOVE_WORKTREE_MAX_LISTED as u16 + 1 + 1
+        );
+
+        let area = Rect::new(0, 0, 80, 40);
+        let small = remove_worktree_popup_rect(area, &clean).expect("popup");
+        let large = remove_worktree_popup_rect(area, &many).expect("popup");
+        assert!(
+            large.height > small.height,
+            "the box has to make room: {} vs {}",
+            large.height,
+            small.height
+        );
+
+        let mut app = AppState::test_new();
+        app.worktree_remove = Some(many);
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("and 14 more"), "{text:?}");
     }
 
     #[test]
