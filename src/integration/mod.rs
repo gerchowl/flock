@@ -278,6 +278,14 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     if let Some(run_id) = take_pending_run_id() {
         cmd.env(FLOCK_RUN_ID_ENV_VAR, run_id);
     }
+    // #329: an agent-initiated child does not inherit the operator's ambient
+    // credentials. `CommandBuilder` starts from the parent environment, so
+    // the removal has to be explicit.
+    if take_pending_credential_scrub() {
+        for key in AGENT_SPAWN_DENIED_ENV {
+            cmd.env_remove(key);
+        }
+    }
 }
 
 thread_local! {
@@ -307,6 +315,77 @@ impl Drop for PendingRunIdGuard {
 /// Arm the run_id the *next* pane spawn on this thread inherits as
 /// `FLOCK_RUN_ID`. Consumed exactly once by [`apply_pane_env`]; the
 /// returned guard disarms it however the caller leaves scope.
+/// Ambient credentials an AGENT-SPAWNED child must not inherit (#329,
+/// ADR-0014 §3).
+///
+/// A pty child inherits the operator's environment wholesale. For a pane the
+/// operator started that is correct — it is their shell. For a pane ANOTHER
+/// AGENT asked for, it silently hands a process the operator's GitHub push
+/// rights and live ssh-agent, and nothing in the `Agent-Run:` trailer or the
+/// spawn ceiling constrains what it does with them.
+///
+/// This is a deny list rather than the allowlist ADR-0014 §3 argues for. The
+/// allowlist is stronger and should follow; it needs per-agent knowledge of
+/// what each CLI actually requires, and getting that wrong fails as a
+/// mysterious startup break rather than a clean refusal. Denying the
+/// credentials removes the sharpest edge without that risk.
+const AGENT_SPAWN_DENIED_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "SSH_AUTH_SOCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "NPM_TOKEN",
+];
+
+thread_local! {
+    /// Armed immediately before an agent-initiated pane spawn, consumed by
+    /// `apply_pane_env`. Same one-shot shape as the run id, and for the same
+    /// reason: pane spawn is synchronous on the App thread, so a global slot
+    /// would race with a concurrent spawn.
+    static SCRUB_AMBIENT_CREDENTIALS: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
+}
+
+pub(crate) struct PendingCredentialScrubGuard;
+
+impl Drop for PendingCredentialScrubGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_credential_scrub();
+    }
+}
+
+/// Arm credential scrubbing for the NEXT pane spawn on this thread.
+///
+/// A guard, not a bare set, for the same reason the run id is one — and with
+/// a worse failure mode if it were not. The flag is consumed inside
+/// `apply_pane_env`, which a failed spawn may never reach; a leaked flag then
+/// lands on whatever pane is spawned next on this thread. That could be the
+/// OPERATOR's own pane, which would silently lose its GitHub token and
+/// ssh-agent with no error to explain it.
+#[must_use = "the guard disarms the scrub; dropping it immediately re-arms nothing"]
+pub(crate) fn set_pending_credential_scrub() -> PendingCredentialScrubGuard {
+    SCRUB_AMBIENT_CREDENTIALS.with(|slot| *slot.borrow_mut() = true);
+    PendingCredentialScrubGuard
+}
+
+fn take_pending_credential_scrub() -> bool {
+    SCRUB_AMBIENT_CREDENTIALS.with(|slot| {
+        let armed = *slot.borrow();
+        *slot.borrow_mut() = false;
+        armed
+    })
+}
+
+/// The deny list, exposed so the test can assert on the same table the
+/// scrub uses rather than restating it.
+#[cfg(test)]
+pub(crate) fn agent_spawn_denied_env() -> &'static [&'static str] {
+    AGENT_SPAWN_DENIED_ENV
+}
+
 pub(crate) fn set_pending_run_id(run_id: String) -> PendingRunIdGuard {
     PENDING_RUN_ID.with(|slot| *slot.borrow_mut() = Some(run_id));
     PendingRunIdGuard
@@ -2899,6 +2978,91 @@ mod tests {
         std::env::remove_var(COPILOT_HOME_ENV_VAR);
         std::env::remove_var(KIMI_CODE_HOME_ENV_VAR);
         std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    }
+
+    /// The scrub only works if `env_remove` suppresses INHERITANCE rather
+    /// than merely un-setting something the builder set itself. It does:
+    /// `CommandBuilder::new` seeds its map from `std::env::vars_os()` at
+    /// construction, and that map IS the child's environment — so removing a
+    /// key that was never explicitly set still keeps it from the child.
+    ///
+    /// Pinned here because if it were the other way round, every assertion
+    /// below would pass while the scrub did nothing at all.
+    #[test]
+    fn env_remove_suppresses_an_inherited_var_not_just_an_explicit_one() {
+        std::env::set_var("FLOCK_TEST_INHERITED", "from-the-parent");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        assert_eq!(
+            cmd.get_env("FLOCK_TEST_INHERITED").and_then(|v| v.to_str()),
+            Some("from-the-parent"),
+            "the builder must start from the parent environment"
+        );
+        cmd.env_remove("FLOCK_TEST_INHERITED");
+        assert_eq!(
+            cmd.get_env("FLOCK_TEST_INHERITED"),
+            None,
+            "removing an inherited key must keep it from the child"
+        );
+        std::env::remove_var("FLOCK_TEST_INHERITED");
+    }
+
+    /// #329: a pty child inherits the operator's environment wholesale. For
+    /// a pane the operator started that is correct. For one another AGENT
+    /// asked for, it silently hands a process the operator's GitHub push
+    /// rights and live ssh-agent — which neither the run-id trailer nor the
+    /// spawn ceiling constrains.
+    #[test]
+    fn an_agent_spawned_pane_does_not_inherit_ambient_credentials() {
+        std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+        std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_credential_scrub();
+        apply_pane_env(&mut cmd, PaneId::from_raw(11));
+        drop(guard);
+        for key in agent_spawn_denied_env() {
+            assert_eq!(
+                cmd.get_env(key),
+                None,
+                "{key} must not reach an agent-spawned child"
+            );
+        }
+
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("SSH_AUTH_SOCK");
+    }
+
+    /// The scrub is a ONE-SHOT consumed by `apply_pane_env`.
+    #[test]
+    fn the_credential_scrub_is_consumed_by_the_pane_it_was_armed_for() {
+        let mut spawned = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_credential_scrub();
+        apply_pane_env(&mut spawned, PaneId::from_raw(12));
+        drop(guard);
+        assert!(
+            !take_pending_credential_scrub(),
+            "the one-shot must already be consumed"
+        );
+    }
+
+    /// The case the guard exists for: a spawn that fails BEFORE
+    /// `apply_pane_env` runs. Without the guard the flag survives, and the
+    /// next pane on this thread — possibly the operator's own — silently
+    /// loses its GitHub token and ssh-agent with no error to explain it.
+    #[test]
+    fn an_aborted_spawn_does_not_strip_the_next_panes_credentials() {
+        std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+        {
+            let _guard = set_pending_credential_scrub();
+            // Spawn fails here — `apply_pane_env` is never reached.
+        }
+        let mut operator_pane = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut operator_pane, PaneId::from_raw(13));
+        assert!(
+            operator_pane.get_env("GH_TOKEN").is_some(),
+            "an aborted agent spawn must not disarm the operator's own pane"
+        );
+        std::env::remove_var("GH_TOKEN");
     }
 
     #[test]

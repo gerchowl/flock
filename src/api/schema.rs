@@ -68,6 +68,15 @@ pub enum Method {
     AgentRead(AgentReadParams),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
+    /// #329 / ADR-0014: agent-initiated spawn of a FRESH agent.
+    ///
+    /// Deliberately NOT `agent.start`. That verb takes raw `argv` — a
+    /// shell-level "run this binary" primitive backing `flk agent start
+    /// -- <cmd>` — so constraining it in one caller leaves the escape hatch
+    /// open in the type for every future caller. Here the kind is a closed
+    /// enum and argv is assembled server-side.
+    #[serde(rename = "agent.spawn")]
+    AgentSpawn(AgentSpawnParams),
     #[serde(rename = "agent.rename")]
     AgentRename(AgentRenameParams),
     #[serde(rename = "agent.focus")]
@@ -519,6 +528,47 @@ pub struct AgentStartParams {
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+}
+
+/// Params for `agent.spawn` (#329). Every field is narrowed relative to
+/// `AgentStartParams`: no argv, no cwd, no pane placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSpawnParams {
+    /// Which agent to launch. A closed set — see `spawn::AgentKind`.
+    pub agent: String,
+    /// The child's opening turn. Passed to the agent as a single positional
+    /// argument, never interpolated into a command line.
+    pub prompt: String,
+    /// Where the child runs. A discriminated union over places flock already
+    /// owns, rather than a free-form path.
+    pub location: SpawnLocation,
+    /// Custom label for the child agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub focus: bool,
+}
+
+/// Where an `agent.spawn` child runs (#329).
+///
+/// A free-form `cwd` would let a caller point a git-aware child at any repo
+/// on disk — and `flk revert-run` only walks repos it is told about, so the
+/// `Agent-Run:` trailer would not contain the damage. Every variant here
+/// names something flock already tracks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpawnLocation {
+    /// An existing worktree checkout, as returned by `worktree.list`.
+    WorktreePath { path: String },
+    /// A new linked worktree on a new branch, created the way `agent.fork`
+    /// creates one.
+    NewBranch {
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+    },
+    /// An already-open workspace.
+    WorkspaceId { workspace_id: String },
 }
 
 /// Fork a pane's agent conversation into a new linked worktree (#175 F1):
@@ -1455,6 +1505,10 @@ pub enum ResponseResult {
         argv: Vec<String>,
         /// Whether a pivot prompt was injected as the fork's opening turn.
         seeded: bool,
+    },
+    AgentSpawned {
+        run_id: String,
+        agent: AgentInfo,
     },
     AgentList {
         agents: Vec<AgentInfo>,

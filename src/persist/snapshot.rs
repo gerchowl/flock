@@ -135,6 +135,14 @@ pub struct PaneSnapshot {
     /// run id on restart would strand them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Spawn-tree depth (#329). Persisted because the ceiling reads it: an
+    /// agent that forgot its depth on restart could spawn past the limit.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub spawn_depth: u32,
+    /// The agent id that spawned this one (#329). Persisted for the same
+    /// reason — a forgotten parent means a forgotten fanout count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,7 +418,7 @@ fn capture_tab(
                         }
                     })
                 });
-        let (last_prompt, header_reserved, agent_id, run_id) = tab
+        let (last_prompt, header_reserved, agent_id, run_id, spawn_depth, spawned_by) = tab
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id))
@@ -422,9 +430,11 @@ fn capture_tab(
                     // a handle: without it, restart re-addresses every agent.
                     Some(terminal.agent_id.to_string()),
                     terminal.run_id.clone(),
+                    terminal.spawn_depth,
+                    terminal.spawned_by.clone(),
                 )
             })
-            .unwrap_or((None, false, None, None));
+            .unwrap_or((None, false, None, None, 0, None));
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -435,6 +445,8 @@ fn capture_tab(
                 header_reserved,
                 agent_name,
                 run_id,
+                spawn_depth,
+                spawned_by,
                 agent_session,
                 launch_argv,
             },
@@ -543,6 +555,10 @@ pub(super) fn snapshot_file_version(content: &str) -> Option<u32> {
     serde_json::from_str::<RawSessionSnapshot>(content)
         .ok()
         .map(|raw| raw.version)
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -774,6 +790,8 @@ mod tests {
                 header_reserved: false,
                 agent_name: None,
                 run_id: None,
+                spawn_depth: 0,
+                spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -788,6 +806,8 @@ mod tests {
                 header_reserved: false,
                 agent_name: None,
                 run_id: None,
+                spawn_depth: 0,
+                spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -1466,6 +1486,8 @@ mod tests {
                 header_reserved: false,
                 agent_name: None,
                 run_id: None,
+                spawn_depth: 0,
+                spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
             },
@@ -1482,6 +1504,8 @@ mod tests {
                 header_reserved: false,
                 agent_name: None,
                 run_id: None,
+                spawn_depth: 0,
+                spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
             },

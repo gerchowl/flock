@@ -226,6 +226,15 @@ pub struct TerminalState {
     /// has no trailer to join against, and minting an id for it would make
     /// `flk revert-run` offer to revert work no run produced.
     pub run_id: Option<String>,
+    /// How deep this agent sits in the spawn tree (#329). An operator's own
+    /// pane is 0; an agent it spawned is 1; that agent's child is 2. Read by
+    /// the spawn ceiling to refuse recursion without walking the durable
+    /// event log on a request path.
+    pub spawn_depth: u32,
+    /// The `AgentId` of the agent that spawned this one (#329), when an agent
+    /// did. `None` for an operator-started pane. Read by the ceiling to count
+    /// one parent's live children.
+    pub spawned_by: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
@@ -283,6 +292,8 @@ impl TerminalState {
             manual_label: None,
             agent_name: None,
             run_id: None,
+            spawn_depth: 0,
+            spawned_by: None,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,
