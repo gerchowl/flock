@@ -332,6 +332,79 @@ pub(crate) fn checkout_is_dirty(checkout: &std::path::Path) -> Option<bool> {
         .map(|status| !status.trim().is_empty())
 }
 
+/// What a kill would actually destroy, beyond the checkout folder (#325).
+///
+/// Every field distinguishes "nothing" from "could not tell". The dialog says
+/// so out loud rather than rendering an unreadable repo as clean — the whole
+/// point of showing this is that the user is authorising a destructive act
+/// against a named set, and an unnamed set is what they had before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KillProbe {
+    /// Uncommitted and untracked paths, as `git status --porcelain` name them.
+    /// `Some(vec![])` is a clean checkout; `None` is "git could not be asked".
+    pub dirty: Option<Vec<String>>,
+    /// Commits on the branch that no remote ref holds — the other thing
+    /// deleting a branch can lose. `None` when it could not be counted.
+    pub unpushed: Option<usize>,
+}
+
+impl KillProbe {
+    /// Is there anything here whose loss is worth a second look? Unknown counts
+    /// as yes: it is the reading that makes the user check.
+    pub fn has_stakes(&self) -> bool {
+        !matches!(self.dirty.as_deref(), Some([])) || self.unpushed.is_none_or(|count| count > 0)
+    }
+}
+
+/// Collect what a kill would destroy in `checkout`, for the branch it holds.
+///
+/// Runs on the caller's thread — the kill dialog calls it from the same worker
+/// that resolves the merge gate, so it inherits that thread and never touches
+/// the UI one. Every failure degrades to `None` (unknown) rather than an empty
+/// answer; see [`KillProbe`].
+///
+/// `-uall` lists untracked files individually instead of collapsing a directory
+/// to `dir/`, because "one untracked directory" is exactly the summary that
+/// hides how much is about to go.
+pub(crate) fn probe_kill_targets(checkout: &std::path::Path, branch: Option<&str>) -> KillProbe {
+    let path = checkout.to_string_lossy().to_string();
+    let dirty = run_command_capture(
+        "git",
+        &["-C", &path, "status", "--porcelain=v1", "-uall"],
+        None,
+    )
+    .ok()
+    .map(|status| {
+        status
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    // `--not --remotes` subtracts every remote-tracking ref, not just this
+    // branch's upstream: work pushed to a fork, or landed on another branch's
+    // remote, is recorded somewhere and is not what this warning is for.
+    let unpushed = branch.and_then(|branch| {
+        run_command_capture(
+            "git",
+            &[
+                "-C",
+                &path,
+                "rev-list",
+                "--count",
+                &branch_ref(branch),
+                "--not",
+                "--remotes",
+            ],
+            None,
+        )
+        .ok()
+        .and_then(|count| count.trim().parse::<usize>().ok())
+    });
+    KillProbe { dirty, unpushed }
+}
+
 /// What the all-worktrees sweep (#81) does to ONE worktree, decided from its
 /// resolved state. Ordered safest → most aggressive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,27 +799,89 @@ fn github_repo_from_remote_url(url: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
-/// gh matches PRs by branch NAME; commits added locally after the merge
-/// would not be covered by that evidence. Only accept it when the PR's head
-/// equals the local tip — otherwise fall through to the tip-exact checks.
+/// gh matches PRs by branch NAME, so a merged PR says nothing on its own about
+/// what the local branch holds — the tip has to be accounted for too. An exact
+/// match is the common case; a local tip REACHABLE FROM the merged head is the
+/// other safe one (#321), and everything else falls through to the tip-exact
+/// checks below.
 fn gh_pr_merged_evidence(
     args: &[&str],
     cwd: &std::path::Path,
+    root: &str,
     local_tip: Option<&str>,
 ) -> Option<String> {
     let json = run_command_capture("gh", args, Some(cwd)).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    merged_pr_evidence(&value, root, local_tip)
+}
+
+/// The decision [`gh_pr_merged_evidence`] makes once gh has answered, split out
+/// from the subprocess so the tip rules are testable against a real repo with
+/// no GitHub remote and no `gh` on PATH.
+///
+/// The tip rule is the whole point. A merged PR plus a tip that is an ANCESTOR
+/// of `headRefOid` means every commit the local branch holds is inside what was
+/// merged — the branch simply never caught up with what the PR pushed, which is
+/// the normal state of a worktree left alone while its PR finished (#321: the
+/// local branch sat 6 commits behind the head GitHub merged, and the gate threw
+/// a definitive MERGED away over it).
+///
+/// A tip that is NOT reachable from the merged head keeps the branch, even when
+/// the commits it gained came from the default branch: merging `main` back in
+/// afterwards produces a merge commit that no other ref holds, and a merge
+/// commit can carry conflict resolutions of its own. Reachability cannot prove
+/// that costs nothing, so it does not try — a manual `--force` is the cheaper
+/// mistake.
+fn merged_pr_evidence(
+    value: &serde_json::Value,
+    root: &str,
+    local_tip: Option<&str>,
+) -> Option<String> {
     if value.get("state").and_then(|v| v.as_str()) != Some("MERGED") {
         return None;
     }
     let head_oid = value.get("headRefOid").and_then(|v| v.as_str())?;
-    if local_tip != Some(head_oid) {
+    let number = value.get("number").and_then(|v| v.as_u64());
+    let named = |suffix: &str| {
+        Some(match number {
+            Some(number) => format!("PR #{number} merged{suffix}"),
+            None => format!("PR merged{suffix}"),
+        })
+    };
+    if local_tip == Some(head_oid) {
+        return named("");
+    }
+    if !commit_is_ancestor_of(root, local_tip?, head_oid) {
         return None;
     }
-    Some(match value.get("number").and_then(|v| v.as_u64()) {
-        Some(number) => format!("PR #{number} merged"),
-        None => "PR merged".to_string(),
-    })
+    named(" (local tip is inside the merged head)")
+}
+
+/// Is `ancestor` reachable from `descendant`?
+///
+/// `git merge-base --is-ancestor` answers by exit status: 0 yes, 1 no, and
+/// anything else (an oid this clone does not have, an unreadable repo) is an
+/// error. `run_command_capture` maps every non-zero exit to `Err`, so both the
+/// honest "no" and the unusable answer land on `false` — the reading that keeps
+/// the branch.
+///
+/// Both arguments are raw object ids here, not refnames: one comes from gh and
+/// one from `rev-parse`, so there is no ref to be shadowed by a same-named tag
+/// and no [`branch_ref`] to apply.
+fn commit_is_ancestor_of(root: &str, ancestor: &str, descendant: &str) -> bool {
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ],
+        None,
+    )
+    .is_ok()
 }
 
 /// Does every commit reachable from `branch` also live on some *other* ref?
@@ -839,6 +974,7 @@ pub(crate) fn branch_merge_gate(
     if let Some(evidence) = gh_pr_merged_evidence(
         &["pr", "view", branch, "--json", "state,number,headRefOid"],
         checkout,
+        &root,
         local_tip.as_deref(),
     ) {
         return WorktreeMergeGate::Merged { evidence };
@@ -860,6 +996,7 @@ pub(crate) fn branch_merge_gate(
                 "state,number,headRefOid",
             ],
             checkout,
+            &root,
             local_tip.as_deref(),
         ) {
             return WorktreeMergeGate::Merged { evidence };
@@ -2510,6 +2647,308 @@ prunable stale
             "an unreadable repo is not evidence of anything"
         );
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A repo whose `feature/landed` branch was pushed, then squash-merged.
+    /// Returns the branch tip AS THE PR MERGED IT — what gh reports as
+    /// `headRefOid` — alongside an earlier tip the local worktree stopped at.
+    fn repo_with_a_squashed_pr(name: &str) -> SquashedPr {
+        let repo = create_committed_repo(name);
+        let checkout = unique_temp_path(&format!("{name}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/landed",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("new.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "first"]);
+        let stale_tip = head_oid_of(&checkout);
+        // Work that landed on the PR after the local worktree stopped
+        // following it — the 6 commits of #321, in miniature.
+        std::fs::write(checkout.join("new.txt"), "one\ntwo\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "second"]);
+        let merged_head = head_oid_of(&checkout);
+
+        run_git(&repo, &["merge", "--squash", "feature/landed"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "feature work (#7)"]);
+        let default = detect_default_branch(&repo).expect("default branch");
+        SquashedPr {
+            repo,
+            checkout,
+            stale_tip,
+            merged_head,
+            default,
+        }
+    }
+
+    struct SquashedPr {
+        repo: PathBuf,
+        checkout: PathBuf,
+        stale_tip: String,
+        merged_head: String,
+        default: String,
+    }
+
+    impl SquashedPr {
+        fn root(&self) -> String {
+            self.repo.display().to_string()
+        }
+        fn cleanup(self) {
+            let _ = std::fs::remove_dir_all(&self.checkout);
+            let _ = std::fs::remove_dir_all(&self.repo);
+        }
+    }
+
+    fn head_oid_of(checkout: &Path) -> String {
+        run_command_capture(
+            "git",
+            &["-C", checkout.to_str().unwrap(), "rev-parse", "HEAD"],
+            None,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    fn merged_pr_json(number: u64, head_oid: &str) -> serde_json::Value {
+        serde_json::json!({ "state": "MERGED", "number": number, "headRefOid": head_oid })
+    }
+
+    #[test]
+    fn merged_pr_evidence_accepts_a_local_tip_inside_the_merged_head() {
+        // The live miss (#321): PR #287 merged at a head the local worktree
+        // never fast-forwarded to — it sat 6 commits behind. gh answered
+        // MERGED, and the gate discarded it purely because the oids differed,
+        // then reported "no merge evidence" for a branch wholly contained in
+        // what had been merged.
+        let pr = repo_with_a_squashed_pr("merge-gate-stale-tip");
+        assert_ne!(pr.stale_tip, pr.merged_head, "fixture must lag the head");
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&pr.stale_tip),
+            ),
+            Some("PR #7 merged (local tip is inside the merged head)".to_string())
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_keeps_a_branch_holding_work_the_pr_never_saw() {
+        // The dangerous neighbour: the tip is not reachable from the merged
+        // head because the branch gained a commit of its own afterwards. That
+        // commit is exactly what the gate exists to protect.
+        let pr = repo_with_a_squashed_pr("merge-gate-tip-ahead");
+        std::fs::write(pr.checkout.join("later.txt"), "unmerged\n").unwrap();
+        run_git(&pr.checkout, &["add", "later.txt"]);
+        run_git(
+            &pr.checkout,
+            &["commit", "--quiet", "-m", "after the merge"],
+        );
+        let ahead = head_oid_of(&pr.checkout);
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&ahead)
+            ),
+            None,
+            "a commit the PR never merged must keep the branch"
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_keeps_a_branch_advanced_by_the_default_branch() {
+        // Merging the default branch back INTO a finished branch also moves
+        // the tip off the merged head. The merge commit is on no other ref and
+        // can carry conflict resolutions of its own, so reachability declines
+        // to call it free — deliberately fail-closed rather than reasoning
+        // about content (#321).
+        let pr = repo_with_a_squashed_pr("merge-gate-tip-remerged");
+        run_git(
+            &pr.checkout,
+            &["merge", "--quiet", "--no-edit", &pr.default],
+        );
+        let remerged = head_oid_of(&pr.checkout);
+        assert_ne!(remerged, pr.merged_head);
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&remerged),
+            ),
+            None
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_reads_an_exact_tip_the_way_it_always_did() {
+        let pr = repo_with_a_squashed_pr("merge-gate-exact-tip");
+
+        // The common case must keep saying exactly what it said before, with
+        // no mention of containment.
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&pr.merged_head),
+            ),
+            Some("PR #7 merged".to_string())
+        );
+        // A PR with no number still reports, just without one.
+        let numberless =
+            serde_json::json!({ "state": "MERGED", "headRefOid": pr.merged_head.clone() });
+        assert_eq!(
+            merged_pr_evidence(&numberless, &pr.root(), Some(&pr.merged_head)),
+            Some("PR merged".to_string())
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_ignores_a_pr_that_is_not_merged() {
+        // State outranks the tips: an open PR at the exact head is not
+        // evidence of anything.
+        let pr = repo_with_a_squashed_pr("merge-gate-open-pr");
+        let open = serde_json::json!({ "state": "OPEN", "number": 7, "headRefOid": pr.merged_head.clone() });
+
+        assert_eq!(
+            merged_pr_evidence(&open, &pr.root(), Some(&pr.merged_head)),
+            None
+        );
+        assert_eq!(
+            merged_pr_evidence(&open, &pr.root(), Some(&pr.stale_tip)),
+            None
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn commit_is_ancestor_of_keeps_the_branch_when_git_cannot_answer() {
+        // Same contract as every other source: only a readable answer counts,
+        // because the accepting answer is the one that deletes a branch.
+        let pr = repo_with_a_squashed_pr("merge-gate-ancestor-unreadable");
+        let root = pr.root();
+
+        assert!(
+            commit_is_ancestor_of(&root, &pr.stale_tip, &pr.merged_head),
+            "the fixture's stale tip really is an ancestor"
+        );
+        assert!(
+            !commit_is_ancestor_of(&root, &pr.merged_head, &pr.stale_tip),
+            "and the relation is not symmetric"
+        );
+        assert!(
+            !commit_is_ancestor_of(
+                &root,
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                &pr.stale_tip
+            ),
+            "an oid this clone does not have is not evidence"
+        );
+        assert!(
+            !commit_is_ancestor_of("/no/such/repo/path", &pr.stale_tip, &pr.merged_head),
+            "an unreadable repo is not evidence"
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn probe_kill_targets_names_the_dirty_files_and_counts_unpushed_commits() {
+        // #325: the dialog authorises a destructive act, so the account has to
+        // be a list of paths, not a boolean.
+        let repo = create_committed_repo("kill-probe");
+        let checkout = unique_temp_path("kill-probe-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/probe",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        // Clean, and every commit is on the (remote-less) default branch's
+        // history — but with no remotes at all, nothing is "pushed".
+        let clean = probe_kill_targets(&checkout, Some("feature/probe"));
+        assert_eq!(clean.dirty.as_deref(), Some(&[][..]));
+
+        std::fs::write(checkout.join("tracked.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "tracked.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "a commit"]);
+        std::fs::write(checkout.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::create_dir_all(checkout.join("scratch")).unwrap();
+        std::fs::write(checkout.join("scratch/untracked.txt"), "x\n").unwrap();
+
+        let probe = probe_kill_targets(&checkout, Some("feature/probe"));
+        let dirty = probe
+            .dirty
+            .clone()
+            .expect("a readable checkout reports its state");
+        assert!(
+            dirty.iter().any(|line| line.contains("tracked.txt")),
+            "{dirty:?}"
+        );
+        // `-uall` lists the file, not the directory: "one untracked directory"
+        // is exactly the summary that hides how much is about to go.
+        assert!(
+            dirty
+                .iter()
+                .any(|line| line.contains("scratch/untracked.txt")),
+            "{dirty:?}"
+        );
+        assert_eq!(
+            probe.unpushed,
+            Some(2),
+            "no remote holds either commit of this branch"
+        );
+        assert!(probe.has_stakes());
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn probe_kill_targets_reports_unknown_rather_than_clean() {
+        // An unreadable checkout must not render as "nothing to lose" — the
+        // caller distinguishes the two, and this is where that starts.
+        let missing = unique_temp_path("kill-probe-missing");
+        let probe = probe_kill_targets(&missing, Some("feature/gone"));
+        assert_eq!(probe.dirty, None);
+        assert_eq!(probe.unpushed, None);
+        assert!(
+            probe.has_stakes(),
+            "unknown counts as stakes — it is the reading that makes the user check"
+        );
+
+        // No branch at all (a detached checkout) leaves the count unknown too,
+        // rather than claiming zero.
+        let repo = create_committed_repo("kill-probe-detached");
+        assert_eq!(probe_kill_targets(&repo, None).unpushed, None);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

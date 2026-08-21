@@ -26,6 +26,10 @@ pub struct WorktreeKillGateResult {
     /// out)" note so the checkout-only fallback reads as intentional, not a
     /// genuine "no merge evidence" verdict.
     pub timed_out: bool,
+    /// What the kill would destroy beyond the checkout (#325). `None` from the
+    /// fleet sweep, which shares this event but would pay the probe once per
+    /// row for a summary it does not render.
+    pub probe: Option<crate::worktree::KillProbe>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

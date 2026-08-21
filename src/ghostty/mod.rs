@@ -499,9 +499,6 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<DecodedPng> {
         png::ColorType::Rgba => frame.to_vec(),
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity((info.width as usize) * (info.height as usize) * 4);
-            // `as_chunks` over `chunks_exact`: the array length is in the
-            // type, so the indexing below is bounds-checked once at compile
-            // time instead of per pixel.
             for &[r, g, b] in frame.as_chunks::<3>().0 {
                 out.extend_from_slice(&[r, g, b, 255]);
             }
