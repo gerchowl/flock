@@ -930,6 +930,16 @@ pub struct NewLinkedWorktreeRequest {
     pub base: Option<String>,
 }
 
+/// The kill dialog's focusable controls (#326), in the order they read on
+/// screen. `Force` only exists once the probe has landed (#325), which is why
+/// focus is stored as this enum rather than an index into a list that grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveWorktreeControl {
+    Force,
+    Remove,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRemoveState {
     /// False when the checkout was adopted ad hoc (not a flock-managed
@@ -960,6 +970,10 @@ pub struct WorktreeRemoveState {
     /// the kill flow keeps it and the dialog says so — even in the "& branch"
     /// path. Set when the merge gate resolves (#121).
     pub branch_protected: bool,
+    /// Which control has keyboard focus (#326). Defaults to `Remove`, so bare
+    /// Enter keeps meaning what it has always meant here — the focus model is
+    /// additive, and nothing changes until an arrow or Tab is pressed.
+    pub focus: RemoveWorktreeControl,
     /// The merge gate timed out (#119): the checkout-only fallback is shown
     /// with an "unknown (timed out)" note rather than "no merge evidence".
     pub gate_timed_out: bool,
