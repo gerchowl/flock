@@ -3139,6 +3139,24 @@ pub(crate) fn peer_push_consumed(peer: &str) {
     );
 }
 
+/// A pushed summary was discarded for being too old to answer a poll (#4).
+///
+/// The event a "peer row is stale" report needs: it says the hub had a push in
+/// hand, judged it expired, and went to the wire instead. Its ABSENCE while
+/// rows look stale is equally informative — it means the pushes being consumed
+/// were fresh, and the staleness is somewhere else.
+pub(crate) fn peer_push_expired(peer: &str, age_secs: u64) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.push.expired",
+        subsystem = "peers",
+        outcome = "discarded",
+        peer,
+        age_secs,
+        "pushed summary too old to answer this poll; fetching live"
+    );
+}
+
 /// A held connection ended. Says which peer and why, so a fleet that quietly
 /// degraded to one-shot polling is diagnosable rather than merely slower.
 pub(crate) fn peer_stream_closed(peer: &str, err: &str, backoff_secs: u64) {

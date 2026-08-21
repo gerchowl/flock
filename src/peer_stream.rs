@@ -68,7 +68,12 @@ struct PeerStream {
     /// Latest unsolicited summary the peer pushed. One slot, not a queue:
     /// the payload is a snapshot, so an older push carries nothing the newer
     /// one does not already say and queueing them would only serve staleness.
-    latest_push: Arc<Mutex<Option<String>>>,
+    /// The newest unconsumed push, with the instant it ARRIVED.
+    ///
+    /// The timestamp is load-bearing, not diagnostic: a push answers a poll in
+    /// place of a live request, so an old one in this slot actively SUPPRESSES
+    /// the fetch that would have refreshed everything it cannot carry (#4).
+    latest_push: Arc<Mutex<Option<(std::time::Instant, String)>>>,
 }
 
 /// Whether a relay line is an unsolicited push rather than a response.
@@ -98,7 +103,7 @@ fn line_is_push(line: &str) -> bool {
 fn route_relay_lines<R: BufRead>(
     reader: R,
     responses: &std::sync::mpsc::Sender<String>,
-    push_slot: &Arc<Mutex<Option<String>>>,
+    push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
 ) {
     for line in reader.lines().map_while(Result::ok) {
         // A push carries `push` where a response carries `id`, so routing
@@ -108,7 +113,7 @@ fn route_relay_lines<R: BufRead>(
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
             if let Ok(mut slot) = push_slot.lock() {
-                *slot = Some(line);
+                *slot = Some((std::time::Instant::now(), line));
             }
             continue;
         }
@@ -296,12 +301,30 @@ pub fn request(
     }
 }
 
-/// Take the freshest summary this peer pushed, if any.
+/// How old a pushed summary may be and still answer a poll (#4).
+///
+/// A push does not merely arrive early — it REPLACES the request that poll
+/// would otherwise have made. Everything a push cannot carry because nothing
+/// generated an event for it, cpu and memory above all, therefore stops
+/// refreshing for as long as a push keeps pre-empting the fetch. On a busy peer
+/// that is every poll, forever, which is exactly the "system stats are stale"
+/// half of the report.
+///
+/// Well under the poll interval, so a stale push costs one fresh request rather
+/// than a whole cycle, and comfortably above the push debounce, so a push
+/// emitted for a real change is still used for the change it was emitted for.
+const MAX_PUSH_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the freshest summary this peer pushed, if it is still current.
 ///
 /// Consuming rather than peeking: a summary answers exactly one poll, and
 /// leaving it in place would let a peer that has gone quiet keep answering
 /// with a snapshot that is no longer current. An empty slot falls through to
 /// an ordinary request, so a silent peer is still polled at its usual cadence.
+///
+/// A push past [`MAX_PUSH_AGE`] is DISCARDED rather than returned — taken out
+/// of the slot either way, because leaving it would have the next poll re-judge
+/// the same expired snapshot instead of getting on with a live request.
 pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
     let slot = {
         let registry = registry().lock().ok()?;
@@ -310,7 +333,12 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
     let mut slot = slot.lock().ok()?;
     let stream = slot.stream.as_mut()?;
     let mut push = stream.latest_push.lock().ok()?;
-    push.take()
+    let (arrived, payload) = push.take()?;
+    if arrived.elapsed() > MAX_PUSH_AGE {
+        crate::logging::peer_push_expired(&peer.name, arrived.elapsed().as_secs());
+        return None;
+    }
+    Some(payload)
 }
 
 /// Drop connections invalidated by a config reload.
@@ -414,7 +442,8 @@ mod tests {
         use std::io::Cursor;
 
         let (tx, responses) = std::sync::mpsc::channel();
-        let push_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
+            Arc::new(Mutex::new(None));
 
         // As the relay would emit it: a push lands between the two responses,
         // and one of the responses mentions `push` in its payload.
@@ -446,9 +475,42 @@ mod tests {
 
         let pushed = push_slot.lock().expect("push slot").take();
         assert_eq!(
-            pushed.as_deref(),
+            pushed.as_ref().map(|(_, line)| line.as_str()),
             Some(r#"{"push":"peers.summary","result":{"host":"anvil"}}"#),
             "the push is delivered exactly once, to the push slot"
+        );
+    }
+
+    /// #4: a push does not merely arrive early, it REPLACES the request the
+    /// poll would have made — so an expired one must not be handed back, or
+    /// everything a push cannot carry (cpu, memory: nothing emits an event for
+    /// them) stops refreshing for as long as pushes keep pre-empting the fetch.
+    #[test]
+    fn an_expired_push_is_discarded_rather_than_answering_a_poll() {
+        let fresh = std::time::Instant::now();
+        let expired = fresh
+            .checked_sub(MAX_PUSH_AGE + std::time::Duration::from_secs(1))
+            .expect("a monotonic clock far enough from its origin");
+
+        assert!(
+            fresh.elapsed() <= MAX_PUSH_AGE,
+            "a just-arrived push answers the poll it was emitted for"
+        );
+        assert!(
+            expired.elapsed() > MAX_PUSH_AGE,
+            "one older than the budget must not"
+        );
+
+        // The budget has to sit between the two cadences it mediates, or it is
+        // either useless (never expires) or destroys the feature (always does).
+        assert!(
+            MAX_PUSH_AGE < std::time::Duration::from_secs(crate::peers::PEER_POLL_INTERVAL_SECS),
+            "an expiry at or past the poll interval never fires"
+        );
+        assert!(
+            MAX_PUSH_AGE > std::time::Duration::from_secs(1),
+            "an expiry at the push debounce would discard pushes emitted for a \
+             real change before they could ever be used"
         );
     }
 
@@ -461,7 +523,8 @@ mod tests {
         use std::io::Cursor;
 
         let (tx, responses) = std::sync::mpsc::channel();
-        let push_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
+            Arc::new(Mutex::new(None));
 
         route_relay_lines(
             Cursor::new("ssh: connect to host anvil port 22: \"push\"\n"),
