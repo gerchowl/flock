@@ -224,7 +224,8 @@ pub struct ChecksNamedTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChecksListEntry {
     pub name: String,
-    /// One of `script`, `blocked_alert`, `hibernation`, `issue_guard`.
+    /// One of `script`, `cron`, `blocked_alert`, `hibernation`,
+    /// `issue_guard`, `reap`.
     pub kind: String,
     /// `enabled` / `disabled` / `errored` — a coarse human-readable state.
     pub state: String,
@@ -234,6 +235,53 @@ pub struct ChecksListEntry {
     /// Last outcome string (`fire` / `pass` / `error`) or `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<String>,
+    /// Next scheduled fire, unix wall-clock ms (#330). Present for scripts
+    /// and crons; absent for built-ins, which are folded on the App tick
+    /// rather than scheduled against a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_ms: Option<u64>,
+    /// Most recent fire, unix wall-clock ms (#330). Crons only — see
+    /// `CheckListEntry::last_fire_wall_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire_ms: Option<u64>,
+    /// Slots skipped by the most recent asleep-collapse (crons only).
+    /// Omitted when zero so a quiet row stays quiet. A floor rather than an
+    /// exact count — the runner stops counting at its collapse cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_fires: Option<u32>,
+    /// The enrolled cron expression, echoed so a client can tell WHICH
+    /// schedule a named cron is actually running on (#330).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_expr: Option<String>,
+    /// `local` or `utc` — the tz the expression's fields are read in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_tz: Option<String>,
+    /// Cadence in seconds for built-ins that poll on a fixed period
+    /// (`issue_guard`, `reap`). Absent where it does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_secs: Option<u64>,
+}
+
+impl ChecksListEntry {
+    /// A built-in row with every scheduler-specific field empty. Built-ins
+    /// are folded on the App tick rather than enrolled in the runner, so
+    /// debounce counters and cron fields do not apply; callers override the
+    /// handful that do via struct-update syntax.
+    pub fn builtin() -> Self {
+        Self {
+            name: String::new(),
+            kind: String::new(),
+            state: String::new(),
+            consecutive_fails: None,
+            last_outcome: None,
+            next_fire_ms: None,
+            last_fire_ms: None,
+            missed_fires: None,
+            cron_expr: None,
+            cron_tz: None,
+            cadence_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

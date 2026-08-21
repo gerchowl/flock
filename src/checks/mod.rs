@@ -19,6 +19,7 @@ pub(crate) use blocked_alert::{
     BLOCKED_ALERT_CHECK_NAME,
 };
 pub(crate) use config::{ActionSpec, ChecksConfig};
+pub(crate) use cron::CronTz;
 pub(crate) use hibernation::{HibernationFold, HibernationPaneSnapshot, HIBERNATION_CHECK_NAME};
 pub(crate) use issue_guard::{
     GhIssue, IssueGuardFold, IssueGuardOutcome, TriggerBlock, ISSUE_GUARD_CHECK_NAME,
