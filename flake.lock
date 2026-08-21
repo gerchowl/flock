@@ -27,11 +27,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1786756642,
-        "narHash": "sha256-w9W9F9oZRMmRcNRNZULBvb9+BorZPIL4+u3Cii80HNQ=",
+        "lastModified": 1787144056,
+        "narHash": "sha256-xPN+/bXHsGB3PWN0eCzf/TciwqTc7XXSqZu2zK6T+yM=",
         "owner": "gerchowl",
         "repo": "guardrails",
-        "rev": "1b2387ccd08ae9555b3b11f2bb010b30e52161e5",
+        "rev": "7265f706cffb27e45491309e6c14352515063704",
         "type": "github"
       },
       "original": {

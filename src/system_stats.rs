@@ -244,6 +244,7 @@ impl ThermalSampler {
         let command = self.command.as_deref()?;
         let output = crate::process::TracedCommand::new("sh", "stats")
             .args(["-c", command])
+            .periodic()
             .output_traced_with_timeout(THERMAL_TIMEOUT)
             .ok()?;
         if !output.status.success() {
@@ -275,6 +276,7 @@ fn read_battery() -> (Option<u8>, Option<bool>) {
     }
     let Ok(output) = crate::process::TracedCommand::new("pmset", "stats")
         .args(["-g", "batt"])
+        .periodic()
         .output_traced_with_timeout(SAMPLER_EXEC_TIMEOUT)
     else {
         return (None, None);
@@ -302,6 +304,7 @@ fn read_gpu_percent() -> Option<u8> {
     }
     let output = crate::process::TracedCommand::new("ioreg", "stats")
         .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
+        .periodic()
         .output_traced_with_timeout(SAMPLER_EXEC_TIMEOUT)
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
