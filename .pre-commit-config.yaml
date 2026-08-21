@@ -130,6 +130,15 @@ repos:
         language: system
         stages: [pre-push]
         pass_filenames: false
+      # Level-vs-frequency, measured. Skips cleanly when logs/flock-session.jsonl
+      # is absent (the sample is generated, not committed) — run
+      # `just log-budget` to capture one and gate it for real.
+      - id: log-budget
+        name: "log noise/silence vs log-budgets.toml"
+        entry: guardrails-log-budget
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
 
       # --- commit message ------------------------------------------------------
       - id: conventional-commits

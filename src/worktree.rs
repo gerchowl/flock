@@ -239,8 +239,34 @@ fn run_command_capture(
     args: &[&str],
     cwd: Option<&std::path::Path>,
 ) -> Result<String, String> {
+    run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Lifecycle)
+}
+
+/// `run_command_capture` for a caller a TIMER reaches (#318).
+///
+/// Split out rather than adding a parameter to thirty user-driven call sites:
+/// the overwhelming majority of this module's git invocations are one-shot
+/// answers to a keypress, and their INFO is the audit trail. Only the poll
+/// path needs the demotion, so only the poll path names it.
+fn run_command_capture_periodic(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
+    run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Periodic)
+}
+
+fn run_command_capture_with_cadence(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    cadence: crate::process::ExecCadence,
+) -> Result<String, String> {
     let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
+    if cadence == crate::process::ExecCadence::Periodic {
+        command.periodic();
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -674,7 +700,10 @@ pub(crate) fn parse_pr_state_fields(
 /// session — a repo's origin does not move under us.
 pub(crate) fn github_repo_for_root(repo_root: &std::path::Path) -> Option<String> {
     let root = repo_root.to_string_lossy().to_string();
-    run_command_capture("git", &["-C", &root, "remote", "get-url", "origin"], None)
+    // Periodic: the PR poller reaches this once per repo per round, forever.
+    // A remote that is not GitHub answers the same way every time, so at
+    // Lifecycle level it wrote one INFO per repo per tick for no new fact.
+    run_command_capture_periodic("git", &["-C", &root, "remote", "get-url", "origin"], None)
         .ok()
         .as_deref()
         .and_then(github_repo_from_remote_url)

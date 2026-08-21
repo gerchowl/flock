@@ -2060,6 +2060,11 @@ async fn run_client_loop(
                             let target = slots::SlotTarget::from_key(&ssh_target);
                             match manager.flip_to(&target) {
                                 Ok(Some((new_writer, new_reader_src))) => {
+                                    // Read before the flip: `apply_slot_flip`
+                                    // overwrites `active_slot_key` in place, so
+                                    // the "from" side of the switch is only
+                                    // available here.
+                                    let previous_slot_key = active_slot_key.clone();
                                     // Warm flip: apply in-process.
                                     apply_slot_flip(
                                         new_writer,
@@ -2074,6 +2079,16 @@ async fn run_client_loop(
                                         max_frame_size,
                                         focus_workspace.as_deref(),
                                     )?;
+                                    // #318: the happy-path INFO. Emitted at
+                                    // the flip, not at the next paint, so a
+                                    // switch that lands but never repaints is
+                                    // still bracketed in the log.
+                                    crate::logging::client_slot_flipped(
+                                        &previous_slot_key,
+                                        &active_slot_key,
+                                        false,
+                                        switch_received.elapsed().as_millis() as u64,
+                                    );
                                     switch_timing =
                                         Some((switch_received, slot_display_label(&target), true));
                                     // PopupGuard invariant: if a switch was in
@@ -2336,6 +2351,9 @@ async fn run_client_loop(
                                 pending_switch = None;
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
+                                // See the warm arm: captured before the flip
+                                // rewrites `active_slot_key`.
+                                let previous_slot_key = active_slot_key.clone();
                                 apply_slot_flip(
                                     new_writer,
                                     new_reader_src,
@@ -2351,6 +2369,16 @@ async fn run_client_loop(
                                 )?;
                                 // #43: cold-dial switch — time from request to next paint.
                                 if let Some((t0, to)) = cold_timing {
+                                    // #318: `cold=true` — this one paid ssh
+                                    // connect + handshake, so its elapsed_ms
+                                    // belongs in a different population from a
+                                    // warm flip's.
+                                    crate::logging::client_slot_flipped(
+                                        &previous_slot_key,
+                                        &active_slot_key,
+                                        true,
+                                        t0.elapsed().as_millis() as u64,
+                                    );
                                     switch_timing = Some((t0, to, false));
                                 }
                             }
@@ -2447,9 +2475,22 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Render-loop heartbeat (#176), coarse cadence: a live loop
                 // stamps flock-client.log every HEARTBEAT_INTERVAL, so a freeze
-                // localizes to the gap after the last tick.
+                // localizes to the gap after the last tick. The tick itself is
+                // DEBUG (#318 — it was 99% of the log at INFO); the liveness
+                // signal that survives a default-level tail is the LATE tick
+                // below, which reports a stall instead of requiring a reader to
+                // infer one from missing beacons.
                 let now = Instant::now();
                 if last_heartbeat.is_none_or(|at| now.duration_since(at) >= HEARTBEAT_INTERVAL) {
+                    if let Some(previous) = last_heartbeat {
+                        let age = now.duration_since(previous);
+                        if age >= STALLED_TICK_THRESHOLD {
+                            crate::logging::client_render_loop_stalled(
+                                &active_slot_key,
+                                age.as_millis() as u64,
+                            );
+                        }
+                    }
                     crate::logging::client_tick(&active_slot_key);
                     last_heartbeat = Some(now);
                 }
@@ -2766,6 +2807,16 @@ const POPUP_REPAINT_INTERVAL: Duration = Duration::from_millis(220);
 /// needs to prove it isn't wedged, and a per-frame log would flood the file. A
 /// freeze then reads as a gap larger than this after the last `client.tick`.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How late a heartbeat has to be before it is reported as a stall (#318).
+///
+/// Three times the cadence, not a hair over it: the Timer arm shares the loop
+/// with input, frames and slot events, so a tick landing a few hundred ms late
+/// under a burst of paint work is ORDINARY and must not cry wolf — a WARN that
+/// fires on healthy load is the same triage-destroying noise this replaced.
+/// At 15s the loop has missed two whole beats, which no amount of ordinary
+/// scheduling jitter explains.
+const STALLED_TICK_THRESHOLD: Duration = Duration::from_secs(15);
 
 /// What the loop should do with a gen-stamped dial outcome event (#93).
 /// Pure function so the cancel/re-switch race table is unit-testable.

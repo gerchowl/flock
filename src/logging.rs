@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -806,28 +807,111 @@ pub(crate) fn remote_install_declined(target: &str, dest: &str) {
 // One traced funnel: every external process flock spawns emits its command
 // line here so the "what did flock actually run?" question is answerable from
 // the log tail. `src/process.rs` owns the invocation sites; this facade owns
-// the schema. Non-zero exit is WARN (a caller's story is broken), zero exit
-// is INFO (routine but audit-worthy), spawn failure is ERROR (the command
-// never ran — the loudest failure to surface).
+// the schema and the LEVEL rule.
+//
+// Level is a function of (cadence, outcome) — never outcome alone (#318).
+// Levelling on the exit code by itself is what made `process.exec` 98.9% of
+// flock-server.log: a 2s sampler exiting 0 forever wrote an INFO every 2s, and
+// a `gh` poll that had been failing since breakfast wrote 6,060 WARNs. Both
+// are per-iteration events wearing a lifecycle level. See `ExecCadence`.
+
+/// Last-reported status per periodic command, keyed `subsystem/program`.
+///
+/// This is what makes a periodic failure EDGE-triggered: a poll that fails
+/// forever is one WARN, not one per tick, and its recovery is the other edge.
+/// Bounded — periodic commands are a small fixed set, but `program` can be a
+/// caller-supplied path, so the map refuses to grow past a sane cap rather
+/// than becoming an unbounded leak on a pathological caller.
+static PERIODIC_LAST_STATUS: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+/// Distinct periodic commands tracked for edge detection. Real call sites
+/// number under a dozen; the cap only ever bites on a caller passing a
+/// varying program path, which then simply reports every run as an edge
+/// (loud, not silent — the safe direction to fail).
+const PERIODIC_TRACKED_MAX: usize = 64;
+
+/// Where one periodic run sits relative to that command's previous run.
+///
+/// `First` and `Changed` are kept apart deliberately. Both are "edges" for a
+/// FAILURE — an initial failure must be heard, so it is not folded into the
+/// quiet arm — but only `Changed` is a RECOVERY. Collapsing them would make
+/// every sampler announce "recovered" on the first tick after startup, which
+/// is a fresh flavour of the noise this is here to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodicEdge {
+    /// Nothing on record for this command yet.
+    First,
+    /// The status string differs from the previous run: failure→success
+    /// recovery, success→failure onset, or one failure mode replacing another
+    /// (exit 1 → exit 128).
+    Changed,
+    /// Same status as last tick. The steady state, and the arm that has to
+    /// stay quiet for any of this to be worth doing.
+    Same,
+}
+
+fn periodic_edge(subsystem: &str, program: &str, status: &str) -> PeriodicEdge {
+    let key = format!("{subsystem}/{program}");
+    let map = PERIODIC_LAST_STATUS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = map.lock() else {
+        // A poisoned lock must not silence the tail. `Changed` is the loud
+        // side of both arms, so a failure still WARNs; the cost is a spurious
+        // "recovered" INFO on a success, which is the cheaper wrong answer.
+        return PeriodicEdge::Changed;
+    };
+    match map.get(&key) {
+        Some(previous) if previous == status => PeriodicEdge::Same,
+        Some(_) => {
+            map.insert(key, status.to_string());
+            PeriodicEdge::Changed
+        }
+        None => {
+            if map.len() < PERIODIC_TRACKED_MAX {
+                map.insert(key, status.to_string());
+            }
+            PeriodicEdge::First
+        }
+    }
+}
 
 /// A child process finished. `status` is `None` if the wrapper never got a
 /// `Wait`ed status (currently unused: `output`/`status` always yield one).
-/// The exit-code component drives level selection so a caller's non-zero exit
-/// lands at WARN in the tail without extra ceremony at the call site.
+///
+/// `cadence` is the call site's declaration of how often this runs, and it —
+/// not the exit code alone — selects the level:
+///
+/// | cadence   | exit 0                      | non-zero                       |
+/// |-----------|-----------------------------|--------------------------------|
+/// | Lifecycle | INFO `ok`                   | WARN `error`                   |
+/// | Periodic  | DEBUG `ok`; INFO `recovered`| WARN `error` on the first tick |
+/// |           | when the previous run FAILED| and on a change; else DEBUG    |
 pub(crate) fn process_exec_completed(
     subsystem: &'static str,
     program: &str,
     args: &str,
     status: Option<std::process::ExitStatus>,
     duration_ms: u64,
+    cadence: crate::process::ExecCadence,
 ) {
     let event = "process.exec";
     let code = status.and_then(|s| s.code());
     let status_str = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".into());
-    if code == Some(0) {
-        tracing::info!(
+    let periodic = cadence == crate::process::ExecCadence::Periodic;
+    // One lookup, before the branches: the edge must be RECORDED on every
+    // periodic run, including the quiet ones, or the next run re-reports the
+    // same status as fresh and the fire hose comes straight back.
+    let edge = periodic.then(|| periodic_edge(subsystem, program, &status_str));
+    let recovered = edge == Some(PeriodicEdge::Changed);
+    let new_failure = matches!(
+        edge,
+        Some(PeriodicEdge::First) | Some(PeriodicEdge::Changed)
+    );
+    match (code == Some(0), periodic, recovered, new_failure) {
+        // One-shot success: routine but audit-worthy.
+        (true, false, _, _) => tracing::info!(
             event,
             subsystem,
             outcome = "ok",
@@ -836,9 +920,33 @@ pub(crate) fn process_exec_completed(
             status = status_str,
             duration_ms,
             "process exec completed"
-        );
-    } else {
-        tracing::warn!(
+        ),
+        // A periodic command that had been failing is working again. Low
+        // frequency by construction (it fires once per outage), so INFO.
+        (true, true, true, _) => tracing::info!(
+            event,
+            subsystem,
+            outcome = "recovered",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec recovered"
+        ),
+        // The steady state of every sampler and poller flock runs.
+        (true, true, false, _) => tracing::debug!(
+            event,
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec completed"
+        ),
+        // A failure that is NEW: a one-shot's, or a periodic command's first
+        // tick in this failure mode. This is the line worth waking up for.
+        (false, false, _, _) | (false, true, _, true) => tracing::warn!(
             event,
             subsystem,
             outcome = "error",
@@ -847,7 +955,20 @@ pub(crate) fn process_exec_completed(
             status = status_str,
             duration_ms,
             "process exec exited non-zero"
-        );
+        ),
+        // Still failing the same way it was last tick. The WARN above already
+        // said so; repeating it per-iteration is what makes `grep WARN`
+        // useless (#318, #319).
+        (false, true, _, false) => tracing::debug!(
+            event,
+            subsystem,
+            outcome = "error",
+            program,
+            args,
+            status = status_str,
+            duration_ms,
+            "process exec still failing"
+        ),
     }
 }
 
@@ -867,17 +988,36 @@ pub(crate) fn process_exec_failed(subsystem: &'static str, program: &str, args: 
 
 /// A child process was spawned (fire-and-follow: the caller wires up its own
 /// wait/kill semantics). The child's later exit is the caller's event, not
-/// this facade's.
-pub(crate) fn process_spawned(subsystem: &'static str, program: &str, args: &str, pid: u32) {
-    tracing::info!(
-        event = "process.spawn",
-        subsystem,
-        outcome = "ok",
-        program,
-        args,
-        pid,
-        "process spawned"
-    );
+/// this facade's. A spawn on a timer is per-iteration and lands at DEBUG for
+/// the same reason its completion does.
+pub(crate) fn process_spawned(
+    subsystem: &'static str,
+    program: &str,
+    args: &str,
+    pid: u32,
+    cadence: crate::process::ExecCadence,
+) {
+    if cadence == crate::process::ExecCadence::Periodic {
+        tracing::debug!(
+            event = "process.spawn",
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            pid,
+            "process spawned"
+        );
+    } else {
+        tracing::info!(
+            event = "process.spawn",
+            subsystem,
+            outcome = "ok",
+            program,
+            args,
+            pid,
+            "process spawned"
+        );
+    }
 }
 
 /// `Command::spawn` refused: the program isn't executable, isn't on PATH, or
@@ -2350,13 +2490,70 @@ pub(crate) fn client_slot_flip_failed(target: &str, err: &str) {
 /// silence (a frozen loop cannot log, so absence of ticks localizes the freeze).
 /// `active_slot` names the slot currently driving input, so a hang is
 /// attributable to the peer the loop was serving.
+///
+/// DEBUG, not INFO (#318): this is the definition of a per-iteration event and
+/// at INFO it was 93-99% of every client log we have ever captured. The
+/// liveness property it existed for does NOT depend on the level — it depends
+/// on someone READING the stream and noticing a gap, which is exactly the
+/// weakness [`client_render_loop_stalled`] removes by firing on its own.
 pub(crate) fn client_tick(active_slot: &str) {
-    tracing::info!(
+    tracing::debug!(
         event = "client.tick",
         subsystem = "client",
         outcome = "alive",
         active_slot,
         "client render loop heartbeat"
+    );
+}
+
+/// The render loop went quiet for materially longer than its tick cadence and
+/// has just come back (#318).
+///
+/// This is the heartbeat's liveness property, inverted and made self-reporting.
+/// A beacon at INFO only proves a freeze to someone tailing the log at the
+/// time; a WARN on the LATE tick is a positive assertion that the loop stalled,
+/// so it survives `grep WARN` on a log nobody was watching. `tick_age_ms` is
+/// the measured gap and `active_slot` names the peer the loop was serving when
+/// it wedged — the pair that makes a stall attributable (#43, #282).
+///
+/// Only the recovered case can report: a loop that never comes back logs
+/// nothing at all, and the bounded gap after the last DEBUG tick remains the
+/// evidence for that.
+pub(crate) fn client_render_loop_stalled(active_slot: &str, tick_age_ms: u64) {
+    tracing::warn!(
+        event = "client.tick",
+        subsystem = "client",
+        outcome = "stalled",
+        active_slot,
+        tick_age_ms,
+        "client render loop tick was late"
+    );
+}
+
+/// A server switch completed: the client is now driving `to` instead of
+/// `from` (#318).
+///
+/// The load-bearing event the client log did not have. Every other member of
+/// the `client_slot_*` family reports a FAILURE or a background step; the
+/// single most common user operation — switching servers — emitted nothing at
+/// INFO, which is why a 5s connect→handshake stall was invisible in a default
+/// tail (#43, #282). One INFO per switch is by definition low-frequency: it
+/// takes a human keypress to produce one.
+///
+/// `cold` separates the two populations that share this path and have wildly
+/// different budgets: a warm flip is an in-process pointer swap, a cold dial
+/// pays ssh connect + handshake. Comparing `elapsed_ms` across the two without
+/// that flag would average a stall into noise.
+pub(crate) fn client_slot_flipped(from: &str, to: &str, cold: bool, elapsed_ms: u64) {
+    tracing::info!(
+        event = "client.slot.flipped",
+        subsystem = "client_slot",
+        outcome = "ok",
+        from,
+        to,
+        cold,
+        elapsed_ms,
+        "slot flip completed"
     );
 }
 
@@ -4427,6 +4624,55 @@ mod tests {
         assert!(out.contains("warm=true"), "{out}");
         assert!(out.contains("elapsed_ms=42"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    /// #318, the SILENCE half: the single most common user operation wrote
+    /// nothing at INFO, so a 5s connect→handshake stall during a switch was
+    /// unobservable in a default-level tail. `elapsed_ms` and `cold` are the
+    /// two fields that make it diagnosable (#43, #282) — without `cold` a warm
+    /// flip's sub-millisecond flip averages a cold dial's stall into noise.
+    #[test]
+    fn client_slot_flipped_is_the_happy_path_info_with_timing() {
+        let warm = capture_logs(|| client_slot_flipped("home", "sage", false, 3));
+        assert!(warm.contains("INFO"), "the happy path must be INFO: {warm}");
+        assert!(warm.contains("event=\"client.slot.flipped\""), "{warm}");
+        assert!(warm.contains("from=\"home\""), "{warm}");
+        assert!(warm.contains("to=\"sage\""), "{warm}");
+        assert!(warm.contains("cold=false"), "{warm}");
+        assert!(warm.contains("elapsed_ms=3"), "{warm}");
+
+        let cold = capture_logs(|| client_slot_flipped("sage", "home", true, 5050));
+        assert!(cold.contains("cold=true"), "{cold}");
+        assert!(cold.contains("elapsed_ms=5050"), "{cold}");
+    }
+
+    /// #318, the NOISE half. The tick was 93-99% of every client log we have
+    /// captured; the liveness property it existed for moves to a WARN that
+    /// fires on its own instead of requiring a reader to notice missing
+    /// beacons.
+    #[test]
+    fn tick_is_debug_but_a_late_tick_reports_the_stall_at_warn() {
+        let tick = capture_logs(|| client_tick("home"));
+        assert!(
+            tick.contains("DEBUG"),
+            "a per-iteration heartbeat is never INFO: {tick}"
+        );
+        assert!(tick.contains("event=\"client.tick\""), "{tick}");
+
+        let stalled = capture_logs(|| client_render_loop_stalled("sage", 21_000));
+        assert!(
+            stalled.contains("WARN"),
+            "a stall must survive `grep WARN`: {stalled}"
+        );
+        assert!(stalled.contains("outcome=\"stalled\""), "{stalled}");
+        assert!(
+            stalled.contains("tick_age_ms=21000"),
+            "the measured gap is the evidence: {stalled}"
+        );
+        assert!(
+            stalled.contains("active_slot=\"sage\""),
+            "a stall is attributable to the peer the loop was serving: {stalled}"
+        );
     }
 
     #[test]

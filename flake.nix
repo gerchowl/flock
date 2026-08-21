@@ -89,6 +89,7 @@
                   && guardrails-derived-docs . \
                   && guardrails-adr-matrix \
                   && env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim .github/workflows \
+                  && guardrails-log-budget \
                   && touch $out
               '';
           default = self.checks.${system}.flock;
