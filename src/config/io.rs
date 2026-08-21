@@ -6,6 +6,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "checks",
     "experimental",
+    "fleet",
     "gossip",
     "icon",
     "keys",
@@ -478,6 +479,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.checks = section,
+    );
+    load_live_section(
+        &table,
+        "fleet",
+        "fleet config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.fleet = section,
     );
     load_live_section(
         &table,

@@ -134,15 +134,80 @@ pub(super) fn table() -> &'static [Tool] {
         Tool {
             name: "flock_worktree_list",
             description: "List worktree checkouts and their branches. Feeds \
-                          the fork-vs-message decision: same repo ⇒ fork, \
-                          cross-repo ⇒ message.",
+                          the three-way spawn rule: same repo and you want \
+                          THIS conversation continued ⇒ `flock_agent_fork`; \
+                          same repo but a fresh conversation ⇒ \
+                          `flock_agent_spawn` with a returned `path`; \
+                          cross-repo ⇒ `flock_msg_send`.",
             input_schema: schema_no_args,
             build: build_worktree_list,
+        },
+        Tool {
+            name: "flock_agent_spawn",
+            description: "Start a FRESH agent in an existing checkout. Prefer \
+                          this over `flock_agent_fork` when the child does not \
+                          need your conversation: a fork copies your entire \
+                          transcript, so forking from a long session is \
+                          expensive and hands the child irrelevant context. \
+                          Refusals carry `data.refusal` and `data.retryable` \
+                          — do not retry when `retryable` is false.",
+            input_schema: schema_agent_spawn,
+            build: build_agent_spawn,
         },
     ]
 }
 
 // ---- Schemas -------------------------------------------------------------
+
+fn schema_agent_spawn() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent": {
+                "type": "string",
+                "enum": crate::spawn::AgentKind::supported(),
+                "description": "Which agent to launch. A closed set."
+            },
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+                "description": "The child's opening turn. Give it everything it needs — it does NOT inherit your context."
+            },
+            "location": {
+                "type": "object",
+                "description": "Where the child runs. Use a `path` from flock_worktree_list.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["worktree_path", "workspace_id"] },
+                    "path": { "type": "string" },
+                    "workspace_id": { "type": "string" }
+                },
+                "required": ["kind"]
+            },
+            "name": { "type": "string", "description": "Custom label for the child agent." }
+        },
+        "required": ["agent", "prompt", "location"],
+        "additionalProperties": false
+    })
+}
+
+fn build_agent_spawn(args: Value) -> Result<Method, McpError> {
+    let agent = required_string(&args, "agent")?;
+    let prompt = required_string(&args, "prompt")?;
+    let location = args
+        .get("location")
+        .ok_or_else(|| McpError::invalid_params("location is required"))?;
+    let location: crate::api::schema::SpawnLocation = serde_json::from_value(location.clone())
+        .map_err(|err| McpError::invalid_params(format!("invalid location: {err}")))?;
+    Ok(Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+        agent,
+        prompt,
+        location,
+        name: optional_string(&args, "name")?,
+        // An MCP-spawned child never steals the operator's focus.
+        focus: false,
+    }))
+}
 
 fn schema_no_args() -> Value {
     json!({
@@ -478,6 +543,7 @@ mod tests {
                 "flock_msg_read",
                 "flock_pane_read",
                 "flock_worktree_list",
+                "flock_agent_spawn",
             ]
         );
     }

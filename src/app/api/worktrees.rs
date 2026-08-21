@@ -1150,7 +1150,7 @@ impl App {
         })
     }
 
-    fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
+    pub(super) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
         self.state.workspaces.iter().position(|ws| {
