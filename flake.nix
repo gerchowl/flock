@@ -74,6 +74,11 @@
                 nativeBuildInputs = [
                   guardrails.packages.${system}.default
                   pkgs.gitMinimal
+                  # `log-budget` parses the sample and budgets file in python
+                  # (tomllib, so >=3.11). The sandbox has no interpreter of its
+                  # own, and the gate `exec`s straight into it — so without
+                  # this it dies 127 before it can even decide to skip.
+                  pkgs.python3
                 ];
               }
               ''
