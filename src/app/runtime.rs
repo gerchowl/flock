@@ -898,6 +898,10 @@ impl App {
         // Half-state gate FIRST. Any drift disables the reap for this
         // tick and (throttled) notifies.
         let verdict = crate::integration::verify_integration_manifest();
+        // Cache it before branching so `checks.list` reports the gate state
+        // on BOTH arms — a clean verdict is as much of an answer as a
+        // drifted one (#330).
+        self.reap_last_verdict = Some(format!("{verdict:?}"));
         if verdict != crate::integration::ManifestVerdict::Ok {
             let should_emit = self.reap_check.should_emit_drift(now);
             if should_emit {

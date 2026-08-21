@@ -2,6 +2,15 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// The `source` string Claude's hooks report themselves under.
+///
+/// One constant because the routing below keys on it and two independent
+/// stores are populated from it — `hook_authority` and
+/// `persisted_agent_session`. A mismatch between them is invisible until a
+/// feature silently reads the empty one, which is exactly how the
+/// prompt-history panel shipped dead (#328).
+pub const CLAUDE_HOOK_SOURCE: &str = "flock:claude";
+
 const MAX_SESSION_ID_LEN: usize = 512;
 const MAX_SESSION_PATH_LEN: usize = 4096;
 
@@ -83,7 +92,7 @@ pub fn normalize_claude_session_start_source(value: Option<String>) -> Option<St
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("flock:claude", "claude") | ("flock:codex", "codex") | ("flock:opencode", "opencode")
+        (CLAUDE_HOOK_SOURCE, "claude") | ("flock:codex", "codex") | ("flock:opencode", "opencode")
     )
 }
 
@@ -183,7 +192,7 @@ pub fn branch_plan(
             agent: agent.to_string(),
         });
     };
-    if source == "flock:claude" {
+    if source == CLAUDE_HOOK_SOURCE {
         plan.argv.push("--fork-session".into());
         Ok(plan)
     } else {

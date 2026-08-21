@@ -77,6 +77,7 @@ mod server_icons;
 mod session;
 mod sound;
 mod spawn;
+mod switch_progress;
 mod system_stats;
 mod terminal;
 mod terminal_notify;

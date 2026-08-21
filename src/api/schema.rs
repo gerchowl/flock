@@ -233,7 +233,8 @@ pub struct ChecksNamedTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChecksListEntry {
     pub name: String,
-    /// One of `script`, `blocked_alert`, `hibernation`, `issue_guard`.
+    /// One of `script`, `cron`, `blocked_alert`, `hibernation`,
+    /// `issue_guard`, `reap`.
     pub kind: String,
     /// `enabled` / `disabled` / `errored` — a coarse human-readable state.
     pub state: String,
@@ -243,6 +244,53 @@ pub struct ChecksListEntry {
     /// Last outcome string (`fire` / `pass` / `error`) or `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<String>,
+    /// Next scheduled fire, unix wall-clock ms (#330). Present for scripts
+    /// and crons; absent for built-ins, which are folded on the App tick
+    /// rather than scheduled against a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_ms: Option<u64>,
+    /// Most recent fire, unix wall-clock ms (#330). Crons only — see
+    /// `CheckListEntry::last_fire_wall_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire_ms: Option<u64>,
+    /// Slots skipped by the most recent asleep-collapse (crons only).
+    /// Omitted when zero so a quiet row stays quiet. A floor rather than an
+    /// exact count — the runner stops counting at its collapse cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_fires: Option<u32>,
+    /// The enrolled cron expression, echoed so a client can tell WHICH
+    /// schedule a named cron is actually running on (#330).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_expr: Option<String>,
+    /// `local` or `utc` — the tz the expression's fields are read in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_tz: Option<String>,
+    /// Cadence in seconds for built-ins that poll on a fixed period
+    /// (`issue_guard`, `reap`). Absent where it does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_secs: Option<u64>,
+}
+
+impl ChecksListEntry {
+    /// A built-in row with every scheduler-specific field empty. Built-ins
+    /// are folded on the App tick rather than enrolled in the runner, so
+    /// debounce counters and cron fields do not apply; callers override the
+    /// handful that do via struct-update syntax.
+    pub fn builtin() -> Self {
+        Self {
+            name: String::new(),
+            kind: String::new(),
+            state: String::new(),
+            consecutive_fails: None,
+            last_outcome: None,
+            next_fire_ms: None,
+            last_fire_ms: None,
+            missed_fires: None,
+            cron_expr: None,
+            cron_tz: None,
+            cadence_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1464,6 +1512,16 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// The fleet directory (#320): every agent this server can address,
+        /// local ones included, each stamped with the host it lives on.
+        ///
+        /// Separate from `agents` because it answers a different question.
+        /// `agents` describes the panes THIS server owns, in full. `fleet`
+        /// answers "who can I message, and by what name" — the only question
+        /// with an answer that is the same on every host. Empty on servers
+        /// older than #320, which is why it is `default`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fleet: Vec<FleetAgentInfo>,
     },
     Lineage {
         chain: Vec<LineageEdge>,
@@ -1695,6 +1753,44 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,
+}
+
+/// One row of the fleet directory: an agent's identity and where it currently
+/// lives — including agents on OTHER hosts (ADR-0008, #320).
+///
+/// Deliberately thin next to [`AgentInfo`]. A local agent is described by a
+/// live pane this server owns, so it can answer `revision`, `tab_id`, `cwd`,
+/// session details. A remote agent is a gossiped summary; inventing those
+/// fields for it would be fabricating detail this server does not have. So
+/// this carries only what addressing needs, and is the same shape whether the
+/// agent is here or three machines away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetAgentInfo {
+    /// The address. Fleet-global and restart-stable — the ONLY target shape
+    /// that means the same thing on every host, so this is what goes in a
+    /// `msg.send` `{"type":"agent"}` target.
+    pub agent_id: String,
+    /// Short host name of the server the agent lives on.
+    pub host: String,
+    /// Public pane id **on that host**. A routing detail, not an address:
+    /// meaningless as a `{"type":"pane"}` target unless `local` is true.
+    pub pane_id: String,
+    /// `true` when the agent is on the server that answered. Only these are
+    /// addressable by pane id; the rest need `agent_id`.
+    pub local: bool,
+    /// How this server REACHES that host: the `[[peers]]` name of the entry
+    /// the directory answered from. `None` when local, and also `None` for a
+    /// relayed entry we have no direct edge to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// Short agent label ("cc", "codex", …) where known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Operator-assigned agent name, local rows only — a name is a local
+    /// convenience and does not travel with the gossip summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub status: AgentStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

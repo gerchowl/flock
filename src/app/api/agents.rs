@@ -14,6 +14,10 @@ impl App {
             id,
             ResponseResult::AgentList {
                 agents: self.collect_agent_infos(),
+                // #320: the same call answers "who is here" and "who can I
+                // reach". A separate fleet verb would have been a second
+                // listing to keep in step with this one.
+                fleet: self.collect_fleet_agents(),
             },
         )
     }

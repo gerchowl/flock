@@ -2060,6 +2060,11 @@ async fn run_client_loop(
                             let target = slots::SlotTarget::from_key(&ssh_target);
                             match manager.flip_to(&target) {
                                 Ok(Some((new_writer, new_reader_src))) => {
+                                    // Read before the flip: `apply_slot_flip`
+                                    // overwrites `active_slot_key` in place, so
+                                    // the "from" side of the switch is only
+                                    // available here.
+                                    let previous_slot_key = active_slot_key.clone();
                                     // Warm flip: apply in-process.
                                     apply_slot_flip(
                                         new_writer,
@@ -2074,6 +2079,16 @@ async fn run_client_loop(
                                         max_frame_size,
                                         focus_workspace.as_deref(),
                                     )?;
+                                    // #318: the happy-path INFO. Emitted at
+                                    // the flip, not at the next paint, so a
+                                    // switch that lands but never repaints is
+                                    // still bracketed in the log.
+                                    crate::logging::client_slot_flipped(
+                                        &previous_slot_key,
+                                        &active_slot_key,
+                                        false,
+                                        switch_received.elapsed().as_millis() as u64,
+                                    );
                                     switch_timing =
                                         Some((switch_received, slot_display_label(&target), true));
                                     // PopupGuard invariant: if a switch was in
@@ -2336,6 +2351,9 @@ async fn run_client_loop(
                                 pending_switch = None;
                                 clear_switch_popup(&mut state);
                                 esc_grace_until = Some(Instant::now() + ESC_GRACE_AFTER_SUCCESS);
+                                // See the warm arm: captured before the flip
+                                // rewrites `active_slot_key`.
+                                let previous_slot_key = active_slot_key.clone();
                                 apply_slot_flip(
                                     new_writer,
                                     new_reader_src,
@@ -2351,6 +2369,16 @@ async fn run_client_loop(
                                 )?;
                                 // #43: cold-dial switch — time from request to next paint.
                                 if let Some((t0, to)) = cold_timing {
+                                    // #318: `cold=true` — this one paid ssh
+                                    // connect + handshake, so its elapsed_ms
+                                    // belongs in a different population from a
+                                    // warm flip's.
+                                    crate::logging::client_slot_flipped(
+                                        &previous_slot_key,
+                                        &active_slot_key,
+                                        true,
+                                        t0.elapsed().as_millis() as u64,
+                                    );
                                     switch_timing = Some((t0, to, false));
                                 }
                             }
@@ -2447,9 +2475,22 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Render-loop heartbeat (#176), coarse cadence: a live loop
                 // stamps flock-client.log every HEARTBEAT_INTERVAL, so a freeze
-                // localizes to the gap after the last tick.
+                // localizes to the gap after the last tick. The tick itself is
+                // DEBUG (#318 — it was 99% of the log at INFO); the liveness
+                // signal that survives a default-level tail is the LATE tick
+                // below, which reports a stall instead of requiring a reader to
+                // infer one from missing beacons.
                 let now = Instant::now();
                 if last_heartbeat.is_none_or(|at| now.duration_since(at) >= HEARTBEAT_INTERVAL) {
+                    if let Some(previous) = last_heartbeat {
+                        let age = now.duration_since(previous);
+                        if age >= STALLED_TICK_THRESHOLD {
+                            crate::logging::client_render_loop_stalled(
+                                &active_slot_key,
+                                age.as_millis() as u64,
+                            );
+                        }
+                    }
                     crate::logging::client_tick(&active_slot_key);
                     last_heartbeat = Some(now);
                 }
@@ -2767,6 +2808,16 @@ const POPUP_REPAINT_INTERVAL: Duration = Duration::from_millis(220);
 /// freeze then reads as a gap larger than this after the last `client.tick`.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How late a heartbeat has to be before it is reported as a stall (#318).
+///
+/// Three times the cadence, not a hair over it: the Timer arm shares the loop
+/// with input, frames and slot events, so a tick landing a few hundred ms late
+/// under a burst of paint work is ORDINARY and must not cry wolf — a WARN that
+/// fires on healthy load is the same triage-destroying noise this replaced.
+/// At 15s the loop has missed two whole beats, which no amount of ordinary
+/// scheduling jitter explains.
+const STALLED_TICK_THRESHOLD: Duration = Duration::from_secs(15);
+
 /// What the loop should do with a gen-stamped dial outcome event (#93).
 /// Pure function so the cancel/re-switch race table is unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2845,11 +2896,36 @@ const POPUP_CANCEL_BEAT: Duration = Duration::from_millis(600);
 /// box centered via the reported terminal size, cursor saved/restored so the
 /// underlying frame is never disturbed (the #72 show_status_line precedent).
 fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: Instant) {
+    let lines = popup_lines(pending, now);
+    let (border_ansi, text_ansi) = popup_tone_ansi(pending, now);
+    paint_centered_notice(
+        [lines[0].as_str(), lines[1].as_str()],
+        border_ansi,
+        text_ansi,
+        reported_size,
+    );
+}
+
+/// Draw a two-line centered box in plain raw ANSI, cursor saved/restored so
+/// whatever is underneath is never disturbed (the #72 `show_status_line`
+/// precedent).
+///
+/// Shared by the two switch surfaces, which draw the same box for the same
+/// reason but know completely different things: the slots client paints over a
+/// still-live frame, and the launcher paints over the PREVIOUS server's frozen
+/// held frame between legs (#282). Extracted rather than duplicated — a second
+/// copy of box geometry is how the two drift into looking like different
+/// features to the user.
+pub(crate) fn paint_centered_notice(
+    lines: [&str; 2],
+    border_ansi: &str,
+    text_ansi: &str,
+    reported_size: (u16, u16),
+) {
     let (cols, rows) = reported_size;
     if cols < 12 || rows < 6 {
         return;
     }
-    let lines = popup_lines(pending, now);
     // Box geometry: 50 wide, 4 inner rows (top border + 2 text + bottom).
     let box_w: u16 = 50.min(cols.saturating_sub(2));
     let box_h: u16 = 4;
@@ -2860,9 +2936,7 @@ fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: I
     let mut out = String::with_capacity(512);
     out.push_str("\x1b7"); // save cursor
     out.push_str("\x1b[?25l"); // hide cursor while painting
-                               // Tone selects foreground color.
-    let (border_ansi, text_ansi) = popup_tone_ansi(pending, now);
-    // Top border.
+                               // Top border.
     let border_w = (box_w as usize).saturating_sub(2);
     out.push_str(&format!(
         "\x1b[{};{}H{}┌{:─<border_w$}┐\x1b[0m",
@@ -2871,7 +2945,17 @@ fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: I
     // Two text rows. Each row is "│ <content padded> │".
     let inner_w = (box_w as usize).saturating_sub(4);
     for (i, line) in lines.iter().take(2).enumerate() {
-        let truncated: String = line.chars().take(inner_w).collect();
+        // Ellipsize rather than hard-truncate. A silent cut is how a stalled
+        // switch came to report "taking long" and stop there — the message
+        // looked complete, so nothing suggested it had been clipped (#282).
+        let truncated: String = if line.chars().count() > inner_w {
+            line.chars()
+                .take(inner_w.saturating_sub(1))
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            line.chars().collect()
+        };
         let pad = inner_w.saturating_sub(truncated.chars().count());
         let spaces = " ".repeat(pad);
         out.push_str(&format!(
@@ -3205,46 +3289,21 @@ fn spawn_switch_dial(
         // channel receiver is dropped, so a late success drops its stream +
         // bridge (which clean up on drop) rather than racing a stale flip.
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        // The dial thread names the target in its stage traces; the outer
+        // thread still needs `key` for the outcome event it sends afterwards.
+        let dial_key = key.clone();
         std::thread::spawn(move || {
             let dialed: Result<(UnixStream, Option<crate::remote::SshStdioBridge>), ClientError> =
                 (|| {
                     // Path A: the slot already has a live transport (home, or the
                     // active leg's launcher-owned bridge). Just dial it.
                     if let Some(path) = slot_socket_path(&target) {
-                        let mut stream =
-                            UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)?;
-                        do_handshake(
-                            &mut stream,
-                            cols,
-                            rows,
-                            cell_width_px,
-                            cell_height_px,
-                            requested_encoding,
-                            false,
-                            None,
-                            fleet.as_ref(),
+                        let mut stream = crate::logging::timed_switch_stage(
+                            &dial_key,
+                            "socket_connect",
+                            || UnixStream::connect(&path).map_err(ClientError::ConnectionFailed),
                         )?;
-                        return Ok((stream, None));
-                    }
-                    // Path B: cold ssh peer with no bridge — build one
-                    // non-interactively, then dial the forwarded socket. The
-                    // bridge is returned to the loop and stored on the slot.
-                    match &target {
-                        slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
-                            io::Error::other("home slot has no socket path"),
-                        )),
-                        slots::SlotTarget::Ssh(t) => {
-                            let (bridge, sock) = crate::remote::start_switch_bridge_noninteractive(
-                                t,
-                                proxy_jump.as_deref(),
-                            )
-                            .map_err(ClientError::ConnectionFailed)?;
-                            // The bridge listener may need a moment to be ready
-                            // (it binds synchronously, but ssh dial latency hides
-                            // here on first connect). Retry briefly on connect
-                            // refused to avoid spurious failures.
-                            let mut stream = connect_with_brief_retry(&sock)
-                                .map_err(ClientError::ConnectionFailed)?;
+                        crate::logging::timed_switch_stage(&dial_key, "handshake", || {
                             do_handshake(
                                 &mut stream,
                                 cols,
@@ -3255,7 +3314,58 @@ fn spawn_switch_dial(
                                 false,
                                 None,
                                 fleet.as_ref(),
+                            )
+                        })?;
+                        return Ok((stream, None));
+                    }
+                    // Path B: cold ssh peer with no bridge — build one
+                    // non-interactively, then dial the forwarded socket. The
+                    // bridge is returned to the loop and stored on the slot.
+                    match &target {
+                        slots::SlotTarget::Home => Err(ClientError::ConnectionFailed(
+                            io::Error::other("home slot has no socket path"),
+                        )),
+                        slots::SlotTarget::Ssh(t) => {
+                            // `bridge_start` covers the remote-binary probe (a
+                            // full ssh round trip) plus binding the listener.
+                            // remote.rs splits those two internally; this leg
+                            // is the one the client can attribute on its own.
+                            let (bridge, sock) = crate::logging::timed_switch_stage(
+                                &dial_key,
+                                "bridge_start",
+                                || {
+                                    crate::remote::start_switch_bridge_noninteractive(
+                                        t,
+                                        proxy_jump.as_deref(),
+                                    )
+                                    .map_err(ClientError::ConnectionFailed)
+                                },
                             )?;
+                            // The bridge listener may need a moment to be ready
+                            // (it binds synchronously, but ssh dial latency hides
+                            // here on first connect). Retry briefly on connect
+                            // refused to avoid spurious failures.
+                            let mut stream = crate::logging::timed_switch_stage(
+                                &dial_key,
+                                "socket_connect",
+                                || {
+                                    connect_with_brief_retry(&sock)
+                                        .map_err(ClientError::ConnectionFailed)
+                                },
+                            )?;
+                            crate::logging::timed_switch_stage(&dial_key, "handshake", || {
+                                do_handshake(
+                                    &mut stream,
+                                    cols,
+                                    rows,
+                                    cell_width_px,
+                                    cell_height_px,
+                                    requested_encoding,
+                                    false,
+                                    None,
+                                    fleet.as_ref(),
+                                )
+                            })?;
                             Ok((stream, Some(bridge)))
                         }
                     }

@@ -5,8 +5,8 @@
 //! `flk checks` CLI surface (#175 phase 4, C4 tail).
 //!
 //! Three verbs, mirroring the `checks.*` methods over the socket:
-//! - `flk checks list` — enumerate the runner's script checks + built-in
-//!   states.
+//! - `flk checks list` — enumerate every scheduled check: script checks,
+//!   crons, and each built-in, with `next_fire_ms` on the scheduled ones.
 //! - `flk checks ack <name>` — silence a check's next fire.
 //! - `flk checks run <name>` — force a script check due right now.
 
@@ -75,7 +75,9 @@ fn checks_run(args: &[String]) -> std::io::Result<i32> {
 
 fn print_checks_help() {
     eprintln!("flk checks commands:");
-    eprintln!("  flk checks list                # enumerate runner + built-in state");
+    eprintln!(
+        "  flk checks list                # scripts, crons + built-ins, with next-fire times"
+    );
     eprintln!("  flk checks ack <name>          # silence the next fire");
     eprintln!("  flk checks run <name>          # force a script check due now");
 }

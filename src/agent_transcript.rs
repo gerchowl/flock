@@ -49,7 +49,16 @@ const MAX_UNPARSED_RATIO: f64 = 0.05;
 
 /// Writer versions this parser has been exercised against. A newer writer
 /// still renders (leniently); callers may surface a "newer than tested" hint.
-pub const KNOWN_GOOD_WRITER_MAX: (u32, u32, u32) = (2, 1, 227);
+///
+/// Bumping this is licensed by EVIDENCE, not by editing the number: run
+/// `cargo nextest run --run-ignored all -E 'test(real_transcripts)'`, which
+/// parses every transcript on the machine and fails if the kernel chokes.
+/// Left stale it stops being a sentinel — at 2.1.227 against a 2.1.238 writer
+/// the "untested" warning fired on every current session, so the one signal
+/// that the format had moved was indistinguishable from the happy path
+/// (#337). If it is behind again, re-run the check and move it; do not
+/// silence the warning.
+pub const KNOWN_GOOD_WRITER_MAX: (u32, u32, u32) = (2, 1, 238);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -448,7 +457,9 @@ pub fn spawn_load<F>(
         // yet (the first hook can beat the agent's first write) is retried
         // rather than disabling hydration for the rest of the session.
         let Some(path) = crate::agent_resume::claude_transcript_path(&home, &session_id) else {
-            crate::logging::transcript_unreadable(&session_id, "no transcript on disk");
+            // Expected, not a fault: the first hook routinely beats the agent's
+            // first write, and the receiver re-arms on empty.
+            crate::logging::transcript_absent(&session_id);
             deliver(Vec::new());
             return;
         };
@@ -732,6 +743,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(Role::User, "do the thing"), (Role::Assistant, "done"),],
             "tool call/result turns carry no prose and must not become entries"
+        );
+    }
+
+    /// #337: the sentinel is only a sentinel while it sits at or above what
+    /// agents actually write. Left behind it fires on every current session,
+    /// which is how it stopped being a signal. This pins the intent rather
+    /// than the number: whatever `KNOWN_GOOD_WRITER_MAX` says, a writer AT
+    /// that version must be silent, and only something past it may flag.
+    #[test]
+    fn the_drift_flag_is_silent_at_the_tested_ceiling() {
+        let (major, minor, patch) = KNOWN_GOOD_WRITER_MAX;
+        let at_ceiling = read(&format!(
+            "{}\n",
+            format_args!(
+                r#"{{"type":"user","version":"{major}.{minor}.{patch}","message":{{"role":"user","content":"a"}}}}"#
+            )
+        ));
+        assert!(
+            !at_ceiling.writer_newer_than_tested,
+            "the version the parser is tested against must not warn",
+        );
+
+        let past_ceiling = read(&format!(
+            "{}\n",
+            format_args!(
+                r#"{{"type":"user","version":"{major}.{minor}.{next}","message":{{"role":"user","content":"a"}}}}"#,
+                next = patch + 1
+            )
+        ));
+        assert!(
+            past_ceiling.writer_newer_than_tested,
+            "one patch past the ceiling is what the flag exists for",
         );
     }
 

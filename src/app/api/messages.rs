@@ -539,6 +539,10 @@ impl App {
             .correlation_id
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
+        let in_reply_to = params
+            .in_reply_to
+            .as_deref()
+            .filter(|explicit| !explicit.trim().is_empty());
 
         match crate::peers::send_peer_message(
             &peer,
@@ -547,6 +551,7 @@ impl App {
             &crate::app::short_host_name(),
             body,
             &correlation_id,
+            in_reply_to,
         ) {
             Ok(()) => {
                 // Without this the sender's durable log has NO record that a

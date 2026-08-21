@@ -178,6 +178,12 @@ pub struct App {
     /// Instant the reap tick last ran — folds the reap's own cadence
     /// (`[checks.reap] cadence_secs`) on top of the checks tick.
     pub(crate) reap_next_deadline: Option<Instant>,
+    /// Last `verify_integration_manifest()` verdict observed by the reap
+    /// tick, cached so `checks.list` can report a gated reap WITHOUT doing
+    /// filesystem I/O on a request path (#330). `None` until the reap has
+    /// ticked at least once — which is itself the honest answer, and is
+    /// reported as such rather than as a clean verdict.
+    pub(crate) reap_last_verdict: Option<String>,
     /// #175 S3 commit 3 (US-9): fleet-wide pause switch. Persisted to
     /// `session::data_dir()/pause.json` and re-read at boot, so a paused
     /// fleet survives a `flk server stop && flk server start`. Gates
@@ -818,6 +824,7 @@ impl App {
                 guard
             },
             reap_check: crate::checks::ReapFold::new(),
+            reap_last_verdict: None,
             reap_next_deadline: (config.checks.enable && config.checks.reap.enable).then(|| {
                 Instant::now() + Duration::from_secs(config.checks.reap.cadence_secs.max(1))
             }),
