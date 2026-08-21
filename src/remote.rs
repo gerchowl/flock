@@ -247,29 +247,49 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
+    // #282: THIS is the path a default build switches on. `[slots] enabled`
+    // defaults to false, so an ordinary switch does not flip an in-process slot
+    // — the client exits and the launcher runs a fresh leg through here, with
+    // the host terminal held on the PREVIOUS server's frozen frame the whole
+    // time (#63). Everything below until `run_client_process` is therefore the
+    // window in which the user sees a stale screen and nothing else, and it was
+    // completely uninstrumented: the switch-latency traces in #43 covered the
+    // slots path, which most sessions never take.
+    // #282: tell the user what is happening while the held frame lies. The
+    // guard is dropped before `run_client_process` so the painter thread is
+    // joined before the client can touch the terminal.
+    let progress = crate::switch_progress::SwitchProgress::start(&active_ssh_target);
     let prepared_remote =
-        prepare_remote_flock(&remote.target, remote.live_handoff, remote.context)?;
-    ensure_remote_server_ready(
-        &remote.target,
-        &prepared_remote.remote_flock,
-        prepared_remote.installed_or_replaced,
-        prepared_remote.stop_after_install_approved,
-        remote.live_handoff,
-        remote.context,
-    )?;
+        crate::logging::timed_switch_stage(&active_ssh_target, "remote_prepare", || {
+            prepare_remote_flock(&remote.target, remote.live_handoff, remote.context)
+        })?;
+    progress.set_stage(crate::switch_progress::Stage::StartingServer);
+    crate::logging::timed_switch_stage(&active_ssh_target, "remote_server_ready", || {
+        ensure_remote_server_ready(
+            &remote.target,
+            &prepared_remote.remote_flock,
+            prepared_remote.installed_or_replaced,
+            prepared_remote.stop_after_install_approved,
+            remote.live_handoff,
+            remote.context,
+        )
+    })?;
 
     let manage_ssh_config = crate::config::Config::load()
         .config
         .remote
         .manage_ssh_config;
-    let _bridge = SshStdioBridge::start(
-        remote.target,
-        prepared_remote.remote_flock,
-        local_socket.clone(),
-        session_name,
-        manage_ssh_config,
-        remote.proxy_jump.clone(),
-    )?;
+    progress.set_stage(crate::switch_progress::Stage::Connecting);
+    let _bridge = crate::logging::timed_switch_stage(&active_ssh_target, "bridge_listen", || {
+        SshStdioBridge::start(
+            remote.target,
+            prepared_remote.remote_flock,
+            local_socket.clone(),
+            session_name,
+            manage_ssh_config,
+            remote.proxy_jump.clone(),
+        )
+    })?;
 
     // Every remote leg carries a fleet snapshot: the one handed over by the
     // previous server (pass-through — keeps the ORIGINAL origin on nested
@@ -286,6 +306,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             // carry the origin's own workspaces (#66).
             origin_summary: None,
         });
+
+    progress.set_stage(crate::switch_progress::Stage::Attaching);
+    // Explicit, not end-of-scope: the client process owns the terminal from
+    // here, and a painter still alive when it starts would scribble a stale box
+    // over a live frame. Dropping the guard joins that thread first.
+    drop(progress);
 
     run_client_process(
         &local_socket,

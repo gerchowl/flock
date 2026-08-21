@@ -2896,11 +2896,36 @@ const POPUP_CANCEL_BEAT: Duration = Duration::from_millis(600);
 /// box centered via the reported terminal size, cursor saved/restored so the
 /// underlying frame is never disturbed (the #72 show_status_line precedent).
 fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: Instant) {
+    let lines = popup_lines(pending, now);
+    let (border_ansi, text_ansi) = popup_tone_ansi(pending, now);
+    paint_centered_notice(
+        [lines[0].as_str(), lines[1].as_str()],
+        border_ansi,
+        text_ansi,
+        reported_size,
+    );
+}
+
+/// Draw a two-line centered box in plain raw ANSI, cursor saved/restored so
+/// whatever is underneath is never disturbed (the #72 `show_status_line`
+/// precedent).
+///
+/// Shared by the two switch surfaces, which draw the same box for the same
+/// reason but know completely different things: the slots client paints over a
+/// still-live frame, and the launcher paints over the PREVIOUS server's frozen
+/// held frame between legs (#282). Extracted rather than duplicated — a second
+/// copy of box geometry is how the two drift into looking like different
+/// features to the user.
+pub(crate) fn paint_centered_notice(
+    lines: [&str; 2],
+    border_ansi: &str,
+    text_ansi: &str,
+    reported_size: (u16, u16),
+) {
     let (cols, rows) = reported_size;
     if cols < 12 || rows < 6 {
         return;
     }
-    let lines = popup_lines(pending, now);
     // Box geometry: 50 wide, 4 inner rows (top border + 2 text + bottom).
     let box_w: u16 = 50.min(cols.saturating_sub(2));
     let box_h: u16 = 4;
@@ -2911,9 +2936,7 @@ fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: I
     let mut out = String::with_capacity(512);
     out.push_str("\x1b7"); // save cursor
     out.push_str("\x1b[?25l"); // hide cursor while painting
-                               // Tone selects foreground color.
-    let (border_ansi, text_ansi) = popup_tone_ansi(pending, now);
-    // Top border.
+                               // Top border.
     let border_w = (box_w as usize).saturating_sub(2);
     out.push_str(&format!(
         "\x1b[{};{}H{}┌{:─<border_w$}┐\x1b[0m",
@@ -2922,7 +2945,17 @@ fn paint_switch_popup(pending: &PendingSwitch, reported_size: (u16, u16), now: I
     // Two text rows. Each row is "│ <content padded> │".
     let inner_w = (box_w as usize).saturating_sub(4);
     for (i, line) in lines.iter().take(2).enumerate() {
-        let truncated: String = line.chars().take(inner_w).collect();
+        // Ellipsize rather than hard-truncate. A silent cut is how a stalled
+        // switch came to report "taking long" and stop there — the message
+        // looked complete, so nothing suggested it had been clipped (#282).
+        let truncated: String = if line.chars().count() > inner_w {
+            line.chars()
+                .take(inner_w.saturating_sub(1))
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            line.chars().collect()
+        };
         let pad = inner_w.saturating_sub(truncated.chars().count());
         let spaces = " ".repeat(pad);
         out.push_str(&format!(
@@ -3225,38 +3258,6 @@ fn spawn_warm_bridge_dial(
     );
 }
 
-/// A switch stage over this is not slow, it is STALLED (#43, #282).
-///
-/// A healthy switch on a LAN completes every one of its stages in tens of
-/// milliseconds; the stall that motivated this instrumentation was 5.05s. The
-/// budget sits well above legitimate variation — a first ssh connect to a
-/// sleeping host, a cold remote-binary probe — so a breach is a real anomaly
-/// and not a WARN anyone learns to scroll past.
-const SWITCH_STAGE_BUDGET: Duration = Duration::from_millis(1500);
-
-/// Time one leg of a switch, logging it and escalating if it blew its budget.
-///
-/// Returns the stage's own result untouched: a failing stage is still a timed
-/// stage, and knowing a failure took 5s before it failed is often the whole
-/// diagnosis.
-fn timed_switch_stage<T>(target: &str, stage: &'static str, work: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    let result = work();
-    let elapsed = started.elapsed();
-    let elapsed_ms = elapsed.as_millis() as u64;
-    if elapsed >= SWITCH_STAGE_BUDGET {
-        crate::logging::client_switch_stage_slow(
-            target,
-            stage,
-            elapsed_ms,
-            SWITCH_STAGE_BUDGET.as_millis() as u64,
-        );
-    } else {
-        crate::logging::client_switch_stage(target, stage, elapsed_ms);
-    }
-    result
-}
-
 /// Spawn an on-demand SWITCH dial for a cold slot (#93). Targets with a live
 /// local socket (home, the active ssh leg's bridge) just dial that socket;
 /// bridge-less ssh peers get a NON-INTERACTIVE client-side `SshStdioBridge`
@@ -3297,10 +3298,12 @@ fn spawn_switch_dial(
                     // Path A: the slot already has a live transport (home, or the
                     // active leg's launcher-owned bridge). Just dial it.
                     if let Some(path) = slot_socket_path(&target) {
-                        let mut stream = timed_switch_stage(&dial_key, "socket_connect", || {
-                            UnixStream::connect(&path).map_err(ClientError::ConnectionFailed)
-                        })?;
-                        timed_switch_stage(&dial_key, "handshake", || {
+                        let mut stream = crate::logging::timed_switch_stage(
+                            &dial_key,
+                            "socket_connect",
+                            || UnixStream::connect(&path).map_err(ClientError::ConnectionFailed),
+                        )?;
+                        crate::logging::timed_switch_stage(&dial_key, "handshake", || {
                             do_handshake(
                                 &mut stream,
                                 cols,
@@ -3327,24 +3330,30 @@ fn spawn_switch_dial(
                             // full ssh round trip) plus binding the listener.
                             // remote.rs splits those two internally; this leg
                             // is the one the client can attribute on its own.
-                            let (bridge, sock) =
-                                timed_switch_stage(&dial_key, "bridge_start", || {
+                            let (bridge, sock) = crate::logging::timed_switch_stage(
+                                &dial_key,
+                                "bridge_start",
+                                || {
                                     crate::remote::start_switch_bridge_noninteractive(
                                         t,
                                         proxy_jump.as_deref(),
                                     )
                                     .map_err(ClientError::ConnectionFailed)
-                                })?;
+                                },
+                            )?;
                             // The bridge listener may need a moment to be ready
                             // (it binds synchronously, but ssh dial latency hides
                             // here on first connect). Retry briefly on connect
                             // refused to avoid spurious failures.
-                            let mut stream =
-                                timed_switch_stage(&dial_key, "socket_connect", || {
+                            let mut stream = crate::logging::timed_switch_stage(
+                                &dial_key,
+                                "socket_connect",
+                                || {
                                     connect_with_brief_retry(&sock)
                                         .map_err(ClientError::ConnectionFailed)
-                                })?;
-                            timed_switch_stage(&dial_key, "handshake", || {
+                                },
+                            )?;
+                            crate::logging::timed_switch_stage(&dial_key, "handshake", || {
                                 do_handshake(
                                     &mut stream,
                                     cols,

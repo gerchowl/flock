@@ -2482,6 +2482,47 @@ pub(crate) fn client_switch_stage(target: &str, stage: &'static str, elapsed_ms:
     );
 }
 
+/// A switch stage over this is not slow, it is STALLED (#43, #282).
+///
+/// A healthy switch completes every one of its stages in tens of milliseconds;
+/// the stall that motivated this instrumentation was 5.05s. The budget sits
+/// well above legitimate variation — a first ssh connect to a sleeping host, a
+/// cold remote-binary probe — so a breach is a real anomaly and not a WARN
+/// anyone learns to scroll past.
+pub(crate) const SWITCH_STAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Time one leg of a switch, reporting it and escalating if it blew its budget.
+///
+/// Lives here rather than at either call site because the thing being decided
+/// is a LEVEL, and this module owns the level policy. Both switch paths use it:
+/// the in-process slot dial and the launcher's exit-and-relaunch leg, which are
+/// different code but the same question — where did the five seconds go?
+///
+/// Returns the stage's own result untouched: a failing stage is still a timed
+/// stage, and knowing a failure took 5s before it failed is often the whole
+/// diagnosis.
+pub(crate) fn timed_switch_stage<T>(
+    target: &str,
+    stage: &'static str,
+    work: impl FnOnce() -> T,
+) -> T {
+    let started = std::time::Instant::now();
+    let result = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if elapsed >= SWITCH_STAGE_BUDGET {
+        client_switch_stage_slow(
+            target,
+            stage,
+            elapsed_ms,
+            SWITCH_STAGE_BUDGET.as_millis() as u64,
+        );
+    } else {
+        client_switch_stage(target, stage, elapsed_ms);
+    }
+    result
+}
+
 /// A switch stage measured inside the remote layer (#43, #282).
 ///
 /// `bridge_start` as the client sees it is two very different things bolted
