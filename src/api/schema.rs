@@ -1410,6 +1410,16 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// The fleet directory (#320): every agent this server can address,
+        /// local ones included, each stamped with the host it lives on.
+        ///
+        /// Separate from `agents` because it answers a different question.
+        /// `agents` describes the panes THIS server owns, in full. `fleet`
+        /// answers "who can I message, and by what name" — the only question
+        /// with an answer that is the same on every host. Empty on servers
+        /// older than #320, which is why it is `default`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fleet: Vec<FleetAgentInfo>,
     },
     Lineage {
         chain: Vec<LineageEdge>,
@@ -1592,6 +1602,44 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,
+}
+
+/// One row of the fleet directory: an agent's identity and where it currently
+/// lives — including agents on OTHER hosts (ADR-0008, #320).
+///
+/// Deliberately thin next to [`AgentInfo`]. A local agent is described by a
+/// live pane this server owns, so it can answer `revision`, `tab_id`, `cwd`,
+/// session details. A remote agent is a gossiped summary; inventing those
+/// fields for it would be fabricating detail this server does not have. So
+/// this carries only what addressing needs, and is the same shape whether the
+/// agent is here or three machines away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetAgentInfo {
+    /// The address. Fleet-global and restart-stable — the ONLY target shape
+    /// that means the same thing on every host, so this is what goes in a
+    /// `msg.send` `{"type":"agent"}` target.
+    pub agent_id: String,
+    /// Short host name of the server the agent lives on.
+    pub host: String,
+    /// Public pane id **on that host**. A routing detail, not an address:
+    /// meaningless as a `{"type":"pane"}` target unless `local` is true.
+    pub pane_id: String,
+    /// `true` when the agent is on the server that answered. Only these are
+    /// addressable by pane id; the rest need `agent_id`.
+    pub local: bool,
+    /// How this server REACHES that host: the `[[peers]]` name of the entry
+    /// the directory answered from. `None` when local, and also `None` for a
+    /// relayed entry we have no direct edge to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// Short agent label ("cc", "codex", …) where known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Operator-assigned agent name, local rows only — a name is a local
+    /// convenience and does not travel with the gossip summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub status: AgentStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
