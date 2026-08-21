@@ -8,7 +8,11 @@
 //! is answerable from the log tail: every invocation emits a `process.exec` or
 //! `process.spawn` event through the `crate::logging` facade.
 //!
-//! Non-zero exit → WARN; spawn failure → ERROR event; zero exit → INFO.
+//! Level is picked from CADENCE and outcome together, not outcome alone
+//! (#318): a one-shot's zero exit is INFO and its failure WARN, while a
+//! [`ExecCadence::Periodic`] command declared via `.periodic()` reports
+//! success at DEBUG and failure at WARN only on the edge. Spawn failure is
+//! always ERROR — the command never ran.
 //! Argument shaping is bounded: joined with spaces and truncated to
 //! `MAX_ARG_LOG_CHARS` with an ellipsis marker so a hostile or huge invocation
 //! can't blow up the audit trail.
@@ -40,6 +44,33 @@ pub(crate) struct TracedCommand {
     inner: Command,
     subsystem: &'static str,
     program: String,
+    cadence: ExecCadence,
+}
+
+/// How often this command runs — the input that picks the level a completed
+/// run is reported at.
+///
+/// `docs/CONVENTIONS.md`: *"frequency dictates level … info is for
+/// low-frequency lifecycle events, never per-iteration"*. Levelling on the
+/// EXIT CODE alone breaks that rule for anything on a timer: flock's 2s stats
+/// sampler wrote 98.9% of `flock-server.log` as successful `process.exec`
+/// INFOs, and a `gh` poll that had been failing for hours wrote 6,060 WARNs
+/// nobody could triage (#318). The cadence is a property of the CALL SITE, so
+/// the call site declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ExecCadence {
+    /// One-shot or user-driven: a switch, an install, an update check. Success
+    /// is INFO (routine but audit-worthy), failure is WARN. The default,
+    /// because a command whose cadence nobody thought about is far more likely
+    /// to be a one-shot than a timer.
+    #[default]
+    Lifecycle,
+    /// Timer-driven and unbounded: it will run again in N seconds, forever.
+    /// Success is DEBUG. Failure is WARN only on the EDGE — the first run whose
+    /// status differs from that command's previous run — and DEBUG while the
+    /// status is unchanged, so a persistent outage is one line instead of one
+    /// per tick. Recovery is the other edge and lands at INFO.
+    Periodic,
 }
 
 // Landing the wrapper as its own commit means every builder method looks
@@ -58,6 +89,7 @@ impl TracedCommand {
             inner: Command::new(program_ref),
             subsystem,
             program: program_display,
+            cadence: ExecCadence::default(),
         }
     }
 
@@ -71,7 +103,19 @@ impl TracedCommand {
             inner: command,
             subsystem,
             program,
+            cadence: ExecCadence::default(),
         }
+    }
+
+    /// Declare this command as timer-driven (see [`ExecCadence::Periodic`]).
+    ///
+    /// Call it on every invocation that a poll, sampler, or watchdog reaches
+    /// on a fixed interval. It changes NOTHING about what runs — only the
+    /// level its completion is reported at, which is the difference between a
+    /// log you can grep and 15 MB/day of one event.
+    pub(crate) fn periodic(&mut self) -> &mut Self {
+        self.cadence = ExecCadence::Periodic;
+        self
     }
 
     pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
@@ -233,6 +277,7 @@ impl TracedCommand {
                 &args,
                 Some(output.status),
                 duration_ms,
+                self.cadence,
             ),
             Err(err) => crate::logging::process_exec_failed(
                 self.subsystem,
@@ -278,6 +323,7 @@ impl TracedCommand {
                 &args,
                 Some(output.status),
                 duration_ms,
+                self.cadence,
             ),
             Err(err) => crate::logging::process_exec_failed(
                 self.subsystem,
@@ -309,6 +355,7 @@ impl TracedCommand {
                     &args,
                     Some(output.status),
                     duration_ms,
+                    self.cadence,
                 );
             }
             Err(err) => {
@@ -340,6 +387,7 @@ impl TracedCommand {
                     &args,
                     Some(*status),
                     duration_ms,
+                    self.cadence,
                 );
             }
             Err(err) => {
@@ -364,7 +412,13 @@ impl TracedCommand {
         let result = self.inner.spawn();
         match &result {
             Ok(child) => {
-                crate::logging::process_spawned(self.subsystem, &self.program, &args, child.id());
+                crate::logging::process_spawned(
+                    self.subsystem,
+                    &self.program,
+                    &args,
+                    child.id(),
+                    self.cadence,
+                );
             }
             Err(err) => {
                 crate::logging::process_spawn_failed(
@@ -486,6 +540,154 @@ mod tests {
         let secret = "y".repeat(16);
         let basic = redact_arg(&format!("AUTHORIZATION: Basic {secret}"));
         assert!(!basic.contains(&secret), "{basic}");
+    }
+
+    /// #318: a 2s sampler exiting 0 forever wrote 98.9% of flock-server.log.
+    /// The exit code is identical in both cases here — only the declared
+    /// cadence differs, which is the whole claim.
+    #[test]
+    fn cadence_not_exit_code_picks_the_level_of_a_successful_run() {
+        let one_shot = capture_logs(|| {
+            let _ = TracedCommand::new(TRUE_PROG, "test-lifecycle").status_traced();
+        });
+        assert!(
+            one_shot.contains("INFO"),
+            "a one-shot success stays audit-worthy: {one_shot}"
+        );
+
+        let sampler = capture_logs(|| {
+            let _ = TracedCommand::new(TRUE_PROG, "test-periodic-ok")
+                .periodic()
+                .status_traced();
+        });
+        assert!(
+            sampler.contains("DEBUG") && !sampler.contains("INFO"),
+            "a timer-driven success is per-iteration noise: {sampler}"
+        );
+    }
+
+    /// The failure side of the same rule. A `gh` poll that had been failing
+    /// since breakfast wrote 6,060 WARNs — the same defect as the INFO fire
+    /// hose, wearing the level operators actually triage on. The FIRST failure
+    /// must still be loud, or this is suppression rather than a fix.
+    #[test]
+    fn a_periodic_failure_warns_on_the_edge_and_goes_quiet_while_unchanged() {
+        // One SHELL standing in for one poll across ticks: the edge map keys
+        // on `subsystem/program`, which is what makes "this command's status
+        // changed" meaningful, so the recovery tick has to be the same program
+        // with a different result rather than a different program.
+        // `/bin/sh` is the only /bin path POSIX guarantees (AGENTS.md).
+        let tick = |script: &str| {
+            capture_logs(|| {
+                let _ = TracedCommand::new("/bin/sh", "test-periodic-edge")
+                    .args(["-c", script])
+                    .periodic()
+                    .status_traced();
+            })
+        };
+
+        let first = tick("exit 1");
+        assert!(
+            first.contains("WARN"),
+            "the first failing tick is the line worth waking up for: {first}"
+        );
+
+        let repeat = tick("exit 1");
+        assert!(
+            !repeat.contains("WARN"),
+            "still-failing-the-same-way must not repeat per tick: {repeat}"
+        );
+
+        // A DIFFERENT failure mode is a new fact, not the same outage.
+        let other_failure = tick("exit 3");
+        assert!(
+            other_failure.contains("WARN") && other_failure.contains("status=\"3\""),
+            "a changed failure mode is its own edge: {other_failure}"
+        );
+
+        // Recovery is the other edge, and it is exactly as low-frequency as
+        // the failure was — so it earns an INFO that says what changed.
+        let recovered = tick("exit 0");
+        assert!(
+            recovered.contains("outcome=\"recovered\"") && recovered.contains("INFO"),
+            "a poll coming back is a fact the tail needs: {recovered}"
+        );
+
+        // ...and the steady state after recovery is quiet again, which is the
+        // property the whole cadence rule exists to deliver.
+        let steady = tick("exit 0");
+        assert!(
+            steady.contains("DEBUG") && !steady.contains("INFO"),
+            "a healthy poll writes nothing at default level: {steady}"
+        );
+    }
+
+    /// A periodic command's FIRST run is an edge for a failure but must not be
+    /// announced as a "recovery" when it succeeds — otherwise every sampler
+    /// declares recovery once at startup, which is a fresh flavour of the
+    /// noise this replaced.
+    #[test]
+    fn a_first_periodic_success_is_quiet_not_a_recovery() {
+        let out = capture_logs(|| {
+            let _ = TracedCommand::new(TRUE_PROG, "test-periodic-first-ok")
+                .periodic()
+                .status_traced();
+        });
+        assert!(
+            !out.contains("recovered"),
+            "nothing was broken, so nothing recovered: {out}"
+        );
+        assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    /// Guard on the split introduced by the cadence work: the edge map keys on
+    /// `subsystem/program`, so two DIFFERENT periodic commands failing must
+    /// each get their own WARN rather than one masking the other.
+    #[test]
+    fn edge_detection_is_per_command_not_global() {
+        let a = capture_logs(|| {
+            let _ = TracedCommand::new(FALSE_PROG, "test-periodic-a")
+                .periodic()
+                .status_traced();
+        });
+        let b = capture_logs(|| {
+            let _ = TracedCommand::new(FALSE_PROG, "test-periodic-b")
+                .periodic()
+                .status_traced();
+        });
+        assert!(a.contains("WARN"), "{a}");
+        assert!(
+            b.contains("WARN"),
+            "a second command's failure is its own: {b}"
+        );
+    }
+
+    /// The cadence work rewrote every level branch in `process_exec_completed`.
+    /// argv redaction runs BEFORE that branch and must be untouched by it —
+    /// #318's acceptance list names this explicitly because a demotion that
+    /// quietly moved a secret from a WARN to a DEBUG would still write it.
+    #[test]
+    fn redaction_survives_on_every_cadence_and_outcome() {
+        let fake = format!("{}{}", "ghp_", "z".repeat(20));
+        for (prog, subsystem, periodic) in [
+            (TRUE_PROG, "test-redact-ok", false),
+            (FALSE_PROG, "test-redact-err", false),
+            (TRUE_PROG, "test-redact-periodic-ok", true),
+            (FALSE_PROG, "test-redact-periodic-err", true),
+        ] {
+            let out = capture_logs(|| {
+                let mut cmd = TracedCommand::new(prog, subsystem);
+                cmd.arg(format!("Authorization: bearer {fake}"));
+                if periodic {
+                    cmd.periodic();
+                }
+                let _ = cmd.status_traced();
+            });
+            assert!(
+                !out.contains(&fake),
+                "token reached the log ({subsystem}): {out}"
+            );
+        }
     }
 
     /// The whole point: a child that never exits must not take its caller with
