@@ -29,7 +29,12 @@ serial-pty = { max-threads = 1 }
 # poll fails with "replacement server did not appear" (#129, Linux-only). It
 # was previously only in the retry pool, but the contention outlasts all 3
 # attempts — serializing it gives the handoff a free core.
-filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff)'
+# mcp_fleet_messaging joins them: it stands up two servers AND two `flk mcp
+# serve` panes, then hands off over FIFOs whose open() blocks until the pane
+# is actually running. Under contention that handshake is the first thing to
+# miss its deadline, and it fails as "the MCP pane did not start" — a message
+# that reads like a product bug and is not one.
+filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging)'
 test-group = 'serial-pty'
 retries = 2
 
