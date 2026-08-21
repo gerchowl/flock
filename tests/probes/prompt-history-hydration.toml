@@ -1,0 +1,54 @@
+# #328 end-to-end: does the prompt-history panel hydrate assistant turns from
+# the pane's own session jsonl? Isolated flk instance, fixture transcript under
+# a sandbox HOME. Sockets live in a SHORT dir: unix sun_path caps at ~104 bytes.
+[session]
+command = ["${bin}"]
+cols = 200
+rows = 50
+startup_wait = 12
+timeout = 180
+env = { HOME = "${home}", XDG_CONFIG_HOME = "${xdg}", SHELL = "/bin/sh" }
+env_unset = ["FLOCK_ENV", "FLOCK_PANE_ID", "FLOCK_SOCKET_PATH", "FLOCK_BIN"]
+
+[[step]]
+wait_for = "No workspaces yet"
+
+[[step]]                      # a workspace with a shell pane
+keys = "C-b N"
+sleep = 4
+[[step]]
+wait_for = "\\$"
+
+[[step]]                      # SessionStart -> names the pane's session
+type = "printf '%s' '{\"hook_event_name\":\"SessionStart\",\"session_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"source\":\"startup\"}' | $FLOCK_BIN hook claude session; echo SESSION_HOOK_DONE"
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 4
+[[step]]
+wait_for = "SESSION_HOOK_DONE"
+
+[[step]]                      # UserPromptSubmit -> arms hydration
+type = "printf '%s' '{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"prompt\":\"LIVEPROMPT-three\"}' | $FLOCK_BIN hook claude prompt; echo PROMPT_HOOK_DONE"
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 5
+[[step]]
+wait_for = "PROMPT_HOOK_DONE"
+
+[[step]]                      # open the panel
+keys = "F8"
+sleep = 3
+capture = "panel"
+assert_text = "prompt history"
+
+[[step]]                      # the hook-appended prompt is never in doubt
+assert_text = "LIVEPROMPT-three"
+
+[[step]]                      # THE claim: assistant turns read from the jsonl
+assert_text = "PROBEREPLY-alpha"
+[[step]]
+assert_text = "PROBEREPLY-omega"
+[[step]]
+assert_text = "PROBEPROMPT-one"

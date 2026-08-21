@@ -82,6 +82,30 @@ A test that reads the process cwd, the machine's hostname, or a hardcoded FHS pa
 
 Concretely: derive fixture paths from the fixture's own name (`Workspace::test_new` does this), use `std::env::temp_dir()` when a test just needs *a* directory, pick fixture hostnames that cannot collide with real machines (RFC 2606 reserves `.invalid`), and prefer `/bin/sh` — it is the only `/bin` path POSIX guarantees, and NixOS ships nothing else there. Determinism pins for the test environment belong in `.config/nextest.toml`'s `[env]`, so a bare `cargo nextest run` gets them too, not only `just`.
 
+### Unit tests can be green while the feature has never run
+
+#328 shipped a prompt-history panel with 47 passing tests over its parser,
+byte caps, detail levels, hydration merge and path resolution — and the
+feature had never executed its read path once, for any user. Every test set
+`hook_authority` directly; nothing drove the `HookStateReported` routing that
+decides which store the session id lands in, and that routing sent it to the
+other one. The parser was flawless and was never asked to parse.
+
+The lesson is not "write more unit tests". It is that a test which constructs
+the state it asserts on cannot tell you whether anything *produces* that
+state. When a feature depends on a value arriving from another subsystem,
+one test must start where the value really starts — the event, the hook
+report, the socket call — and end at the observable behaviour.
+
+When the observable behaviour is on screen, drive a real flk. `tests/probes/`
+holds runbooks that launch an isolated instance against a sandbox `$HOME`,
+inject keys, and assert on the rendered screen; its README documents the
+sandboxing rules (short socket path, `FLOCK_*` unset, seeded config). Point
+one at two builds — with and without your fix — and the diff between the two
+runs is the bug, demonstrated rather than argued.
+
+Prefer that over asking a human to restart their live server to look at it.
+
 ## Vendored libghostty-vt
 
 `vendor/libghostty-vt.vendor.json` records the upstream source commit currently vendored.

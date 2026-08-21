@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 // strong visible blocker > visible working/idle recovery > hook > fallback.
 // Process-exit updates clear matching hook authority before recomputing state.
 
+use crate::agent_resume::CLAUDE_HOOK_SOURCE;
 use crate::detect::{Agent, AgentState};
 use crate::terminal::{AgentId, TerminalId};
 
@@ -200,6 +201,11 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// True when `persisted_agent_session` was established by a hook report
+    /// from the process running in this pane, rather than restored from a
+    /// snapshot. A restored ref names a session that may no longer be live,
+    /// so it must not be used to pick a transcript to render (#328).
+    session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
@@ -255,6 +261,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
+            session_ref_hook_confirmed: false,
             manual_label: None,
             agent_name: None,
             hook_report_sequences: HashMap::new(),
@@ -404,6 +411,7 @@ impl TerminalState {
             || detected_agent_changed_or_disappeared && persisted_agent_was_previously_detected
         {
             self.persisted_agent_session = None;
+            self.session_ref_hook_confirmed = false;
         }
         self.update_stale_hook_idle_window(now);
         TerminalStateMutation {
@@ -505,6 +513,7 @@ impl TerminalState {
                 .unwrap_or(session_ref)
         });
         self.persisted_agent_session = None;
+        self.session_ref_hook_confirmed = false;
         self.header_reserved = true;
         let applied_session_ref = session_ref.clone();
         self.hook_authority = Some(HookAuthority {
@@ -640,11 +649,16 @@ impl TerminalState {
         )
     }
 
+    /// Restore path only: adopt a session ref read back from a snapshot. It is
+    /// deliberately NOT hook-confirmed — the process that owned it may be gone,
+    /// so it names the pane's identity without licensing a transcript read
+    /// (#328).
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session);
+        self.session_ref_hook_confirmed = false;
     }
 
     /// Returns true when the current persisted identity is an id for the same
@@ -688,7 +702,7 @@ impl TerminalState {
         agent_label: &str,
         session_start_source: Option<&str>,
     ) -> bool {
-        source == "flock:claude"
+        source == CLAUDE_HOOK_SOURCE
             && agent_label == "claude"
             && matches!(session_start_source, Some("clear" | "resume" | "compact"))
     }
@@ -741,6 +755,9 @@ impl TerminalState {
             agent: agent_label,
             session_ref,
         });
+        // A live process just named itself, so this ref may drive a transcript
+        // read (#328).
+        self.session_ref_hook_confirmed = true;
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: None,
@@ -770,6 +787,7 @@ impl TerminalState {
             .is_some_and(|session| &session.session_ref == session_ref)
         {
             self.persisted_agent_session = None;
+            self.session_ref_hook_confirmed = false;
             changed = true;
         }
         changed
@@ -1146,13 +1164,34 @@ impl TerminalState {
     ///
     /// Only Claude is wired today; other sources get their own
     /// `TranscriptSource` impl rather than a branch here (#246).
+    ///
+    /// Both stores are consulted, and the fallback is the one that actually
+    /// fires: Claude is a reserved native state source, so `HookStateReported`
+    /// routes its session ref through `set_agent_session_ref` into
+    /// `persisted_agent_session` and never touches `hook_authority` (see
+    /// [`crate::agent_resume::is_reserved_native_state_source`] and the branch
+    /// in `AppState::handle_app_event`). Reading only the authority left this
+    /// permanently `None`, so the panel never hydrated and showed hook-appended
+    /// prompts with no replies (#328). The authority is still checked first: it
+    /// is the right precedence the day Claude stops being a reserved source.
+    /// `crate::app::creation::terminal_agent_session_info` already resolves the
+    /// pane's session the same way.
     pub fn claude_session_id(&self) -> Option<String> {
-        let authority = self.hook_authority.as_ref()?;
-        if authority.source != "flock:claude" {
+        if let Some(session_ref) = self
+            .hook_authority
+            .as_ref()
+            .filter(|authority| authority.source == CLAUDE_HOOK_SOURCE)
+            .and_then(|authority| authority.session_ref.as_ref())
+        {
+            return Some(session_ref.value.clone());
+        }
+        if !self.session_ref_hook_confirmed {
             return None;
         }
-        let session_ref = authority.session_ref.as_ref()?;
-        Some(session_ref.value.clone())
+        self.persisted_agent_session
+            .as_ref()
+            .filter(|session| session.source == CLAUDE_HOOK_SOURCE)
+            .map(|session| session.session_ref.value.clone())
     }
 
     /// Ask for a re-read even though the `(session, detail)` pair is unchanged.
@@ -1495,6 +1534,125 @@ mod tests {
         );
         // The collapsed header follows the ring it summarises.
         assert_eq!(terminal.last_prompt.as_deref(), Some("second prompt"));
+    }
+
+    /// #328: a RESTORED session ref names the pane's identity but may point at
+    /// a process that is long gone, so it must never pick a transcript to
+    /// render. The dangerous shape: the pane comes back from a snapshot
+    /// holding session A, the user starts a fresh `claude` (session B, whose
+    /// `SessionStart` reports `source: "startup"`), and
+    /// `has_conflicting_current_session_ref` rejects the replacement to
+    /// protect a nested `claude -p` from clobbering the incumbent. That leaves
+    /// A in place while B is live — and the panel would happily render A's
+    /// conversation. Reading only `hook_authority` hid this behind an
+    /// always-`None`; the fallback must not surface it.
+    #[test]
+    fn a_restored_session_ref_never_picks_a_transcript() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: CLAUDE_HOOK_SOURCE.into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("restored-aaaa")
+                .expect("valid id"),
+        });
+        assert_eq!(
+            terminal.claude_session_id(),
+            None,
+            "a snapshot-restored ref is an identity, not a licence to read",
+        );
+
+        // A fresh `claude` in that pane: SessionStart carries "startup", which
+        // the incumbent guard refuses to let replace a different id.
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("live-bbbb"),
+            Some(1),
+            Some("startup".into()),
+        );
+        let got = terminal.claude_session_id();
+        assert_ne!(
+            got.as_deref(),
+            Some("restored-aaaa"),
+            "the panel must never resolve the PREVIOUS session's id; got {got:?}",
+        );
+
+        // A replacement the guard DOES authorise re-licenses the pane.
+        terminal.set_agent_session_ref_for_session_start(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("live-bbbb"),
+            Some(2),
+            Some("resume".into()),
+        );
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("live-bbbb"),
+            "a live process that named itself must hydrate",
+        );
+    }
+
+    /// #328: both stores can name the session, and the panel must find it in
+    /// either. In production only the persisted one is ever populated for
+    /// Claude — `HookStateReported` routes a reserved native source through
+    /// `set_agent_session_ref` — so reading the authority alone left the
+    /// panel permanently unhydrated.
+    #[test]
+    fn claude_session_id_prefers_hook_authority_and_falls_back_to_the_persisted_session() {
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.claude_session_id(), None);
+
+        // The path Claude actually takes.
+        terminal.set_agent_session_ref(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("persisted-id"),
+            Some(1),
+        );
+        assert!(
+            terminal.hook_authority.is_none(),
+            "a reserved native source must not claim hook authority",
+        );
+        assert_eq!(
+            terminal.claude_session_id().as_deref(),
+            Some("persisted-id"),
+            "the persisted session is the fallback the panel depends on",
+        );
+
+        // An authority ref is read first — the precedence that applies if
+        // Claude ever stops being a reserved source. A fresh terminal,
+        // because an authority landing on top of an existing identity
+        // deliberately keeps the incumbent ref (a nested `claude -p` must not
+        // steal the pane's session).
+        let mut authoritative = test_terminal();
+        authoritative.set_hook_authority_with_session_ref(
+            CLAUDE_HOOK_SOURCE.into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            None,
+            crate::agent_resume::AgentSessionRef::id("authority-id"),
+            Some(1),
+        );
+        assert_eq!(
+            authoritative.claude_session_id().as_deref(),
+            Some("authority-id"),
+            "hook authority is read when it carries a ref",
+        );
+    }
+
+    /// Another agent's session must never be handed to the Claude transcript
+    /// reader — the reader resolves the id under `~/.claude/projects`.
+    #[test]
+    fn claude_session_id_ignores_a_non_claude_source() {
+        let mut terminal = test_terminal();
+        terminal.set_agent_session_ref(
+            "flock:codex".into(),
+            "codex".into(),
+            crate::agent_resume::AgentSessionRef::id("codex-id"),
+            Some(1),
+        );
+        assert_eq!(terminal.claude_session_id(), None);
     }
 
     /// The guard used to be per-session, which meant cycling the panel's
