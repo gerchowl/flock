@@ -44,9 +44,15 @@ pub(super) fn table() -> &'static [Tool] {
     &[
         Tool {
             name: "flock_agent_list",
-            description: "List all detected agents in the flock. Each record \
-                          carries `seen` and `status_age_secs`; agents in the \
-                          `blocked` status are the ones needing attention.",
+            description: "List agents, and the fleet directory. `agents` is \
+                          this server's own panes in full — each record \
+                          carries `seen` and `status_age_secs`, and the ones \
+                          in `blocked` status need attention. `fleet` is \
+                          every agent addressable from here INCLUDING other \
+                          hosts, each row carrying `agent_id`, `host` and \
+                          `local`. Use a `fleet` row's `agent_id` to message \
+                          an agent on another machine; `local: false` means \
+                          its `pane_id` is meaningless here.",
             input_schema: schema_no_args,
             build: build_agent_list,
         },
@@ -86,20 +92,31 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_send",
-            description: "Queue a message to another pane's agent. Delivered \
-                          at the recipient's next settled idle boundary \
-                          (~1.2s dwell) — never mid-turn. `correlation_id` \
-                          is your idempotency key. The recipient sees a \
-                          sender stamp and reply instructions. Limits: 20 \
-                          messages/min, 32 per recipient mailbox.",
+            description: "Queue a message to another agent, on this host or \
+                          any host in the fleet. Address by `agent` id to \
+                          cross machines — a `pane` target names a placement \
+                          on THIS server and cannot leave it. Delivered at \
+                          the recipient's next settled idle boundary (~1.2s \
+                          dwell) — never mid-turn. `correlation_id` is your \
+                          idempotency key. The recipient sees a sender stamp \
+                          and reply instructions. Limits: 20 messages/min, 32 \
+                          per recipient mailbox. Refusals: \
+                          `msg_target_not_found` (no such agent anywhere in \
+                          the fleet), `peer_not_configured` (found it, but \
+                          its host is not in this server's peers), \
+                          `msg_not_allowed` (the receiver declines), \
+                          `sender_unresolved` (a cross-host send needs an \
+                          attestable sender, so it must come from inside a \
+                          pane).",
             input_schema: schema_msg_send,
             build: build_msg_send,
         },
         Tool {
             name: "flock_msg_reply",
             description: "Reply to a message you received. Routes back to the \
-                          original sender's pane using the incoming \
-                          `correlation_id` — no addressing needed.",
+                          original sender using the incoming \
+                          `correlation_id` — no addressing needed, and it \
+                          finds them on another host just as well.",
             input_schema: schema_msg_reply,
             build: build_msg_reply,
         },
@@ -217,13 +234,29 @@ fn schema_msg_send() -> Value {
         "properties": {
             "to": {
                 "type": "object",
-                "description": "Message recipient. `type=pane` addresses any bare pane; `type=repo_pane` restricts the resolution to workspaces backed by the named repo.",
+                "description": "Message recipient, one of three shapes. \
+                                `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` is the ONLY shape that reaches another host — \
+                                `agent_id` is fleet-global and restart-stable. \
+                                `{\"type\":\"pane\",\"pane\":\"<pane>\"}` addresses a pane on THIS server only. \
+                                `{\"type\":\"repo_pane\",\"repo\":\"<repo>\",\"pane\":\"<pane>\"}` restricts pane resolution to workspaces backed by that repo. \
+                                Get ids from `flock_agent_list`: its `fleet` rows carry `agent_id`, `host` and `local`.",
                 "properties": {
-                    "type": { "type": "string", "enum": ["pane", "repo_pane"] },
-                    "pane": { "type": "string" },
-                    "repo": { "type": "string" },
+                    "type": { "type": "string", "enum": ["pane", "repo_pane", "agent"] },
+                    "pane": {
+                        "type": "string",
+                        "description": "Required for `pane` and `repo_pane`. A public pane id, terminal id, or unique agent name on this server. Never an agent id.",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Required for `repo_pane`: the repo whose workspaces `pane` resolves within.",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Required for `agent`: a fleet-global agent id such as `agent_sage_6f21c4`, exactly as `flock_agent_list` reports it. Not a pane id — a pane id here is refused, not guessed at.",
+                    },
                 },
-                "required": ["type", "pane"],
+                "required": ["type"],
+                "additionalProperties": false,
             },
             "body": {
                 "type": "string",
@@ -254,6 +287,10 @@ fn schema_msg_reply() -> Value {
             "body": {
                 "type": "string",
                 "description": "Reply body (same 16 KiB cap as send).",
+            },
+            "reply_correlation_id": {
+                "type": "string",
+                "description": "Your idempotency key for THIS reply, so a retry does not deliver twice. Minted server-side when omitted — the same trade-off as `flock_msg_send`'s `correlation_id`.",
             },
         },
         "required": ["correlation_id", "body"],
@@ -318,6 +355,9 @@ fn build_agent_list(_args: Value) -> Result<Method, McpError> {
 }
 
 fn build_worktree_list(_args: Value) -> Result<Method, McpError> {
+    // Unfiltered on purpose: the tool exists to answer "what checkouts are
+    // there", and `workspace_id`/`cwd` would narrow the one call an agent
+    // makes to orient itself (#320 P1 audit).
     Ok(Method::WorktreeList(WorktreeListParams::default()))
 }
 
@@ -336,6 +376,9 @@ fn build_agent_lineage(args: Value) -> Result<Method, McpError> {
 fn build_agent_read(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentRead(AgentReadParams {
         target: required_string(&args, "target")?,
+        // Fixed to the recent buffer: `flock_pane_read` is the tool for
+        // choosing a source, and an agent-shaped read wants the scrollback,
+        // not whatever happens to be on screen (#320 P1 audit).
         source: ReadSource::Recent,
         lines: optional_lines(&args, "lines")?,
         format: ReadFormat::Text,
@@ -347,6 +390,10 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentFork(AgentForkParams {
         target: required_string(&args, "target")?,
         branch: optional_string(&args, "branch")?,
+        // Deliberate narrowings, not dropped fields (#320 P1 audit): `base`
+        // and `path` let a caller place a checkout anywhere on the operator's
+        // disk, and `focus` would let a background tool call yank the
+        // operator's screen to a pane they did not ask for.
         base: None,
         path: None,
         label: optional_string(&args, "label")?,
@@ -356,6 +403,10 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
 }
 
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
+    // `from_agent`/`from_host` stay unset on purpose: they are a RELAY's
+    // assertion about a sender it could not attest locally. The server reads
+    // this caller's identity from process ancestry, and letting an MCP client
+    // name itself would make the sender stamp a free-text claim.
     let to_value = args
         .get("to")
         .cloned()
@@ -376,7 +427,10 @@ fn build_msg_reply(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgReply(MsgReplyParams {
         correlation_id: required_string(&args, "correlation_id")?,
         body: required_string(&args, "body")?,
-        reply_correlation_id: None,
+        // Was hardcoded `None`, which left reply as the one message verb with
+        // no idempotency key: a retried reply delivered twice while a retried
+        // send deduplicated (#320 P1 audit).
+        reply_correlation_id: optional_string(&args, "reply_correlation_id")?,
     }))
 }
 
@@ -573,8 +627,116 @@ mod tests {
     }
 
     #[test]
+    fn build_msg_reply_carries_its_own_idempotency_key() {
+        // The P1 audit's find: reply was the one message verb whose retry
+        // could not deduplicate, because the MCP builder hardcoded `None`.
+        let method = build_msg_reply(json!({
+            "correlation_id": "c-orig",
+            "body": "answer",
+            "reply_correlation_id": "c-reply",
+        }))
+        .unwrap();
+        let Method::MsgReply(params) = method else {
+            panic!("expected MsgReply");
+        };
+        assert_eq!(params.correlation_id, "c-orig");
+        assert_eq!(params.reply_correlation_id.as_deref(), Some("c-reply"));
+
+        // Still optional — omitting it mints one server-side, as before.
+        let method = build_msg_reply(json!({"correlation_id": "c", "body": "b"})).unwrap();
+        let Method::MsgReply(params) = method else {
+            panic!("expected MsgReply");
+        };
+        assert!(params.reply_correlation_id.is_none());
+    }
+
+    #[test]
     fn build_msg_send_rejects_missing_to() {
         assert!(build_msg_send(json!({"body": "x"})).is_err());
+    }
+
+    #[test]
+    fn build_msg_send_parses_agent_target() {
+        let method = build_msg_send(json!({
+            "to": {"type": "agent", "agent": "agent_sage_6f21c4"},
+            "body": "cross-host",
+        }))
+        .unwrap();
+        let Method::MsgSend(params) = method else {
+            panic!("expected MsgSend");
+        };
+        match params.to {
+            MessageTarget::Agent { agent } => assert_eq!(agent, "agent_sage_6f21c4"),
+            other => panic!("expected agent target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_message_target_variant_is_expressible_through_the_schema() {
+        // The schema and `MessageTarget` are hand-written in two places and
+        // they drifted: `Agent` — the ONLY shape that crosses hosts — was
+        // absent from the schema for the whole life of the MCP surface, so no
+        // MCP client could message another machine while the CLI could (#320).
+        // The builder never had the bug; only the advertisement did, which is
+        // why nothing caught it. This test reads the advertisement.
+        let variants = [
+            MessageTarget::Pane {
+                pane: "ws1:p2".into(),
+            },
+            MessageTarget::RepoPane {
+                repo: "flock".into(),
+                pane: "p2".into(),
+            },
+            MessageTarget::Agent {
+                agent: "agent_sage_6f21c4".into(),
+            },
+        ];
+        // Compile-time exhaustiveness: a fourth variant has to break HERE,
+        // rather than quietly not being in the list above.
+        for variant in &variants {
+            match variant {
+                MessageTarget::Pane { .. }
+                | MessageTarget::RepoPane { .. }
+                | MessageTarget::Agent { .. } => {}
+            }
+        }
+
+        let schema = schema_msg_send();
+        let to = &schema["properties"]["to"];
+        let tags: Vec<&str> = to["properties"]["type"]["enum"]
+            .as_array()
+            .expect("`to.type` declares an enum of tags")
+            .iter()
+            .map(|tag| tag.as_str().expect("tags are strings"))
+            .collect();
+
+        for variant in variants {
+            let encoded = serde_json::to_value(&variant).unwrap();
+            let fields = encoded.as_object().expect("targets encode as objects");
+            let tag = fields["type"].as_str().unwrap();
+            assert!(
+                tags.contains(&tag),
+                "schema `to.type` enum is missing `{tag}`: {tags:?}"
+            );
+            for field in fields.keys() {
+                assert!(
+                    to["properties"].get(field).is_some(),
+                    "schema `to` declares no `{field}` property, so `{tag}` cannot be expressed"
+                );
+            }
+            // And what the schema advertises must actually build.
+            let method = build_msg_send(json!({"to": encoded, "body": "x"})).unwrap();
+            let Method::MsgSend(params) = method else {
+                panic!("expected MsgSend");
+            };
+            assert_eq!(params.to, variant);
+        }
+
+        assert_eq!(
+            tags.len(),
+            3,
+            "schema advertises a target shape `MessageTarget` does not have: {tags:?}"
+        );
     }
 
     #[test]
