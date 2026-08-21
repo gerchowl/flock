@@ -74,10 +74,30 @@ pub(crate) struct FireDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckListEntry {
     pub name: String,
+    /// Which scheduler table this row came from: `script` or `cron`. The
+    /// App adds the built-in kinds (`blocked_alert`, `hibernation`,
+    /// `issue_guard`, `reap`) — those live in config, not in the runner.
+    pub kind: &'static str,
     pub consecutive_fails: u32,
     pub last_outcome: Option<&'static str>,
     pub fired_this_episode: bool,
     pub acked: bool,
+    /// Next scheduled fire as unix wall-clock ms. Authoritative for crons
+    /// (`CronRuntimeState::next_fire_wall_ms`); DERIVED for scripts, whose
+    /// `next_due` is an `Instant` — see [`CheckRunner::list_entries`].
+    pub next_fire_wall_ms: Option<u64>,
+    /// When this check last fired, unix wall-clock ms. Crons only: the
+    /// script fire path (`complete`) carries no wall anchor, and its
+    /// `last_outcome` + `consecutive_fails` already answer "did it trip".
+    pub last_fire_wall_ms: Option<u64>,
+    /// Slots skipped by the most recent asleep-collapse (crons only). The
+    /// collapse rule fires ONCE however many slots were missed, which is
+    /// surprising unless the count is visible.
+    pub missed_fires: u32,
+    /// The cron expression text, echoed for crons so `flk checks list`
+    /// shows what is actually enrolled rather than just a name.
+    pub cron_expr: Option<String>,
+    pub cron_tz: Option<CronTz>,
 }
 
 /// One check ready to run (returned by `next_runnable`). The App spawns the
@@ -109,6 +129,14 @@ pub(crate) struct CronRuntimeState {
     pub on_fire: ActionSpec,
     /// The next epoch millisecond the predicate should fire at.
     pub next_fire_wall_ms: u64,
+    /// Wall-clock ms of the most recent fire, `None` until it first fires.
+    /// Stamped by [`CheckRunner::tick_crons`], which already holds the
+    /// authoritative clock — no extra clock read.
+    pub last_fire_wall_ms: Option<u64>,
+    /// `missed_fires` from the most recent fire. Reset on every fire, not
+    /// cumulative: the question this answers is "was the last fire a
+    /// collapse", not "how many slots has this cron ever missed".
+    pub last_missed_fires: u32,
 }
 
 /// A cron firing surfaced by `tick_crons` — one per collapsed episode. See
@@ -270,6 +298,8 @@ impl CheckRunner {
                     break;
                 }
             }
+            cron.last_fire_wall_ms = Some(now_wall_ms);
+            cron.last_missed_fires = missed;
             out.push(CronFireDecision {
                 name: name.clone(),
                 run_id: cron_run_id(name, scheduled),
@@ -398,12 +428,26 @@ impl CheckRunner {
 
     /// Enumerate every enrolled script check with a coarse
     /// (last_outcome, consecutive_fails) view for `flk checks list`.
-    pub(crate) fn list_entries(&self) -> Vec<CheckListEntry> {
+    /// Every enrolled check the runner owns — scripts AND crons.
+    ///
+    /// Crons were invisible here until #330: they tick, they fire, and the
+    /// only inspection surface listed neither them nor when anything fires
+    /// next. Both tables are folded into one row set so `flk checks list`
+    /// shows the full scheduled set.
+    ///
+    /// `now` / `now_wall_ms` must name the SAME instant. A script's
+    /// `next_due` is an `Instant` (monotonic, so it survives a wall-clock
+    /// step); wall-clock ms is what a client can render. The projection
+    /// `now_wall_ms + (next_due - now)` needs both halves of that anchor,
+    /// and saturates to `now_wall_ms` for an already-due check rather than
+    /// reporting a time in the past.
+    pub(crate) fn list_entries(&self, now: Instant, now_wall_ms: u64) -> Vec<CheckListEntry> {
         let mut out: Vec<CheckListEntry> = self
             .state
             .iter()
             .map(|(name, state)| CheckListEntry {
                 name: name.clone(),
+                kind: "script",
                 consecutive_fails: state.consecutive_fails,
                 last_outcome: state.last_outcome.as_ref().map(|outcome| match outcome {
                     Outcome::Fire => "fire",
@@ -412,8 +456,37 @@ impl CheckRunner {
                 }),
                 fired_this_episode: state.fired_this_episode,
                 acked: state.ack_until.is_some(),
+                next_fire_wall_ms: Some(
+                    now_wall_ms.saturating_add(
+                        state
+                            .next_due
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    ),
+                ),
+                last_fire_wall_ms: None,
+                missed_fires: 0,
+                cron_expr: None,
+                cron_tz: None,
             })
             .collect();
+        out.extend(self.crons.iter().map(|(name, cron)| CheckListEntry {
+            name: name.clone(),
+            kind: "cron",
+            // A cron has no debounce and no pass/fail outcome — it fires on
+            // a schedule. Reporting 0/None here is the honest read of a
+            // field that genuinely does not apply to this kind.
+            consecutive_fails: 0,
+            last_outcome: None,
+            fired_this_episode: false,
+            acked: false,
+            next_fire_wall_ms: Some(cron.next_fire_wall_ms),
+            last_fire_wall_ms: cron.last_fire_wall_ms,
+            missed_fires: cron.last_missed_fires,
+            cron_expr: Some(cron.expr.to_string()),
+            cron_tz: Some(cron.tz),
+        }));
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -469,6 +542,8 @@ where
                 tz: cron.tz,
                 on_fire: cron.on_fire.clone(),
                 next_fire_wall_ms,
+                last_fire_wall_ms: None,
+                last_missed_fires: 0,
             },
         );
     }
@@ -673,6 +748,97 @@ mod tests {
             }],
             ..ChecksConfig::default()
         }
+    }
+
+    /// #330: crons ticked and fired but `list_entries` showed only scripts,
+    /// so the one inspection surface was blind to half the scheduler.
+    #[test]
+    fn list_entries_includes_crons_with_their_schedule() {
+        let now = Instant::now();
+        let base_wall = 1_700_000_000_000u64 - (1_700_000_000_000u64 % 60_000);
+        let runner =
+            CheckRunner::from_config_at(&cron_config("nightly", "0 3 * * *"), now, base_wall);
+
+        let entries = runner.list_entries(now, base_wall);
+        let cron = entries
+            .iter()
+            .find(|e| e.name == "nightly")
+            .expect("cron must appear in list_entries");
+
+        assert_eq!(cron.kind, "cron");
+        assert_eq!(cron.cron_expr.as_deref(), Some("0 3 * * *"));
+        assert_eq!(cron.cron_tz, Some(CronTz::Utc));
+        // Never fired yet: no last fire, no collapse count.
+        assert_eq!(cron.last_fire_wall_ms, None);
+        assert_eq!(cron.missed_fires, 0);
+        // The next fire is authoritative wall-clock, strictly in the future.
+        let next = cron.next_fire_wall_ms.expect("cron carries a next fire");
+        assert!(
+            next > base_wall,
+            "next fire {next} must be after {base_wall}"
+        );
+    }
+
+    /// The collapse count is surprising unless it is visible: one fire for
+    /// nine skipped slots must READ as one fire that skipped nine.
+    #[test]
+    fn list_entries_reports_last_fire_and_collapse_count() {
+        let now = Instant::now();
+        let base_wall = 1_700_000_000_000u64 - (1_700_000_000_000u64 % 60_000);
+        let mut runner =
+            CheckRunner::from_config_at(&cron_config("every-min", "* * * * *"), now, base_wall);
+
+        // Sleep ten minutes past the first slot, then tick once.
+        let woke_at = base_wall + 60_000 * 10;
+        let fires = runner.tick_crons(woke_at);
+        assert_eq!(fires.len(), 1, "collapse rule: one fire per wake");
+        let collapsed = fires[0].missed_fires;
+        assert!(collapsed > 0, "the fixture must actually collapse slots");
+
+        let entries = runner.list_entries(now, woke_at);
+        let cron = entries.iter().find(|e| e.name == "every-min").unwrap();
+        assert_eq!(cron.last_fire_wall_ms, Some(woke_at));
+        assert_eq!(
+            cron.missed_fires, collapsed,
+            "the listed collapse count must match what actually fired"
+        );
+    }
+
+    /// A script's `next_due` is an `Instant`; clients need wall-clock ms.
+    /// The projection must use the caller's anchor, and must never report a
+    /// due-in-the-past as a past timestamp.
+    #[test]
+    fn list_entries_projects_script_next_due_onto_the_wall_anchor() {
+        let now = Instant::now();
+        let wall = 1_700_000_000_000u64;
+        let mut runner =
+            CheckRunner::from_config_at(&config_with_script("deploy-probe", 300, 1, 4), now, wall);
+
+        let entry = |r: &CheckRunner, at: Instant, at_wall: u64| -> CheckListEntry {
+            r.list_entries(at, at_wall)
+                .into_iter()
+                .find(|e| e.name == "deploy-probe")
+                .expect("script row")
+        };
+
+        let row = entry(&runner, now, wall);
+        assert_eq!(row.kind, "script");
+        // Enrolled one min-tick out (min_tick_secs = 1 in the fixture).
+        assert_eq!(row.next_fire_wall_ms, Some(wall + 1_000));
+        // Scripts carry no cron fields — reporting an expression here would
+        // be a lie about which table the row came from.
+        assert_eq!(row.cron_expr, None);
+        assert_eq!(row.cron_tz, None);
+
+        // Past-due must saturate to the anchor, not underflow into the past.
+        runner.force_due("deploy-probe", now);
+        let later = now + Duration::from_secs(30);
+        let row = entry(&runner, later, wall + 30_000);
+        assert_eq!(
+            row.next_fire_wall_ms,
+            Some(wall + 30_000),
+            "an overdue check reports 'now', never a timestamp in the past"
+        );
     }
 
     #[test]
