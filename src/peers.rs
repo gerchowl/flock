@@ -758,7 +758,32 @@ pub fn send_peer_message(
     from_host: &str,
     body: &str,
     correlation_id: &str,
+    in_reply_to: Option<&str>,
 ) -> Result<(), String> {
+    let remote = peer_message_command(
+        to_agent,
+        from_agent,
+        from_host,
+        body,
+        correlation_id,
+        in_reply_to,
+    )?;
+    run_peer_ssh(peer, &remote).map(|_| ())
+}
+
+/// Build the `sh -lc …` the relay hands to the owning server.
+///
+/// Split out from [`send_peer_message`] so the quoting and the id guard — the
+/// two things here that have actually been wrong in production — can be
+/// asserted without an SSH round trip.
+fn peer_message_command(
+    to_agent: &str,
+    from_agent: &str,
+    from_host: &str,
+    body: &str,
+    correlation_id: &str,
+    in_reply_to: Option<&str>,
+) -> Result<String, String> {
     // Ids are server-minted and travel into a remote shell command; refuse
     // anything that could escape it (same guard shape as checkout-prepare).
     for (label, value) in [
@@ -766,7 +791,10 @@ pub fn send_peer_message(
         ("sender id", from_agent),
         ("sender host", from_host),
         ("correlation id", correlation_id),
-    ] {
+    ]
+    .into_iter()
+    .chain(in_reply_to.map(|id| ("in-reply-to id", id)))
+    {
         if value.is_empty()
             || !value
                 .chars()
@@ -775,6 +803,14 @@ pub fn send_peer_message(
             return Err(format!("invalid {label}: {value:?}"));
         }
     }
+    // Threading has to survive the hop as well as the message does. Without
+    // `--reply-to` a cross-host answer arrived with `in_reply_to` empty, so an
+    // agent that had asked two questions could not tell which one it had just
+    // been answered — the reply routed home and still lost the one field that
+    // made it an answer.
+    let reply_to = in_reply_to
+        .map(|id| format!(" --reply-to {id}"))
+        .unwrap_or_default();
     // Quote ONCE, at the outside. The body is caller-supplied and cannot be
     // validated like the ids, so it must never reach the remote shell as
     // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
@@ -787,11 +823,10 @@ pub fn send_peer_message(
     // idiom at both levels rather than by hand at one.
     let inner = format!(
         "flk msg send --agent {to_agent} --from-agent {from_agent} --from-host {from_host} \
-         --correlation-id {correlation_id} --json -- {}",
+         --correlation-id {correlation_id}{reply_to} --json -- {}",
         shell_single_quote(body)
     );
-    let remote = format!("sh -lc {}", shell_single_quote(&inner));
-    run_peer_ssh(peer, &remote).map(|_| ())
+    Ok(format!("sh -lc {}", shell_single_quote(&inner)))
 }
 
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
@@ -925,6 +960,57 @@ mod tests {
         let outer = super::shell_single_quote(&inner);
         assert!(outer.starts_with('\''), "{outer}");
         assert!(outer.contains("a b c"), "body must survive: {outer}");
+    }
+
+    #[test]
+    fn a_relayed_message_carries_its_threading() {
+        // The reply routed home and arrived unthreaded: `relay_message_to_host`
+        // filled `in_reply_to`, and the relay command dropped it on the floor
+        // (#320). An answer that cannot be matched to its question is not an
+        // answer when an agent has more than one outstanding.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "pong",
+            "c-reply",
+            Some("c-question"),
+        )
+        .expect("valid ids");
+        assert!(
+            command.contains("--reply-to c-question"),
+            "threading must reach the owning server: {command}"
+        );
+
+        // A first message has nothing to thread to, and must not grow an
+        // empty flag the remote CLI would then reject.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "ping",
+            "c-first",
+            None,
+        )
+        .expect("valid ids");
+        assert!(!command.contains("--reply-to"), "{command}");
+    }
+
+    #[test]
+    fn a_threading_id_is_guarded_like_every_other_id() {
+        // Every id in this command is interpolated into a remote shell, so the
+        // new one is guarded by the same rule as the rest rather than trusted
+        // for being server-minted.
+        let err = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "pong",
+            "c-reply",
+            Some("c'; rm -rf /"),
+        )
+        .expect_err("a shell-escaping id must be refused");
+        assert!(err.contains("in-reply-to id"), "{err}");
     }
     #[test]
     fn to_wire_dedups_origin_and_caps_peer_count() {

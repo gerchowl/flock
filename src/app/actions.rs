@@ -7750,6 +7750,61 @@ mod tests {
         assert!(!state.scroll_prompt_history(3, 10));
     }
 
+    /// #328: the seam the panel actually runs through. `claude_session_id`
+    /// used to read `hook_authority` only, but Claude is a reserved native
+    /// state source, so `HookStateReported` routes its session ref into
+    /// `persisted_agent_session` instead — leaving hydration permanently
+    /// un-armed and the panel showing hook-appended prompts with no replies.
+    ///
+    /// Driven through `handle_app_event` on purpose: every existing test on
+    /// this surface sets `hook_authority` directly and so never exercised the
+    /// routing that breaks it.
+    #[test]
+    fn a_claude_hook_report_arms_transcript_hydration() {
+        use crate::agent_transcript::TranscriptDetail;
+
+        let mut state = app_with_workspaces(&["a"]);
+        state.active = Some(0);
+        let pane = state.workspaces[0].focused_pane_id().expect("focused pane");
+
+        assert_eq!(
+            state.take_due_transcript_hydration(pane),
+            None,
+            "nothing is due before any hook has named a session",
+        );
+
+        // Exactly what `flk hook claude session` posts over the socket.
+        let _ = state.handle_app_event(AppEvent::HookStateReported {
+            pane_id: pane,
+            source: "flock:claude".into(),
+            agent_label: "claude".into(),
+            state: AgentState::Working,
+            message: None,
+            custom_status: None,
+            seq: Some(1),
+            session_ref: crate::agent_resume::session_ref_from_report(
+                "flock:claude",
+                "claude",
+                Some("11111111-2222-3333-4444-555555555555".into()),
+                None,
+            ),
+        });
+
+        assert_eq!(
+            state.take_due_transcript_hydration(pane),
+            Some((
+                "11111111-2222-3333-4444-555555555555".to_string(),
+                TranscriptDetail::Reply
+            )),
+            "a Claude hook report carrying the session id must make hydration due",
+        );
+        assert_eq!(
+            state.take_due_transcript_hydration(pane),
+            None,
+            "and it must stay a once-per-(session, detail) arm",
+        );
+    }
+
     /// #246/#254: cycling only makes sense while the panel is open. The scroll
     /// offset is NOT reset any more — the anchor survives the re-read, so
     /// asking for more detail no longer throws the reader to the newest turn.

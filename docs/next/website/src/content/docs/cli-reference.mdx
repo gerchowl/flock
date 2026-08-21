@@ -319,19 +319,40 @@ flk mcp serve
 
 Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on stdin/stdout. Wire it into an MCP client (Claude Desktop, `mcp` CLI, agent runners) to give an agent a read-mostly view of the flock — list agents, read panes, fork Claude conversations, send/reply pane-to-pane messages, and walk fork lineage. `FLOCK_SOCKET_PATH` selects the flock server socket; the default is the current session's.
 
+### Addressing across hosts
+
+A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
+
+The two-step is the whole story:
+
+```jsonc
+// 1. flock_agent_list  →  find the agent, wherever it is
+{ "fleet": [
+  { "agent_id": "agent_sage_6f21c4", "host": "sage",  "local": false, "route": "sage" },
+  { "agent_id": "agent_mba22_9d0e17", "host": "mba22", "local": true,  "pane_id": "w1:p2" }
+]}
+
+// 2. flock_msg_send  →  address it by identity
+{ "to": { "type": "agent", "agent": "agent_sage_6f21c4" }, "body": "…" }
+```
+
+Replies need no addressing at all: `flock_msg_reply` carries the incoming `correlation_id` and the server routes it home by identity.
+
+A cross-host send is refused, never dropped: `msg_target_not_found` (no such agent anywhere in the fleet), `peer_not_configured` (found it, but its host is not in this server's `[[peers]]`), `msg_not_allowed` (the receiver's `[msg] allow_from` declines), `sender_unresolved` (the caller has no attestable identity — a cross-host send must come from inside a pane, which is where an MCP client normally runs).
+
 The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
 Exposed tools:
 
 | Tool | Wraps | Notes |
 | --- | --- | --- |
-| `flock_agent_list` | `agent.list` | `blocked` agents need attention. |
+| `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
 | `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
 | `flock_agent_read` | `agent.read` | Reading marks the pane seen — use sparingly. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
-| `flock_msg_send` | `msg.send` | Delivered at the recipient's next settled idle boundary. |
-| `flock_msg_reply` | `msg.reply` | Routes to the original sender's pane. |
+| `flock_msg_send` | `msg.send` | Delivered at the recipient's next settled idle boundary. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
+| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
 | `flock_pane_read` | `pane.read` | Same seen caveat as `agent.read`. |

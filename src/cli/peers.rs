@@ -5,6 +5,8 @@
 )]
 use crate::api::schema::{EmptyParams, Method, PeersCheckoutPrepareParams, Request};
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -315,6 +317,18 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
 /// it is a snapshot, so when changes arrive faster than the debounce only the
 /// latest matters, and dropping the intermediates is free rather than lossy.
 ///
+/// The debounce is TRAILING-edge, and that distinction is the whole of #4.
+/// Leading-edge coalescing drops every event inside the window, which is
+/// harmless while events keep coming — the next one carries what the dropped
+/// ones would have said — and silently wrong the moment a burst ENDS inside
+/// the window. That is not an edge case: it is what every state change looks
+/// like. An agent goes working, then idle 300ms later; the first event pushes
+/// a snapshot saying "working", the second is dropped, and no further event is
+/// coming because the node just went quiet. The hub then shows "working" until
+/// a poll happens to find the push slot empty. Deferring the event instead of
+/// dropping it keeps the same at-most-one-push-per-window guarantee while
+/// making the LAST state always the one that ships.
+///
 /// Distinguished from a response by carrying `push` instead of `id`, so the
 /// hub can route it without guessing.
 fn start_summary_push(socket: std::path::PathBuf) {
@@ -339,28 +353,46 @@ fn start_summary_push(socket: std::path::PathBuf) {
         // reason — the failure mode that hid a rejected subscription until a
         // live run caught it.
         let mut ack = String::new();
-        if reader.read_line(&mut ack).is_err() {
-            return;
+        match reader.read_line(&mut ack) {
+            // EOF with no answer at all: the server closed instead of
+            // acknowledging. Reported rather than treated as success — logging
+            // "subscription active" for a subscription that will never deliver
+            // is the same silent-failure shape this ack check was added to
+            // remove.
+            Ok(0) => {
+                crate::logging::peer_push_subscribe_failed("stream closed without an ack");
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => return,
         }
         if ack.contains("\"error\"") {
             crate::logging::peer_push_subscribe_failed(ack.trim());
             return;
         }
         crate::logging::peer_push_subscribed(PUSH_SUBSCRIPTIONS.len());
-        let mut last_push = std::time::Instant::now() - SUMMARY_PUSH_DEBOUNCE;
-        // Counted, not just dropped: "5 events became 1 push" is the evidence
-        // coalescing is working, and its absence is the evidence it is not.
-        let mut coalesced: u64 = 0;
-        for _ in reader.lines().map_while(Result::ok) {
-            // Coalesce: a burst of changes is worth one fresh snapshot, not
-            // one per event. Skipping is safe precisely because the payload is
-            // a snapshot — the next push carries everything the skipped ones
-            // would have said.
-            if last_push.elapsed() < SUMMARY_PUSH_DEBOUNCE {
-                coalesced += 1;
-                continue;
+
+        // The reader parks on the event stream; the pusher below wakes on the
+        // debounce. Splitting them is what makes the trailing edge possible at
+        // all — a single loop blocked in `lines()` cannot notice that a window
+        // has expired with an event still owed.
+        let debounce = PushDebounce::default();
+        let reader_debounce = debounce.clone();
+        std::thread::spawn(move || {
+            for _ in reader.lines().map_while(Result::ok) {
+                reader_debounce.note_event();
             }
-            last_push = std::time::Instant::now();
+            reader_debounce.note_closed();
+        });
+
+        loop {
+            std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+            let Some(coalesced) = debounce.take_due() else {
+                if debounce.is_finished() {
+                    return;
+                }
+                continue;
+            };
             let Ok(mut summary_stream) = std::os::unix::net::UnixStream::connect(&socket) else {
                 continue;
             };
@@ -392,9 +424,67 @@ fn start_summary_push(socket: std::path::PathBuf) {
                 return;
             }
             drop(out);
-            crate::logging::peer_push_emitted(std::mem::take(&mut coalesced));
+            crate::logging::peer_push_emitted(coalesced);
         }
     });
+}
+
+/// Trailing-edge debounce state, shared between the event reader and the
+/// pusher (#4).
+///
+/// Split out of the thread bodies so the property that matters is testable
+/// without sockets or sleeps: an event arriving inside a window is DEFERRED to
+/// the end of it, never dropped. The leading-edge version this replaced could
+/// only be wrong when a burst ended inside the window — which is what every
+/// state change on a node that then goes quiet looks like.
+#[derive(Clone, Default)]
+struct PushDebounce {
+    /// A push is owed.
+    pending: Arc<AtomicBool>,
+    /// The event stream ended; stop once nothing is owed.
+    closed: Arc<AtomicBool>,
+    /// Events folded into the owed push. Counted, not merely dropped: "5
+    /// events became 1 push" is the evidence coalescing works, and its absence
+    /// is the evidence it does not.
+    ///
+    /// Deliberately not synchronised with `pending`: a thread preempted between
+    /// the two can attribute one event to the neighbouring push. That is ±1 on
+    /// a diagnostic counter, and paying a lock on every event to make a log
+    /// field exact would be a poor trade.
+    coalesced: Arc<AtomicU64>,
+}
+
+impl PushDebounce {
+    /// Reader side: this node changed.
+    fn note_event(&self) {
+        // Already owed a push? Then this event folds into it. That is the
+        // coalescing — the difference from the leading-edge version is that
+        // the fold is into a push that WILL happen, not one that already did.
+        if self.pending.swap(true, Ordering::AcqRel) {
+            self.coalesced.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Reader side: the event stream ended.
+    fn note_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Pusher side: is a push owed now? Returns how many events folded into it.
+    fn take_due(&self) -> Option<u64> {
+        self.pending
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.coalesced.swap(0, Ordering::Relaxed))
+    }
+
+    /// Pusher side: nothing more will ever be owed.
+    ///
+    /// Deliberately only meaningful AFTER `take_due` returned `None` — a final
+    /// event that landed in the same window as the disconnect must still ship,
+    /// and the outgoing pipe long outlives the subscription stream.
+    fn is_finished(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
 }
 
 /// Fastest cadence at which state pushes leave a node. Not configurable: the
@@ -500,6 +590,77 @@ fn print_peers_help() {
 
 #[cfg(test)]
 mod tests {
+    use super::PushDebounce;
+
+    /// #4, the whole bug in one assertion. A burst that ENDS inside the
+    /// debounce window must still ship its final state.
+    ///
+    /// The leading-edge version pushed on the first event and dropped the
+    /// rest, which is harmless while events keep arriving — the next one
+    /// carries what the dropped ones would have said — and silently wrong the
+    /// moment the node goes quiet. An agent goes working, then idle 300ms
+    /// later, then nothing: the hub was told "working" and never corrected.
+    #[test]
+    fn the_last_event_of_a_burst_still_produces_a_push() {
+        let debounce = PushDebounce::default();
+
+        // A burst: three changes inside one window.
+        debounce.note_event();
+        debounce.note_event();
+        debounce.note_event();
+
+        // The window expires. One push, carrying all three.
+        assert_eq!(
+            debounce.take_due(),
+            Some(2),
+            "three events are one push, with two folded in"
+        );
+
+        // Nothing further owed while the node is quiet.
+        assert_eq!(debounce.take_due(), None, "a quiet node pushes nothing");
+
+        // The event that used to be lost: it lands after a push has already
+        // gone out, and nothing else follows it.
+        debounce.note_event();
+        assert_eq!(
+            debounce.take_due(),
+            Some(0),
+            "the trailing event of a burst is deferred, never dropped"
+        );
+    }
+
+    /// A disconnect must not strand a push that was already owed — the
+    /// outgoing pipe outlives the subscription stream, so the final state can
+    /// still be delivered.
+    #[test]
+    fn a_close_racing_the_last_event_still_ships_it() {
+        let debounce = PushDebounce::default();
+        debounce.note_event();
+        debounce.note_closed();
+
+        assert_eq!(
+            debounce.take_due(),
+            Some(0),
+            "an owed push survives the stream ending"
+        );
+        assert!(debounce.is_finished(), "and only then does the pusher stop");
+    }
+
+    /// Coalescing must reset per push, or the count becomes a running total
+    /// and stops meaning "how many events this push represents".
+    #[test]
+    fn the_coalesced_count_is_per_push() {
+        let debounce = PushDebounce::default();
+        debounce.note_event();
+        debounce.note_event();
+        assert_eq!(debounce.take_due(), Some(1));
+
+        debounce.note_event();
+        debounce.note_event();
+        debounce.note_event();
+        assert_eq!(debounce.take_due(), Some(2), "not 3 — the count reset");
+    }
+
     use super::*;
 
     fn args(items: &[&str]) -> Vec<String> {
