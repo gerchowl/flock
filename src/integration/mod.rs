@@ -2980,6 +2980,32 @@ mod tests {
         std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
     }
 
+    /// The scrub only works if `env_remove` suppresses INHERITANCE rather
+    /// than merely un-setting something the builder set itself. It does:
+    /// `CommandBuilder::new` seeds its map from `std::env::vars_os()` at
+    /// construction, and that map IS the child's environment — so removing a
+    /// key that was never explicitly set still keeps it from the child.
+    ///
+    /// Pinned here because if it were the other way round, every assertion
+    /// below would pass while the scrub did nothing at all.
+    #[test]
+    fn env_remove_suppresses_an_inherited_var_not_just_an_explicit_one() {
+        std::env::set_var("FLOCK_TEST_INHERITED", "from-the-parent");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        assert_eq!(
+            cmd.get_env("FLOCK_TEST_INHERITED").and_then(|v| v.to_str()),
+            Some("from-the-parent"),
+            "the builder must start from the parent environment"
+        );
+        cmd.env_remove("FLOCK_TEST_INHERITED");
+        assert_eq!(
+            cmd.get_env("FLOCK_TEST_INHERITED"),
+            None,
+            "removing an inherited key must keep it from the child"
+        );
+        std::env::remove_var("FLOCK_TEST_INHERITED");
+    }
+
     /// #329: a pty child inherits the operator's environment wholesale. For
     /// a pane the operator started that is correct. For one another AGENT
     /// asked for, it silently hands a process the operator's GitHub push

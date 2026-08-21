@@ -23,6 +23,12 @@ impl App {
         // Resolving the caller first made a disabled node report
         // `spawn_caller_unknown`, which sends an operator debugging identity
         // when the real answer is "you never turned this on".
+        // `admit` re-checks both below. That duplication is deliberate: the
+        // gate stays the single source of truth for the ORDER of refusals,
+        // while these two run before caller attestation so the answer to
+        // "why did nothing happen" is the real reason rather than an
+        // identity puzzle. Neither can drift, because both read the same
+        // config.
         let fleet = self.state.config.fleet;
         if !fleet.agent_spawn_enabled {
             let refusal = SpawnRefusal::NotEnabled;
@@ -118,9 +124,19 @@ impl App {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
 
-        let caller_agent_id = self
-            .agent_id_for_pane(caller_ws, caller_pane)
-            .unwrap_or_default();
+        // Refuse rather than invent an id. `unwrap_or_default()` would stamp
+        // `spawned_by = Some("")`, and every child with that empty parent
+        // would then share ONE fanout counter — so a second dispatcher's
+        // children would count against the first's limit, and neither would
+        // be attributable.
+        let Some(caller_agent_id) = self.agent_id_for_pane(caller_ws, caller_pane) else {
+            return encode_error_with_data(
+                id,
+                "spawn_caller_unknown",
+                "the calling pane has no agent identity to record as the child's parent",
+                serde_json::json!({ "refusal": "spawn_caller_unknown", "retryable": false }),
+            );
+        };
         let run_id = crate::app::worktrees::generated_fork_run_id();
         self.install_run_trailer_if_enabled(&cwd);
         // Guard, not a bare set: a spawn failure below must disarm the id, or
@@ -186,6 +202,11 @@ impl App {
             // counted: the cap bounds what agents do, and counting the
             // operator's work against it would make a busy human shrink the
             // fleet's headroom for no safety gain.
+            // "Live" means present in `state.terminals`, which includes a
+            // HIBERNATED agent: its pane is parked but resumable, and its
+            // worktree still exists. Counting it is the conservative read —
+            // a fleet that forgot about parked agents would admit past the
+            // cap and then find them all resumed at once.
             live_agent_started: self
                 .state
                 .terminals
