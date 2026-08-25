@@ -774,6 +774,17 @@ impl AppState {
                     // share a `row`, so this is safe to run before the card
                     // hit-tests below.
                     if let Some(key) = self.space_header_at_row(mouse.row) {
+                        // #331: a solo project renders a header that CANNOT
+                        // fold. Toggling it anyway looks like a no-op but
+                        // writes latent state: when a federated peer sharing
+                        // the project later appears, the section crosses into
+                        // the >= 2 aggregate path — which DOES honour
+                        // `collapsed_space_keys` — and folds itself out of
+                        // nowhere. Suppressing the triangle was not enough —
+                        // the click itself has to be inert.
+                        if !self.collapsible_space_keys().contains(&key) {
+                            return None;
+                        }
                         if self.collapsed_space_keys.contains(&key) {
                             self.collapsed_space_keys.remove(&key);
                         } else {
@@ -1195,11 +1206,15 @@ impl AppState {
                 if let Some(key) = self.space_header_at_row(mouse.row) {
                     let collapsed = self.collapsed_space_keys.contains(&key);
                     let sole_local = self.local_section_member_count(&key) == 1;
+                    // Same reason as the left-click guard above: a section
+                    // that cannot fold must not be OFFERED a fold.
+                    let collapsible = self.collapsible_space_keys().contains(&key);
                     self.context_menu = Some(ContextMenuState {
                         kind: ContextMenuKind::SpaceHeader {
                             key,
                             collapsed,
                             sole_local,
+                            collapsible,
                         },
                         x: mouse.column,
                         y: mouse.row,
@@ -2391,6 +2406,47 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         assert_eq!(app.state.server_filter, None);
+    }
+
+    /// #331 review: suppressing the fold TRIANGLE on a solo header was not
+    /// enough — the click handler still toggled `collapsed_space_keys`.
+    ///
+    /// That looks like a harmless no-op, because the solo render path
+    /// ignores collapse state. It is not: the flag persists, and when a
+    /// federated peer sharing the project later appears, the section crosses
+    /// into the >= 2 aggregate path, which DOES honour the flag — and the
+    /// section renders collapsed out of nowhere, with no click to explain it.
+    #[tokio::test]
+    async fn clicking_a_non_collapsible_header_writes_no_latent_collapse_state() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![workspace_with_project("flock", "github.com/gerchowl/flock")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
+
+        let header = app
+            .state
+            .view
+            .space_header_areas
+            .first()
+            .cloned()
+            .expect("a solo project renders a header");
+        assert!(
+            !app.state.collapsible_space_keys().contains(&header.key),
+            "fixture must be a solo, non-collapsible section"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            header.rect.x + 2,
+            header.rect.y,
+        ));
+        assert!(
+            app.state.collapsed_space_keys.is_empty(),
+            "a header that cannot fold must not record a collapse: {:?}",
+            app.state.collapsed_space_keys
+        );
     }
 
     #[tokio::test]
