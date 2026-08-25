@@ -1,7 +1,7 @@
 # ADR 0014 — An agent may start an agent, but only through a narrowed verb with a lineage-aware ceiling
 
-- Status: Proposed
-- Date: 2026-08-21
+- Status: Accepted
+- Date: 2026-08-21 (accepted 2026-08-21)
 - Issues: #329 (the tool + the cap); consumes #332's run-id join; constrained
   by ADR-0005 (durable event log as the audit substrate) and ADR-0006
   (structured addressing, never a flat string).
@@ -50,6 +50,13 @@ tool-table review will not catch it because the type still says "argv is a
 `handle_agent_start` also performs none of the run-id minting, trailer
 installation, or lineage recording that the fork path does. Bolting those onto
 `AgentStart` would retroactively change what the CLI verb does.
+
+The **tool** an agent calls is nevertheless named `flock_agent_start`: tool
+names describe intent ("start an agent"), and an agent hunting for that
+capability should find it under that name. What it builds is
+`Method::AgentSpawn`. `Method::AgentStart` stays off the MCP surface, so the
+split is exactly the point — the label is ergonomics, the Method is the
+constraint, and only one of the two survives a careless refactor.
 
 **The invariant belongs in the type system.** `AgentSpawn` carries a closed
 `AgentKind` enum (argv assembled server-side), and the trailer/lineage code runs
@@ -146,6 +153,31 @@ It should ship with the allowlist logged at spawn.
 **Not settled here.** Whether the depth default of 2 is right — it is a guess
 until there is telemetry. Ship it refusing at 2 and widen on evidence, because
 widening a limit is a decision and narrowing one is an incident.
+
+## Implementation status
+
+Accepted means the decision is committed to, not that every part is built.
+As of acceptance (#345):
+
+| § | decision | state |
+| --- | --- | --- |
+| 1 | `Method::AgentSpawn`, closed `AgentKind`, server-side argv | landed |
+| 2 | location as a union over known checkouts | landed, minus `new_branch` — a caller creates the checkout first and spawns into it by path |
+| 3 | env allowlist | **not landed** (#347). Ships as a credential DENY-list instead. An allowlist needs per-agent knowledge of what each CLI requires, and getting it wrong fails as a mysterious startup break rather than a clean refusal. The allowlist remains the target; the deny-list removes the sharpest edge without that risk |
+| 4 | untrusted prompt: system-owned preamble, control-byte refusal | **not landed** (#348). The prompt is length-capped and passed as one argv element, so nothing reaches a shell — but a foreman's prompts come from issue bodies, and neither the preamble nor the byte filter exists yet |
+| 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
+| 6 | ceiling in the shared spawn funnel | **partial** (#349). It gates `agent.spawn`. `agent.fork` and the TUI keyboard fork do not consult it, so an operator's own forking is unbounded — correct for a human, but it means the capacity count and the thing it protects are not yet the same funnel |
+| 7 | `fleet pause` refuses agent-initiated spawn | landed |
+| 8 | refusals separate retryable from terminal | landed |
+
+The three gaps are #347, #348 and #349 — tracked as issues rather than left
+in this table, because an Accepted ADR whose unbuilt parts live only in prose
+is how they get forgotten.
+
+#349 is the one that bites soonest: `flock_agent_fork` is already on the MCP
+surface and does not consult the ceiling, so an agent refused by
+`at_agent_capacity` can fork instead. The cap is not closed until that path
+shares the gate.
 
 ## Alternatives rejected
 
