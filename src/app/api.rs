@@ -12,6 +12,7 @@ mod panes;
 pub(crate) mod peers;
 mod responses;
 mod revert;
+mod spawn;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -1183,6 +1184,7 @@ impl App {
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentFork(params) => return self.handle_agent_fork(request.id, params),
+            Method::AgentSpawn(params) => return self.handle_agent_spawn(request.id, params),
             Method::AgentHibernate(target) => {
                 return self.handle_agent_hibernate(request.id, target)
             }

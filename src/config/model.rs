@@ -481,6 +481,8 @@ pub struct Config {
     pub web: WebSectionConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
+    /// `[fleet]` — limits on agent-initiated spawn (#329, ADR-0014).
+    pub fleet: crate::spawn::FleetConfig,
     pub msg: MsgConfig,
     pub peers: Vec<PeerConfig>,
 }

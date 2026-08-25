@@ -261,6 +261,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_msg_read",
             "flock_pane_read",
             "flock_worktree_list",
+            "flock_agent_start",
         ]
     );
     for tool in tools {
