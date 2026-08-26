@@ -3664,6 +3664,60 @@ sidebar_pane_gap = 99
     }
 
     #[tokio::test]
+    async fn an_untargeted_agent_start_gets_its_own_space_as_the_only_pane() {
+        // Asking for an agent with no placement used to SPLIT the active
+        // workspace, so the agent landed beside whatever the operator was
+        // looking at and the space it should have had never existed. Two
+        // unrelated things then shared a tab, a width, and a close.
+        let mut app = test_app();
+        let workspace = Workspace::test_new("occupied");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_start_own_space".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                // The point of the test: no target AND no split.
+                split: None,
+                focus: false,
+                argv: vec![crate::test_support::no_op_program()],
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "an untargeted agent gets its own space, not a pane in someone else's"
+        );
+        let agent_ws = &app.state.workspaces[1];
+        assert_eq!(agent_ws.tabs.len(), 1, "one tab: {:?}", agent_ws.tabs.len());
+        assert_eq!(
+            agent_ws.tabs[0].panes.len(),
+            1,
+            "the agent is the tab's ONLY pane, not one half of a split"
+        );
+
+        // And the workspace it was called from is untouched — same pane count,
+        // same focus. A spawn must not rearrange what the operator is reading.
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
     async fn focused_agent_start_records_previous_pane() {
         let mut app = test_app();
         let workspace = Workspace::test_new("agent-start-focus");
