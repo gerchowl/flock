@@ -3703,7 +3703,7 @@ sidebar_pane_gap = 99
                 // The point of the test: no target AND no split.
                 split: None,
                 focus: false,
-                argv: vec![crate::test_support::no_op_program()],
+                argv: vec![crate::test_support::live_program()],
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3752,7 +3752,7 @@ sidebar_pane_gap = 99
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
                 focus: true,
-                argv: vec![crate::test_support::no_op_program()],
+                argv: vec![crate::test_support::live_program()],
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
