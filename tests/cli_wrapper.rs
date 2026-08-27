@@ -797,49 +797,50 @@ fn copilot_hook_releases_on_user_exit_only() {
     assert_eq!(user_exit["params"]["agent"], "copilot");
 }
 
+/// #362 (4): `pane run` must NOT hand the command and the Enter to the pane in
+/// one burst.
+///
+/// It used to, and documented that as submitting them "atomically". Atomicity
+/// is the bug: a program reading a raw-mode stdin sees read boundaries, not
+/// keystrokes, and agent TUIs use those boundaries to tell typing from
+/// pasting — so `echo hello\r` arriving in one read is a pasted block
+/// containing a newline, the newline is inserted, and nothing is submitted.
+/// That is the reported failure, and a later `pane send-keys <pane> Enter`
+/// submitted the identical bytes.
+///
+/// Asserted at the wire, because that is where the burst was: an assertion on
+/// the CLI's own plan cannot see two writes coalescing into one request.
 #[test]
-fn pane_run_sends_one_send_input_request_with_enter_key() {
+fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("flock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {
-        let (mut first_stream, _) = listener.accept().unwrap();
-        let mut first_line = String::new();
-        let mut first_reader = BufReader::new(first_stream.try_clone().unwrap());
-        first_reader.read_line(&mut first_line).unwrap();
-        first_stream
-            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-            .unwrap();
-        first_stream.write_all(b"\n").unwrap();
-        first_stream.flush().unwrap();
-
-        let mut second_line = None;
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < deadline {
+        while requests.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
-                Ok((mut second_stream, _)) => {
+                Ok((mut stream, _)) => {
                     let mut line = String::new();
-                    let mut reader = BufReader::new(second_stream.try_clone().unwrap());
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
                     reader.read_line(&mut line).unwrap();
-                    second_stream
+                    stream
                         .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                         .unwrap();
-                    second_stream.write_all(b"\n").unwrap();
-                    second_stream.flush().unwrap();
-                    second_line = Some(line);
-                    break;
+                    stream.write_all(b"\n").unwrap();
+                    stream.flush().unwrap();
+                    requests.push((line, Instant::now()));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(5));
                 }
-                Err(err) => panic!("second accept failed: {err}"),
+                Err(err) => panic!("accept failed: {err}"),
             }
         }
-
-        (first_line, second_line)
+        requests
     });
 
     let run = run_cli(&socket_path, &["pane", "run", "1-1", "echo hello"]);
@@ -849,19 +850,36 @@ fn pane_run_sends_one_send_input_request_with_enter_key() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    let (first_line, second_line) = server.join().unwrap();
-    let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();
-    assert_eq!(first_request["method"], "pane.send_input");
-    assert_eq!(first_request["params"]["pane_id"], "1-1");
-    assert_eq!(first_request["params"]["text"], "echo hello");
+    let requests = server.join().unwrap();
     assert_eq!(
-        first_request["params"]["keys"],
-        serde_json::json!(["Enter"])
+        requests.len(),
+        2,
+        "pane run must type and submit separately, got: {:?}",
+        requests.iter().map(|(line, _)| line).collect::<Vec<_>>()
     );
+
+    let typed: serde_json::Value = serde_json::from_str(&requests[0].0).unwrap();
+    assert_eq!(typed["method"], "pane.send_input");
+    assert_eq!(typed["params"]["pane_id"], "1-1");
+    assert_eq!(typed["params"]["text"], "echo hello");
+    assert_eq!(
+        typed["params"]["keys"],
+        serde_json::json!([]),
+        "the typing request must carry no Enter of its own — that is the burst"
+    );
+
+    let submitted: serde_json::Value = serde_json::from_str(&requests[1].0).unwrap();
+    assert_eq!(submitted["method"], "pane.send_keys");
+    assert_eq!(submitted["params"]["pane_id"], "1-1");
+    assert_eq!(submitted["params"]["keys"], serde_json::json!(["Enter"]));
+
+    // Two requests back to back can still land in one read on the far side.
+    // The gap is what puts a read boundary between them, so it is part of the
+    // contract and not an implementation detail.
+    let gap = requests[1].1.duration_since(requests[0].1);
     assert!(
-        second_line.is_none(),
-        "pane run sent an unexpected second request: {:?}",
-        second_line
+        gap >= Duration::from_millis(50),
+        "the Enter must be separated from the text in time, not just in requests: {gap:?}"
     );
 
     cleanup_test_base(&base);

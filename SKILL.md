@@ -174,11 +174,19 @@ press Enter or other keys:
 flock pane send-keys 1-1 Enter
 ```
 
-`pane run` sends the text and then a real `Enter` key in one request:
+`pane run` types the text and then presses a real `Enter`:
 
 ```bash
 flock pane run 1-1 "echo hello"
 ```
+
+the two are deliberately separate writes with a short pause between them. a
+program reading raw stdin sees read boundaries, not keystrokes, and every agent
+tui uses those boundaries to tell typing from pasting — text and a carriage
+return arriving in one read look like a pasted block containing a newline, so
+the newline gets inserted and nothing is submitted. the pause is a heuristic,
+not a guarantee: a tui that has not started reading stdin yet misses the text
+as well as the enter. wait for the pane to be ready first (see below).
 
 ## workspace management
 
@@ -272,11 +280,17 @@ flock pane read 1-3 --source recent-unwrapped --lines 40
 ### spawn a new agent and give it a task
 
 ```bash
-flock pane split 1-2 --direction right --no-focus
-flock pane run 1-3 "claude"
-flock wait output 1-3 --match ">" --timeout 15000
+# prints the agent as json once it is up; read result.agent.pane_id from it
+flock agent start reviewer --cwd /path/to/project --wait-ready -- claude
 flock pane run 1-3 "review the test coverage in src/api/"
 ```
+
+`--wait-ready` returns once the pane reports an agent status other than
+`unknown`, and prints the agent — so `agent_status` tells you whether it is at
+its prompt (`idle` / `done`) or already stuck on a first-run dialog
+(`blocked`). matching on prompt text instead is what makes this fragile: an
+agent tui paints nothing recognisable for its first 30-60 seconds, so a match
+that has not arrived is indistinguishable from a crash.
 
 ### coordinate with another agent
 

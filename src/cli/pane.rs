@@ -1235,6 +1235,10 @@ mod tests {
     /// turn. The contract is now three steps, and the middle one is the fix:
     /// the Enter has to be a write of its own, after the pane's reader has
     /// had a chance to come back round.
+    ///
+    /// The wire-level proof of this lives in `tests/cli_wrapper.rs`, which is
+    /// compiled out on macOS. This one runs everywhere, so the ordering is
+    /// still pinned on the platform where the other test is not evidence.
     #[test]
     fn pane_run_types_then_settles_then_submits() {
         let steps = pane_run_steps("1:p2", "cargo test");

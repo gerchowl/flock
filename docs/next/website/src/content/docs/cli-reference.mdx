@@ -189,7 +189,7 @@ flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <pane_id> <command>
 ```
 
-`pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
+`pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
 Report agent state from custom hooks:
 
@@ -236,9 +236,9 @@ flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [
 flk agent send <target> <text>
 flk agent rename <target> <name>|--clear
 flk agent focus <target>
-flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
+flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
-flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
 flk agent hibernate <target>
 flk agent resume <target>
@@ -256,6 +256,8 @@ Agent targets can be terminal IDs, unique agent names, detected or reported agen
 `agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
+
+`agent start --wait-ready` and `agent wait --ready` block until the pane reports an agent status other than `unknown`, then print the agent exactly as `agent get` would. `unknown` is the only status Flock reports when its detector has not recognised the agent's own chrome, so it is what a booting TUI looks like — for a Claude pane, for 30-60 seconds during which `pane read` returns an empty string and "still booting", "crashed on launch" and "blocked on a first-run dialog" are the same observation. Ready is the first moment the question is answerable, and the status it lands on is the answer: `blocked` returns immediately rather than waiting a dialog out, which `--status idle` cannot do. A wait that fails says what it saw — the last status and the last line the pane printed — and an agent whose pane exits during the wait ends it straight away with `agent_exited_before_ready` instead of running out the clock. A pane running something Flock does not detect never becomes ready; that is reported at the timeout rather than being papered over. The default timeout is 60s.
 
 `msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `--intent needs-reply` marks the message as one you are owed an answer to; it rides the envelope, so the recipient sees it before reading the body, and `msg list` shows it on the queued row. It defaults to `fyi` on the CLI — the MCP tool requires the choice instead, since an agent that never has to look at the field will not. Both verbs **refuse an option they do not recognise** rather than treating it as body text, and `--` ends flag parsing so a message may legitimately begin with dashes. This matters most where you cannot see it: the cross-host relay is `flk msg send` run over ssh on the peer that owns the recipient, so on a version-skewed fleet a flag the peer's build predates used to arrive welded to the front of the message — silently, with a success reported to the sender. It now fails on the sending side with `peer_refused_message` and the peer's own words. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
 
