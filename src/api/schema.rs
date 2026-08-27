@@ -673,6 +673,61 @@ pub struct LineageNode {
     pub branch: Option<String>,
 }
 
+/// Does the sender want an answer (#280, R4 of #213)?
+///
+/// Stamped by the SENDER, never inferred by the receiver — the same principle
+/// that fixed provenance in #213. A receiver cannot read intent off a body
+/// without guessing, and both guesses fail on their own: replying to every FYI
+/// burns the recipient's turn and invites a loop, while treating a question as
+/// an FYI strands the sender, who gets no signal that the message landed and
+/// went unanswered.
+///
+/// The failure is observed, not reasoned. The one real agent-to-agent redirect
+/// sent so far had its "answer me" in the last line of a ~2.5k-character body,
+/// where a recipient reading the envelope cannot see it at all.
+///
+/// Two values on purpose. #316's third `blocking` tier is escalation
+/// machinery — a wake decision, an attention-surface entry, a cost on the
+/// sender — and is deferred there. This enum says what the sender WANTS, not
+/// how hard flock should knock, and nothing in the wake path reads it: the
+/// wake still carries a count and a tool name (ADR-0008). A tier can be added
+/// later without moving what is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgIntent {
+    /// No answer expected. The conservative value, and what an unstamped
+    /// envelope has always meant in practice.
+    #[default]
+    Fyi,
+    /// The sender is owed a reply.
+    NeedsReply,
+}
+
+impl MsgIntent {
+    /// The wire spelling, shared by the socket API, the MCP tool schema, the
+    /// CLI flag and the cross-host relay command. One spelling, in one place,
+    /// so a stamp cannot change meaning on the way through.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Fyi => "fyi",
+            Self::NeedsReply => "needs_reply",
+        }
+    }
+
+    /// Parse a caller-supplied spelling. `needs-reply` is accepted alongside
+    /// `needs_reply` because every prose mention of this field hyphenates it,
+    /// and refusing the spelling people already write buys nothing.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "fyi" => Some(Self::Fyi),
+            "needs_reply" | "needs-reply" => Some(Self::NeedsReply),
+            _ => None,
+        }
+    }
+}
+
 /// Destination of a pane-to-pane message (#175 M1, ADR-0006). Structured on
 /// the wire: `:` is already load-bearing in pane ids, member labels, and
 /// agent-source labels, so no fourth string grammar.
@@ -696,6 +751,18 @@ pub struct MsgSendParams {
     /// Sanitized like reported prompts: 16 KiB cap, control sequences
     /// stripped.
     pub body: String,
+    /// Whether the sender is owed an answer (#280).
+    ///
+    /// `#[serde(default)]` on the WIRE, required on the MCP tool schema. The
+    /// two are not in tension: a default here keeps every existing caller
+    /// working — an older peer relaying a message, the CLI, a reply — and
+    /// `fyi` is the conservative reading of an unstamped envelope, which is
+    /// exactly what those callers meant before this field existed. The
+    /// forcing function belongs where the mislabelling actually happens: an
+    /// agent that never has to look at the field will not, so
+    /// `flock_msg_send` makes the model choose.
+    #[serde(default)]
+    pub intent: MsgIntent,
     /// Client-supplied idempotency key. Minted server-side when omitted —
     /// but then the sender loses at-least-once retry ergonomics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -729,6 +796,17 @@ pub struct MsgReplyParams {
     /// The original message's correlation id.
     pub correlation_id: String,
     pub body: String,
+    /// Whether THIS reply is itself a question (#280).
+    ///
+    /// Defaulted rather than required, unlike `msg.send`. A reply already has
+    /// a prior: it is the discharge of an obligation, so `fyi` is a
+    /// structural fact about the common case and not a guess. Taxing every
+    /// answer with a decision whose answer is nearly always the same is the
+    /// "required fields get filled reflexively" failure at its strongest. A
+    /// reply that asks something back can still say so, which is the point —
+    /// without this, a two-turn exchange strands its intent in prose again.
+    #[serde(default)]
+    pub intent: MsgIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_correlation_id: Option<String>,
 }
@@ -818,6 +896,10 @@ pub struct QueuedMessageInfo {
     pub in_reply_to: Option<String>,
     pub enqueued_at_ms: u64,
     pub delivery_attempts: u32,
+    /// The sender's stamp, so the operator's peek can tell a question waiting
+    /// in an inbox from a notice (#280).
+    #[serde(default)]
+    pub intent: MsgIntent,
     /// Body preview, truncated for listing.
     pub preview: String,
 }
@@ -855,6 +937,11 @@ pub struct InboxMessage {
     /// `from_pane` is absent — surfaced so the recipient never attempts a
     /// reply that would fail.
     pub replyable: bool,
+    /// What the sender said it wanted (#280). A field on the envelope, which
+    /// is the whole point: `needs_reply` is knowable before the body is read,
+    /// where a sentence asking for an answer is not.
+    #[serde(default)]
+    pub intent: MsgIntent,
     pub body: String,
 }
 
@@ -2221,6 +2308,13 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         in_reply_to: Option<String>,
         enqueued_at_ms: u64,
+        /// The sender's intent stamp (#280). Durable for the same reason the
+        /// body is: this log is what rebuilds the mailbox at boot, so an
+        /// intent left out of it would be silently downgraded to `fyi` by a
+        /// restart — turning the one signal this field exists to carry into
+        /// the failure it exists to prevent.
+        #[serde(default)]
+        intent: MsgIntent,
         /// Sanitized body — the durable log doubles as the mailbox's
         /// restart source, so the payload must survive here (ADR-0005/0006).
         body: String,
