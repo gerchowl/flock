@@ -24,6 +24,11 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// The pane child's exit slot, where one exists (#178).
+    pub fn child_exit(&self) -> Option<&crate::pane::ChildExit> {
+        self.0.child_exit()
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()
