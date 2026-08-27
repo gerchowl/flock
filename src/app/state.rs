@@ -863,6 +863,24 @@ pub enum PendingUiEvent {
         tab_id: String,
         label: String,
     },
+    /// #372 / ADR-0016: an outcome filed for the operator. Unlike the pane
+    /// variants there is nothing to resolve at drain — the record is already
+    /// complete, and the projection that holds it is derived from this event,
+    /// not the other way round.
+    NotificationFiled {
+        notification_id: String,
+        title: String,
+        body: Option<String>,
+        kind: crate::api::schema::NotificationRecordKind,
+        source: crate::api::schema::NotificationSource,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        origin_host: String,
+        filed_at_ms: u64,
+    },
+    NotificationSeen {
+        notification_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2221,6 +2239,10 @@ pub struct AppState {
     pub(crate) float_esc_at: Option<std::time::Instant>,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    /// The operator's durable notification list (#372, ADR-0016). A read
+    /// model over `NotificationFiled` / `NotificationSeen` on the event log;
+    /// the toast above is the ephemeral half of the same outcome.
+    pub(crate) notifications: crate::app::notifications::NotificationLog,
     /// Agent state-change notifications waiting out `[ui.toast] delay_seconds`
     /// before they are delivered (#36). Empty when the delay is 0.
     pub(crate) pending_agent_notifications:
@@ -3217,6 +3239,7 @@ impl AppState {
             float_esc_at: None,
             config_diagnostic: None,
             toast: None,
+            notifications: crate::app::notifications::NotificationLog::default(),
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,

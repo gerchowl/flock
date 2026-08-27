@@ -287,6 +287,18 @@ flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
 
+## Notifications
+
+```bash
+flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]
+flk notification list [--unread] [--limit N]
+flk notification read <notification-id> | --all
+```
+
+`show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
+
+Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks for no popups, not for Flock to forget: the outcome is still recorded and still readable here. Records survive a server restart, and reading the list is not the same as acknowledging it, because acknowledging is what lets an old record be dropped.
+
 ## Integrations
 
 ```bash
