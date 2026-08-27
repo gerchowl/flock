@@ -286,6 +286,18 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
             cmd.env_remove(key);
         }
     }
+    // #359: an argv exec runs no shell init, so whatever a login shell would
+    // have exported never reaches the child. `CLAUDE_CONFIG_DIR` is the case
+    // that bites: unset, the child falls back to `~/.claude`, which may be a
+    // DIFFERENT authenticated account than the agent that asked for it.
+    //
+    // Applied AFTER the scrub on purpose. The scrub removes the operator's
+    // ambient credentials, which the child has no business holding; this hands
+    // down the requester's own identity, which is the entire point. Should a
+    // future key appear in both tables, the deliberate carry must win.
+    for (key, value) in take_pending_spawn_env() {
+        cmd.env(key, value);
+    }
 }
 
 thread_local! {
@@ -384,6 +396,42 @@ fn take_pending_credential_scrub() -> bool {
 #[cfg(test)]
 pub(crate) fn agent_spawn_denied_env() -> &'static [&'static str] {
     AGENT_SPAWN_DENIED_ENV
+}
+
+thread_local! {
+    /// Shell-supplied environment for the NEXT argv pane spawn on this thread
+    /// (#359). Same one-shot shape as the run id and the credential scrub, and
+    /// for the same reason: pane spawn is synchronous on the App thread, so a
+    /// global slot would race with a concurrent spawn.
+    static PENDING_SPAWN_ENV: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct PendingSpawnEnvGuard;
+
+impl Drop for PendingSpawnEnvGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_spawn_env();
+    }
+}
+
+/// Arm the environment the NEXT argv pane spawn on this thread inherits on top
+/// of the server's own — the profile selector a login shell would have
+/// exported (`crate::spawn::env`).
+///
+/// A guard, not a bare set, for the same reason the run id is one. The slot is
+/// consumed inside `apply_pane_env`, which a failed spawn may never reach; a
+/// leaked value would then be stamped on whatever pane is spawned next on this
+/// thread — including the OPERATOR's own, silently relocating its agent config
+/// dir with no error to explain it.
+#[must_use = "hold the guard across the spawn; dropping it discards the inherited environment"]
+pub(crate) fn set_pending_spawn_env(vars: Vec<(String, String)>) -> PendingSpawnEnvGuard {
+    PENDING_SPAWN_ENV.with(|slot| *slot.borrow_mut() = vars);
+    PendingSpawnEnvGuard
+}
+
+fn take_pending_spawn_env() -> Vec<(String, String)> {
+    PENDING_SPAWN_ENV.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 pub(crate) fn set_pending_run_id(run_id: String) -> PendingRunIdGuard {
@@ -3063,6 +3111,78 @@ mod tests {
             "an aborted agent spawn must not disarm the operator's own pane"
         );
         std::env::remove_var("GH_TOKEN");
+    }
+
+    /// #359: the pin the issue asks for. An argv exec runs no shell init, so
+    /// the profile selector reaches the child only if this stamps it — and it
+    /// must survive the credential scrub sitting immediately above it. When
+    /// #347 turns that scrub into an allowlist, an allowlist that forgets this
+    /// key reproduces exactly today's bug, but now by design; this test is
+    /// what refuses to let that land quietly.
+    #[test]
+    fn an_argv_spawned_pane_carries_the_agent_profile_selector() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let scrub = set_pending_credential_scrub();
+        let profile = set_pending_spawn_env(vec![(
+            crate::spawn::env::CLAUDE_CONFIG_DIR.to_string(),
+            "/profiles/work".to_string(),
+        )]);
+        apply_pane_env(&mut cmd, PaneId::from_raw(21));
+        drop(profile);
+        drop(scrub);
+
+        assert_eq!(
+            cmd.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR)
+                .and_then(|value| value.to_str()),
+            Some("/profiles/work"),
+            "an agent-spawned child must run against the requester's profile,              not fall back to the default one"
+        );
+        assert!(
+            !agent_spawn_denied_env().contains(&crate::spawn::env::CLAUDE_CONFIG_DIR),
+            "the profile selector is the requester's own identity handed down,              not an ambient credential to strip"
+        );
+    }
+
+    /// The carry is a ONE-SHOT consumed by `apply_pane_env`, like the run id
+    /// and the scrub.
+    #[test]
+    fn the_spawn_env_is_consumed_by_the_pane_it_was_armed_for() {
+        let mut spawned = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_spawn_env(vec![("K".to_string(), "v".to_string())]);
+        apply_pane_env(&mut spawned, PaneId::from_raw(22));
+        drop(guard);
+        assert!(
+            take_pending_spawn_env().is_empty(),
+            "the one-shot must already be consumed"
+        );
+    }
+
+    /// The case the guard exists for: a spawn that fails BEFORE
+    /// `apply_pane_env` runs. Without it the value survives onto the next pane
+    /// on this thread — possibly the operator's own, whose agent config dir
+    /// would then be silently relocated with no error to explain it.
+    #[test]
+    fn an_aborted_spawn_does_not_relocate_the_next_panes_config_dir() {
+        {
+            let _guard = set_pending_spawn_env(vec![(
+                crate::spawn::env::CLAUDE_CONFIG_DIR.to_string(),
+                "/profiles/someone-else".to_string(),
+            )]);
+            // The spawn fails here, so `apply_pane_env` is never reached.
+        }
+        let mut operator_pane = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut operator_pane, PaneId::from_raw(23));
+
+        // Compared against a pane that was never near an armed spawn, rather
+        // than against a literal: the operator's own value is whatever their
+        // shell exported, and "unchanged" is the property under test.
+        let mut untouched = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut untouched, PaneId::from_raw(24));
+        assert_eq!(
+            operator_pane.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR),
+            untouched.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR),
+            "an aborted agent spawn must not move the operator's own profile"
+        );
     }
 
     #[test]
