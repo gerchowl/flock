@@ -130,6 +130,25 @@ You can place that agent in a specific workspace or tab:
 flk agent start docs --workspace 1 --tab 1-1 -- claude
 ```
 
+A start returns as soon as the child has exec'd and outlived a short liveness
+window. That is a statement about the process, not about the agent: a TUI takes
+another 30-60 seconds to paint anything Flock's detector recognises, and until
+it does, `pane read` returns an empty string and a booting agent, one that
+crashed on launch, and one stuck on a first-run permission dialog all look the
+same. `--wait-ready` waits out that window and prints the agent when it is over:
+
+```bash
+flk agent start docs --cwd ~/project --wait-ready --ready-timeout 90000 -- claude
+```
+
+It returns when the pane reports an agent status other than `unknown`, and the
+status it returns is the answer — `idle` or `done` for an agent sitting at its
+prompt, `blocked` for one that needs you before it will do anything. If the
+agent exits during the wait, that ends the wait immediately rather than after
+the timeout; if the timeout is reached, the refusal names the status Flock last
+saw and quotes the last line the pane printed. `flk agent wait <target> --ready`
+asks the same question about an agent that is already running.
+
 Use `flk pane ...` commands for ordinary terminals, servers, tests, shells, and low-level terminal input. For example, use `pane split` and `pane run` for `cargo test`, not `agent start`, unless that terminal is intentionally being treated as an agent target.
 
 ## Attach directly to an agent
