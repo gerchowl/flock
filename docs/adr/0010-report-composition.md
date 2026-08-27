@@ -1,6 +1,7 @@
 # ADR 0010 — Bug reports compose locally and are submitted by a human, never by the binary
 
-- Status: Proposed
+- Status: Proposed (decision 6 amended by ADR-0015 for operator-initiated
+  cross-repo filing; every other decision here stands unchanged)
 - Date: 2026-08-06
 - Issues: #233 (the spike). Constrained by ADR-0002 (config layers — the report
   destination is deliberately *not* one of them), ADR-0003 (the executable is

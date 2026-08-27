@@ -37,11 +37,7 @@
 
 use std::collections::HashMap;
 
-use crate::process::TracedCommand;
 use crate::worktree::{parse_pr_state_fields, PrStateInfo};
-
-/// GitHub's GraphQL endpoint. Overridable for tests and GHES.
-const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 /// Aliases per request. GitHub enforces node/complexity ceilings, and an
 /// oversized document is refused wholesale — which without chunking means the
@@ -50,74 +46,11 @@ const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 /// while staying orders of magnitude below one process per worktree.
 pub(crate) const MAX_ALIASES_PER_REQUEST: usize = 100;
 
-/// Bound on one poll round. `curl` enforces this itself, so a hung request is
-/// reaped by the transport rather than needing a supervising thread — the
-/// timeout half of #295 comes free with the transport swap.
-const CONNECT_TIMEOUT_SECS: &str = "5";
-const MAX_TIME_SECS: &str = "20";
-
 /// One `(owner/repo, branch)` pair to resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PrQuery {
     pub repo: String,
     pub branch: String,
-}
-
-/// Cached GitHub token. `RwLock` rather than `OnceLock` because a server runs
-/// for days and a token can be rotated underneath it — see
-/// [`forget_cached_token`].
-static TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
-
-/// The token, resolved once and then cached.
-///
-/// `gh` supplied auth for free; dropping it means resolving one ourselves. The
-/// env vars cover CI and anyone already exporting one. The `gh auth token`
-/// fallback costs a single large-binary exec for the server's lifetime rather
-/// than one per poll per worktree — which is the entire point of #294.
-fn github_token() -> Option<String> {
-    if let Ok(guard) = TOKEN.read() {
-        if let Some(token) = guard.as_ref() {
-            return Some(token.clone());
-        }
-    }
-    let resolved = resolve_token()?;
-    if let Ok(mut guard) = TOKEN.write() {
-        *guard = Some(resolved.clone());
-    }
-    Some(resolved)
-}
-
-/// Forget the cached token so the next round re-reads it.
-///
-/// Without this, a token rotated or refreshed underneath a long-running server
-/// pins the poller at `broken` until restart — the health row correctly reports
-/// a failure that nobody can clear from outside. Called only on an auth
-/// failure, so this is a recovery path, not a per-round re-read.
-pub(crate) fn forget_cached_token() {
-    if let Ok(mut guard) = TOKEN.write() {
-        *guard = None;
-    }
-}
-
-fn resolve_token() -> Option<String> {
-    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(value) = std::env::var(var) {
-            let value = value.trim().to_string();
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    let out = TracedCommand::new("gh", "pr_poll")
-        .args(["auth", "token"])
-        .periodic()
-        .output_traced()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!token.is_empty()).then_some(token)
 }
 
 /// Split `owner/name`, rejecting anything that is not exactly two segments.
@@ -197,19 +130,6 @@ pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery
 /// `200 OK` with errors in the body, so transport success is not query success
 /// — treating it as success is how a poller silently reports "no PRs anywhere"
 /// forever after a token expires.
-pub(crate) fn top_level_error(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    let errors = value.get("errors")?.as_array()?;
-    let first = errors.first()?;
-    Some(
-        first
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("graphql error")
-            .to_string(),
-    )
-}
-
 /// Run one batched round. `Err` means the ROUND failed (no transport, no token,
 /// GraphQL-level error); an empty-but-`Ok` map means "asked, nothing matched".
 /// The distinction is what lets health tell "GitHub is unreachable" from
@@ -220,7 +140,6 @@ pub(crate) fn fetch_batch(
     if queries.is_empty() {
         return Ok(HashMap::new());
     }
-    let token = github_token().ok_or(PrPollErrorKind::NoToken)?;
     // Chunked so a large fleet degrades into a few requests instead of one
     // document GitHub refuses. Still bounded work per round, unlike 2N execs.
     if queries.len() > MAX_ALIASES_PER_REQUEST {
@@ -230,40 +149,8 @@ pub(crate) fn fetch_batch(
         }
         return Ok(merged);
     }
-    let body = serde_json::json!({ "query": build_query(queries) }).to_string();
-    // The token is handed over on STDIN via `--config -`, never in argv.
-    // argv is world-readable through `ps`, and `TracedCommand` writes it to the
-    // process-exec log on every run — so a header argument would publish the
-    // credential to every local user and persist it on disk each tick.
-    let config = format!("header = \"Authorization: bearer {token}\"\n");
-    let output = TracedCommand::new("curl", "pr_poll")
-        .periodic()
-        .args([
-            "-sS",
-            "--connect-timeout",
-            CONNECT_TIMEOUT_SECS,
-            "--max-time",
-            MAX_TIME_SECS,
-            "--config",
-            "-",
-            "-H",
-            "Content-Type: application/json",
-            "-X",
-            "POST",
-            "-d",
-            &body,
-            GRAPHQL_URL,
-        ])
-        .output_traced_with_stdin(config.as_bytes())
-        .map_err(|_| PrPollErrorKind::Transport)?;
-    if !output.status.success() {
-        return Err(PrPollErrorKind::Transport);
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    if let Some(message) = top_level_error(&text) {
-        // Classified here so the message itself is dropped rather than stored.
-        return Err(PrPollErrorKind::classify_graphql(&message));
-    }
+    let text =
+        crate::github::graphql::execute(&build_query(queries), serde_json::Value::Null, "pr_poll")?;
     Ok(parse_response(&text, queries))
 }
 
@@ -286,47 +173,17 @@ pub(crate) const PR_POLL_MAX_ROUND_SECS: u64 = 40;
 
 /// Why a round failed, as a closed set.
 ///
-/// `PrPollHealth.last_error` is served to OTHER MACHINES inside `PeersSummary`.
-/// GitHub's raw `errors[0].message` routinely names private repositories
-/// ("Could not resolve to a Repository with the name 'acme/secret-project'")
-/// and echoes branch names back, so putting it on the wire discloses to every
-/// polling peer what the local token could see. The detailed message stays in
-/// the local log; only this classification crosses a host boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrPollErrorKind {
-    NoToken,
-    Transport,
-    RateLimited,
-    Auth,
-    GraphQl,
-}
+/// An alias rather than a second enum: `PrPollHealth.last_error` is served to
+/// OTHER MACHINES inside `PeersSummary`, and the reason it is a closed set —
+/// GitHub's raw `errors[0].message` names private repositories and echoes
+/// branch names back — applies identically to every caller of the shared
+/// transport. Two enums would be two places for that rule to drift.
+pub(crate) type PrPollErrorKind = crate::github::graphql::GraphQlErrorKind;
 
-impl PrPollErrorKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::NoToken => "no_token",
-            Self::Transport => "transport",
-            Self::RateLimited => "rate_limited",
-            Self::Auth => "auth",
-            Self::GraphQl => "graphql",
-        }
-    }
-
-    /// Classify from GitHub's message text WITHOUT retaining it.
-    pub(crate) fn classify_graphql(message: &str) -> Self {
-        let lowered = message.to_ascii_lowercase();
-        if lowered.contains("rate limit") || lowered.contains("abuse") {
-            Self::RateLimited
-        } else if lowered.contains("bad credentials")
-            || lowered.contains("unauthorized")
-            || lowered.contains("authentication")
-        {
-            Self::Auth
-        } else {
-            Self::GraphQl
-        }
-    }
-}
+/// Recovery hook for an auth failure. Re-exported rather than re-implemented:
+/// the cache it clears is the shared transport's, so a second copy here would
+/// clear nothing.
+pub(crate) use crate::github::graphql::forget_cached_token;
 
 // The three-state verdict and the degraded-failure-streak threshold moved
 // to `crate::health` as part of the shared health primitive (#295). Callers
@@ -335,6 +192,7 @@ impl PrPollErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::graphql::top_level_error;
     use std::time::{Duration, Instant};
 
     fn q(repo: &str, branch: &str) -> PrQuery {
@@ -501,42 +359,6 @@ mod tests {
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.last_error.is_none());
         assert!(health.in_flight_since.is_none());
-    }
-
-    /// The credential must not reach argv: argv is world-readable via `ps` and
-    /// `TracedCommand` writes it to the process-exec log on every run. Asserts
-    /// on the arguments the transport actually builds.
-    #[test]
-    fn the_token_never_appears_in_the_command_arguments() {
-        let queries = vec![q("o/n", "main")];
-        let body = serde_json::json!({ "query": build_query(&queries) }).to_string();
-        // Mirrors fetch_batch's argv exactly; the token is handed over on stdin
-        // via `--config -` and must be absent here.
-        let args = [
-            "-sS",
-            "--connect-timeout",
-            CONNECT_TIMEOUT_SECS,
-            "--max-time",
-            MAX_TIME_SECS,
-            "--config",
-            "-",
-            "-H",
-            "Content-Type: application/json",
-            "-X",
-            "POST",
-            "-d",
-            &body,
-            GRAPHQL_URL,
-        ];
-        let joined = args.join(" ");
-        assert!(
-            !joined.to_ascii_lowercase().contains("authorization"),
-            "no Authorization header may be passed as an argument: {joined}"
-        );
-        assert!(
-            joined.contains("--config -"),
-            "token must arrive on stdin: {joined}"
-        );
     }
 
     /// GitHub error text names private repositories. It is classified and

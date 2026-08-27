@@ -24,6 +24,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0012](0012-conversation-read-model.md) | The conversation read model: canonical entries and a derived index | Proposed |
 | [0013](0013-node-declared-thermal-health.md) | Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist | Proposed |
 | [0014](0014-agent-initiated-agent-spawn.md) | An agent may start an agent, but only through a narrowed verb with a lineage-aware ceiling | Accepted |
+| [0015](0015-operator-initiated-cross-repo-issue-filing.md) | The operator may file an issue from flock, over the API, into any repo their own token can reach | Proposed |
 
 ## Conventions
 

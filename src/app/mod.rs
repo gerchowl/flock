@@ -19,6 +19,7 @@ pub(crate) mod directory;
 pub(crate) mod float;
 mod ids;
 mod input;
+pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
 mod peer_checkout;
@@ -553,6 +554,8 @@ impl App {
         };
 
         let mut state = AppState {
+            issue_drop: None,
+            issue_repo_cache: None,
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -946,6 +949,9 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        if let Some(draft) = snapshot.issue_draft.as_ref() {
+            app.state.restore_issue_draft(draft);
+        }
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -1789,6 +1795,9 @@ impl App {
             }
             Mode::OpenExistingWorktree => {
                 self.handle_worktree_open_key(key_event);
+            }
+            Mode::IssueDrop => {
+                self.handle_issue_drop_key(key_event);
             }
             Mode::ConfirmRemoveWorktree => {
                 self.handle_worktree_remove_key(key_event);
