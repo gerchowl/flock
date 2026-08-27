@@ -26,6 +26,8 @@
 //! (`spawn_depth`, `spawned_by`), so the check is O(live panes) and never
 //! walks the durable event log on a request path.
 
+pub mod env;
+
 use serde::{Deserialize, Serialize};
 
 /// Which agent a spawn may launch. CLOSED — a free string would let a caller
@@ -81,6 +83,10 @@ pub enum SpawnRefusal {
     FleetPaused,
     /// Agent-initiated spawn is not enabled on this node. Terminal.
     NotEnabled,
+    /// The child's agent profile could not be established from the requester
+    /// (#359). Terminal — see [`env::ProfileUnresolved`] for why each case is
+    /// a refusal rather than a default.
+    ProfileUnresolved(env::ProfileUnresolved),
 }
 
 impl SpawnRefusal {
@@ -92,6 +98,7 @@ impl SpawnRefusal {
             Self::AtDepth { .. } => "at_lineage_depth",
             Self::FleetPaused => "fleet_paused",
             Self::NotEnabled => "agent_spawn_disabled",
+            Self::ProfileUnresolved(unresolved) => unresolved.code(),
         }
     }
 
@@ -102,6 +109,9 @@ impl SpawnRefusal {
         match self {
             Self::AtCapacity { .. } | Self::AtFanout { .. } | Self::FleetPaused => true,
             Self::AtDepth { .. } | Self::NotEnabled => false,
+            // Delegated rather than restated: whether a profile refusal can be
+            // retried is a property of the profile failure, not of this enum.
+            Self::ProfileUnresolved(unresolved) => unresolved.retryable(),
         }
     }
 
@@ -123,6 +133,7 @@ impl SpawnRefusal {
             Self::NotEnabled => {
                 "agent-initiated spawn is disabled; set [fleet] agent_spawn_enabled".to_string()
             }
+            Self::ProfileUnresolved(unresolved) => unresolved.message(),
         }
     }
 }

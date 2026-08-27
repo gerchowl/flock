@@ -510,7 +510,7 @@ fn space_join(app: &AppState, key: &str) -> StateJoin {
 
 /// The full state tally across every local workspace — the self server-row
 /// leading counts (#42: `0 2 1 flock`).
-fn local_server_tally(app: &AppState) -> StateTally {
+pub(crate) fn local_server_tally(app: &AppState) -> StateTally {
     tally_states(
         app.workspaces
             .iter()

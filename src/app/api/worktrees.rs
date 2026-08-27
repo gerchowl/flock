@@ -245,6 +245,28 @@ impl App {
             }
         }
 
+        // #359: a fork execs `claude --resume … --fork-session` from argv, so
+        // it skips shell init exactly as a fresh spawn does. The child must
+        // land on the SAME profile as the agent it forked from — a fork that
+        // continues the parent's conversation against a different account is
+        // the sharpest form of this bug. Resolved from the forked pane's own
+        // process, and before `git worktree add` so a refusal leaves no
+        // checkout behind.
+        // The recorded profile is the fallback the live read cannot provide:
+        // a hibernated agent is forkable and has no child process to inspect.
+        let recorded_profile = crate::agent_resume::claude_resume_session_id(&plan)
+            .and_then(crate::agent_resume::claude_config_dir_for_session);
+        let spawn_env = match self.resolve_spawn_env(
+            &plan.argv,
+            self.pane_child_pid(resolved.pane_id),
+            recorded_profile,
+        ) {
+            Ok(vars) => vars,
+            Err(unresolved) => {
+                return encode_error(id, unresolved.code(), unresolved.message());
+            }
+        };
+
         let branch = params
             .branch
             .unwrap_or_else(|| {
@@ -333,6 +355,7 @@ impl App {
         // must disarm the id, or the next unrelated pane inherits it and
         // `flk revert-run` would revert that pane's work (US-8).
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
         let (ws_idx, spawned_pane) = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,

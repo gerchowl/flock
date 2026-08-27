@@ -153,7 +153,7 @@ impl App {
     }
 
     /// PID of the pane's direct child process, when alive.
-    fn pane_child_pid(&self, pane_id: crate::layout::PaneId) -> Option<u32> {
+    pub(crate) fn pane_child_pid(&self, pane_id: crate::layout::PaneId) -> Option<u32> {
         #[cfg(test)]
         if let Some(pid) = self.test_pane_child_pids.get(&pane_id) {
             return Some(*pid);

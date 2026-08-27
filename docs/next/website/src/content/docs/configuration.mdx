@@ -342,6 +342,47 @@ delivery = "off"
 
 Popup notifications are for background attention. Flock suppresses popups for the active tab.
 
+## Window title
+
+Flock labels the host terminal's window so you can tell, from a window switcher
+or a row of tabs, which terminal is Flock, which server it is attached to, and
+whether something is blocked and waiting on you.
+
+```
+● 2B  feat/foo · mba22 — flk
+```
+
+The badge leads because it is the only part that changes, and titles are
+truncated from the right. It carries the states that want your attention —
+`B` blocked, `D` finished-but-unseen — and disappears entirely when none of them
+apply, so a calm fleet reads `main · mba22 — flk`. An empty Flock reads `flk`.
+
+Flock sets the window title only (OSC 2), never the icon name, and hands the
+title back when it exits.
+
+The title carries your focused branch and your server name. On a shared screen,
+a recording, or a streamed terminal, that is information leaving the room — turn
+it off with:
+
+```toml
+[title]
+enabled = false
+```
+
+Disabled, Flock writes nothing at all: the window title stays whatever your
+shell last set it to.
+
+Inside tmux, the title only reaches the outer terminal if tmux is allowed to
+pass the sequence through:
+
+```
+set -g allow-passthrough on
+```
+
+Without it tmux swallows the sequence and the window title is unchanged — the
+same as not publishing at all. The setting is read from the server you are
+attached to, so a remote attach follows the remote host's `[title]` section.
+
 ## Sound
 
 Sound notifications are enabled by default and are played by the local Flock client.

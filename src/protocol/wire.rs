@@ -92,6 +92,15 @@ use serde::{Deserialize, Serialize};
 /// and an RTX 5090 is fine at 80 °C — the host owns calibration, flock owns
 /// transport and colour. Additive with `#[serde(default)]`, but the positional
 /// bincode shape still changed, so the pinned golden below moves with it.
+///
+/// v25 also carries `ServerMessage::SetWindowTitle` (#361), folded in on the
+/// same reasoning as `FocusWorkspace` and `FleetSystem.gpu_percent` above: no
+/// shipped artifact has ever spoken v25, so there is nothing to stay compatible
+/// with. The server owns the title because the server owns the state a title
+/// describes — the per-state tally and the focused workspace — while only the
+/// client owns the host terminal it has to be written to. Additive enum variant
+/// appended at the END of `ServerMessage` (existing variant indices unchanged on
+/// the positional wire).
 pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Refusal notice sent to clients while a live update handoff is in
@@ -802,6 +811,18 @@ pub enum ServerMessage {
         /// ProxyJump=<value>` when set.
         #[serde(default)]
         proxy_jump: Option<String>,
+    },
+
+    /// Publish this title on the client's HOST terminal window (#361).
+    ///
+    /// Already debounced and deduped by the server: every message that arrives
+    /// is a title the client's terminal has not been shown, so the client may
+    /// write it straight out. Sent only to the FOREGROUND app client, and only
+    /// while that client wants frames — a warm background connection slot must
+    /// not label a window it is not painting.
+    SetWindowTitle {
+        /// The rendered title, ready for an OSC 2 payload.
+        title: String,
     },
 }
 
@@ -1966,6 +1987,12 @@ mod tests {
                     proxy_jump: None,
                 },
             ),
+            (
+                "SetWindowTitle",
+                ServerMessage::SetWindowTitle {
+                    title: "\u{25cf} 1B  main \u{00b7} mba22 \u{2014} flk".to_string(),
+                },
+            ),
         ]
     }
 
@@ -2000,6 +2027,7 @@ mod tests {
             ServerMessage::ReloadSoundConfig => {}
             ServerMessage::MouseCapture { .. } => {}
             ServerMessage::SwitchServer { .. } => {}
+            ServerMessage::SetWindowTitle { .. } => {}
         }
     }
 
@@ -2044,6 +2072,7 @@ mod tests {
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
             ("SwitchServer", 0x2d3af25d23eaadf5),
+            ("SetWindowTitle", 0x00dd463b8dd23476),
         ];
 
         if actual.as_slice() != GOLDEN {

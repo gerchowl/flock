@@ -194,6 +194,14 @@ pub struct App {
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
+    /// Debounce + dedupe in front of the HOST terminal window title (#361).
+    /// Owned by the App because the title describes app state; both loops feed
+    /// it and each writes the result to its own sink — the monolithic loop to
+    /// its own terminal, the headless loop to the foreground client's.
+    pub(crate) window_title_publisher: crate::ui::window_title::WindowTitlePublisher,
+    /// When to wake for a title publish the debounce window suppressed. `None`
+    /// once the title has settled, so a quiet flock schedules no wakeups.
+    pub(crate) window_title_deadline: Option<Instant>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) suppressed_repeat_keys:
@@ -831,6 +839,8 @@ impl App {
             fleet_pause: fleet_pause::FleetPauseState::load_from(&fleet_pause::default_pause_path()),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
+            window_title_publisher: Default::default(),
+            window_title_deadline: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
@@ -1029,6 +1039,12 @@ impl App {
             if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
+
+            // #361: advertise flock's state to the host terminal. Monolithic
+            // mode owns the terminal itself, so the write happens right here.
+            // The headless loop ships the same computed title to its foreground
+            // client instead.
+            self.publish_host_window_title(now);
 
             if self.state.request_complete_onboarding {
                 self.state.request_complete_onboarding = false;
@@ -3660,6 +3676,60 @@ sidebar_pane_gap = 99
         match original_shell {
             Some(value) => std::env::set_var("SHELL", value),
             None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untargeted_agent_start_gets_its_own_space_as_the_only_pane() {
+        // Asking for an agent with no placement used to SPLIT the active
+        // workspace, so the agent landed beside whatever the operator was
+        // looking at and the space it should have had never existed. Two
+        // unrelated things then shared a tab, a width, and a close.
+        let mut app = test_app();
+        let workspace = Workspace::test_new("occupied");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_start_own_space".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                // The point of the test: no target AND no split.
+                split: None,
+                focus: false,
+                argv: vec![crate::test_support::no_op_program()],
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "an untargeted agent gets its own space, not a pane in someone else's"
+        );
+        let agent_ws = &app.state.workspaces[1];
+        assert_eq!(agent_ws.tabs.len(), 1, "one tab: {:?}", agent_ws.tabs.len());
+        assert_eq!(
+            agent_ws.tabs[0].panes.len(),
+            1,
+            "the agent is the tab's ONLY pane, not one half of a split"
+        );
+
+        // And the workspace it was called from is untouched — same pane count,
+        // same focus. A spawn must not rearrange what the operator is reading.
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
         }
     }
 
