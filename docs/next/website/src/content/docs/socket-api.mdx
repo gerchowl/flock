@@ -70,11 +70,12 @@ Raw socket method names use dot notation:
 | Area | Methods |
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config` |
+| Notification | `notification.show`, `notification.list`, `notification.ack` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
 | Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wake`, `msg.mute` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
@@ -108,10 +109,10 @@ Remove a linked checkout:
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
 
-`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A recipient that is already idle is not woken until something else prompts it. The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, `message_not_found`, and `no_reply_address`.
+`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A recipient that is already idle is not woken until something else prompts it. The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. They also carry an `intent` of `fyi` or `needs_reply`, stamped by the sender and delivered on the envelope so a recipient knows whether it is owed an answer before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool; the wake path deliberately does not read it, so a nudge still names a count and a tool and nothing else. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, `message_not_found`, and `no_reply_address`.
 
 ```json
-{"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1"}}
+{"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1","intent":"needs_reply"}}
 ```
 
 `agent.hibernate` parks a pane: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. `AgentStatus::Hibernated` appears on the record and a durable `agent_hibernated` event is emitted. Panes without a resumable session are refused with `hibernate_unsupported` (data-loss guard); a pane that is already hibernated returns `already_hibernated`. `agent.resume` respawns the stashed argv into the same terminal and clears the plan (`not_hibernated` if the pane is not parked); the next `focus` of a hibernated pane triggers the same resume implicitly. Both verbs emit durable events (`agent_hibernated`, `agent_resumed_from_hibernation`).
@@ -124,6 +125,13 @@ Remove a linked checkout:
 `checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
 
 `agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone.
+
+`notification.list` reads the operator's filed outcomes, newest first, with `unread_only` and `limit`; `notification.ack` marks one (`notification_id`) or all (`all: true`) as read. Both answer with the fleet-wide `unread` count. Every outcome Flock decides is worth saying — an agent that blocked or finished, and every `notification.show` call including the ones it refuses to display — is filed as a durable `notification_filed` event, with `notification_seen` as its acknowledgement; the unread list is the fold of one over the other, rebuilt at startup. Listing is not acknowledging: acknowledging is what lets retention drop a record, so it is never inferred from a read.
+
+```json
+{"id":"req_n1","method":"notification.list","params":{"unread_only":true,"limit":20}}
+{"id":"req_n2","method":"notification.ack","params":{"notification_id":"ntf:19a2f:3"}}
+```
 
 ## Checks
 
@@ -229,6 +237,46 @@ Session-only official integrations report native session references with `pane.r
 If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Flock can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
+
+## Reading an agent's conversation
+
+`agent.read` reads a **pane**: terminal output, wrapped at the width it was drawn at. `agent.history` reads the **conversation** — the agent's own session transcript, unwrapped, one entry per turn. Claude only, since that is the transcript format Flock parses.
+
+```json
+{"id":"req_9","method":"agent.history","params":{"target":"claude","detail":"collapsed","limit":10}}
+```
+
+| Param | Meaning |
+| --- | --- |
+| `target` | Public pane id, terminal id, or unique agent name. |
+| `detail` | `reply` (prose only, the default), `collapsed` (adds `⚙ ToolName` per tool call), `full` (adds tool output). |
+| `cursor` | A `next_cursor` from a previous response. Omit for the most recent turns. |
+| `limit` | Maximum turns. Defaults to 20, capped at 200. |
+
+The result carries the turns plus the cursor that resumes after them:
+
+```json
+{
+  "type": "agent_history",
+  "history": {
+    "pane_id": "1-1",
+    "workspace_id": "1",
+    "session_id": "...",
+    "detail": "collapsed",
+    "turns": [{"role": "assistant", "text": "on it\n\n⚙ Edit", "at_ms": 1756300000000}],
+    "cursor": 41216,
+    "next_cursor": 45312,
+    "more": false,
+    "truncated": true
+  }
+}
+```
+
+`cursor` and `next_cursor` are byte offsets into the transcript, valid only for the `session_id` the same response reports — a restarted agent writes a new session, and a cursor from the old one means nothing in the new one. Handing `next_cursor` back reads only what has been appended since; that is what makes the method cheap enough to poll, since a call never parses more than 1 MiB of transcript. `more` means further turns are already on disk, so page again rather than wait. `truncated` means turns older than `cursor` exist and were not returned.
+
+Two properties are deliberate. `agent.history` touches **no pane state** — it does not mark the pane seen and does not move the operator's attention ordering, which is what makes polling it safe. And it renders at the `detail` the *caller* asked for, never at whatever level the operator's prompt-history panel happens to be showing.
+
+Refusals: `unsupported_for_agent` (the pane's agent writes no transcript Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet), `transcript_unreadable`.
 
 Pane and agent records also carry `seen` (whether the operator has viewed the agent's latest completed turn — `agent_status` folds this bit into `done`) and `status_age_secs` (seconds since the semantic agent state last changed; omitted when no transition has been observed). Records from older servers parse as seen with no age.
 

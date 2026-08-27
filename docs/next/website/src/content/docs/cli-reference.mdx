@@ -243,8 +243,8 @@ flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABE
 flk agent hibernate <target>
 flk agent resume <target>
 flk lineage <target> [--json]
-flk msg send <target> <text...> [--repo NAME] [--correlation-id ID] [--reply-to ID]
-flk msg reply <correlation_id> <text...>
+flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID]
+flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply]
 flk msg list [--pane TARGET]
 flk checks list
 flk checks ack <name>
@@ -257,7 +257,7 @@ Agent targets can be terminal IDs, unique agent names, detected or reported agen
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
-`msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
+`msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `--intent needs-reply` marks the message as one you are owed an answer to; it rides the envelope, so the recipient sees it before reading the body, and `msg list` shows it on the queued row. It defaults to `fyi` on the CLI — the MCP tool requires the choice instead, since an agent that never has to look at the field will not. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
 
 `agent hibernate` parks a pane cleanly: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. The next focus (or an explicit `agent resume`) respawns it. Panes without a resumable session refuse with `hibernate_unsupported` (data-loss guard).
 
@@ -286,6 +286,18 @@ flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--
 ```
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
+
+## Notifications
+
+```bash
+flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]
+flk notification list [--unread] [--limit N]
+flk notification read <notification-id> | --all
+```
+
+`show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
+
+Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks for no popups, not for Flock to forget: the outcome is still recorded and still readable here. Records survive a server restart, and reading the list is not the same as acknowledging it, because acknowledging is what lets an old record be dropped.
 
 ## Integrations
 
@@ -349,10 +361,11 @@ Exposed tools:
 | `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
 | `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
 | `flock_agent_read` | `agent.read` | Reading marks the pane seen — use sparingly. |
+| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. Claude only. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
-| `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
-| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. |
+| `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` (`fyi` or `needs_reply`) is required. |
+| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. |

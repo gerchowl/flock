@@ -22,6 +22,7 @@ mod input;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
+pub(crate) mod notifications;
 mod peer_checkout;
 mod runtime;
 mod session;
@@ -673,6 +674,8 @@ impl App {
             float_esc_at: None,
             config_diagnostic,
             toast: None,
+            notifications: crate::app::notifications::NotificationLog::default(),
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             app_client_attached: true,
@@ -878,6 +881,13 @@ impl App {
         // Sync the render-facing pause banner from the persisted state so
         // a paused fleet renders the banner immediately on restart.
         Self::sync_fleet_pause_banner(&this.fleet_pause, &mut this.state);
+        // #372 / ADR-0016: rebuild the operator's notification list from the
+        // durable log, the way the agent mailboxes above are. Surviving a
+        // restart is most of what "durable" means here — the toast never did.
+        let restored = this.event_hub.persisted_events_after(0);
+        this.state
+            .notifications
+            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
         this
     }
 

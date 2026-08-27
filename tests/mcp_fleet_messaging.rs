@@ -384,6 +384,11 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
             "to": {"type": "agent", "agent": bob.agent_id},
             "body": "ping from nodea over mcp",
             "correlation_id": "c-320-e2e",
+            // #280. Required on this tool, and it has a hop to survive: the
+            // relay rebuilds the send as a `flk msg send` on the owning
+            // server, so a stamp dropped here is a cross-host question
+            // arriving as a notice.
+            "intent": "needs_reply",
         }),
     );
     assert_eq!(queued["correlation_id"], "c-320-e2e", "send: {queued}");
@@ -408,6 +413,11 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         delivered["replyable"], true,
         "a message that cannot be answered is a dead end: {delivered}"
     );
+    assert_eq!(
+        delivered["intent"], "needs_reply",
+        "the sender's stamp has to survive the hop, or a cross-host question \
+         arrives as a notice: {delivered}"
+    );
 
     // 4. The reply routes home, with B addressing nothing at all.
     let correlation_id = delivered["correlation_id"]
@@ -429,6 +439,11 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         answer["in_reply_to"], "c-320-e2e",
         "the answer has to thread back to the question: {answer}"
     );
+    assert_eq!(
+        answer["intent"], "fyi",
+        "an answer ends the exchange unless it says otherwise — `intent` is \
+         optional on reply and defaults quiet: {answer}"
+    );
 
     // 5. A target that does not exist is refused by name, never dropped.
     let error = alice.call_tool_error(
@@ -436,6 +451,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         json!({
             "to": {"type": "agent", "agent": "agent_nowhere_00000000"},
             "body": "into the void",
+            "intent": "fyi",
         }),
     );
     let message = serde_json::to_string(&error).unwrap();
@@ -452,6 +468,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         json!({
             "to": {"type": "agent", "agent": bob.pane_id},
             "body": "wrong field",
+            "intent": "fyi",
         }),
     );
     let message = serde_json::to_string(&error).unwrap();

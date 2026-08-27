@@ -22,6 +22,10 @@ pub enum Method {
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
+    #[serde(rename = "notification.list")]
+    NotificationList(NotificationListParams),
+    #[serde(rename = "notification.ack")]
+    NotificationAck(NotificationAckParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -66,6 +70,16 @@ pub enum Method {
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
+    /// #276: an agent's own conversation, from the session transcript.
+    ///
+    /// Deliberately a verb of its own rather than another `ReadSource` on
+    /// `agent.read`. That method reads a PANE — terminal output, hard-wrapped
+    /// at the width it was drawn at, with a `lines` budget that means nothing
+    /// to a conversation. This one reads the transcript, so its parameters
+    /// are the ones a conversation has: how much of each turn, and where in
+    /// the history to resume.
+    #[serde(rename = "agent.history")]
+    AgentHistory(AgentHistoryParams),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
     /// #329 / ADR-0014: agent-initiated spawn of a FRESH agent.
@@ -314,6 +328,75 @@ pub struct NotificationShowParams {
     pub sound: NotificationShowSound,
 }
 
+/// What class of outcome a filed notification records (#372 / ADR-0016).
+/// Deliberately coarser than `ToastKind`: the log answers "does this still
+/// want me" long after the toast's placement and sound stopped mattering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationRecordKind {
+    /// Something is waiting on the operator.
+    Attention,
+    /// Something finished and produced a result.
+    Outcome,
+    /// Everything else worth keeping — a refusal, an update, an announcement.
+    Notice,
+}
+
+/// Who decided this notification was worth filing (#372 / ADR-0016). flock
+/// itself is the only producer today; the field exists so a later
+/// agent-facing verb is distinguishable in the log rather than indistinguishable
+/// from flock's own judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSource {
+    /// An agent state change flock decided was worth saying (#36).
+    AgentState,
+    /// An explicit `notification.show` request.
+    Api,
+}
+
+/// `notification.list` (#372 / ADR-0016). Reads the operator's filed
+/// outcomes, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NotificationListParams {
+    /// Only what has not been acknowledged.
+    #[serde(default)]
+    pub unread_only: bool,
+    /// Cap the reply. `None` returns everything the projection holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `notification.ack` (#372 / ADR-0016). Acknowledging is the operator saying
+/// "read"; it is also what makes a record eligible for eviction, so it is
+/// never inferred from a list call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NotificationAckParams {
+    /// Acknowledge one record. Omit with `all = true` to acknowledge the lot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// One row of `notification.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSummary {
+    pub notification_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub kind: NotificationRecordKind,
+    pub source: NotificationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    pub origin_host: String,
+    pub filed_at_ms: u64,
+    pub seen: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationShowSound {
@@ -505,6 +588,33 @@ pub struct AgentReadParams {
     pub strip_ansi: bool,
 }
 
+/// Params for `agent.history` (#276).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHistoryParams {
+    pub target: String,
+    /// How much of each turn to render. The read is done at THIS level, not
+    /// at whatever level the operator's panel happens to be showing — an
+    /// agent's view of history must not change because a human clicked
+    /// something.
+    #[serde(default)]
+    pub detail: crate::agent_transcript::TranscriptDetail,
+    /// Byte offset into the transcript to resume from, from a previous
+    /// response's `next_cursor`. Omitted means "the latest turns".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    /// Maximum turns to return. Clamped to [`AGENT_HISTORY_MAX_TURNS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Turns returned by `agent.history` when the caller names no `limit`.
+pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
+
+/// Hard cap on turns one `agent.history` call returns. A single turn can
+/// carry a 128 KiB tool result, so the count is the only thing between a
+/// poll and a response nobody can read.
+pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
     pub target: String,
@@ -636,6 +746,61 @@ pub struct LineageNode {
     pub branch: Option<String>,
 }
 
+/// Does the sender want an answer (#280, R4 of #213)?
+///
+/// Stamped by the SENDER, never inferred by the receiver — the same principle
+/// that fixed provenance in #213. A receiver cannot read intent off a body
+/// without guessing, and both guesses fail on their own: replying to every FYI
+/// burns the recipient's turn and invites a loop, while treating a question as
+/// an FYI strands the sender, who gets no signal that the message landed and
+/// went unanswered.
+///
+/// The failure is observed, not reasoned. The one real agent-to-agent redirect
+/// sent so far had its "answer me" in the last line of a ~2.5k-character body,
+/// where a recipient reading the envelope cannot see it at all.
+///
+/// Two values on purpose. #316's third `blocking` tier is escalation
+/// machinery — a wake decision, an attention-surface entry, a cost on the
+/// sender — and is deferred there. This enum says what the sender WANTS, not
+/// how hard flock should knock, and nothing in the wake path reads it: the
+/// wake still carries a count and a tool name (ADR-0008). A tier can be added
+/// later without moving what is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgIntent {
+    /// No answer expected. The conservative value, and what an unstamped
+    /// envelope has always meant in practice.
+    #[default]
+    Fyi,
+    /// The sender is owed a reply.
+    NeedsReply,
+}
+
+impl MsgIntent {
+    /// The wire spelling, shared by the socket API, the MCP tool schema, the
+    /// CLI flag and the cross-host relay command. One spelling, in one place,
+    /// so a stamp cannot change meaning on the way through.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Fyi => "fyi",
+            Self::NeedsReply => "needs_reply",
+        }
+    }
+
+    /// Parse a caller-supplied spelling. `needs-reply` is accepted alongside
+    /// `needs_reply` because every prose mention of this field hyphenates it,
+    /// and refusing the spelling people already write buys nothing.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "fyi" => Some(Self::Fyi),
+            "needs_reply" | "needs-reply" => Some(Self::NeedsReply),
+            _ => None,
+        }
+    }
+}
+
 /// Destination of a pane-to-pane message (#175 M1, ADR-0006). Structured on
 /// the wire: `:` is already load-bearing in pane ids, member labels, and
 /// agent-source labels, so no fourth string grammar.
@@ -659,6 +824,18 @@ pub struct MsgSendParams {
     /// Sanitized like reported prompts: 16 KiB cap, control sequences
     /// stripped.
     pub body: String,
+    /// Whether the sender is owed an answer (#280).
+    ///
+    /// `#[serde(default)]` on the WIRE, required on the MCP tool schema. The
+    /// two are not in tension: a default here keeps every existing caller
+    /// working — an older peer relaying a message, the CLI, a reply — and
+    /// `fyi` is the conservative reading of an unstamped envelope, which is
+    /// exactly what those callers meant before this field existed. The
+    /// forcing function belongs where the mislabelling actually happens: an
+    /// agent that never has to look at the field will not, so
+    /// `flock_msg_send` makes the model choose.
+    #[serde(default)]
+    pub intent: MsgIntent,
     /// Client-supplied idempotency key. Minted server-side when omitted —
     /// but then the sender loses at-least-once retry ergonomics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,6 +869,17 @@ pub struct MsgReplyParams {
     /// The original message's correlation id.
     pub correlation_id: String,
     pub body: String,
+    /// Whether THIS reply is itself a question (#280).
+    ///
+    /// Defaulted rather than required, unlike `msg.send`. A reply already has
+    /// a prior: it is the discharge of an obligation, so `fyi` is a
+    /// structural fact about the common case and not a guess. Taxing every
+    /// answer with a decision whose answer is nearly always the same is the
+    /// "required fields get filled reflexively" failure at its strongest. A
+    /// reply that asks something back can still say so, which is the point —
+    /// without this, a two-turn exchange strands its intent in prose again.
+    #[serde(default)]
+    pub intent: MsgIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_correlation_id: Option<String>,
 }
@@ -781,6 +969,10 @@ pub struct QueuedMessageInfo {
     pub in_reply_to: Option<String>,
     pub enqueued_at_ms: u64,
     pub delivery_attempts: u32,
+    /// The sender's stamp, so the operator's peek can tell a question waiting
+    /// in an inbox from a notice (#280).
+    #[serde(default)]
+    pub intent: MsgIntent,
     /// Body preview, truncated for listing.
     pub preview: String,
 }
@@ -818,6 +1010,11 @@ pub struct InboxMessage {
     /// `from_pane` is absent — surfaced so the recipient never attempts a
     /// reply that would fail.
     pub replyable: bool,
+    /// What the sender said it wanted (#280). A field on the envelope, which
+    /// is the whole point: `needs_reply` is knowable before the body is read,
+    /// where a sentence asking for an answer is not.
+    #[serde(default)]
+    pub intent: MsgIntent,
     pub body: String,
 }
 
@@ -1336,6 +1533,12 @@ pub enum EventKind {
     /// #175 S3 commit 4 (ops): every commit whose tree was reverted via
     /// `flk revert-run` writes one of these onto the durable log.
     RunReverted,
+    /// #372 / ADR-0016: an outcome a human should read. Every other kind
+    /// here records that a thing HAPPENED; this one records what came of
+    /// it, in prose, addressed to the operator. `NotificationSeen` is its
+    /// acknowledgement — the unread set is the fold of one over the other.
+    NotificationFiled,
+    NotificationSeen,
 }
 
 impl EventKind {
@@ -1380,7 +1583,9 @@ impl EventKind {
             | Self::TriggerErrored
             | Self::FleetPaused
             | Self::FleetResumed
-            | Self::RunReverted => true,
+            | Self::RunReverted
+            | Self::NotificationFiled
+            | Self::NotificationSeen => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1421,6 +1626,18 @@ pub enum ResponseResult {
     NotificationShow {
         shown: bool,
         reason: NotificationShowReason,
+    },
+    NotificationList {
+        notifications: Vec<NotificationSummary>,
+        /// Unread across the whole projection, not just this page — it is the
+        /// number the badge and the sidebar tally render.
+        unread: usize,
+    },
+    NotificationAck {
+        /// How many records this call actually changed. Zero for an unknown id
+        /// or one already read.
+        acknowledged: usize,
+        unread: usize,
     },
     PeersSummary {
         /// Short hostname of the answering server.
@@ -1575,6 +1792,9 @@ pub enum ResponseResult {
         /// older than #320, which is why it is `default`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fleet: Vec<FleetAgentInfo>,
+    },
+    AgentHistory {
+        history: AgentHistoryResult,
     },
     Lineage {
         chain: Vec<LineageEdge>,
@@ -1960,6 +2180,43 @@ pub struct AgentSessionInfo {
     pub value: String,
 }
 
+/// One page of an agent's conversation (#276).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHistoryResult {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// The transcript this page came from. A restarted agent writes a new
+    /// session, and a `cursor` from the old one means nothing in the new
+    /// one — comparing this field is how a poller notices.
+    pub session_id: String,
+    /// The level the turns were rendered at, echoed so a caller reading a
+    /// stored response knows what it is holding.
+    pub detail: crate::agent_transcript::TranscriptDetail,
+    pub turns: Vec<HistoryTurnInfo>,
+    /// Byte offset the first returned turn was parsed from.
+    pub cursor: u64,
+    /// Byte offset to send as `cursor` next time. A poll that hands this back
+    /// parses only what was appended since.
+    pub next_cursor: u64,
+    /// More transcript already sits after `next_cursor` — page again rather
+    /// than wait.
+    pub more: bool,
+    /// Turns older than `cursor` exist and this call did not return them.
+    pub truncated: bool,
+}
+
+/// One turn in an [`AgentHistoryResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTurnInfo {
+    pub role: crate::agent_transcript::Role,
+    pub text: String,
+    /// Unix wall-clock ms the writer stamped on the entry, when it stamped
+    /// one. History is old by definition, so ages come from here rather than
+    /// from when the read happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReadResult {
     pub pane_id: String,
@@ -2144,6 +2401,13 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         in_reply_to: Option<String>,
         enqueued_at_ms: u64,
+        /// The sender's intent stamp (#280). Durable for the same reason the
+        /// body is: this log is what rebuilds the mailbox at boot, so an
+        /// intent left out of it would be silently downgraded to `fyi` by a
+        /// restart — turning the one signal this field exists to carry into
+        /// the failure it exists to prevent.
+        #[serde(default)]
+        intent: MsgIntent,
         /// Sanitized body — the durable log doubles as the mailbox's
         /// restart source, so the payload must survive here (ADR-0005/0006).
         body: String,
@@ -2300,6 +2564,33 @@ pub enum EventData {
         reverted_commit: String,
         revert_branch: String,
         dry_run: bool,
+    },
+    /// #372 / ADR-0016: an outcome filed for the operator to read. Durable
+    /// because the display may never happen — a toast expires, delivery may
+    /// be `off`, and `notification.show` refuses outright when one is
+    /// already on screen.
+    NotificationFiled {
+        notification_id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        kind: NotificationRecordKind,
+        source: NotificationSource,
+        /// Where to jump to read the whole story, when there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        /// The node that produced the outcome — the field that makes an
+        /// outcome from `sage` legible on `anvil`.
+        origin_host: String,
+        filed_at_ms: u64,
+    },
+    /// #372 / ADR-0016: the operator acknowledged one filed notification.
+    /// Separate event rather than a mutation because the log is append-only,
+    /// and because "when was it read" is itself worth auditing.
+    NotificationSeen {
+        notification_id: String,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
@@ -3192,6 +3483,68 @@ mod tests {
         ] {
             assert!(kind.is_persisted(), "{kind:?} must persist");
         }
+    }
+
+    #[test]
+    fn agent_history_method_and_response_round_trip() {
+        let request = Request {
+            id: "req_h".into(),
+            method: Method::AgentHistory(AgentHistoryParams {
+                target: "w2:p1".into(),
+                detail: crate::agent_transcript::TranscriptDetail::Collapsed,
+                cursor: Some(4096),
+                limit: Some(10),
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"method\":\"agent.history\""), "{json}");
+        assert!(
+            json.contains("\"detail\":\"collapsed\""),
+            "the detail levels are wire names, not Debug strings: {json}"
+        );
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, request);
+
+        let response = SuccessResponse {
+            id: "req_h".into(),
+            result: ResponseResult::AgentHistory {
+                history: AgentHistoryResult {
+                    pane_id: "w2:p1".into(),
+                    workspace_id: "w2".into(),
+                    session_id: "sess-1".into(),
+                    detail: crate::agent_transcript::TranscriptDetail::Collapsed,
+                    turns: vec![HistoryTurnInfo {
+                        role: crate::agent_transcript::Role::Assistant,
+                        text: "on it".into(),
+                        at_ms: Some(1_754_000_000_000),
+                    }],
+                    cursor: 4096,
+                    next_cursor: 8192,
+                    more: true,
+                    truncated: true,
+                },
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"agent_history\""), "{json}");
+        assert!(json.contains("\"role\":\"assistant\""), "{json}");
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    /// The default is the cheapest read a caller can make: the latest turns,
+    /// replies only. Anything more is opt-in, which is what keeps a poll from
+    /// being expensive by accident.
+    #[test]
+    fn agent_history_params_default_to_the_cheapest_read() {
+        let params: AgentHistoryParams =
+            serde_json::from_str(r#"{"target":"claude"}"#).expect("minimal params");
+        assert_eq!(
+            params.detail,
+            crate::agent_transcript::TranscriptDetail::Reply
+        );
+        assert_eq!(params.cursor, None);
+        assert_eq!(params.limit, None);
     }
 
     #[test]

@@ -2983,7 +2983,8 @@ mod tests {
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
-        // #130: a background completion's toast is deferred to the settle commit.
+        // #130 defers a background completion's toast to the settle commit and
+        // #36 drains it through the delay gate; both hang off the loop tick.
         let changed_at = app
             .state
             .terminals
@@ -2991,12 +2992,13 @@ mod tests {
             .unwrap()
             .state_changed_at
             .unwrap();
-        app.state.commit_settled_completions(
-            changed_at
-                + crate::app::actions::ATTENTION_SETTLE
-                + std::time::Duration::from_millis(1),
-            &app.terminal_runtimes,
-        );
+        let settled_at = changed_at
+            + crate::app::actions::ATTENTION_SETTLE
+            + std::time::Duration::from_millis(1);
+        app.state
+            .commit_settled_completions(settled_at, &app.terminal_runtimes);
+        app.state
+            .drain_due_agent_notifications(settled_at, &app.terminal_runtimes);
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
         let hit = app.state.view.toast_hit_area;

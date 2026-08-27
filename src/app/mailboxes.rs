@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::api::schema::{EventData, EventEnvelope};
+use crate::api::schema::{EventData, EventEnvelope, MsgIntent};
 
 /// Per-pane message queues (#175 M1). The durable event log (ADR-0005) is
 /// the source of truth: every admit emits `MessageQueued`, every settle
@@ -51,6 +51,10 @@ pub(crate) struct PendingMessage {
     pub in_reply_to: Option<String>,
     pub enqueued_at_ms: u64,
     pub delivery_attempts: u32,
+    /// Whether the sender said it is owed an answer (#280). Carried on the
+    /// queued message so it reaches the reader on the envelope rather than
+    /// buried in the body.
+    pub intent: MsgIntent,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +109,7 @@ impl MailboxRegistry {
                     body,
                     from_agent,
                     from_host,
+                    intent,
                     ..
                 } => {
                     self.mark_seen(correlation_id.clone());
@@ -122,6 +127,7 @@ impl MailboxRegistry {
                             in_reply_to: in_reply_to.clone(),
                             enqueued_at_ms: *enqueued_at_ms,
                             delivery_attempts: 0,
+                            intent: *intent,
                         },
                     );
                     order.push(correlation_id.clone());
@@ -351,6 +357,7 @@ impl MailboxRegistry {
                 in_reply_to: message.in_reply_to.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
                 delivery_attempts: message.delivery_attempts,
+                intent: message.intent,
                 preview: message.body.chars().take(120).collect(),
             })
             .collect();
@@ -377,6 +384,7 @@ mod tests {
             in_reply_to: None,
             enqueued_at_ms: 1,
             delivery_attempts: 0,
+            intent: MsgIntent::Fyi,
         }
     }
 
@@ -394,6 +402,7 @@ mod tests {
                 cross_repo: false,
                 in_reply_to: message.in_reply_to.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
+                intent: message.intent,
                 body: message.body.clone(),
             },
         }

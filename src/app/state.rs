@@ -863,6 +863,24 @@ pub enum PendingUiEvent {
         tab_id: String,
         label: String,
     },
+    /// #372 / ADR-0016: an outcome filed for the operator. Unlike the pane
+    /// variants there is nothing to resolve at drain — the record is already
+    /// complete, and the projection that holds it is derived from this event,
+    /// not the other way round.
+    NotificationFiled {
+        notification_id: String,
+        title: String,
+        body: Option<String>,
+        kind: crate::api::schema::NotificationRecordKind,
+        source: crate::api::schema::NotificationSource,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        origin_host: String,
+        filed_at_ms: u64,
+    },
+    NotificationSeen {
+        notification_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1944,6 +1962,45 @@ pub struct ToastNotification {
     pub target: Option<ToastTarget>,
 }
 
+/// An agent state-change notification that has been decided but not yet
+/// delivered, held until the pane has dwelled in `state` for
+/// `[ui.toast] delay_seconds` (#36).
+///
+/// Keyed by pane: a newer transition on the same pane replaces the entry, which
+/// is what gives the gate its cancellation semantics for free — an agent that
+/// leaves the state inside the delay never notifies at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentNotification {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub previous_state: AgentState,
+    pub state: AgentState,
+    pub deadline: std::time::Instant,
+}
+
+/// One decided notification, resolved into the sinks that should carry it.
+///
+/// The sinks are gated differently on purpose: the in-app Flock toast is
+/// pointless for a pane the operator is already looking at (`!is_active_tab`),
+/// while a client-local desktop/terminal notification is only suppressed when
+/// that tab is *also* focused (`!suppress_active_tab_notifications`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentNotificationDelivery {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub kind: ToastKind,
+    /// In-app Flock toast, when the pane is not the active tab.
+    pub toast: Option<ToastNotification>,
+    /// Desktop/terminal notification for the attached client, when active-tab
+    /// suppression does not apply.
+    pub client_notification: Option<ToastNotification>,
+    pub sound: Option<crate::sound::Sound>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFeedback {
     pub message: String,
@@ -2182,6 +2239,14 @@ pub struct AppState {
     pub(crate) float_esc_at: Option<std::time::Instant>,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    /// The operator's durable notification list (#372, ADR-0016). A read
+    /// model over `NotificationFiled` / `NotificationSeen` on the event log;
+    /// the toast above is the ephemeral half of the same outcome.
+    pub(crate) notifications: crate::app::notifications::NotificationLog,
+    /// Agent state-change notifications waiting out `[ui.toast] delay_seconds`
+    /// before they are delivered (#36). Empty when the delay is 0.
+    pub(crate) pending_agent_notifications:
+        std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting flock.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
@@ -3174,6 +3239,8 @@ impl AppState {
             float_esc_at: None,
             config_diagnostic: None,
             toast: None,
+            notifications: crate::app::notifications::NotificationLog::default(),
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             app_client_attached: true,

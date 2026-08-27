@@ -631,7 +631,10 @@ impl App {
             if let Some((version, install_command)) = update_ready {
                 let instruction = crate::update::update_install_instruction(&install_command);
                 let _ = notify(&format!("v{version} available"), Some(&instruction));
-            } else {
+            } else if self.state.toast_config().delay_seconds == 0 {
+                // #36: with a delay configured, agent notifications are held on
+                // `AppState` and emitted from the drain
+                // (`emit_client_local_agent_notifications`) instead.
                 for update in &pane_updates {
                     let is_active_tab = self
                         .state
@@ -666,11 +669,7 @@ impl App {
                     else {
                         continue;
                     };
-                    let event_text = match kind {
-                        ToastKind::NeedsAttention => "needs attention",
-                        ToastKind::Finished => "finished",
-                        ToastKind::UpdateInstalled => "updated",
-                    };
+                    let event_text = crate::app::actions::toast_event_text(kind);
                     let workspace_label =
                         ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
                     let _ = notify(
@@ -918,6 +917,36 @@ impl App {
         }
     }
 
+    /// Emit the desktop/terminal notifications for notifications that came out
+    /// of the delay gate (#36). The inline edge path above owns the same sink
+    /// when `delay_seconds` is 0; exactly one of the two runs.
+    pub(crate) fn emit_client_local_agent_notifications(
+        &self,
+        deliveries: &[crate::app::state::AgentNotificationDelivery],
+    ) {
+        if !self.local_terminal_notifications
+            || !matches!(
+                self.state.toast_config().delivery,
+                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
+            )
+        {
+            return;
+        }
+
+        let notify = match self.state.toast_config().delivery {
+            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
+            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
+            _ => unreachable!("toast delivery was checked above"),
+        };
+
+        for delivery in deliveries {
+            let Some(notification) = &delivery.client_notification else {
+                continue;
+            };
+            let _ = notify(&notification.title, Some(&notification.context));
+        }
+    }
+
     pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
@@ -1019,6 +1048,36 @@ impl App {
                         label,
                     },
                 },
+                crate::app::state::PendingUiEvent::NotificationFiled {
+                    notification_id,
+                    title,
+                    body,
+                    kind,
+                    source,
+                    workspace_id,
+                    pane_id,
+                    origin_host,
+                    filed_at_ms,
+                } => crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::NotificationFiled,
+                    data: crate::api::schema::EventData::NotificationFiled {
+                        notification_id,
+                        title,
+                        body,
+                        kind,
+                        source,
+                        workspace_id,
+                        pane_id,
+                        origin_host,
+                        filed_at_ms,
+                    },
+                },
+                crate::app::state::PendingUiEvent::NotificationSeen { notification_id } => {
+                    crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::NotificationSeen,
+                        data: crate::api::schema::EventData::NotificationSeen { notification_id },
+                    }
+                }
             };
             self.emit_event(envelope);
         }
@@ -1143,6 +1202,12 @@ impl App {
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }
+            Method::NotificationList(params) => {
+                return self.handle_notification_list(request.id, params);
+            }
+            Method::NotificationAck(params) => {
+                return self.handle_notification_ack(request.id, params);
+            }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
             Method::PeersCheckoutPrepare(params) => {
                 return self.handle_peers_checkout_prepare(request.id, params)
@@ -1198,6 +1263,7 @@ impl App {
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
+            Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
@@ -1295,8 +1361,8 @@ impl App {
                     self.mark_api_notification_shown(Instant::now());
                     self.state.toast = Some(crate::app::state::ToastNotification {
                         kind: ToastKind::UpdateInstalled,
-                        title,
-                        context: body.unwrap_or_default(),
+                        title: title.clone(),
+                        context: body.clone().unwrap_or_default(),
                         position: params.position,
                         target: None,
                     });
@@ -1337,11 +1403,103 @@ impl App {
             }
         };
 
+        // #372 / ADR-0016: file it whether or not it was shown. Every refusal
+        // above — `Busy`, `RateLimited`, `Disabled` (the DEFAULT delivery),
+        // `NoForegroundClient` — discarded the caller's text outright until
+        // now. The display is still refused; the record is kept.
+        self.state
+            .file_notification(crate::app::notifications::NotificationEntry {
+                id: crate::app::notifications::mint_notification_id(),
+                title,
+                body,
+                kind: crate::api::schema::NotificationRecordKind::Notice,
+                source: crate::api::schema::NotificationSource::Api,
+                workspace_id: None,
+                pane_id: None,
+                origin_host: crate::app::short_host_name(),
+                filed_at_ms: crate::app::notifications::now_ms(),
+                seen: false,
+            });
+
         responses::encode_success(
             id,
             ResponseResult::NotificationShow {
                 shown: matches!(reason, NotificationShowReason::Shown),
                 reason,
+            },
+        )
+    }
+
+    /// `notification.list` (#372 / ADR-0016) — what happened while you were
+    /// away. Reading is not acknowledging: a list call never marks anything
+    /// seen, because acknowledging is what makes a record evictable.
+    fn handle_notification_list(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationListParams,
+    ) -> String {
+        use crate::api::schema::{NotificationSummary, ResponseResult};
+
+        let limit = params.limit.unwrap_or(usize::MAX);
+        let notifications: Vec<NotificationSummary> = self
+            .state
+            .notifications
+            .newest_first()
+            .filter(|entry| !params.unread_only || !entry.seen)
+            .take(limit)
+            .map(|entry| NotificationSummary {
+                notification_id: entry.id.clone(),
+                title: entry.title.clone(),
+                body: entry.body.clone(),
+                kind: entry.kind,
+                source: entry.source,
+                workspace_id: entry.workspace_id.clone(),
+                pane_id: entry.pane_id.clone(),
+                origin_host: entry.origin_host.clone(),
+                filed_at_ms: entry.filed_at_ms,
+                seen: entry.seen,
+            })
+            .collect();
+
+        responses::encode_success(
+            id,
+            ResponseResult::NotificationList {
+                notifications,
+                unread: self.state.notifications.unread(),
+            },
+        )
+    }
+
+    /// `notification.ack` (#372 / ADR-0016).
+    fn handle_notification_ack(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationAckParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let acknowledged = if params.all {
+            self.state.acknowledge_all_notifications()
+        } else {
+            match params.notification_id.as_deref() {
+                Some(notification_id) => {
+                    usize::from(self.state.acknowledge_notification(notification_id))
+                }
+                None => {
+                    return responses::encode_error(
+                        id,
+                        "invalid_params",
+                        "notification.ack needs a notification_id or all = true",
+                    )
+                }
+            }
+        };
+
+        responses::encode_success(
+            id,
+            ResponseResult::NotificationAck {
+                acknowledged,
+                unread: self.state.notifications.unread(),
             },
         )
     }
@@ -1629,6 +1787,187 @@ mod tests {
         assert!(summary["status_age_secs"].as_u64().unwrap() >= 90);
     }
 
+    fn notification_test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn notification_request(
+        id: &str,
+        method: crate::api::schema::Method,
+    ) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method,
+        }
+    }
+
+    /// #372: `[ui.toast] delivery` defaults to `off`, so until now the one
+    /// content-bearing verb flock has answered "disabled" and threw the
+    /// caller's text away. The display is still refused; the record is kept.
+    #[tokio::test]
+    async fn notification_show_files_the_record_even_when_it_refuses_to_show_it() {
+        let mut app = notification_test_app();
+        assert_eq!(
+            app.state.toast_config().delivery,
+            crate::config::ToastDelivery::Off,
+            "this test is about the shipped default"
+        );
+
+        let response = app.handle_api_request(notification_request(
+            "show",
+            crate::api::schema::Method::NotificationShow(
+                crate::api::schema::NotificationShowParams {
+                    title: "pr opened".into(),
+                    body: Some("gerchowl/flock#378".into()),
+                    position: None,
+                    sound: crate::api::schema::NotificationShowSound::None,
+                },
+            ),
+        ));
+
+        assert!(response.contains("\"shown\":false"), "{response}");
+        assert!(response.contains("\"disabled\""), "{response}");
+        assert_eq!(app.state.notifications.unread(), 1);
+        let entry = app
+            .state
+            .notifications
+            .newest_first()
+            .next()
+            .expect("the refused notification is still filed")
+            .clone();
+        assert_eq!(entry.title, "pr opened");
+        assert_eq!(entry.body.as_deref(), Some("gerchowl/flock#378"));
+    }
+
+    /// The projection is derived, so it must be reconstructible from the
+    /// events it queued — otherwise it survives only as long as the process
+    /// that built it, which is the bug this feature exists to fix. Starts at
+    /// the verb and ends at a second projection built only from the log.
+    #[tokio::test]
+    async fn a_filed_notification_rebuilds_itself_from_the_durable_log() {
+        let mut app = notification_test_app();
+        app.handle_api_request(notification_request(
+            "show",
+            crate::api::schema::Method::NotificationShow(
+                crate::api::schema::NotificationShowParams {
+                    title: "check failed".into(),
+                    body: None,
+                    position: None,
+                    sound: crate::api::schema::NotificationShowSound::None,
+                },
+            ),
+        ));
+        let id = app
+            .state
+            .notifications
+            .newest_first()
+            .next()
+            .expect("filed")
+            .id
+            .clone();
+        app.handle_api_request(notification_request(
+            "ack",
+            crate::api::schema::Method::NotificationAck(
+                crate::api::schema::NotificationAckParams {
+                    notification_id: Some(id.clone()),
+                    all: false,
+                },
+            ),
+        ));
+
+        let published: Vec<crate::api::schema::EventEnvelope> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .collect();
+        let mut rebuilt = crate::app::notifications::NotificationLog::default();
+        rebuilt.seed_from_events(published.iter());
+
+        assert_eq!(rebuilt.len(), 1, "the file reached the log");
+        assert_eq!(rebuilt.unread(), 0, "so did the acknowledgement");
+        assert_eq!(
+            rebuilt.newest_first().next().map(|e| e.id.clone()),
+            Some(id)
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_list_reads_without_acknowledging_and_ack_is_idempotent() {
+        let mut app = notification_test_app();
+        for title in ["first", "second"] {
+            app.handle_api_request(notification_request(
+                "show",
+                crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: title.into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            ));
+        }
+
+        let listed = app.handle_api_request(notification_request(
+            "list",
+            crate::api::schema::Method::NotificationList(
+                crate::api::schema::NotificationListParams::default(),
+            ),
+        ));
+        assert!(listed.contains("\"unread\":2"), "{listed}");
+        assert!(
+            listed.find("second").unwrap() < listed.find("first").unwrap(),
+            "newest first: {listed}"
+        );
+        assert_eq!(
+            app.state.notifications.unread(),
+            2,
+            "listing is not acknowledging"
+        );
+
+        let id = app
+            .state
+            .notifications
+            .newest_first()
+            .next()
+            .expect("filed")
+            .id
+            .clone();
+        let acked = app.handle_api_request(notification_request(
+            "ack",
+            crate::api::schema::Method::NotificationAck(
+                crate::api::schema::NotificationAckParams {
+                    notification_id: Some(id.clone()),
+                    all: false,
+                },
+            ),
+        ));
+        assert!(acked.contains("\"acknowledged\":1"), "{acked}");
+        assert!(acked.contains("\"unread\":1"), "{acked}");
+
+        let again = app.handle_api_request(notification_request(
+            "ack",
+            crate::api::schema::Method::NotificationAck(
+                crate::api::schema::NotificationAckParams {
+                    notification_id: Some(id),
+                    all: false,
+                },
+            ),
+        ));
+        assert!(
+            again.contains("\"acknowledged\":0"),
+            "a second ack changes nothing: {again}"
+        );
+    }
+
     #[tokio::test]
     async fn flock_toast_context_uses_live_root_runtime_cwd_label() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1711,7 +2050,9 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
-        // #130: a background completion's toast is deferred to the settle commit.
+        // #130: a background completion's toast is deferred to the settle
+        // commit, and #36 then drains it through the delay gate — both run off
+        // the loop tick, so drive the tick rather than either half of it.
         let changed_at = app
             .state
             .terminals
@@ -1719,11 +2060,11 @@ mod tests {
             .unwrap()
             .state_changed_at
             .unwrap();
-        app.state.commit_settled_completions(
+        app.handle_scheduled_tasks(
             changed_at
                 + crate::app::actions::ATTENTION_SETTLE
                 + std::time::Duration::from_millis(1),
-            &app.terminal_runtimes,
+            false,
         );
 
         assert_eq!(

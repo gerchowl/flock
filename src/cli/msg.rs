@@ -3,7 +3,7 @@
     reason = "CLI output surface: usage and errors go to stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    EmptyParams, MessageTarget, Method, MsgListParams, MsgReadParams, MsgReplyParams,
+    EmptyParams, MessageTarget, Method, MsgIntent, MsgListParams, MsgReadParams, MsgReplyParams,
     MsgSendParams, Request,
 };
 
@@ -39,8 +39,9 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
 
 fn msg_send(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
-         [--correlation-id ID] [--reply-to ID] [--from-agent ID]";
+         [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID] [--from-agent ID]";
     let mut repo = None;
+    let mut intent = MsgIntent::default();
     let mut correlation_id = None;
     let mut in_reply_to = None;
     let mut agent = None;
@@ -95,6 +96,22 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
                 from_agent = Some(value.clone());
                 index += 2;
             }
+            // #280. Optional here, and required on the MCP tool: the CLI
+            // caller is an operator or the cross-host relay, and both already
+            // know what they meant. The stamp an agent might skip without
+            // noticing is the one worth forcing.
+            "--intent" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --intent");
+                    return Ok(2);
+                };
+                let Some(parsed) = MsgIntent::from_wire(value) else {
+                    eprintln!("unknown --intent {value:?}: expected fyi or needs-reply");
+                    return Ok(2);
+                };
+                intent = parsed;
+                index += 2;
+            }
             "--json" => index += 1,
             "--" => {
                 positional.extend(args[index + 1..].iter().cloned());
@@ -143,6 +160,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             body,
             correlation_id,
             in_reply_to,
+            intent,
         }),
     })?)
 }
@@ -189,16 +207,42 @@ fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
 }
 
 fn msg_reply(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: flk msg reply <correlation_id> <text...>");
+    const USAGE: &str = "usage: flk msg reply <correlation_id> <text...> \
+         [--intent fyi|needs-reply]";
+    let mut intent = MsgIntent::default();
+    let mut positional: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--intent" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --intent");
+                    return Ok(2);
+                };
+                let Some(parsed) = MsgIntent::from_wire(value) else {
+                    eprintln!("unknown --intent {value:?}: expected fyi or needs-reply");
+                    return Ok(2);
+                };
+                intent = parsed;
+                index += 2;
+            }
+            _ => {
+                positional.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    if positional.len() < 2 {
+        eprintln!("{USAGE}");
         return Ok(2);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:msg:reply".into(),
         method: Method::MsgReply(MsgReplyParams {
-            correlation_id: args[0].clone(),
-            body: args[1..].join(" "),
+            correlation_id: positional[0].clone(),
+            body: positional[1..].join(" "),
             reply_correlation_id: None,
+            intent,
         }),
     })?)
 }
@@ -318,9 +362,14 @@ fn msg_mute(args: &[String]) -> std::io::Result<i32> {
 fn print_msg_help() {
     eprintln!("flk msg commands:");
     eprintln!(
-        "  flk msg send <target> <text...> [--repo NAME] [--correlation-id ID] [--reply-to ID]"
+        "  flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply] \
+         [--correlation-id ID] [--reply-to ID]"
     );
-    eprintln!("  flk msg reply <correlation_id> <text...>");
+    eprintln!("  flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply]");
+    eprintln!(
+        "  --intent needs-reply marks a message as owed an answer; it rides the envelope, \
+         so the recipient sees it without reading the body (default: fyi)"
+    );
     eprintln!("  flk msg list [--pane TARGET]");
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
     eprintln!("  flk msg status <correlation_id>  what became of a message you sent");

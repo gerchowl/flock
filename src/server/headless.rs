@@ -1235,6 +1235,42 @@ impl HeadlessServer {
         self.clients.get(&client_id)?.outer_terminal_focus
     }
 
+    /// Ship one delay-gated agent notification (#36) to the foreground client.
+    /// The inline edge paths own the same forward when `delay_seconds` is 0;
+    /// exactly one of the two runs for any transition.
+    fn forward_agent_notification_delivery(
+        &mut self,
+        delivery: &crate::app::state::AgentNotificationDelivery,
+    ) {
+        if let Some(sound) = delivery.sound {
+            let message = match sound {
+                crate::sound::Sound::Done => "agent done",
+                crate::sound::Sound::Request => "agent attention",
+                crate::sound::Sound::AllClear => "attention clear",
+            };
+            crate::logging::notification_sound_forwarded(&format!("{:?}", sound));
+            self.send_to_foreground_client(ServerMessage::Notify {
+                kind: protocol::NotifyKind::Sound,
+                message: message.to_owned(),
+                body: None,
+            });
+        }
+
+        let Some(notification) = delivery.client_notification.as_ref() else {
+            return;
+        };
+        let Some(kind) = toast_notify_kind(self.app.state.toast_config().delivery) else {
+            return;
+        };
+        let message = format!("{}: {}", notification.title, notification.context);
+        crate::logging::notification_toast_forwarded(&message);
+        self.send_to_foreground_client(ServerMessage::Notify {
+            kind,
+            message,
+            body: None,
+        });
+    }
+
     fn active_tab_suppresses_notifications(&self, is_active_tab: bool) -> bool {
         crate::app::actions::active_tab_suppresses_notifications(
             is_active_tab,
@@ -1579,7 +1615,11 @@ impl HeadlessServer {
 
                 let next_state = self.pane_effective_state(pane_id_val);
 
-                if self.app.state.sound_config().allows(agent_val) {
+                // #36: with a delay configured the transition is held on
+                // `AppState` and forwarded from the drain instead.
+                if self.app.state.toast_config().delay_seconds == 0
+                    && self.app.state.sound_config().allows(agent_val)
+                {
                     if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                         suppress_active_tab_notifications,
                         prev_state,
@@ -1598,27 +1638,28 @@ impl HeadlessServer {
                     }
                 }
 
-                let toast_msg =
-                    if should_forward_toast_to_clients(self.app.state.toast_config().delivery) {
-                        if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                            self.app
-                                .state
-                                .toast
-                                .as_ref()
-                                .map(|toast| format!("{}: {}", toast.title, toast.context))
-                        } else {
-                            toast_message_from_state_change(
-                                &self.app.state,
-                                &self.app.terminal_runtimes,
-                                pane_id_val,
-                                suppress_active_tab_notifications,
-                                prev_state,
-                                next_state,
-                            )
-                        }
+                let toast_msg = if self.app.state.toast_config().delay_seconds == 0
+                    && should_forward_toast_to_clients(self.app.state.toast_config().delivery)
+                {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
                     } else {
-                        None
-                    };
+                        toast_message_from_state_change(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            pane_id_val,
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                        )
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(msg) = toast_msg {
                     self.send_to_foreground_client(ServerMessage::Notify {
@@ -1667,7 +1708,11 @@ impl HeadlessServer {
 
                 let next_state = self.pane_effective_state(pane_id_val);
 
-                if self.app.state.sound_config().allows(agent_val) {
+                // #36: with a delay configured the transition is held on
+                // `AppState` and forwarded from the drain instead.
+                if self.app.state.toast_config().delay_seconds == 0
+                    && self.app.state.sound_config().allows(agent_val)
+                {
                     if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                         suppress_active_tab_notifications,
                         prev_state,
@@ -1686,27 +1731,28 @@ impl HeadlessServer {
                     }
                 }
 
-                let toast_msg =
-                    if should_forward_toast_to_clients(self.app.state.toast_config().delivery) {
-                        if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                            self.app
-                                .state
-                                .toast
-                                .as_ref()
-                                .map(|toast| format!("{}: {}", toast.title, toast.context))
-                        } else {
-                            toast_message_from_state_change(
-                                &self.app.state,
-                                &self.app.terminal_runtimes,
-                                pane_id_val,
-                                suppress_active_tab_notifications,
-                                prev_state,
-                                next_state,
-                            )
-                        }
+                let toast_msg = if self.app.state.toast_config().delay_seconds == 0
+                    && should_forward_toast_to_clients(self.app.state.toast_config().delivery)
+                {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
                     } else {
-                        None
-                    };
+                        toast_message_from_state_change(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            pane_id_val,
+                            suppress_active_tab_notifications,
+                            prev_state,
+                            next_state,
+                        )
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(msg) = toast_msg {
                     self.send_to_foreground_client(ServerMessage::Notify {
@@ -2613,7 +2659,10 @@ impl HeadlessServer {
                 &format!("{:?}", agent),
             );
 
+            // #36: with a delay configured the transition is held on `AppState`
+            // and forwarded from the drain instead.
             if !forwarded_toast_from_state
+                && self.app.state.toast_config().delay_seconds == 0
                 && should_forward_toast_to_clients(self.app.state.toast_config().delivery)
             {
                 if let Some(kind) = crate::app::actions::notification_toast_for_state_change(
@@ -2628,11 +2677,7 @@ impl HeadlessServer {
                         .get(&pane_after.attached_terminal_id)
                         .and_then(|terminal| terminal.effective_agent_label())
                     {
-                        let event_text = match kind {
-                            crate::app::state::ToastKind::NeedsAttention => "needs attention",
-                            crate::app::state::ToastKind::Finished => "finished",
-                            crate::app::state::ToastKind::UpdateInstalled => "updated",
-                        };
+                        let event_text = crate::app::actions::toast_event_text(kind);
                         let workspace_label = self.app.state.workspaces[*ws_idx].display_name_from(
                             &self.app.state.terminals,
                             &self.app.terminal_runtimes,
@@ -2660,7 +2705,9 @@ impl HeadlessServer {
 
             // Forward sound notification when server-side sound policy allows it.
             // Clients still decide locally whether they can execute the side effect.
-            if self.app.state.sound_config().allows(agent) {
+            if self.app.state.toast_config().delay_seconds == 0
+                && self.app.state.sound_config().allows(agent)
+            {
                 if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                     suppress_active_tab_notifications,
                     *prev_state,
@@ -3327,6 +3374,7 @@ impl HeadlessServer {
         // authoritative `seen` clients read never stays stuck pending, and
         // broadcast each Idle→Done change so API subscribers (e.g. `wait
         // agent-status --status done`) are notified at the settle.
+        let toast_before_notifications = self.app.state.toast.clone();
         let settled = self
             .app
             .state
@@ -3338,6 +3386,19 @@ impl HeadlessServer {
             self.app.emit_pane_state_update(update);
         }
         changed |= !settled.is_empty();
+
+        // #36: the same delay gate the TUI runtime drains, mirrored here (the
+        // #25 dual-loop rule). Ordered after the settle commit so a completion
+        // whose gate is measured from the transition goes out in this tick.
+        let deliveries = self
+            .app
+            .state
+            .drain_due_agent_notifications(now, &self.app.terminal_runtimes);
+        for delivery in &deliveries {
+            self.forward_agent_notification_delivery(delivery);
+        }
+        changed |= !deliveries.is_empty();
+        self.app.sync_toast_deadline(toast_before_notifications);
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
@@ -3373,6 +3434,13 @@ impl HeadlessServer {
             self.app.sync_agent_metadata_deadline();
             changed = true;
         }
+
+        // Publish anything a state mutation queued this tick (#175 ADR-0005).
+        // The socket path drains inside its own request handler and the
+        // monolithic loop drains in `App::run`; the headless loop had no
+        // equivalent, so an event queued off a tick here — a filed
+        // notification (#372) among them — never reached the log.
+        self.app.drain_pending_ui_events();
 
         // #175 phase 4 dual-loop rule: the headless server ticks the same
         // check-runner path as the TUI runtime.
@@ -7758,6 +7826,130 @@ next_tab = ""
             }
             other => panic!("expected system toast notify, got {other:?}"),
         }
+    }
+
+    /// #36: the headless forwarders sit behind the same gate the TUI does, and
+    /// the drain on the loop tick is what releases them. Without both halves a
+    /// remote client either notifies on the edge or never notifies at all.
+    #[test]
+    fn agent_notification_forward_waits_for_the_delay_drain() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let pane_id = background.tabs[0].root_pane;
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![background, foreground];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.config.ui.toast.delivery = crate::config::ToastDelivery::Terminal;
+
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+
+        assert!(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the gate holds the forward at the edge"
+        );
+
+        let deadline = server
+            .app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        server.handle_scheduled_tasks_headless(deadline, false);
+
+        let mut forwarded = None;
+        while let Ok(raw) = client_control_rx.recv_timeout(Duration::from_millis(100)) {
+            if let ServerMessage::Notify {
+                kind,
+                message,
+                body: _,
+            } = read_server_message(raw)
+            {
+                if kind == protocol::NotifyKind::Toast {
+                    forwarded = Some(message);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            forwarded.as_deref(),
+            Some("pi needs attention: background · 1")
+        );
+    }
+
+    /// #372: the headless loop had no `drain_pending_ui_events` of its own —
+    /// the socket handler drained inside a request and `App::run` drained in
+    /// the monolithic loop, so an event queued off a tick here reached nothing.
+    /// A notification filed by the delay drain is exactly that case, and the
+    /// server is where most operators run.
+    #[test]
+    fn a_notification_filed_off_the_headless_tick_reaches_the_durable_log() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let pane_id = background.tabs[0].root_pane;
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![background, foreground];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+
+        server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        let deadline = server
+            .app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        server.handle_scheduled_tasks_headless(deadline, false);
+
+        assert_eq!(server.app.state.notifications.unread(), 1);
+        assert!(
+            server
+                .app
+                .event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| { event.event == api::schema::EventKind::NotificationFiled }),
+            "the projection is only as durable as the event it queued"
+        );
     }
 
     #[test]

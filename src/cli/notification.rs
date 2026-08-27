@@ -2,7 +2,10 @@
     clippy::print_stderr,
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
-use crate::api::schema::{Method, NotificationShowParams, NotificationShowSound, Request};
+use crate::api::schema::{
+    Method, NotificationAckParams, NotificationListParams, NotificationShowParams,
+    NotificationShowSound, Request,
+};
 use crate::config::ToastFlockPosition;
 
 pub(super) fn run_notification_command(args: &[String]) -> std::io::Result<i32> {
@@ -13,6 +16,8 @@ pub(super) fn run_notification_command(args: &[String]) -> std::io::Result<i32> 
 
     match subcommand {
         "show" => notification_show(&args[1..]),
+        "list" => notification_list(&args[1..]),
+        "read" => notification_read(&args[1..]),
         "help" | "--help" | "-h" => {
             print_notification_help();
             Ok(0)
@@ -42,6 +47,83 @@ fn notification_show(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:notification:show".into(),
         method: Method::NotificationShow(params),
+    })?)
+}
+
+/// `flk notification list` (#372) — the outcomes that outlived their toasts.
+/// Listing never acknowledges: reading the list is not the same as having
+/// dealt with what is in it, and acknowledging is what lets retention drop a
+/// record.
+fn notification_list(args: &[String]) -> std::io::Result<i32> {
+    let mut params = NotificationListParams::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--unread" => {
+                params.unread_only = true;
+                index += 1;
+            }
+            "--limit" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --limit");
+                    return Ok(2);
+                };
+                let Ok(limit) = value.parse::<usize>() else {
+                    eprintln!("invalid --limit: {value}");
+                    return Ok(2);
+                };
+                params.limit = Some(limit);
+                index += 2;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("usage: flk notification list [--unread] [--limit N]");
+                return Ok(2);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:notification:list".into(),
+        method: Method::NotificationList(params),
+    })?)
+}
+
+/// `flk notification read <id>` / `--all` (#372) — acknowledge.
+fn notification_read(args: &[String]) -> std::io::Result<i32> {
+    let mut params = NotificationAckParams::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--all" => {
+                params.all = true;
+                index += 1;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("usage: flk notification read <notification-id> | --all");
+                return Ok(2);
+            }
+            other if params.notification_id.is_none() && !other.starts_with("--") => {
+                params.notification_id = Some(other.to_string());
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    if params.notification_id.is_none() && !params.all {
+        eprintln!("usage: flk notification read <notification-id> | --all");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:notification:read".into(),
+        method: Method::NotificationAck(params),
     })?)
 }
 
@@ -140,6 +222,8 @@ fn print_notification_help() {
     eprintln!(
         "  flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]"
     );
+    eprintln!("  flk notification list [--unread] [--limit N]");
+    eprintln!("  flk notification read <notification-id> | --all");
 }
 
 #[cfg(test)]

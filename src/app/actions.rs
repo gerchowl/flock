@@ -12,9 +12,10 @@ use crate::workspace::WorkspaceGitStatus;
 use unicode_width::UnicodeWidthChar;
 
 use super::state::{
-    text_matches_query, AppState, Mode, NavigatorRow, NavigatorStateFilter, NavigatorTarget,
-    PaneFocusTarget, PromptHistoryAnchor, SectionGroupingMemo, ToastKind, ToastNotification,
-    ToastTarget, ViewLayout,
+    text_matches_query, AgentNotificationDelivery, AppState, Mode, NavigatorRow,
+    NavigatorStateFilter, NavigatorTarget, PaneFocusTarget, PendingAgentNotification,
+    PromptHistoryAnchor, SectionGroupingMemo, ToastKind, ToastNotification, ToastTarget,
+    ViewLayout,
 };
 
 fn public_tab_id_for_index(ws: &crate::workspace::Workspace, tab_idx: usize) -> Option<String> {
@@ -85,6 +86,14 @@ pub fn notification_toast_for_state_change(
 
 fn toast_agent_label(agent_label: &str) -> &str {
     agent_label
+}
+
+pub(crate) fn toast_event_text(kind: ToastKind) -> &'static str {
+    match kind {
+        ToastKind::NeedsAttention => "needs attention",
+        ToastKind::Finished => "finished",
+        ToastKind::UpdateInstalled => "updated",
+    }
 }
 
 pub fn notification_context(
@@ -4221,12 +4230,172 @@ impl AppState {
         agent_label: Option<&str>,
         terminal_runtimes: Option<&crate::terminal::TerminalRuntimeRegistry>,
     ) {
-        if self.local_sound_playback && self.sound_config().allows(known_agent) {
-            if let Some(sound) = notification_sound_for_state_change(
-                suppress_active_tab_notifications,
+        // A newer transition supersedes anything this pane still had waiting out
+        // the delay (#36) — the outcome it described is no longer true.
+        self.pending_agent_notifications.remove(&pane_id);
+
+        let Some(agent_label) = agent_label else {
+            return;
+        };
+        // Decide at the edge whether this transition says anything at all, so
+        // the gate only ever holds what the edge itself would have delivered.
+        // Re-deciding at the deadline may narrow a held notification; it must
+        // never invent one for a transition that was silent here.
+        let Some(delivery) = self.agent_notification_delivery(
+            ws_idx,
+            pane_id,
+            is_active_tab,
+            suppress_active_tab_notifications,
+            previous_state,
+            new_state,
+            known_agent,
+            agent_label,
+            terminal_runtimes,
+        ) else {
+            return;
+        };
+
+        let delay = self.agent_notification_delay();
+        if delay.is_zero() {
+            self.apply_agent_notification_delivery(&delivery);
+            return;
+        }
+
+        // Anchor the gate on the transition itself rather than on this call.
+        // A background completion has already dwelled through the attention
+        // settle (#130) by the time it commits here, and must not serve a
+        // second delay on top of the one the operator asked for: with the
+        // default 1s and a 1.2s settle its deadline is already past, so the
+        // drain in the same tick fires it with no added latency.
+        let now = std::time::Instant::now();
+        let deadline = self
+            .pane_state_changed_at(ws_idx, pane_id)
+            .unwrap_or(now)
+            .checked_add(delay)
+            .unwrap_or(now);
+        self.pending_agent_notifications.insert(
+            pane_id,
+            PendingAgentNotification {
+                pane_id,
+                workspace_id: delivery.workspace_id,
+                agent_label: delivery.agent_label,
+                known_agent,
                 previous_state,
-                new_state,
-            ) {
+                state: new_state,
+                deadline,
+            },
+        );
+    }
+
+    /// The configured notification gate, clamped to the same bound the config
+    /// loader enforces so a hand-edited hot reload can never park a delivery
+    /// beyond it.
+    fn agent_notification_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.toast_config()
+                .delay_seconds
+                .min(crate::config::model::MAX_TOAST_DELAY_SECONDS),
+        )
+    }
+
+    /// When this pane's terminal last changed agent state — the instant the
+    /// delay gate measures dwell from.
+    fn pane_state_changed_at(&self, ws_idx: usize, pane_id: PaneId) -> Option<std::time::Instant> {
+        self.workspaces
+            .get(ws_idx)?
+            .pane_state(pane_id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.state_changed_at)
+    }
+
+    /// Resolve a decided transition into the sinks that should carry it.
+    ///
+    /// The in-app Flock toast is gated on `!is_active_tab` — there is nothing to
+    /// tell an operator about the pane they are looking at — while the
+    /// client-local desktop/terminal notification only drops out when that tab
+    /// is focused too. Returns `None` when no sink wants it.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_notification_delivery(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        is_active_tab: bool,
+        suppress_active_tab_notifications: bool,
+        previous_state: AgentState,
+        new_state: AgentState,
+        known_agent: Option<Agent>,
+        agent_label: &str,
+        terminal_runtimes: Option<&crate::terminal::TerminalRuntimeRegistry>,
+    ) -> Option<AgentNotificationDelivery> {
+        let kind = notification_toast_for_state_change(false, previous_state, new_state)?;
+        let sound = notification_sound_for_state_change(
+            suppress_active_tab_notifications,
+            previous_state,
+            new_state,
+        )
+        .filter(|_| self.sound_config().allows(known_agent));
+
+        let workspace_id = self.workspaces.get(ws_idx)?.id.clone();
+        let build_toast = || {
+            let workspace_label = match terminal_runtimes {
+                Some(runtimes) => {
+                    self.workspaces[ws_idx].display_name_from(&self.terminals, runtimes)
+                }
+                None => self.workspaces[ws_idx].display_name(),
+            };
+            ToastNotification {
+                kind,
+                title: format!(
+                    "{} {}",
+                    toast_agent_label(agent_label),
+                    toast_event_text(kind)
+                ),
+                context: notification_context(
+                    &self.workspaces[ws_idx],
+                    &workspace_label,
+                    ws_idx,
+                    pane_id,
+                ),
+                position: None,
+                target: Some(ToastTarget {
+                    workspace_id: workspace_id.clone(),
+                    pane_id,
+                }),
+            }
+        };
+        let toast = notification_toast_for_state_change(is_active_tab, previous_state, new_state)
+            .map(|_| build_toast());
+        let client_notification = notification_toast_for_state_change(
+            suppress_active_tab_notifications,
+            previous_state,
+            new_state,
+        )
+        .map(|_| build_toast());
+
+        if toast.is_none() && client_notification.is_none() && sound.is_none() {
+            return None;
+        }
+
+        Some(AgentNotificationDelivery {
+            pane_id,
+            workspace_id,
+            agent_label: agent_label.to_owned(),
+            known_agent,
+            kind,
+            toast,
+            client_notification,
+            sound,
+        })
+    }
+
+    /// Fire the sinks this process owns: the local sound and the in-app toast.
+    /// The client-local desktop/terminal notification and the headless forward
+    /// are the App/server layer's to emit from the same delivery.
+    fn apply_agent_notification_delivery(&mut self, delivery: &AgentNotificationDelivery) {
+        self.file_agent_notification(delivery);
+
+        if self.local_sound_playback {
+            if let Some(sound) = delivery.sound {
                 crate::sound::play(sound, self.sound_config());
             }
         }
@@ -4235,39 +4404,130 @@ impl AppState {
             self.toast_config().delivery,
             crate::config::ToastDelivery::Flock
         ) {
-            if let (Some(agent_label), Some(kind)) = (
-                agent_label,
-                notification_toast_for_state_change(is_active_tab, previous_state, new_state),
-            ) {
-                let event_text = match kind {
-                    ToastKind::NeedsAttention => "needs attention",
-                    ToastKind::Finished => "finished",
-                    ToastKind::UpdateInstalled => "updated",
-                };
-                let workspace_label = match terminal_runtimes {
-                    Some(runtimes) => {
-                        self.workspaces[ws_idx].display_name_from(&self.terminals, runtimes)
-                    }
-                    None => self.workspaces[ws_idx].display_name(),
-                };
-                let context = notification_context(
-                    &self.workspaces[ws_idx],
-                    &workspace_label,
-                    ws_idx,
-                    pane_id,
-                );
-                self.toast = Some(ToastNotification {
-                    kind,
-                    title: format!("{} {}", toast_agent_label(agent_label), event_text),
-                    context,
-                    position: None,
-                    target: Some(ToastTarget {
-                        workspace_id: self.workspaces[ws_idx].id.clone(),
-                        pane_id,
-                    }),
-                });
+            if let Some(toast) = delivery.toast.clone() {
+                self.toast = Some(toast);
             }
         }
+    }
+
+    /// Keep the outcome as well as show it (#372, ADR-0016). Filing is
+    /// deliberately independent of `[ui.toast] delivery`: `off` is a request
+    /// for no popups, not a request to forget what happened — and it is the
+    /// default, so gating on it would leave the log empty for most operators.
+    fn file_agent_notification(&mut self, delivery: &AgentNotificationDelivery) {
+        let (title, body) = match delivery
+            .toast
+            .as_ref()
+            .or(delivery.client_notification.as_ref())
+        {
+            Some(toast) => (toast.title.clone(), Some(toast.context.clone())),
+            // Sound-only: the operator hears it, so the record still has to
+            // exist for them to find out what it was about.
+            None => (
+                format!(
+                    "{} {}",
+                    toast_agent_label(&delivery.agent_label),
+                    toast_event_text(delivery.kind)
+                ),
+                None,
+            ),
+        };
+        let pane_id = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == delivery.workspace_id)
+            .and_then(|ws_idx| self.public_pane_id(ws_idx, delivery.pane_id));
+
+        self.file_notification(crate::app::notifications::NotificationEntry {
+            id: crate::app::notifications::mint_notification_id(),
+            title,
+            body,
+            kind: match delivery.kind {
+                ToastKind::NeedsAttention => crate::api::schema::NotificationRecordKind::Attention,
+                ToastKind::Finished => crate::api::schema::NotificationRecordKind::Outcome,
+                ToastKind::UpdateInstalled => crate::api::schema::NotificationRecordKind::Notice,
+            },
+            source: crate::api::schema::NotificationSource::AgentState,
+            workspace_id: Some(delivery.workspace_id.clone()),
+            pane_id,
+            origin_host: crate::app::short_host_name(),
+            filed_at_ms: crate::app::notifications::now_ms(),
+            seen: false,
+        });
+    }
+
+    /// Earliest instant at which some held notification comes due, so the loop
+    /// can sleep until exactly then instead of polling.
+    pub fn next_pending_agent_notification_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_agent_notifications
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+    }
+
+    /// Deliver every held notification whose pane has now dwelled out the
+    /// delay (#36), re-deciding each against live state rather than replaying
+    /// what was true when it was filed: a pane that left the state, lost its
+    /// agent, or became the tab the operator is looking at is dropped here.
+    /// Returns the deliveries so the caller can drive the sinks AppState does
+    /// not own.
+    pub fn drain_due_agent_notifications(
+        &mut self,
+        now: std::time::Instant,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> Vec<AgentNotificationDelivery> {
+        let due: Vec<PaneId> = self
+            .pending_agent_notifications
+            .iter()
+            .filter_map(|(&pane_id, pending)| (pending.deadline <= now).then_some(pane_id))
+            .collect();
+
+        let mut deliveries = Vec::new();
+        for pane_id in due {
+            let Some(pending) = self.pending_agent_notifications.remove(&pane_id) else {
+                continue;
+            };
+            let Some(ws_idx) = self
+                .workspaces
+                .iter()
+                .position(|ws| ws.id == pending.workspace_id)
+            else {
+                continue;
+            };
+            // The state must still hold, and still hold for the same agent —
+            // otherwise this outcome expired inside the delay window.
+            let still_true = self.workspaces[ws_idx]
+                .pane_state(pane_id)
+                .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+                .is_some_and(|terminal| {
+                    terminal.state == pending.state
+                        && terminal.effective_agent_label() == Some(pending.agent_label.as_str())
+                });
+            if !still_true {
+                continue;
+            }
+
+            let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
+            let suppress_active_tab_notifications =
+                active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
+            let Some(delivery) = self.agent_notification_delivery(
+                ws_idx,
+                pane_id,
+                is_active_tab,
+                suppress_active_tab_notifications,
+                pending.previous_state,
+                pending.state,
+                pending.known_agent,
+                &pending.agent_label,
+                Some(terminal_runtimes),
+            ) else {
+                continue;
+            };
+            self.apply_agent_notification_delivery(&delivery);
+            deliveries.push(delivery);
+        }
+
+        deliveries
     }
 
     /// Per-frame commit pass for deferred background completions (#130). A pane
@@ -4409,6 +4669,8 @@ impl AppState {
     }
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
+        // Nothing to tell the operator about a pane that is gone (#36).
+        self.pending_agent_notifications.remove(&pane_id);
         let ws_idx = self
             .workspaces
             .iter()
@@ -4485,6 +4747,18 @@ mod tests {
             state.mode = Mode::Terminal;
         }
         state
+    }
+
+    /// Advance past the `[ui.toast] delay_seconds` gate (#36) and deliver
+    /// whatever it was holding, the way the loop tick does.
+    fn deliver_due_agent_notifications(state: &mut AppState) -> Vec<AgentNotificationDelivery> {
+        let Some(deadline) = state.next_pending_agent_notification_deadline() else {
+            return Vec::new();
+        };
+        state.drain_due_agent_notifications(
+            deadline,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+        )
     }
 
     fn mark_linked_worktree(state: &mut AppState, ws_idx: usize) {
@@ -6509,13 +6783,18 @@ mod tests {
         assert!(state.toast.is_none());
 
         // Past the settle from the final Idle: a single `●` lights + one toast.
+        let settled_at = changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1);
         assert!(!state
-            .commit_settled_completions(
-                changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
-                &Default::default()
-            )
+            .commit_settled_completions(settled_at, &Default::default())
             .is_empty());
         assert!(!is_seen(&state), "settled completion lights ● exactly once");
+        assert_eq!(
+            state
+                .drain_due_agent_notifications(settled_at, &Default::default())
+                .len(),
+            1,
+            "one delivery, from the final Idle only"
+        );
         assert_eq!(
             state.toast.as_ref().map(|t| t.kind),
             Some(ToastKind::Finished),
@@ -6765,10 +7044,319 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
+        // #36: the attention toast is held until the pane has stayed Blocked
+        // for `[ui.toast] delay_seconds`.
+        assert!(state.toast.is_none(), "the gate holds the edge");
+        deliver_due_agent_notifications(&mut state);
+
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
         assert_eq!(toast.title, "pi needs attention");
         assert_eq!(toast.context, "background · 2");
+    }
+
+    /// #36: `[ui.toast] delay_seconds` was live config with no effect — every
+    /// agent notification fired on the edge. The gate holds it until the pane
+    /// has actually stayed in the state that long.
+    #[test]
+    fn attention_toast_waits_out_the_configured_delay() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert!(
+            state.toast.is_none(),
+            "the edge no longer notifies by itself"
+        );
+        let changed_at = state
+            .terminals
+            .get(&bg_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+        let deadline = state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        assert_eq!(
+            deadline,
+            changed_at + std::time::Duration::from_secs(1),
+            "the gate is measured from the transition, at the configured delay"
+        );
+
+        assert!(state
+            .drain_due_agent_notifications(
+                deadline - std::time::Duration::from_millis(1),
+                &Default::default()
+            )
+            .is_empty());
+        assert!(state.toast.is_none(), "nothing fires before the gate opens");
+
+        let delivered = state.drain_due_agent_notifications(deadline, &Default::default());
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::NeedsAttention)
+        );
+    }
+
+    /// #372: the toast expires; the outcome must not. Drives the real
+    /// transition through the #36 gate and asserts on what is left afterwards.
+    #[test]
+    fn a_delivered_agent_notification_is_also_filed_for_later() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let public_pane_id = state.public_pane_id(1, bg_pane_id).expect("public pane id");
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            state.notifications.unread(),
+            0,
+            "nothing is filed for a transition the gate has not delivered"
+        );
+        deliver_due_agent_notifications(&mut state);
+
+        assert_eq!(state.notifications.unread(), 1);
+        let filed = state
+            .notifications
+            .newest_first()
+            .next()
+            .expect("the outcome outlives the toast")
+            .clone();
+        assert_eq!(filed.title, "pi needs attention");
+        assert_eq!(filed.body.as_deref(), Some("background · 2"));
+        assert_eq!(
+            filed.kind,
+            crate::api::schema::NotificationRecordKind::Attention
+        );
+        assert_eq!(filed.pane_id.as_deref(), Some(public_pane_id.as_str()));
+        assert_eq!(
+            filed.workspace_id.as_deref(),
+            Some(state.workspaces[1].id.as_str())
+        );
+
+        // Expire the toast the way the loop does. The record is what is left.
+        state.toast = None;
+        assert_eq!(state.notifications.unread(), 1);
+    }
+
+    /// The default delivery is `off`, so gating filing on it would leave the
+    /// log empty for most operators — `off` asks for no popups, not amnesia.
+    #[test]
+    fn an_outcome_is_filed_even_with_popup_delivery_off() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        assert_eq!(
+            state.toast_config().delivery,
+            crate::config::ToastDelivery::Off,
+            "this test is about the shipped default"
+        );
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        deliver_due_agent_notifications(&mut state);
+
+        assert!(state.toast.is_none(), "no popup, as configured");
+        assert_eq!(state.notifications.unread(), 1, "but the outcome is kept");
+    }
+
+    /// The cancellation the gate buys: an agent that unblocks itself inside the
+    /// delay never interrupts anyone.
+    #[test]
+    fn agent_leaving_the_state_inside_the_delay_never_notifies() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let transition = |state: &mut AppState, agent_state: AgentState| {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id: bg_pane_id,
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                activity: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+
+        transition(&mut state, AgentState::Blocked);
+        assert!(state.next_pending_agent_notification_deadline().is_some());
+        transition(&mut state, AgentState::Working);
+
+        assert!(
+            state.next_pending_agent_notification_deadline().is_none(),
+            "the newer transition supersedes the held one"
+        );
+        assert!(state.toast.is_none());
+    }
+
+    /// Walking over to the pane inside the delay answers the question the toast
+    /// was going to ask, so it is re-decided against live focus at the gate.
+    #[test]
+    fn pane_that_became_the_active_tab_inside_the_delay_drops_its_toast() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        // Sound is opt-in and stays audible for a blocked agent either way, so
+        // it is the control the dropped toast is measured against.
+        state.config.ui.sound.enabled = true;
+        state.local_sound_playback = false;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let deadline = state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        state.active = Some(1);
+
+        let delivered = state.drain_due_agent_notifications(deadline, &Default::default());
+
+        assert_eq!(delivered.len(), 1, "the attention sound still carries");
+        assert!(delivered[0].toast.is_none());
+        assert!(
+            state.toast.is_none(),
+            "no toast for the pane the operator is now looking at"
+        );
+    }
+
+    /// `delay_seconds = 0` is the opt-out, and keeps the edge behaviour intact.
+    #[test]
+    fn zero_delay_keeps_the_immediate_edge_notification() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delay_seconds = 0;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::NeedsAttention)
+        );
+        assert!(state.next_pending_agent_notification_deadline().is_none());
+    }
+
+    /// A delay longer than the attention settle (#130) is the operator's, and
+    /// wins: the completion commits its `●` on the settle and still waits for
+    /// the gate before it says anything.
+    #[test]
+    fn delay_longer_than_the_settle_still_holds_the_completion_toast() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        state.config.ui.toast.delay_seconds = 5;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Working;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Droid),
+            state: AgentState::Idle,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let changed_at = state
+            .terminals
+            .get(&bg_terminal_id)
+            .unwrap()
+            .state_changed_at
+            .unwrap();
+
+        let settled_at = changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1);
+        assert!(!state
+            .commit_settled_completions(settled_at, &Default::default())
+            .is_empty());
+        assert!(state
+            .drain_due_agent_notifications(settled_at, &Default::default())
+            .is_empty());
+        assert!(
+            state.toast.is_none(),
+            "the settle lights the ●; the gate still owns the toast"
+        );
+
+        state.drain_due_agent_notifications(
+            changed_at + std::time::Duration::from_secs(5),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Finished)
+        );
     }
 
     #[test]
@@ -6788,6 +7376,8 @@ mod tests {
             seq: None,
             session_ref: None,
         });
+
+        deliver_due_agent_notifications(&mut state);
 
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
@@ -6840,6 +7430,8 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
+
+        deliver_due_agent_notifications(&mut state);
 
         let terminal = state.terminals.get(&bg_terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Blocked);
@@ -7009,10 +7601,12 @@ mod tests {
             .unwrap()
             .state_changed_at
             .unwrap();
-        state.commit_settled_completions(
-            changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1),
-            &Default::default(),
-        );
+        let settled_at = changed_at + ATTENTION_SETTLE + std::time::Duration::from_millis(1);
+        state.commit_settled_completions(settled_at, &Default::default());
+        // #36: the delay gate measures dwell from the transition, and the
+        // settle already outlasted the default 1s — so the drain in this same
+        // tick delivers it rather than serving a second delay.
+        state.drain_due_agent_notifications(settled_at, &Default::default());
 
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::Finished);
@@ -7045,6 +7639,8 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
+        deliver_due_agent_notifications(&mut state);
+
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
         assert_eq!(toast.title, "pi needs attention");
@@ -7072,6 +7668,8 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
+
+        deliver_due_agent_notifications(&mut state);
 
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, ToastKind::NeedsAttention);

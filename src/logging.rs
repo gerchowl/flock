@@ -1531,6 +1531,19 @@ pub(crate) fn notification_toast_forwarded(message: &str) {
     );
 }
 
+/// #372: the projection hit its cap with nothing read to give up, so an
+/// unread outcome was dropped. Warn rather than debug — this is the one
+/// retention path that loses something the operator has not seen.
+pub(crate) fn notification_unread_evicted(notification_id: &str) {
+    tracing::warn!(
+        event = "notification.unread.evicted",
+        subsystem = "notification",
+        outcome = "dropped",
+        notification_id,
+        "notification log full with nothing read; dropped the oldest unread outcome"
+    );
+}
+
 pub(crate) fn notification_sound_forwarded(sound: &str) {
     tracing::debug!(
         event = "notification.sound.forward",
