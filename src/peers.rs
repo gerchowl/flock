@@ -759,6 +759,7 @@ pub fn send_peer_message(
     body: &str,
     correlation_id: &str,
     in_reply_to: Option<&str>,
+    intent: crate::api::schema::MsgIntent,
 ) -> Result<(), String> {
     let remote = peer_message_command(
         to_agent,
@@ -767,6 +768,7 @@ pub fn send_peer_message(
         body,
         correlation_id,
         in_reply_to,
+        intent,
     )?;
     run_peer_ssh(peer, &remote).map(|_| ())
 }
@@ -783,6 +785,7 @@ fn peer_message_command(
     body: &str,
     correlation_id: &str,
     in_reply_to: Option<&str>,
+    intent: crate::api::schema::MsgIntent,
 ) -> Result<String, String> {
     // Ids are server-minted and travel into a remote shell command; refuse
     // anything that could escape it (same guard shape as checkout-prepare).
@@ -811,6 +814,21 @@ fn peer_message_command(
     let reply_to = in_reply_to
         .map(|id| format!(" --reply-to {id}"))
         .unwrap_or_default();
+    // Intent has to survive the hop too, or a cross-host question arrives
+    // stamped `fyi` — the exact mislabel #280 exists to remove, reintroduced
+    // by the one leg that rebuilds the send from scratch (#280).
+    //
+    // Appended only for `needs_reply`, the same shape `--reply-to` uses. A
+    // default-intent relay is then byte-identical to what shipped before this
+    // flag existed, so the far side needing a build that understands
+    // `--intent` is confined to the case that actually carries new signal.
+    let intent_flag = match intent {
+        crate::api::schema::MsgIntent::Fyi => String::new(),
+        crate::api::schema::MsgIntent::NeedsReply => format!(
+            " --intent {}",
+            crate::api::schema::MsgIntent::NeedsReply.as_wire()
+        ),
+    };
     // Quote ONCE, at the outside. The body is caller-supplied and cannot be
     // validated like the ids, so it must never reach the remote shell as
     // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
@@ -823,7 +841,7 @@ fn peer_message_command(
     // idiom at both levels rather than by hand at one.
     let inner = format!(
         "flk msg send --agent {to_agent} --from-agent {from_agent} --from-host {from_host} \
-         --correlation-id {correlation_id}{reply_to} --json -- {}",
+         --correlation-id {correlation_id}{reply_to}{intent_flag} --json -- {}",
         shell_single_quote(body)
     );
     Ok(format!("sh -lc {}", shell_single_quote(&inner)))
@@ -975,6 +993,7 @@ mod tests {
             "pong",
             "c-reply",
             Some("c-question"),
+            crate::api::schema::MsgIntent::Fyi,
         )
         .expect("valid ids");
         assert!(
@@ -991,9 +1010,47 @@ mod tests {
             "ping",
             "c-first",
             None,
+            crate::api::schema::MsgIntent::Fyi,
         )
         .expect("valid ids");
         assert!(!command.contains("--reply-to"), "{command}");
+    }
+
+    #[test]
+    fn a_needs_reply_relay_carries_its_stamp_and_a_fyi_one_is_unchanged() {
+        // #280. The relay is the one leg that REBUILDS the send from scratch,
+        // as a `flk msg send` on the owning server — so a stamp not passed
+        // here is a cross-host question arriving as a notice, which is the
+        // mislabel the field exists to remove.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "re-derive both parameters and report back",
+            "c-question",
+            None,
+            crate::api::schema::MsgIntent::NeedsReply,
+        )
+        .expect("valid ids");
+        assert!(
+            command.contains("--intent needs_reply"),
+            "the stamp must reach the owning server: {command}"
+        );
+
+        // The default relays byte-identically to what shipped before the flag
+        // existed, so the far side needing a build that understands `--intent`
+        // is confined to the case that actually carries new signal.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "landed the fix",
+            "c-notice",
+            None,
+            crate::api::schema::MsgIntent::Fyi,
+        )
+        .expect("valid ids");
+        assert!(!command.contains("--intent"), "{command}");
     }
 
     #[test]
@@ -1008,6 +1065,7 @@ mod tests {
             "pong",
             "c-reply",
             Some("c'; rm -rf /"),
+            crate::api::schema::MsgIntent::Fyi,
         )
         .expect_err("a shell-escaping id must be refused");
         assert!(err.contains("in-reply-to id"), "{err}");

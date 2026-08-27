@@ -157,6 +157,7 @@ impl App {
             in_reply_to: params.in_reply_to,
             enqueued_at_ms: now,
             delivery_attempts: 0,
+            intent: params.intent,
         };
 
         self.queue_message(id, message, warnings)
@@ -238,6 +239,7 @@ impl App {
                         body: body.clone(),
                         correlation_id: params.reply_correlation_id.clone(),
                         in_reply_to: Some(params.correlation_id.clone()),
+                        intent: params.intent,
                     },
                 );
             }
@@ -289,6 +291,7 @@ impl App {
             in_reply_to: Some(params.correlation_id.clone()),
             enqueued_at_ms: now,
             delivery_attempts: 0,
+            intent: params.intent,
         };
         // Telemetry only records a reply the mailbox actually accepted: a
         // full mailbox or a duplicate must not bump round_trips or leave a
@@ -563,6 +566,7 @@ impl App {
                 to_pane: message.to_pane.clone(),
                 in_reply_to: message.in_reply_to.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
+                intent: message.intent,
                 body: message.body.clone(),
             });
         }
@@ -651,6 +655,7 @@ impl App {
             body,
             &correlation_id,
             in_reply_to,
+            params.intent,
         ) {
             Ok(()) => {
                 // Without this the sender's durable log has NO record that a
@@ -710,6 +715,7 @@ impl App {
             },
             in_reply_to: message.in_reply_to.clone(),
             enqueued_at_ms: message.enqueued_at_ms,
+            intent: message.intent,
             body: message.body.clone(),
         };
         match self.mailboxes.enqueue(message) {
@@ -873,9 +879,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{
-        ErrorResponse, EventData, EventEnvelope, EventKind, MessageTarget, Method, MsgListParams,
-        MsgReadParams, MsgReplyParams, MsgSendParams, MsgStatusParams, Request, ResponseResult,
-        SuccessResponse,
+        ErrorResponse, EventData, EventEnvelope, EventKind, MessageTarget, Method, MsgIntent,
+        MsgListParams, MsgReadParams, MsgReplyParams, MsgSendParams, MsgStatusParams, Request,
+        ResponseResult, SuccessResponse,
     };
     use crate::config::Config;
 
@@ -915,6 +921,7 @@ mod tests {
                 body: body.into(),
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             },
         )
     }
@@ -1003,6 +1010,7 @@ mod tests {
                 body: "   ".into(),
                 correlation_id: None,
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1019,6 +1027,7 @@ mod tests {
                 body: "hi".into(),
                 correlation_id: None,
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1036,6 +1045,7 @@ mod tests {
                 body: "hi".into(),
                 correlation_id: None,
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1066,6 +1076,7 @@ mod tests {
                 correlation_id: "nope".into(),
                 body: "hi".into(),
                 reply_correlation_id: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1079,6 +1090,7 @@ mod tests {
                 correlation_id: "c-orig".into(),
                 body: "answer".into(),
                 reply_correlation_id: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1130,6 +1142,7 @@ mod tests {
                 body: "cross-host".into(),
                 correlation_id: Some("c-remote".into()),
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1158,6 +1171,7 @@ mod tests {
                 body: "hello".into(),
                 correlation_id: None,
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1191,6 +1205,7 @@ mod tests {
                     body: "knock knock".into(),
                     correlation_id: Some(cid.into()),
                     in_reply_to: None,
+                    intent: MsgIntent::Fyi,
                 }),
             })
         };
@@ -1337,6 +1352,7 @@ mod tests {
                 body: "never arrives".into(),
                 correlation_id: Some("c-unreachable".into()),
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1379,6 +1395,7 @@ mod tests {
                 body: "from another machine".into(),
                 correlation_id: Some("c-relayed".into()),
                 in_reply_to: None,
+                intent: MsgIntent::Fyi,
             }),
         });
         assert!(!response.contains("\"error\""), "{response}");
@@ -1640,6 +1657,240 @@ mod tests {
         assert!(
             !response.contains("preview"),
             "the wake must not carry a preview either: {response}",
+        );
+    }
+    /// Build a request the way a client does — off the wire, as JSON — so the
+    /// serde contract is under test alongside the handler. A struct literal
+    /// would prove the field exists in Rust and nothing about whether a
+    /// caller can set it.
+    fn wire_request(json: serde_json::Value) -> Request {
+        serde_json::from_value(json).expect("a request a client could send")
+    }
+
+    fn read_inbox(app: &mut crate::app::App, pane: &str) -> Vec<crate::api::schema::InboxMessage> {
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(MsgReadParams {
+                pane: Some(pane.to_string()),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgRead { messages } = success.result else {
+            panic!("expected msg_read: {response}");
+        };
+        messages
+    }
+
+    #[tokio::test]
+    async fn a_needs_reply_stamp_reaches_the_reader_on_the_envelope() {
+        // #280, R4 of #213. The founding case: an hour-deep redirect whose
+        // "answer me" sat in the last line of a ~2.5k-character body, where a
+        // recipient reading the envelope could not see it. The stamp has to
+        // arrive as a FIELD, before the body is read, or it has changed
+        // nothing.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": {
+                "to": { "type": "pane", "pane": to },
+                "body": "re-derive both disputed parameters and report back",
+                "correlation_id": "c-question",
+                "intent": "needs_reply",
+            },
+        })));
+        assert!(!response.contains("\"error\""), "{response}");
+
+        // Asserted on the WIRE rather than the typed field, deliberately: the
+        // MCP bridge hands this JSON to the model verbatim, so the string is
+        // what a recipient actually sees. It also makes the test portable to
+        // the commit before this one, where it fails rather than failing to
+        // compile.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(MsgReadParams {
+                pane: Some(to.clone()),
+            }),
+        });
+        assert!(
+            response.contains("\"intent\":\"needs_reply\""),
+            "the sender's stamp must survive to the reader: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstamped_send_is_fyi_rather_than_refused() {
+        // The wire default, which is what keeps every pre-#280 caller working:
+        // an older peer relaying a message, `flk msg send` without the flag, a
+        // reply. `fyi` is the conservative reading of an unstamped envelope and
+        // is what all of them meant before the field existed. The forcing
+        // function lives on the MCP tool schema instead — see
+        // `build_msg_send_requires_an_intent`.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": {
+                "to": { "type": "pane", "pane": to },
+                "body": "landed the fix",
+                "correlation_id": "c-quiet",
+            },
+        })));
+        assert!(!response.contains("\"error\""), "{response}");
+
+        let messages = read_inbox(&mut app, &to);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].intent, MsgIntent::Fyi);
+    }
+
+    #[tokio::test]
+    async fn an_intent_survives_the_restart_that_rebuilds_the_mailbox() {
+        // The durable log is what reconstructs an undelivered queue at boot
+        // (§8.4). An intent that lived only in memory would be silently
+        // downgraded to `fyi` by a restart — turning the one signal this field
+        // carries into exactly the mislabel it exists to prevent. So the test
+        // starts where the value really starts: the event.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        app.mailboxes = crate::app::mailboxes::MailboxRegistry::default();
+        let queued: EventEnvelope = serde_json::from_value(serde_json::json!({
+            "event": "message_queued",
+            "data": {
+                "type": "message_queued",
+                "correlation_id": "c-restarted",
+                "from_pane": "w1:p1",
+                "from_agent": "agent_sage_1",
+                "from_host": "sage",
+                "to_pane": to,
+                "cross_repo": false,
+                "enqueued_at_ms": 1,
+                "intent": "needs_reply",
+                "body": "still waiting on an answer",
+            },
+        }))
+        .expect("an event the durable log could hold");
+        app.mailboxes.seed_from_events([queued].iter());
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(MsgReadParams {
+                pane: Some(to.clone()),
+            }),
+        });
+        assert!(
+            response.contains("\"intent\":\"needs_reply\""),
+            "a restart must not downgrade a question to a notice: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_can_itself_ask_for_an_answer() {
+        // Without this, a two-turn exchange strands its intent in prose again:
+        // the answer to a question is `fyi` by default, correctly, but a reply
+        // that asks something back has no way to say so. Same field, opposite
+        // default — see `MsgReplyParams::intent`.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let asker = pane_target(&app, 0);
+        let answerer = pane_target(&app, 1);
+        // A message the reply can route home to: `msg.reply` addresses by the
+        // ORIGINAL sender, so the exchange has to start from the other pane.
+        app.mailboxes
+            .enqueue(crate::app::mailboxes::PendingMessage {
+                correlation_id: "c-orig".into(),
+                body: "which sigma governs the fits?".into(),
+                from_pane: Some(answerer.clone()),
+                from_agent: None,
+                from_host: None,
+                from_repo: None,
+                to_pane: asker.clone(),
+                to_repo: None,
+                in_reply_to: None,
+                enqueued_at_ms: 1,
+                delivery_attempts: 0,
+                intent: MsgIntent::NeedsReply,
+            });
+        assert_eq!(read_inbox(&mut app, &asker).len(), 1);
+
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.reply",
+            "params": {
+                "correlation_id": "c-orig",
+                "body": "0.165 ns — but which of the two fits do you mean?",
+                "intent": "needs_reply",
+            },
+        })));
+        assert!(!response.contains("\"error\""), "{response}");
+
+        let messages = read_inbox(&mut app, &answerer);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].intent, MsgIntent::NeedsReply);
+    }
+
+    #[tokio::test]
+    async fn the_wake_still_reports_a_count_and_never_an_intent() {
+        // ADR-0008: the wake channel names a COUNT and a tool, never anything
+        // a sender chose. #316 made that structural by giving `msg.wake` a
+        // number to return; an intent leaking into it would reopen the hole
+        // for the sake of a louder knock, which is escalation machinery this
+        // issue deliberately does not build.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        for (cid, intent) in [("c-a", "needs_reply"), ("c-b", "fyi")] {
+            let response = app.handle_api_request(wire_request(serde_json::json!({
+                "id": "req",
+                "method": "msg.send",
+                "params": {
+                    "to": { "type": "pane", "pane": to },
+                    "body": "hi",
+                    "correlation_id": cid,
+                    "intent": intent,
+                },
+            })));
+            assert!(!response.contains("\"error\""), "{response}");
+        }
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgWake(crate::api::schema::MsgWakeParams {
+                pane: Some(to.clone()),
+            }),
+        });
+        assert!(
+            !response.contains("intent") && !response.contains("needs_reply"),
+            "the wake must carry no intent: {response}"
+        );
+        assert_eq!(wake(&mut app, &to), (2, None), "the count is unchanged");
+    }
+
+    #[tokio::test]
+    async fn the_operators_peek_shows_which_queued_message_is_a_question() {
+        // `msg.list` is the operator's view of an inbox nobody has read yet.
+        // Without the stamp it cannot distinguish a fleet waiting on answers
+        // from a fleet with a backlog of notices.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": {
+                "to": { "type": "pane", "pane": to },
+                "body": "are you still on the bound?",
+                "correlation_id": "c-peek",
+                "intent": "needs_reply",
+            },
+        })));
+        assert!(!response.contains("\"error\""), "{response}");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgList(MsgListParams::default()),
+        });
+        assert!(
+            response.contains("\"intent\":\"needs_reply\""),
+            "the peek must say which queued message is a question: {response}"
         );
     }
 }
