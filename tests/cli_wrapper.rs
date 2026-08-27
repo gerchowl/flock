@@ -862,10 +862,11 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     assert_eq!(typed["method"], "pane.send_input");
     assert_eq!(typed["params"]["pane_id"], "1-1");
     assert_eq!(typed["params"]["text"], "echo hello");
-    assert_eq!(
-        typed["params"]["keys"],
-        serde_json::json!([]),
-        "the typing request must carry no Enter of its own — that is the burst"
+    // `keys` is skipped when empty, so its ABSENCE is the assertion: the
+    // typing request must carry no Enter of its own — that is the burst.
+    assert!(
+        typed["params"].get("keys").is_none(),
+        "the typing request must carry no keys: {typed}"
     );
 
     let submitted: serde_json::Value = serde_json::from_str(&requests[1].0).unwrap();
