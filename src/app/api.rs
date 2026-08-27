@@ -631,7 +631,10 @@ impl App {
             if let Some((version, install_command)) = update_ready {
                 let instruction = crate::update::update_install_instruction(&install_command);
                 let _ = notify(&format!("v{version} available"), Some(&instruction));
-            } else {
+            } else if self.state.toast_config().delay_seconds == 0 {
+                // #36: with a delay configured, agent notifications are held on
+                // `AppState` and emitted from the drain
+                // (`emit_client_local_agent_notifications`) instead.
                 for update in &pane_updates {
                     let is_active_tab = self
                         .state
@@ -666,11 +669,7 @@ impl App {
                     else {
                         continue;
                     };
-                    let event_text = match kind {
-                        ToastKind::NeedsAttention => "needs attention",
-                        ToastKind::Finished => "finished",
-                        ToastKind::UpdateInstalled => "updated",
-                    };
+                    let event_text = crate::app::actions::toast_event_text(kind);
                     let workspace_label =
                         ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
                     let _ = notify(
@@ -915,6 +914,36 @@ impl App {
                     state_labels: presentation.state_labels,
                 },
             });
+        }
+    }
+
+    /// Emit the desktop/terminal notifications for notifications that came out
+    /// of the delay gate (#36). The inline edge path above owns the same sink
+    /// when `delay_seconds` is 0; exactly one of the two runs.
+    pub(crate) fn emit_client_local_agent_notifications(
+        &self,
+        deliveries: &[crate::app::state::AgentNotificationDelivery],
+    ) {
+        if !self.local_terminal_notifications
+            || !matches!(
+                self.state.toast_config().delivery,
+                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
+            )
+        {
+            return;
+        }
+
+        let notify = match self.state.toast_config().delivery {
+            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
+            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
+            _ => unreachable!("toast delivery was checked above"),
+        };
+
+        for delivery in deliveries {
+            let Some(notification) = &delivery.client_notification else {
+                continue;
+            };
+            let _ = notify(&notification.title, Some(&notification.context));
         }
     }
 
@@ -1709,7 +1738,9 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
 
-        // #130: a background completion's toast is deferred to the settle commit.
+        // #130: a background completion's toast is deferred to the settle
+        // commit, and #36 then drains it through the delay gate — both run off
+        // the loop tick, so drive the tick rather than either half of it.
         let changed_at = app
             .state
             .terminals
@@ -1717,11 +1748,11 @@ mod tests {
             .unwrap()
             .state_changed_at
             .unwrap();
-        app.state.commit_settled_completions(
+        app.handle_scheduled_tasks(
             changed_at
                 + crate::app::actions::ATTENTION_SETTLE
                 + std::time::Duration::from_millis(1),
-            &app.terminal_runtimes,
+            false,
         );
 
         assert_eq!(
