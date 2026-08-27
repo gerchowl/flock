@@ -71,6 +71,7 @@ Raw socket method names use dot notation:
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config` |
 | Notification | `notification.show`, `notification.list`, `notification.ack` |
+| Handoff | `handoff.list`, `handoff.read` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
@@ -277,6 +278,43 @@ The result carries the turns plus the cursor that resumes after them:
 Two properties are deliberate. `agent.history` touches **no pane state** — it does not mark the pane seen and does not move the operator's attention ordering, which is what makes polling it safe. And it renders at the `detail` the *caller* asked for, never at whatever level the operator's prompt-history panel happens to be showing.
 
 Refusals: `unsupported_for_agent` (the pane's agent writes no transcript Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet), `transcript_unreadable`.
+
+## Reading a handed-over file
+
+A file dropped on a pane is staged on the server and its path is typed into the agent's input surface. Since #286 the staged file is also a durable record: `handoff.list` enumerates them and `handoff.read` returns the bytes by id.
+
+```json
+{"id":"req_10","method":"handoff.list","params":{}}
+```
+
+```json
+{
+  "type": "handoff_list",
+  "files": [{
+    "file_id": "file:1a04ff2c3b:0",
+    "name": "client-1-clipboard-1756-0.pdf",
+    "mime": "application/pdf",
+    "bytes": 184320,
+    "path": "/tmp/flock-clipboard-images-501/client-1-clipboard-1756-0.pdf",
+    "workspace_id": "1",
+    "pane_id": "1-1",
+    "agent_id": "agent_sage_6f21c4",
+    "origin_host": "sage",
+    "received_at_ms": 1756300000000
+  }],
+  "total": 1
+}
+```
+
+The listing is **not** filtered by who is asking. `target` (a pane id, terminal id, or unique agent name) narrows it to one agent; without it every handed-over file on this server is returned, each row saying who it was handed to. `total` always reports the whole projection, so a filtered empty list is distinguishable from an empty server.
+
+```json
+{"id":"req_11","method":"handoff.read","params":{"file_id":"file:1a04ff2c3b:0"}}
+```
+
+The result carries `encoding` — `utf8` with the text in `content`, or `base64` for images, PDFs and anything that is not valid UTF-8. Files over 4 MiB are refused with `handoff_too_large` and the caller reads `path` with its own file tool; the bytes and the agent are on the same machine. Other refusals: `handoff_not_found` (no such id) and `handoff_unreadable` (the record outlived its bytes).
+
+Both verbs are read-only: neither marks a pane seen, so an agent may poll them. Records survive the client connection that handed the file over and a server restart; retention is 128 records (oldest evicted first, and eviction deletes the file) plus the staging directory's 24-hour age sweep.
 
 Pane and agent records also carry `seen` (whether the operator has viewed the agent's latest completed turn — `agent_status` folds this bit into `done`) and `status_age_secs` (seconds since the semantic agent state last changed; omitted when no transition has been observed). Records from older servers parse as seen with no age.
 

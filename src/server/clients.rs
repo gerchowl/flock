@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::protocol::RenderEncoding;
 use crate::server::client_transport::ClientWriter;
@@ -55,8 +54,6 @@ pub(crate) struct ClientConnection {
     pub(crate) frame_subscription: bool,
     /// Last host mouse capture mode sent to this client.
     pub(crate) host_mouse_capture_active: Option<bool>,
-    /// Temporary files staged from this client's local clipboard image pastes.
-    pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
     /// When this connection was accepted (handshake complete) — the baseline for
@@ -119,7 +116,6 @@ impl ClientConnection {
             render_pending: false,
             frame_subscription: true,
             host_mouse_capture_active: None,
-            staged_clipboard_files: Vec::new(),
             writer,
             attached_at: std::time::Instant::now(),
             first_frame_sent: false,

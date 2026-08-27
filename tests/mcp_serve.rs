@@ -17,6 +17,7 @@ mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -26,8 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
-    unregister_spawned_flock_pid,
+    cleanup_test_base, client_handshake, drain_messages, register_runtime_dir,
+    register_spawned_flock_pid, send_clipboard_file, send_set_frame_subscription,
+    unregister_spawned_flock_pid, wait_for_file,
 };
 
 // ---- harness (a lean copy of api_ping.rs' spawn helpers) -----------------
@@ -300,6 +302,118 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
     assert_eq!(refusal["id"], 4);
     assert_eq!(refusal["error"]["code"], -32000);
     assert_eq!(refusal["error"]["data"]["refusal"], "not_exposed_via_mcp");
+
+    mcp.shutdown();
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+/// #286 end to end, starting where the bytes really start.
+///
+/// A dropped file reaches the server as `ClientMessage::ClipboardImage` on the
+/// client socket — that is the wire, and everything above it (the OS drag
+/// event, the local path read) is what #79 already documented as un-CI-able.
+/// From there this drives a REAL `flk mcp serve` and asserts the file comes
+/// back as an MCP resource it can list and read.
+///
+/// Then it drops the client connection and lists again. Before #286 the staged
+/// file was deleted with the connection that produced it, so that second
+/// listing is the whole durability claim.
+#[test]
+fn a_dropped_file_is_listed_and_read_as_an_mcp_resource() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
+
+    let server = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    // Attach a client and hand a file over the way a drop does.
+    let mut stream = UnixStream::connect(&client_socket).expect("connect to client socket");
+    let (_version, error) = client_handshake(&mut stream, support::PROTOCOL_VERSION, 80, 24)
+        .expect("handshake should succeed");
+    assert!(error.is_none(), "handshake error: {error:?}");
+    // Stop frame streaming so the server's writer never blocks on a test
+    // client that is not draining renders.
+    send_set_frame_subscription(&mut stream, false).expect("pause frames");
+    drain_messages(&mut stream);
+    send_clipboard_file(&mut stream, "md", b"# handed over\n").expect("send dropped file");
+
+    let mut mcp = McpClient::spawn(&socket_path);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}},
+    }));
+    let init = mcp.recv(Duration::from_secs(5));
+    assert_eq!(
+        init["result"]["capabilities"]["resources"],
+        json!({}),
+        "the server has to advertise resources for a client to ask for them: {init}"
+    );
+
+    // The drop is asynchronous relative to the socket call, so poll the
+    // resource list rather than assuming an ordering the wire does not give.
+    let mut resource = Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut next_id = 2;
+    while Instant::now() < deadline {
+        mcp.send(
+            &json!({"jsonrpc": "2.0", "id": next_id, "method": "resources/list", "params": {}}),
+        );
+        let listed = mcp.recv(Duration::from_secs(5));
+        next_id += 1;
+        let resources = listed["result"]["resources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a resources array, got {listed}"));
+        if let Some(found) = resources.first() {
+            resource = found.clone();
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        resource["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("flock://handoff/")),
+        "the dropped file never appeared as a resource: {resource}"
+    );
+    assert_eq!(resource["mimeType"], "text/markdown");
+    assert_eq!(resource["size"], 14);
+
+    // Read it back by URI. The bytes never went through the pane.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": next_id,
+        "method": "resources/read",
+        "params": {"uri": resource["uri"]},
+    }));
+    let read = mcp.recv(Duration::from_secs(5));
+    assert_eq!(read["id"], next_id, "read response: {read}");
+    next_id += 1;
+    assert_eq!(read["result"]["contents"][0]["text"], "# handed over\n");
+    assert_eq!(read["result"]["contents"][0]["uri"], resource["uri"]);
+
+    // The connection that handed the file over goes away. The resource does
+    // not: that is the difference between a paste and a durable record.
+    drop(stream);
+    thread::sleep(Duration::from_millis(500));
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": next_id,
+        "method": "resources/read",
+        "params": {"uri": resource["uri"]},
+    }));
+    let after = mcp.recv(Duration::from_secs(5));
+    assert_eq!(
+        after["result"]["contents"][0]["text"], "# handed over\n",
+        "the handed-over file must outlive the client that handed it over: {after}"
+    );
 
     mcp.shutdown();
     drop(server);

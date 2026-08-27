@@ -17,6 +17,7 @@ pub(crate) mod config_io;
 mod creation;
 pub(crate) mod directory;
 pub(crate) mod float;
+pub(crate) mod handoffs;
 mod ids;
 mod input;
 pub(crate) mod issue_drop;
@@ -675,6 +676,7 @@ impl App {
             config_diagnostic,
             toast: None,
             notifications: crate::app::notifications::NotificationLog::default(),
+            handoffs: crate::app::handoffs::HandoffLog::default(),
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
@@ -888,6 +890,16 @@ impl App {
         this.state
             .notifications
             .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
+        // #286 / ADR-0017: and the handed-over files, reconciled against the
+        // filesystem that actually owns their bytes. The log outlives the OS
+        // temp directory, so a record whose file a reboot took is dropped
+        // here rather than offered as a resource that cannot be read.
+        this.state
+            .handoffs
+            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope), &|path| {
+                path.exists()
+            });
+        crate::server::clipboard_image::sweep_stale();
         this
     }
 

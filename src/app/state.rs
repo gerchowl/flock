@@ -881,6 +881,22 @@ pub enum PendingUiEvent {
     NotificationSeen {
         notification_id: String,
     },
+    /// #286 / ADR-0017: a file was handed to an agent on this server. Like
+    /// the notification variants there is nothing to resolve at drain — the
+    /// recipient was resolved where the drop landed, which is the only place
+    /// that still knows.
+    FileHandedOver {
+        file_id: String,
+        name: String,
+        mime: String,
+        bytes: u64,
+        path: String,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        agent_id: Option<String>,
+        origin_host: String,
+        received_at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2243,6 +2259,10 @@ pub struct AppState {
     /// model over `NotificationFiled` / `NotificationSeen` on the event log;
     /// the toast above is the ephemeral half of the same outcome.
     pub(crate) notifications: crate::app::notifications::NotificationLog,
+    /// Files handed over to agents on this server (#286, ADR-0017). Like
+    /// `notifications`, a read model folded from the durable log — the paste
+    /// that used to be the whole record kept nothing.
+    pub(crate) handoffs: crate::app::handoffs::HandoffLog,
     /// Agent state-change notifications waiting out `[ui.toast] delay_seconds`
     /// before they are delivered (#36). Empty when the delay is 0.
     pub(crate) pending_agent_notifications:
@@ -3240,6 +3260,7 @@ impl AppState {
             config_diagnostic: None,
             toast: None,
             notifications: crate::app::notifications::NotificationLog::default(),
+            handoffs: crate::app::handoffs::HandoffLog::default(),
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,

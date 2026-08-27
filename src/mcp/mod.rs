@@ -9,6 +9,7 @@
 //! Structure:
 //!   - [`framing`] — JSON-RPC decode + error envelopes
 //!   - [`tools`]   — the closed tool table (names, schemas, method builders)
+//!   - [`resources`] — the resource surface: handed-over files (#286)
 //!   - [`bridge`]  — pure dispatcher from parsed method → MCP result
 //!   - this file  — the blocking read/write loop
 //!
@@ -24,6 +25,7 @@ use serde_json::Value;
 
 mod bridge;
 mod framing;
+mod resources;
 mod tools;
 
 use bridge::{FlockCall, LocalApi};

@@ -1324,7 +1324,9 @@ impl HeadlessServer {
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
-            crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
+            // Staged files are NOT deleted here (#286). The file was handed
+            // to an agent, not lent to a connection, and its record outlives
+            // both — retention is the handoff cap plus the staging sweep.
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
                 if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
@@ -1475,10 +1477,25 @@ impl HeadlessServer {
         data: &[u8],
     ) -> std::io::Result<String> {
         let staged = crate::server::clipboard_image::stage(client_id, extension, data)?;
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.staged_clipboard_files.push(staged.path);
-        }
         crate::logging::client_clipboard_image_staged(client_id, data.len(), &staged.paste_text);
+        // #286: the staged file becomes a durable handoff record, addressed
+        // to whatever the paste below is about to land on. This used to be a
+        // `PathBuf` on the client connection, deleted with it — so the file
+        // an agent was handed stopped existing when the operator detached.
+        let attached_terminal = match self.clients.get(&client_id) {
+            Some(ClientConnection {
+                mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                ..
+            }) => Some(terminal_id.clone()),
+            _ => None,
+        };
+        let file_id = self.app.record_file_handoff(
+            attached_terminal.as_deref(),
+            staged.path,
+            &staged.extension,
+            data.len() as u64,
+        );
+        crate::logging::handoff_recorded(&file_id, &staged.extension, data.len());
         Ok(staged.paste_text)
     }
 
@@ -3533,13 +3550,9 @@ impl HeadlessServer {
         // Drain remaining API requests with server_unavailable.
         self.drain_api_requests_with_shutdown_check();
 
-        // Close all client connections.
-        let staged_files = self
-            .clients
-            .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
-            .collect::<Vec<_>>();
-        crate::server::clipboard_image::remove_files(staged_files);
+        // Close all client connections. Staged handoff files stay on disk
+        // (#286): surviving a restart is most of what makes them durable.
+        self.clients.clear();
 
         // Remove socket files.
         self.cleanup_sockets()?;
@@ -3565,12 +3578,6 @@ impl HeadlessServer {
 
 impl Drop for HeadlessServer {
     fn drop(&mut self) {
-        let staged_files = self
-            .clients
-            .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
-            .collect::<Vec<_>>();
-        crate::server::clipboard_image::remove_files(staged_files);
         let _ = self.cleanup_sockets();
     }
 }
