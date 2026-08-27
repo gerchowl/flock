@@ -129,7 +129,7 @@ impl App {
 
     // Staged for #00f with resolve_terminal_target.
     #[allow(dead_code)]
-    fn terminal_target_for_pane(
+    pub(crate) fn terminal_target_for_pane(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,

@@ -11,7 +11,7 @@ use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{Method, Request};
 
 use super::framing::McpError;
-use super::tools;
+use super::{resources, tools};
 
 /// The one dependency the router has on the outside world: send a flock
 /// [`Method`] and get back the raw response value (success OR error
@@ -49,6 +49,16 @@ pub(super) fn route<F: FlockCall>(
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => tools_call(params, flock),
+        // #286 / ADR-0017: files a human handed to an agent on this server.
+        // A different MCP primitive from tools, for content the server
+        // already holds and can name.
+        "resources/list" => resources_list(flock),
+        "resources/read" => resources_read(params, flock),
+        // Templates are how a server advertises PARAMETERISED uris. flock's
+        // resources are minted, never constructed by the client, so the
+        // honest answer is an empty list — and a client that asks deserves
+        // that rather than a method-not-found it has to special-case.
+        "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
         // `ping` is a spec-level keepalive some clients send; respond with an
         // empty object per the MCP spec.
         "ping" => Ok(json!({})),
@@ -58,11 +68,15 @@ pub(super) fn route<F: FlockCall>(
 
 fn initialize_result() -> Value {
     // The `2024-11-05` protocol version is what the Anthropic MCP spec
-    // documents for the tools-only capability set we advertise. Bumping this
-    // is a wire change — update the golden test alongside.
+    // documents for the capability set we advertise. Bumping this is a wire
+    // change — update the golden test alongside.
     json!({
         "protocolVersion": "2024-11-05",
-        "capabilities": { "tools": {} },
+        // `resources` advertises the handed-over-file surface (#286). No
+        // `subscribe`/`listChanged` sub-capability: flock does not push
+        // resource notifications, and claiming otherwise would make a client
+        // wait for an update that never comes.
+        "capabilities": { "tools": {}, "resources": {} },
         "serverInfo": {
             "name": "flock",
             "version": env!("CARGO_PKG_VERSION"),
@@ -73,6 +87,24 @@ fn initialize_result() -> Value {
 fn tools_list_result() -> Value {
     let list: Vec<Value> = tools::table().iter().map(tools::Tool::descriptor).collect();
     json!({ "tools": list })
+}
+
+fn resources_list<F: FlockCall>(flock: &F) -> Result<Value, McpError> {
+    let method = Method::HandoffList(crate::api::schema::HandoffListParams::default());
+    Ok(resources::list_result(&call_flock(method, flock)?))
+}
+
+fn resources_read<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError> {
+    let file_id = resources::file_id_from_params(&params)?;
+    let method = Method::HandoffRead(crate::api::schema::HandoffReadParams { file_id });
+    Ok(resources::read_result(&call_flock(method, flock)?))
+}
+
+/// Send one flock method and unwrap its envelope. Shared by the tool and
+/// resource paths so a flock refusal translates identically on both.
+fn call_flock<F: FlockCall>(method: Method, flock: &F) -> Result<Value, McpError> {
+    let raw = flock.call(method).map_err(McpError::transport)?;
+    extract_flock_result(raw)
 }
 
 fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError> {
@@ -90,8 +122,7 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments)?;
-    let raw = flock.call(method).map_err(McpError::transport)?;
-    let flock_result = extract_flock_result(raw)?;
+    let flock_result = call_flock(method, flock)?;
 
     // MCP's tool-call result shape: `content` is an array of blocks. We JSON-
     // encode the flock result and hand it back as a single text block so the
@@ -162,6 +193,7 @@ mod tests {
         let result = route("initialize", json!({}), &flock).unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(result["capabilities"]["resources"], json!({}));
         assert_eq!(result["serverInfo"]["name"], "flock");
         assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(flock.calls.borrow().is_empty(), "initialize is client-only");
@@ -177,7 +209,9 @@ mod tests {
     #[test]
     fn unknown_method_is_method_not_found() {
         let flock = MockApi::ok(json!({}));
-        let err = route("resources/list", json!({}), &flock).unwrap_err();
+        // `prompts/list` is a real MCP method flock does not implement —
+        // `resources/list` stopped being one in #286.
+        let err = route("prompts/list", json!({}), &flock).unwrap_err();
         assert_eq!(err.code, -32601);
     }
 
@@ -258,6 +292,96 @@ mod tests {
             Some(&json!("unsupported_for_agent"))
         );
         assert!(err.message.contains("only supports Claude"));
+    }
+
+    #[test]
+    fn resources_list_maps_handed_over_files_onto_the_resource_shape() {
+        let flock = MockApi::ok(json!({
+            "id": "mcp:1",
+            "result": {
+                "type": "handoff_list",
+                "files": [{
+                    "file_id": "file:abc:0",
+                    "name": "spec.pdf",
+                    "mime": "application/pdf",
+                    "bytes": 9,
+                    "path": "/tmp/staged/spec.pdf",
+                    "pane_id": "ws_1:p1",
+                    "agent_id": "agent_host_abc",
+                    "origin_host": "host",
+                    "received_at_ms": 1
+                }],
+                "total": 1
+            }
+        }));
+        let result = route("resources/list", json!({}), &flock).unwrap();
+        assert_eq!(result["resources"][0]["uri"], "flock://handoff/file:abc:0");
+        assert_eq!(result["resources"][0]["name"], "spec.pdf");
+        assert!(matches!(flock.calls.borrow()[0], Method::HandoffList(_)));
+    }
+
+    #[test]
+    fn resources_read_addresses_a_file_id_never_a_path() {
+        // The uri is the only way in, and it carries a minted id — there is
+        // no parameter anywhere on this path that names a filesystem path.
+        let flock = MockApi::ok(json!({
+            "id": "mcp:1",
+            "result": {
+                "type": "handoff_read",
+                "file_id": "file:abc:0",
+                "name": "notes.md",
+                "mime": "text/markdown",
+                "bytes": 7,
+                "path": "/tmp/staged/notes.md",
+                "encoding": "utf8",
+                "content": "# hello"
+            }
+        }));
+        let result = route(
+            "resources/read",
+            json!({ "uri": "flock://handoff/file:abc:0" }),
+            &flock,
+        )
+        .unwrap();
+        assert_eq!(result["contents"][0]["text"], "# hello");
+        assert_eq!(
+            flock.calls.borrow()[0],
+            Method::HandoffRead(crate::api::schema::HandoffReadParams {
+                file_id: "file:abc:0".into()
+            })
+        );
+    }
+
+    #[test]
+    fn resources_read_of_an_unknown_file_propagates_the_flock_refusal() {
+        let flock = MockApi::ok(json!({
+            "id": "mcp:1",
+            "error": { "code": "handoff_not_found", "message": "no handed-over file with id x" }
+        }));
+        let err = route(
+            "resources/read",
+            json!({ "uri": "flock://handoff/x" }),
+            &flock,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("refusal")),
+            Some(&json!("handoff_not_found"))
+        );
+    }
+
+    #[test]
+    fn resources_read_of_a_foreign_uri_never_reaches_the_server() {
+        let flock = MockApi::ok(json!({}));
+        let err = route(
+            "resources/read",
+            json!({ "uri": "file:///etc/passwd" }),
+            &flock,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(flock.calls.borrow().is_empty(), "refusal short-circuits");
     }
 
     #[test]

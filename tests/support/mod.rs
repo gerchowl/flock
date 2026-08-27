@@ -419,6 +419,30 @@ pub fn send_input(stream: &mut UnixStream, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Send `ClientMessage::ClipboardImage { extension, data }` — the wire a
+/// dropped file takes (#79/#286). Variant index 2, then the extension string
+/// and the byte payload, each varint-length-prefixed.
+#[allow(dead_code)]
+pub fn send_clipboard_file(
+    stream: &mut UnixStream,
+    extension: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    let mut buf = encode_varint_u32(2);
+    buf.extend_from_slice(&encode_varint_u32(extension.len() as u32));
+    buf.extend_from_slice(extension.as_bytes());
+    buf.extend_from_slice(&encode_varint_u32(data.len() as u32));
+    buf.extend_from_slice(data);
+    let framed = frame_message(&buf);
+    stream
+        .write_all(&framed)
+        .map_err(|e| format!("write clipboard file: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush clipboard file: {e}"))?;
+    Ok(())
+}
+
 pub fn send_detach(stream: &mut UnixStream) -> Result<(), String> {
     let detach_payload = encode_varint_u32(4);
     let framed = frame_message(&detach_payload);

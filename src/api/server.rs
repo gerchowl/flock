@@ -336,6 +336,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::NotificationShow(_) => "notification.show",
         Method::NotificationList(_) => "notification.list",
         Method::NotificationAck(_) => "notification.ack",
+        Method::HandoffList(_) => "handoff.list",
+        Method::HandoffRead(_) => "handoff.read",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",

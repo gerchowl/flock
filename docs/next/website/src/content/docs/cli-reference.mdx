@@ -331,7 +331,9 @@ flk integration status [--outdated-only]
 flk mcp serve
 ```
 
-Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on stdin/stdout. Wire it into an MCP client (Claude Desktop, `mcp` CLI, agent runners) to give an agent a read-mostly view of the flock — list agents, read panes, fork Claude conversations, send/reply pane-to-pane messages, and walk fork lineage. `FLOCK_SOCKET_PATH` selects the flock server socket; the default is the current session's.
+Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on stdin/stdout. Wire it into an MCP client (Claude Desktop, `mcp` CLI, agent runners) to give an agent a read-mostly view of the flock — list agents, read panes, fork Claude conversations, send/reply pane-to-pane messages, walk fork lineage, and read the files a human has handed over. `FLOCK_SOCKET_PATH` selects the flock server socket; the default is the current session's.
+
+The server advertises two capabilities: `tools` (the closed table below) and `resources` (handed-over files). It claims no `subscribe`/`listChanged` sub-capability, because it pushes no resource notifications.
 
 ### Addressing across hosts
 
@@ -373,6 +375,28 @@ Exposed tools:
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. |
 | `flock_pane_read` | `pane.read` | Same seen caveat as `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
+
+### Resources: files handed over to an agent
+
+Tools are not the whole surface. A file dropped on a pane used to reach its agent only as a pasted path, deleted when the operator's client disconnected. It is now also an **MCP resource** — content the server holds and can name — so an agent lists and reads it natively instead of scraping it out of its own input surface.
+
+```jsonc
+// resources/list
+{ "resources": [{
+  "uri": "flock://handoff/file:1a04ff2c3b:0",
+  "name": "client-1-clipboard-1756-0.pdf",
+  "description": "file handed to agent_sage_6f21c4; staged at /tmp/… on this host",
+  "mimeType": "application/pdf",
+  "size": 184320
+}]}
+
+// resources/read
+{ "contents": [{ "uri": "flock://handoff/file:1a04ff2c3b:0", "mimeType": "application/pdf", "blob": "JVBERi0…" }] }
+```
+
+Text comes back in `text`, everything else base64 in `blob`. `resources/read` takes a URI carrying a flock-minted id and nothing else — there is no path parameter anywhere on this surface. Files over 4 MiB refuse with `handoff_too_large`; read them from the `path` in the listing instead. The list is not filtered by which agent is asking, because a filtered list that comes back empty cannot be told apart from a server that was handed nothing.
+
+The paste still happens as well: flock cannot tell from outside a pane whether the agent in it has this MCP server wired up.
 
 ## Read sources
 

@@ -26,6 +26,18 @@ pub enum Method {
     NotificationList(NotificationListParams),
     #[serde(rename = "notification.ack")]
     NotificationAck(NotificationAckParams),
+    /// #286: list the files handed over to this server, as durable records.
+    ///
+    /// Deliberately NOT `file.list`. A verb named for files reads as "read a
+    /// file on this host", which is the authority flock's MCP surface exists
+    /// to withhold. There is no path parameter anywhere in this pair: the
+    /// only addressable bytes are the ones a human handed over, named by an
+    /// id flock minted. The constraint lives in the type.
+    #[serde(rename = "handoff.list")]
+    HandoffList(HandoffListParams),
+    /// #286: read one handed-over file's bytes by its flock-minted id.
+    #[serde(rename = "handoff.read")]
+    HandoffRead(HandoffReadParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -395,6 +407,66 @@ pub struct NotificationSummary {
     pub origin_host: String,
     pub filed_at_ms: u64,
     pub seen: bool,
+}
+
+/// `handoff.list` (#286 / ADR-0017). Every file handed to this server, newest
+/// first — not only the caller's own.
+///
+/// Filtering by the caller's identity would be the tidier default and is the
+/// wrong one: an MCP client that cannot be resolved to a pane would get an
+/// empty list, which is indistinguishable from "nothing was handed over". A
+/// row says who it was handed to; the caller filters if it cares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HandoffListParams {
+    /// Only files handed to this agent — a public pane id, a terminal id, or
+    /// a unique agent name, resolved the way every other `target` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Cap the reply. `None` returns everything the projection holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `handoff.read` (#286 / ADR-0017).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffReadParams {
+    /// The id from a `handoff.list` row. Not a path — see [`Method::HandoffList`].
+    pub file_id: String,
+}
+
+/// One row of `handoff.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffSummary {
+    pub file_id: String,
+    /// The staged file's own name. flock mints it: the client wire carries
+    /// the bytes and an extension, never the name they had on the machine
+    /// they were dropped from.
+    pub name: String,
+    pub mime: String,
+    pub bytes: u64,
+    /// Server-side absolute path. Carried so an agent too small to want a
+    /// 12 MB base64 payload can hand the path to its own file tool instead;
+    /// the bytes and the agent are on the same machine by construction.
+    pub path: String,
+    /// Who it was handed to, when that was resolvable at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub origin_host: String,
+    pub received_at_ms: u64,
+}
+
+/// How `handoff.read` encoded the bytes it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffEncoding {
+    /// The file is valid UTF-8 and `content` is the text itself.
+    Utf8,
+    /// `content` is standard base64 of the raw bytes.
+    Base64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1539,6 +1611,11 @@ pub enum EventKind {
     /// acknowledgement — the unread set is the fold of one over the other.
     NotificationFiled,
     NotificationSeen,
+    /// #286 / ADR-0017: a human handed a file to an agent on this server.
+    /// The record — id, name, mime, size, staged path, recipient — lives
+    /// here; the BYTES never do. A JSONL audit log is not a blob store, and
+    /// ADR-0005's rotation should not be holding 16 MB of base64 hostage.
+    FileHandedOver,
 }
 
 impl EventKind {
@@ -1585,7 +1662,8 @@ impl EventKind {
             | Self::FleetResumed
             | Self::RunReverted
             | Self::NotificationFiled
-            | Self::NotificationSeen => true,
+            | Self::NotificationSeen
+            | Self::FileHandedOver => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1638,6 +1716,23 @@ pub enum ResponseResult {
         /// or one already read.
         acknowledged: usize,
         unread: usize,
+    },
+    /// #286 / ADR-0017: the handed-over files this server holds.
+    HandoffList {
+        files: Vec<HandoffSummary>,
+        /// Everything the projection holds, before `limit` and `target` cut
+        /// it down — so a caller can tell "you asked for one agent's files"
+        /// from "nothing has been handed over at all".
+        total: usize,
+    },
+    HandoffRead {
+        file_id: String,
+        name: String,
+        mime: String,
+        bytes: u64,
+        path: String,
+        encoding: HandoffEncoding,
+        content: String,
     },
     PeersSummary {
         /// Short hostname of the answering server.
@@ -2591,6 +2686,25 @@ pub enum EventData {
     /// and because "when was it read" is itself worth auditing.
     NotificationSeen {
         notification_id: String,
+    },
+    /// #286 / ADR-0017: a file was handed to an agent on this server. The
+    /// record the MCP resource surface is built from — enough to list, name
+    /// and type the file without opening it, and the staged path to reach
+    /// the bytes with.
+    FileHandedOver {
+        file_id: String,
+        name: String,
+        mime: String,
+        bytes: u64,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        origin_host: String,
+        received_at_ms: u64,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.

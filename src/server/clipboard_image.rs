@@ -8,6 +8,10 @@ const STAGED_CLIPBOARD_IMAGE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 6
 pub(crate) struct StagedClipboardImage {
     pub(crate) path: PathBuf,
     pub(crate) paste_text: String,
+    /// The sanitized extension the file was staged under. The handoff record
+    /// types the resource from it (#286), so it is returned rather than
+    /// re-derived from `path` by a second parser that could disagree.
+    pub(crate) extension: String,
 }
 
 pub(crate) fn stage(
@@ -51,13 +55,30 @@ pub(crate) fn stage(
             // pointing at the SERVER-side staged copy.
             format!("read this file: {path_str}")
         };
-        return Ok(StagedClipboardImage { paste_text, path });
+        return Ok(StagedClipboardImage {
+            paste_text,
+            path,
+            extension,
+        });
     }
 
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "failed to allocate unique clipboard image staging path",
     ))
+}
+
+/// Drop staged files older than [`STAGED_CLIPBOARD_IMAGE_MAX_AGE`].
+///
+/// The sweep used to run only when a new file was staged, which meant a
+/// server that never saw another drop never swept. Since #286 the records
+/// outlive the client connection that produced them, so the age bound is the
+/// one that has to hold on its own — this runs it at boot as well.
+pub(crate) fn sweep_stale() {
+    let dir = staging_dir();
+    if dir.is_dir() {
+        cleanup_stale(&dir);
+    }
 }
 
 pub(crate) fn remove_files(paths: Vec<PathBuf>) {
