@@ -18,7 +18,7 @@ enum ResolvedTarget {
     Remote(Box<crate::app::directory::AgentLocation>),
 }
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_with_data, encode_success};
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -684,10 +684,21 @@ impl App {
                     },
                 )
             }
-            Err(err) => encode_error(
+            // #380: a peer that READ the command and rejected it is not an
+            // unreachable peer. The relay is `flk msg send` on the far side,
+            // so a flag that build does not understand now comes back here as
+            // a refusal — the same failure that used to arrive as flag text
+            // welded to the front of somebody's message body, with a success
+            // reported to the sender.
+            Err(failure) => encode_error_with_data(
                 id,
-                "peer_unreachable",
-                format!("could not reach {host}: {err}"),
+                failure.code(),
+                failure.message(host),
+                serde_json::json!({
+                    "retryable": failure.retryable(),
+                    "peer": peer.name,
+                    "detail": failure.detail(),
+                }),
             ),
         }
     }
@@ -1359,6 +1370,19 @@ mod tests {
         assert_eq!(
             error.error.code, "peer_unreachable",
             "the send fails synchronously, so the caller learns immediately"
+        );
+        // #380 split this from a refusal, so the code alone is now a claim
+        // about which of the two happened — and it comes with the advice that
+        // follows from it. A peer that was never reached is worth retrying.
+        let data: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let data = &data["error"]["data"];
+        assert_eq!(
+            data["retryable"], true,
+            "an unreachable peer is a transient failure: {data}"
+        );
+        assert!(
+            data["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "the far side's own words reach the caller unedited: {data}"
         );
         let relayed = hub
             .events_after(0)
