@@ -673,6 +673,7 @@ impl App {
             float_esc_at: None,
             config_diagnostic,
             toast: None,
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             app_client_attached: true,

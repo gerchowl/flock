@@ -1,4 +1,5 @@
 use crate::app;
+use crate::app::actions::toast_event_text;
 use crate::app::state::AppState;
 use crate::config;
 use crate::detect::AgentState;
@@ -52,14 +53,6 @@ pub(crate) fn toast_message_from_state_change(
                 ))
             })
         })
-}
-
-fn toast_event_text(kind: app::state::ToastKind) -> &'static str {
-    match kind {
-        app::state::ToastKind::NeedsAttention => "needs attention",
-        app::state::ToastKind::Finished => "finished",
-        app::state::ToastKind::UpdateInstalled => "updated",
-    }
 }
 
 #[cfg(test)]
