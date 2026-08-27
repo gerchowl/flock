@@ -24,6 +24,14 @@ pub(crate) struct MailboxRegistry {
     history: HashMap<String, DeliveredMeta>,
     /// Sender pane → recent send timestamps (ms), for rate limiting.
     rate: HashMap<String, VecDeque<u64>>,
+    /// Recipient pane → ms-since-epoch its self-declared mute expires (#316).
+    ///
+    /// Deliberately NOT seeded from the durable log and not persisted. A mute
+    /// is a receiver saying "not for the next few minutes", and the honest
+    /// thing to do with one across a restart is forget it — which fails OPEN,
+    /// the only direction that cannot strand a message. Queues are the
+    /// durable half; this is a live preference about interruptions.
+    mutes: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +79,11 @@ const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Ceiling on a receiver-side mute (#316). An unbounded mute is a black hole
+/// wearing a politeness hat; a bounded one has to be renewed, which is what
+/// makes it impossible to set and forget. Half an hour is long enough to
+/// finish a refactor and short enough that the worst case is bounded latency.
+pub(crate) const MAX_MUTE_SECONDS: u64 = 30 * 60;
 
 impl MailboxRegistry {
     /// Rebuild queues, dedupe set, and reply history from the durable event
@@ -283,6 +296,45 @@ impl MailboxRegistry {
         expired
     }
 
+    /// Set (or, with `seconds == 0`, clear) a pane's wake mute. Returns the
+    /// expiry in ms since epoch, or 0 when cleared.
+    ///
+    /// `seconds` is CLAMPED to [`MAX_MUTE_SECONDS`] rather than refused. A
+    /// receiver asking for two hours has still said "not now"; answering with
+    /// an error would leave it un-muted, which is the opposite of what it
+    /// asked for and the kind of refusal an agent retries in a loop.
+    pub(crate) fn set_mute(&mut self, pane: &str, seconds: u64, now_ms: u64) -> u64 {
+        if seconds == 0 {
+            self.mutes.remove(pane);
+            return 0;
+        }
+        let until = now_ms.saturating_add(seconds.min(MAX_MUTE_SECONDS).saturating_mul(1000));
+        self.mutes.insert(pane.to_string(), until);
+        until
+    }
+
+    /// The pane's live mute expiry, or `None` when it is not muted. Expired
+    /// entries are dropped as they are read, so a pane that muted once does
+    /// not hold an entry for the life of the server.
+    pub(crate) fn muted_until(&mut self, pane: &str, now_ms: u64) -> Option<u64> {
+        match self.mutes.get(pane) {
+            Some(&until) if until > now_ms => Some(until),
+            Some(_) => {
+                self.mutes.remove(pane);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// How many messages are queued for one pane — the number the wake path
+    /// is allowed to know. No bodies, no previews; see [`MsgWakeParams`].
+    ///
+    /// [`MsgWakeParams`]: crate::api::schema::MsgWakeParams
+    pub(crate) fn queued_len(&self, pane: &str) -> usize {
+        self.queues.get(pane).map_or(0, VecDeque::len)
+    }
+
     pub(crate) fn queued_infos(
         &self,
         pane: Option<&str>,
@@ -439,6 +491,59 @@ mod tests {
             registry.enqueue(message("c-overflow", "w1:p2")),
             EnqueueOutcome::MailboxFull
         );
+    }
+
+    /// #316: a mute is bounded by construction. Asking for longer is
+    /// clamped, not refused — a receiver that said "not now" must not end up
+    /// un-muted because it asked for too much.
+    #[test]
+    fn a_mute_is_clamped_to_the_cap_and_zero_clears_it() {
+        let mut registry = MailboxRegistry::default();
+        let now = 1_000_000;
+
+        let until = registry.set_mute("pane-1", MAX_MUTE_SECONDS * 4, now);
+        assert_eq!(
+            until,
+            now + MAX_MUTE_SECONDS * 1000,
+            "an over-long mute is clamped to the cap",
+        );
+        assert_eq!(registry.muted_until("pane-1", now), Some(until));
+
+        assert_eq!(registry.set_mute("pane-1", 0, now), 0, "zero clears");
+        assert_eq!(registry.muted_until("pane-1", now), None);
+    }
+
+    /// An expired mute is not just ignored, it is dropped — otherwise a pane
+    /// that muted itself once holds an entry for the life of the server.
+    #[test]
+    fn an_expired_mute_is_swept_as_it_is_read() {
+        let mut registry = MailboxRegistry::default();
+        let now = 1_000_000;
+        let until = registry.set_mute("pane-1", 60, now);
+
+        assert_eq!(registry.muted_until("pane-1", until - 1), Some(until));
+        assert_eq!(
+            registry.muted_until("pane-1", until),
+            None,
+            "the mute lifts at its expiry, not after it",
+        );
+        assert!(
+            registry.mutes.is_empty(),
+            "reading an expired mute drops it"
+        );
+    }
+
+    /// The wake path is allowed to know a number and nothing else.
+    #[test]
+    fn queued_len_counts_only_the_named_pane() {
+        let mut registry = MailboxRegistry::default();
+        registry.enqueue(message("c-1", "pane-1"));
+        registry.enqueue(message("c-2", "pane-1"));
+        registry.enqueue(message("c-3", "pane-2"));
+
+        assert_eq!(registry.queued_len("pane-1"), 2);
+        assert_eq!(registry.queued_len("pane-2"), 1);
+        assert_eq!(registry.queued_len("pane-3"), 0);
     }
 
     #[test]

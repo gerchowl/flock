@@ -9,8 +9,13 @@
 //! 1. Check runner tick — [`App::dispatch_due_script_checks`] early-returns
 //!    at the top when paused, so no built-in fold runs, no script check
 //!    dispatches, and no heartbeat lands.
-//! 2. Mailbox drain — [`App::deliver_due_messages`] early-returns at the
-//!    top when paused, so a settled Idle boundary does not deliver.
+//! 2. The message WAKE — [`App::handle_msg_wake`] reports zero when paused,
+//!    so no agent is interrupted about its inbox. ADR-0008 (#216) deleted the
+//!    scheduled drain this used to name (`deliver_due_messages`) along with
+//!    the keystrokes it required; the stop-hook wake that replaced it went
+//!    ungated until #316. The TTL sweep
+//!    ([`App::expire_undeliverable_messages`]) is halted too, so a paused
+//!    fleet does not quietly age messages out either.
 //! 3. Cron fires ([`App::dispatch_cron_fires`], S1) and the scheduled
 //!    reap / quarantine tick ([`App::evaluate_reap_check`], S2) — both
 //!    gated transitively: they are dispatched from inside
