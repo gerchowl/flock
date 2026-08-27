@@ -33,6 +33,9 @@ mod checksum;
 mod cli;
 mod client;
 mod config;
+// #348 / ADR-0014 §4: one definition of "terminal control sequence",
+// shared by the handler that strips them and the one that refuses them.
+mod control_bytes;
 // #175 phase 5 / S3 commit 1: per-agent spend accountant folded from the
 // durable event log. Consumed by the digest render (commit 2); imported
 // here so `just test` picks up its unit tests without waiting on the digest.

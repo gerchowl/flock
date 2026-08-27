@@ -167,20 +167,37 @@ As of acceptance (#345):
 | 1 | `Method::AgentSpawn`, closed `AgentKind`, server-side argv | landed |
 | 2 | location as a union over known checkouts | landed, minus `new_branch` — a caller creates the checkout first and spawns into it by path |
 | 3 | env allowlist | landed (#347). `env_clear()` plus a per-agent table (`src/spawn/allowlist.rs`), armed only on the agent-spawn path, with the resolved keys on the spawn's log line so an omission is a read rather than a bisect. The deny-list stays on beneath it as a second line. Not settled: a fleet on Bedrock or Vertex needs `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`, which §3's own deny-list strips — allowing a third-party cloud credential through is the operator's call, not the implementer's |
-| 4 | untrusted prompt: system-owned preamble, control-byte refusal | **not landed** (#348). The prompt is length-capped and passed as one argv element, so nothing reaches a shell — but a foreman's prompts come from issue bodies, and neither the preamble nor the byte filter exists yet |
+| 4 | untrusted prompt: system-owned preamble, control-byte refusal | landed (#348). `src/spawn/prompt.rs` composes the opening turn: flock's preamble, then the caller's text fenced under a tag minted per spawn, so the caller — whose text is fixed before the tag exists — cannot close the block and carry on in flock's voice. `AgentKind::argv` accepts only the composed type, which is what keeps the constraint off any one call site. Control sequences are refused rather than stripped (`src/control_bytes.rs`, one filter shared with `msg.send`'s strip policy), because the prompt is the whole turn and silently editing it runs a task nobody wrote. What the preamble may promise is bounded below |
 | 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
 | 6 | ceiling in the shared spawn funnel | **partial** (#349). It gates `agent.spawn`. `agent.fork` and the TUI keyboard fork do not consult it, so an operator's own forking is unbounded — correct for a human, but it means the capacity count and the thing it protects are not yet the same funnel |
 | 7 | `fleet pause` refuses agent-initiated spawn | landed |
 | 8 | refusals separate retryable from terminal | landed |
 
-The remaining gaps are #348 and #349 — tracked as issues rather than left
-in this table, because an Accepted ADR whose unbuilt parts live only in prose
-is how they get forgotten.
+The remaining gap is #349 — tracked as an issue rather than left in this
+table, because an Accepted ADR whose unbuilt parts live only in prose is how
+they get forgotten.
 
 #349 is the one that bites soonest: `flock_agent_fork` is already on the MCP
 surface and does not consult the ceiling, so an agent refused by
 `at_agent_capacity` can fork instead. The cap is not closed until that path
 shares the gate.
+
+### What §4's preamble may promise
+
+Mitigation, not a trust boundary. The preamble tells the child what it is
+reading and raises the cost of an injection carried in relayed text; a model
+can still be talked around, and §4 does not become a boundary by being
+implemented. The P3 line — sender identity is routing and audit, never
+authorization — applies to it exactly as it applies to a sender stamp, so
+nothing downstream may treat a composed prompt as a safe one.
+
+Two things it *does* promise, because both are properties of the construction
+rather than of the child's judgement: the caller's text can never precede the
+preamble, and the caller cannot close the fence, since the tag is minted after
+its text is fixed. The boundaries that actually hold are the ones already
+built — the closed `AgentKind` (§1), the environment allowlist (§3), the
+lineage ceiling (§5), and the `Agent-Run:` trailer that keeps a talked-around
+child's commits revertable.
 
 ## Alternatives rejected
 

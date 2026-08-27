@@ -3075,6 +3075,11 @@ pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
+    /// Any valid prompt will do here: this reads argv[0], not the turn.
+    fn probe_prompt() -> crate::spawn::prompt::SpawnPrompt {
+        crate::spawn::prompt::SpawnPrompt::compose("probe").expect("a plain prompt composes")
+    }
+
     fn clear_integration_path_env() {
         std::env::remove_var(PI_CODING_AGENT_DIR_ENV_VAR);
         std::env::remove_var(CLAUDE_CONFIG_DIR_ENV_VAR);
@@ -3255,7 +3260,7 @@ mod tests {
     fn no_denied_key_is_on_any_agent_kinds_allowlist() {
         for kind in crate::spawn::AgentKind::supported() {
             let kind = crate::spawn::AgentKind::parse(kind).expect("supported kinds parse");
-            let allowlist = crate::spawn::allowlist::for_argv(&kind.argv("prompt"));
+            let allowlist = crate::spawn::allowlist::for_argv(&kind.argv(&probe_prompt()));
             for denied in agent_spawn_denied_env() {
                 assert!(
                     !allowlist.keys().contains(denied),
