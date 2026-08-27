@@ -1655,6 +1655,22 @@ impl App {
                     crate::agent_resume::append_pivot_message(&mut plan, &pivot);
                     let seeded = !pivot.trim().is_empty();
                     let (rows, cols) = self.state.estimate_pane_size();
+                    // #359: the keyboard fork execs argv just as `agent.fork`
+                    // does, so it needs the same profile carry. The requester
+                    // is the pane being forked, captured with `branch_parent`
+                    // when the dialog opened — by now the focus may have moved
+                    // and `git worktree add` has already run on a thread.
+                    let requester_pid = branch_parent
+                        .as_ref()
+                        .and_then(|parent| self.parse_pane_id(&parent.pane_id))
+                        .and_then(|(_, pane_id)| self.pane_child_pid(pane_id));
+                    // The recorded profile is the fallback the live read
+                    // cannot provide: the forked pane may have been hibernated
+                    // or closed while `git worktree add` ran on its thread.
+                    let recorded_profile = crate::agent_resume::claude_resume_session_id(&plan)
+                        .and_then(crate::agent_resume::claude_config_dir_for_session);
+                    let spawn_env =
+                        self.resolve_spawn_env(&plan.argv, requester_pid, recorded_profile);
                     let run_id = generated_fork_run_id();
                     self.install_run_trailer_if_enabled(&path);
                     // Guard, not a bare set: a spawn failure below must disarm
@@ -1662,14 +1678,19 @@ impl App {
                     // `flk revert-run` would revert that pane's work (#192).
                     let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
                     fork_run_id = Some((run_id.clone(), seeded));
-                    self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
-                        .map(|(ws_idx, _, pane_id)| {
-                            self.record_spawn_run_id(ws_idx, pane_id, &run_id);
-                            ws_idx
-                        })
-                        .map_err(|err| match err {
-                            super::agents::AgentStartError::SpawnFailed(message) => message,
-                            _ => "agent spawn rejected".to_string(),
+                    spawn_env
+                        .map_err(|unresolved| unresolved.message())
+                        .and_then(|vars| {
+                            let _spawn_env_guard = crate::integration::set_pending_spawn_env(vars);
+                            self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
+                                .map(|(ws_idx, _, pane_id)| {
+                                    self.record_spawn_run_id(ws_idx, pane_id, &run_id);
+                                    ws_idx
+                                })
+                                .map_err(|err| match err {
+                                    super::agents::AgentStartError::SpawnFailed(message) => message,
+                                    _ => "agent spawn rejected".to_string(),
+                                })
                         })
                 } else {
                     self.create_workspace_with_options(path.clone(), true)

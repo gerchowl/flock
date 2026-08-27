@@ -137,6 +137,25 @@ impl App {
                 serde_json::json!({ "refusal": "spawn_caller_unknown", "retryable": false }),
             );
         };
+        // #359: the child is exec'd from argv with no shell in between, so the
+        // agent profile the REQUESTER is on has to be carried explicitly or the
+        // child silently starts against the default one — which may be a
+        // different authenticated account, not merely a logged-out one.
+        // Resolved before any state is mutated so a refusal costs nothing.
+        let argv = kind.argv(prompt);
+        let spawn_env = match self.resolve_spawn_env(&argv, self.current_api_peer_pid, None) {
+            Ok(vars) => vars,
+            Err(unresolved) => {
+                let refusal = SpawnRefusal::ProfileUnresolved(unresolved);
+                return encode_error_with_data(
+                    id,
+                    refusal.code(),
+                    refusal.message(),
+                    refusal_data(&refusal),
+                );
+            }
+        };
+
         let run_id = crate::app::worktrees::generated_fork_run_id();
         self.install_run_trailer_if_enabled(&cwd);
         // Guard, not a bare set: a spawn failure below must disarm the id, or
@@ -148,9 +167,12 @@ impl App {
         // operator-started pane inheriting them is correct — it is their
         // shell — which is exactly why this is armed here and not globally.
         let _scrub_guard = crate::integration::set_pending_credential_scrub();
+        // Armed after the scrub, and dropped with it: the profile the requester
+        // runs under is handed down deliberately, where its ambient GitHub and
+        // ssh credentials are not.
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
 
         let (rows, cols) = self.state.estimate_pane_size();
-        let argv = kind.argv(prompt);
         let spawned = self.spawn_agent_workspace(cwd, rows, cols, &argv, params.focus);
         let (ws_idx, pane_id) = match spawned {
             Ok((ws_idx, _, pane_id)) => (ws_idx, pane_id),
@@ -307,6 +329,16 @@ fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
         SpawnRefusal::AtDepth { depth, limit } => {
             map.insert("depth".into(), (*depth).into());
             map.insert("limit".into(), (*limit).into());
+        }
+        SpawnRefusal::ProfileUnresolved(unresolved) => {
+            // Name the key the operator has to fix. Without it the caller
+            // learns only that "the profile" is wrong, which is exactly the
+            // mysterious-startup-break failure ADR-0014 §3 warns an allowlist
+            // produces.
+            if let crate::spawn::env::ProfileUnresolved::NoSuchProfile { key, value } = unresolved {
+                map.insert("env_key".into(), (*key).into());
+                map.insert("env_value".into(), value.clone().into());
+            }
         }
         SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled => {}
     }
