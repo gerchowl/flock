@@ -446,6 +446,51 @@ impl App {
         self.selection_autoscroll_deadline = None;
     }
 
+    /// The HOST window title to publish this tick, if any (#361).
+    ///
+    /// Both loops call this — the monolithic one writes the result to its own
+    /// terminal, the headless one ships it to the foreground client — so the
+    /// grammar, the kill switch, the debounce and the dedupe have exactly one
+    /// implementation between them.
+    ///
+    /// Recomputing the title walks every pane's state, so the debounce window
+    /// short-circuits BEFORE the walk and records when to come back instead.
+    /// A settled title schedules no wakeup at all: a quiet flock stays quiet.
+    pub(crate) fn due_window_title(&mut self, now: Instant) -> Option<String> {
+        if !self.state.config.title.enabled {
+            self.window_title_deadline = None;
+            return None;
+        }
+        if let Some(deadline) = self.window_title_publisher.retry_deadline(now) {
+            self.window_title_deadline = Some(deadline);
+            return None;
+        }
+        self.window_title_deadline = None;
+        let title = crate::ui::window_title::window_title(&self.state, &self.terminal_runtimes);
+        self.window_title_publisher.due(title, now)
+    }
+
+    /// Monolithic (`--no-session`) sink for [`due_window_title`](Self::due_window_title):
+    /// this process owns the host terminal, so it writes the OSC itself.
+    ///
+    /// The title stack is pushed lazily, with the FIRST title — a session that
+    /// never publishes one (the `[title] enabled = false` kill switch) leaves
+    /// the host terminal completely untouched, with nothing to hand back.
+    pub(crate) fn publish_host_window_title(&mut self, now: Instant) {
+        let first_publish = !self.window_title_publisher.has_published();
+        let Some(title) = self.due_window_title(now) else {
+            return;
+        };
+        let mut sequence = Vec::new();
+        if first_publish {
+            sequence.extend_from_slice(crate::terminal_notify::PUSH_WINDOW_TITLE);
+        }
+        sequence.extend(crate::terminal_notify::set_window_title_sequence(&title));
+        // Best-effort, like every other raw host-terminal write: a failure here
+        // means stdout is gone, which the loop finds out about anyway.
+        let _ = crate::terminal_notify::write_host_sequence(&sequence);
+    }
+
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
             Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,
@@ -584,6 +629,9 @@ impl App {
                 .and_then(|()| self.issue_guard.next_poll_deadline()),
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
+            // #361: a title change that landed inside the debounce window must
+            // still reach the host terminal — wake for the end of the window.
+            self.window_title_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
             render_deadline,

@@ -28,6 +28,7 @@ pub(crate) mod state_signal;
 pub(crate) mod status;
 mod tabs;
 mod widgets;
+pub(crate) mod window_title;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_cross_checkout_overlay, render_kill_all_worktrees_overlay,

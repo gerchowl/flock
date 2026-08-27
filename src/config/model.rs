@@ -478,6 +478,8 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub slots: SlotsConfig,
+    /// `[title]` — host terminal window title publishing (#361).
+    pub title: TitleConfig,
     pub web: WebSectionConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
@@ -1159,6 +1161,25 @@ impl Default for SlotsConfig {
             max: 8,
             prewarm_ssh_peers: true,
         }
+    }
+}
+
+/// `[title]` — what flock advertises to the HOST terminal's window title
+/// (#361). The kill switch is the whole section for now: a title carries the
+/// focused branch and the server name, which is exactly the information a
+/// shared screen, a recording, or a streamed terminal leaks to whoever is
+/// watching. Set `enabled = false` and flock writes no OSC 2 at all — the
+/// window title stays whatever the shell last set it to.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TitleConfig {
+    /// Publish the host window title. Default: true.
+    pub enabled: bool,
+}
+
+impl Default for TitleConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
