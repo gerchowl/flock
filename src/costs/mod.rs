@@ -276,6 +276,7 @@ mod tests {
                 cross_repo: from_repo != to_repo,
                 in_reply_to: None,
                 enqueued_at_ms: 0,
+                intent: crate::api::schema::MsgIntent::Fyi,
                 body: "hi".into(),
             },
         }
