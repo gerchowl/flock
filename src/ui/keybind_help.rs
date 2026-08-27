@@ -179,6 +179,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(keybind_label(&kb.zoom), "zoom pane"),
         help_entry(keybind_label(&kb.toggle_float), "toggle floating pane"),
         help_entry(
+            keybind_label(&kb.drop_issue),
+            "drop an issue into any repo you can reach",
+        ),
+        help_entry(
             keybind_label(&kb.toggle_prompt_expand),
             "expand the pane header's last prompt (Tab inside cycles \
              replies/tool calls/tool output)",

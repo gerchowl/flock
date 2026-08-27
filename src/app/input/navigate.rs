@@ -65,6 +65,10 @@ impl App {
                 let previous_mode = self.state.mode;
                 self.toggle_float_pane();
                 finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
+            } else if action == NavigateAction::DropIssue {
+                let previous_mode = self.state.mode;
+                self.open_issue_drop();
+                finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
             } else {
                 execute_navigate_action_in_context(
                     &mut self.state,
@@ -106,6 +110,9 @@ impl App {
                 leave_navigate_mode(&mut self.state);
             } else if action == NavigateAction::ToggleFloat {
                 self.toggle_float_pane();
+                leave_navigate_mode(&mut self.state);
+            } else if action == NavigateAction::DropIssue {
+                self.open_issue_drop();
                 leave_navigate_mode(&mut self.state);
             } else {
                 execute_navigate_action_in_context(
@@ -300,6 +307,66 @@ impl App {
             });
         }
         Ok(())
+    }
+
+    /// Open the cross-repo issue-drop dialog (#371).
+    ///
+    /// Restores any draft left from a previous open rather than starting
+    /// blank: an idea half-typed and lost to a stray Esc is worse than not
+    /// offering the feature.
+    pub(crate) fn open_issue_drop(&mut self) {
+        if self.state.issue_drop.is_none() {
+            self.state.issue_drop = Some(crate::app::issue_drop::IssueDropState::default());
+        }
+        // Rank from the cache when it is still fresh, so reopening the dialog
+        // inside the TTL is instant and costs no request. Ranking is redone
+        // every open rather than cached with the entries: which repos have a
+        // local checkout changes as worktrees come and go.
+        let now = std::time::Instant::now();
+        let fresh = self
+            .state
+            .issue_repo_cache
+            .as_ref()
+            .filter(|cache| !cache.is_stale(now))
+            .map(|cache| cache.entries().to_vec());
+        match fresh {
+            Some(entries) => self.state.apply_issue_repo_entries(&entries),
+            None => self.refresh_issue_drop_directory(),
+        }
+        self.state.mode = crate::app::state::Mode::IssueDrop;
+    }
+
+    /// Enumerate filable repositories off-thread.
+    ///
+    /// Off the UI thread because this is a network round trip: the whole point
+    /// of #371 is that filing does not stall what the operator is doing, and a
+    /// blocking fetch inside a key handler would freeze the render loop —
+    /// including the panes whose agents must not be disturbed.
+    fn refresh_issue_drop_directory(&mut self) {
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::github::repos::fetch_directory();
+            let _ = event_tx.blocking_send(crate::events::AppEvent::IssueReposFetched(outcome));
+        });
+    }
+
+    /// Hand the body off to the operator's editor in a new pane.
+    ///
+    /// A NEW pane, never the focused one: #371's hard requirement is that the
+    /// agent the operator is watching is not disturbed, and writing into its
+    /// PTY is exactly the interruption the feature exists to avoid.
+    pub(crate) fn hand_off_issue_drop(&mut self, repo: &str, title: &str) {
+        let exe = std::env::current_exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "flk".to_string());
+        let command = crate::app::issue_drop::handoff_command(&exe, repo, title);
+        if let Err(err) = self.spawn_pane_command(&command, Vec::new()) {
+            // Shaped into a String rather than a Display formatter: the field
+            // is what reaches the log schema, and a raw formatter is what the
+            // no-raw-trace-fields gate exists to keep out.
+            let err = err.to_string();
+            tracing::warn!(err, "issue drop: could not open the editor pane");
+        }
     }
 
     pub(crate) fn spawn_pane_command(
@@ -540,6 +607,7 @@ pub(crate) enum NavigateAction {
     EditScrollback,
     EditConfig,
     ToggleFloat,
+    DropIssue,
     CopyMode,
     Zoom,
     EnterResizeMode,
@@ -662,6 +730,7 @@ fn action_for_key(
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
         (&kb.edit_config, NavigateAction::EditConfig),
         (&kb.toggle_float, NavigateAction::ToggleFloat),
+        (&kb.drop_issue, NavigateAction::DropIssue),
         (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
@@ -935,6 +1004,9 @@ pub(super) fn execute_navigate_action_in_context(
         // mirroring EditScrollback above.
         NavigateAction::EditConfig => {}
         NavigateAction::ToggleFloat => {}
+        // Also App-level: the directory fetch needs event_tx, and the hand-off
+        // spawns a pane.
+        NavigateAction::DropIssue => {}
         NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
