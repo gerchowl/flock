@@ -407,8 +407,8 @@ impl App {
     /// or — omitted — the caller's own pane, resolved the way `msg.send`
     /// resolves its sender. `Err` is the encoded refusal, ready to return.
     ///
-    /// Shared by `msg.read` and `msg.wake` so the two cannot drift on what
-    /// "my inbox" means. They have to agree: a wake counted
+    /// Shared by `msg.read`, `msg.wake` and `msg.mute` so the three cannot
+    /// drift on what "my inbox" means. They have to agree: a wake counted
     /// against one pane and a read taken from another is an agent told it has
     /// mail that it then cannot find.
     fn resolve_inbox_pane(
@@ -475,6 +475,19 @@ impl App {
                 ResponseResult::MsgWake {
                     count: 0,
                     suppressed: Some("fleet_paused".into()),
+                    muted_until_ms: None,
+                },
+            );
+        }
+
+        let now = now_ms();
+        if let Some(until) = self.mailboxes.muted_until(&pane, now) {
+            return encode_success(
+                id,
+                ResponseResult::MsgWake {
+                    count: 0,
+                    suppressed: Some("muted".into()),
+                    muted_until_ms: Some(until),
                 },
             );
         }
@@ -484,8 +497,28 @@ impl App {
             ResponseResult::MsgWake {
                 count: self.mailboxes.queued_len(&pane),
                 suppressed: None,
+                muted_until_ms: None,
             },
         )
+    }
+
+    /// `msg.mute` — a recipient declining to be woken for a bounded window.
+    ///
+    /// Receiver-side and self-scoped: the pane defaults to the caller's own.
+    /// It is not gated on the pause, because it only ever removes wakes — a
+    /// receiver quieting itself inside a paused fleet is asking for less, and
+    /// refusing that would be pause working against its own purpose.
+    pub(super) fn handle_msg_mute(
+        &mut self,
+        id: String,
+        params: crate::api::schema::MsgMuteParams,
+    ) -> String {
+        let pane = match self.resolve_inbox_pane(&id, params.pane, "mute") {
+            Ok(pane) => pane,
+            Err(refusal) => return refusal,
+        };
+        let muted_until_ms = self.mailboxes.set_mute(&pane, params.seconds, now_ms());
+        encode_success(id, ResponseResult::MsgMute { muted_until_ms })
     }
 
     /// `msg.read` — the recipient consumes its inbox (ADR-0008).
@@ -1529,6 +1562,59 @@ mod tests {
             wake(&mut app, &pane),
             (1, None),
             "resume restores the wake, with the message still there to name",
+        );
+    }
+
+    /// #316 C: a receiver may decline to be woken for a bounded window, and
+    /// that must cost it latency rather than a message.
+    #[tokio::test]
+    async fn a_muted_pane_is_not_woken_and_keeps_its_mail() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        basic_send(&mut app, "c-mute-1", "before the mute");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+                pane: Some(pane.clone()),
+                seconds: 600,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgMute { muted_until_ms } = success.result else {
+            panic!("expected msg_mute: {response}");
+        };
+        assert!(muted_until_ms > 0, "a mute must name when it lifts");
+
+        assert_eq!(
+            wake(&mut app, &pane),
+            (0, Some("muted".into())),
+            "a muted pane is not woken",
+        );
+
+        // Mail keeps arriving while muted — the mute is on the wake, not the
+        // delivery.
+        basic_send(&mut app, "c-mute-2", "during the mute");
+        assert_eq!(
+            queued_count(&mut app),
+            2,
+            "delivery is unaffected by a mute"
+        );
+        assert_eq!(wake(&mut app, &pane), (0, Some("muted".into())));
+
+        // Clearing it names everything that queued meanwhile, so the window
+        // cost latency and nothing else.
+        app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+                pane: Some(pane.clone()),
+                seconds: 0,
+            }),
+        });
+        assert_eq!(
+            wake(&mut app, &pane),
+            (2, None),
+            "the first allowed wake names everything that arrived during the mute",
         );
     }
 

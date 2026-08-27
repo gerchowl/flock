@@ -154,6 +154,21 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_msg_read,
         },
         Tool {
+            name: "flock_msg_mute",
+            description: "Decline to be woken about new mail for a bounded \
+                          window — the receiver's 'not now'. Suppresses the \
+                          NUDGE only: messages keep arriving, \
+                          `flock_msg_read` still returns them, and the first \
+                          nudge after the window names everything that \
+                          queued meanwhile. It costs you latency, never a \
+                          message. Capped at 30 minutes, and cleared by a \
+                          server restart — a preference, not a promise, so \
+                          renew it if you still want quiet. `seconds: 0` \
+                          clears it. Omit `pane` to mute yourself.",
+            input_schema: schema_msg_mute,
+            build: build_msg_mute,
+        },
+        Tool {
             name: "flock_pane_read",
             description: "Read a pane's recent output. Reading marks the pane \
                           seen — same caveat as `flock_agent_read`.",
@@ -519,6 +534,35 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn schema_msg_mute() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How long to stay un-nudged. Clamped to 1800 (30 minutes); 0 clears the mute.",
+            },
+            "pane": {
+                "type": "string",
+                "description": "Whose wake to suppress. Omit for your own pane.",
+            },
+        },
+        "required": ["seconds"],
+        "additionalProperties": false,
+    })
+}
+
+fn build_msg_mute(args: Value) -> Result<Method, McpError> {
+    Ok(Method::MsgMute(crate::api::schema::MsgMuteParams {
+        pane: optional_string(&args, "pane")?,
+        seconds: args
+            .get("seconds")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| McpError::invalid_params("`seconds` is required (0 clears the mute)"))?,
+    }))
+}
+
 fn build_msg_read(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgRead(crate::api::schema::MsgReadParams {
         pane: optional_string(&args, "pane")?,
@@ -609,6 +653,7 @@ mod tests {
                 "flock_msg_reply",
                 "flock_msg_list",
                 "flock_msg_read",
+                "flock_msg_mute",
                 "flock_pane_read",
                 "flock_worktree_list",
                 "flock_agent_start",

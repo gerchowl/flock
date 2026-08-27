@@ -103,6 +103,8 @@ pub enum Method {
     MsgStatus(MsgStatusParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
+    #[serde(rename = "msg.mute")]
+    MsgMute(MsgMuteParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -750,6 +752,23 @@ pub struct MsgWakeParams {
     /// `msg.read` resolves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+}
+
+/// `msg.mute` — the recipient declines to be woken, for a bounded window
+/// (#316 C).
+///
+/// Suppresses the WAKE, never the delivery. Messages keep queuing, `msg.list`
+/// and `msg.read` are untouched, and the first allowed wake after the window
+/// reports everything that arrived meanwhile — so a mute costs latency, never
+/// a message. Bounded by
+/// [`crate::app::mailboxes::MAX_MUTE_SECONDS`]; `seconds: 0` clears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgMuteParams {
+    /// Whose wake to suppress. Omitted means the caller's own pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    /// How long to stay muted. Clamped to the cap; 0 clears the mute.
+    pub seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1599,10 +1618,17 @@ pub enum ResponseResult {
         /// through a suppression by ignoring the reason. The true queue depth
         /// is still `msg.list`'s answer.
         count: usize,
-        /// Why the count was forced to zero: `fleet_paused` today.
+        /// Why the count was forced to zero: `fleet_paused` or `muted`.
         /// Absent when nothing was suppressed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suppressed: Option<String>,
+        /// When a `muted` suppression lifts, in ms since epoch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        muted_until_ms: Option<u64>,
+    },
+    MsgMute {
+        /// When the mute expires, in ms since epoch; 0 when it was cleared.
+        muted_until_ms: u64,
     },
     PaneInfo {
         pane: PaneInfo,

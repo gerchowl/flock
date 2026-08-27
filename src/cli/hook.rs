@@ -189,8 +189,8 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // does not answer means no nudge, never a blocked turn.
     //
     // The count comes from `msg.wake`, not `msg.list`: the server decides
-    // whether a wake may fire at all (a paused fleet) and answers with a
-    // number rather than message previews (#316).
+    // whether a wake may fire at all (a paused fleet, a muted recipient) and
+    // answers with a number rather than message previews (#316).
     let pending_messages = if matches!(action, Action::Stop) {
         wake_message_count(&pane_id)
     } else {
@@ -453,7 +453,8 @@ fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
 /// `msg.wake` answers with a count, so the wake path structurally cannot
 /// carry text a sender wrote (ADR-0008). It also answers ZERO when a wake is
 /// suppressed, which is why the hook asks this rather than `msg.list`: the
-/// decision belongs to the server, where the fleet pause is known.
+/// decision belongs to the server, where the fleet pause and the recipient's
+/// own mute are known.
 ///
 /// Any failure counts as zero. A hook must never block or fail the parent
 /// agent, so an unreachable or older server means no nudge.
@@ -616,14 +617,16 @@ mod tests {
         let woken = encode(crate::api::schema::ResponseResult::MsgWake {
             count: 3,
             suppressed: None,
+            muted_until_ms: None,
         });
         assert_eq!(wake_count_from_response(&woken), 3);
 
         // A suppressed wake reports zero in the count itself, so a hook that
-        // reads only the count cannot nudge through a pause.
+        // reads only the count cannot nudge through a pause or a mute.
         let suppressed = encode(crate::api::schema::ResponseResult::MsgWake {
             count: 0,
             suppressed: Some("fleet_paused".into()),
+            muted_until_ms: None,
         });
         assert_eq!(wake_count_from_response(&suppressed), 0);
         assert_eq!(

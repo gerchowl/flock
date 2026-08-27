@@ -25,6 +25,7 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
         "list" => msg_list(&args[1..]),
         "read" => msg_read(&args[1..]),
         "status" => msg_status(&args[1..]),
+        "mute" => msg_mute(&args[1..]),
         "help" | "--help" | "-h" => {
             print_msg_help();
             Ok(0)
@@ -273,6 +274,47 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// `flk msg mute` — the receiver-side half of the wake rule (#316).
+///
+/// Suppresses the WAKE for a bounded window, never the delivery: mail keeps
+/// arriving and `flk msg list` keeps showing it. `0` clears. The operator
+/// path exists alongside the agent's `flock_msg_mute` so a mute an agent set
+/// on itself can always be lifted from outside it.
+fn msg_mute(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: flk msg mute <seconds> [--pane TARGET]   (0 clears)";
+    let mut pane = None;
+    let mut seconds = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pane" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --pane");
+                    return Ok(2);
+                };
+                pane = Some(value.clone());
+                index += 2;
+            }
+            other => {
+                let Ok(parsed) = other.parse::<u64>() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                seconds = Some(parsed);
+                index += 1;
+            }
+        }
+    }
+    let Some(seconds) = seconds else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:msg:mute".into(),
+        method: Method::MsgMute(crate::api::schema::MsgMuteParams { pane, seconds }),
+    })?)
+}
+
 fn print_msg_help() {
     eprintln!("flk msg commands:");
     eprintln!(
@@ -282,6 +324,10 @@ fn print_msg_help() {
     eprintln!("  flk msg list [--pane TARGET]");
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
     eprintln!("  flk msg status <correlation_id>  what became of a message you sent");
+    eprintln!(
+        "  flk msg mute <seconds> [--pane TARGET]  stop waking a recipient; 0 clears, \
+         mail still arrives"
+    );
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
     eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
 }

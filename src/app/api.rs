@@ -1196,6 +1196,7 @@ impl App {
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
+            Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
