@@ -230,8 +230,17 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
 pub enum WorktreeMergeGate {
     /// The branch's work is recorded elsewhere; deleting it is safe.
     Merged { evidence: String },
-    /// No merge evidence found; only the checkout should be removed.
+    /// The branch was judged and no merge evidence was found; only the
+    /// checkout should be removed.
     NotMerged,
+    /// Nothing was judged. The checkout is not on disk, so no branch could be
+    /// resolved and there was no question to put to git or gh (#360).
+    ///
+    /// Distinct from [`WorktreeMergeGate::NotMerged`], which is an answer
+    /// ABOUT a branch: reporting a cannot-ask as an asked-and-got-no sends the
+    /// operator to go check a PR, when the real state is a workspace pointing
+    /// at a directory that no longer exists and no work at risk at all.
+    CheckoutMissing,
 }
 
 fn run_command_capture(
@@ -301,6 +310,35 @@ pub(crate) fn checkout_branch_name(checkout: &std::path::Path) -> Option<String>
     run_command_capture("git", &["-C", &path, "branch", "--show-current"], None)
         .ok()
         .filter(|branch| !branch.is_empty())
+}
+
+/// The gate's verdict for a checkout that yielded no branch name.
+///
+/// [`checkout_branch_name`] answers `None` for two unrelated states: a
+/// detached HEAD, which is a live checkout with a tip nothing can judge, and a
+/// checkout that is not there at all, where there was never a question to ask.
+/// Both used to collapse into [`WorktreeMergeGate::NotMerged`], so a workspace
+/// whose checkout had been removed out from under it was refused with the
+/// wording of a branch GitHub had been asked about (#360).
+pub(crate) fn gate_for_branchless_checkout(checkout: &std::path::Path) -> WorktreeMergeGate {
+    if checkout_is_readable(checkout) {
+        WorktreeMergeGate::NotMerged
+    } else {
+        WorktreeMergeGate::CheckoutMissing
+    }
+}
+
+/// Can git still read `checkout` as a work tree?
+///
+/// `Path::exists` is not enough on its own. An unmounted volume leaves the
+/// mount point behind as an empty directory, and a sibling tool's
+/// `git worktree prune` leaves the directory while taking the admin files —
+/// both are directories that exist and hold no checkout. `rev-parse --git-dir`
+/// is false for every one of those, true for a detached checkout, and one
+/// process either way.
+fn checkout_is_readable(checkout: &std::path::Path) -> bool {
+    let path = checkout.to_string_lossy().to_string();
+    run_command_capture("git", &["-C", &path, "rev-parse", "--git-dir"], None).is_ok()
 }
 
 /// A branch the worktree-kill flow must never auto-delete (#121). Three tiers,
@@ -2949,6 +2987,65 @@ prunable stale
         // rather than claiming zero.
         let repo = create_committed_repo("kill-probe-detached");
         assert_eq!(probe_kill_targets(&repo, None).unpushed, None);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn gate_for_branchless_checkout_separates_a_ghost_from_a_detached_head() {
+        // #360: `checkout_branch_name` answers None for both, and collapsing
+        // them into NotMerged reports a cannot-ask with the wording of an
+        // asked-and-got-no — a claim about a branch there was never one of.
+        let repo = create_committed_repo("branchless-gate");
+
+        // A live checkout, detached: git answers, there is just no branch to
+        // judge. This is the arm that must stay NotMerged.
+        let detached = unique_temp_path("branchless-gate-detached");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                detached.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(checkout_branch_name(&detached), None);
+        assert_eq!(
+            gate_for_branchless_checkout(&detached),
+            WorktreeMergeGate::NotMerged
+        );
+
+        // The checkout removed out from under the workspace.
+        let ghost = unique_temp_path("branchless-gate-ghost");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/ghost",
+                ghost.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(&ghost).unwrap();
+        assert_eq!(
+            gate_for_branchless_checkout(&ghost),
+            WorktreeMergeGate::CheckoutMissing
+        );
+
+        // The unmounted-volume shape: the mount point is still a directory,
+        // and it holds no checkout. `Path::exists` alone would call this live.
+        std::fs::create_dir_all(&ghost).unwrap();
+        assert!(ghost.exists());
+        assert_eq!(
+            gate_for_branchless_checkout(&ghost),
+            WorktreeMergeGate::CheckoutMissing
+        );
+
+        let _ = std::fs::remove_dir_all(&ghost);
+        let _ = std::fs::remove_dir_all(&detached);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
