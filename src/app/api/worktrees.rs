@@ -8,7 +8,7 @@ use crate::api::schema::{
 };
 use crate::app::App;
 
-use super::responses::{encode_error, encode_error_body, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_error_with_data, encode_success};
 
 struct ApiFailure {
     code: &'static str,
@@ -180,6 +180,35 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+
+        // #349 / ADR-0014 §6: the ceiling belongs to the shared spawn funnel,
+        // not to one verb. It used to gate `agent.spawn` alone, so an agent
+        // refused by `at_agent_capacity` could call `flock_agent_fork` for the
+        // same fleet cost and be admitted unconditionally — a live bypass, not
+        // a theoretical one. What is gated is the CALLER: an operator's
+        // `flk agent fork`, and the TUI keybind (which never reaches this
+        // handler at all), stay unbounded, because a cap that stops the
+        // operator from opening a worktree is a cap that gets turned off.
+        //
+        // Asked before `git worktree add`, so a refusal leaves nothing on disk
+        // and costs the caller nothing to back off from.
+        let caller = self.spawn_caller();
+        let lineage = match self.admit_spawn(
+            crate::spawn::SpawnVerb::Fork,
+            &caller,
+            Some((resolved.ws_idx, resolved.pane_id)),
+        ) {
+            Ok(lineage) => lineage,
+            Err(refusal) => {
+                return encode_error_with_data(
+                    id,
+                    refusal.code(),
+                    refusal.message(),
+                    super::spawn::refusal_data(&refusal),
+                );
+            }
+        };
+
         let session = self
             .state
             .workspaces
@@ -387,6 +416,20 @@ impl App {
         // those commits without inferring from `cwd`. Stamped after a
         // successful spawn so a failed fork leaves no agent claiming a run.
         self.record_spawn_run_id(ws_idx, spawned_pane, &run_id);
+        // #349: stamp the child's lineage so that it COUNTS. Without it a fork
+        // child is invisible to the census, and an agent could alternate the
+        // two verbs indefinitely — every fork child free, and the cap only
+        // ever counting half the fleet it was asked to bound. `None` is an
+        // operator fork: not agent-initiated, so billing it to the ceiling
+        // would shrink the fleet's headroom every time a human works.
+        if let Some(lineage) = &lineage {
+            self.record_spawn_lineage(
+                ws_idx,
+                spawned_pane,
+                lineage.child_depth,
+                &lineage.parent_agent_id,
+            );
+        }
 
         // Membership stamping mirrors the TUI confirm path: the source keeps
         // (or gains non-linked) membership; the child is a linked worktree of
@@ -2723,6 +2766,258 @@ mod tests {
         assert_eq!(forked.4, "fork/alt-approach");
         assert_eq!(forked.5, worktree.path);
         assert!(forked.6, "pivot seeded");
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
+    }
+
+    /// Put a DISPATCHER agent beside the parent and make it the API caller:
+    /// an agent terminal whose child process the peer's ancestry lands on.
+    /// Returns its agent id.
+    ///
+    /// The caller is deliberately a different pane from the one being forked.
+    /// That is the shape the bypass takes — a dispatcher at its cap forking
+    /// somebody's conversation — and it leaves the #359 profile carry reading
+    /// the FORKED pane, which has no live process in a test, rather than a
+    /// stand-in pid whose environment no platform reliably hands over.
+    fn caller_is_a_dispatcher_agent(app: &mut App) -> String {
+        app.state.workspaces.push(Workspace::test_new("dispatcher"));
+        app.state.ensure_test_terminals();
+        let ws_idx = app.state.workspaces.len() - 1;
+        let pane_id = app.state.workspaces[ws_idx]
+            .focused_pane_id()
+            .expect("dispatcher pane");
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal");
+        terminal.launch_argv = Some(vec!["claude".into()]);
+        let agent_id = terminal.agent_id.to_string();
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        agent_id
+    }
+
+    fn fork_request(target: &str, branch: &str) -> Request {
+        Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                target: target.to_string(),
+                branch: Some(branch.to_string()),
+                base: None,
+                path: None,
+                label: None,
+                pivot: Some(String::new()),
+                focus: false,
+            }),
+        }
+    }
+
+    /// #349 / ADR-0014 §6: an agent-initiated fork is stamped with the
+    /// lineage the ceiling reads, so it COUNTS. Before this, a fork child was
+    /// invisible to the census — an agent refused by `at_agent_capacity` on
+    /// `agent.spawn` could call `flock_agent_fork` for the same fleet cost,
+    /// and the child it got back did not even register against the next
+    /// check. The parent is whoever ASKED, which is what makes fanout
+    /// attributable.
+    #[tokio::test]
+    async fn an_agent_initiated_fork_stamps_the_child_with_its_lineage() {
+        let claude_home = fake_claude_home("agent-fork-lineage-home", "sess-fork");
+        let repo = create_committed_repo("agent-fork-lineage-repo");
+        let worktree_root = unique_temp_path("agent-fork-lineage-root");
+        let bin_dir = stub_claude_on_path("agent-fork-lineage-bin");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+        let caller_agent_id = caller_is_a_dispatcher_agent(&mut app);
+
+        let response = app.handle_api_request(fork_request(&target, "fork/agent-initiated"));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked { worktree, .. } = success.result else {
+            panic!("expected agent_forked response");
+        };
+
+        let child_pane = app.state.workspaces[2]
+            .focused_pane_id()
+            .expect("child root pane");
+        let child_terminal = app.state.workspaces[2]
+            .pane_state(child_pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let child = &app.state.terminals[&child_terminal];
+        assert_eq!(
+            child.spawned_by.as_deref(),
+            Some(caller_agent_id.as_str()),
+            "the child is billed to the agent that asked for it"
+        );
+        assert_eq!(
+            child.spawn_depth, 1,
+            "a child of a root agent sits one deeper"
+        );
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
+    }
+
+    /// The bypass itself: an agent that has hit the fleet-wide cap is refused
+    /// by `flock_agent_fork`, and the refusal is the same structured shape
+    /// `flock_agent_start` returns. Refused before `git worktree add`, so a
+    /// caller backing off leaves nothing behind to clean up.
+    #[tokio::test]
+    async fn an_agent_at_capacity_is_refused_by_fork_as_well_as_spawn() {
+        let claude_home = fake_claude_home("agent-fork-capacity-home", "sess-fork");
+        let repo = create_committed_repo("agent-fork-capacity-repo");
+        let worktree_root = unique_temp_path("agent-fork-capacity-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.config.fleet.max_concurrent_agents = 1;
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+        caller_is_a_dispatcher_agent(&mut app);
+
+        // One agent-started agent already live fleet-wide fills the cap.
+        let parent_pane = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("parent pane");
+        app.record_spawn_lineage(0, parent_pane, 0, "agent_elsewhere");
+
+        let response = app.handle_api_request(fork_request(&target, "fork/over-cap"));
+        let error =
+            serde_json::from_str::<serde_json::Value>(&response).expect("json")["error"].clone();
+        assert_eq!(error["code"], "at_agent_capacity");
+        assert_eq!(error["data"]["refusal"], "at_agent_capacity");
+        assert_eq!(
+            error["data"]["retryable"], true,
+            "capacity frees up when something exits; backing off is correct"
+        );
+        assert_eq!(error["data"]["limit"], 1);
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "a refused fork must create nothing beyond the parent and its caller"
+        );
+        assert!(
+            !worktree_root.exists(),
+            "a refused fork must not reach `git worktree add`"
+        );
+
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(claude_home);
+    }
+
+    /// The other half of the caller split, and the reason it is a split at
+    /// all: a cap that stops the operator from opening a worktree is a cap
+    /// that gets turned off. `flk agent fork` typed by a human is refused by
+    /// nothing here — the fleet is full, paused, and configured to zero.
+    #[tokio::test]
+    async fn an_operators_fork_is_never_refused_by_the_ceiling() {
+        let claude_home = fake_claude_home("operator-fork-home", "sess-fork");
+        let repo = create_committed_repo("operator-fork-repo");
+        let worktree_root = unique_temp_path("operator-fork-root");
+        let bin_dir = stub_claude_on_path("operator-fork-bin");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.config.fleet.max_concurrent_agents = 0;
+        app.state.config.fleet.max_spawn_fanout = 0;
+        app.state.config.fleet.max_spawn_depth = 0;
+        app.fleet_pause.paused = true;
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+        // No peer pid: `flk agent fork` typed in the operator's own terminal.
+
+        let response = app.handle_api_request(fork_request(&target, "fork/by-hand"));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked { worktree, .. } = success.result else {
+            panic!("an operator fork must not be refused: {response}");
+        };
+
+        let child_pane = app.state.workspaces[1]
+            .focused_pane_id()
+            .expect("child root pane");
+        let child_terminal = app.state.workspaces[1]
+            .pane_state(child_pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        assert_eq!(
+            app.state.terminals[&child_terminal].spawned_by, None,
+            "an operator's fork is not agent-initiated; billing it to the ceiling \
+             would shrink the fleet's headroom every time a human works"
+        );
+
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
+        let _ = crate::worktree::run_worktree_command(&remove);
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(bin_dir);
+        let _ = std::fs::remove_dir_all(claude_home);
+    }
+
+    /// The acceptance the issue is actually about: the two verbs share ONE
+    /// census, so an agent cannot alternate between them to stay under a cap
+    /// that only ever counted half of what it admitted. A real fork is taken
+    /// first — its child is what fills the last slot — and then both verbs
+    /// are asked again.
+    #[tokio::test]
+    async fn an_agent_cannot_exceed_the_cap_by_alternating_fork_and_spawn() {
+        let claude_home = fake_claude_home("alternating-verbs-home", "sess-fork");
+        let repo = create_committed_repo("alternating-verbs-repo");
+        let worktree_root = unique_temp_path("alternating-verbs-root");
+        let bin_dir = stub_claude_on_path("alternating-verbs-bin");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.config.fleet.max_concurrent_agents = 1;
+        app.state.config.fleet.agent_spawn_enabled = true;
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+        caller_is_a_dispatcher_agent(&mut app);
+
+        let response = app.handle_api_request(fork_request(&target, "fork/first"));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentForked { worktree, .. } = success.result else {
+            panic!("the first fork is within the cap: {response}");
+        };
+
+        // The fork child now occupies the only slot. Both verbs must see it.
+        let second_fork = app.handle_api_request(fork_request(&target, "fork/second"));
+        let fork_error =
+            serde_json::from_str::<serde_json::Value>(&second_fork).expect("json")["error"].clone();
+        assert_eq!(fork_error["code"], "at_agent_capacity");
+
+        let spawn = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+                agent: "claude".into(),
+                prompt: "pick up the second half".into(),
+                location: crate::api::schema::SpawnLocation::WorktreePath {
+                    path: repo.display().to_string(),
+                },
+                name: None,
+                focus: false,
+            }),
+        });
+        let spawn_error =
+            serde_json::from_str::<serde_json::Value>(&spawn).expect("json")["error"].clone();
+        assert_eq!(
+            spawn_error["code"], "at_agent_capacity",
+            "a fork child must fill the same slot a spawn would have: {spawn}"
+        );
 
         let remove =
             crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);

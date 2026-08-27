@@ -8,13 +8,61 @@
 
 use crate::api::schema::{AgentSpawnParams, ResponseResult, SpawnLocation};
 use crate::app::App;
-use crate::spawn::{admit, AgentKind, SpawnCensus, SpawnRefusal};
+use crate::spawn::{admit, AgentKind, SpawnCensus, SpawnRefusal, SpawnVerb};
 
 use super::responses::{encode_error, encode_error_with_data, encode_success};
 
 /// Cap on the opening turn. Bounded so a caller cannot push an unbounded
 /// body through the socket; generous enough for a real dispatch brief.
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
+
+/// Who is on the other end of a spawn-shaped request (#349, ADR-0014 §6).
+///
+/// The ceiling gates a caller CLASS, not a verb. `fleet.pause` already draws
+/// this line for the same reason — it halts what flock initiates and leaves
+/// human keystrokes alone — and a cap that stops the operator from opening a
+/// worktree is a cap that gets turned off.
+///
+/// Process ancestry of the API peer is the only evidence either way. A
+/// caller-supplied identity would be a claim, and depth is exactly the thing a
+/// runaway caller would want to lie about.
+pub(super) enum SpawnCaller {
+    /// Ancestry attests a live pane that is running an agent. Whatever it
+    /// asks for is agent-initiated, whichever verb it reached for.
+    Agent {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        /// The parent stamped on the child, and the key its fanout is counted
+        /// under. Carried from the classification rather than re-read later,
+        /// so there is no path where a child is admitted against one parent
+        /// and recorded against another — or against `Some("")`, which would
+        /// pool every such child into ONE fanout counter and make none of
+        /// them attributable.
+        agent_id: String,
+    },
+    /// Ancestry attests a pane that is not an agent — an operator's own shell,
+    /// inside flock or outside it — or attests nothing at all. Either way
+    /// there is no agent to bill a child to.
+    ///
+    /// The two verbs read this oppositely, and deliberately. `flk agent fork`
+    /// typed by a human is a real and supported thing to do, so fork proceeds
+    /// unbounded. `agent.spawn` has no CLI surface at all — every caller is an
+    /// MCP client — so an unattested one there is a caller the ceiling cannot
+    /// bound, and it refuses.
+    Operator,
+}
+
+/// The lineage a child admitted by the funnel must be stamped with.
+///
+/// Returned by the gate rather than recomputed at the call site: the numbers
+/// the ceiling decided on and the numbers written onto the child are then the
+/// same numbers, and a child cannot be admitted at one depth and recorded at
+/// another.
+#[derive(Debug)]
+pub(super) struct SpawnLineage {
+    pub parent_agent_id: String,
+    pub child_depth: u32,
+}
 
 impl App {
     pub(super) fn handle_agent_spawn(&mut self, id: String, params: AgentSpawnParams) -> String {
@@ -75,34 +123,36 @@ impl App {
             );
         }
 
-        // Who is asking. Process ancestry of the API peer is the only
-        // evidence — a caller-supplied identity would be a claim, and depth
-        // is exactly the thing a runaway caller would want to lie about.
+        // Who is asking, and whether the ceiling lets them. Both answered by
+        // the shared funnel `agent.fork` also goes through, so a limit cannot
+        // be enforced on one verb and skipped by the next.
         //
-        // Fail CLOSED when ancestry attests nothing: without a caller we
-        // cannot bound depth or fanout, and an unbounded spawn verb is the
-        // thing this whole path exists to prevent.
-        let caller = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
-        let Some((caller_ws, caller_pane)) = caller else {
-            return encode_error_with_data(
-                id,
-                "spawn_caller_unknown",
-                "agent.spawn could not attest which agent is calling; refusing to spawn unbounded",
-                serde_json::json!({ "refusal": "spawn_caller_unknown", "retryable": false }),
-            );
+        // Fail CLOSED on an operator caller: `agent.spawn` has no CLI surface,
+        // so "not attested as an agent" here means ancestry told us nothing at
+        // all — and without a caller we can bound neither depth nor fanout.
+        // An unbounded spawn verb is the thing this whole path exists to
+        // prevent, which is why fork's answer to the same class is the
+        // opposite one.
+        let caller = self.spawn_caller();
+        let lineage = match self.admit_spawn(SpawnVerb::Spawn, &caller, None) {
+            Ok(Some(lineage)) => lineage,
+            Ok(None) => {
+                return encode_error_with_data(
+                    id,
+                    "spawn_caller_unknown",
+                    "agent.spawn could not attest which agent is calling; refusing to spawn unbounded",
+                    serde_json::json!({ "refusal": "spawn_caller_unknown", "retryable": false }),
+                );
+            }
+            Err(refusal) => {
+                return encode_error_with_data(
+                    id,
+                    refusal.code(),
+                    refusal.message(),
+                    refusal_data(&refusal),
+                );
+            }
         };
-
-        // The ceiling. Depth and fanout come from state stamped on terminals
-        // at spawn, so this never walks the durable event log.
-        let census = self.spawn_census(caller_ws, caller_pane);
-        if let Err(refusal) = admit(&fleet, census, self.fleet_pause.paused) {
-            return encode_error_with_data(
-                id,
-                refusal.code(),
-                refusal.message(),
-                refusal_data(&refusal),
-            );
-        }
 
         let Some(target_ws) = self.resolve_spawn_location(&params.location) else {
             return encode_error_with_data(
@@ -124,19 +174,6 @@ impl App {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
 
-        // Refuse rather than invent an id. `unwrap_or_default()` would stamp
-        // `spawned_by = Some("")`, and every child with that empty parent
-        // would then share ONE fanout counter — so a second dispatcher's
-        // children would count against the first's limit, and neither would
-        // be attributable.
-        let Some(caller_agent_id) = self.agent_id_for_pane(caller_ws, caller_pane) else {
-            return encode_error_with_data(
-                id,
-                "spawn_caller_unknown",
-                "the calling pane has no agent identity to record as the child's parent",
-                serde_json::json!({ "refusal": "spawn_caller_unknown", "retryable": false }),
-            );
-        };
         // #359: the child is exec'd from argv with no shell in between, so the
         // agent profile the REQUESTER is on has to be carried explicitly or the
         // child silently starts against the default one — which may be a
@@ -195,7 +232,12 @@ impl App {
         // is what its commits will carry; depth and parent are what the
         // ceiling reads on the child's own next spawn attempt.
         self.record_spawn_run_id(ws_idx, pane_id, &run_id);
-        self.record_spawn_lineage(ws_idx, pane_id, census.child_depth, &caller_agent_id);
+        self.record_spawn_lineage(
+            ws_idx,
+            pane_id,
+            lineage.child_depth,
+            &lineage.parent_agent_id,
+        );
 
         if let Some(name) = params
             .name
@@ -210,6 +252,97 @@ impl App {
             return encode_error(id, "internal_error", "spawned pane is not an agent");
         };
         encode_success(id, ResponseResult::AgentSpawned { run_id, agent })
+    }
+
+    /// Classify the caller of a spawn-shaped request (#349).
+    ///
+    /// An AGENT is a caller whose process ancestry lands in a live pane that
+    /// is running one. Anything else — a shell pane, an operator's terminal
+    /// outside flock, a caller ancestry cannot place at all — is the operator,
+    /// because none of them is an agent whose children the ceiling is counting.
+    pub(super) fn spawn_caller(&mut self) -> SpawnCaller {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)
+        else {
+            return SpawnCaller::Operator;
+        };
+        let agent_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .filter(|terminal| terminal.is_agent_terminal())
+            .map(|terminal| terminal.agent_id.to_string())
+            .filter(|agent_id| !agent_id.is_empty());
+        match agent_id {
+            Some(agent_id) => SpawnCaller::Agent {
+                ws_idx,
+                pane_id,
+                agent_id,
+            },
+            None => SpawnCaller::Operator,
+        }
+    }
+
+    /// The shared spawn funnel: may this caller put another agent on the node,
+    /// and under whose lineage (ADR-0014 §6, #349).
+    ///
+    /// Every agent-initiated path asks HERE. The ceiling first shipped inside
+    /// `agent.spawn`'s handler, which meant an agent refused by
+    /// `at_agent_capacity` could call `agent.fork` instead — same fleet cost,
+    /// no ceiling at all. A constraint applied at one call site is one refactor
+    /// from gone; this one did not even need the refactor.
+    ///
+    /// `Ok(None)` is an operator caller: unbounded, and nothing to stamp. Each
+    /// verb decides what that means — see [`SpawnCaller::Operator`].
+    ///
+    /// `inherits_depth_from` is the pane whose CONVERSATION the child
+    /// continues, when that is not the caller's own — a fork of somebody
+    /// else's session. The child sits below both, so it takes the deeper: a
+    /// caller already at the depth limit must not be able to launder its depth
+    /// away by forking something shallow.
+    pub(super) fn admit_spawn(
+        &mut self,
+        verb: SpawnVerb,
+        caller: &SpawnCaller,
+        inherits_depth_from: Option<(usize, crate::layout::PaneId)>,
+    ) -> Result<Option<SpawnLineage>, SpawnRefusal> {
+        let SpawnCaller::Agent {
+            ws_idx,
+            pane_id,
+            agent_id,
+        } = caller
+        else {
+            return Ok(None);
+        };
+        let mut census = self.spawn_census(*ws_idx, *pane_id);
+        if let Some((ws_idx, pane_id)) = inherits_depth_from {
+            census.child_depth = census
+                .child_depth
+                .max(self.pane_spawn_depth(ws_idx, pane_id).saturating_add(1));
+        }
+        admit(
+            &self.state.config.fleet,
+            verb,
+            census,
+            self.fleet_pause.paused,
+        )?;
+        Ok(Some(SpawnLineage {
+            parent_agent_id: agent_id.clone(),
+            child_depth: census.child_depth,
+        }))
+    }
+
+    /// How deep in the spawn tree a pane's terminal already sits. An untracked
+    /// pane reads as 0 — the operator's own root, which is what a pane with no
+    /// stamp is.
+    fn pane_spawn_depth(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> u32 {
+        self.state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .map_or(0, |terminal| terminal.spawn_depth)
     }
 
     /// Live counts the ceiling needs, read from terminal state.
@@ -253,7 +386,7 @@ impl App {
         }
     }
 
-    fn record_spawn_lineage(
+    pub(super) fn record_spawn_lineage(
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -270,15 +403,6 @@ impl App {
             terminal.spawn_depth = depth;
             terminal.spawned_by = Some(parent_agent_id.to_string());
         }
-    }
-
-    fn agent_id_for_pane(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<String> {
-        self.state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.pane_state(pane_id))
-            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
-            .map(|t| t.agent_id.to_string())
     }
 
     fn set_spawned_agent_name(
@@ -319,7 +443,7 @@ impl App {
     }
 }
 
-fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
+pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
     let mut data = serde_json::json!({
         "refusal": refusal.code(),
         "retryable": refusal.retryable(),
@@ -366,6 +490,33 @@ mod tests {
                 focus: false,
             }),
         }
+    }
+
+    /// Make workspace 0's focused pane look like a live agent the API peer is
+    /// running inside: an agent terminal, with this test process standing in
+    /// for the pane's child so the ancestry walk lands on it.
+    fn caller_pane_is_an_agent(app: &mut crate::app::App) -> (crate::layout::PaneId, String) {
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace has a pane");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
+        terminal.launch_argv = Some(vec!["claude".into()]);
+        let agent_id = terminal.agent_id.to_string();
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        (pane_id, agent_id)
+    }
+
+    fn app_with_one_pane() -> crate::app::App {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.ensure_test_terminals();
+        app
     }
 
     fn error_of(raw: &str) -> serde_json::Value {
@@ -449,5 +600,123 @@ mod tests {
             before,
             "a refused spawn must create nothing"
         );
+    }
+
+    /// The funnel classifies by caller, not by verb. An MCP client runs
+    /// inside an agent's pane, so ancestry lands on an agent terminal.
+    #[tokio::test]
+    async fn a_caller_running_inside_an_agent_pane_is_an_agent() {
+        let mut app = app_with_one_pane();
+        let (pane_id, agent_id) = caller_pane_is_an_agent(&mut app);
+        match app.spawn_caller() {
+            super::SpawnCaller::Agent {
+                ws_idx,
+                pane_id: resolved,
+                agent_id: resolved_id,
+            } => {
+                assert_eq!(ws_idx, 0);
+                assert_eq!(resolved, pane_id);
+                assert_eq!(resolved_id, agent_id);
+            }
+            super::SpawnCaller::Operator => panic!("an agent pane must attest as an agent"),
+        }
+    }
+
+    /// An operator's own shell — inside flock or outside it — is not an agent,
+    /// and neither is a caller ancestry cannot place at all. Both read as the
+    /// operator, because neither is an agent whose children the cap counts.
+    #[tokio::test]
+    async fn an_operators_shell_and_an_unattested_caller_are_both_the_operator() {
+        let mut app = app_with_one_pane();
+        assert!(
+            matches!(app.spawn_caller(), super::SpawnCaller::Operator),
+            "no peer pid attests nothing"
+        );
+
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace has a pane");
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        assert!(
+            matches!(app.spawn_caller(), super::SpawnCaller::Operator),
+            "a shell pane is the operator's, not an agent's"
+        );
+    }
+
+    /// The ceiling never applies to an operator, whichever verb they used.
+    /// `agent.spawn` refuses one anyway — it has no CLI surface, so an
+    /// unattested caller there is one the ceiling cannot bound.
+    #[tokio::test]
+    async fn an_operator_caller_is_never_gated_by_the_ceiling() {
+        let mut app = app_with_one_pane();
+        app.state.config.fleet.max_concurrent_agents = 0;
+        app.state.config.fleet.max_spawn_fanout = 0;
+        app.state.config.fleet.max_spawn_depth = 0;
+        app.fleet_pause.paused = true;
+
+        let caller = app.spawn_caller();
+        let admitted = app
+            .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+            .expect("an operator is never refused by the ceiling");
+        assert!(
+            admitted.is_none(),
+            "an operator fork has no parent to bill the child to"
+        );
+    }
+
+    /// #349: an agent at the depth limit must not be able to launder its own
+    /// depth by forking a shallower conversation. The child sits below both,
+    /// so it takes the deeper of the two.
+    #[tokio::test]
+    async fn a_fork_child_takes_the_deeper_of_caller_and_forked_conversation() {
+        let mut app = app_with_one_pane();
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("target"));
+        app.state.ensure_test_terminals();
+        let (_caller_pane, caller_agent_id) = caller_pane_is_an_agent(&mut app);
+
+        // The forked conversation is three deep; the caller is at the root.
+        let target_pane = app.state.workspaces[1]
+            .focused_pane_id()
+            .expect("target pane");
+        let target_terminal = app.state.workspaces[1]
+            .pane_state(target_pane)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&target_terminal)
+            .expect("terminal")
+            .spawn_depth = 3;
+        app.state.config.fleet.max_spawn_depth = 9;
+
+        let caller = app.spawn_caller();
+        let lineage = app
+            .admit_spawn(
+                crate::spawn::SpawnVerb::Fork,
+                &caller,
+                Some((1, target_pane)),
+            )
+            .expect("within the widened depth limit")
+            .expect("an agent caller is stamped");
+        assert_eq!(lineage.child_depth, 4);
+        assert_eq!(
+            lineage.parent_agent_id, caller_agent_id,
+            "fanout is counted against whoever ASKED, not whoever was forked"
+        );
+
+        // And the limit binds on that deeper number, not on the caller's own.
+        app.state.config.fleet.max_spawn_depth = 3;
+        let refusal = app
+            .admit_spawn(
+                crate::spawn::SpawnVerb::Fork,
+                &caller,
+                Some((1, target_pane)),
+            )
+            .expect_err("depth 4 exceeds a limit of 3");
+        assert_eq!(refusal.code(), "at_lineage_depth");
     }
 }

@@ -169,18 +169,20 @@ As of acceptance (#345):
 | 3 | env allowlist | landed (#347). `env_clear()` plus a per-agent table (`src/spawn/allowlist.rs`), armed only on the agent-spawn path, with the resolved keys on the spawn's log line so an omission is a read rather than a bisect. The deny-list stays on beneath it as a second line. Not settled: a fleet on Bedrock or Vertex needs `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`, which §3's own deny-list strips — allowing a third-party cloud credential through is the operator's call, not the implementer's |
 | 4 | untrusted prompt: system-owned preamble, control-byte refusal | **not landed** (#348). The prompt is length-capped and passed as one argv element, so nothing reaches a shell — but a foreman's prompts come from issue bodies, and neither the preamble nor the byte filter exists yet |
 | 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
-| 6 | ceiling in the shared spawn funnel | **partial** (#349). It gates `agent.spawn`. `agent.fork` and the TUI keyboard fork do not consult it, so an operator's own forking is unbounded — correct for a human, but it means the capacity count and the thing it protects are not yet the same funnel |
+| 6 | ceiling in the shared spawn funnel | landed (#349). `agent.spawn` and `agent.fork` both ask one App-side funnel, which gates a caller CLASS rather than a verb: a caller whose process ancestry lands in an agent's pane meets the three limits, an operator meets none of them. Agent-initiated fork children are stamped with `spawned_by`/`spawn_depth`, so they count and the two verbs cannot be alternated past the cap. The TUI keyboard fork never enters the funnel at all — deliberately, per the operator exemption. Note the fork half is NOT behind `[fleet] agent_spawn_enabled`: that switch opts a node into `agent.spawn`, and gating an already-shipped verb on it would leave the bypass open on every node that never set it |
 | 7 | `fleet pause` refuses agent-initiated spawn | landed |
 | 8 | refusals separate retryable from terminal | landed |
 
-The remaining gaps are #348 and #349 — tracked as issues rather than left
-in this table, because an Accepted ADR whose unbuilt parts live only in prose
-is how they get forgotten.
+The remaining gap is #348 — tracked as an issue rather than left in this
+table, because an Accepted ADR whose unbuilt parts live only in prose is how
+they get forgotten.
 
-#349 is the one that bites soonest: `flock_agent_fork` is already on the MCP
-surface and does not consult the ceiling, so an agent refused by
-`at_agent_capacity` can fork instead. The cap is not closed until that path
-shares the gate.
+What #349 turned out to be about, worth keeping: the ceiling could not be
+described by naming verbs. `agent.spawn` gated, `agent.fork` not, and the two
+cost the fleet the same thing — so the cap held only for as long as an agent
+reached for the verb that had it. What it gates now is who is asking, which is
+the same line `fleet pause` draws in §7 and the only one that does not have to
+be re-drawn every time a verb is added.
 
 ## Alternatives rejected
 
