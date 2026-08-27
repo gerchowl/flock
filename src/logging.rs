@@ -1414,6 +1414,29 @@ pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: 
     );
 }
 
+pub(crate) fn handoff_recorded(file_id: &str, extension: &str, bytes: usize) {
+    tracing::info!(
+        event = "handoff.record",
+        subsystem = "clipboard",
+        outcome = "ok",
+        file_id,
+        extension,
+        bytes,
+        "filed a handed-over file as an MCP resource"
+    );
+}
+
+pub(crate) fn handoff_evicted(file_id: &str, path: &str) {
+    tracing::info!(
+        event = "handoff.evict",
+        subsystem = "clipboard",
+        outcome = "dropped",
+        file_id,
+        path,
+        "handoff log full; dropped the oldest handed-over file and its bytes"
+    );
+}
+
 pub(crate) fn client_clipboard_image_stage_failed(client_id: u64, err: &str) {
     tracing::warn!(
         event = "clipboard.image.stage",

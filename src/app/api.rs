@@ -5,6 +5,7 @@ mod agents;
 mod checks;
 mod digest;
 mod fleet;
+mod handoffs;
 mod integrations;
 mod lineage;
 mod messages;
@@ -1078,6 +1079,32 @@ impl App {
                         data: crate::api::schema::EventData::NotificationSeen { notification_id },
                     }
                 }
+                crate::app::state::PendingUiEvent::FileHandedOver {
+                    file_id,
+                    name,
+                    mime,
+                    bytes,
+                    path,
+                    workspace_id,
+                    pane_id,
+                    agent_id,
+                    origin_host,
+                    received_at_ms,
+                } => crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::FileHandedOver,
+                    data: crate::api::schema::EventData::FileHandedOver {
+                        file_id,
+                        name,
+                        mime,
+                        bytes,
+                        path,
+                        workspace_id,
+                        pane_id,
+                        agent_id,
+                        origin_host,
+                        received_at_ms,
+                    },
+                },
             };
             self.emit_event(envelope);
         }
@@ -1207,6 +1234,12 @@ impl App {
             }
             Method::NotificationAck(params) => {
                 return self.handle_notification_ack(request.id, params);
+            }
+            Method::HandoffList(params) => {
+                return self.handle_handoff_list(request.id, params);
+            }
+            Method::HandoffRead(params) => {
+                return self.handle_handoff_read(request.id, params);
             }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
             Method::PeersCheckoutPrepare(params) => {
