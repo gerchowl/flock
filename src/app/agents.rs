@@ -1,7 +1,46 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::{terminal_targets::TerminalTargetError, App, Mode};
 use crate::api::schema::{AgentStartParams, SplitDirection};
+use crate::terminal::{TerminalId, TerminalRuntime};
+
+/// How long a freshly started agent gets to still be running before flock
+/// reports the start as a success (#178).
+///
+/// `exec` itself fails synchronously: a binary missing from `PATH`, one that
+/// is not executable, an unreadable interpreter all come back as a spawn
+/// error and are already refused. A process that execs and THEN exits does
+/// not — the API answers `agent_started`, the pane is reaped a moment later,
+/// and nothing machine-readable ever names the failure, so a script driving
+/// `agent.start`/`agent.fork` cannot tell a running agent from one that died
+/// on its own arguments.
+///
+/// The window is short on purpose. What it catches is loader- and
+/// argument-shaped — a CLI rejecting its own flags, a missing dylib, a
+/// wrapper script that exits — and those die in single-digit milliseconds;
+/// the rest is headroom for a loaded machine getting round to reaping them,
+/// not a health check. Every healthy start pays it in full, which is the
+/// reason not to make it generous, and a dead one pays none of it — the wait
+/// ends the moment the exit lands. An agent that lives past the window and
+/// exits later is a different event, and belongs to the pane that reports it.
+const START_LIVENESS_WINDOW: Duration = Duration::from_millis(250);
+
+/// How often the liveness window re-reads the child's exit slot.
+const START_LIVENESS_POLL: Duration = Duration::from_millis(5);
+
+/// How long a dead child's last words get to reach the terminal.
+///
+/// The PTY reader is a separate task, so at the instant `wait()` returns the
+/// bytes the child printed on its way out may not be parsed yet. Bounded, and
+/// a pane that stays blank is simply reported as having printed nothing.
+const START_OUTPUT_SETTLE: Duration = Duration::from_millis(50);
+
+/// How much of the pane's last line to quote back in the refusal.
+const START_OUTPUT_MAX_CHARS: usize = 200;
+
+/// How far up the dead pane to look for that line.
+const START_OUTPUT_TAIL_LINES: usize = 40;
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
@@ -319,6 +358,10 @@ impl App {
                 code: "agent_start_failed".into(),
                 message,
             },
+            AgentStartError::ExitedAtStart(exit) => crate::api::schema::ErrorBody {
+                code: "agent_exited_at_start".into(),
+                message: exit.message(),
+            },
             AgentStartError::ProfileUnresolved(unresolved) => crate::api::schema::ErrorBody {
                 code: unresolved.code().into(),
                 message: unresolved.message(),
@@ -476,6 +519,7 @@ impl App {
             self.render_dirty.clone(),
         )
         .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
+        let terminal_id = terminal.id.clone();
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);
@@ -488,7 +532,50 @@ impl App {
         }
         self.schedule_session_save();
         let pane_id = self.state.workspaces[ws_idx].tabs[0].root_pane;
+        if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
+            self.discard_agent_pane_that_never_ran(pane_id);
+            return Err(AgentStartError::ExitedAtStart(exit));
+        }
         Ok((ws_idx, 0, pane_id))
+    }
+
+    /// Did the agent flock just started die before it could do anything
+    /// (#178)? `None` means it was still running when the window closed,
+    /// which is as much as a start can honestly claim.
+    ///
+    /// Polls the child's exit slot rather than waiting on `PaneDied`: the
+    /// event is delivered through the app loop, and this runs INSIDE a
+    /// handler on that loop, so nothing would ever drain it here.
+    fn agent_exited_at_start(&self, terminal_id: &TerminalId) -> Option<AgentExitedAtStart> {
+        let runtime = self.terminal_runtimes.get(terminal_id)?;
+        // A pane with no watcher — one adopted over a live handoff — has
+        // nothing to observe, so it is reported as alive rather than waited on.
+        let exit = runtime.child_exit()?;
+        let deadline = Instant::now() + START_LIVENESS_WINDOW;
+        while !exit.is_reaped() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(START_LIVENESS_POLL);
+        }
+        Some(AgentExitedAtStart {
+            exit_code: exit.exit_code(),
+            last_output: last_pane_output(runtime),
+        })
+    }
+
+    /// Undo a start whose agent was already gone (#178).
+    ///
+    /// The watcher's own `PaneDied` reaps this pane a moment later anyway,
+    /// but "a moment later" is after the caller has been told the start
+    /// failed — and a caller told that must not be able to list the
+    /// half-built workspace in between. Reaping it here makes the refusal and
+    /// the state agree.
+    fn discard_agent_pane_that_never_ran(&mut self, pane_id: crate::layout::PaneId) {
+        self.state
+            .handle_app_event(crate::events::AppEvent::PaneDied { pane_id });
+        self.shutdown_detached_terminal_runtimes();
+        self.schedule_session_save();
     }
 
     fn spawn_agent_split(
@@ -527,6 +614,7 @@ impl App {
                 target: target_pane.raw().to_string(),
             })?
             .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
+        let terminal_id = result.1.terminal.id.clone();
         self.terminal_runtimes
             .insert(result.1.terminal.id.clone(), result.1.runtime);
         self.state
@@ -541,6 +629,10 @@ impl App {
             self.state.mode = Mode::Terminal;
         }
         self.schedule_session_save();
+        if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
+            self.discard_agent_pane_that_never_ran(result.1.pane_id);
+            return Err(AgentStartError::ExitedAtStart(exit));
+        }
         Ok((ws_idx, result.0, result.1.pane_id))
     }
 
@@ -602,6 +694,9 @@ pub(super) enum AgentStartError {
     },
     PlacementConflict,
     SpawnFailed(String),
+    /// #178: the child exec'd and was already gone when flock looked. A
+    /// successful spawn is not a started agent.
+    ExitedAtStart(AgentExitedAtStart),
     /// #359: the agent profile the child would run under could not be
     /// established from the caller.
     ProfileUnresolved(crate::spawn::env::ProfileUnresolved),
@@ -609,6 +704,71 @@ pub(super) enum AgentStartError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+/// An agent that exec'd cleanly and then exited inside the liveness window
+/// (#178).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AgentExitedAtStart {
+    /// `None` when the wait itself failed, which is not the same thing as
+    /// "exited 0" and must not read like it.
+    pub(super) exit_code: Option<u32>,
+    /// The last thing the pane printed, which is usually the only
+    /// explanation there is: `claude --resume` against a transcript that is
+    /// not on disk prints `No conversation found with session ID: <id>` and
+    /// exits 0.
+    pub(super) last_output: Option<String>,
+}
+
+impl AgentExitedAtStart {
+    pub(super) fn message(&self) -> String {
+        let exit = match self.exit_code {
+            Some(code) => format!("exit code {code}"),
+            None => "an unreadable exit status".to_string(),
+        };
+        match self.last_output.as_deref() {
+            Some(output) => format!(
+                "the agent exited immediately after starting ({exit}); its last output was: {output}"
+            ),
+            None => format!(
+                "the agent exited immediately after starting ({exit}) without printing anything"
+            ),
+        }
+    }
+}
+
+/// The last thing a dead pane printed, trimmed to one quotable line (#178).
+///
+/// Read after the exit, not before: the child's bytes reach the terminal
+/// through the PTY reader task, so at the instant `wait()` returns they may
+/// not be parsed yet. The settle is bounded — a pane that stays blank is
+/// reported as having printed nothing.
+fn last_pane_output(runtime: &TerminalRuntime) -> Option<String> {
+    let deadline = Instant::now() + START_OUTPUT_SETTLE;
+    loop {
+        if let Some(line) = last_non_empty_line(&runtime.recent_text(START_OUTPUT_TAIL_LINES)) {
+            return Some(line);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(START_LIVENESS_POLL);
+    }
+}
+
+/// The bottom-most line with anything on it, capped so a pane full of escape
+/// noise cannot turn an error message into a screen dump.
+fn last_non_empty_line(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut capped: String = line.chars().take(START_OUTPUT_MAX_CHARS).collect();
+    if capped.chars().count() < line.chars().count() {
+        capped.push('…');
+    }
+    Some(capped)
 }
 
 pub(super) enum AgentRenameError {
@@ -712,6 +872,15 @@ mod tests {
         }
     }
 
+    /// Tear down whatever panes the test left running. A pty child outlives
+    /// the test process otherwise.
+    fn shutdown(mut app: crate::app::App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
     /// A pid that named a process and no longer does. Reaped before use, so
     /// the read attests nothing on any platform.
     #[cfg(unix)]
@@ -761,7 +930,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_agent_program_is_not_gated_on_a_profile() {
         let mut app = test_app();
-        let raw = app.handle_api_request(start_request(&crate::test_support::no_op_program()));
+        let raw = app.handle_api_request(start_request(&crate::test_support::live_program()));
         let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
 
         assert_ne!(
@@ -769,10 +938,117 @@ mod tests {
             "only agents with a shell-supplied selector are gated"
         );
 
-        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
-        for (_terminal_id, runtime) in runtimes {
-            runtime.shutdown();
+        shutdown(app);
+    }
+
+    /// A program that stays up is still a successful start — the liveness
+    /// window (#178) must not turn every spawn into a refusal.
+    #[tokio::test]
+    async fn a_program_that_keeps_running_starts_normally() {
+        let mut app = test_app();
+        let raw = app.handle_api_request(start_request(&crate::test_support::live_program()));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(
+            response["result"]["type"], "agent_started",
+            "unexpected response: {response}"
+        );
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        shutdown(app);
+    }
+
+    /// #178: the failure a successful `spawn` cannot see. The program execs
+    /// cleanly and is gone microseconds later, so flock used to answer
+    /// `agent_started`, reap the pane a moment afterwards, and leave the
+    /// caller holding an agent id for a process that never existed.
+    #[tokio::test]
+    async fn an_agent_that_exits_the_instant_it_starts_is_not_reported_as_started() {
+        let mut app = test_app();
+        let raw = app.handle_api_request(start_request(&crate::test_support::no_op_program()));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(
+            response["error"]["code"], "agent_exited_at_start",
+            "unexpected response: {response}"
+        );
+        assert!(
+            app.state.workspaces.is_empty(),
+            "a start that died must not leave its workspace behind"
+        );
+
+        shutdown(app);
+    }
+
+    /// The other half of the same claim, and the one #178 opened on: a binary
+    /// that is not on `PATH` at all. This one never reaches the liveness
+    /// window — `exec` failure is reported synchronously by the pty spawn, so
+    /// the refusal is `agent_start_failed` and no pane is ever built. Asserted
+    /// rather than assumed, because the issue's premise was that it was NOT.
+    #[tokio::test]
+    async fn a_missing_agent_binary_is_refused_before_a_pane_exists() {
+        let mut app = test_app();
+        let raw = app.handle_api_request(start_request("flock-178-no-such-binary"));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(
+            response["error"]["code"], "agent_start_failed",
+            "unexpected response: {response}"
+        );
+        assert!(app.state.workspaces.is_empty());
+
+        shutdown(app);
+    }
+
+    #[test]
+    fn the_quoted_line_is_the_last_one_with_anything_on_it() {
+        assert_eq!(
+            super::last_non_empty_line(
+                "No conversation found with session ID: abc
+
+  
+"
+            ),
+            Some("No conversation found with session ID: abc".to_string())
+        );
+        assert_eq!(
+            super::last_non_empty_line(
+                "
+   
+"
+            ),
+            None
+        );
+    }
+
+    /// A pane full of escape noise must not turn one error message into a
+    /// screen dump on the socket.
+    #[test]
+    fn a_very_long_line_is_capped_and_marked() {
+        let line = "x".repeat(super::START_OUTPUT_MAX_CHARS + 50);
+        let quoted = super::last_non_empty_line(&line).expect("a line");
+        assert_eq!(quoted.chars().count(), super::START_OUTPUT_MAX_CHARS + 1);
+        assert!(quoted.ends_with('…'));
+    }
+
+    /// An unreadable wait is not "exited 0", and the message must not read
+    /// like it is.
+    #[test]
+    fn an_unreadable_exit_is_not_reported_as_a_clean_one() {
+        let message = super::AgentExitedAtStart {
+            exit_code: None,
+            last_output: None,
         }
+        .message();
+        assert!(message.contains("unreadable exit status"), "{message}");
+
+        let message = super::AgentExitedAtStart {
+            exit_code: Some(0),
+            last_output: Some("No conversation found".into()),
+        }
+        .message();
+        assert!(message.contains("exit code 0"), "{message}");
+        assert!(message.contains("No conversation found"), "{message}");
     }
 
     /// #365: `--workspace <id>` named where the PANE goes and nothing about
