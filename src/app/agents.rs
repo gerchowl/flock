@@ -845,15 +845,10 @@ mod tests {
                 tab_id: None,
                 split: None,
                 focus: false,
-                argv: vec![crate::test_support::no_op_program()],
+                // #178/#374: a start whose child is already gone is a failed
+                // start, so these need a pane that is still there afterwards.
+                argv: vec![crate::test_support::live_program()],
             }),
-        }
-    }
-
-    fn shutdown(app: &mut crate::app::App) {
-        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
-        for (_terminal_id, runtime) in runtimes {
-            runtime.shutdown();
         }
     }
 
@@ -1072,7 +1067,7 @@ mod tests {
             "the agent belongs in the checkout its workspace stands in"
         );
 
-        shutdown(&mut app);
+        shutdown(app);
         let _ = std::fs::remove_dir_all(&checkout);
     }
 
@@ -1097,7 +1092,7 @@ mod tests {
             "with no checkout to prefer, the agent lands where the pane it joins stands"
         );
 
-        shutdown(&mut app);
+        shutdown(app);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
@@ -1123,7 +1118,7 @@ mod tests {
             asked_for.to_string_lossy().as_ref()
         );
 
-        shutdown(&mut app);
+        shutdown(app);
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&asked_for);
     }
@@ -1151,6 +1146,6 @@ mod tests {
             "a checkout that is not there cannot be started in"
         );
 
-        shutdown(&mut app);
+        shutdown(app);
     }
 }
