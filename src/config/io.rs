@@ -19,6 +19,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "slots",
     "terminal",
     "theme",
+    "title",
     "ui",
     "update",
     "web",
@@ -463,6 +464,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.web = section,
+    );
+    load_live_section(
+        &table,
+        "title",
+        "title config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.title = section,
     );
     load_live_section(
         &table,

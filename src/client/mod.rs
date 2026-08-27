@@ -305,6 +305,60 @@ fn host_terminal_is_held() -> bool {
         || INHERITED_TERMINAL_HOLD.load(Ordering::Acquire)
 }
 
+/// True once this leg has written a host window title (#361), i.e. flock owns
+/// the terminal's title and owes it back on the way out.
+///
+/// Set by the FIRST [`ServerMessage::SetWindowTitle`](protocol::ServerMessage)
+/// this leg receives, never at setup: a server with `[title] enabled = false`
+/// sends nothing, so a leg attached to it leaves the host title completely
+/// untouched — nothing pushed, nothing to restore, no empty write blanking a
+/// title flock never set.
+static HOST_WINDOW_TITLE_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Writes `title` to the host terminal's window, taking ownership of the title
+/// on the first call.
+///
+/// The title stack push rides the first write rather than terminal setup, so
+/// the stack grows only for sessions that actually publish. A leg chained in
+/// after a seamless switch (#63/#69) skips the push: the previous leg already
+/// pushed and deliberately did not pop, so pushing again would grow the host's
+/// title stack once per switch, without bound.
+fn set_host_window_title(title: &str) {
+    let first_publish = !HOST_WINDOW_TITLE_OWNED.swap(true, Ordering::AcqRel);
+    let inherited_hold = INHERITED_TERMINAL_HOLD.load(Ordering::Acquire);
+    let _ = crate::terminal_notify::write_host_sequence(&host_window_title_sequence(
+        title,
+        first_publish,
+        inherited_hold,
+    ));
+}
+
+/// The bytes one title publish writes. Pure, so the push decision — the part
+/// that goes wrong quietly, by growing the host's title stack once per server
+/// switch — is testable without a terminal.
+fn host_window_title_sequence(title: &str, first_publish: bool, inherited_hold: bool) -> Vec<u8> {
+    let mut sequence = Vec::new();
+    if first_publish && !inherited_hold {
+        sequence.extend_from_slice(crate::terminal_notify::PUSH_WINDOW_TITLE);
+    }
+    sequence.extend(crate::terminal_notify::set_window_title_sequence(title));
+    sequence
+}
+
+/// Hands the host window title back, if this leg ever took it (#361).
+///
+/// Skipped on a switch handoff, where the next leg inherits both the frozen
+/// frame and the title: restoring here would flash the shell's title between
+/// legs and drop the stack entry the next leg's exit is going to pop.
+fn restore_host_window_title() {
+    if !HOST_WINDOW_TITLE_OWNED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let _ = crate::terminal_notify::write_host_sequence(
+        &crate::terminal_notify::restore_window_title_sequence(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Crash-time terminal restore (defense-in-depth)
 //
@@ -690,6 +744,12 @@ fn restore_terminal_state(reset_modify_other_keys: bool) {
         return;
     }
 
+    // A real exit hands the host window title back (#361) — an empty OSC 2 AND
+    // a title-stack pop, because terminals without the stack silently no-op the
+    // pop. Below the handoff early-return on purpose: a leg switching away
+    // leaves its title standing for the next leg to overwrite.
+    restore_host_window_title();
+
     // A real exit reclaims the terminal: this leg now owns the restore, so any
     // inherited hold from a previous leg (#69) is superseded and must not
     // trigger a second force-restore on the way out.
@@ -757,6 +817,13 @@ pub fn force_restore_host_terminal() {
     // it (tmux/host-specific) and exited without resetting. Harmless on hosts
     // that never set it.
     let _ = io::stdout().write_all(b"\x1b[>4;0m");
+    // Same reasoning for the window title (#361): this runs only when a chain
+    // died holding the terminal, and a held leg's title survived its exit by
+    // design. Unconditional because the leg that took the title may have been a
+    // subprocess whose flag this process never saw. An empty title plus a pop
+    // on a terminal that never had one set is a no-op.
+    HOST_WINDOW_TITLE_OWNED.store(true, Ordering::Release);
+    restore_host_window_title();
     let _ = execute!(
         io::stdout(),
         PopKeyboardEnhancementFlags,
@@ -2214,6 +2281,13 @@ async fn run_client_loop(
                         body,
                     } => {
                         handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    }
+                    ServerMessage::SetWindowTitle { title } => {
+                        // Already debounced and deduped server-side, and
+                        // already dropped by the slot router above if it came
+                        // from a slot that is no longer active — so anything
+                        // reaching here is a title this terminal should wear.
+                        set_host_window_title(&title);
                     }
                     ServerMessage::Clipboard { data } => {
                         forward_clipboard(&data);
@@ -4018,6 +4092,48 @@ mod tests {
         INHERITED_TERMINAL_HOLD.store(true, Ordering::Release);
         assert!(host_terminal_is_held(), "inherited hold counts");
         INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn the_first_title_of_a_session_saves_the_host_title_first() {
+        let sequence = host_window_title_sequence("main \u{00b7} mba22 \u{2014} flk", true, false);
+        assert!(
+            sequence.starts_with(crate::terminal_notify::PUSH_WINDOW_TITLE),
+            "the first publish pushes the title stack so exit can hand it back"
+        );
+        // Every later publish is the title alone.
+        let later = host_window_title_sequence("main \u{00b7} mba22 \u{2014} flk", false, false);
+        assert!(!later.starts_with(crate::terminal_notify::PUSH_WINDOW_TITLE));
+        assert_eq!(
+            later,
+            crate::terminal_notify::set_window_title_sequence("main \u{00b7} mba22 \u{2014} flk")
+        );
+    }
+
+    #[test]
+    fn a_leg_chained_in_by_a_switch_never_pushes_the_title_stack_again() {
+        // #63/#69: the previous leg exited HOLDING the terminal and deliberately
+        // did not pop. Pushing again here would grow the host's title stack once
+        // per switch, without bound, over a session that switches a lot.
+        let sequence = host_window_title_sequence("main \u{2014} flk", true, true);
+        assert!(!sequence.starts_with(crate::terminal_notify::PUSH_WINDOW_TITLE));
+    }
+
+    #[test]
+    fn the_title_is_handed_back_once_and_only_if_it_was_taken() {
+        let _guard = hold_test_lock();
+        HOST_WINDOW_TITLE_OWNED.store(false, Ordering::Release);
+        // Never published: nothing to hand back, and no empty write blanking a
+        // title flock never set.
+        restore_host_window_title();
+        assert!(!HOST_WINDOW_TITLE_OWNED.load(Ordering::Acquire));
+
+        HOST_WINDOW_TITLE_OWNED.store(true, Ordering::Release);
+        restore_host_window_title();
+        assert!(
+            !HOST_WINDOW_TITLE_OWNED.load(Ordering::Acquire),
+            "the restore is one-shot: a second exit path must not pop again"
+        );
     }
 
     #[test]

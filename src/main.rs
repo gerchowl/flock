@@ -704,6 +704,15 @@ fn main() -> io::Result<()> {
         );
         let result = app.run(&mut terminal).await;
 
+        // Hand the host window title back (#361) — only if this session ever
+        // took it. `[title] enabled = false` publishes nothing, so there is
+        // nothing pushed and nothing to blank on the way out.
+        if app.window_title_publisher.has_published() {
+            let _ = terminal_notify::write_host_sequence(
+                &terminal_notify::restore_window_title_sequence(),
+            );
+        }
+
         // Reset modifyOtherKeys if we enabled it.
         if modify_other_keys_mode.is_some() {
             use std::io::Write;

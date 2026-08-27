@@ -1252,6 +1252,12 @@ impl HeadlessServer {
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
+        if changed {
+            // A different terminal is now wearing this server's title (#361).
+            // The text may be identical to the last one published, so the
+            // dedupe has to be told the AUDIENCE changed, not the title.
+            self.app.window_title_publisher.invalidate();
+        }
         changed
     }
 
@@ -1260,6 +1266,9 @@ impl HeadlessServer {
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
+        if changed {
+            self.app.window_title_publisher.invalidate();
+        }
         changed
     }
 
@@ -2341,6 +2350,11 @@ impl HeadlessServer {
                     // next frame is a full redraw, since the client missed
                     // every frame while paused (#65).
                     client.request_full_redraw();
+                    // Same reasoning for the host window title (#361): every
+                    // title published while this slot was paused was suppressed
+                    // on the way out, so the dedupe baseline is a lie about what
+                    // this terminal has been shown.
+                    self.app.window_title_publisher.invalidate();
                     true
                 } else {
                     // Pausing: no frame work to do; just stop targeting it.
@@ -3373,7 +3387,37 @@ impl HeadlessServer {
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
         self.app.sync_headless_animation_timer(now);
+
+        // #361: advertise this server's state on the attached client's host
+        // terminal. The App owns the grammar, the kill switch and the
+        // debounce/dedupe; the headless loop only owns the sink.
+        self.publish_window_title(now);
+
         changed
+    }
+
+    /// Ships a due window title (#361) to the client whose terminal it labels.
+    ///
+    /// The FOREGROUND app client only, and only while it wants frames: with
+    /// connection slots (#65) one client holds warm connections to several
+    /// servers at once, and a background slot must not relabel a window it is
+    /// not painting. Both gates are re-checked here rather than trusted from
+    /// the last tick, because either can change between ticks.
+    fn publish_window_title(&mut self, now: Instant) {
+        let Some(client_id) = self.foreground_client_id else {
+            return;
+        };
+        let publishable = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.is_full_app_client() && client.frame_subscription);
+        if !publishable {
+            return;
+        }
+        let Some(title) = self.app.due_window_title(now) else {
+            return;
+        };
+        self.send_to_client(client_id, ServerMessage::SetWindowTitle { title });
     }
 
     /// Initiates graceful shutdown.
@@ -7366,6 +7410,210 @@ next_tab = ""
             !server.clients.contains_key(&1),
             "failed targeted send should remove the broken foreground client"
         );
+    }
+
+    // ---- Host window title (#361) ----
+    //
+    // These start where the title's inputs really start — a pane's detected
+    // agent state and the focused workspace — and end at the wire, because the
+    // defect this feature fixes is precisely that everything in between was
+    // already computed and NOTHING was published outward.
+
+    /// A server with one workspace on `feat/title`, one pane, and a foreground
+    /// client whose control channel the test can read.
+    fn window_title_test_server() -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let mut server = test_headless_server();
+        let mut ws = crate::workspace::Workspace::test_new("flock");
+        ws.custom_name = None;
+        ws.cached_git_branch = Some("feat/title".into());
+        server.app.state.workspaces = vec![ws];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+
+        let (writer, control_rx, render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        // The render receiver goes back to the caller: dropping it closes the
+        // render channel, which would take the client down mid-test.
+        (server, control_rx, render_rx)
+    }
+
+    fn set_pane_state(server: &mut HeadlessServer, state: crate::detect::AgentState) {
+        let root = server.app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(root)
+            .cloned()
+            .expect("test pane has a terminal");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal")
+            .set_detected_state(Some(crate::detect::Agent::Codex), state);
+    }
+
+    fn published_titles(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+        let mut titles = Vec::new();
+        while let Ok(bytes) = control_rx.try_recv() {
+            if let ServerMessage::SetWindowTitle { title } = read_server_message(bytes) {
+                titles.push(title);
+            }
+        }
+        titles
+    }
+
+    #[test]
+    fn a_blocked_agent_reaches_the_host_window_title() {
+        // The gap #361 names: the tally and the focused branch were both
+        // already computed, and nothing ever published them outward.
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        set_pane_state(&mut server, crate::detect::AgentState::Blocked);
+
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+
+        let titles = published_titles(&control_rx);
+        assert_eq!(
+            titles.len(),
+            1,
+            "expected exactly one title, got {titles:?}"
+        );
+        // The host name is the machine's, so assert around it rather than on it.
+        assert!(
+            titles[0].starts_with("\u{25cf} 1B  feat/title \u{00b7} "),
+            "got {:?}",
+            titles[0]
+        );
+        assert!(titles[0].ends_with(" \u{2014} flk"), "got {:?}", titles[0]);
+    }
+
+    #[test]
+    fn a_calm_flock_publishes_a_title_with_no_badge() {
+        // The badge APPEARING is the signal, so a working agent must produce a
+        // title indistinguishable from an idle one.
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        set_pane_state(&mut server, crate::detect::AgentState::Working);
+
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+
+        let titles = published_titles(&control_rx);
+        assert_eq!(
+            titles.len(),
+            1,
+            "expected exactly one title, got {titles:?}"
+        );
+        assert!(!titles[0].contains('\u{25cf}'), "got {:?}", titles[0]);
+        assert!(
+            titles[0].starts_with("feat/title \u{00b7} "),
+            "got {:?}",
+            titles[0]
+        );
+    }
+
+    #[test]
+    fn a_repeated_tick_does_not_republish_the_same_title() {
+        // Dedupe on the rendered title: a title rewritten every tick flickers
+        // and bounces taskbar entries.
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        set_pane_state(&mut server, crate::detect::AgentState::Blocked);
+
+        let start = Instant::now();
+        server.handle_scheduled_tasks_headless(start, false);
+        server.handle_scheduled_tasks_headless(
+            start + crate::ui::window_title::TITLE_DEBOUNCE * 4,
+            false,
+        );
+
+        assert_eq!(published_titles(&control_rx).len(), 1);
+    }
+
+    #[test]
+    fn a_title_change_inside_the_debounce_window_is_held_and_scheduled() {
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        set_pane_state(&mut server, crate::detect::AgentState::Blocked);
+
+        let start = Instant::now();
+        server.handle_scheduled_tasks_headless(start, false);
+        assert_eq!(published_titles(&control_rx).len(), 1);
+
+        // The agent unblocks 100 ms later: inside the window, so nothing goes
+        // out — but the loop is told to wake for the end of the window, or the
+        // change would sit unpublished until some unrelated event.
+        set_pane_state(&mut server, crate::detect::AgentState::Working);
+        let inside = start + Duration::from_millis(100);
+        server.handle_scheduled_tasks_headless(inside, false);
+        assert!(published_titles(&control_rx).is_empty());
+        assert_eq!(
+            server.app.window_title_deadline,
+            Some(start + crate::ui::window_title::TITLE_DEBOUNCE)
+        );
+
+        // Past the window, the CURRENT title goes out.
+        server.handle_scheduled_tasks_headless(
+            start + crate::ui::window_title::TITLE_DEBOUNCE,
+            false,
+        );
+        let titles = published_titles(&control_rx);
+        assert_eq!(titles.len(), 1, "got {titles:?}");
+        assert!(!titles[0].contains('\u{25cf}'), "got {:?}", titles[0]);
+    }
+
+    #[test]
+    fn the_title_kill_switch_publishes_nothing_at_all() {
+        // `[title] enabled = false` exists because a title leaks the focused
+        // branch and the server name to anyone watching a shared or streamed
+        // terminal. It has to mean NO bytes, not a blank title.
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        server.app.state.config.title.enabled = false;
+        set_pane_state(&mut server, crate::detect::AgentState::Blocked);
+
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+
+        assert!(published_titles(&control_rx).is_empty());
+        assert!(!server.app.window_title_publisher.has_published());
+    }
+
+    #[test]
+    fn a_paused_connection_slot_is_not_told_to_relabel_its_window() {
+        // With slots (#65) one client holds warm connections to several
+        // servers; a background one must not label a window it is not painting.
+        let (mut server, control_rx, _render_rx) = window_title_test_server();
+        set_pane_state(&mut server, crate::detect::AgentState::Blocked);
+        server
+            .clients
+            .get_mut(&1)
+            .expect("test client")
+            .frame_subscription = false;
+
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(published_titles(&control_rx).is_empty());
+
+        // Resuming republishes even though the title text never changed: this
+        // terminal has never been shown it.
+        server.handle_server_event(ServerEvent::ClientSetFrameSubscription {
+            client_id: 1,
+            enabled: true,
+        });
+        server.handle_scheduled_tasks_headless(
+            Instant::now() + crate::ui::window_title::TITLE_DEBOUNCE,
+            false,
+        );
+        assert_eq!(published_titles(&control_rx).len(), 1);
     }
 
     #[test]

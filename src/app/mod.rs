@@ -194,6 +194,14 @@ pub struct App {
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
+    /// Debounce + dedupe in front of the HOST terminal window title (#361).
+    /// Owned by the App because the title describes app state; both loops feed
+    /// it and each writes the result to its own sink — the monolithic loop to
+    /// its own terminal, the headless loop to the foreground client's.
+    pub(crate) window_title_publisher: crate::ui::window_title::WindowTitlePublisher,
+    /// When to wake for a title publish the debounce window suppressed. `None`
+    /// once the title has settled, so a quiet flock schedules no wakeups.
+    pub(crate) window_title_deadline: Option<Instant>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) suppressed_repeat_keys:
@@ -831,6 +839,8 @@ impl App {
             fleet_pause: fleet_pause::FleetPauseState::load_from(&fleet_pause::default_pause_path()),
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
+            window_title_publisher: Default::default(),
+            window_title_deadline: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
@@ -1029,6 +1039,12 @@ impl App {
             if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
+
+            // #361: advertise flock's state to the host terminal. Monolithic
+            // mode owns the terminal itself, so the write happens right here.
+            // The headless loop ships the same computed title to its foreground
+            // client instead.
+            self.publish_host_window_title(now);
 
             if self.state.request_complete_onboarding {
                 self.state.request_complete_onboarding = false;
