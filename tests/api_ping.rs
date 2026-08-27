@@ -212,6 +212,25 @@ impl JsonLineReader {
     }
 }
 
+/// Run the real `flk` CLI against this test's server.
+///
+/// The readiness wait is a client-side composition — subscribe, filter, report
+/// — so the binary is the only place it exists whole.
+#[cfg(not(target_os = "macos"))]
+// TracedCommand is flock's funnel for the subprocesses FLOCK spawns; this is
+// the harness spawning flock, which is the funnel's own subject.
+#[allow(clippy::disallowed_methods)]
+fn run_flk(socket_path: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+        .args(args)
+        .env("FLOCK_SOCKET_PATH", socket_path)
+        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_SESSION")
+        .env_remove("FLOCK_ENV")
+        .output()
+        .expect("flk should run")
+}
+
 fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     let mut reader = JsonLineReader::connect(socket_path);
     reader.send_line(json);
@@ -767,6 +786,145 @@ fn agent_start_creates_named_terminal_over_socket() {
         .as_str()
         .unwrap()
         .contains(&terminal_id));
+
+    cleanup_spawned_flock(child, base);
+}
+
+/// #362 (3): a readiness wait has to tell "still booting" from "already
+/// gone", and say which one it saw.
+///
+/// Driven through the compiled binary against a real server, because the
+/// value this protects does not exist in any one layer: the CLI subscribes,
+/// the server's detector decides what `unknown` means, and the pane's death
+/// arrives as an event through the app loop. A test that constructed the
+/// status it asserts on could not tell whether anything produces it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn agent_wait_ready_reports_booting_then_returns_on_the_first_real_status() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let started = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"ready_start","method":"agent.start","params":{{"name":"boot","cwd":"{}","argv":["/bin/sh","-c","printf still-booting; sleep 30"]}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(started["result"]["type"], "agent_started");
+    let pane_id = started["result"]["agent"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A shell is not an agent flock's detector recognises, so the pane stays
+    // `unknown` — the same thing a Claude TUI looks like for its first 30-60
+    // seconds. The wait must give up saying what it saw, not just that it
+    // gave up.
+    let booting = run_flk(
+        &socket_path,
+        &["agent", "wait", "boot", "--ready", "--timeout", "800"],
+    );
+    assert_eq!(
+        booting.status.code(),
+        Some(1),
+        "a pane that never becomes ready is a refusal: {}",
+        String::from_utf8_lossy(&booting.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&booting.stderr).to_string();
+    assert!(
+        stderr.contains("agent_not_ready"),
+        "the refusal needs a machine-readable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("last status unknown"),
+        "and must name the status it saw, which is the whole point: {stderr}"
+    );
+    assert!(
+        stderr.contains("still-booting"),
+        "and quote what the pane had printed: {stderr}"
+    );
+
+    // The moment anything reports a real state, the wait is over and the
+    // state IS the answer.
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"ready_report","method":"pane.report_agent","params":{{"pane_id":"{pane_id}","source":"test","agent":"probe","state":"blocked"}}}}"#
+        ),
+    );
+    let ready = run_flk(
+        &socket_path,
+        &["agent", "wait", "boot", "--ready", "--timeout", "5000"],
+    );
+    assert_eq!(
+        ready.status.code(),
+        Some(0),
+        "blocked is a ready status — it answers the question: {}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let stdout: serde_json::Value =
+        serde_json::from_slice(&ready.stdout).expect("a ready wait prints the agent as json");
+    assert_eq!(stdout["result"]["agent"]["agent_status"], "blocked");
+
+    cleanup_spawned_flock(child, base);
+}
+
+/// #362 (3), the other half: an agent that dies at second one is invisible to
+/// the start-time liveness window (#178, 250ms) and used to be
+/// indistinguishable from a slow boot until the caller's whole timeout
+/// expired.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn agent_wait_ready_gives_up_immediately_when_the_agent_exits() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let started = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"dies_start","method":"agent.start","params":{{"name":"dies","cwd":"{}","argv":["/bin/sh","-c","sleep 1"]}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(
+        started["result"]["type"], "agent_started",
+        "one second outlives the liveness window, so the START succeeds: {started}"
+    );
+
+    let began = Instant::now();
+    let waited = run_flk(
+        &socket_path,
+        &["agent", "wait", "dies", "--ready", "--timeout", "20000"],
+    );
+    let elapsed = began.elapsed();
+    assert_eq!(
+        waited.status.code(),
+        Some(1),
+        "a dead agent never becomes ready: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&waited.stderr).to_string();
+    assert!(
+        stderr.contains("agent_exited_before_ready"),
+        "the exit must be told apart from a slow boot, by code: {stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "and reported when it happens, not when the timeout expires: took {elapsed:?}"
+    );
 
     cleanup_spawned_flock(child, base);
 }

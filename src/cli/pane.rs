@@ -469,6 +469,54 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
 }
 
+/// How long `pane run` leaves between typing the command and pressing Enter
+/// (#362).
+///
+/// `pane run` used to hand the text and the Enter to the pane in one burst,
+/// and documented that as submitting them "atomically". Atomicity is the bug.
+/// A program reading a raw-mode stdin sees read boundaries, not keystrokes,
+/// and every agent TUI uses those boundaries to tell typing from pasting: text
+/// and a carriage return arriving in ONE read look like a pasted block that
+/// happens to contain a newline, so the newline is inserted rather than
+/// submitting. That is the reported failure — the prompt landed in Claude's
+/// input box and sat there, and an explicit `pane send-keys <pane> Enter`
+/// afterwards submitted the identical bytes.
+///
+/// A gap is what makes the two land in separate reads. The value is above the
+/// input-inactivity windows TUIs use to close a paste and below anything a
+/// caller would notice, and it is deliberately not configurable: a knob here
+/// would be a knob for a heuristic.
+///
+/// It is a heuristic, and the docs say so. A TUI that has not started reading
+/// stdin at all misses the text as well as the Enter, and no gap fixes that —
+/// `agent start --wait-ready` is the answer to that half.
+const PANE_RUN_SUBMIT_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// One step of a `pane run`, so the ordering contract is a value that can be
+/// asserted on rather than a shape buried in a socket conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneRunStep {
+    /// Type the command. No keys ride along: that is the whole point.
+    Type { pane_id: String, text: String },
+    /// Let the pane's reader come back round before the Enter.
+    Settle(std::time::Duration),
+    /// Press Enter, on its own, as its own write.
+    Submit { pane_id: String },
+}
+
+fn pane_run_steps(pane_id: &str, text: &str) -> Vec<PaneRunStep> {
+    vec![
+        PaneRunStep::Type {
+            pane_id: pane_id.to_owned(),
+            text: text.to_owned(),
+        },
+        PaneRunStep::Settle(PANE_RUN_SUBMIT_GAP),
+        PaneRunStep::Submit {
+            pane_id: pane_id.to_owned(),
+        },
+    ]
+}
+
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
         eprintln!("usage: flk pane run <pane_id> <command>");
@@ -477,11 +525,28 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::normalize_pane_id(&args[0]);
     let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendInput(PaneSendInputParams {
-        pane_id,
-        text,
-        keys: vec!["Enter".into()],
-    }))
+    for step in pane_run_steps(&pane_id, &text) {
+        let method = match step {
+            PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text,
+                keys: Vec::new(),
+            }),
+            PaneRunStep::Settle(gap) => {
+                std::thread::sleep(gap);
+                continue;
+            }
+            PaneRunStep::Submit { pane_id } => Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id,
+                keys: vec!["Enter".into()],
+            }),
+        };
+        let exit_code = super::send_ok_request(method)?;
+        if exit_code != 0 {
+            return Ok(exit_code);
+        }
+    }
+    Ok(0)
 }
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
@@ -1162,7 +1227,47 @@ fn print_pane_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::pane_help_text;
+    use super::{pane_help_text, pane_run_steps, PaneRunStep};
+
+    /// #362 (4): `pane run` sent the text and the Enter as one burst, and a
+    /// TUI that reads raw stdin cannot tell that burst from a paste — so the
+    /// Enter became a newline inside the prompt and the agent never took the
+    /// turn. The contract is now three steps, and the middle one is the fix:
+    /// the Enter has to be a write of its own, after the pane's reader has
+    /// had a chance to come back round.
+    #[test]
+    fn pane_run_types_then_settles_then_submits() {
+        let steps = pane_run_steps("1:p2", "cargo test");
+        assert_eq!(
+            steps,
+            vec![
+                PaneRunStep::Type {
+                    pane_id: "1:p2".into(),
+                    text: "cargo test".into(),
+                },
+                PaneRunStep::Settle(super::PANE_RUN_SUBMIT_GAP),
+                PaneRunStep::Submit {
+                    pane_id: "1:p2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_typed_step_carries_no_enter_of_its_own() {
+        // The regression to guard: folding the Enter back into the text step
+        // restores the single burst, and every assertion above still passes
+        // if the Type step is allowed to carry keys.
+        let steps = pane_run_steps("1:p2", "echo hi");
+        let PaneRunStep::Type { text, .. } = &steps[0] else {
+            panic!("the first step must type the command");
+        };
+        assert_eq!(text, "echo hi");
+        assert!(
+            !super::PANE_RUN_SUBMIT_GAP.is_zero(),
+            "a zero gap puts the Enter back in the same read as the text"
+        );
+    }
 
     #[test]
     fn pane_help_lists_report_recap_and_history_explanation() {

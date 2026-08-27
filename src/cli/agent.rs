@@ -38,14 +38,16 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
     };
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
     };
     if separator == args.len() - 1 {
@@ -58,6 +60,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut tab_id = None;
     let mut split = None;
     let mut focus = false;
+    let mut wait_ready = false;
+    let mut ready_timeout_ms = None;
 
     let mut index = 1;
     while index < separator {
@@ -102,6 +106,18 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--wait-ready" => {
+                wait_ready = true;
+                index += 1;
+            }
+            "--ready-timeout" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --ready-timeout");
+                    return Ok(2);
+                };
+                ready_timeout_ms = Some(super::parse_u64_flag("--ready-timeout", value)?);
+                index += 2;
+            }
             other => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -109,7 +125,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    super::print_response(&super::send_request(&Request {
+    if ready_timeout_ms.is_some() && !wait_ready {
+        eprintln!("--ready-timeout only means something with --wait-ready");
+        return Ok(2);
+    }
+
+    let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
             name: name.clone(),
@@ -120,7 +141,23 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             focus,
             argv: args[separator + 1..].to_vec(),
         }),
-    })?)
+    })?;
+    if !wait_ready || response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+
+    // A start answers as soon as the child has exec'd and outlived the
+    // liveness window (#178), which says nothing about the TUI. Everything
+    // below is the second question: is it actually up?
+    let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
+        eprintln!("agent start failed: response did not include pane_id");
+        return Ok(1);
+    };
+    super::ready::wait_until_ready(
+        name,
+        pane_id,
+        ready_timeout_ms.unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS),
+    )
 }
 
 /// Fork the target pane's agent conversation into a new linked worktree
@@ -323,20 +360,26 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
+const AGENT_WAIT_USAGE: &str =
+    "flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]";
+
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!(
-            "usage: flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]"
-        );
+        eprintln!("usage: {AGENT_WAIT_USAGE}");
         return Ok(2);
     };
 
     let mut timeout_ms = None;
     let mut desired_status = None;
+    let mut ready = false;
 
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
+            "--ready" => {
+                ready = true;
+                index += 1;
+            }
             "--status" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --status");
@@ -354,7 +397,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                 index += 2;
             }
             "help" | "--help" | "-h" => {
-                eprintln!("usage: flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+                eprintln!("usage: {AGENT_WAIT_USAGE}");
                 return Ok(0);
             }
             other => {
@@ -364,8 +407,33 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    // `--ready` and `--status` are different questions, and a caller who asks
+    // both has not decided which one they mean: `--status idle` on a pane that
+    // came up `blocked` waits out the whole timeout, which is the failure
+    // `--ready` exists to end.
+    if ready && desired_status.is_some() {
+        eprintln!("--ready and --status ask different questions; pass one");
+        return Ok(2);
+    }
+    if ready {
+        let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
+        if response.get("error").is_some() {
+            eprintln!("{}", serde_json::to_string(&response).unwrap());
+            return Ok(1);
+        }
+        let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
+            eprintln!("agent wait failed: response did not include pane_id");
+            return Ok(1);
+        };
+        return super::ready::wait_until_ready(
+            target,
+            pane_id,
+            timeout_ms.unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS),
+        );
+    }
+
     let Some(agent_status) = desired_status else {
-        eprintln!("missing required --status");
+        eprintln!("missing required --status or --ready");
         return Ok(2);
     };
 
@@ -564,9 +632,9 @@ fn print_agent_help() {
     eprintln!("  flk agent send <target> <text>");
     eprintln!("  flk agent rename <target> <name>|--clear");
     eprintln!("  flk agent focus <target>");
-    eprintln!("  flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+    eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
-    eprintln!("  flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  {AGENT_START_USAGE}");
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
@@ -575,4 +643,7 @@ fn print_agent_help() {
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"
     );
+    eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
+    eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
+    eprintln!("    working or blocked is a real answer rather than flock not being able to tell");
 }

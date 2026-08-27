@@ -27,6 +27,7 @@ mod notification;
 mod pane;
 mod peers;
 mod preflight;
+mod ready;
 mod report;
 mod revert;
 mod server;

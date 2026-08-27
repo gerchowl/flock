@@ -134,6 +134,18 @@ pub struct EventStream {
 }
 
 impl EventStream {
+    /// Re-arm the per-read timeout mid-stream.
+    ///
+    /// `subscribe_value` sets the timeout once, which is enough for a wait
+    /// that returns on the first event. A wait that has to READ PAST events
+    /// it does not want — a readiness wait sees every status and title change
+    /// on the pane — would otherwise get the full timeout again on each one,
+    /// so a chatty pane could stretch a bounded wait indefinitely. Callers
+    /// that loop re-arm this with whatever is left of their own deadline.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)
+    }
+
     pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
         read_optional_json_line(&mut self.reader)
     }
