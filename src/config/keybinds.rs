@@ -267,6 +267,7 @@ pub struct Keybinds {
     pub switch_home: ActionKeybinds,
     pub toggle_prompt_expand: ActionKeybinds,
     pub toggle_float: ActionKeybinds,
+    pub drop_issue: ActionKeybinds,
     pub kill_worktree: ActionKeybinds,
     pub kill_all_worktrees: ActionKeybinds,
     pub focus_attention: ActionKeybinds,
@@ -467,6 +468,7 @@ impl Config {
                 &self.keys.toggle_prompt_expand
             ),
             toggle_float: action!("keys.toggle_float", &self.keys.toggle_float),
+            drop_issue: action!("keys.drop_issue", &self.keys.drop_issue),
             kill_worktree: action!("keys.kill_worktree", &self.keys.kill_worktree),
             kill_all_worktrees: action!("keys.kill_all_worktrees", &self.keys.kill_all_worktrees),
             focus_attention: action!("keys.focus_attention", &self.keys.focus_attention),

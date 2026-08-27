@@ -19,6 +19,7 @@ mod digest;
 mod fleet;
 mod hook;
 mod integration;
+mod issue;
 mod lineage;
 mod mcp;
 mod msg;
@@ -67,6 +68,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "pane" => pane::run_pane_command(&args[2..])?,
         "peers" => peers::run_peers_command(&args[2..])?,
         "report" => report::run_report_command(&args[2..])?,
+        "issue" => issue::run_issue_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "preflight" => preflight::run_preflight_command(&args[2..])?,

@@ -301,6 +301,9 @@ impl App {
                 super::navigate::NavigateAction::EditConfig => {
                     self.launch_config_editor();
                 }
+                super::navigate::NavigateAction::DropIssue => {
+                    self.open_issue_drop();
+                }
                 super::navigate::NavigateAction::ToggleFloat => {
                     self.toggle_float_pane();
                 }

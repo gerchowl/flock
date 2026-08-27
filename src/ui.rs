@@ -598,6 +598,7 @@ pub fn render_with_runtime_registry(
             render_rename_overlay(app, frame, frame.area())
         }
         Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
+        Mode::IssueDrop => dialogs::render_issue_drop_overlay(app, frame, frame.area()),
         Mode::OpenExistingWorktree => {
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }

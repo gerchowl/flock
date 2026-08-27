@@ -25,7 +25,7 @@ impl App {
         if self.state.workspaces.is_empty() {
             crate::persist::clear();
         } else {
-            let snap = crate::persist::capture(
+            let mut snap = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
@@ -41,6 +41,7 @@ impl App {
                     .map(|(old, pane)| (*old, pane.raw()))
                     .collect(),
             );
+            snap.issue_draft = self.state.issue_draft_snapshot();
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
             });

@@ -37,6 +37,25 @@ pub struct SessionSnapshot {
     /// keeps resolving no matter how many handoffs happened since spawn.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub pane_id_aliases: std::collections::HashMap<u32, u32>,
+    /// An unfiled issue draft (#371), so a thought survives a dismissal and a
+    /// restart. Additive and `#[serde(default)]`, so it needs no
+    /// `SNAPSHOT_VERSION` bump and an older build reading a newer file ignores
+    /// it.
+    ///
+    /// The body is deliberately absent: it lives in the operator's editor in a
+    /// pane, never in flock's memory, so there is nothing here to lose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_draft: Option<IssueDraftSnapshot>,
+}
+
+/// The half of an issue drop that flock holds: where it is going and what it
+/// is called.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueDraftSnapshot {
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -236,6 +255,7 @@ struct RawSessionSnapshot {
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
     Ok(SessionSnapshot {
+        issue_draft: None,
         version: raw.version,
         workspaces: raw
             .workspaces
@@ -317,6 +337,7 @@ pub fn capture(
     pane_id_aliases: std::collections::HashMap<u32, u32>,
 ) -> SessionSnapshot {
     SessionSnapshot {
+        issue_draft: None,
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
@@ -735,6 +756,7 @@ mod tests {
     #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
+            issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
@@ -814,6 +836,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
@@ -1086,6 +1109,7 @@ mod tests {
         // Sibling workspaces (#25) group purely via stamped membership — a
         // snapshot round-trip must preserve it or restore loses grouping.
         let snap = SessionSnapshot {
+            issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wsib".to_string()),
                 custom_name: Some("sibling".to_string()),
@@ -1512,6 +1536,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
