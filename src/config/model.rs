@@ -526,6 +526,11 @@ pub struct KeysConfig {
     /// and shows it, pressing again while visible hides it (the shell keeps
     /// running), and the next press shows the same float. Unset by default.
     pub toggle_float: BindingConfig,
+    /// Open the cross-repo issue-drop dialog (#371): pick any repository the
+    /// GitHub token can reach, give the issue a title, and compose the body in
+    /// your own editor in a NEW pane — the focused pane's agent is never
+    /// touched. Unset by default.
+    pub drop_issue: BindingConfig,
     /// Delete a linked worktree checkout AND its local branch once the merge
     /// gate (PR merged / branch merged into the default branch) passes.
     /// Unset by default.
@@ -1236,6 +1241,7 @@ impl Default for KeysConfig {
             switch_home: BindingConfig::empty(),
             toggle_prompt_expand: BindingConfig::empty(),
             toggle_float: BindingConfig::empty(),
+            drop_issue: BindingConfig::empty(),
             kill_worktree: BindingConfig::empty(),
             kill_all_worktrees: BindingConfig::empty(),
             focus_attention: BindingConfig::empty(),

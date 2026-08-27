@@ -71,6 +71,7 @@ impl App {
                     }
                     Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                     Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+                    Mode::IssueDrop => self.handle_issue_drop_key(key_event),
                     Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                     Mode::ConfirmKillAllWorktrees => self.handle_worktree_kill_all_key(key_event),
                     // Cross-machine checkout confirm (#125): ↵ pushes + fetches,
@@ -95,6 +96,80 @@ impl App {
                     Mode::Navigator => handle_navigator_key(&mut self.state, key_event),
                     Mode::Terminal => unreachable!(),
                 }
+            }
+        }
+    }
+
+    /// Keys for the cross-repo issue-drop dialog (#371).
+    ///
+    /// The dialog holds two single-line fields, so every key here is either
+    /// list navigation or plain line editing — there is deliberately no
+    /// multi-line surface. Enter on the title hands off to a pane running the
+    /// operator's editor.
+    pub(crate) fn handle_issue_drop_key(&mut self, key: KeyEvent) {
+        use crate::app::issue_drop::IssueDropFocus;
+
+        let Some(drop) = self.state.issue_drop.as_mut() else {
+            self.state.mode = Mode::Terminal;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // The draft survives: reopening restores what was typed, so a
+                // stray Esc mid-compose costs nothing.
+                self.state.mode = Mode::Terminal;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                drop.focus = match drop.focus {
+                    IssueDropFocus::Repo => IssueDropFocus::Title,
+                    IssueDropFocus::Title => IssueDropFocus::Repo,
+                };
+            }
+            KeyCode::Up => drop.move_selection(-1),
+            KeyCode::Down => drop.move_selection(1),
+            KeyCode::Enter => match drop.focus {
+                IssueDropFocus::Repo => drop.focus = IssueDropFocus::Title,
+                IssueDropFocus::Title => match drop.confirm() {
+                    Ok((repo, title)) => {
+                        self.state.mode = Mode::Terminal;
+                        self.state.issue_drop = None;
+                        self.hand_off_issue_drop(&repo, &title);
+                    }
+                    Err(message) => drop.error = Some(message),
+                },
+            },
+            _ => {
+                let field = match drop.focus {
+                    IssueDropFocus::Repo => &mut drop.query,
+                    IssueDropFocus::Title => &mut drop.title,
+                };
+                match key.code {
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        field.insert(c)
+                    }
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        field.delete_word_back()
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        field.delete_to_start()
+                    }
+                    KeyCode::Backspace => field.backspace(),
+                    KeyCode::Delete => field.delete(),
+                    KeyCode::Left => field.left(),
+                    KeyCode::Right => field.right(),
+                    KeyCode::Home => field.home(),
+                    KeyCode::End => field.end(),
+                    _ => {}
+                }
+                if drop.focus == IssueDropFocus::Repo {
+                    // The filter just changed; the cursor must not be left
+                    // past the end of the narrowed list.
+                    drop.clamp_selection();
+                }
+                drop.error = None;
             }
         }
     }

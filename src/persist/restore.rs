@@ -1126,6 +1126,7 @@ mod tests {
         // resolve, and nothing here asserts on which directory it is.
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
+            issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1216,6 +1217,7 @@ mod tests {
         // resolve, and nothing here asserts on which directory it is.
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
+            issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1437,6 +1439,7 @@ mod tests {
             }],
         };
         let snapshot = SessionSnapshot {
+            issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),

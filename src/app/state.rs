@@ -1214,6 +1214,9 @@ pub enum Mode {
     RenamePane,
     NewLinkedWorktree,
     OpenExistingWorktree,
+    /// Cross-repo issue drop (#371): pick a destination and a title, then hand
+    /// the body off to a real editor in a new pane.
+    IssueDrop,
     ConfirmRemoveWorktree,
     ConfirmKillAllWorktrees,
     /// Confirm a cross-machine checkout (#125) after the read-only probe, so the
@@ -2135,6 +2138,13 @@ pub struct AppState {
     pub rename_pane_target: Option<PaneId>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
+    /// The cross-repo issue-drop dialog (#371), when it is up.
+    pub issue_drop: Option<crate::app::issue_drop::IssueDropState>,
+    /// Enumerated destinations, cached across dialog opens (#371).
+    ///
+    /// Raw entries rather than the ranked list: ranking depends on which repos
+    /// have a local checkout right now, which changes as worktrees come and go.
+    pub issue_repo_cache: Option<crate::github::repos::RepoDirectory>,
     pub worktree_remove: Option<WorktreeRemoveState>,
     /// Fleet-wide kill sweep dialog state (#81).
     pub worktree_kill_all: Option<WorktreeKillAllState>,
@@ -2333,7 +2343,72 @@ pub struct AppState {
     pub config: crate::config::Config,
 }
 
+/// Reduce workspace project keys to GitHub `owner/name` slugs.
+///
+/// `project_key()` is already a normalized origin (`github.com/owner/name`), so
+/// this reuses the identity flock resolves once per workspace rather than
+/// shelling `git remote` again. Used to rank the issue-drop directory (#371):
+/// repos with a local checkout sort above ones the token merely reaches.
+///
+/// Non-GitHub origins are dropped — they cannot be destinations here.
+pub(crate) fn repo_slugs_from_project_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut slugs: Vec<String> = keys
+        .filter_map(|key| key.strip_prefix("github.com/"))
+        .filter(|slug| {
+            slug.matches('/').count() == 1 && !slug.starts_with('/') && !slug.ends_with('/')
+        })
+        .map(str::to_string)
+        .collect();
+    slugs.sort();
+    slugs.dedup();
+    slugs
+}
+
 impl AppState {
+    /// The unfiled draft worth persisting, if there is one.
+    ///
+    /// Only a draft with something typed in it is saved: an empty dialog left
+    /// open is not a thought worth restoring, and writing it would resurrect an
+    /// empty overlay on every restart.
+    pub(crate) fn issue_draft_snapshot(&self) -> Option<crate::persist::IssueDraftSnapshot> {
+        let drop = self.issue_drop.as_ref()?;
+        let repo = drop.query.value().trim().to_string();
+        let title = drop.title.value().trim().to_string();
+        let has_content = !repo.is_empty() || !title.is_empty();
+        has_content.then_some(crate::persist::IssueDraftSnapshot { repo, title })
+    }
+
+    /// Restore a persisted draft into a fresh dialog state.
+    pub(crate) fn restore_issue_draft(&mut self, draft: &crate::persist::IssueDraftSnapshot) {
+        let mut state = crate::app::issue_drop::IssueDropState::default();
+        state.query.set(&draft.repo);
+        state.title.set(&draft.title);
+        self.issue_drop = Some(state);
+    }
+
+    /// Rank fetched repositories into the open dialog and refresh the cache.
+    ///
+    /// Split out so the cache-hit path and the network path converge on one
+    /// implementation — two call sites ranking separately is how a picker
+    /// starts showing a different order depending on how it was opened.
+    pub(crate) fn apply_issue_repo_entries(&mut self, entries: &[crate::github::repos::RepoEntry]) {
+        let local = self.known_repo_slugs();
+        let ranked = crate::github::repos::rank(entries, &local, &[]);
+        if let Some(drop) = self.issue_drop.as_mut() {
+            drop.repos = ranked;
+            drop.status = crate::app::issue_drop::DirectoryStatus::Ready;
+            drop.clamp_selection();
+        }
+    }
+
+    /// `owner/name` for every open workspace whose origin is on GitHub.
+    ///
+    /// Thin wrapper over [`repo_slugs_from_project_keys`] so the transformation
+    /// is testable without building `Workspace` fixtures.
+    pub(crate) fn known_repo_slugs(&self) -> Vec<String> {
+        repo_slugs_from_project_keys(self.workspaces.iter().filter_map(|ws| ws.project_key()))
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -2996,6 +3071,8 @@ impl AppState {
     /// Create an AppState for testing — no channels, no PTYs.
     pub fn test_new() -> Self {
         Self {
+            issue_drop: None,
+            issue_repo_cache: None,
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -3209,6 +3286,70 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn project_keys_reduce_to_github_slugs() {
+        let slugs = repo_slugs_from_project_keys(
+            [
+                "github.com/gerchowl/flock",
+                "github.com/gerchowl/flock",
+                "github.com/acme/widgets",
+                // Not GitHub: cannot be a destination here.
+                "gitlab.com/acme/widgets",
+                // Already-normalized keys should be two segments; anything
+                // else would produce a destination that fails validation later.
+                "github.com/too/many/segments",
+                "github.com/",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(slugs, ["acme/widgets", "gerchowl/flock"]);
+    }
+
+    #[test]
+    fn an_untouched_issue_dialog_is_not_persisted() {
+        // An empty dialog left open is not a thought worth restoring; saving it
+        // would resurrect an empty overlay on every restart.
+        let mut state = AppState::test_new();
+        assert_eq!(state.issue_draft_snapshot(), None);
+        state.issue_drop = Some(crate::app::issue_drop::IssueDropState::default());
+        assert_eq!(state.issue_draft_snapshot(), None);
+    }
+
+    #[test]
+    fn a_typed_draft_survives_a_save_and_restore_round_trip() {
+        let mut state = AppState::test_new();
+        let mut drop = crate::app::issue_drop::IssueDropState::default();
+        drop.query.set("acme/widgets");
+        drop.title.set("the thing is wrong");
+        state.issue_drop = Some(drop);
+
+        let saved = state
+            .issue_draft_snapshot()
+            .expect("a typed draft is saved");
+        assert_eq!(saved.repo, "acme/widgets");
+        assert_eq!(saved.title, "the thing is wrong");
+
+        let mut restored = AppState::test_new();
+        restored.restore_issue_draft(&saved);
+        let back = restored.issue_drop.expect("restored");
+        assert_eq!(back.query.value(), "acme/widgets");
+        assert_eq!(back.title.value(), "the thing is wrong");
+    }
+
+    #[test]
+    fn a_title_alone_is_still_a_draft_worth_keeping() {
+        // The common case is typing the thought first and choosing the repo
+        // second; losing it because no repo was picked yet is the exact failure
+        // the persistence exists to prevent.
+        let mut state = AppState::test_new();
+        let mut drop = crate::app::issue_drop::IssueDropState::default();
+        drop.title.set("half a thought");
+        state.issue_drop = Some(drop);
+        let saved = state.issue_draft_snapshot().expect("kept");
+        assert_eq!(saved.repo, "");
+        assert_eq!(saved.title, "half a thought");
+    }
     use super::*;
     use crossterm::event::KeyEvent;
     use std::time::Duration;

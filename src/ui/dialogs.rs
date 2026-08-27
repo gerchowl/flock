@@ -363,6 +363,162 @@ fn render_dialog_field_input(
     focused.then(|| (rect.x + 1 + cursor_col as u16, rect.y))
 }
 
+/// Height of the issue-drop popup: header, two labelled fields, the repository
+/// list, and a row for the status or error banner.
+fn issue_drop_popup_height() -> u16 {
+    18
+}
+
+/// Rows the repository list gets, once the fixed chrome is accounted for.
+fn issue_drop_list_rows(inner_height: u16) -> u16 {
+    // header(1) + repo label(1) + repo input(1) + title label(1) + title
+    // input(1) + banner(1) + hint(1)
+    inner_height.saturating_sub(7)
+}
+
+/// Scroll the list so the selected row stays visible.
+///
+/// Returned as the first visible index rather than mutating state: render is
+/// pure in this codebase, so the viewport is derived every frame from the
+/// selection instead of being stored and kept in sync.
+pub(crate) fn issue_drop_scroll_offset(selected: usize, rows: usize) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    // Keep the cursor on screen: anchored at the top until it passes the last
+    // visible row, then follow it.
+    selected.saturating_sub(rows - 1)
+}
+
+pub(super) fn render_issue_drop_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    use crate::app::issue_drop::{DirectoryStatus, IssueDropFocus};
+    use crate::github::repos::Provenance;
+
+    let Some(drop) = app.issue_drop.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(frame, area, 72, issue_drop_popup_height(), &app.palette)
+    else {
+        return;
+    };
+    if inner.height < 8 {
+        return;
+    }
+
+    let row = |i: u16| Rect::new(inner.x, inner.y + i, inner.width, 1);
+    render_modal_header(frame, row(0), "drop an issue", &app.palette);
+
+    let mut cursor_pos = None;
+
+    render_dialog_field_label(frame, row(1), " repository · type to filter", &app.palette);
+    cursor_pos = cursor_pos.or(render_dialog_field_input(
+        frame,
+        row(2),
+        &drop.query,
+        drop.focus == IssueDropFocus::Repo,
+        &app.palette,
+    ));
+
+    render_dialog_field_label(frame, row(3), " title · tab to switch", &app.palette);
+    cursor_pos = cursor_pos.or(render_dialog_field_input(
+        frame,
+        row(4),
+        &drop.title,
+        drop.focus == IssueDropFocus::Title,
+        &app.palette,
+    ));
+
+    // The destination list.
+    let list_rows = issue_drop_list_rows(inner.height);
+    let filtered = drop.filtered();
+    let offset = issue_drop_scroll_offset(drop.selected, usize::from(list_rows));
+    for slot in 0..list_rows {
+        let Some(entry_idx) = filtered.get(offset + usize::from(slot)) else {
+            break;
+        };
+        let Some(repo) = drop.repos.get(*entry_idx) else {
+            break;
+        };
+        let selected = offset + usize::from(slot) == drop.selected;
+        // The tier is shown, not just implied by order: "why is this repo
+        // first" is otherwise invisible, and the answer is what tells the
+        // operator whether they are about to file somewhere they know.
+        let tier = match repo.provenance {
+            Provenance::LocalCheckout => "local",
+            Provenance::SeenInFleet => "fleet",
+            Provenance::Reachable => "     ",
+        };
+        let style = if selected {
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface1)
+        } else {
+            Style::default().fg(app.palette.subtext0)
+        };
+        frame.render_widget(
+            Paragraph::new(format!(" {tier}  {}", repo.name_with_owner)).style(style),
+            row(5 + slot),
+        );
+    }
+
+    let banner_row = row(5 + list_rows);
+    if let Some(error) = drop.error.as_ref() {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
+            banner_row,
+        );
+    } else {
+        let (text, colour) = match &drop.status {
+            DirectoryStatus::Loading => (
+                " enumerating repositories…".to_string(),
+                app.palette.overlay0,
+            ),
+            DirectoryStatus::Ready => (
+                format!(" {} repositories · ↑↓ to choose", filtered.len()),
+                app.palette.overlay0,
+            ),
+            // Not a dead end: a typed owner/name still files.
+            DirectoryStatus::Failed(kind) => (
+                format!(" could not list repositories ({kind}) — type owner/name"),
+                app.palette.yellow,
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(colour)),
+            banner_row,
+        );
+    }
+
+    // Filing into a repo with no local checkout and nobody in the fleet on it
+    // is the case a mistyped owner/name looks exactly like, so say so before
+    // the operator commits an editor session to it.
+    let unfamiliar = !matches!(
+        drop.provenance(),
+        Some(Provenance::LocalCheckout | Provenance::SeenInFleet)
+    );
+    let (hint, hint_colour) = if unfamiliar && drop.destination().is_some() {
+        (
+            " ↵ opens your editor · no checkout here — check the owner/name",
+            app.palette.yellow,
+        )
+    } else {
+        (
+            " ↵ opens your editor in a new pane · esc keeps the draft",
+            app.palette.overlay0,
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(hint_colour)),
+        row(6 + list_rows),
+    );
+
+    if let Some(pos) = cursor_pos {
+        frame.set_cursor_position(pos);
+    }
+}
+
 pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     use crate::app::state::WorktreeCreateFocus;
     let Some(create) = app.worktree_create.as_ref() else {
@@ -1437,10 +1593,33 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_issue_drop_list_scrolls_to_keep_the_selection_visible() {
+        // Anchored at the top until the cursor passes the last visible row,
+        // then follows it — the same rule LineEditor::view uses horizontally.
+        assert_eq!(issue_drop_scroll_offset(0, 5), 0);
+        assert_eq!(issue_drop_scroll_offset(4, 5), 0, "last visible row");
+        assert_eq!(issue_drop_scroll_offset(5, 5), 1, "scrolls by one");
+        assert_eq!(issue_drop_scroll_offset(9, 5), 5);
+        // A zero-row viewport must not underflow.
+        assert_eq!(issue_drop_scroll_offset(3, 0), 0);
+    }
+
+    #[test]
+    fn the_issue_drop_list_leaves_room_for_its_chrome() {
+        // Header, two labelled fields, banner and hint all sit outside the
+        // list; a taller popup must give the extra rows to the list itself.
+        assert_eq!(issue_drop_list_rows(18), 11);
+        assert!(issue_drop_list_rows(24) > issue_drop_list_rows(18));
+        // A popup too short for the chrome yields no list rather than wrapping.
+        assert_eq!(issue_drop_list_rows(6), 0);
+    }
     use crate::{app::AppState, workspace::Workspace};
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use super::confirm_close_overlay_text;
+    use super::{issue_drop_list_rows, issue_drop_scroll_offset};
     use super::{
         new_linked_worktree_inner_rect, new_linked_worktree_popup_height,
         remove_worktree_popup_rect, remove_worktree_stakes_rows,

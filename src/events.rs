@@ -91,6 +91,14 @@ pub enum AppEvent {
             crate::pr_poll::PrPollErrorKind,
         >,
     ),
+    /// The issue-drop repository directory finished enumerating (#371).
+    ///
+    /// Carries the ranked list or the classified failure. A failure is not
+    /// fatal to the dialog — a typed `owner/name` still files — so this is a
+    /// banner rather than a dismissal.
+    IssueReposFetched(
+        Result<Vec<crate::github::repos::RepoEntry>, crate::github::graphql::GraphQlErrorKind>,
+    ),
     /// The peer-summary poll interval elapsed; spawn SSH fetches per peer.
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).
