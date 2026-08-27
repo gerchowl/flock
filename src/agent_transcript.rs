@@ -34,9 +34,11 @@
 //!   everything typed and every tool result
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 /// Longest block body handed to a renderer. A single `tool_result` line of
 /// 1.35 MB was measured in a real transcript; re-wrapping that would stall the
@@ -60,7 +62,8 @@ const MAX_UNPARSED_RATIO: f64 = 0.05;
 /// silence the warning.
 pub const KNOWN_GOOD_WRITER_MAX: (u32, u32, u32) = (2, 1, 238);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
@@ -113,6 +116,11 @@ pub enum TranscriptError {
 #[derive(Debug, Default)]
 pub struct TranscriptRead {
     pub events: Vec<TranscriptEvent>,
+    /// Byte range of the line each event was parsed from, relative to the
+    /// start of the reader. Parallel to `events` and pushed with it, so an
+    /// event's index is also its span's index. `agent.history` (#276) pages a
+    /// transcript by byte offset, and a turn's offset is its line's offset.
+    pub line_spans: Vec<std::ops::Range<u64>>,
     /// Highest `version` string seen, if any entry carried one.
     pub writer_version: Option<String>,
     /// True when `writer_version` is newer than [`KNOWN_GOOD_WRITER_MAX`].
@@ -147,6 +155,10 @@ pub fn read_lines<R: BufRead>(reader: R) -> Result<TranscriptRead, TranscriptErr
 
     let mut reader = reader;
     let mut line = String::new();
+    // Where the next line starts, relative to the reader's own origin. The
+    // caller adds the window's absolute offset; this function has no idea
+    // where in the file it was handed.
+    let mut consumed: u64 = 0;
     loop {
         line.clear();
         // `BufRead::lines()` cannot be used here: it yields a final
@@ -163,6 +175,9 @@ pub fn read_lines<R: BufRead>(reader: R) -> Result<TranscriptRead, TranscriptErr
             // what we have rather than discarding it.
             Err(_) => break,
         }
+        let line_start = consumed;
+        consumed += line.len() as u64;
+        let line_end = consumed;
         let line = line.trim_end_matches(['\n', '\r']);
         if line.trim().is_empty() {
             continue;
@@ -188,7 +203,11 @@ pub fn read_lines<R: BufRead>(reader: R) -> Result<TranscriptRead, TranscriptErr
             }
         }
 
+        // Pushed as a pair: an event and the span it came from must never
+        // get out of step, and the only way to guarantee that is to append
+        // them together.
         out.events.push(parse_entry(&value));
+        out.line_spans.push(line_start..line_end);
     }
 
     let total = parsed + failed;
@@ -340,7 +359,8 @@ fn tool_result_text(value: &serde_json::Value) -> String {
 /// Cycling levels re-reads the transcript rather than caching all three
 /// renderings per entry: a 60k-message session would otherwise triple the
 /// memory the panel holds for a mode the user is not looking at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptDetail {
     /// Prompt + assistant prose only. What the pre-#246 panel roughly showed.
     #[default]
@@ -435,6 +455,221 @@ pub fn turns_at_level(
         turns.push((display_role, pieces.join("\n\n"), *at));
     }
     turns
+}
+
+/// Largest slice of a transcript one [`read_history`] call parses (#276).
+///
+/// `agent.history` exists to be polled, and a poll that re-reads a 15 MB file
+/// is not pollable: the read runs on the task that also draws the UI. A
+/// transcript is newline-delimited JSON, so a window is exact rather than
+/// approximate — seek, align to a line boundary, parse forward. A caller that
+/// hands `next_cursor` back parses only what was appended since, which is the
+/// steady state of a poll and is normally a few kilobytes.
+pub const HISTORY_WINDOW_BYTES: u64 = 1024 * 1024;
+
+/// One turn of an agent's history, rendered at the detail the caller asked
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTurn {
+    pub role: Role,
+    pub text: String,
+    /// When the writer stamped the entry, if it stamped one.
+    pub at: Option<SystemTime>,
+}
+
+/// One page of an agent's history plus the cursor that resumes after it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryPage {
+    pub turns: Vec<HistoryTurn>,
+    /// Byte offset the first returned turn was parsed from. Handing this back
+    /// as `cursor` re-reads exactly this page.
+    pub cursor: u64,
+    /// Byte offset to hand back as `cursor` to read what comes next.
+    pub next_cursor: u64,
+    /// Transcript length when the page was cut. `next_cursor < len` means
+    /// more is already on disk.
+    pub len: u64,
+    /// Turns older than `cursor` exist and this call skipped them, either
+    /// because it started at the tail or because `limit` cut them.
+    pub truncated: bool,
+}
+
+impl HistoryPage {
+    /// Whether more transcript already sits after [`Self::next_cursor`]. A
+    /// caller seeing this page again immediately, rather than on its next
+    /// poll, is the difference between paging and waiting.
+    pub fn more(&self) -> bool {
+        self.next_cursor < self.len
+    }
+}
+
+/// Read one bounded page of a transcript at `detail`, starting from `cursor`
+/// (or from the tail when there is none).
+///
+/// The rendering goes through [`turns_at_level`] with the detail this call
+/// asked for, never through whatever a panel happens to be hydrated at: an
+/// agent's view of history must not change because a human clicked something.
+pub fn read_history(
+    path: &Path,
+    detail: TranscriptDetail,
+    cursor: Option<u64>,
+    limit: usize,
+) -> Result<HistoryPage, TranscriptError> {
+    let limit = limit.max(1);
+    let mut file = File::open(path).map_err(|_| TranscriptError::Unreadable)?;
+    let len = file
+        .metadata()
+        .map_err(|_| TranscriptError::Unreadable)?
+        .len();
+
+    // A cursor past the end means the file shrank under the caller — Claude
+    // prunes transcripts, and the same session id can be rewritten. Serving
+    // nothing forever would be the silent failure. Restart from the tail: the
+    // returned `cursor` is below the one that was handed in, which is how a
+    // caller sees it happened.
+    let from_tail = cursor.is_none_or(|at| at > len);
+    let requested = if from_tail {
+        len.saturating_sub(HISTORY_WINDOW_BYTES)
+    } else {
+        cursor.unwrap_or(0)
+    };
+
+    // A tail read starts at the beginning of the entry the offset falls in.
+    // A cursored one starts at the first entry at or after it. The difference
+    // matters when a single entry is larger than the window: skipping forward
+    // out of it would answer "nothing here" for a transcript whose newest
+    // turn is one big tool result, which is precisely the turn that was asked
+    // for. Reading back into it costs at most that one entry.
+    let (window_start, take) = if from_tail {
+        let start = align_back_to_line_start(&mut file, requested)?;
+        (start, len.saturating_sub(start))
+    } else {
+        let start = align_to_line_start(&mut file, requested)?;
+        (start, len.saturating_sub(start).min(HISTORY_WINDOW_BYTES))
+    };
+    file.seek(SeekFrom::Start(window_start))
+        .map_err(|_| TranscriptError::Unreadable)?;
+    let mut buf = Vec::with_capacity(usize::try_from(take).unwrap_or(0));
+    (&mut file)
+        .take(take)
+        .read_to_end(&mut buf)
+        .map_err(|_| TranscriptError::Unreadable)?;
+    // Never hand a half-written trailing line to the parser: the window edge
+    // is as likely to land mid-entry as the live writer is.
+    let mut complete = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1);
+    if complete == 0 && window_start + (buf.len() as u64) < len {
+        // The window ended inside a single entry bigger than itself. Finish
+        // that entry rather than return an empty page with an unchanged
+        // cursor, which is a poll that never advances.
+        let read_to_line_end = BufReader::new(&mut file)
+            .read_until(b'\n', &mut buf)
+            .map_err(|_| TranscriptError::Unreadable)?;
+        if read_to_line_end > 0 && buf.last() == Some(&b'\n') {
+            complete = buf.len();
+        }
+    }
+    buf.truncate(complete);
+    let window_end = window_start + complete as u64;
+
+    let read = read_lines(&buf[..])?;
+    let mut turns: Vec<(HistoryTurn, std::ops::Range<u64>)> = Vec::new();
+    for (event, span) in read.events.iter().zip(read.line_spans.iter()) {
+        // One event yields at most one turn, so a turn's byte span IS its
+        // event's line span — that is what makes the cursor exact.
+        for (role, text, at) in turns_at_level(std::slice::from_ref(event), detail) {
+            turns.push((
+                HistoryTurn { role, text, at },
+                window_start + span.start..window_start + span.end,
+            ));
+        }
+    }
+
+    let mut truncated = from_tail && window_start > 0;
+    let mut limited = false;
+    if turns.len() > limit {
+        if from_tail {
+            // No cursor means "what happened lately", so the newest turns are
+            // the ones to keep.
+            turns.drain(..turns.len() - limit);
+            truncated = true;
+        } else {
+            turns.truncate(limit);
+            limited = true;
+        }
+    }
+
+    Ok(HistoryPage {
+        cursor: turns.first().map_or(window_start, |(_, span)| span.start),
+        // When `limit` cut the page short the cursor must stop at the last
+        // turn actually returned, or the next poll skips the rest. Otherwise
+        // advance past every complete line read, including the meta ones that
+        // rendered no turn — leaving those behind would make a settled
+        // transcript look like it always had more.
+        next_cursor: if limited {
+            turns.last().map_or(window_end, |(_, span)| span.end)
+        } else {
+            window_end
+        },
+        turns: turns.into_iter().map(|(turn, _)| turn).collect(),
+        len,
+        truncated,
+    })
+}
+
+/// The offset of the first complete line at or after `at`.
+///
+/// Reads the byte BEFORE `at` rather than scanning forward blind: when that
+/// byte is the newline ending the previous line, `at` already starts a line
+/// and skipping to the next one would silently drop a whole turn.
+fn align_to_line_start(file: &mut File, at: u64) -> Result<u64, TranscriptError> {
+    if at == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(at - 1))
+        .map_err(|_| TranscriptError::Unreadable)?;
+    let mut probe = [0u8; 1];
+    match file.read_exact(&mut probe) {
+        Ok(()) if probe[0] == b'\n' => return Ok(at),
+        Ok(()) => {}
+        Err(_) => return Err(TranscriptError::Unreadable),
+    }
+    let mut reader = BufReader::new(&mut *file);
+    let mut skipped = Vec::new();
+    let taken = reader
+        .read_until(b'\n', &mut skipped)
+        .map_err(|_| TranscriptError::Unreadable)?;
+    Ok(at + taken as u64)
+}
+
+/// The offset of the start of the line that CONTAINS `at`.
+///
+/// Scans backwards, bounded to one extra window: a file with no newline
+/// within 2 MiB of the tail has no complete entry there to return, and
+/// walking a 15 MB transcript to prove it is the cost this whole verb exists
+/// to avoid. Falls back to forward alignment in that case.
+fn align_back_to_line_start(file: &mut File, at: u64) -> Result<u64, TranscriptError> {
+    const CHUNK: u64 = 64 * 1024;
+    let floor = at.saturating_sub(HISTORY_WINDOW_BYTES);
+    let mut end = at;
+    while end > floor {
+        let start = end.saturating_sub(CHUNK).max(floor);
+        let mut buf = vec![0u8; usize::try_from(end - start).unwrap_or(0)];
+        file.seek(SeekFrom::Start(start))
+            .map_err(|_| TranscriptError::Unreadable)?;
+        file.read_exact(&mut buf)
+            .map_err(|_| TranscriptError::Unreadable)?;
+        if let Some(index) = buf.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    if floor == 0 {
+        return Ok(0);
+    }
+    align_to_line_start(file, at)
 }
 
 /// Read and flatten a Claude session transcript on a worker thread, handing
@@ -874,5 +1109,275 @@ mod tests {
         assert_eq!(TranscriptDetail::Reply.next(), TranscriptDetail::Collapsed);
         assert_eq!(TranscriptDetail::Collapsed.next(), TranscriptDetail::Full);
         assert_eq!(TranscriptDetail::Full.next(), TranscriptDetail::Reply);
+    }
+
+    // ---- #276: bounded, resumable history reads ---------------------------
+
+    /// A transcript on disk, in a directory this test owns.
+    fn history_fixture(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("flock-history-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join("transcript.jsonl");
+        std::fs::write(&path, body).expect("fixture transcript");
+        path
+    }
+
+    fn user(text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": text}
+            })
+        )
+    }
+
+    fn assistant_with_tool(text: &str, tool: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": text},
+                    {"type": "tool_use", "name": tool},
+                ]}
+            })
+        )
+    }
+
+    fn texts(page: &HistoryPage) -> Vec<&str> {
+        page.turns.iter().map(|turn| turn.text.as_str()).collect()
+    }
+
+    #[test]
+    fn history_without_a_cursor_returns_the_newest_turns_and_admits_what_it_skipped() {
+        let body: String = (0..10).map(|i| user(&format!("turn {i}"))).collect();
+        let path = history_fixture("tail", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 3).expect("history");
+
+        assert_eq!(texts(&page), vec!["turn 7", "turn 8", "turn 9"]);
+        assert!(
+            page.truncated,
+            "seven older turns were dropped; saying otherwise would read as `that is all there is`"
+        );
+        assert_eq!(page.next_cursor, page.len, "the tail read reaches the end");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The poll loop the whole verb exists for: hand back `next_cursor` and
+    /// get only what was appended since.
+    #[test]
+    fn history_resumes_from_next_cursor_and_returns_only_what_was_appended() {
+        let body: String = (0..3).map(|i| user(&format!("turn {i}"))).collect();
+        let path = history_fixture("resume", &body);
+
+        let first = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+        assert_eq!(texts(&first), vec!["turn 0", "turn 1", "turn 2"]);
+        assert!(!first.truncated, "the whole file fitted");
+
+        let quiet = read_history(&path, TranscriptDetail::Reply, Some(first.next_cursor), 20)
+            .expect("history");
+        assert!(
+            quiet.turns.is_empty(),
+            "a poll against an unchanged transcript must return nothing, not repeat itself"
+        );
+        assert_eq!(quiet.next_cursor, first.next_cursor);
+        assert!(!quiet.more());
+
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        std::io::Write::write_all(&mut appended, user("turn 3").as_bytes()).expect("write");
+        drop(appended);
+
+        let next = read_history(&path, TranscriptDetail::Reply, Some(first.next_cursor), 20)
+            .expect("history");
+        assert_eq!(texts(&next), vec!["turn 3"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A cursor lands exactly on a line boundary, which is the case a naive
+    /// "skip to the next newline" alignment silently eats a turn on.
+    #[test]
+    fn history_paging_under_a_limit_loses_no_turn() {
+        let body: String = (0..5).map(|i| user(&format!("turn {i}"))).collect();
+        let path = history_fixture("paging", &body);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = Some(0);
+        for _ in 0..5 {
+            let page = read_history(&path, TranscriptDetail::Reply, cursor, 2).expect("history");
+            seen.extend(page.turns.iter().map(|turn| turn.text.clone()));
+            if !page.more() {
+                break;
+            }
+            cursor = Some(page.next_cursor);
+        }
+
+        assert_eq!(
+            seen,
+            vec!["turn 0", "turn 1", "turn 2", "turn 3", "turn 4"],
+            "paging must visit every turn exactly once"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_re_reads_the_same_page_when_handed_back_its_own_cursor() {
+        let body: String = (0..6).map(|i| user(&format!("turn {i}"))).collect();
+        let path = history_fixture("stable", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 2).expect("history");
+        let again =
+            read_history(&path, TranscriptDetail::Reply, Some(page.cursor), 2).expect("history");
+
+        assert_eq!(texts(&page), texts(&again));
+        assert_eq!(page.cursor, again.cursor);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_never_parses_a_half_written_trailing_line() {
+        let mut body = user("complete");
+        body.push_str(r#"{"type":"user","message":{"role":"user","content":"half w"#);
+        let path = history_fixture("partial", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+
+        assert_eq!(texts(&page), vec!["complete"]);
+        assert!(
+            page.next_cursor < page.len,
+            "the cursor must stop before the partial line so the next poll re-reads it whole"
+        );
+        assert!(page.more(), "there are bytes the reader deliberately left");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The detail is the CALLER's. Nothing about this read consults, or is
+    /// affected by, the level a panel happens to be hydrated at.
+    #[test]
+    fn history_renders_at_the_requested_detail() {
+        let path = history_fixture("detail", &assistant_with_tool("thinking about it", "Edit"));
+
+        let reply = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+        let collapsed =
+            read_history(&path, TranscriptDetail::Collapsed, None, 20).expect("history");
+
+        assert_eq!(texts(&reply), vec!["thinking about it"]);
+        assert_eq!(
+            texts(&collapsed),
+            vec!["thinking about it\n\n\u{2699} Edit"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Claude prunes transcripts, so a cursor can outlive the bytes it named.
+    /// Serving nothing forever would be the silent failure.
+    #[test]
+    fn history_restarts_from_the_tail_when_the_cursor_outlives_the_file() {
+        let path = history_fixture("shrunk", &user("all that is left"));
+        let len = std::fs::metadata(&path).expect("meta").len();
+
+        let page =
+            read_history(&path, TranscriptDetail::Reply, Some(len + 4096), 20).expect("history");
+
+        assert_eq!(texts(&page), vec!["all that is left"]);
+        assert!(
+            page.cursor < len + 4096,
+            "the returned cursor is below the one handed in — that is how a caller sees the reset"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The window is the poll-safety property: a transcript far larger than
+    /// [`HISTORY_WINDOW_BYTES`] must not be parsed whole to answer one call.
+    #[test]
+    fn history_reads_a_bounded_window_of_a_large_transcript() {
+        let filler = "x".repeat(4096);
+        let mut body = String::new();
+        let mut turns = 0;
+        while body.len() as u64 <= HISTORY_WINDOW_BYTES * 2 {
+            body.push_str(&user(&format!("turn {turns} {filler}")));
+            turns += 1;
+        }
+        let path = history_fixture("window", &body);
+        let len = std::fs::metadata(&path).expect("meta").len();
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 500).expect("history");
+
+        assert!(
+            page.cursor >= len - HISTORY_WINDOW_BYTES - 8192,
+            "the read must start near the tail, not at the top of a {len}-byte file"
+        );
+        assert!(page.truncated);
+        assert!(
+            page.turns
+                .last()
+                .is_some_and(|turn| turn.text.starts_with(&format!("turn {}", turns - 1))),
+            "the newest turn is the one a caller with no cursor came for"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A single `tool_result` line of 1.35 MB was measured in a real
+    /// transcript, so an entry larger than the window is not hypothetical. A
+    /// tail read that skipped forward out of it would answer "nothing here"
+    /// for the very turn it was asked about.
+    #[test]
+    fn history_returns_an_entry_larger_than_the_window() {
+        let huge = "y".repeat(usize::try_from(HISTORY_WINDOW_BYTES).unwrap() + 4096);
+        let body = user("small opener") + &user(&huge);
+        let path = history_fixture("oversize", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+
+        assert_eq!(
+            page.turns.len(),
+            1,
+            "the newest turn is the over-long one, and it must not vanish"
+        );
+        assert!(page.turns[0].text.starts_with("yyy"));
+        assert_eq!(page.next_cursor, page.len);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The same entry, reached by paging rather than by tailing. A window that
+    /// ends inside one entry must still advance, or a poller re-reads the same
+    /// offset forever.
+    #[test]
+    fn history_paging_advances_through_an_entry_larger_than_the_window() {
+        let huge = "z".repeat(usize::try_from(HISTORY_WINDOW_BYTES).unwrap() + 4096);
+        let body = user(&huge) + &user("after the giant");
+        let path = history_fixture("oversize-paging", &body);
+
+        let first = read_history(&path, TranscriptDetail::Reply, Some(0), 20).expect("history");
+        assert!(
+            first.next_cursor > 0,
+            "a page that returned nothing and did not advance is an infinite poll"
+        );
+
+        let second = read_history(&path, TranscriptDetail::Reply, Some(first.next_cursor), 20)
+            .expect("history");
+        let all: Vec<&str> = first
+            .turns
+            .iter()
+            .chain(second.turns.iter())
+            .map(|turn| turn.text.as_str())
+            .collect();
+        assert_eq!(all.len(), 2, "both entries arrive across the two pages");
+        assert_eq!(all[1], "after the giant");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_on_a_missing_transcript_is_unreadable_not_a_panic() {
+        let missing = std::env::temp_dir().join(format!(
+            "flock-history-missing-{}.jsonl",
+            std::process::id()
+        ));
+        let err = read_history(&missing, TranscriptDetail::Reply, None, 20);
+        assert!(matches!(err, Err(TranscriptError::Unreadable)));
     }
 }

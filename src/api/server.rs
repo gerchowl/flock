@@ -356,6 +356,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
         Method::AgentRead(_) => "agent.read",
+        Method::AgentHistory(_) => "agent.history",
         Method::AgentSend(_) => "agent.send",
         Method::AgentRename(_) => "agent.rename",
         Method::AgentFocus(_) => "agent.focus",

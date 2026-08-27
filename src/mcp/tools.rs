@@ -213,10 +213,61 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_agent_start,
             build: build_agent_start,
         },
+        Tool {
+            name: "flock_agent_history",
+            description: "Read an agent's CONVERSATION from its session \
+                          transcript — the prompts and replies themselves, \
+                          not the pane's wrapped terminal output. Safe to \
+                          poll: it touches no pane state, so unlike \
+                          `flock_agent_read` it never moves the operator's \
+                          attention ordering. `detail` chooses how much of \
+                          each turn you get: `reply` (prose only), \
+                          `collapsed` (adds one line per tool call), `full` \
+                          (adds tool output). Omit `cursor` for the latest \
+                          turns, then send back the `next_cursor` you were \
+                          given to get only what has been written since — \
+                          that is what keeps a poll cheap. `more: true` means \
+                          page again now rather than wait; `truncated: true` \
+                          means older turns exist above `cursor`. Claude \
+                          only. Refusals: `unsupported_for_agent`, \
+                          `no_agent_session`, `transcript_not_found`, \
+                          `transcript_unreadable`.",
+            input_schema: schema_agent_history,
+            build: build_agent_history,
+        },
     ]
 }
 
 // ---- Schemas -------------------------------------------------------------
+
+fn schema_agent_history() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Public pane id, terminal id, or unique agent name.",
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["reply", "collapsed", "full"],
+                "description": "How much of each turn to return. Defaults to `reply`. `full` can be very large — one tool result reaches 128 KiB.",
+            },
+            "cursor": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "A `next_cursor` from a previous call. Omit for the most recent turns. Only valid for the same `session_id` the response reported.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum turns to return. Defaults to 20, capped at 200.",
+            },
+        },
+        "required": ["target"],
+        "additionalProperties": false,
+    })
+}
 
 fn schema_agent_start() -> Value {
     json!({
@@ -503,6 +554,33 @@ fn build_agent_read(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn build_agent_history(args: Value) -> Result<Method, McpError> {
+    use crate::agent_transcript::TranscriptDetail;
+
+    let detail = match args.get("detail") {
+        None | Some(Value::Null) => TranscriptDetail::Reply,
+        Some(Value::String(level)) => match level.as_str() {
+            "reply" => TranscriptDetail::Reply,
+            "collapsed" => TranscriptDetail::Collapsed,
+            "full" => TranscriptDetail::Full,
+            other => {
+                return Err(McpError::invalid_params(format!(
+                    "invalid `detail`: {other}"
+                )));
+            }
+        },
+        Some(_) => return Err(McpError::invalid_params("`detail` must be a string")),
+    };
+    Ok(Method::AgentHistory(
+        crate::api::schema::AgentHistoryParams {
+            target: required_string(&args, "target")?,
+            detail,
+            cursor: optional_u64(&args, "cursor")?,
+            limit: optional_lines(&args, "limit")?,
+        },
+    ))
+}
+
 fn build_agent_fork(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentFork(AgentForkParams {
         target: required_string(&args, "target")?,
@@ -681,6 +759,19 @@ fn optional_string(args: &Value, field: &str) -> Result<Option<String>, McpError
     }
 }
 
+fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>, McpError> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| McpError::invalid_params(format!("`{field}` out of range"))),
+        Some(_) => Err(McpError::invalid_params(format!(
+            "`{field}` must be an integer"
+        ))),
+    }
+}
+
 fn optional_lines(args: &Value, field: &str) -> Result<Option<u32>, McpError> {
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -725,6 +816,7 @@ mod tests {
                 "flock_pane_read",
                 "flock_worktree_list",
                 "flock_agent_start",
+                "flock_agent_history",
             ]
         );
     }
@@ -807,6 +899,60 @@ mod tests {
             }
             other => panic!("unexpected method: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_agent_history_defaults_to_replies_and_no_cursor() {
+        let method = build_agent_history(json!({"target": "claude"})).unwrap();
+        let Method::AgentHistory(params) = method else {
+            panic!("expected AgentHistory");
+        };
+        assert_eq!(params.target, "claude");
+        assert_eq!(
+            params.detail,
+            crate::agent_transcript::TranscriptDetail::Reply,
+            "the cheapest level is the default; `full` is opt-in"
+        );
+        assert_eq!(params.cursor, None, "no cursor means the latest turns");
+        assert_eq!(params.limit, None);
+    }
+
+    #[test]
+    fn build_agent_history_carries_detail_cursor_and_limit() {
+        let method = build_agent_history(json!({
+            "target": "claude",
+            "detail": "full",
+            "cursor": 4096,
+            "limit": 5
+        }))
+        .unwrap();
+        let Method::AgentHistory(params) = method else {
+            panic!("expected AgentHistory");
+        };
+        assert_eq!(
+            params.detail,
+            crate::agent_transcript::TranscriptDetail::Full
+        );
+        assert_eq!(params.cursor, Some(4096));
+        assert_eq!(params.limit, Some(5));
+    }
+
+    #[test]
+    fn build_agent_history_refuses_a_detail_it_does_not_have() {
+        let err = build_agent_history(json!({"target": "claude", "detail": "everything"}))
+            .expect_err("unknown detail levels are refused, not silently downgraded");
+        assert_eq!(err.code, -32602);
+    }
+
+    /// The reason this tool exists rather than another `agent.read` source:
+    /// `agent.read` is a pane read, and a pane read is not a transcript.
+    #[test]
+    fn flock_agent_history_builds_the_transcript_verb_not_a_pane_read() {
+        let method = build_agent_history(json!({"target": "claude"})).unwrap();
+        assert!(
+            matches!(method, Method::AgentHistory(_)),
+            "history must never resolve to a pane buffer read"
+        );
     }
 
     /// There is no argv on the wire, so a caller cannot smuggle one in.

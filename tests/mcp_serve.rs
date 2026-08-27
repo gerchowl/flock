@@ -241,7 +241,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
     // the request's response (not two lines).
     mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
-    // 3. tools/list — closed table with the design's 10 exposed verbs.
+    // 3. tools/list — the closed table, in order.
     mcp.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
     let list = mcp.recv(Duration::from_secs(5));
     assert_eq!(list["id"], 2);
@@ -263,6 +263,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_pane_read",
             "flock_worktree_list",
             "flock_agent_start",
+            "flock_agent_history",
         ]
     );
     for tool in tools {
