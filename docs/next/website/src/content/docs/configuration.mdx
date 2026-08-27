@@ -330,6 +330,7 @@ Flock can show popup notifications when agents finish or need input.
 ```toml
 [ui.toast]
 delivery = "off"
+delay_seconds = 1
 ```
 
 `delivery = "off"` disables popup notifications. This is the default.
@@ -341,6 +342,8 @@ delivery = "off"
 `delivery = "system"` asks the local operating system directly. On macOS, Flock uses `terminal-notifier` when available, then falls back to `/usr/bin/osascript`. `terminal-notifier` can activate the hosting terminal when you click the notification. On Linux, Flock uses `notify-send` and requires `DISPLAY` or `WAYLAND_DISPLAY`.
 
 Popup notifications are for background attention. Flock suppresses popups for the active tab.
+
+`delay_seconds` is how long an agent has to stay in a state before Flock says anything about it. The default is 1 second, which is enough to swallow the brief pauses agents make while they are still working. An agent that leaves the state inside the window never notifies at all, and neither does one whose pane you walked over to in the meantime — the decision is re-taken when the delay expires, not when it started. Set `delay_seconds = 0` to notify on the transition itself, or raise it if you only want to hear about work that has genuinely stopped. The maximum is 3600. This applies to agent state changes only; `flock notification show` is an explicit request and is never held.
 
 ## Window title
 

@@ -229,6 +229,7 @@ impl App {
         // #130: commit any background completions that have now dwelled past the
         // attention settle (re-arm `●` + fire the completion sound/toast) and
         // broadcast each resulting Idle→Done status change to API subscribers.
+        let toast_before_notifications = self.state.toast.clone();
         let settled = self
             .state
             .commit_settled_completions(now, &self.terminal_runtimes);
@@ -239,6 +240,22 @@ impl App {
             self.emit_pane_state_update(update);
         }
         changed |= !settled.is_empty();
+
+        // #36: deliver agent notifications whose pane has now dwelled out
+        // `[ui.toast] delay_seconds`. Ordered after the settle commit so a
+        // completion that just committed — and whose gate is measured from the
+        // transition, not from the commit — goes out in this same tick.
+        let deliveries = self
+            .state
+            .drain_due_agent_notifications(now, &self.terminal_runtimes);
+        if !deliveries.is_empty() {
+            self.emit_client_local_agent_notifications(&deliveries);
+            changed = true;
+        }
+        // A toast raised off the loop tick — by the settle commit or by the
+        // delay gate — still has to be given its dismissal deadline, or it sits
+        // on screen until some unrelated event syncs one.
+        self.sync_toast_deadline(toast_before_notifications);
 
         self.start_git_status_refresh_if_due(now);
 
@@ -628,6 +645,10 @@ impl App {
                 .then_some(())
                 .and_then(|()| self.issue_guard.next_poll_deadline()),
             self.pending_agent_resume_deadline,
+            // #36: a notification held behind `[ui.toast] delay_seconds` must
+            // wake an otherwise quiet loop, or it lands only on the next
+            // unrelated tick.
+            self.state.next_pending_agent_notification_deadline(),
             self.session_save_deadline,
             // #361: a title change that landed inside the debounce window must
             // still reach the host terminal — wake for the end of the window.
@@ -1836,6 +1857,49 @@ mod tests {
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             Some(now)
+        );
+    }
+
+    /// #36: a notification held behind `[ui.toast] delay_seconds` has to wake
+    /// an otherwise idle loop, or it lands only when something unrelated ticks.
+    #[test]
+    fn held_agent_notification_wakes_the_loop() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces.push(Workspace::test_new("background"));
+        app.state.workspaces.push(Workspace::test_new("active"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                activity: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        // #175 C2: blocked-alert arms the checks heartbeat, which would
+        // otherwise be the nearer deadline and hide the one under test.
+        app.checks_heartbeat_deadline = None;
+
+        let deadline = app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(Instant::now(), false, false),
+            Some(deadline)
         );
     }
 
