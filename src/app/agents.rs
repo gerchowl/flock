@@ -135,6 +135,17 @@ impl App {
         let focus = params.focus;
         let (rows, cols) = self.state.estimate_pane_size();
 
+        // #359: `flk agent start` execs argv directly, so the profile selector
+        // the operator's shell exported never reaches the child unless it is
+        // carried here. Resolved from the API peer — the `flk` process the
+        // operator ran, or the agent that asked — and refused rather than
+        // guessed. Held across every placement branch below, because all of
+        // them end in an argv exec.
+        let spawn_env = self
+            .resolve_spawn_env(&argv, self.current_api_peer_pid, None)
+            .map_err(AgentStartError::ProfileUnresolved)?;
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+
         let (ws_idx, tab_idx, pane_id) = if let Some(tab_id) = params.tab_id {
             let (ws_idx, tab_idx) =
                 self.parse_tab_id(&tab_id)
@@ -238,6 +249,10 @@ impl App {
                 code: "agent_start_failed".into(),
                 message,
             },
+            AgentStartError::ProfileUnresolved(unresolved) => crate::api::schema::ErrorBody {
+                code: unresolved.code().into(),
+                message: unresolved.message(),
+            },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 code: "agent_name_taken".into(),
                 message: format!(
@@ -319,6 +334,56 @@ impl App {
                 ),
             },
         }
+    }
+
+    /// The shell-supplied environment an argv-spawned agent must carry so it
+    /// lands on the same agent profile as whoever asked for it (#359).
+    ///
+    /// `requester_pid` is the process that ASKED: the API peer for
+    /// `agent.spawn` and `agent.start`, the forked pane's own child for either
+    /// fork path. Reading it there rather than from the server is not a
+    /// preference — the server's environment has no profile selector in it at
+    /// all, so there is nothing at this end to allow-list.
+    ///
+    /// `recorded` is the profile flock already knows this child belongs on,
+    /// from the `session_id -> config_dir` records Claude's `SessionStart` hook
+    /// writes (`agent_resume::claude_config_dir_for_session`). It is a
+    /// FALLBACK, not an override: a live requester is the current truth, since
+    /// an operator can switch a pane's profile after the session started. The
+    /// record is what answers for a pane with no live process — a hibernated
+    /// agent is forkable and has no child pid at all.
+    ///
+    /// Shared by all four spawn doors so a refusal, and a successful carry,
+    /// mean the same thing whichever one the caller came in through.
+    pub(crate) fn resolve_spawn_env(
+        &self,
+        argv: &[String],
+        requester_pid: Option<u32>,
+        recorded: Option<String>,
+    ) -> Result<Vec<(String, String)>, crate::spawn::env::ProfileUnresolved> {
+        let agent = crate::spawn::env::agent_for_argv(argv);
+        let attested = requester_pid
+            .and_then(|pid| crate::spawn::env::read_requester_env(pid, std::process::id()))
+            .or_else(|| recorded.map(crate::spawn::env::recorded_claude_profile));
+        let requester_env = match (attested, requester_pid) {
+            (Some(env), _) => crate::spawn::env::RequesterEnv::Attested(env),
+            // A pid we could not read is the case worth refusing over: a
+            // process IS there, so a selector may well be there with it.
+            (None, Some(_)) => crate::spawn::env::RequesterEnv::Unreadable,
+            // No requester and no record. Nothing was ever there to read.
+            (None, None) => crate::spawn::env::RequesterEnv::Absent,
+        };
+        crate::spawn::env::resolve(agent, &requester_env, |dir| {
+            std::path::Path::new(dir).is_dir()
+        })
+        .map_err(|unresolved| match unresolved {
+            // The pure resolver has no pid to name; fill it in here so the
+            // refusal points an operator at a process they can inspect.
+            crate::spawn::env::ProfileUnresolved::RequesterUnreadable { .. } => {
+                crate::spawn::env::ProfileUnresolved::RequesterUnreadable { pid: requester_pid }
+            }
+            other => other,
+        })
     }
 
     pub(super) fn spawn_agent_workspace(
@@ -467,6 +532,9 @@ pub(super) enum AgentStartError {
     },
     PlacementConflict,
     SpawnFailed(String),
+    /// #359: the agent profile the child would run under could not be
+    /// established from the caller.
+    ProfileUnresolved(crate::spawn::env::ProfileUnresolved),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
@@ -479,4 +547,98 @@ pub(super) enum AgentRenameError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::schema::{AgentStartParams, Method, Request};
+
+    fn test_app() -> crate::app::App {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn start_request(program: &str) -> Request {
+        Request {
+            id: "req_agent_start_profile".into(),
+            method: Method::AgentStart(AgentStartParams {
+                name: "worker".into(),
+                cwd: Some("/".into()),
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                argv: vec![program.to_string()],
+            }),
+        }
+    }
+
+    /// A pid that named a process and no longer does. Reaped before use, so
+    /// the read attests nothing on any platform.
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)]
+    fn unreadable_requester_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a probe child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    /// #359: `flk agent start` execs argv with no shell in between, so the
+    /// Claude profile selector a login shell exports never reaches the child.
+    /// A caller flock cannot read attests nothing, and the guess that would
+    /// license is the default profile — which may be a DIFFERENT authenticated
+    /// account. Refuse at spawn time instead, so the failure is a typed error
+    /// rather than a child parked at a login prompt in a pane nobody is
+    /// watching.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claude_start_refuses_when_the_callers_profile_cannot_be_read() {
+        let mut app = test_app();
+        let before = app.state.workspaces.len();
+        app.current_api_peer_pid = Some(unreadable_requester_pid());
+        let raw = app.handle_api_request(start_request("claude"));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(response["error"]["code"], "agent_profile_unresolved");
+        assert_eq!(
+            app.state.workspaces.len(),
+            before,
+            "a refused start must create nothing"
+        );
+    }
+
+    /// The refusal is scoped to agents flock knows to have shell-supplied
+    /// state. Anything else must start exactly as it did before — a global
+    /// gate here would break every non-claude `agent start` on a host where
+    /// process environments are unreadable.
+    #[tokio::test]
+    async fn a_non_agent_program_is_not_gated_on_a_profile() {
+        let mut app = test_app();
+        let raw = app.handle_api_request(start_request(&crate::test_support::no_op_program()));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_ne!(
+            response["error"]["code"], "agent_profile_unresolved",
+            "only agents with a shell-supplied selector are gated"
+        );
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
 }
