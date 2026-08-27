@@ -107,6 +107,63 @@ impl App {
             })
     }
 
+    /// Where an agent starts, given an explicit `--cwd` and the placement it
+    /// was aimed at (#365).
+    ///
+    /// `agent start` used to consult `--cwd`, then `current_dir()` — the
+    /// SERVER's cwd, which for a daemon launched from a login shell is
+    /// `$HOME`. So `--workspace <id>` named a destination for the pane and
+    /// none at all for the process: the agent landed in the home directory of
+    /// a machine it had just been pointed away from. When that agent is Claude
+    /// Code the first thing the operator sees is a trust prompt asking for
+    /// read, edit and execute over all of `$HOME` — flock steered it there,
+    /// and accepting is the natural reflex.
+    ///
+    /// Every other pane-creating verb already follows its target:
+    /// `pane.split` and `tab.create` both read the target pane's cwd. This is
+    /// that, for agents, with flock's own record of the checkout preferred
+    /// over wherever a shell inside it has since wandered — an agent wants the
+    /// worktree root, which is also where `worktree create` puts its own root
+    /// pane.
+    ///
+    /// Deliberately NOT routed through `resolve_new_terminal_cwd`. The
+    /// `[terminal] new_cwd` policy answers "where does a new interactive pane
+    /// go when nobody said", and `--workspace` / `--tab` / `--split` IS
+    /// somebody saying. Honouring a `home` policy here would rebuild this bug
+    /// out of a config key.
+    ///
+    /// Candidates are checked for existence, so a membership whose checkout
+    /// has been removed degrades to the old fallback instead of turning
+    /// `agent start` into an ENOENT from the PTY layer.
+    fn agent_start_cwd(
+        &self,
+        explicit: Option<PathBuf>,
+        placement: Option<(usize, crate::layout::PaneId)>,
+    ) -> PathBuf {
+        explicit
+            .or_else(|| {
+                let (ws_idx, target_pane) = placement?;
+                let ws = self.state.workspaces.get(ws_idx)?;
+                let checkout = ws
+                    .worktree_space
+                    .as_ref()
+                    .map(|space| space.checkout_path.clone());
+                let pane_cwd = ws.find_tab_index_for_pane(target_pane).and_then(|tab_idx| {
+                    ws.tabs.get(tab_idx)?.cwd_for_pane(
+                        target_pane,
+                        &self.state.terminals,
+                        &self.terminal_runtimes,
+                    )
+                });
+                checkout
+                    .into_iter()
+                    .chain(pane_cwd)
+                    .find(|path| path.is_dir())
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -126,11 +183,7 @@ impl App {
             });
         }
 
-        let cwd = params
-            .cwd
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let explicit_cwd = params.cwd.map(PathBuf::from);
         let argv = params.argv;
         let focus = params.focus;
         let (rows, cols) = self.state.estimate_pane_size();
@@ -163,6 +216,7 @@ impl App {
                 }
             }
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
+            let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             self.spawn_agent_split(
                 ws_idx,
                 target_pane,
@@ -179,6 +233,7 @@ impl App {
             })?;
             let tab_idx = self.state.workspaces[ws_idx].active_tab;
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
+            let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             self.spawn_agent_split(
                 ws_idx,
                 target_pane,
@@ -193,10 +248,12 @@ impl App {
             // "put this beside what I am looking at" without naming a target.
             let ws_idx = self.state.active.unwrap_or(0);
             if self.state.workspaces.is_empty() {
+                let cwd = self.agent_start_cwd(explicit_cwd, None);
                 self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
             } else {
                 let tab_idx = self.state.workspaces[ws_idx].active_tab;
                 let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
+                let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
                 self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
             }
         } else {
@@ -212,6 +269,7 @@ impl App {
             //
             // Splitting is still reachable, but only by asking: name a
             // `workspace_id`/`tab_id`, or pass `split`.
+            let cwd = self.agent_start_cwd(explicit_cwd, None);
             self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
         };
 
@@ -576,6 +634,69 @@ mod tests {
         )
     }
 
+    /// A real directory for a fixture checkout. The new cwd resolution gates
+    /// its candidates on `is_dir()`, so a made-up path would silently
+    /// exercise the fallback rather than the branch under test.
+    fn fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flock-agent-start-cwd-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture checkout directory");
+        std::fs::canonicalize(&dir).expect("canonical fixture path")
+    }
+
+    fn worktree_membership(
+        checkout: &std::path::Path,
+    ) -> crate::workspace::WorktreeSpaceMembership {
+        crate::workspace::WorktreeSpaceMembership {
+            key: "fixture-repo".into(),
+            label: "fixture".into(),
+            repo_root: checkout.to_path_buf(),
+            checkout_path: checkout.to_path_buf(),
+            is_linked_worktree: true,
+        }
+    }
+
+    /// One workspace, optionally standing at a checkout, active and ready to
+    /// be named by `--workspace`.
+    fn app_with_workspace(
+        name: &str,
+        membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    ) -> (crate::app::App, String) {
+        let mut app = test_app();
+        let mut workspace = crate::workspace::Workspace::test_new(name);
+        workspace.worktree_space = membership;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let workspace_id = app.public_workspace_id(0);
+        (app, workspace_id)
+    }
+
+    fn targeted_start_request(workspace_id: &str, cwd: Option<String>) -> Request {
+        Request {
+            id: "req_agent_start_cwd".into(),
+            method: Method::AgentStart(AgentStartParams {
+                name: "worker".into(),
+                cwd,
+                workspace_id: Some(workspace_id.to_string()),
+                tab_id: None,
+                split: None,
+                focus: false,
+                argv: vec![crate::test_support::no_op_program()],
+            }),
+        }
+    }
+
+    fn shutdown(app: &mut crate::app::App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
     fn start_request(program: &str) -> Request {
         Request {
             id: "req_agent_start_profile".into(),
@@ -652,5 +773,108 @@ mod tests {
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
         }
+    }
+
+    /// #365: `--workspace <id>` named where the PANE goes and nothing about
+    /// where the PROCESS starts, so the agent opened in the server's own cwd —
+    /// `$HOME` for a daemon started from a login shell. Claude Code then asks
+    /// the operator to trust the entire home directory, and the reflex is to
+    /// accept.
+    #[tokio::test]
+    async fn a_workspace_targeted_agent_starts_in_that_workspaces_checkout() {
+        let checkout = fixture_dir("checkout");
+        let (mut app, workspace_id) =
+            app_with_workspace("issue-365", Some(worktree_membership(&checkout)));
+
+        let raw = app.handle_api_request(targeted_start_request(&workspace_id, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            response["result"]["agent"]["cwd"],
+            checkout.to_string_lossy().as_ref(),
+            "the agent belongs in the checkout its workspace stands in"
+        );
+
+        shutdown(&mut app);
+        let _ = std::fs::remove_dir_all(&checkout);
+    }
+
+    /// A workspace that is not a flock-managed worktree still names a place.
+    /// Following the target pane is what `pane.split` and `tab.create` already
+    /// do; `agent.start` was the one pane-creating verb that did not.
+    #[tokio::test]
+    async fn a_workspace_targeted_agent_follows_the_target_pane_without_a_worktree() {
+        let elsewhere = fixture_dir("pane");
+        let (mut app, workspace_id) = app_with_workspace("no-worktree", None);
+        for terminal in app.state.terminals.values_mut() {
+            terminal.cwd = elsewhere.clone();
+        }
+
+        let raw = app.handle_api_request(targeted_start_request(&workspace_id, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            response["result"]["agent"]["cwd"],
+            elsewhere.to_string_lossy().as_ref(),
+            "with no checkout to prefer, the agent lands where the pane it joins stands"
+        );
+
+        shutdown(&mut app);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// `--cwd` is still the last word. It was the documented workaround for
+    /// this bug, and scripts carrying it must not start behaving differently
+    /// once the default improves.
+    #[tokio::test]
+    async fn an_explicit_cwd_still_outranks_the_workspace_target() {
+        let checkout = fixture_dir("outranked-checkout");
+        let asked_for = fixture_dir("asked-for");
+        let (mut app, workspace_id) =
+            app_with_workspace("explicit", Some(worktree_membership(&checkout)));
+
+        let raw = app.handle_api_request(targeted_start_request(
+            &workspace_id,
+            Some(asked_for.to_string_lossy().into_owned()),
+        ));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            response["result"]["agent"]["cwd"],
+            asked_for.to_string_lossy().as_ref()
+        );
+
+        shutdown(&mut app);
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&asked_for);
+    }
+
+    /// A membership whose checkout has been deleted must not turn a working
+    /// verb into an ENOENT from the PTY layer. It degrades to the old
+    /// fallback, which is a wrong directory rather than no agent at all.
+    #[tokio::test]
+    async fn a_vanished_checkout_falls_back_instead_of_failing_the_start() {
+        let gone = std::env::temp_dir().join(format!(
+            "flock-agent-start-cwd-{}-vanished",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&gone);
+        let (mut app, workspace_id) =
+            app_with_workspace("vanished", Some(worktree_membership(&gone)));
+
+        let raw = app.handle_api_request(targeted_start_request(&workspace_id, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_ne!(
+            response["result"]["agent"]["cwd"],
+            gone.to_string_lossy().as_ref(),
+            "a checkout that is not there cannot be started in"
+        );
+
+        shutdown(&mut app);
     }
 }
