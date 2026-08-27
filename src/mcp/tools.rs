@@ -289,7 +289,7 @@ fn schema_agent_start() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 16384,
-                "description": "The child's opening turn. Give it everything it needs — it does NOT inherit your context."
+                "description": "The child's opening turn. Give it everything it needs — it does NOT inherit your context. Flock puts its own preamble ahead of this text and fences it as untrusted input, so relaying an issue body verbatim is safe to do and safe to read. Terminal control sequences are refused rather than stripped."
             },
             "location": {
                 "type": "object",

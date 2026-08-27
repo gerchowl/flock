@@ -167,15 +167,16 @@ As of acceptance (#345):
 | 1 | `Method::AgentSpawn`, closed `AgentKind`, server-side argv | landed |
 | 2 | location as a union over known checkouts | landed, minus `new_branch` — a caller creates the checkout first and spawns into it by path |
 | 3 | env allowlist | landed (#347). `env_clear()` plus a per-agent table (`src/spawn/allowlist.rs`), armed only on the agent-spawn path, with the resolved keys on the spawn's log line so an omission is a read rather than a bisect. The deny-list stays on beneath it as a second line. Not settled: a fleet on Bedrock or Vertex needs `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`, which §3's own deny-list strips — allowing a third-party cloud credential through is the operator's call, not the implementer's |
-| 4 | untrusted prompt: system-owned preamble, control-byte refusal | **not landed** (#348). The prompt is length-capped and passed as one argv element, so nothing reaches a shell — but a foreman's prompts come from issue bodies, and neither the preamble nor the byte filter exists yet |
+| 4 | untrusted prompt: system-owned preamble, control-byte refusal | landed (#348). `src/spawn/prompt.rs` composes the opening turn: flock's preamble, then the caller's text fenced under a tag minted per spawn, so the caller — whose text is fixed before the tag exists — cannot close the block and carry on in flock's voice. `AgentKind::argv` accepts only the composed type, which is what keeps the constraint off any one call site. Control sequences are refused rather than stripped (`src/control_bytes.rs`, one filter shared with `msg.send`'s strip policy), because the prompt is the whole turn and silently editing it runs a task nobody wrote. What the preamble may promise is bounded below |
 | 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
 | 6 | ceiling in the shared spawn funnel | landed (#349). `agent.spawn` and `agent.fork` both ask one App-side funnel, which gates a caller CLASS rather than a verb: a caller whose process ancestry lands in an agent's pane meets the three limits, an operator meets none of them. Agent-initiated fork children are stamped with `spawned_by`/`spawn_depth`, so they count and the two verbs cannot be alternated past the cap. The TUI keyboard fork never enters the funnel at all — deliberately, per the operator exemption. Note the fork half is NOT behind `[fleet] agent_spawn_enabled`: that switch opts a node into `agent.spawn`, and gating an already-shipped verb on it would leave the bypass open on every node that never set it |
 | 7 | `fleet pause` refuses agent-initiated spawn | landed |
 | 8 | refusals separate retryable from terminal | landed |
 
-The remaining gap is #348 — tracked as an issue rather than left in this
-table, because an Accepted ADR whose unbuilt parts live only in prose is how
-they get forgotten.
+Every § is now built (#348 closed §4, #349 closed §6). The table stays because
+an Accepted ADR whose gaps live only in prose is how they get forgotten — and
+because the two rows above record what was decided while closing them, which
+is not derivable from the code.
 
 What #349 turned out to be about, worth keeping: the ceiling could not be
 described by naming verbs. `agent.spawn` gated, `agent.fork` not, and the two
@@ -183,6 +184,23 @@ cost the fleet the same thing — so the cap held only for as long as an agent
 reached for the verb that had it. What it gates now is who is asking, which is
 the same line `fleet pause` draws in §7 and the only one that does not have to
 be re-drawn every time a verb is added.
+
+### What §4's preamble may promise
+
+Mitigation, not a trust boundary. The preamble tells the child what it is
+reading and raises the cost of an injection carried in relayed text; a model
+can still be talked around, and §4 does not become a boundary by being
+implemented. The P3 line — sender identity is routing and audit, never
+authorization — applies to it exactly as it applies to a sender stamp, so
+nothing downstream may treat a composed prompt as a safe one.
+
+Two things it *does* promise, because both are properties of the construction
+rather than of the child's judgement: the caller's text can never precede the
+preamble, and the caller cannot close the fence, since the tag is minted after
+its text is fixed. The boundaries that actually hold are the ones already
+built — the closed `AgentKind` (§1), the environment allowlist (§3), the
+lineage ceiling (§5), and the `Agent-Run:` trailer that keeps a talked-around
+child's commits revertable.
 
 ## Alternatives rejected
 

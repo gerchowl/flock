@@ -96,44 +96,14 @@ pub(super) fn pane_agent_status_from_terminal(
 
 /// Cap reported prompts to a sane size and strip control characters that
 /// could corrupt the float rendering. Newlines and tabs survive.
+///
+/// Stripping is the right policy HERE: this text is appended to a turn that
+/// already exists, so a mangled sentence beats a refused delivery. The spawn
+/// path shares the filter and refuses instead, because there the text is the
+/// whole turn (`crate::spawn::prompt`, ADR-0014 §4).
 pub(super) fn sanitize_reported_prompt(prompt: &str) -> String {
     const MAX_PROMPT_LEN: usize = 16 * 1024;
-    // Drop full ANSI CSI/OSC escape sequences, then any leftover controls.
-    let mut cleaned = String::with_capacity(prompt.len().min(MAX_PROMPT_LEN + 8));
-    let mut chars = prompt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    // CSI: consume through the final byte (@..~).
-                    for follow in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&follow) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    // OSC: consume through BEL or ESC\.
-                    while let Some(follow) = chars.next() {
-                        if follow == '\u{7}' {
-                            break;
-                        }
-                        if follow == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if !c.is_control() || c == '\n' || c == '\t' {
-            cleaned.push(c);
-        }
-    }
+    let mut cleaned = crate::control_bytes::strip(prompt);
     if cleaned.len() > MAX_PROMPT_LEN {
         let mut cut = MAX_PROMPT_LEN;
         while !cleaned.is_char_boundary(cut) {

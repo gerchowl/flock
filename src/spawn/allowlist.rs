@@ -173,6 +173,11 @@ mod tests {
     use super::*;
     use crate::spawn::AgentKind;
 
+    /// Any valid prompt will do here: these tests read argv[0], not the turn.
+    fn probe_prompt() -> crate::spawn::prompt::SpawnPrompt {
+        crate::spawn::prompt::SpawnPrompt::compose("probe").expect("a plain prompt composes")
+    }
+
     /// Acceptance: every supported kind resolves to a table that can actually
     /// start it. PATH and HOME are the two whose absence is not a subtle
     /// misbehaviour but a failure to exec at all — `CommandBuilder` resolves
@@ -181,7 +186,7 @@ mod tests {
     fn every_supported_agent_kind_gets_an_allowlist_that_can_start_it() {
         for kind in AgentKind::supported() {
             let kind = AgentKind::parse(kind).expect("supported kinds parse");
-            let allowlist = for_argv(&kind.argv("prompt"));
+            let allowlist = for_argv(&kind.argv(&probe_prompt()));
             for required in ["PATH", "HOME"] {
                 assert!(
                     allowlist.keys().contains(&required),
@@ -200,7 +205,7 @@ mod tests {
     fn every_supported_agent_kind_is_recognised_from_its_own_argv() {
         for kind in AgentKind::supported() {
             let kind = AgentKind::parse(kind).expect("supported kinds parse");
-            let argv = kind.argv("prompt");
+            let argv = kind.argv(&probe_prompt());
             assert!(
                 super::super::env::agent_for_argv(&argv).is_some(),
                 "{argv:?} must resolve to an agent, or its per-kind keys are unreachable"
@@ -236,7 +241,7 @@ mod tests {
     fn no_entry_is_a_wildcard() {
         for kind in AgentKind::supported() {
             let kind = AgentKind::parse(kind).expect("supported kinds parse");
-            for key in for_argv(&kind.argv("prompt")).keys() {
+            for key in for_argv(&kind.argv(&probe_prompt())).keys() {
                 assert!(
                     !key.contains('*') && !key.is_empty(),
                     "{key:?} is not an exact environment variable name"
