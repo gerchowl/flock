@@ -25,6 +25,16 @@
 //! Depth and fanout are answered from state stamped on each terminal at spawn
 //! (`spawn_depth`, `spawned_by`), so the check is O(live panes) and never
 //! walks the durable event log on a request path.
+//!
+//! # The funnel
+//!
+//! The ceiling gates a CALLER CLASS, not a verb (ADR-0014 §6). It first shipped
+//! on `agent.spawn`'s own call site, which meant an agent refused by
+//! `at_agent_capacity` could call `agent.fork` for the same fleet cost and be
+//! admitted unconditionally — one verb's constraint, routed around by the verb
+//! next to it. Both now ask [`admit`] through one App-side funnel, and what
+//! distinguishes them is who is on the other end: an agent attested by process
+//! ancestry answers to the limits, an operator never does (#349).
 
 pub mod allowlist;
 pub mod env;
@@ -192,14 +202,50 @@ impl Default for FleetConfig {
     }
 }
 
+/// Which spawn-shaped verb is asking (#349).
+///
+/// Both put an agent-initiated agent on this node, so both answer to the same
+/// three limits. They differ in one thing only: whether the node had to opt
+/// into the verb before it existed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnVerb {
+    /// `agent.spawn` — the closed dispatch verb (#329). New surface, so it
+    /// ships off and an operator turns it on.
+    Spawn,
+    /// `agent.fork` — cloning a live conversation into a fresh worktree.
+    /// Older than the ceiling, and already reachable everywhere.
+    Fork,
+}
+
+impl SpawnVerb {
+    /// Whether `[fleet] agent_spawn_enabled` gates this verb.
+    ///
+    /// Only `agent.spawn`. That switch opts a node INTO a verb it did not
+    /// have before; `agent.fork` predates it and already ships enabled, so
+    /// gating fork on it would delete a shipped capability under the banner
+    /// of adding a ceiling — and would leave the bypass the ceiling exists to
+    /// close open on every node that never set the flag, which is all of them
+    /// by default. A limit nobody turned on bounds nothing.
+    fn requires_opt_in(self) -> bool {
+        matches!(self, Self::Spawn)
+    }
+}
+
 /// Decide whether one agent-initiated spawn may proceed.
 ///
 /// `paused` is the fleet pause switch. Pause deliberately exempts human
 /// keystrokes — it halts the scheduler and delivery, not human agency — but an
 /// MCP-originated spawn is not a human, so it refuses. This is the first place
-/// pause distinguishes caller CLASS rather than mechanism (ADR-0014 §7).
-pub fn admit(config: &FleetConfig, census: SpawnCensus, paused: bool) -> Result<(), SpawnRefusal> {
-    if !config.agent_spawn_enabled {
+/// pause distinguishes caller CLASS rather than mechanism (ADR-0014 §7). Which
+/// callers are agents is the CALLER's question, answered before this one: what
+/// reaches here is already known to be agent-initiated.
+pub fn admit(
+    config: &FleetConfig,
+    verb: SpawnVerb,
+    census: SpawnCensus,
+    paused: bool,
+) -> Result<(), SpawnRefusal> {
+    if verb.requires_opt_in() && !config.agent_spawn_enabled {
         return Err(SpawnRefusal::NotEnabled);
     }
     if paused {
@@ -243,8 +289,13 @@ mod tests {
     #[test]
     fn spawn_is_disabled_by_default() {
         assert!(!FleetConfig::default().agent_spawn_enabled);
-        let refusal = admit(&FleetConfig::default(), SpawnCensus::default(), false)
-            .expect_err("default config refuses");
+        let refusal = admit(
+            &FleetConfig::default(),
+            SpawnVerb::Spawn,
+            SpawnCensus::default(),
+            false,
+        )
+        .expect_err("default config refuses");
         assert_eq!(refusal.code(), "agent_spawn_disabled");
         assert!(
             !refusal.retryable(),
@@ -256,12 +307,86 @@ mod tests {
     /// and a paused fleet that still spawns agents is not paused.
     #[test]
     fn a_paused_fleet_refuses_agent_initiated_spawn() {
-        let refusal = admit(&enabled(), SpawnCensus::default(), true).expect_err("paused refuses");
+        let refusal = admit(&enabled(), SpawnVerb::Spawn, SpawnCensus::default(), true)
+            .expect_err("paused refuses");
         assert_eq!(refusal.code(), "fleet_paused");
         assert!(
             refusal.retryable(),
             "an operator can resume; backing off is correct"
         );
+    }
+
+    /// #349: the master switch opts a node INTO `agent.spawn`. `agent.fork`
+    /// already shipped enabled, so it must not be refused for a flag the
+    /// operator never had to set — a ceiling that binds only on nodes which
+    /// turned on an unrelated verb leaves the bypass open on every other one.
+    #[test]
+    fn the_opt_in_switch_gates_spawn_but_never_fork() {
+        let off = FleetConfig::default();
+        assert!(!off.agent_spawn_enabled);
+        assert_eq!(
+            admit(&off, SpawnVerb::Spawn, SpawnCensus::default(), false)
+                .expect_err("spawn is opt-in")
+                .code(),
+            "agent_spawn_disabled"
+        );
+        assert!(
+            admit(&off, SpawnVerb::Fork, SpawnCensus::default(), false).is_ok(),
+            "fork predates the switch; gating it on the flag would delete a shipped verb"
+        );
+    }
+
+    /// The limits belong to the CALLER, not to the verb it reached for. An
+    /// agent-initiated fork costs the fleet exactly what a spawn costs, so it
+    /// meets the same three numbers — on a node where nothing was configured.
+    #[test]
+    fn fork_answers_to_the_same_three_limits_as_spawn() {
+        let config = FleetConfig::default();
+        let cases = [
+            (
+                SpawnCensus {
+                    live_agent_started: 0,
+                    parent_live_children: 0,
+                    child_depth: config.max_spawn_depth + 1,
+                },
+                "at_lineage_depth",
+            ),
+            (
+                SpawnCensus {
+                    live_agent_started: 0,
+                    parent_live_children: config.max_spawn_fanout,
+                    child_depth: 1,
+                },
+                "at_fanout_limit",
+            ),
+            (
+                SpawnCensus {
+                    live_agent_started: config.max_concurrent_agents,
+                    parent_live_children: 0,
+                    child_depth: 1,
+                },
+                "at_agent_capacity",
+            ),
+        ];
+        for (census, expected) in cases {
+            assert_eq!(
+                admit(&config, SpawnVerb::Fork, census, false)
+                    .expect_err("fork is refused")
+                    .code(),
+                expected,
+                "{census:?}"
+            );
+        }
+    }
+
+    /// Pause halts what flock initiates and leaves human agency alone. A fork
+    /// an AGENT asked for is the former, whichever verb carried it (§7).
+    #[test]
+    fn a_paused_fleet_refuses_an_agent_initiated_fork_too() {
+        let refusal = admit(&enabled(), SpawnVerb::Fork, SpawnCensus::default(), true)
+            .expect_err("paused refuses");
+        assert_eq!(refusal.code(), "fleet_paused");
+        assert!(refusal.retryable());
     }
 
     /// The ordering is the point. A caller at max depth told "at capacity"
@@ -274,7 +399,7 @@ mod tests {
             parent_live_children: 99,
             child_depth: 99,
         };
-        let refusal = admit(&enabled(), census, false).expect_err("refused");
+        let refusal = admit(&enabled(), SpawnVerb::Spawn, census, false).expect_err("refused");
         assert_eq!(refusal.code(), "at_lineage_depth");
         assert!(
             !refusal.retryable(),
@@ -292,7 +417,7 @@ mod tests {
             parent_live_children: config.max_spawn_fanout,
             child_depth: 1,
         };
-        let refusal = admit(&config, census, false).expect_err("refused");
+        let refusal = admit(&config, SpawnVerb::Spawn, census, false).expect_err("refused");
         assert_eq!(refusal.code(), "at_fanout_limit");
     }
 
@@ -310,7 +435,9 @@ mod tests {
             child_depth: config.max_spawn_depth + 1,
         };
         assert_eq!(
-            admit(&config, census, false).expect_err("refused").code(),
+            admit(&config, SpawnVerb::Spawn, census, false)
+                .expect_err("refused")
+                .code(),
             "at_lineage_depth"
         );
     }
@@ -319,6 +446,7 @@ mod tests {
     fn a_spawn_within_every_limit_is_admitted() {
         assert!(admit(
             &enabled(),
+            SpawnVerb::Spawn,
             SpawnCensus {
                 live_agent_started: 1,
                 parent_live_children: 1,
@@ -337,7 +465,7 @@ mod tests {
             parent_live_children: 0,
             child_depth: 1,
         };
-        match admit(&config, census, false).expect_err("refused") {
+        match admit(&config, SpawnVerb::Spawn, census, false).expect_err("refused") {
             SpawnRefusal::AtCapacity { current, limit } => {
                 assert_eq!(current, config.max_concurrent_agents);
                 assert_eq!(limit, config.max_concurrent_agents);

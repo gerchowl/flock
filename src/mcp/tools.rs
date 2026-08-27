@@ -85,8 +85,15 @@ pub(super) fn table() -> &'static [Tool] {
             description: "Fork a Claude conversation into a fresh worktree + \
                           pane; the fork carries the full conversation \
                           history. `pivot` becomes the fork's opening turn. \
-                          Refusals: `unsupported_for_agent` (non-Claude), \
-                          `no_agent_session`, `transcript_not_found`.",
+                          Subject to the same spawn ceiling as \
+                          `flock_agent_start` — forking is not a way around a \
+                          capacity refusal. Refusals: \
+                          `unsupported_for_agent` (non-Claude), \
+                          `no_agent_session`, `transcript_not_found`, and the \
+                          ceiling's `at_agent_capacity`, `at_fanout_limit`, \
+                          `at_lineage_depth`, `fleet_paused` — all carrying \
+                          `data.retryable`, which says whether backing off \
+                          can help.",
             input_schema: schema_agent_fork,
             build: build_agent_fork,
         },

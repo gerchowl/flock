@@ -169,18 +169,21 @@ As of acceptance (#345):
 | 3 | env allowlist | landed (#347). `env_clear()` plus a per-agent table (`src/spawn/allowlist.rs`), armed only on the agent-spawn path, with the resolved keys on the spawn's log line so an omission is a read rather than a bisect. The deny-list stays on beneath it as a second line. Not settled: a fleet on Bedrock or Vertex needs `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`, which §3's own deny-list strips — allowing a third-party cloud credential through is the operator's call, not the implementer's |
 | 4 | untrusted prompt: system-owned preamble, control-byte refusal | landed (#348). `src/spawn/prompt.rs` composes the opening turn: flock's preamble, then the caller's text fenced under a tag minted per spawn, so the caller — whose text is fixed before the tag exists — cannot close the block and carry on in flock's voice. `AgentKind::argv` accepts only the composed type, which is what keeps the constraint off any one call site. Control sequences are refused rather than stripped (`src/control_bytes.rs`, one filter shared with `msg.send`'s strip policy), because the prompt is the whole turn and silently editing it runs a task nobody wrote. What the preamble may promise is bounded below |
 | 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
-| 6 | ceiling in the shared spawn funnel | **partial** (#349). It gates `agent.spawn`. `agent.fork` and the TUI keyboard fork do not consult it, so an operator's own forking is unbounded — correct for a human, but it means the capacity count and the thing it protects are not yet the same funnel |
+| 6 | ceiling in the shared spawn funnel | landed (#349). `agent.spawn` and `agent.fork` both ask one App-side funnel, which gates a caller CLASS rather than a verb: a caller whose process ancestry lands in an agent's pane meets the three limits, an operator meets none of them. Agent-initiated fork children are stamped with `spawned_by`/`spawn_depth`, so they count and the two verbs cannot be alternated past the cap. The TUI keyboard fork never enters the funnel at all — deliberately, per the operator exemption. Note the fork half is NOT behind `[fleet] agent_spawn_enabled`: that switch opts a node into `agent.spawn`, and gating an already-shipped verb on it would leave the bypass open on every node that never set it |
 | 7 | `fleet pause` refuses agent-initiated spawn | landed |
 | 8 | refusals separate retryable from terminal | landed |
 
-The remaining gap is #349 — tracked as an issue rather than left in this
-table, because an Accepted ADR whose unbuilt parts live only in prose is how
-they get forgotten.
+Every § is now built (#348 closed §4, #349 closed §6). The table stays because
+an Accepted ADR whose gaps live only in prose is how they get forgotten — and
+because the two rows above record what was decided while closing them, which
+is not derivable from the code.
 
-#349 is the one that bites soonest: `flock_agent_fork` is already on the MCP
-surface and does not consult the ceiling, so an agent refused by
-`at_agent_capacity` can fork instead. The cap is not closed until that path
-shares the gate.
+What #349 turned out to be about, worth keeping: the ceiling could not be
+described by naming verbs. `agent.spawn` gated, `agent.fork` not, and the two
+cost the fleet the same thing — so the cap held only for as long as an agent
+reached for the verb that had it. What it gates now is who is asking, which is
+the same line `fleet pause` draws in §7 and the only one that does not have to
+be re-drawn every time a verb is added.
 
 ### What §4's preamble may promise
 
