@@ -37,35 +37,91 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn msg_send(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
-         [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID] [--from-agent ID]";
-    let mut repo = None;
-    let mut intent = MsgIntent::default();
-    let mut correlation_id = None;
-    let mut in_reply_to = None;
-    let mut agent = None;
-    let mut from_agent = None;
-    let mut from_host = None;
-    let mut positional: Vec<String> = Vec::new();
+/// Every option `flk msg send` understands, named once.
+///
+/// The list is not decoration: the cross-host relay IS `flk msg send` run on
+/// the peer that owns the recipient (`send_peer_message`), so when a peer
+/// refuses a flag this list is that peer telling the sender which build it is
+/// running. In a version-skewed fleet that is the entire diagnosis (#380).
+const SEND_OPTIONS: &[&str] = &[
+    "--repo",
+    "--agent",
+    "--from-agent",
+    "--from-host",
+    "--correlation-id",
+    "--reply-to",
+    "--intent",
+    "--json",
+];
 
+const REPLY_OPTIONS: &[&str] = &["--intent", "--json"];
+
+/// Whether an argument is being offered as an option.
+///
+/// `--` on its own is the terminator, and a lone `-` or a `-1` is body text,
+/// so only a `--`-prefixed word longer than the terminator can be refused.
+fn looks_like_option(arg: &str) -> bool {
+    arg.starts_with("--") && arg.len() > 2
+}
+
+/// The one-line refusal an unrecognised flag earns.
+///
+/// One line on purpose: the relay reports the *last* stderr line of the remote
+/// `flk`, so a refusal that wraps loses the half that names the flag.
+fn unknown_option(command: &str, flag: &str, known: &[&str]) -> String {
+    format!(
+        "{command}: unknown option {flag:?} — this build understands {}, and `--` ends flag \
+         parsing so a body may begin with dashes",
+        known.join(" ")
+    )
+}
+
+/// Everything `flk msg send` can be told, before the target is resolved.
+#[derive(Debug)]
+struct SendArgs {
+    repo: Option<String>,
+    intent: MsgIntent,
+    correlation_id: Option<String>,
+    in_reply_to: Option<String>,
+    agent: Option<String>,
+    from_agent: Option<String>,
+    from_host: Option<String>,
+    positional: Vec<String>,
+}
+
+/// Parse `flk msg send`'s argv, refusing anything shaped like an option that
+/// this build does not know (#380).
+///
+/// Pure, and split out from [`msg_send`], because the refusal is the whole
+/// point: what this returns for an argument it does not understand used to be
+/// the message body, and asserting on it must not need a running server — let
+/// alone the ssh hop the relay puts in front of one.
+fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
+    let mut parsed = SendArgs {
+        repo: None,
+        intent: MsgIntent::default(),
+        correlation_id: None,
+        in_reply_to: None,
+        agent: None,
+        from_agent: None,
+        from_host: None,
+        positional: Vec::new(),
+    };
     let mut index = 0;
     while index < args.len() {
+        // Every value-taking arm reads `args[index + 1]`, so name it once.
+        let value = || {
+            args.get(index + 1)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {}", args[index]))
+        };
         match args[index].as_str() {
             "--repo" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --repo");
-                    return Ok(2);
-                };
-                repo = Some(value.clone());
+                parsed.repo = Some(value()?);
                 index += 2;
             }
             "--correlation-id" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --correlation-id");
-                    return Ok(2);
-                };
-                correlation_id = Some(value.clone());
+                parsed.correlation_id = Some(value()?);
                 index += 2;
             }
             // ADR-0008 addressing: `--agent` targets a fleet-global identity
@@ -73,27 +129,15 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             // a peer relays on its behalf (the receiving server has no local
             // ancestry to attest from).
             "--agent" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --agent");
-                    return Ok(2);
-                };
-                agent = Some(value.clone());
+                parsed.agent = Some(value()?);
                 index += 2;
             }
             "--from-host" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --from-host");
-                    return Ok(2);
-                };
-                from_host = Some(value.clone());
+                parsed.from_host = Some(value()?);
                 index += 2;
             }
             "--from-agent" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --from-agent");
-                    return Ok(2);
-                };
-                from_agent = Some(value.clone());
+                parsed.from_agent = Some(value()?);
                 index += 2;
             }
             // #280. Optional here, and required on the MCP tool: the CLI
@@ -101,36 +145,64 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             // know what they meant. The stamp an agent might skip without
             // noticing is the one worth forcing.
             "--intent" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --intent");
-                    return Ok(2);
+                let raw = value()?;
+                let Some(intent) = MsgIntent::from_wire(&raw) else {
+                    return Err(format!(
+                        "unknown --intent {raw:?}: expected fyi or needs-reply"
+                    ));
                 };
-                let Some(parsed) = MsgIntent::from_wire(value) else {
-                    eprintln!("unknown --intent {value:?}: expected fyi or needs-reply");
-                    return Ok(2);
-                };
-                intent = parsed;
+                parsed.intent = intent;
                 index += 2;
             }
             "--json" => index += 1,
             "--" => {
-                positional.extend(args[index + 1..].iter().cloned());
+                parsed.positional.extend(args[index + 1..].iter().cloned());
                 break;
             }
             "--reply-to" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --reply-to");
-                    return Ok(2);
-                };
-                in_reply_to = Some(value.clone());
+                parsed.in_reply_to = Some(value()?);
                 index += 2;
             }
+            // The fix for #380. An unrecognised flag used to fall through to
+            // the positional arm below and become body text, so a peer running
+            // a build that predated any flag delivered a message with the flag
+            // glued to it — silently, at both ends. Refusing turns that
+            // corruption into a failure the relay reports on the SENDING side,
+            // the posture `SpawnRefusal` and `PrPollErrorKind` already take: a
+            // failure that crosses a host boundary arrives as data, not damage.
+            other if looks_like_option(other) => {
+                return Err(unknown_option("flk msg send", other, SEND_OPTIONS));
+            }
             _ => {
-                positional.push(args[index].clone());
+                parsed.positional.push(args[index].clone());
                 index += 1;
             }
         }
     }
+    Ok(parsed)
+}
+
+fn msg_send(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
+         [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID] [--from-agent ID] \
+         [-- <text starting with dashes>]";
+    let parsed = match parse_send_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+    let SendArgs {
+        repo,
+        intent,
+        correlation_id,
+        in_reply_to,
+        agent,
+        from_agent,
+        from_host,
+        positional,
+    } = parsed;
     // With --agent the identity IS the target, so only the body is positional.
     let (to, body) = if let Some(agent) = agent {
         if positional.is_empty() {
@@ -206,9 +278,13 @@ fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
     }
 }
 
-fn msg_reply(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: flk msg reply <correlation_id> <text...> \
-         [--intent fyi|needs-reply]";
+/// Parse `flk msg reply`'s argv into `(intent, positional)`.
+///
+/// Same refusal rule as [`parse_send_args`], and for the same reason: `reply`
+/// grew `--intent` in the same PR `send` did (#280), so it carries the same
+/// skew hazard. Refusing on one verb and swallowing on the other would leave a
+/// caller unable to tell which behaviour it is talking to.
+fn parse_reply_args(args: &[String]) -> Result<(MsgIntent, Vec<String>), String> {
     let mut intent = MsgIntent::default();
     let mut positional: Vec<String> = Vec::new();
     let mut index = 0;
@@ -216,15 +292,23 @@ fn msg_reply(args: &[String]) -> std::io::Result<i32> {
         match args[index].as_str() {
             "--intent" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --intent");
-                    return Ok(2);
+                    return Err("missing value for --intent".to_string());
                 };
                 let Some(parsed) = MsgIntent::from_wire(value) else {
-                    eprintln!("unknown --intent {value:?}: expected fyi or needs-reply");
-                    return Ok(2);
+                    return Err(format!(
+                        "unknown --intent {value:?}: expected fyi or needs-reply"
+                    ));
                 };
                 intent = parsed;
                 index += 2;
+            }
+            "--json" => index += 1,
+            "--" => {
+                positional.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            other if looks_like_option(other) => {
+                return Err(unknown_option("flk msg reply", other, REPLY_OPTIONS));
             }
             _ => {
                 positional.push(args[index].clone());
@@ -232,6 +316,19 @@ fn msg_reply(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
+    Ok((intent, positional))
+}
+
+fn msg_reply(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: flk msg reply <correlation_id> <text...> \
+         [--intent fyi|needs-reply] [-- <text starting with dashes>]";
+    let (intent, positional) = match parse_reply_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
     if positional.len() < 2 {
         eprintln!("{USAGE}");
         return Ok(2);
@@ -377,6 +474,156 @@ fn print_msg_help() {
         "  flk msg mute <seconds> [--pane TARGET]  stop waking a recipient; 0 clears, \
          mail still arrives"
     );
+    eprintln!(
+        "  --  ends flag parsing: everything after it is body text, so a message may begin \
+         with dashes"
+    );
+    eprintln!(
+        "  an unrecognised --flag is refused, never appended to the body: the relay is this same \
+         command run on the peer, and a peer too old to know a flag must say so rather than \
+         deliver it as text"
+    );
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
     eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        looks_like_option, parse_reply_args, parse_send_args, REPLY_OPTIONS, SEND_OPTIONS,
+    };
+    use crate::api::schema::MsgIntent;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_sent_as_body_text() {
+        // #380. The relay is `flk msg send` run over ssh on the peer that owns
+        // the recipient, and a fleet is routinely version-skewed — so before
+        // this, every flag ever added was, on the day it shipped, a way to
+        // deliver `--intent needs_reply` as the first four words of somebody's
+        // message. Silently, with a success at the sending end.
+        let err = parse_send_args(&argv(&[
+            "--agent",
+            "agent_sage_1",
+            "--intent-typo",
+            "needs_reply",
+            "the message",
+        ]))
+        .expect_err("an unrecognised flag must not become body text");
+        assert!(
+            err.contains("--intent-typo"),
+            "the refusal must name the flag it refused: {err}"
+        );
+        // The refusal crosses the ssh hop as the remote's LAST stderr line, so
+        // it has to be one line and it has to carry the diagnosis with it.
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.contains("--reply-to"),
+            "a peer that refuses also says which flags its build does know: {err}"
+        );
+    }
+
+    #[test]
+    fn a_dash_dash_terminator_lets_a_body_begin_with_dashes() {
+        // The escape hatch the refusal depends on, and the one the relay
+        // already uses for every body it sends.
+        let parsed = parse_send_args(&argv(&[
+            "--agent",
+            "agent_sage_1",
+            "--",
+            "--intent",
+            "is what I typed",
+        ]))
+        .expect("`--` ends flag parsing");
+        assert_eq!(parsed.positional, vec!["--intent", "is what I typed"]);
+        assert_eq!(
+            parsed.intent,
+            MsgIntent::Fyi,
+            "a flag after `--` is text, not a flag"
+        );
+    }
+
+    #[test]
+    fn every_advertised_option_is_actually_accepted() {
+        // The refusal message lists `SEND_OPTIONS`, so a flag that drifts out
+        // of the match arms would be advertised and then refused — the same
+        // builder/advertisement drift #320 found on the MCP schema, one layer
+        // down. Each option is fed with a value; the arms that take none
+        // ignore the extra word as body text, which is what makes this cheap.
+        for option in SEND_OPTIONS {
+            let args = argv(&["--agent", "agent_sage_1", option, "fyi", "body"]);
+            assert!(
+                parse_send_args(&args).is_ok(),
+                "{option} is advertised but refused"
+            );
+        }
+        for option in REPLY_OPTIONS {
+            let args = argv(&[option, "fyi", "c-1", "body"]);
+            assert!(
+                parse_reply_args(&args).is_ok(),
+                "{option} is advertised but refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_may_still_start_with_a_single_dash() {
+        // Only a `--`-prefixed word is refused. A lone `-`, a `-5` or a diff
+        // line is body text, exactly as before — narrowing the escape hatch
+        // any further would break bodies that work today.
+        let parsed = parse_send_args(&argv(&["--agent", "agent_sage_1", "-5", "degrees"]))
+            .expect("a single dash is body text");
+        assert_eq!(parsed.positional, vec!["-5", "degrees"]);
+        assert!(!looks_like_option("-"));
+        assert!(!looks_like_option("--"));
+        assert!(looks_like_option("--anything"));
+    }
+
+    #[test]
+    fn reply_refuses_unknown_flags_and_honours_the_terminator() {
+        // `reply` grew `--intent` alongside `send` (#280) and had no `--` at
+        // all, so a reply whose text began with dashes lost its correlation id
+        // to the body.
+        let err = parse_reply_args(&argv(&["--needs-reply", "c-1", "answered"]))
+            .expect_err("an unrecognised flag must not become the correlation id");
+        assert!(err.contains("--needs-reply"), "{err}");
+
+        let (intent, positional) =
+            parse_reply_args(&argv(&["c-1", "--", "--not-a-flag"])).expect("`--` ends parsing");
+        assert_eq!(positional, vec!["c-1", "--not-a-flag"]);
+        assert_eq!(intent, MsgIntent::Fyi);
+    }
+
+    #[test]
+    fn the_relays_own_command_line_still_parses() {
+        // The exact argv `peer_message_command` builds. If refusing unknown
+        // flags ever broke this, the fix would have closed the corruption by
+        // breaking cross-host messaging outright.
+        let parsed = parse_send_args(&argv(&[
+            "--agent",
+            "agent_sage_1",
+            "--from-agent",
+            "agent_mba22_2",
+            "--from-host",
+            "mba22",
+            "--correlation-id",
+            "c-1",
+            "--reply-to",
+            "c-0",
+            "--intent",
+            "needs_reply",
+            "--json",
+            "--",
+            "re-derive both parameters",
+        ]))
+        .expect("the relay's own command line must survive its own refusal rule");
+        assert_eq!(parsed.agent.as_deref(), Some("agent_sage_1"));
+        assert_eq!(parsed.from_host.as_deref(), Some("mba22"));
+        assert_eq!(parsed.in_reply_to.as_deref(), Some("c-0"));
+        assert_eq!(parsed.intent, MsgIntent::NeedsReply);
+        assert_eq!(parsed.positional, vec!["re-derive both parameters"]);
+    }
 }
