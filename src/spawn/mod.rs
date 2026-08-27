@@ -28,6 +28,7 @@
 
 pub mod allowlist;
 pub mod env;
+pub mod prompt;
 
 use serde::{Deserialize, Serialize};
 
@@ -61,9 +62,17 @@ impl AgentKind {
     /// The prompt is passed as a single positional argument, not interpolated
     /// into a string — there is no shell between here and `execvp`, so a
     /// prompt containing quotes or newlines is inert.
-    pub fn argv(self, prompt: &str) -> Vec<String> {
+    ///
+    /// It arrives as a [`SpawnPrompt`] rather than a `&str` because that type
+    /// is the only thing that has flock's preamble in front of it (ADR-0014
+    /// §4). A `&str` parameter would let a future caller assemble an argv
+    /// around raw caller text and still typecheck, which is the shape §1
+    /// refused `agent.start` over.
+    ///
+    /// [`SpawnPrompt`]: prompt::SpawnPrompt
+    pub fn argv(self, prompt: &prompt::SpawnPrompt) -> Vec<String> {
         match self {
-            Self::Claude => vec!["claude".to_string(), prompt.to_string()],
+            Self::Claude => vec!["claude".to_string(), prompt.as_argv_element().to_string()],
         }
     }
 }
@@ -355,9 +364,31 @@ mod tests {
     /// shell between here and exec, so quoting metacharacters is inert.
     #[test]
     fn a_hostile_prompt_stays_one_argument() {
-        let argv = AgentKind::Claude.argv("'; rm -rf ~ #\nsecond line");
+        let raw = "'; rm -rf ~ #\nsecond line";
+        let argv = AgentKind::Claude.argv(&prompt::SpawnPrompt::compose(raw).expect("valid"));
         assert_eq!(argv.len(), 2);
         assert_eq!(argv[0], "claude");
-        assert_eq!(argv[1], "'; rm -rf ~ #\nsecond line");
+        assert!(
+            argv[1].contains(raw),
+            "the caller's text is carried verbatim, quoting and all"
+        );
+    }
+
+    /// Every argv this enum assembles carries the preamble, because the only
+    /// prompt type it accepts is the one that has already been composed. A
+    /// future kind cannot opt out of it without changing this signature.
+    #[test]
+    fn every_agent_kind_puts_the_preamble_ahead_of_the_task() {
+        let composed = prompt::SpawnPrompt::compose("review #42").expect("valid");
+        for kind in AgentKind::supported() {
+            let kind = AgentKind::parse(kind).expect("supported kinds parse");
+            let argv = kind.argv(&composed);
+            let turn = argv.last().expect("the prompt is the last element");
+            assert!(
+                turn.starts_with("[flock] You were started by another agent"),
+                "{kind:?} must hand the child the preamble first"
+            );
+            assert!(turn.contains("review #42"));
+        }
     }
 }
