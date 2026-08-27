@@ -2034,6 +2034,30 @@ pub(crate) fn agent_run_id_stamp_missed(run_id: &str, workspace_id: &str) {
     );
 }
 
+/// The environment an agent-spawned child was cut down to (#347, ADR-0014 §3).
+///
+/// The line ADR-0014 asks the allowlist to ship with, and it earns its place
+/// on the failure the ADR names: an allowlist that omits something a CLI needs
+/// surfaces as the agent behaving oddly, with nothing to bisect. `allowed` is
+/// the table that was applied and `kept` the subset the server actually had,
+/// so a variable that did not reach the child is a read rather than an
+/// experiment.
+///
+/// Keys only, never values. A line of values would be precisely the leak the
+/// allowlist exists to prevent.
+pub(crate) fn agent_spawn_env_allowlisted(agent: &str, allowed: &str, kept: &str, dropped: usize) {
+    tracing::info!(
+        event = "agent.spawn.env",
+        subsystem = "spawn",
+        outcome = "ok",
+        agent,
+        allowed,
+        kept,
+        dropped,
+        "agent-spawned child scrubbed to its environment allowlist"
+    );
+}
+
 pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
     tracing::info!(
         event = "worktree.add",
