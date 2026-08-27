@@ -3,7 +3,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 
 use bytes::Bytes;
@@ -659,6 +659,43 @@ impl PaneRuntime {
         let pid = self.child_pid.load(Ordering::Acquire);
         (pid > 0).then_some(pid)
     }
+
+    /// The pane child's exit slot, for panes that own a watcher (#178). A
+    /// pane adopted over a live handoff has none: its child was reaped by the
+    /// process that spawned it, not by this one.
+    pub fn child_exit(&self) -> Option<&ChildExit> {
+        self.child_exit.as_deref()
+    }
+}
+
+/// Where a pane's child watcher publishes the exit it reaped (#178).
+///
+/// The watcher already announces a death as `AppEvent::PaneDied`, but that
+/// travels through the app event loop, so the code that has just spawned a
+/// pane cannot use it to answer "is this child already dead?" without
+/// draining events it does not own. This slot answers that question directly,
+/// from whichever thread asks.
+#[derive(Debug, Default)]
+pub struct ChildExit {
+    /// `Some(Some(code))` once the child was reaped; `Some(None)` when the
+    /// wait itself failed, which is not the same thing as "exited 0".
+    reaped: OnceLock<Option<u32>>,
+}
+
+impl ChildExit {
+    fn record(&self, code: Option<u32>) {
+        let _ = self.reaped.set(code);
+    }
+
+    /// Whether the child has been waited on at all.
+    pub fn is_reaped(&self) -> bool {
+        self.reaped.get().is_some()
+    }
+
+    /// The code the child exited with, when the wait yielded one.
+    pub fn exit_code(&self) -> Option<u32> {
+        self.reaped.get().copied().flatten()
+    }
 }
 
 pub struct PaneRuntime {
@@ -667,7 +704,7 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
-    child_wait_completed: Option<Arc<AtomicBool>>,
+    child_exit: Option<Arc<ChildExit>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -815,7 +852,7 @@ impl Drop for PaneRuntime {
             shutdown_pane_processes(
                 self.pane_id,
                 self.child_pid.load(Ordering::Acquire),
-                self.child_wait_completed.as_deref(),
+                self.child_exit.as_deref(),
             );
         }
     }
@@ -836,13 +873,12 @@ fn process_alive_for_shutdown(
 fn wait_for_processes_to_exit(
     pids: &[u32],
     child_pid: u32,
-    child_wait_completed: Option<&AtomicBool>,
+    child_exit: Option<&ChildExit>,
     timeout: std::time::Duration,
 ) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let child_wait_completed =
-            child_wait_completed.is_some_and(|flag| flag.load(Ordering::Acquire));
+        let child_wait_completed = child_exit.is_some_and(ChildExit::is_reaped);
         if pids.iter().all(|pid| {
             !process_alive_for_shutdown(
                 *pid,
@@ -860,11 +896,7 @@ fn wait_for_processes_to_exit(
     }
 }
 
-fn shutdown_pane_processes(
-    pane_id: PaneId,
-    child_pid: u32,
-    child_wait_completed: Option<&AtomicBool>,
-) {
+fn shutdown_pane_processes(pane_id: PaneId, child_pid: u32, child_exit: Option<&ChildExit>) {
     if child_pid == 0 {
         return;
     }
@@ -891,7 +923,7 @@ fn shutdown_pane_processes(
         ),
     ] {
         crate::platform::signal_processes(&pids, signal);
-        if wait_for_processes_to_exit(&pids, child_pid, child_wait_completed, grace) {
+        if wait_for_processes_to_exit(&pids, child_pid, child_exit, grace) {
             info!(
                 pane = pane_id.raw(),
                 pid = child_pid,
@@ -1034,7 +1066,7 @@ impl PaneRuntime {
         shutdown_pane_processes(
             self.pane_id,
             self.child_pid.load(Ordering::Acquire),
-            self.child_wait_completed.as_deref(),
+            self.child_exit.as_deref(),
         );
         self.preserve_processes_on_drop = true;
     }
@@ -1377,7 +1409,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
-            child_wait_completed: None,
+            child_exit: None,
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
@@ -1428,10 +1460,10 @@ impl PaneRuntime {
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
-        let child_wait_completed = Arc::new(AtomicBool::new(false));
+        let child_exit = Arc::new(ChildExit::default());
         {
             let child_pid = child_pid.clone();
-            let child_wait_completed = child_wait_completed.clone();
+            let child_exit = child_exit.clone();
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
@@ -1440,14 +1472,20 @@ impl PaneRuntime {
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
-                match child.wait() {
+                let code = match child.wait() {
                     Ok(status) => {
                         let status_text = format!("{status:?}");
                         crate::logging::pane_exited(pane_id.raw(), &status_text);
+                        Some(status.exit_code())
                     }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
-                }
-                child_wait_completed.store(true, Ordering::Release);
+                    Err(e) => {
+                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                        None
+                    }
+                };
+                // Published BEFORE the event, so a caller polling the slot
+                // never has to out-wait the app loop draining its queue.
+                child_exit.record(code);
                 // Use blocking send — PaneDied is critical, must not be dropped
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
                     crate::logging::pane_died_send_failed(pane_id.raw(), &e.to_string());
@@ -1796,7 +1834,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
-            child_wait_completed: Some(child_wait_completed),
+            child_exit: Some(child_exit),
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
@@ -2153,7 +2191,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
-                child_wait_completed: None,
+                child_exit: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -2483,7 +2521,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
-            child_wait_completed: None,
+            child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -2511,7 +2549,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
-            child_wait_completed: None,
+            child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
