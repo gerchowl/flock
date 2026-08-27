@@ -66,6 +66,16 @@ pub enum Method {
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
+    /// #276: an agent's own conversation, from the session transcript.
+    ///
+    /// Deliberately a verb of its own rather than another `ReadSource` on
+    /// `agent.read`. That method reads a PANE — terminal output, hard-wrapped
+    /// at the width it was drawn at, with a `lines` budget that means nothing
+    /// to a conversation. This one reads the transcript, so its parameters
+    /// are the ones a conversation has: how much of each turn, and where in
+    /// the history to resume.
+    #[serde(rename = "agent.history")]
+    AgentHistory(AgentHistoryParams),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
     /// #329 / ADR-0014: agent-initiated spawn of a FRESH agent.
@@ -504,6 +514,33 @@ pub struct AgentReadParams {
     #[serde(default = "default_true")]
     pub strip_ansi: bool,
 }
+
+/// Params for `agent.history` (#276).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHistoryParams {
+    pub target: String,
+    /// How much of each turn to render. The read is done at THIS level, not
+    /// at whatever level the operator's panel happens to be showing — an
+    /// agent's view of history must not change because a human clicked
+    /// something.
+    #[serde(default)]
+    pub detail: crate::agent_transcript::TranscriptDetail,
+    /// Byte offset into the transcript to resume from, from a previous
+    /// response's `next_cursor`. Omitted means "the latest turns".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    /// Maximum turns to return. Clamped to [`AGENT_HISTORY_MAX_TURNS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Turns returned by `agent.history` when the caller names no `limit`.
+pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
+
+/// Hard cap on turns one `agent.history` call returns. A single turn can
+/// carry a 128 KiB tool result, so the count is the only thing between a
+/// poll and a response nobody can read.
+pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
@@ -1576,6 +1613,9 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fleet: Vec<FleetAgentInfo>,
     },
+    AgentHistory {
+        history: AgentHistoryResult,
+    },
     Lineage {
         chain: Vec<LineageEdge>,
     },
@@ -1958,6 +1998,43 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+}
+
+/// One page of an agent's conversation (#276).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHistoryResult {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// The transcript this page came from. A restarted agent writes a new
+    /// session, and a `cursor` from the old one means nothing in the new
+    /// one — comparing this field is how a poller notices.
+    pub session_id: String,
+    /// The level the turns were rendered at, echoed so a caller reading a
+    /// stored response knows what it is holding.
+    pub detail: crate::agent_transcript::TranscriptDetail,
+    pub turns: Vec<HistoryTurnInfo>,
+    /// Byte offset the first returned turn was parsed from.
+    pub cursor: u64,
+    /// Byte offset to send as `cursor` next time. A poll that hands this back
+    /// parses only what was appended since.
+    pub next_cursor: u64,
+    /// More transcript already sits after `next_cursor` — page again rather
+    /// than wait.
+    pub more: bool,
+    /// Turns older than `cursor` exist and this call did not return them.
+    pub truncated: bool,
+}
+
+/// One turn in an [`AgentHistoryResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTurnInfo {
+    pub role: crate::agent_transcript::Role,
+    pub text: String,
+    /// Unix wall-clock ms the writer stamped on the entry, when it stamped
+    /// one. History is old by definition, so ages come from here rather than
+    /// from when the read happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3192,6 +3269,68 @@ mod tests {
         ] {
             assert!(kind.is_persisted(), "{kind:?} must persist");
         }
+    }
+
+    #[test]
+    fn agent_history_method_and_response_round_trip() {
+        let request = Request {
+            id: "req_h".into(),
+            method: Method::AgentHistory(AgentHistoryParams {
+                target: "w2:p1".into(),
+                detail: crate::agent_transcript::TranscriptDetail::Collapsed,
+                cursor: Some(4096),
+                limit: Some(10),
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"method\":\"agent.history\""), "{json}");
+        assert!(
+            json.contains("\"detail\":\"collapsed\""),
+            "the detail levels are wire names, not Debug strings: {json}"
+        );
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, request);
+
+        let response = SuccessResponse {
+            id: "req_h".into(),
+            result: ResponseResult::AgentHistory {
+                history: AgentHistoryResult {
+                    pane_id: "w2:p1".into(),
+                    workspace_id: "w2".into(),
+                    session_id: "sess-1".into(),
+                    detail: crate::agent_transcript::TranscriptDetail::Collapsed,
+                    turns: vec![HistoryTurnInfo {
+                        role: crate::agent_transcript::Role::Assistant,
+                        text: "on it".into(),
+                        at_ms: Some(1_754_000_000_000),
+                    }],
+                    cursor: 4096,
+                    next_cursor: 8192,
+                    more: true,
+                    truncated: true,
+                },
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"agent_history\""), "{json}");
+        assert!(json.contains("\"role\":\"assistant\""), "{json}");
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    /// The default is the cheapest read a caller can make: the latest turns,
+    /// replies only. Anything more is opt-in, which is what keeps a poll from
+    /// being expensive by accident.
+    #[test]
+    fn agent_history_params_default_to_the_cheapest_read() {
+        let params: AgentHistoryParams =
+            serde_json::from_str(r#"{"target":"claude"}"#).expect("minimal params");
+        assert_eq!(
+            params.detail,
+            crate::agent_transcript::TranscriptDetail::Reply
+        );
+        assert_eq!(params.cursor, None);
+        assert_eq!(params.limit, None);
     }
 
     #[test]
