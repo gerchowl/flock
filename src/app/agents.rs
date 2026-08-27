@@ -187,20 +187,32 @@ impl App {
                 &argv,
                 focus,
             )?
-        } else if self.state.workspaces.is_empty() {
-            self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
-        } else {
+        } else if let Some(split) = params.split {
+            // No placement target, but the caller ASKED to split: honour it
+            // against whatever is active. `--split` is the only way to say
+            // "put this beside what I am looking at" without naming a target.
             let ws_idx = self.state.active.unwrap_or(0);
-            let tab_idx = self.state.workspaces[ws_idx].active_tab;
-            let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
-            self.spawn_agent_split(
-                ws_idx,
-                target_pane,
-                params.split.unwrap_or(SplitDirection::Right),
-                cwd,
-                &argv,
-                focus,
-            )?
+            if self.state.workspaces.is_empty() {
+                self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+            } else {
+                let tab_idx = self.state.workspaces[ws_idx].active_tab;
+                let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
+                self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
+            }
+        } else {
+            // An agent asked for with no placement at all gets its OWN space,
+            // as the tab's only pane.
+            //
+            // This used to split the ACTIVE workspace, which put the new agent
+            // beside whatever the operator happened to be looking at — so
+            // `flk agent start` from inside a pane landed the agent in that
+            // pane's tab, and the space it should have had never existed. The
+            // agent then shares a tab with an unrelated shell, both compete for
+            // the same width, and closing "the space" closes two things.
+            //
+            // Splitting is still reachable, but only by asking: name a
+            // `workspace_id`/`tab_id`, or pass `split`.
+            self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
         };
 
         let terminal_id = self
