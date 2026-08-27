@@ -101,6 +101,8 @@ pub enum Method {
     MsgRead(MsgReadParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
+    #[serde(rename = "msg.wake")]
+    MsgWake(MsgWakeParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.move")]
@@ -722,6 +724,32 @@ pub struct MsgReadParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgStatusParams {
     pub correlation_id: String,
+}
+
+/// `msg.wake` — may this pane be interrupted about its mail, and about how
+/// many messages (#316).
+///
+/// Split from `msg.list` on two axes rather than added to it as a flag.
+///
+/// **Caller class.** `msg.list` answers a reader: what is waiting for me.
+/// This answers flock's own wake path: may I interrupt this agent. #345
+/// settled that the seam is what encodes caller class — a constraint applied
+/// at one call site is one refactor from gone — so the suppression rules live
+/// in a verb only the wake path calls, and the reader's view stays ungated.
+/// An agent that asks `msg.list` inside a paused fleet still sees its mail;
+/// it is the interruption pause halts, not the information.
+///
+/// **Content.** ADR-0008 says the wake channel names a count and a tool,
+/// never a body. `msg.list` carries a 120-character preview of every queued
+/// message, so peeking with it pulled sender-written text into the hook
+/// process at every turn boundary and threw it away. This returns a number,
+/// which makes the rule structural instead of a discipline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MsgWakeParams {
+    /// Whose inbox. Omitted means the caller's own pane, resolved the way
+    /// `msg.read` resolves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1564,6 +1592,17 @@ pub enum ResponseResult {
         /// The messages just consumed, oldest first. Each is marked delivered
         /// as part of this call, so a second read returns an empty list.
         messages: Vec<InboxMessage>,
+    },
+    MsgWake {
+        /// Messages a wake may name. Forced to zero whenever a wake is
+        /// suppressed, so a caller that reads only this field cannot wake
+        /// through a suppression by ignoring the reason. The true queue depth
+        /// is still `msg.list`'s answer.
+        count: usize,
+        /// Why the count was forced to zero: `fleet_paused` today.
+        /// Absent when nothing was suppressed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppressed: Option<String>,
     },
     PaneInfo {
         pane: PaneInfo,

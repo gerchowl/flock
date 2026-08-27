@@ -351,7 +351,7 @@ Exposed tools:
 | `flock_agent_read` | `agent.read` | Reading marks the pane seen — use sparingly. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
-| `flock_msg_send` | `msg.send` | Delivered at the recipient's next settled idle boundary. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
+| `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
 | `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |

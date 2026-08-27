@@ -403,6 +403,91 @@ impl App {
         }
     }
 
+    /// Which inbox a receiver-side verb is about: an explicit `pane` target,
+    /// or — omitted — the caller's own pane, resolved the way `msg.send`
+    /// resolves its sender. `Err` is the encoded refusal, ready to return.
+    ///
+    /// Shared by `msg.read` and `msg.wake` so the two cannot drift on what
+    /// "my inbox" means. They have to agree: a wake counted
+    /// against one pane and a read taken from another is an agent told it has
+    /// mail that it then cannot find.
+    fn resolve_inbox_pane(
+        &mut self,
+        id: &str,
+        pane: Option<String>,
+        verb: &str,
+    ) -> Result<String, String> {
+        let resolved = match pane {
+            Some(pane) => match self.resolve_terminal_target(&pane) {
+                Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
+                Err(err) => {
+                    return Err(super::responses::encode_error_body(
+                        id.to_string(),
+                        self.agent_target_error_body(err),
+                    ))
+                }
+            },
+            None => self
+                .parse_pane_id_or_peer("", self.current_api_peer_pid)
+                .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
+        };
+        resolved.ok_or_else(|| {
+            encode_error(
+                id.to_string(),
+                "msg_target_not_found",
+                format!(
+                    "no pane to {verb}: pass `pane`, or call from inside the pane whose inbox \
+                     you want"
+                ),
+            )
+        })
+    }
+
+    /// `msg.wake` — the count the wake path is allowed to act on (#316).
+    ///
+    /// Suppression, not filtering: nothing leaves the mailbox and nothing is
+    /// marked delivered. A suppressed wake reports zero and names why; the
+    /// messages are still there for `msg.list`, for `msg.read`, and for the
+    /// next wake that is allowed to fire.
+    pub(super) fn handle_msg_wake(
+        &mut self,
+        id: String,
+        params: crate::api::schema::MsgWakeParams,
+    ) -> String {
+        let pane = match self.resolve_inbox_pane(&id, params.pane, "wake") {
+            Ok(pane) => pane,
+            Err(refusal) => return refusal,
+        };
+
+        // US-9 (#175 S3 commit 3). Pause halts what FLOCK initiates and
+        // exempts human agency on purpose — an operator can still type into a
+        // paused pane. A wake is neither: it is flock interrupting an agent
+        // on its own initiative, so it sits on the halted side of that line.
+        //
+        // This gate is a restoration, not a new rule. Pause used to hold the
+        // mailbox by gating `deliver_due_messages`; ADR-0008 (#216) deleted
+        // that drain along with the keystrokes, and the stop-hook wake that
+        // replaced it inherited no gate. A paused fleet went on returning
+        // `decision: block` to every agent at every turn boundary.
+        if self.fleet_pause.paused {
+            return encode_success(
+                id,
+                ResponseResult::MsgWake {
+                    count: 0,
+                    suppressed: Some("fleet_paused".into()),
+                },
+            );
+        }
+
+        encode_success(
+            id,
+            ResponseResult::MsgWake {
+                count: self.mailboxes.queued_len(&pane),
+                suppressed: None,
+            },
+        )
+    }
+
     /// `msg.read` — the recipient consumes its inbox (ADR-0008).
     ///
     /// This is where "delivered" now happens. Under pane injection, delivery
@@ -411,28 +496,9 @@ impl App {
     /// emitted on the same edge, so the audit trail gets truer rather than
     /// noisier.
     pub(super) fn handle_msg_read(&mut self, id: String, params: MsgReadParams) -> String {
-        let pane = match params.pane {
-            Some(pane) => match self.resolve_terminal_target(&pane) {
-                Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
-                Err(err) => {
-                    return super::responses::encode_error_body(
-                        id,
-                        self.agent_target_error_body(err),
-                    )
-                }
-            },
-            // Omitted: the caller's own pane, resolved the way `msg.send`
-            // resolves its sender.
-            None => self
-                .parse_pane_id_or_peer("", self.current_api_peer_pid)
-                .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
-        };
-        let Some(pane) = pane else {
-            return encode_error(
-                id,
-                "msg_target_not_found",
-                "no pane to read: pass `pane`, or call from inside the pane whose inbox you want",
-            );
+        let pane = match self.resolve_inbox_pane(&id, params.pane, "read") {
+            Ok(pane) => pane,
+            Err(refusal) => return refusal,
         };
 
         let now = now_ms();
@@ -818,6 +884,37 @@ mod tests {
                 in_reply_to: None,
             },
         )
+    }
+
+    /// Drive `msg.wake` the way the stop hook does and return what it
+    /// reports: `(count, suppressed_reason)`.
+    fn wake(app: &mut crate::app::App, pane: &str) -> (usize, Option<String>) {
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgWake(crate::api::schema::MsgWakeParams {
+                pane: Some(pane.to_string()),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgWake {
+            count, suppressed, ..
+        } = success.result
+        else {
+            panic!("expected msg_wake: {response}");
+        };
+        (count, suppressed)
+    }
+
+    fn queued_count(app: &mut crate::app::App) -> usize {
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgList(MsgListParams::default()),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgList { messages } = success.result else {
+            panic!("expected msg_list: {response}");
+        };
+        messages.len()
     }
 
     #[tokio::test]
@@ -1393,5 +1490,70 @@ mod tests {
         app.fleet_pause.paused = false;
         app.expire_undeliverable_messages();
         assert_eq!(dropped(&hub), 1, "resume lets the sweep run");
+    }
+
+    /// #316: pause must hold the WAKE, and the wake is what ADR-0008 left
+    /// ungated.
+    ///
+    /// US-9 gated `deliver_due_messages`; #216 deleted that drain along with
+    /// the keystrokes, and the stop-hook wake that replaced it inherited
+    /// nothing — so a paused fleet went on answering every turn boundary with
+    /// `decision: block`. The reader's view is deliberately NOT gated: pause
+    /// halts the interruption, not the information.
+    #[tokio::test]
+    async fn a_paused_fleet_suppresses_the_wake_but_still_lists() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        basic_send(&mut app, "c-wake-pause", "hi");
+
+        assert_eq!(
+            wake(&mut app, &pane),
+            (1, None),
+            "an unpaused fleet names the waiting message",
+        );
+
+        app.fleet_pause.paused = true;
+        assert_eq!(
+            wake(&mut app, &pane),
+            (0, Some("fleet_paused".into())),
+            "a paused fleet must not interrupt an agent about its mail",
+        );
+        assert_eq!(
+            queued_count(&mut app),
+            1,
+            "suppression is not deletion: the message is still queued and still listable",
+        );
+
+        app.fleet_pause.paused = false;
+        assert_eq!(
+            wake(&mut app, &pane),
+            (1, None),
+            "resume restores the wake, with the message still there to name",
+        );
+    }
+
+    /// ADR-0008: the wake channel names a count and a tool, never a body.
+    /// `msg.list` carries a 120-character preview of every queued message, so
+    /// peeking with it put sender-written text in the hook process at every
+    /// turn boundary. Assert on the raw wire, because that is what the hook
+    /// actually receives.
+    #[tokio::test]
+    async fn the_wake_response_carries_no_sender_text() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        basic_send(&mut app, "c-no-body", "SENDER WROTE THIS");
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgWake(crate::api::schema::MsgWakeParams { pane: Some(pane) }),
+        });
+        assert!(
+            !response.contains("SENDER WROTE THIS"),
+            "the wake must not carry the body: {response}",
+        );
+        assert!(
+            !response.contains("preview"),
+            "the wake must not carry a preview either: {response}",
+        );
     }
 }

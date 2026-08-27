@@ -283,6 +283,14 @@ impl MailboxRegistry {
         expired
     }
 
+    /// How many messages are queued for one pane — the number the wake path
+    /// is allowed to know. No bodies, no previews; see [`MsgWakeParams`].
+    ///
+    /// [`MsgWakeParams`]: crate::api::schema::MsgWakeParams
+    pub(crate) fn queued_len(&self, pane: &str) -> usize {
+        self.queues.get(pane).map_or(0, VecDeque::len)
+    }
+
     pub(crate) fn queued_infos(
         &self,
         pane: Option<&str>,
@@ -439,6 +447,19 @@ mod tests {
             registry.enqueue(message("c-overflow", "w1:p2")),
             EnqueueOutcome::MailboxFull
         );
+    }
+
+    /// The wake path is allowed to know a number and nothing else.
+    #[test]
+    fn queued_len_counts_only_the_named_pane() {
+        let mut registry = MailboxRegistry::default();
+        registry.enqueue(message("c-1", "pane-1"));
+        registry.enqueue(message("c-2", "pane-1"));
+        registry.enqueue(message("c-3", "pane-2"));
+
+        assert_eq!(registry.queued_len("pane-1"), 2);
+        assert_eq!(registry.queued_len("pane-2"), 1);
+        assert_eq!(registry.queued_len("pane-3"), 0);
     }
 
     #[test]

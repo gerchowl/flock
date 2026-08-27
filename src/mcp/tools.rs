@@ -103,10 +103,14 @@ pub(super) fn table() -> &'static [Tool] {
             description: "Queue a message to another agent, on this host or \
                           any host in the fleet. Address by `agent` id to \
                           cross machines — a `pane` target names a placement \
-                          on THIS server and cannot leave it. Delivered at \
-                          the recipient's next settled idle boundary (~1.2s \
-                          dwell) — never mid-turn. `correlation_id` is your \
-                          idempotency key. The recipient sees a sender stamp \
+                          on THIS server and cannot leave it. Queued to the \
+                          recipient's inbox, which it reads with \
+                          `flock_msg_read` — flock never types into a \
+                          session. It is nudged to read at its next turn \
+                          boundary, so a recipient that is ALREADY idle is \
+                          not reached until something else prompts it: this \
+                          is a queue, not an interrupt. `correlation_id` is \
+                          your idempotency key. The recipient sees a sender stamp \
                           and reply instructions. Limits: 20 messages/min, 32 \
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
