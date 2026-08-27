@@ -519,9 +519,19 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         )])),
         rows[0],
     );
+    // #360: a workspace whose checkout vanished is not being asked to remove
+    // a folder — the folder is the thing that already went.
+    let checkout_missing = matches!(
+        remove.merge_gate,
+        Some(crate::worktree::WorktreeMergeGate::CheckoutMissing)
+    );
     frame.render_widget(
-        Paragraph::new(" This removes the checkout folder:")
-            .style(Style::default().fg(app.palette.overlay0)),
+        Paragraph::new(if checkout_missing {
+            " This checkout folder is already gone:"
+        } else {
+            " This removes the checkout folder:"
+        })
+        .style(Style::default().fg(app.palette.overlay0)),
         rows[1],
     );
     frame.render_widget(
@@ -545,6 +555,12 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             None => (
                 " checking merge status…".to_string(),
                 Style::default().fg(app.palette.overlay0),
+            ),
+            // #360 goes ahead of the force arm: force cannot delete a branch
+            // that was never resolved, so it has nothing to promise here.
+            Some(crate::worktree::WorktreeMergeGate::CheckoutMissing) => (
+                " ✗ the checkout is gone — no branch to judge; ↵ closes the workspace.".to_string(),
+                Style::default().fg(app.palette.yellow),
             ),
             Some(crate::worktree::WorktreeMergeGate::Merged { evidence }) => (
                 format!(
@@ -655,6 +671,26 @@ fn render_remove_worktree_stakes(
         return;
     }
     let p = &app.palette;
+    // #360: every probe of a checkout that is not there comes back unreadable,
+    // and the block below renders unreadable as "assume there are uncommitted
+    // changes". Here there are none to assume — the directory is gone and the
+    // branch, unresolved, is kept whatever the force toggle says.
+    if matches!(
+        remove.merge_gate,
+        Some(crate::worktree::WorktreeMergeGate::CheckoutMissing)
+    ) {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " nothing to destroy — the checkout is already gone.",
+                    Style::default().fg(p.overlay0),
+                )),
+                remove_worktree_force_line(remove, p),
+            ]),
+            area,
+        );
+        return;
+    }
     let mut lines: Vec<Line<'static>> = Vec::new();
     if probe.has_stakes() {
         lines.push(Line::from(Span::styled(
@@ -1535,6 +1571,39 @@ mod tests {
         let text = render_kill_dialog(&app);
         assert!(text.contains("could not be read"), "{text:?}");
         assert!(text.contains("could not be counted"), "{text:?}");
+    }
+
+    #[test]
+    fn kill_dialog_names_the_missing_checkout_instead_of_blaming_the_branch() {
+        // #360: the gate could not form a question, and reporting that as "no
+        // merge evidence" sends the operator to go check a PR for work that
+        // was never at risk. Every probe of a gone checkout is unreadable too,
+        // so the stakes block used to tell them to assume uncommitted changes
+        // in a directory that is not there.
+        let mut app = AppState::test_new();
+        let mut remove = kill_dialog_state(Some(crate::worktree::KillProbe {
+            dirty: None,
+            unpushed: None,
+        }));
+        remove.branch = None;
+        remove.merge_gate = Some(crate::worktree::WorktreeMergeGate::CheckoutMissing);
+        // Force changes nothing here: there is no branch to delete without
+        // evidence, so the line must not promise one.
+        remove.force = true;
+        app.worktree_remove = Some(remove);
+
+        let text = render_kill_dialog(&app);
+        assert!(text.contains("the checkout is gone"), "{text:?}");
+        assert!(text.contains("closes the workspace"), "{text:?}");
+        assert!(
+            !text.contains("no merge evidence"),
+            "nothing was asked about a branch: {text:?}"
+        );
+        assert!(
+            !text.contains("could not be read"),
+            "there are no changes to assume: {text:?}"
+        );
+        assert!(text.contains("already gone"), "{text:?}");
     }
 
     #[test]

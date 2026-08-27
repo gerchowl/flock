@@ -1465,6 +1465,12 @@ pub enum ResponseResult {
         /// What proved it, when merged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<String>,
+        /// The checkout path is not on disk, so no branch could be resolved
+        /// and the merge gate was never asked (#360). `merged: false` alone
+        /// does not separate this from a branch that WAS judged and found
+        /// unmerged — the two need opposite actions from the operator.
+        #[serde(default)]
+        checkout_missing: bool,
         /// Refused because the branch is the repo default or config-protected
         /// (#121), independent of merge state.
         protected: bool,

@@ -712,17 +712,20 @@ impl App {
         };
 
         let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
-        let (merged, evidence) = match branch.as_deref() {
-            // A detached checkout has no branch to judge or delete.
-            None => (false, None),
-            Some(branch) => match crate::worktree::branch_merge_gate(
-                &space.repo_root,
-                &space.checkout_path,
-                branch,
-            ) {
-                crate::worktree::WorktreeMergeGate::Merged { evidence } => (true, Some(evidence)),
-                crate::worktree::WorktreeMergeGate::NotMerged => (false, None),
-            },
+        let gate = match branch.as_deref() {
+            // A detached checkout has no branch to judge or delete, and a
+            // checkout that is gone has none to resolve — two different
+            // refusals that used to share one wording (#360).
+            None => crate::worktree::gate_for_branchless_checkout(&space.checkout_path),
+            Some(branch) => {
+                crate::worktree::branch_merge_gate(&space.repo_root, &space.checkout_path, branch)
+            }
+        };
+        let checkout_missing = matches!(gate, crate::worktree::WorktreeMergeGate::CheckoutMissing);
+        let (merged, evidence) = match gate {
+            crate::worktree::WorktreeMergeGate::Merged { evidence } => (true, Some(evidence)),
+            crate::worktree::WorktreeMergeGate::NotMerged
+            | crate::worktree::WorktreeMergeGate::CheckoutMissing => (false, None),
         };
         // #121: default and config-protected branches are never auto-deleted,
         // however good the merge evidence is. The CLI never consulted these
@@ -748,6 +751,7 @@ impl App {
                     branch,
                     merged,
                     evidence,
+                    checkout_missing,
                     protected,
                     removed: false,
                     branch_deleted: false,
@@ -781,6 +785,7 @@ impl App {
                 branch,
                 merged,
                 evidence,
+                checkout_missing,
                 protected,
                 removed: true,
                 branch_deleted,
@@ -2189,6 +2194,118 @@ mod tests {
         assert!(branch_exists(&repo, "feature/dry"));
 
         let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// #360: a workspace whose checkout was removed out from under it is a
+    /// different refusal from a branch that was judged and found unmerged, and
+    /// the dry run has to say which one it is. Both used to answer
+    /// `merged: false, branch: null` with nothing to tell them apart, so the
+    /// only reading available was "your work may not have landed" — about a
+    /// branch nothing had been asked about.
+    #[tokio::test]
+    async fn api_worktree_kill_dry_run_names_a_vanished_checkout() {
+        let repo = create_committed_repo("api-kill-ghost-repo");
+
+        // The control: a live checkout on a branch with work of its own. The
+        // gate really does ask, and really does find nothing.
+        let live = unique_temp_path("api-kill-ghost-live");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/live",
+                live.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(live.join("work.txt"), "unmerged work\n").unwrap();
+        run_git(&live, &["add", "work.txt"]);
+        run_git(&live, &["commit", "--quiet", "-m", "unmerged work"]);
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &live);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: false,
+                dry_run: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            branch,
+            merged,
+            checkout_missing,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert_eq!(branch.as_deref(), Some("feature/live"));
+        assert!(!merged, "the branch holds a commit nothing else has");
+        assert!(
+            !checkout_missing,
+            "the checkout is right there — this refusal IS about the branch"
+        );
+
+        // The defect: the checkout deleted without going through flock, the
+        // workspace still registered against it.
+        let ghost = unique_temp_path("api-kill-ghost-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/ghost",
+                ghost.to_str().unwrap(),
+            ],
+        );
+        let ws_id = push_worktree_workspace(&mut app, &repo, &ghost);
+        std::fs::remove_dir_all(&ghost).unwrap();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: false,
+                dry_run: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            branch,
+            merged,
+            checkout_missing,
+            would_delete_branch,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert_eq!(branch, None, "there is no checkout to resolve one from");
+        assert!(!merged);
+        assert!(
+            checkout_missing,
+            "a cannot-ask must not read as an asked-and-got-no: {response}"
+        );
+        assert!(
+            !would_delete_branch,
+            "an unresolved branch is never deleted"
+        );
+        assert!(
+            branch_exists(&repo, "feature/ghost"),
+            "the dry run touches nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&live);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

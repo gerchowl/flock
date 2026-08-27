@@ -587,7 +587,12 @@ impl App {
                     checkout.clone(),
                     branch,
                 ),
-                None => (crate::worktree::WorktreeMergeGate::NotMerged, false),
+                // No branch has two causes — a detached HEAD and a checkout
+                // that is gone — and only one of them is about a branch (#360).
+                None => (
+                    crate::worktree::gate_for_branchless_checkout(&checkout),
+                    false,
+                ),
             };
             // #325: what the kill would destroy, collected on the same worker
             // that resolved the gate — the dialog holds its confirm until both
@@ -763,7 +768,10 @@ impl App {
                         checkout.clone(),
                         branch,
                     ),
-                    None => (crate::worktree::WorktreeMergeGate::NotMerged, false),
+                    None => (
+                        crate::worktree::gate_for_branchless_checkout(&checkout),
+                        false,
+                    ),
                 };
                 let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                     crate::events::WorktreeKillGateResult {
