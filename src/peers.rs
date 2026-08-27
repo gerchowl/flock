@@ -760,7 +760,10 @@ pub fn send_peer_message(
     correlation_id: &str,
     in_reply_to: Option<&str>,
     intent: crate::api::schema::MsgIntent,
-) -> Result<(), String> {
+) -> Result<(), PeerMessageFailure> {
+    // A command this host refuses to build never leaves the machine, so it is
+    // a refusal too — and a terminal one. Retrying an id that cannot be
+    // shell-quoted safely produces the same answer forever.
     let remote = peer_message_command(
         to_agent,
         from_agent,
@@ -769,8 +772,74 @@ pub fn send_peer_message(
         correlation_id,
         in_reply_to,
         intent,
-    )?;
-    run_peer_ssh(peer, &remote).map(|_| ())
+    )
+    .map_err(PeerMessageFailure::Refused)?;
+    run_peer_ssh_status(peer, &remote)
+        .map(|_| ())
+        .map_err(classify_message_failure)
+}
+
+/// Why a relayed message did not land on the peer that owns the recipient.
+///
+/// The split is #380's point. A message the far side never saw and one it read
+/// and rejected want different answers from the caller, and before this both
+/// arrived as "could not reach" — which is a lie about the second, and the
+/// wrong advice: an unreachable peer is worth retrying and a refused flag
+/// never will be. A refusal carries the remote CLI's own words, so a flag a
+/// peer's build does not understand comes back as data instead of being glued
+/// to the front of the message body. Same posture as [`crate::spawn::SpawnRefusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerMessageFailure {
+    /// The hop itself failed: ssh transport, auth, timeout, or a peer with no
+    /// `flk` on its PATH. Retry can succeed.
+    Unreachable(String),
+    /// The peer's `flk msg send` ran and rejected the command — or this host
+    /// refused to build one. Terminal: the identical relay is refused again.
+    Refused(String),
+}
+
+impl PeerMessageFailure {
+    /// The stable `error.code`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unreachable(_) => "peer_unreachable",
+            Self::Refused(_) => "peer_refused_message",
+        }
+    }
+
+    /// Whether retrying the identical relay could ever succeed.
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
+    }
+
+    /// The far side's own words, unedited.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unreachable(detail) | Self::Refused(detail) => detail,
+        }
+    }
+
+    pub fn message(&self, host: &str) -> String {
+        match self {
+            Self::Unreachable(detail) => format!("could not reach {host}: {detail}"),
+            Self::Refused(detail) => format!("the relay to {host} was refused: {detail}"),
+        }
+    }
+}
+
+/// `flk`'s usage/refusal exit code, and the one thing separating a peer that
+/// refused from a peer that was never reached: ssh reports the remote
+/// command's own status and keeps 255 for its own transport failures, so a 2
+/// here is the far side's CLI answering rather than a network that never got
+/// there.
+const REMOTE_REFUSAL_EXIT: i32 = 2;
+
+fn classify_message_failure(failure: PeerSshFailure) -> PeerMessageFailure {
+    if failure.exit_code == Some(REMOTE_REFUSAL_EXIT) {
+        PeerMessageFailure::Refused(failure.detail)
+    } else {
+        PeerMessageFailure::Unreachable(failure.detail)
+    }
 }
 
 /// Build the `sh -lc …` the relay hands to the owning server.
@@ -818,10 +887,16 @@ fn peer_message_command(
     // stamped `fyi` — the exact mislabel #280 exists to remove, reintroduced
     // by the one leg that rebuilds the send from scratch (#280).
     //
-    // Appended only for `needs_reply`, the same shape `--reply-to` uses. A
-    // default-intent relay is then byte-identical to what shipped before this
-    // flag existed, so the far side needing a build that understands
-    // `--intent` is confined to the case that actually carries new signal.
+    // Appended only for `needs_reply`, the same shape `--reply-to` uses. That
+    // containment shipped with #377 because `flk msg send` swallowed unknown
+    // flags into the body; #380 fixed the swallowing, and this KEPT it anyway.
+    // The reason is that the fix lives on the RECEIVING side: a peer only
+    // refuses `--intent` once it runs a build that has #380 in it, and the
+    // hosts this protects are precisely the ones that do not. Dropping the
+    // containment now would trade a silent corruption for a loud one on every
+    // relay to an already-deployed peer, including the `fyi` majority that
+    // carries no new signal at all. It costs one match arm and buys the whole
+    // roll-forward window, so it stays until the fleet has crossed #380.
     let intent_flag = match intent {
         crate::api::schema::MsgIntent::Fyi => String::new(),
         crate::api::schema::MsgIntent::NeedsReply => format!(
@@ -848,6 +923,23 @@ fn peer_message_command(
 }
 
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
+    run_peer_ssh_status(peer, remote_command).map_err(|failure| failure.detail)
+}
+
+/// A failed peer command, with the remote exit status kept.
+///
+/// `run_peer_ssh` flattens this to its message, which is all its callers ever
+/// wanted. The relay is the exception: it is the one caller for which "the far
+/// side answered, and said no" is a different outcome from "the far side never
+/// answered", and the status code is the only place that distinction survives.
+struct PeerSshFailure {
+    /// The remote command's exit status, or `None` when it was killed by a
+    /// signal before producing one.
+    exit_code: Option<i32>,
+    detail: String,
+}
+
+fn run_peer_ssh_status(peer: &PeerConfig, remote_command: &str) -> Result<String, PeerSshFailure> {
     let output = crate::process::TracedCommand::new("ssh", "peers")
         .args([
             "-o",
@@ -863,7 +955,10 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
         ])
         .stdin(std::process::Stdio::null())
         .output_traced_with_timeout(PEER_SSH_TIMEOUT)
-        .map_err(|err| format!("ssh spawn failed: {err}"))?;
+        .map_err(|err| PeerSshFailure {
+            exit_code: None,
+            detail: format!("ssh spawn failed: {err}"),
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
@@ -873,9 +968,15 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
             // Keep the tail: ssh banners/motd come first, the error last.
             stderr.lines().next_back().unwrap_or(stderr).to_string()
         };
-        return Err(detail);
+        return Err(PeerSshFailure {
+            exit_code: output.status.code(),
+            detail,
+        });
     }
-    String::from_utf8(output.stdout).map_err(|_| "non-utf8 ssh output".to_string())
+    String::from_utf8(output.stdout).map_err(|_| PeerSshFailure {
+        exit_code: output.status.code(),
+        detail: "non-utf8 ssh output".to_string(),
+    })
 }
 
 /// Parse the CLI's response envelope:
@@ -1051,6 +1152,73 @@ mod tests {
         )
         .expect("valid ids");
         assert!(!command.contains("--intent"), "{command}");
+    }
+
+    #[test]
+    fn a_peer_that_refuses_is_not_a_peer_that_was_never_reached() {
+        // #380. Both used to arrive as "could not reach {host}", which is a
+        // lie about the second and the wrong advice about both: an unreachable
+        // peer is worth retrying and a rejected flag never will be.
+        //
+        // ssh reports the remote command's own exit status and keeps 255 for
+        // its own transport failures, so the status is the whole distinction.
+        let refused = super::classify_message_failure(super::PeerSshFailure {
+            exit_code: Some(super::REMOTE_REFUSAL_EXIT),
+            detail: "flk msg send: unknown option \"--intent\" — this build understands …"
+                .to_string(),
+        });
+        assert_eq!(refused.code(), "peer_refused_message");
+        assert!(!refused.retryable(), "the identical relay is refused again");
+        assert!(
+            refused.message("sage").contains("--intent"),
+            "the peer's own words ARE the diagnosis and must survive the hop: {}",
+            refused.message("sage")
+        );
+
+        for (exit_code, what) in [
+            (Some(255), "ssh itself failed"),
+            (None, "killed by a signal"),
+        ] {
+            let failure = super::classify_message_failure(super::PeerSshFailure {
+                exit_code,
+                detail: "Connection timed out".to_string(),
+            });
+            assert_eq!(failure.code(), "peer_unreachable", "{what}");
+            assert!(failure.retryable(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_command_this_host_will_not_build_is_a_refusal_too() {
+        // An id that cannot be shell-quoted safely never leaves the machine,
+        // so it is terminal for the same reason a rejected flag is — and used
+        // to be reported as the host being unreachable, which it plainly was
+        // not.
+        // Never dials: the guard rejects shell-unsafe ids before ssh is spawned,
+        // which is what lets this drive the real entry point rather than
+        // hand-building the variant it is supposed to produce.
+        let peer = PeerConfig {
+            name: "sage".into(),
+            ..Default::default()
+        };
+        let failure = super::send_peer_message(
+            &peer,
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "pong",
+            "c-reply",
+            Some("c'; rm -rf /"),
+            crate::api::schema::MsgIntent::Fyi,
+        )
+        .expect_err("a shell-escaping id must be refused");
+        assert_eq!(failure.code(), "peer_refused_message");
+        assert!(!failure.retryable());
+        assert!(
+            failure.detail().contains("in-reply-to id"),
+            "the caller learns which id was rejected: {}",
+            failure.detail()
+        );
     }
 
     #[test]
