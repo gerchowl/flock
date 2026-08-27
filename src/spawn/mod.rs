@@ -26,6 +26,7 @@
 //! (`spawn_depth`, `spawned_by`), so the check is O(live panes) and never
 //! walks the durable event log on a request path.
 
+pub mod allowlist;
 pub mod env;
 
 use serde::{Deserialize, Serialize};

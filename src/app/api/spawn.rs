@@ -162,14 +162,18 @@ impl App {
         // the next unrelated pane inherits it and `flk revert-run` reverts
         // that pane's work instead.
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
-        // #329 / ADR-0014 §3: the child is asked for by an AGENT, so it does
-        // not inherit the operator's ambient credentials. For an
-        // operator-started pane inheriting them is correct — it is their
-        // shell — which is exactly why this is armed here and not globally.
-        let _scrub_guard = crate::integration::set_pending_credential_scrub();
-        // Armed after the scrub, and dropped with it: the profile the requester
-        // runs under is handed down deliberately, where its ambient GitHub and
-        // ssh credentials are not.
+        // #347 / ADR-0014 §3: the child is asked for by an AGENT, so it starts
+        // from a scrubbed baseline and inherits only what its own CLI needs.
+        // For an operator-started pane inheriting the lot is correct — it is
+        // their shell — which is exactly why this is armed here and not
+        // globally. Resolved from the same argv that picked the profile keys,
+        // so both halves of the child's environment answer for one agent.
+        let _allowlist_guard = crate::integration::set_pending_spawn_allowlist(
+            crate::spawn::allowlist::for_argv(&argv),
+        );
+        // Armed after the allowlist, and dropped with it: the profile the
+        // requester runs under is handed down deliberately, and the server
+        // never had it to allow through in the first place.
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
 
         let (rows, cols) = self.state.estimate_pane_size();

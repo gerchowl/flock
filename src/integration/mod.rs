@@ -265,6 +265,15 @@ pub(crate) struct HermesUninstallResult {
 }
 
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
+    // #347 / ADR-0014 §3: a child an AGENT asked for starts from a scrubbed
+    // baseline, not from whatever the server happens to be holding. Run FIRST,
+    // before flock stamps its own variables below: the clear would otherwise
+    // take them with it, and a stale `FLOCK_RUN_ID` sitting in the server's own
+    // environment would be re-inherited rather than dropped — misattributing
+    // this pane's commits to another run.
+    if let Some(allowlist) = take_pending_spawn_allowlist() {
+        scrub_to_allowlist(cmd, &allowlist);
+    }
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
     // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
@@ -278,26 +287,69 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     if let Some(run_id) = take_pending_run_id() {
         cmd.env(FLOCK_RUN_ID_ENV_VAR, run_id);
     }
-    // #329: an agent-initiated child does not inherit the operator's ambient
-    // credentials. `CommandBuilder` starts from the parent environment, so
-    // the removal has to be explicit.
-    if take_pending_credential_scrub() {
-        for key in AGENT_SPAWN_DENIED_ENV {
-            cmd.env_remove(key);
-        }
-    }
     // #359: an argv exec runs no shell init, so whatever a login shell would
     // have exported never reaches the child. `CLAUDE_CONFIG_DIR` is the case
     // that bites: unset, the child falls back to `~/.claude`, which may be a
     // DIFFERENT authenticated account than the agent that asked for it.
     //
-    // Applied AFTER the scrub on purpose. The scrub removes the operator's
-    // ambient credentials, which the child has no business holding; this hands
-    // down the requester's own identity, which is the entire point. Should a
-    // future key appear in both tables, the deliberate carry must win.
+    // Applied AFTER the scrub on purpose. The scrub keeps only what the child's
+    // CLI needs from the server; this hands down what the server never had.
+    // Should a future key appear in both tables, the deliberate carry must win.
     for (key, value) in take_pending_spawn_env() {
         cmd.env(key, value);
     }
+}
+
+/// Cut `cmd` down to `allowlist`, keeping what flock itself has already set.
+///
+/// `env_clear()` rather than removing the keys that are not on the list. An
+/// allowlist enumerated from `iter_full_env_as_str` would silently keep any
+/// entry that is not valid UTF-8, which is the same "only as good as its
+/// enumeration" weakness that makes a deny-list insufficient in the first
+/// place. Clearing is the only way to say "nothing survives unless named".
+fn scrub_to_allowlist(
+    cmd: &mut CommandBuilder,
+    allowlist: &crate::spawn::allowlist::SpawnAllowlist,
+) {
+    // What flock set through `env()` before this point — the pane's TERM and
+    // the flock marker, from `pane.rs`. `iter_extra_env_as_str` yields exactly
+    // the entries that did NOT come from the server's environment, so the clear
+    // below can put these back without putting the server back with them.
+    let deliberate: Vec<(String, String)> = cmd
+        .iter_extra_env_as_str()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    let before = cmd.iter_full_env_as_str().count();
+    // Read as `OsString`: a value the allowlist names is carried through byte
+    // for byte, rather than being dropped for not being UTF-8.
+    let kept: Vec<(&'static str, std::ffi::OsString)> = allowlist
+        .keys()
+        .iter()
+        .filter_map(|key| cmd.get_env(key).map(|value| (*key, value.to_os_string())))
+        .collect();
+
+    cmd.env_clear();
+    for (key, value) in &kept {
+        cmd.env(key, value);
+    }
+    for (key, value) in &deliberate {
+        cmd.env(key, value);
+    }
+    // #329's deny list stays on as a second line, for a key that lands on both
+    // tables by accident. The two do not intersect today and a test keeps it
+    // that way; this sweep is what makes a future overlap a bug rather than a
+    // breach.
+    for key in AGENT_SPAWN_DENIED_ENV {
+        cmd.env_remove(key);
+    }
+
+    let carried: Vec<&str> = kept.iter().map(|(key, _)| *key).collect();
+    crate::logging::agent_spawn_env_allowlisted(
+        allowlist.agent(),
+        &allowlist.joined(),
+        &carried.join(","),
+        before.saturating_sub(cmd.iter_full_env_as_str().count()),
+    );
 }
 
 thread_local! {
@@ -336,11 +388,11 @@ impl Drop for PendingRunIdGuard {
 /// rights and live ssh-agent, and nothing in the `Agent-Run:` trailer or the
 /// spawn ceiling constrains what it does with them.
 ///
-/// This is a deny list rather than the allowlist ADR-0014 §3 argues for. The
-/// allowlist is stronger and should follow; it needs per-agent knowledge of
-/// what each CLI actually requires, and getting that wrong fails as a
-/// mysterious startup break rather than a clean refusal. Denying the
-/// credentials removes the sharpest edge without that risk.
+/// Since #347 the allowlist in `crate::spawn::allowlist` is what actually
+/// bounds the child's environment, and none of these keys is on it. This list
+/// stays as the SECOND line the issue asks for: if a key is ever added to an
+/// allowlist that also belongs here, the sweep in [`scrub_to_allowlist`] keeps
+/// it from the child and the table-hygiene test names the mistake.
 const AGENT_SPAWN_DENIED_ENV: &[&str] = &[
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -357,38 +409,42 @@ thread_local! {
     /// `apply_pane_env`. Same one-shot shape as the run id, and for the same
     /// reason: pane spawn is synchronous on the App thread, so a global slot
     /// would race with a concurrent spawn.
-    static SCRUB_AMBIENT_CREDENTIALS: std::cell::RefCell<bool> =
-        const { std::cell::RefCell::new(false) };
+    static PENDING_SPAWN_ALLOWLIST: std::cell::RefCell<
+        Option<crate::spawn::allowlist::SpawnAllowlist>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct PendingCredentialScrubGuard;
+pub(crate) struct PendingSpawnAllowlistGuard;
 
-impl Drop for PendingCredentialScrubGuard {
+impl Drop for PendingSpawnAllowlistGuard {
     fn drop(&mut self) {
-        let _ = take_pending_credential_scrub();
+        let _ = take_pending_spawn_allowlist();
     }
 }
 
-/// Arm credential scrubbing for the NEXT pane spawn on this thread.
+/// Arm the environment allowlist for the NEXT pane spawn on this thread.
 ///
-/// A guard, not a bare set, for the same reason the run id is one — and with
-/// a worse failure mode if it were not. The flag is consumed inside
-/// `apply_pane_env`, which a failed spawn may never reach; a leaked flag then
-/// lands on whatever pane is spawned next on this thread. That could be the
-/// OPERATOR's own pane, which would silently lose its GitHub token and
-/// ssh-agent with no error to explain it.
-#[must_use = "the guard disarms the scrub; dropping it immediately re-arms nothing"]
-pub(crate) fn set_pending_credential_scrub() -> PendingCredentialScrubGuard {
-    SCRUB_AMBIENT_CREDENTIALS.with(|slot| *slot.borrow_mut() = true);
-    PendingCredentialScrubGuard
+/// Armed per spawn rather than globally because that is the whole distinction:
+/// an operator's own pane keeps inheriting, since it is their shell and
+/// inheriting is what a shell is for. Only a pane another AGENT asked for
+/// starts from a scrubbed baseline.
+///
+/// A guard, not a bare set, for the same reason the run id is one — and with a
+/// worse failure mode if it were not. The slot is consumed inside
+/// `apply_pane_env`, which a failed spawn may never reach; a leaked allowlist
+/// then lands on whatever pane is spawned next on this thread. That could be
+/// the OPERATOR's own pane, which would silently come up with almost no
+/// environment and no error to explain it.
+#[must_use = "the guard disarms the allowlist; dropping it immediately re-arms nothing"]
+pub(crate) fn set_pending_spawn_allowlist(
+    allowlist: crate::spawn::allowlist::SpawnAllowlist,
+) -> PendingSpawnAllowlistGuard {
+    PENDING_SPAWN_ALLOWLIST.with(|slot| *slot.borrow_mut() = Some(allowlist));
+    PendingSpawnAllowlistGuard
 }
 
-fn take_pending_credential_scrub() -> bool {
-    SCRUB_AMBIENT_CREDENTIALS.with(|slot| {
-        let armed = *slot.borrow();
-        *slot.borrow_mut() = false;
-        armed
-    })
+fn take_pending_spawn_allowlist() -> Option<crate::spawn::allowlist::SpawnAllowlist> {
+    PENDING_SPAWN_ALLOWLIST.with(|slot| slot.borrow_mut().take())
 }
 
 /// The deny list, exposed so the test can assert on the same table the
@@ -3054,19 +3110,130 @@ mod tests {
         std::env::remove_var("FLOCK_TEST_INHERITED");
     }
 
-    /// #329: a pty child inherits the operator's environment wholesale. For
-    /// a pane the operator started that is correct. For one another AGENT
-    /// asked for, it silently hands a process the operator's GitHub push
-    /// rights and live ssh-agent — which neither the run-id trailer nor the
-    /// spawn ceiling constrains.
+    /// The allowlist for a claude child, resolved the way `agent.spawn` does.
+    fn claude_allowlist() -> crate::spawn::allowlist::SpawnAllowlist {
+        crate::spawn::allowlist::for_argv(&["claude".to_string(), "prompt".to_string()])
+    }
+
+    /// #347 / ADR-0014 §3, and the reason the deny-list was never enough: a
+    /// deny-list is only as good as its enumeration. `ACME_API_KEY` is not on
+    /// it and never would be — a new provider's variable, a project-local key
+    /// — and under the deny-list it reached the child. Inverting the default
+    /// is the property under test: a variable has to be NAMED to survive.
+    #[test]
+    fn an_agent_spawned_pane_inherits_only_what_the_allowlist_names() {
+        std::env::set_var("FLOCK_TEST_ACME_API_KEY", "sk-not-a-real-key");
+        std::env::set_var("FLOCK_TEST_NETRC", "/home/operator/.netrc");
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_spawn_allowlist(claude_allowlist());
+        apply_pane_env(&mut cmd, PaneId::from_raw(11));
+        drop(guard);
+
+        for key in ["FLOCK_TEST_ACME_API_KEY", "FLOCK_TEST_NETRC"] {
+            assert_eq!(
+                cmd.get_env(key),
+                None,
+                "{key} is not on the allowlist, so it must not reach the child \
+                 even though no deny-list names it"
+            );
+        }
+
+        std::env::remove_var("FLOCK_TEST_ACME_API_KEY");
+        std::env::remove_var("FLOCK_TEST_NETRC");
+    }
+
+    /// The other half of the same decision, and the risk ADR-0014 §3 names:
+    /// an allowlist that omits something the CLI needs fails as a mysterious
+    /// startup break rather than a clean refusal. PATH is the sharpest of
+    /// these — `CommandBuilder` resolves argv[0] through it, so an omission
+    /// there is not a subtle misbehaviour but a failure to exec.
+    #[test]
+    fn the_allowlist_keeps_what_the_agent_cli_needs_to_start() {
+        let probes = [
+            ("PATH", "/probe/bin"),
+            ("HOME", "/probe/home"),
+            ("LANG", "en_US.UTF-8"),
+            (crate::spawn::env::CLAUDE_CONFIG_DIR, "/probe/profile"),
+        ];
+        for (key, value) in probes {
+            std::env::set_var(key, value);
+        }
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_spawn_allowlist(claude_allowlist());
+        apply_pane_env(&mut cmd, PaneId::from_raw(12));
+        drop(guard);
+
+        for (key, value) in probes {
+            assert_eq!(
+                cmd.get_env(key).and_then(|seen| seen.to_str()),
+                Some(value),
+                "{key} is on the allowlist and must survive the scrub"
+            );
+        }
+
+        for (key, _) in probes {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// ADR-0014 §3 names this one alongside the credentials: a stale
+    /// `FLOCK_RUN_ID` in the environment the child inherits would stamp
+    /// `Agent-Run:` on its commits under ANOTHER run's id, so
+    /// `flk revert-run` would revert work that was never part of that run.
+    /// The deny-list did not cover it. Clearing does.
+    #[test]
+    fn an_agent_spawned_pane_does_not_inherit_a_stale_run_id() {
+        std::env::set_var(FLOCK_RUN_ID_ENV_VAR, "run_from_the_servers_own_env");
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let guard = set_pending_spawn_allowlist(claude_allowlist());
+        // No run id armed: this spawn is not part of a run, so the child must
+        // carry none rather than the one the server happens to be holding.
+        apply_pane_env(&mut cmd, PaneId::from_raw(13));
+        drop(guard);
+
+        assert_eq!(
+            cmd.get_env(FLOCK_RUN_ID_ENV_VAR),
+            None,
+            "a run id the child was not given must not arrive by inheritance"
+        );
+
+        std::env::remove_var(FLOCK_RUN_ID_ENV_VAR);
+    }
+
+    /// Acceptance: the operator's own panes are unaffected. Inheriting is what
+    /// a shell is FOR, and this is why the allowlist is armed per spawn rather
+    /// than applied globally.
+    #[test]
+    fn the_operators_own_pane_still_inherits_everything() {
+        std::env::set_var("FLOCK_TEST_OPERATOR_ONLY", "from-their-shell");
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        apply_pane_env(&mut cmd, PaneId::from_raw(14));
+
+        assert_eq!(
+            cmd.get_env("FLOCK_TEST_OPERATOR_ONLY")
+                .and_then(|value| value.to_str()),
+            Some("from-their-shell"),
+            "an operator-started pane is their shell; it inherits their environment"
+        );
+
+        std::env::remove_var("FLOCK_TEST_OPERATOR_ONLY");
+    }
+
+    /// #329: the deny list stays on as a second line under #347's allowlist.
+    /// It is a no-op while the two tables do not intersect, which is exactly
+    /// what makes it a backstop rather than a contradiction.
     #[test]
     fn an_agent_spawned_pane_does_not_inherit_ambient_credentials() {
         std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
         std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
 
         let mut cmd = CommandBuilder::new("/bin/sh");
-        let guard = set_pending_credential_scrub();
-        apply_pane_env(&mut cmd, PaneId::from_raw(11));
+        let guard = set_pending_spawn_allowlist(claude_allowlist());
+        apply_pane_env(&mut cmd, PaneId::from_raw(15));
         drop(guard);
         for key in agent_spawn_denied_env() {
             assert_eq!(
@@ -3080,49 +3247,104 @@ mod tests {
         std::env::remove_var("SSH_AUTH_SOCK");
     }
 
-    /// The scrub is a ONE-SHOT consumed by `apply_pane_env`.
+    /// The two tables must not disagree. A key on both would mean the sweep
+    /// silently undoes a deliberate allow — which is survivable, since the
+    /// sweep runs last and denies — but it is a mistake somebody made, and
+    /// this is where they find out rather than in a spawn that half-works.
     #[test]
-    fn the_credential_scrub_is_consumed_by_the_pane_it_was_armed_for() {
+    fn no_denied_key_is_on_any_agent_kinds_allowlist() {
+        for kind in crate::spawn::AgentKind::supported() {
+            let kind = crate::spawn::AgentKind::parse(kind).expect("supported kinds parse");
+            let allowlist = crate::spawn::allowlist::for_argv(&kind.argv("prompt"));
+            for denied in agent_spawn_denied_env() {
+                assert!(
+                    !allowlist.keys().contains(denied),
+                    "{denied} is on both tables for {}; the deny sweep would undo the allow",
+                    allowlist.agent()
+                );
+            }
+        }
+    }
+
+    /// Acceptance: the resolved allowlist appears in the spawn's log line.
+    /// The whole point is that an agent CLI which starts and then behaves
+    /// oddly is diagnosed by reading which variable was not carried, rather
+    /// than by bisecting a broken agent.
+    #[test]
+    fn the_spawn_logs_the_allowlist_it_resolved() {
+        std::env::set_var("PATH", "/probe/bin");
+        let logged = crate::logging::capture_logs(|| {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            let guard = set_pending_spawn_allowlist(claude_allowlist());
+            apply_pane_env(&mut cmd, PaneId::from_raw(16));
+            drop(guard);
+        });
+        std::env::remove_var("PATH");
+
+        assert!(
+            logged.contains("agent.spawn.env"),
+            "the scrub must be observable in the event log: {logged}"
+        );
+        assert!(
+            logged.contains("agent=") && logged.contains("claude"),
+            "the line must name the agent whose table was applied: {logged}"
+        );
+        assert!(
+            logged.contains(crate::spawn::env::CLAUDE_CONFIG_DIR),
+            "the line must carry the resolved allowlist itself: {logged}"
+        );
+        assert!(
+            logged.contains("kept=") && logged.contains("PATH"),
+            "the line must say which allowed keys the server actually had: {logged}"
+        );
+        assert!(
+            !logged.contains("/probe/bin"),
+            "keys only — a line of values is the leak the allowlist prevents: {logged}"
+        );
+    }
+
+    /// The allowlist is a ONE-SHOT consumed by `apply_pane_env`.
+    #[test]
+    fn the_spawn_allowlist_is_consumed_by_the_pane_it_was_armed_for() {
         let mut spawned = CommandBuilder::new("/bin/sh");
-        let guard = set_pending_credential_scrub();
-        apply_pane_env(&mut spawned, PaneId::from_raw(12));
+        let guard = set_pending_spawn_allowlist(claude_allowlist());
+        apply_pane_env(&mut spawned, PaneId::from_raw(17));
         drop(guard);
         assert!(
-            !take_pending_credential_scrub(),
+            take_pending_spawn_allowlist().is_none(),
             "the one-shot must already be consumed"
         );
     }
 
     /// The case the guard exists for: a spawn that fails BEFORE
-    /// `apply_pane_env` runs. Without the guard the flag survives, and the
-    /// next pane on this thread — possibly the operator's own — silently
-    /// loses its GitHub token and ssh-agent with no error to explain it.
+    /// `apply_pane_env` runs. Without the guard the allowlist survives onto
+    /// the next pane on this thread — possibly the OPERATOR's own, which would
+    /// then come up with almost no environment and no error to explain it.
     #[test]
-    fn an_aborted_spawn_does_not_strip_the_next_panes_credentials() {
-        std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+    fn an_aborted_spawn_does_not_scrub_the_next_panes_environment() {
+        std::env::set_var("FLOCK_TEST_OPERATOR_ONLY", "from-their-shell");
         {
-            let _guard = set_pending_credential_scrub();
+            let _guard = set_pending_spawn_allowlist(claude_allowlist());
             // Spawn fails here — `apply_pane_env` is never reached.
         }
         let mut operator_pane = CommandBuilder::new("/bin/sh");
-        apply_pane_env(&mut operator_pane, PaneId::from_raw(13));
+        apply_pane_env(&mut operator_pane, PaneId::from_raw(18));
         assert!(
-            operator_pane.get_env("GH_TOKEN").is_some(),
-            "an aborted agent spawn must not disarm the operator's own pane"
+            operator_pane.get_env("FLOCK_TEST_OPERATOR_ONLY").is_some(),
+            "an aborted agent spawn must not scrub the operator's own pane"
         );
-        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("FLOCK_TEST_OPERATOR_ONLY");
     }
 
-    /// #359: the pin the issue asks for. An argv exec runs no shell init, so
-    /// the profile selector reaches the child only if this stamps it — and it
-    /// must survive the credential scrub sitting immediately above it. When
-    /// #347 turns that scrub into an allowlist, an allowlist that forgets this
-    /// key reproduces exactly today's bug, but now by design; this test is
-    /// what refuses to let that land quietly.
+    /// #359: the pin that issue asks for, now standing over #347's allowlist —
+    /// an allowlist that forgets this key reproduces exactly the #359 bug, but
+    /// by design and with a comment claiming it is deliberate. The selector
+    /// must reach the child both ways: carried down from the requester when
+    /// the server does not have it, and allowed through when it does.
     #[test]
     fn an_argv_spawned_pane_carries_the_agent_profile_selector() {
         let mut cmd = CommandBuilder::new("/bin/sh");
-        let scrub = set_pending_credential_scrub();
+        let scrub = set_pending_spawn_allowlist(claude_allowlist());
         let profile = set_pending_spawn_env(vec![(
             crate::spawn::env::CLAUDE_CONFIG_DIR.to_string(),
             "/profiles/work".to_string(),
@@ -3140,6 +3362,13 @@ mod tests {
         assert!(
             !agent_spawn_denied_env().contains(&crate::spawn::env::CLAUDE_CONFIG_DIR),
             "the profile selector is the requester's own identity handed down,              not an ambient credential to strip"
+        );
+        assert!(
+            claude_allowlist()
+                .keys()
+                .contains(&crate::spawn::env::CLAUDE_CONFIG_DIR),
+            "and a server that DOES have the selector must be allowed to pass it \
+             through, not just to have it handed back"
         );
     }
 

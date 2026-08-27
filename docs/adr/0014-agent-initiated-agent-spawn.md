@@ -148,7 +148,10 @@ in a type.
 
 **Cost.** Env scrubbing needs a per-agent allowlist, and getting it wrong
 breaks spawns in ways that surface as an agent failing mysteriously on start.
-It should ship with the allowlist logged at spawn.
+It should ship with the allowlist logged at spawn. #359 was that failure
+arriving before the allowlist did — a variable a login shell supplied and the
+server never had — which is why the table is keyed per agent and the log line
+was not treated as optional.
 
 **Not settled here.** Whether the depth default of 2 is right — it is a guess
 until there is telemetry. Ship it refusing at 2 and widen on evidence, because
@@ -163,14 +166,14 @@ As of acceptance (#345):
 | --- | --- | --- |
 | 1 | `Method::AgentSpawn`, closed `AgentKind`, server-side argv | landed |
 | 2 | location as a union over known checkouts | landed, minus `new_branch` — a caller creates the checkout first and spawns into it by path |
-| 3 | env allowlist | **not landed** (#347). Ships as a credential DENY-list instead. An allowlist needs per-agent knowledge of what each CLI requires, and getting it wrong fails as a mysterious startup break rather than a clean refusal. The allowlist remains the target; the deny-list removes the sharpest edge without that risk |
+| 3 | env allowlist | landed (#347). `env_clear()` plus a per-agent table (`src/spawn/allowlist.rs`), armed only on the agent-spawn path, with the resolved keys on the spawn's log line so an omission is a read rather than a bisect. The deny-list stays on beneath it as a second line. Not settled: a fleet on Bedrock or Vertex needs `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS`, which §3's own deny-list strips — allowing a third-party cloud credential through is the operator's call, not the implementer's |
 | 4 | untrusted prompt: system-owned preamble, control-byte refusal | **not landed** (#348). The prompt is length-capped and passed as one argv element, so nothing reaches a shell — but a foreman's prompts come from issue bodies, and neither the preamble nor the byte filter exists yet |
 | 5 | lineage-aware ceiling (depth → fanout → capacity) | landed |
 | 6 | ceiling in the shared spawn funnel | **partial** (#349). It gates `agent.spawn`. `agent.fork` and the TUI keyboard fork do not consult it, so an operator's own forking is unbounded — correct for a human, but it means the capacity count and the thing it protects are not yet the same funnel |
 | 7 | `fleet pause` refuses agent-initiated spawn | landed |
 | 8 | refusals separate retryable from terminal | landed |
 
-The three gaps are #347, #348 and #349 — tracked as issues rather than left
+The remaining gaps are #348 and #349 — tracked as issues rather than left
 in this table, because an Accepted ADR whose unbuilt parts live only in prose
 is how they get forgotten.
 
