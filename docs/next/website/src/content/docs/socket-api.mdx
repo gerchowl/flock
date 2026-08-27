@@ -70,6 +70,7 @@ Raw socket method names use dot notation:
 | Area | Methods |
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config` |
+| Notification | `notification.show`, `notification.list`, `notification.ack` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
@@ -124,6 +125,13 @@ Remove a linked checkout:
 `checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
 
 `agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone.
+
+`notification.list` reads the operator's filed outcomes, newest first, with `unread_only` and `limit`; `notification.ack` marks one (`notification_id`) or all (`all: true`) as read. Both answer with the fleet-wide `unread` count. Every outcome Flock decides is worth saying — an agent that blocked or finished, and every `notification.show` call including the ones it refuses to display — is filed as a durable `notification_filed` event, with `notification_seen` as its acknowledgement; the unread list is the fold of one over the other, rebuilt at startup. Listing is not acknowledging: acknowledging is what lets retention drop a record, so it is never inferred from a read.
+
+```json
+{"id":"req_n1","method":"notification.list","params":{"unread_only":true,"limit":20}}
+{"id":"req_n2","method":"notification.ack","params":{"notification_id":"ntf:19a2f:3"}}
+```
 
 ## Checks
 

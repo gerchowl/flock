@@ -22,6 +22,10 @@ pub enum Method {
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
+    #[serde(rename = "notification.list")]
+    NotificationList(NotificationListParams),
+    #[serde(rename = "notification.ack")]
+    NotificationAck(NotificationAckParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -322,6 +326,75 @@ pub struct NotificationShowParams {
     pub position: Option<crate::config::ToastFlockPosition>,
     #[serde(default, skip_serializing_if = "NotificationShowSound::is_none")]
     pub sound: NotificationShowSound,
+}
+
+/// What class of outcome a filed notification records (#372 / ADR-0016).
+/// Deliberately coarser than `ToastKind`: the log answers "does this still
+/// want me" long after the toast's placement and sound stopped mattering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationRecordKind {
+    /// Something is waiting on the operator.
+    Attention,
+    /// Something finished and produced a result.
+    Outcome,
+    /// Everything else worth keeping — a refusal, an update, an announcement.
+    Notice,
+}
+
+/// Who decided this notification was worth filing (#372 / ADR-0016). flock
+/// itself is the only producer today; the field exists so a later
+/// agent-facing verb is distinguishable in the log rather than indistinguishable
+/// from flock's own judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSource {
+    /// An agent state change flock decided was worth saying (#36).
+    AgentState,
+    /// An explicit `notification.show` request.
+    Api,
+}
+
+/// `notification.list` (#372 / ADR-0016). Reads the operator's filed
+/// outcomes, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NotificationListParams {
+    /// Only what has not been acknowledged.
+    #[serde(default)]
+    pub unread_only: bool,
+    /// Cap the reply. `None` returns everything the projection holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `notification.ack` (#372 / ADR-0016). Acknowledging is the operator saying
+/// "read"; it is also what makes a record eligible for eviction, so it is
+/// never inferred from a list call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NotificationAckParams {
+    /// Acknowledge one record. Omit with `all = true` to acknowledge the lot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// One row of `notification.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSummary {
+    pub notification_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub kind: NotificationRecordKind,
+    pub source: NotificationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    pub origin_host: String,
+    pub filed_at_ms: u64,
+    pub seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1460,6 +1533,12 @@ pub enum EventKind {
     /// #175 S3 commit 4 (ops): every commit whose tree was reverted via
     /// `flk revert-run` writes one of these onto the durable log.
     RunReverted,
+    /// #372 / ADR-0016: an outcome a human should read. Every other kind
+    /// here records that a thing HAPPENED; this one records what came of
+    /// it, in prose, addressed to the operator. `NotificationSeen` is its
+    /// acknowledgement — the unread set is the fold of one over the other.
+    NotificationFiled,
+    NotificationSeen,
 }
 
 impl EventKind {
@@ -1504,7 +1583,9 @@ impl EventKind {
             | Self::TriggerErrored
             | Self::FleetPaused
             | Self::FleetResumed
-            | Self::RunReverted => true,
+            | Self::RunReverted
+            | Self::NotificationFiled
+            | Self::NotificationSeen => true,
             Self::PaneOutputChanged => false,
         }
     }
@@ -1545,6 +1626,18 @@ pub enum ResponseResult {
     NotificationShow {
         shown: bool,
         reason: NotificationShowReason,
+    },
+    NotificationList {
+        notifications: Vec<NotificationSummary>,
+        /// Unread across the whole projection, not just this page — it is the
+        /// number the badge and the sidebar tally render.
+        unread: usize,
+    },
+    NotificationAck {
+        /// How many records this call actually changed. Zero for an unknown id
+        /// or one already read.
+        acknowledged: usize,
+        unread: usize,
     },
     PeersSummary {
         /// Short hostname of the answering server.
@@ -2471,6 +2564,33 @@ pub enum EventData {
         reverted_commit: String,
         revert_branch: String,
         dry_run: bool,
+    },
+    /// #372 / ADR-0016: an outcome filed for the operator to read. Durable
+    /// because the display may never happen — a toast expires, delivery may
+    /// be `off`, and `notification.show` refuses outright when one is
+    /// already on screen.
+    NotificationFiled {
+        notification_id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        kind: NotificationRecordKind,
+        source: NotificationSource,
+        /// Where to jump to read the whole story, when there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        /// The node that produced the outcome — the field that makes an
+        /// outcome from `sage` legible on `anvil`.
+        origin_host: String,
+        filed_at_ms: u64,
+    },
+    /// #372 / ADR-0016: the operator acknowledged one filed notification.
+    /// Separate event rather than a mutation because the log is append-only,
+    /// and because "when was it read" is itself worth auditing.
+    NotificationSeen {
+        notification_id: String,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.

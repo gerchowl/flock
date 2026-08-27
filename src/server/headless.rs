@@ -3435,6 +3435,13 @@ impl HeadlessServer {
             changed = true;
         }
 
+        // Publish anything a state mutation queued this tick (#175 ADR-0005).
+        // The socket path drains inside its own request handler and the
+        // monolithic loop drains in `App::run`; the headless loop had no
+        // equivalent, so an event queued off a tick here — a filed
+        // notification (#372) among them — never reached the log.
+        self.app.drain_pending_ui_events();
+
         // #175 phase 4 dual-loop rule: the headless server ticks the same
         // check-runner path as the TUI runtime.
         changed |= self.app.dispatch_due_script_checks(now);
@@ -7896,6 +7903,52 @@ next_tab = ""
         assert_eq!(
             forwarded.as_deref(),
             Some("pi needs attention: background · 1")
+        );
+    }
+
+    /// #372: the headless loop had no `drain_pending_ui_events` of its own —
+    /// the socket handler drained inside a request and `App::run` drained in
+    /// the monolithic loop, so an event queued off a tick here reached nothing.
+    /// A notification filed by the delay drain is exactly that case, and the
+    /// server is where most operators run.
+    #[test]
+    fn a_notification_filed_off_the_headless_tick_reaches_the_durable_log() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let pane_id = background.tabs[0].root_pane;
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![background, foreground];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+
+        server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        let deadline = server
+            .app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("the transition is held");
+        server.handle_scheduled_tasks_headless(deadline, false);
+
+        assert_eq!(server.app.state.notifications.unread(), 1);
+        assert!(
+            server
+                .app
+                .event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| { event.event == api::schema::EventKind::NotificationFiled }),
+            "the projection is only as durable as the event it queued"
         );
     }
 

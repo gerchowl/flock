@@ -4392,6 +4392,8 @@ impl AppState {
     /// The client-local desktop/terminal notification and the headless forward
     /// are the App/server layer's to emit from the same delivery.
     fn apply_agent_notification_delivery(&mut self, delivery: &AgentNotificationDelivery) {
+        self.file_agent_notification(delivery);
+
         if self.local_sound_playback {
             if let Some(sound) = delivery.sound {
                 crate::sound::play(sound, self.sound_config());
@@ -4406,6 +4408,52 @@ impl AppState {
                 self.toast = Some(toast);
             }
         }
+    }
+
+    /// Keep the outcome as well as show it (#372, ADR-0016). Filing is
+    /// deliberately independent of `[ui.toast] delivery`: `off` is a request
+    /// for no popups, not a request to forget what happened — and it is the
+    /// default, so gating on it would leave the log empty for most operators.
+    fn file_agent_notification(&mut self, delivery: &AgentNotificationDelivery) {
+        let (title, body) = match delivery
+            .toast
+            .as_ref()
+            .or(delivery.client_notification.as_ref())
+        {
+            Some(toast) => (toast.title.clone(), Some(toast.context.clone())),
+            // Sound-only: the operator hears it, so the record still has to
+            // exist for them to find out what it was about.
+            None => (
+                format!(
+                    "{} {}",
+                    toast_agent_label(&delivery.agent_label),
+                    toast_event_text(delivery.kind)
+                ),
+                None,
+            ),
+        };
+        let pane_id = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == delivery.workspace_id)
+            .and_then(|ws_idx| self.public_pane_id(ws_idx, delivery.pane_id));
+
+        self.file_notification(crate::app::notifications::NotificationEntry {
+            id: crate::app::notifications::mint_notification_id(),
+            title,
+            body,
+            kind: match delivery.kind {
+                ToastKind::NeedsAttention => crate::api::schema::NotificationRecordKind::Attention,
+                ToastKind::Finished => crate::api::schema::NotificationRecordKind::Outcome,
+                ToastKind::UpdateInstalled => crate::api::schema::NotificationRecordKind::Notice,
+            },
+            source: crate::api::schema::NotificationSource::AgentState,
+            workspace_id: Some(delivery.workspace_id.clone()),
+            pane_id,
+            origin_host: crate::app::short_host_name(),
+            filed_at_ms: crate::app::notifications::now_ms(),
+            seen: false,
+        });
     }
 
     /// Earliest instant at which some held notification comes due, so the loop
@@ -7068,6 +7116,88 @@ mod tests {
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::NeedsAttention)
         );
+    }
+
+    /// #372: the toast expires; the outcome must not. Drives the real
+    /// transition through the #36 gate and asserts on what is left afterwards.
+    #[test]
+    fn a_delivered_agent_notification_is_also_filed_for_later() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let public_pane_id = state.public_pane_id(1, bg_pane_id).expect("public pane id");
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            state.notifications.unread(),
+            0,
+            "nothing is filed for a transition the gate has not delivered"
+        );
+        deliver_due_agent_notifications(&mut state);
+
+        assert_eq!(state.notifications.unread(), 1);
+        let filed = state
+            .notifications
+            .newest_first()
+            .next()
+            .expect("the outcome outlives the toast")
+            .clone();
+        assert_eq!(filed.title, "pi needs attention");
+        assert_eq!(filed.body.as_deref(), Some("background · 2"));
+        assert_eq!(
+            filed.kind,
+            crate::api::schema::NotificationRecordKind::Attention
+        );
+        assert_eq!(filed.pane_id.as_deref(), Some(public_pane_id.as_str()));
+        assert_eq!(
+            filed.workspace_id.as_deref(),
+            Some(state.workspaces[1].id.as_str())
+        );
+
+        // Expire the toast the way the loop does. The record is what is left.
+        state.toast = None;
+        assert_eq!(state.notifications.unread(), 1);
+    }
+
+    /// The default delivery is `off`, so gating filing on it would leave the
+    /// log empty for most operators — `off` asks for no popups, not amnesia.
+    #[test]
+    fn an_outcome_is_filed_even_with_popup_delivery_off() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        assert_eq!(
+            state.toast_config().delivery,
+            crate::config::ToastDelivery::Off,
+            "this test is about the shipped default"
+        );
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            activity: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        deliver_due_agent_notifications(&mut state);
+
+        assert!(state.toast.is_none(), "no popup, as configured");
+        assert_eq!(state.notifications.unread(), 1, "but the outcome is kept");
     }
 
     /// The cancellation the gate buys: an agent that unblocks itself inside the
