@@ -1697,6 +1697,14 @@ impl App {
                                 })
                                 .map_err(|err| match err {
                                     super::agents::AgentStartError::SpawnFailed(message) => message,
+                                    // #178: the agent exec'd and was gone
+                                    // before it could do anything. Its own
+                                    // last line names the reason, so it is
+                                    // shown rather than flattened into the
+                                    // generic rejection below.
+                                    super::agents::AgentStartError::ExitedAtStart(exit) => {
+                                        exit.message()
+                                    }
                                     _ => "agent spawn rejected".to_string(),
                                 })
                         })

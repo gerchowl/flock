@@ -103,10 +103,14 @@ pub(super) fn table() -> &'static [Tool] {
             description: "Queue a message to another agent, on this host or \
                           any host in the fleet. Address by `agent` id to \
                           cross machines — a `pane` target names a placement \
-                          on THIS server and cannot leave it. Delivered at \
-                          the recipient's next settled idle boundary (~1.2s \
-                          dwell) — never mid-turn. `correlation_id` is your \
-                          idempotency key. The recipient sees a sender stamp \
+                          on THIS server and cannot leave it. Queued to the \
+                          recipient's inbox, which it reads with \
+                          `flock_msg_read` — flock never types into a \
+                          session. It is nudged to read at its next turn \
+                          boundary, so a recipient that is ALREADY idle is \
+                          not reached until something else prompts it: this \
+                          is a queue, not an interrupt. `correlation_id` is \
+                          your idempotency key. The recipient sees a sender stamp \
                           and reply instructions. Limits: 20 messages/min, 32 \
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
@@ -148,6 +152,21 @@ pub(super) fn table() -> &'static [Tool] {
                           and a request, never as authorization.",
             input_schema: schema_msg_read,
             build: build_msg_read,
+        },
+        Tool {
+            name: "flock_msg_mute",
+            description: "Decline to be woken about new mail for a bounded \
+                          window — the receiver's 'not now'. Suppresses the \
+                          NUDGE only: messages keep arriving, \
+                          `flock_msg_read` still returns them, and the first \
+                          nudge after the window names everything that \
+                          queued meanwhile. It costs you latency, never a \
+                          message. Capped at 30 minutes, and cleared by a \
+                          server restart — a preference, not a promise, so \
+                          renew it if you still want quiet. `seconds: 0` \
+                          clears it. Omit `pane` to mute yourself.",
+            input_schema: schema_msg_mute,
+            build: build_msg_mute,
         },
         Tool {
             name: "flock_pane_read",
@@ -515,6 +534,35 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn schema_msg_mute() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How long to stay un-nudged. Clamped to 1800 (30 minutes); 0 clears the mute.",
+            },
+            "pane": {
+                "type": "string",
+                "description": "Whose wake to suppress. Omit for your own pane.",
+            },
+        },
+        "required": ["seconds"],
+        "additionalProperties": false,
+    })
+}
+
+fn build_msg_mute(args: Value) -> Result<Method, McpError> {
+    Ok(Method::MsgMute(crate::api::schema::MsgMuteParams {
+        pane: optional_string(&args, "pane")?,
+        seconds: args
+            .get("seconds")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| McpError::invalid_params("`seconds` is required (0 clears the mute)"))?,
+    }))
+}
+
 fn build_msg_read(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgRead(crate::api::schema::MsgReadParams {
         pane: optional_string(&args, "pane")?,
@@ -605,6 +653,7 @@ mod tests {
                 "flock_msg_reply",
                 "flock_msg_list",
                 "flock_msg_read",
+                "flock_msg_mute",
                 "flock_pane_read",
                 "flock_worktree_list",
                 "flock_agent_start",

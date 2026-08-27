@@ -32,6 +32,10 @@ pub(super) fn run_report_command(args: &[String]) -> std::io::Result<i32> {
             Ok(i32::from(args.is_empty()) * 2)
         }
         Some(kind) => match ReportKind::parse(kind) {
+            Some(_) if asks_for_help(&args[1..]) => {
+                print_report_help();
+                Ok(0)
+            }
             Some(kind) => run_report(kind, &args[1..]),
             None => {
                 eprintln!("unknown report kind: {kind}");
@@ -41,6 +45,15 @@ pub(super) fn run_report_command(args: &[String]) -> std::io::Result<i32> {
             }
         },
     }
+}
+
+/// `flk report bug --help` reached the option parser and came back
+/// "unknown option: --help", pointing the reporter at `flk report help` (#365).
+/// Every other `flk <verb> --help` prints help, so this one read as a bug
+/// rather than a convention. Checked before the options are parsed, because
+/// help is a request to explain the flags, not to satisfy them.
+fn asks_for_help(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
 }
 
 fn run_template(args: &[String]) -> std::io::Result<i32> {
@@ -376,6 +389,22 @@ fn print_report_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_is_recognised_after_the_report_kind() {
+        // `flk report bug --help` used to be an "unknown option" error.
+        assert!(asks_for_help(&["--help".to_string()]));
+        assert!(asks_for_help(&["-h".to_string()]));
+        assert!(asks_for_help(&[
+            "--file".to_string(),
+            "bug.md".to_string(),
+            "--help".to_string(),
+        ]));
+        assert!(!asks_for_help(&[
+            "--file".to_string(),
+            "bug.md".to_string()
+        ]));
+    }
 
     #[test]
     fn skeleton_round_trips_through_the_parser() {

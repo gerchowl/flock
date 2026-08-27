@@ -187,8 +187,12 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // reads its own inbox) whose count rides the existing decision:block
     // contract. Fire-and-forget like every other hook query: a server that
     // does not answer means no nudge, never a blocked turn.
+    //
+    // The count comes from `msg.wake`, not `msg.list`: the server decides
+    // whether a wake may fire at all (a paused fleet, a muted recipient) and
+    // answers with a number rather than message previews (#316).
     let pending_messages = if matches!(action, Action::Stop) {
-        pending_message_count(&pane_id)
+        wake_message_count(&pane_id)
     } else {
         0
     };
@@ -443,25 +447,42 @@ fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
     Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
 }
 
-/// Peek at how many messages are waiting for this pane. Never consumes — the
-/// agent reads its own inbox. Any failure counts as zero: a hook must never
-/// block or fail the parent agent.
-fn pending_message_count(pane_id: &str) -> usize {
+/// Ask the server how many messages this pane may be woken about (#316).
+///
+/// Never consumes — the agent reads its own inbox — and never fetches bodies:
+/// `msg.wake` answers with a count, so the wake path structurally cannot
+/// carry text a sender wrote (ADR-0008). It also answers ZERO when a wake is
+/// suppressed, which is why the hook asks this rather than `msg.list`: the
+/// decision belongs to the server, where the fleet pause and the recipient's
+/// own mute are known.
+///
+/// Any failure counts as zero. A hook must never block or fail the parent
+/// agent, so an unreachable or older server means no nudge.
+fn wake_message_count(pane_id: &str) -> usize {
     let request = Request {
         id: format!("flock:hook:{}", seq()),
-        method: Method::MsgList(crate::api::schema::MsgListParams {
+        method: Method::MsgWake(crate::api::schema::MsgWakeParams {
             pane: Some(pane_id.to_string()),
         }),
     };
     ApiClient::local()
         .request_value_with_timeout(&request, HOOK_TIMEOUT)
         .ok()
-        .and_then(|value| {
-            value
-                .pointer("/result/messages")
-                .and_then(|messages| messages.as_array())
-                .map(Vec::len)
-        })
+        .map_or(0, |value| wake_count_from_response(&value))
+}
+
+/// Pure half of [`wake_message_count`]: read the count out of a `msg.wake`
+/// response.
+///
+/// Split out so a test can pin it against a response built from the server's
+/// OWN `ResponseResult` type. The hook reads the wire by pointer, and a
+/// pointer that stops matching what the handler emits fails silently — the
+/// agent simply never hears about its mail again (#328's shape).
+fn wake_count_from_response(value: &serde_json::Value) -> usize {
+    value
+        .pointer("/result/count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(0)
 }
 
@@ -577,6 +598,49 @@ fn cap(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #316: the hook reads the wake count out of the wire by pointer, and a
+    /// pointer that stops matching what the handler emits fails SILENTLY —
+    /// the agent simply never hears about its mail again. So build the
+    /// response from the server's own `ResponseResult` rather than from a
+    /// hand-written literal, and let a shape change break this test.
+    #[test]
+    fn the_wake_count_is_read_from_the_servers_own_response_shape() {
+        let encode = |result| {
+            serde_json::to_value(crate::api::schema::SuccessResponse {
+                id: "flock:hook:1".into(),
+                result,
+            })
+            .expect("encode")
+        };
+
+        let woken = encode(crate::api::schema::ResponseResult::MsgWake {
+            count: 3,
+            suppressed: None,
+            muted_until_ms: None,
+        });
+        assert_eq!(wake_count_from_response(&woken), 3);
+
+        // A suppressed wake reports zero in the count itself, so a hook that
+        // reads only the count cannot nudge through a pause or a mute.
+        let suppressed = encode(crate::api::schema::ResponseResult::MsgWake {
+            count: 0,
+            suppressed: Some("fleet_paused".into()),
+            muted_until_ms: None,
+        });
+        assert_eq!(wake_count_from_response(&suppressed), 0);
+        assert_eq!(
+            mail_nudge(wake_count_from_response(&suppressed), false),
+            None
+        );
+
+        // An older server, or one that answered with an error, is not a
+        // reason to block the parent agent's turn.
+        assert_eq!(
+            wake_count_from_response(&json!({"error": {"code": "x"}})),
+            0
+        );
+    }
 
     fn method_name(method: &Method) -> &'static str {
         match method {

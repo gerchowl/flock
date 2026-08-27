@@ -570,6 +570,7 @@ fn print_agent_help() {
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
+    eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"

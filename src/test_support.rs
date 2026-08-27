@@ -40,6 +40,16 @@ pub(crate) fn no_op_program() -> String {
     program_path_string("true")
 }
 
+/// A program that stays up instead of exiting the moment it execs, for tests
+/// that need a pane whose process is still there afterwards (#178).
+///
+/// `sh` with no arguments sits reading the pane's pty, which is the shape a
+/// real agent has. Tests that used [`no_op_program`] for this got away with it
+/// until flock started refusing a start whose agent was already gone.
+pub(crate) fn live_program() -> String {
+    program_path_string("sh")
+}
+
 /// `PATH` as a `(key, value)` pair, for check scripts.
 ///
 /// `checks::script::run_script` deliberately calls `env_clear()`, so a script
