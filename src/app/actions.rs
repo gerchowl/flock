@@ -3819,6 +3819,29 @@ impl AppState {
             // Handled in the shared api.rs preprocessing before reaching here.
             // Consumed by the shared preprocessing in app/api.rs before this
             // match runs in either loop.
+            AppEvent::IssueReposFetched(outcome) => {
+                match outcome {
+                    Ok(entries) => {
+                        self.issue_repo_cache = Some(crate::github::repos::RepoDirectory::new(
+                            entries.clone(),
+                            std::time::Instant::now(),
+                        ));
+                        self.apply_issue_repo_entries(&entries);
+                    }
+                    // Enumeration is a shortcut, not the only way through: the
+                    // dialog stays open so a typed owner/name still files. Only
+                    // the classification is shown — GitHub's own message names
+                    // private repositories.
+                    Err(kind) => {
+                        if let Some(drop) = self.issue_drop.as_mut() {
+                            drop.status = crate::app::issue_drop::DirectoryStatus::Failed(
+                                kind.as_str().to_string(),
+                            );
+                        }
+                    }
+                }
+                Vec::new()
+            }
             AppEvent::PrStatePollDue
             | AppEvent::PrStatesUpdated(_)
             // Applied at the App layer, which owns the issue-guard dedupe state.

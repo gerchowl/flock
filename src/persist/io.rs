@@ -201,6 +201,7 @@ mod tests {
 
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
+            issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
