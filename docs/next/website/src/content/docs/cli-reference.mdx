@@ -351,10 +351,11 @@ Exposed tools:
 | `flock_agent_read` | `agent.read` | Reading marks the pane seen — use sparingly. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
-| `flock_msg_send` | `msg.send` | Delivered at the recipient's next settled idle boundary. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
+| `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. |
 | `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
+| `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. |
 | `flock_pane_read` | `pane.read` | Same seen caveat as `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
 
