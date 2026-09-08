@@ -3714,8 +3714,22 @@ sidebar_pane_gap = 99
     /// (#268: never the process cwd, never a hardcoded FHS path).
     fn cwd_fixture_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("flock-390-{name}-{}", std::process::id()));
+        // Removed first so a rerun in the same process id starts from a known
+        // state rather than inheriting whatever a previous run left.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fixture dir");
         std::fs::canonicalize(&dir).unwrap_or(dir)
+    }
+
+    /// Shut the PTY children these tests start. `live_program()` is a real
+    /// `sh` sitting on its pane's pty, so a test that just drops the app leaves
+    /// one per case — `focused_agent_start_records_previous_pane` drains for
+    /// exactly this reason.
+    fn drain_test_runtimes(app: &mut App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 
     fn membership_at(checkout_path: &std::path::Path) -> crate::workspace::WorktreeSpaceMembership {
@@ -3725,6 +3739,21 @@ sidebar_pane_gap = 99
             repo_root: checkout_path.to_path_buf(),
             checkout_path: checkout_path.to_path_buf(),
             is_linked_worktree: true,
+        }
+    }
+
+    /// A live-git identity for a checkout, i.e. what the periodic probe caches.
+    /// The resolver's SECOND arm reads this rather than membership, and a
+    /// workspace open on a plain checkout (no worktree membership) has only
+    /// this — which is the common case for `~/dotfiles`.
+    fn git_space_at(checkout_path: &std::path::Path) -> crate::workspace::GitSpaceMetadata {
+        crate::workspace::GitSpaceMetadata {
+            key: format!("{}/.git", checkout_path.display()),
+            checkout_key: checkout_path.display().to_string(),
+            label: "fixture".into(),
+            repo_root: checkout_path.to_path_buf(),
+            is_linked_worktree: false,
+            project_key: "dir:fixture".into(),
         }
     }
 
@@ -3782,6 +3811,7 @@ sidebar_pane_gap = 99
             ws.active_tab, 0,
             "an unfocused start does not steal the view"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3802,6 +3832,7 @@ sidebar_pane_gap = 99
         assert_eq!(response["result"]["type"], "agent_started");
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3829,6 +3860,7 @@ sidebar_pane_gap = 99
             2,
             "a checkout that is not on disk is not a placement target"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3867,6 +3899,7 @@ sidebar_pane_gap = 99
             1,
             "and the checkout's space is untouched"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3901,6 +3934,7 @@ sidebar_pane_gap = 99
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(ws.tabs.len(), 1, "--workspace splits its target, as before");
         assert_eq!(ws.tabs[0].panes.len(), 2);
+        drain_test_runtimes(&mut app);
     }
 
     fn agent_start_split_with_cwd(cwd: Option<String>) -> crate::api::schema::Request {
@@ -3952,6 +3986,7 @@ sidebar_pane_gap = 99
             1,
             "and leaves the focused workspace alone"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -3977,6 +4012,7 @@ sidebar_pane_gap = 99
             2,
             "no cwd to place by means --split still splits the active workspace"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -4013,6 +4049,69 @@ sidebar_pane_gap = 99
             "the FIRST match takes it, deterministically — not the focused one"
         );
         assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_plain_checkout_matches_on_live_git_identity_not_only_membership() {
+        // The resolver's second arm. A workspace opened on an ordinary checkout
+        // — `~/dotfiles`, not a linked worktree — carries NO
+        // `WorktreeSpaceMembership`; all it has is the git identity the
+        // periodic probe cached. That is the shape the reported bug actually
+        // had, so an implementation that only ever consulted membership would
+        // pass every other test here and fix nothing for the person who
+        // reported it.
+        let checkout = cwd_fixture_dir("gitspace");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.cached_git_space = Some(git_space_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            1,
+            "a plain checkout is still a placement target"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn membership_wins_over_a_live_git_match_on_an_earlier_row() {
+        // Arm-major, not workspace-major. Scanning workspaces on the outside
+        // would let the weaker signal on row 0 beat the exact membership match
+        // on row 1, which is how a resolver that looks right places panes in
+        // the wrong space.
+        let checkout = cwd_fixture_dir("armorder");
+        let mut app = test_app();
+        let mut by_git = Workspace::test_new("live-git-row");
+        by_git.cached_git_space = Some(git_space_at(&checkout));
+        let mut by_membership = Workspace::test_new("membership-row");
+        by_membership.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![by_git, by_membership];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.workspaces[1].tabs.len(),
+            2,
+            "the membership match takes it even though it is the later row"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]
@@ -4042,6 +4141,7 @@ sidebar_pane_gap = 99
             app.state.workspaces[0].worktree_space().map(|s| &s.key),
             "the sibling carries the source's membership, so it groups with it"
         );
+        drain_test_runtimes(&mut app);
     }
 
     #[tokio::test]

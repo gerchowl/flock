@@ -256,6 +256,21 @@ impl App {
     /// headless, and `--no-focus` is not that: it is the CLI's DEFAULT, so
     /// keying on it would turn every scripted `agent start` into a refusal.
     /// That signal is real work of its own; see the follow-up on this issue.
+    ///
+    /// Two things it deliberately does NOT match, both of which fall through
+    /// to a space of the agent's own:
+    ///
+    /// - A cwd BELOW a checkout root. `--cwd ~/dotfiles/modules` names a
+    ///   directory in the dotfiles checkout and resolves to nothing. Matching
+    ///   an ancestor would mean walking up the tree per workspace per call,
+    ///   and it would make `--cwd` inside a nested repo ambiguous in exactly
+    ///   the way arm ordering exists to avoid.
+    /// - A workspace open at a checkout that has neither membership nor a
+    ///   finished git probe. Its `cached_git_space` is `None` until the
+    ///   periodic probe lands, so a call in that window takes the old path.
+    ///   Time-varying, like the identity-cwd arm this rejects — but in the
+    ///   safe direction: it degrades to a space of its own rather than to
+    ///   somebody else's.
     fn agent_cwd_workspace_id(&self, cwd: Option<&std::path::Path>) -> Option<String> {
         let cwd = cwd?;
         if !cwd.is_dir() {
@@ -316,7 +331,13 @@ impl App {
             return self.spawn_agent_workspace(cwd, rows, cols, argv, focus);
         };
         if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
-            let membership = self.state.workspaces[ws_idx].worktree_space().cloned();
+            // `_here`, matching the resolver (#197): a membership that
+            // describes somewhere the source workspace no longer is must not
+            // be stamped onto a sibling, or the sibling inherits a grouping
+            // that was already wrong. A source matched on live git rather than
+            // membership has none to clone, and the sibling groups off the git
+            // probe exactly as an unmatched space does today.
+            let membership = self.state.workspaces[ws_idx].worktree_space_here().cloned();
             let placed = self.spawn_agent_workspace(cwd, rows, cols, argv, focus)?;
             if membership.is_some() {
                 self.state.workspaces[placed.0].worktree_space = membership;
