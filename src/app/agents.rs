@@ -203,6 +203,181 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("/"))
     }
 
+    /// The open workspace an untargeted `agent start --cwd PATH` belongs in
+    /// (#390), named by its stable id rather than its index.
+    ///
+    /// `--cwd` used to decide only where the PROCESS starts, never which space
+    /// the PANE joins, so pointing an agent at a checkout that is already open
+    /// minted a second space for it. Ask for three agents in `~/dotfiles` and
+    /// the sidebar grows three more `dotfiles` rows beside the one that was
+    /// already there — and the operator finishes the job by hand with
+    /// `flk pane move`.
+    ///
+    /// Three narrowings, each one a way this would otherwise answer WRONG:
+    ///
+    /// 1. **Only an explicitly requested cwd.** Never `agent_start_cwd`'s
+    ///    output — that always yields something, and its fallback is the
+    ///    SERVER's `current_dir()`, which for a daemon launched from a login
+    ///    shell is `$HOME`. Matching the derived cwd would file every
+    ///    untargeted agent under whatever workspace happens to sit at the
+    ///    server's own cwd, which is #364 rebuilt out of a default.
+    /// 2. **The directory has to exist.** A workspace whose checkout has been
+    ///    removed (#360) still string-matches: `worktree_space_here` keeps the
+    ///    membership whenever live git has no answer, and
+    ///    `canonical_or_original` hands back the original path when
+    ///    canonicalization fails. `is_dir` is what actually distinguishes them.
+    /// 3. **Membership and live-git identity only — never the root pane's
+    ///    current cwd.** That third signal (`resolved_identity_cwd_from`, which
+    ///    `open_workspace_idx_for_checkout` does consult) makes the answer
+    ///    TIME-VARYING: the same `agent start` lands somewhere else because a
+    ///    shell in some other space has since `cd`'d. A default that moves
+    ///    under you is worse than no default.
+    ///
+    /// Deliberately NOT `open_workspace_idx_for_checkout`. That resolver
+    /// answers "which workspace is this checkout" for callers who NAMED the
+    /// checkout — `SpawnLocation::WorktreePath` wants the loosest true answer.
+    /// This one is a default applied to a caller who named a cwd and said
+    /// nothing about placement, so it has to be the strictest one. Same
+    /// question, different burden of proof.
+    ///
+    /// Arm-major, not workspace-major: scanning workspaces on the outside would
+    /// let a weak match on an earlier row beat an exact membership match on a
+    /// later one.
+    ///
+    /// Several workspaces CAN name one checkout, and that is normal rather
+    /// than a conflict — a sibling space (#25) clones its source's membership
+    /// precisely so the two group together, so every match is a right answer
+    /// to "where does this checkout live". The first is taken, which is the
+    /// source before the siblings it seeded. Refusing to place at all here
+    /// would punish the grouping this feature creates.
+    ///
+    /// A caller who wants the stronger contract — refuse rather than choose,
+    /// so a headless dispatch never guesses — needs a way to say it is
+    /// headless, and `--no-focus` is not that: it is the CLI's DEFAULT, so
+    /// keying on it would turn every scripted `agent start` into a refusal.
+    /// That signal is real work of its own; see the follow-up on this issue.
+    fn agent_cwd_workspace_id(&self, cwd: Option<&std::path::Path>) -> Option<String> {
+        let cwd = cwd?;
+        if !cwd.is_dir() {
+            return None;
+        }
+        let canonical = crate::worktree::canonical_or_original(cwd);
+        let checkout_key = canonical.display().to_string();
+
+        // `_here`, not raw membership (#197): a workspace whose pane has moved
+        // to another repo describes somewhere it no longer is, and must not
+        // claim a cwd on the strength of it.
+        self.state
+            .workspaces
+            .iter()
+            .find(|ws| {
+                ws.worktree_space_here().is_some_and(|space| {
+                    crate::worktree::canonical_or_original(&space.checkout_path) == canonical
+                })
+            })
+            .or_else(|| {
+                self.state.workspaces.iter().find(|ws| {
+                    ws.git_space()
+                        .is_some_and(|space| space.checkout_key == checkout_key)
+                })
+            })
+            .map(|ws| ws.id.clone())
+    }
+
+    /// Put an agent in the space `workspace_id` names, in whichever shape that
+    /// space actually SHOWS (#390).
+    ///
+    /// The mode branch is not a nicety. In `tab_mode = workspace` a "tab" is a
+    /// sibling workspace and the inner-tab strip is never drawn, so an inner
+    /// tab created here would be a pane the operator cannot see or reach —
+    /// exactly the bug `handle_tab_create` already documents at
+    /// `src/app/api/tabs.rs`. In that mode the agent gets a sibling space with
+    /// the source's worktree membership cloned onto it, which is how #25 keeps
+    /// siblings grouped.
+    ///
+    /// Takes the id and resolves it HERE, at the point of mutation. Indices
+    /// into `state.workspaces` do not survive arbitrary code —
+    /// `handle_pane_died` removes a workspace when its last pane goes, and
+    /// close/insert paths reorder the Vec — so an index resolved earlier and
+    /// spent later is a pane placed in whatever row slid into that slot.
+    fn spawn_agent_in_workspace(
+        &mut self,
+        workspace_id: &str,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+        argv: &[String],
+        focus: bool,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        let Some(ws_idx) = self.parse_workspace_id(workspace_id) else {
+            // The space went away between resolution and here. Falling back to
+            // a space of its own is the same answer an unmatched cwd gets, and
+            // it is never a reason to refuse to start the agent.
+            return self.spawn_agent_workspace(cwd, rows, cols, argv, focus);
+        };
+        if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+            let membership = self.state.workspaces[ws_idx].worktree_space().cloned();
+            let placed = self.spawn_agent_workspace(cwd, rows, cols, argv, focus)?;
+            if membership.is_some() {
+                self.state.workspaces[placed.0].worktree_space = membership;
+                // The save scheduled inside the spawn ran BEFORE membership was
+                // stamped, so a crash in that window would restore the sibling
+                // ungrouped — the same second save `create_sibling_workspace_from`
+                // makes, for the same reason.
+                self.schedule_session_save();
+            }
+            return Ok(placed);
+        }
+        self.spawn_agent_tab(ws_idx, cwd, rows, cols, argv, focus)
+    }
+
+    /// The agent as the only pane of a NEW tab in an existing workspace.
+    ///
+    /// The tab-shaped sibling of `spawn_agent_workspace`: same "the agent does
+    /// not share a pane row with anything" property #364 established, without
+    /// minting a space for a checkout that already has one.
+    fn spawn_agent_tab(
+        &mut self,
+        ws_idx: usize,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+        argv: &[String],
+        focus: bool,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
+        let host_terminal_theme = self.state.host_terminal_theme;
+        let (tab_idx, terminal, runtime) = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .ok_or_else(|| AgentStartError::SpawnFailed("workspace disappeared".into()))?
+            .create_tab_argv_command(
+                rows,
+                cols,
+                cwd,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                argv,
+            )
+            .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
+        let terminal_id = terminal.id.clone();
+        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        self.state.terminals.insert(terminal.id.clone(), terminal);
+        let pane_id = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        if focus {
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.state.mode = Mode::Terminal;
+        }
+        self.schedule_session_save();
+        if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
+            self.discard_agent_pane_that_never_ran(pane_id);
+            return Err(AgentStartError::ExitedAtStart(exit));
+        }
+        Ok((ws_idx, tab_idx, pane_id))
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -282,10 +457,31 @@ impl App {
                 focus,
             )?
         } else if let Some(split) = params.split {
-            // No placement target, but the caller ASKED to split: honour it
-            // against whatever is active. `--split` is the only way to say
-            // "put this beside what I am looking at" without naming a target.
-            let ws_idx = self.state.active.unwrap_or(0);
+            // No placement target, but the caller ASKED to split. WHAT gets
+            // split depends on whether the caller also named a cwd flock can
+            // place.
+            //
+            // With a resolvable `--cwd`, split THAT workspace. Falling back to
+            // the active one here would be the same defect this issue is
+            // about, wearing `--split` as a hat: a caller who named a checkout
+            // has said where the work lives, and "beside what I am looking at"
+            // is not an answer to it. For a headless caller — ssh dispatch,
+            // `--no-focus`, MCP — the active workspace is not merely wrong but
+            // MEANINGLESS: it is whatever a human last focused, which is
+            // arbitrary and races every other dispatch in flight.
+            //
+            // With no cwd match, `--split` keeps its original meaning against
+            // the active workspace. That is the one reading under which it is
+            // still the "put this beside what I am looking at" gesture, which
+            // is a real thing to want and the only way to ask for it without
+            // naming a target.
+            let requested_cwd = explicit_cwd.clone();
+            let matched = self.agent_cwd_workspace_id(requested_cwd.as_deref());
+            let ws_idx = matched
+                .as_deref()
+                .and_then(|id| self.parse_workspace_id(id))
+                .or(self.state.active)
+                .unwrap_or(0);
             if self.state.workspaces.is_empty() {
                 let cwd = self.agent_start_cwd(explicit_cwd, None);
                 self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
@@ -296,20 +492,36 @@ impl App {
                 self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
             }
         } else {
-            // An agent asked for with no placement at all gets its OWN space,
-            // as the tab's only pane.
+            // An agent asked for with no placement at all gets a tab of its
+            // own — in the space its cwd names when there is one, otherwise in
+            // a space of its own.
             //
             // This used to split the ACTIVE workspace, which put the new agent
             // beside whatever the operator happened to be looking at — so
             // `flk agent start` from inside a pane landed the agent in that
             // pane's tab, and the space it should have had never existed. The
             // agent then shares a tab with an unrelated shell, both compete for
-            // the same width, and closing "the space" closes two things.
+            // the same width, and closing "the space" closes two things (#364).
+            // Either branch below keeps that: the agent is always the only pane
+            // of a tab nobody else is in.
+            //
+            // What #364 left open is WHICH space, and `--cwd` was the answer
+            // sitting unread in the params all along (#390). A cwd that names
+            // an open checkout means the operator has already told flock where
+            // this work lives; minting a second space for it is flock declining
+            // to listen. Only a matched cwd changes anything — an unmatched one
+            // takes the #364 path unchanged.
             //
             // Splitting is still reachable, but only by asking: name a
             // `workspace_id`/`tab_id`, or pass `split`.
+            let requested_cwd = explicit_cwd.clone();
             let cwd = self.agent_start_cwd(explicit_cwd, None);
-            self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+            match self.agent_cwd_workspace_id(requested_cwd.as_deref()) {
+                Some(workspace_id) => {
+                    self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
+                }
+                None => self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?,
+            }
         };
 
         let terminal_id = self
