@@ -501,7 +501,7 @@ impl App {
             path: space.checkout_path,
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -565,7 +565,7 @@ impl App {
             path: checkout.clone(),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -1598,8 +1598,8 @@ impl App {
         remove.removing = true;
         remove.error = None;
         // #325: either the user armed force up front, or an earlier attempt
-        // already failed on dirty files and asked for confirmation.
-        let force = remove.force_confirmation || remove.force;
+        // already failed on something forcible and asked for confirmation.
+        let force = remove.forced();
 
         let command =
             crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
@@ -1883,13 +1883,17 @@ impl App {
                     &message,
                 );
                 remove.removing = false;
-                if !remove.force_confirmation
-                    && crate::worktree::is_dirty_worktree_remove_error(&message)
-                {
-                    remove.force_confirmation = true;
-                    remove.error = None;
-                } else {
-                    remove.error = Some(message);
+                // A refusal git will drop for `--force` becomes the second
+                // confirmation, not a dead end (#351). Which refusal it was
+                // travels with the flag, because the two say different things
+                // to the user. A second failure after forcing is a real error:
+                // the confirmation has already been spent.
+                match crate::worktree::classify_worktree_remove_error(&message) {
+                    Some(refusal) if remove.force_confirmation.is_none() => {
+                        remove.force_confirmation = Some(refusal);
+                        remove.error = None;
+                    }
+                    _ => remove.error = Some(message),
                 }
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
@@ -2337,7 +2341,7 @@ mod tests {
             path: path.clone(),
             error: None,
             removing: true,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -2359,7 +2363,10 @@ mod tests {
 
         let remove = app.state.worktree_remove.unwrap();
         assert!(!remove.removing);
-        assert!(remove.force_confirmation);
+        assert_eq!(
+            remove.force_confirmation,
+            Some(crate::worktree::WorktreeRemoveRefusal::Dirty)
+        );
         assert_eq!(remove.error, None);
     }
 
@@ -2374,7 +2381,7 @@ mod tests {
             path: path.clone(),
             error: None,
             removing: true,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -2393,7 +2400,7 @@ mod tests {
 
         let remove = app.state.worktree_remove.unwrap();
         assert!(!remove.removing);
-        assert!(!remove.force_confirmation);
+        assert_eq!(remove.force_confirmation, None);
         assert_eq!(
             remove.error,
             Some("fatal: '/w/flock/missing' is not a working tree".into())
@@ -2446,7 +2453,10 @@ mod tests {
 
         let remove = app.state.worktree_remove.as_ref().unwrap();
         assert!(!remove.removing);
-        assert!(remove.force_confirmation);
+        assert_eq!(
+            remove.force_confirmation,
+            Some(crate::worktree::WorktreeRemoveRefusal::Dirty)
+        );
         assert!(checkout.exists());
 
         app.start_worktree_remove();
@@ -2467,6 +2477,222 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(repo);
     }
+
+    /// git blocks the file transport for submodules by default, so a fixture
+    /// cloning one from a sibling temp dir has to opt back in.
+    fn run_git_over_file_protocol(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git command failed: git -C {} {}",
+            repo.display(),
+            args.join(" ")
+        );
+    }
+
+    /// A repo with a populated submodule — the shape (`hyrr` carrying
+    /// `nucl-parquet`) whose kill dead-ended in #351.
+    fn create_repo_with_submodule(name: &str) -> std::path::PathBuf {
+        let sub = create_committed_repo(&format!("{name}-sub"));
+        let repo = create_committed_repo(name);
+        run_git_over_file_protocol(
+            &repo,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                &sub.display().to_string(),
+                "sub",
+            ],
+        );
+        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
+        repo
+    }
+
+    /// #351: git refuses to remove a worktree holding a submodule, and the
+    /// refusal has to become the force confirmation rather than a dead end.
+    /// Drives real git end to end, because the value under test is git's own
+    /// stderr — a hand-written message would only prove the matcher matches
+    /// itself.
+    #[test]
+    fn submodule_worktree_remove_retries_with_force_and_deletes_merged_branch() {
+        let repo = create_repo_with_submodule("app-worktree-submodule-remove");
+        let checkout = unique_temp_path("app-worktree-submodule-remove-checkout");
+        let branch = "worktree/submodule-remove";
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
+        let workspace_id = app.state.workspaces[0].id.clone();
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "hyrr".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_remove_linked_worktree_confirmation(0);
+        {
+            // The kill flow's shape once the gate has landed: merged branch,
+            // so the removal is expected to take the branch with it.
+            let remove = app.state.worktree_remove.as_mut().unwrap();
+            remove.delete_branch = true;
+            remove.branch = Some(branch.to_string());
+            remove.merge_gate = Some(crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "PR #622 merged".into(),
+            });
+        }
+
+        app.start_worktree_remove();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeRemoveFinished(result) => {
+                assert!(result.result.is_err());
+                app.handle_worktree_remove_finished(result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(
+            remove.force_confirmation,
+            Some(crate::worktree::WorktreeRemoveRefusal::Submodules)
+        );
+        assert_eq!(
+            remove.error, None,
+            "the refusal must not read as a dead end"
+        );
+        assert_eq!(remove.primary_label(), "force remove");
+        assert!(checkout.exists());
+
+        app.start_worktree_remove();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeRemoveFinished(result) => {
+                assert_eq!(result.workspace_id, workspace_id);
+                assert_eq!(result.result, Ok(()));
+                app.handle_worktree_remove_finished(result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(!checkout.exists());
+        assert!(app.state.worktree_remove.is_none());
+        assert!(app.state.workspaces.is_empty());
+
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeBranchDeleteFinished(result) => {
+                assert_eq!(result.branch, branch);
+                assert_eq!(result.result, Ok(()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "forced removal dropped the branch delete"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// The force that clears git's refusal is NOT merge evidence (#121, #325):
+    /// an unmerged branch survives a forced-past-submodules removal.
+    #[test]
+    fn forcing_past_the_submodule_refusal_keeps_an_unmerged_branch() {
+        let repo = create_repo_with_submodule("app-worktree-submodule-keep-branch");
+        let checkout = unique_temp_path("app-worktree-submodule-keep-branch-checkout");
+        let branch = "worktree/submodule-keep";
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "hyrr".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_remove_linked_worktree_confirmation(0);
+        {
+            let remove = app.state.worktree_remove.as_mut().unwrap();
+            remove.delete_branch = true;
+            remove.branch = Some(branch.to_string());
+            remove.merge_gate = Some(crate::worktree::WorktreeMergeGate::NotMerged);
+        }
+
+        app.start_worktree_remove();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeRemoveFinished(result) => app.handle_worktree_remove_finished(result),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        app.start_worktree_remove();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeRemoveFinished(result) => {
+                assert_eq!(result.result, Ok(()));
+                app.handle_worktree_remove_finished(result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(!checkout.exists());
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).contains(branch),
+            "the branch was deleted without merge evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
     #[test]
     fn worktree_dialog_follows_live_git_over_a_foreign_repo_membership() {
         // #197: membership calls this a linked worktree of `dompt` while live
@@ -3321,7 +3547,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3365,7 +3591,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3589,7 +3815,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3636,7 +3862,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3677,7 +3903,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3707,7 +3933,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3759,7 +3985,7 @@ mod tests {
             path: checkout.clone(),
             error: None,
             removing: true,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3818,7 +4044,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x"),
             error: None,
             removing: true,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe: None,

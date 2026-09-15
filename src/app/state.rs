@@ -984,9 +984,14 @@ pub struct WorktreeRemoveState {
     pub path: std::path::PathBuf,
     pub error: Option<String>,
     pub removing: bool,
-    pub force_confirmation: bool,
+    /// Set once an attempt has already failed on something `--force` clears,
+    /// carrying WHICH refusal it was (#351) so the confirmation can name it.
+    /// A submodule refusal is not a data-loss warning — the checkout is clean
+    /// and git simply will not touch submodule worktrees unforced — so it must
+    /// not borrow the dirty case's wording.
+    pub force_confirmation: Option<crate::worktree::WorktreeRemoveRefusal>,
     /// User-set force (#325), distinct from [`Self::force_confirmation`], which
-    /// only means "an attempt already failed on dirty files". Set from the
+    /// only means "an attempt already failed on something forcible". Set from the
     /// dialog before the first attempt; overrides BOTH the merge gate (delete
     /// the branch without evidence) and a dirty checkout (force the removal).
     /// Never overrides [`Self::branch_protected`] — losing `main` is a
@@ -1011,6 +1016,28 @@ pub struct WorktreeRemoveState {
     /// The merge gate timed out (#119): the checkout-only fallback is shown
     /// with an "unknown (timed out)" note rather than "no merge evidence".
     pub gate_timed_out: bool,
+}
+
+impl WorktreeRemoveState {
+    /// True when the next attempt will pass `--force`: either the user armed
+    /// it up front, or git already refused for a reason force clears.
+    pub fn forced(&self) -> bool {
+        self.force_confirmation.is_some() || self.force
+    }
+
+    /// The primary button's label. One place, because the render and the mouse
+    /// hit-test measure the same string to find the same rect (#326).
+    pub fn primary_label(&self) -> &'static str {
+        match self.force_confirmation {
+            // Nothing is being deleted that the user did not already expect to
+            // lose: git's submodule check is what is being skipped, not the
+            // user's work (#351).
+            Some(crate::worktree::WorktreeRemoveRefusal::Submodules) => "force remove",
+            Some(crate::worktree::WorktreeRemoveRefusal::Dirty) => "delete anyway",
+            None if self.force => "delete anyway",
+            None => "remove",
+        }
+    }
 }
 
 /// One worktree's row in the fleet-wide kill sweep (#81).

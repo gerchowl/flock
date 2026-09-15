@@ -502,15 +502,16 @@ impl AppState {
                             popup.width.saturating_sub(2),
                             popup.height.saturating_sub(2),
                         );
-                        // Both forms widen the primary button's label to
-                        // "delete anyway" (#325), so the hit-test must ask the
-                        // same question the render does.
-                        let forced = self
+                        // The primary button's label widens with what the
+                        // confirmation has become (#325, #351), so the
+                        // hit-test reads it from the same place the render
+                        // does rather than re-deriving it.
+                        let primary_label = self
                             .worktree_remove
                             .as_ref()
-                            .is_some_and(|remove| remove.force_confirmation || remove.force);
+                            .map_or("remove", |remove| remove.primary_label());
                         let (remove, cancel) =
-                            crate::ui::remove_worktree_button_rects(inner, forced);
+                            crate::ui::remove_worktree_button_rects(inner, primary_label);
                         // #326: the force toggle is a control like the buttons,
                         // so the mouse reaches it too — a keyboard-only
                         // affordance in a mouse-first TUI is half a feature.
@@ -3164,7 +3165,7 @@ mod tests {
             path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: crate::app::state::RemoveWorktreeControl::Remove,
             force: false,
             probe: Some(crate::worktree::KillProbe {
@@ -3221,7 +3222,7 @@ mod tests {
             path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: crate::app::state::RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3242,7 +3243,7 @@ mod tests {
             popup.width.saturating_sub(2),
             popup.height.saturating_sub(2),
         );
-        let (remove, _) = crate::ui::remove_worktree_button_rects(inner, false);
+        let (remove, _) = crate::ui::remove_worktree_button_rects(inner, "remove");
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -3262,7 +3263,7 @@ mod tests {
             path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: crate::app::state::RemoveWorktreeControl::Remove,
             force: false,
             probe: None,
@@ -3283,7 +3284,7 @@ mod tests {
             popup.width.saturating_sub(2),
             popup.height.saturating_sub(2),
         );
-        let (_, cancel) = crate::ui::remove_worktree_button_rects(inner, false);
+        let (_, cancel) = crate::ui::remove_worktree_button_rects(inner, "remove");
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
