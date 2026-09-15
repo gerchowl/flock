@@ -17,6 +17,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "remote",
     "session",
     "slots",
+    "spawn",
     "terminal",
     "theme",
     "title",
@@ -499,12 +500,25 @@ fn load_live_config_from_table(
     );
     load_live_section(
         &table,
+        "spawn",
+        "spawn config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.spawn = section,
+    );
+    load_live_section(
+        &table,
         "msg",
         "msg config",
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.msg = section,
     );
+    // #397: canonicalise the declared agent names and merge them over the
+    // compiled default, so a fleet declaring one agent does not un-declare the
+    // rest. Runs whether or not a `[spawn.env]` was present — it is a no-op on
+    // the default table.
+    diagnostics.extend(config.spawn.env.normalize());
     validate_peers(&mut config.peers, &mut diagnostics);
 
     Ok(LoadedConfig {

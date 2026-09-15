@@ -51,9 +51,16 @@ use super::Config;
 /// - `ui.sound.path`, `ui.sound.done_path`, `ui.sound.request_path`,
 ///   `ui.sound.all_clear_path` — same relative-to-config concern as
 ///   `ui.disk_path`; the ADR calls these `sound.custom` paths.
+/// - `spawn.env`              — a map of agent name to LIST of env-var names
+///   (#397). Listed for the same documentation reason as `peers`: the walk
+///   below already skips arrays, so no `FLOCK_SPAWN_ENV_*` is ever synthesized
+///   and this entry never fires. It records that the omission is a decision —
+///   a per-invocation env poke declaring which variables cross into a child's
+///   environment would be the wrong layer for that decision anyway.
 const BLOCKLIST_PREFIXES: &[&str] = &[
     "keys",
     "peers",
+    "spawn.env",
     "theme.custom",
     "ui.agent_aliases",
     "ui.disk_path",
