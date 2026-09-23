@@ -294,6 +294,24 @@ pub fn claude_config_dir_for_session(session_id: &str) -> Option<String> {
     claude_config_dir_for_session_in(&claude_config_dir_records_dir(), session_id)
 }
 
+/// A recorded selector in the shape `spawn::env::resolve` reads a requester's
+/// environment in.
+///
+/// Claude's `SessionStart` hook runs INSIDE claude, so it sees the live
+/// `CLAUDE_CONFIG_DIR` and records `session_id -> config_dir` above. A fork can
+/// therefore ask what profile the session it is forking actually ran under,
+/// with no live process to read — which is the case that matters, because a
+/// hibernated agent is forkable and has no child pid at all.
+///
+/// This is the one place the variable name is still flock's own knowledge, and
+/// it is load-bearing rather than policy: the record is written by a Claude
+/// hook and read back for a Claude resume, so the key it round-trips through
+/// is fixed by the hook, not by a fleet's `[spawn.env]`. A fleet that declares
+/// no key for `claude` simply never carries what this hands back.
+pub fn recorded_claude_profile(config_dir: String) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), config_dir)])
+}
+
 // Inner forms take the records dir explicitly so they're testable without
 // mutating process-global env (`state_dir()` reads `XDG_STATE_HOME`/`HOME`).
 fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {

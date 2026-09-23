@@ -209,7 +209,7 @@ impl App {
         // globally. Resolved from the same argv that picked the profile keys,
         // so both halves of the child's environment answer for one agent.
         let _allowlist_guard = crate::integration::set_pending_spawn_allowlist(
-            crate::spawn::allowlist::for_argv(&argv),
+            crate::spawn::allowlist::for_argv(&argv, &self.state.config.spawn.env),
         );
         // Armed after the allowlist, and dropped with it: the profile the
         // requester runs under is handed down deliberately, and the server
@@ -467,7 +467,7 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
             // mysterious-startup-break failure ADR-0014 §3 warns an allowlist
             // produces.
             if let crate::spawn::env::ProfileUnresolved::NoSuchProfile { key, value } = unresolved {
-                map.insert("env_key".into(), (*key).into());
+                map.insert("env_key".into(), key.clone().into());
                 map.insert("env_value".into(), value.clone().into());
             }
         }

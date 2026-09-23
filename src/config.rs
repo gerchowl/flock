@@ -5,6 +5,7 @@ mod io;
 mod keybinds;
 pub(crate) mod model;
 mod sound;
+mod spawn_env;
 mod theme;
 
 pub use self::{
@@ -27,6 +28,7 @@ pub use self::{
         UpdateChannelConfig,
     },
     sound::SoundConfig,
+    spawn_env::{SpawnConfig, SpawnEnvConfig},
     theme::{parse_color, CustomThemeColors, ThemeConfig},
 };
 
