@@ -710,7 +710,7 @@ impl App {
         let agent = crate::spawn::env::agent_for_argv(argv);
         let attested = requester_pid
             .and_then(|pid| crate::spawn::env::read_requester_env(pid, std::process::id()))
-            .or_else(|| recorded.map(crate::spawn::env::recorded_claude_profile));
+            .or_else(|| recorded.map(crate::agent_resume::recorded_claude_profile));
         let requester_env = match (attested, requester_pid) {
             (Some(env), _) => crate::spawn::env::RequesterEnv::Attested(env),
             // A pid we could not read is the case worth refusing over: a
@@ -719,7 +719,7 @@ impl App {
             // No requester and no record. Nothing was ever there to read.
             (None, None) => crate::spawn::env::RequesterEnv::Absent,
         };
-        crate::spawn::env::resolve(agent, &requester_env, |dir| {
+        crate::spawn::env::resolve(agent, &self.state.config.spawn.env, &requester_env, |dir| {
             std::path::Path::new(dir).is_dir()
         })
         .map_err(|unresolved| match unresolved {
