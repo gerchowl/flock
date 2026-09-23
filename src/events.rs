@@ -21,6 +21,17 @@ pub struct WorktreeKillGateResult {
     pub path: std::path::PathBuf,
     pub branch: Option<String>,
     pub gate: crate::worktree::WorktreeMergeGate,
+    /// The branch is the repo default or config-protected (#121), so it is
+    /// kept however good the merge evidence is.
+    ///
+    /// Resolved on the SAME worker as the gate, from
+    /// `crate::worktree::resolve_kill_verdict`, rather than recomputed by each
+    /// dialog. The fleet sweep had no protected check at all and reached
+    /// `delete_local_branch`'s main/master floor as its only guard, so a repo
+    /// whose default branch is `develop` — or one with a configured
+    /// `protected_branches` entry — could have it deleted by the sweep where
+    /// the single kill refuses (#396).
+    pub protected: bool,
     /// The merge gate hit its wall-clock bound (`gh`/git wedged) and degraded
     /// to the safe `NotMerged` (#119). Drives the dialog's "unknown (timed
     /// out)" note so the checkout-only fallback reads as intentional, not a

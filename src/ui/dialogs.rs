@@ -998,6 +998,11 @@ pub(super) fn render_kill_all_worktrees_overlay(app: &AppState, frame: &mut Fram
         };
         let gate = if !row.checkout_is_main() && row.merge_gate.is_none() {
             "  ⏳"
+        } else if row.protected {
+            // Otherwise a protected branch renders as a plain checkout-only
+            // row, indistinguishable from one the gate found no evidence for
+            // — two different reasons, one of which the operator can act on.
+            "  (protected)"
         } else {
             ""
         };
@@ -1151,6 +1156,7 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
     );
 
     let filtered = open.filtered_indices();
+    let now_unix = crate::worktree::current_unix_time();
     let max_rows = open_existing_worktree_max_visible_rows(inner);
     let start = open_existing_worktree_visible_start(open, max_rows);
     for (visible_idx, entry_idx) in filtered.iter().skip(start).take(max_rows).enumerate() {
@@ -1197,12 +1203,24 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
             Paragraph::new(truncate_text(&title, inner.width as usize)).style(row_style),
             Rect::new(inner.x, y, inner.width, 1),
         );
+        // The age rides the path line, right-aligned, so the title line keeps
+        // its full width for the branch name (#396). A checkout abandoned five
+        // weeks ago and one branched this morning used to read identically.
+        let age = entry.age_label(now_unix);
+        let mut path_line = format!("  {}", entry.path.display());
+        if !age.is_empty() {
+            let used = path_line.chars().count() + age.chars().count() + 1;
+            let width = inner.width as usize;
+            if used < width {
+                path_line.push_str(&" ".repeat(width - used));
+            } else {
+                path_line = truncate_text(&path_line, width.saturating_sub(age.len() + 1));
+                path_line.push(' ');
+            }
+            path_line.push_str(&age);
+        }
         frame.render_widget(
-            Paragraph::new(truncate_text(
-                &format!("  {}", entry.path.display()),
-                inner.width as usize,
-            ))
-            .style(path_style),
+            Paragraph::new(truncate_text(&path_line, inner.width as usize)).style(path_style),
             Rect::new(inner.x, y.saturating_add(1), inner.width, 1),
         );
     }

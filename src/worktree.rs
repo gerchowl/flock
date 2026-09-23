@@ -1262,40 +1262,6 @@ fn refs_containing(root: &str, branch: &str, scope: RefScope) -> Vec<String> {
 /// would otherwise wedge the dialog on "checking merge status…" forever.
 pub(crate) const MERGE_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
-/// Run the merge gate with a hard wall-clock bound. Returns `(gate, timed_out)`:
-/// on timeout the gate degrades to the safe `NotMerged` (checkout-only, branch
-/// kept) and `timed_out` is `true` so the dialog can label it honestly. The
-/// worker keeps running in the background — a genuinely hung `gh` is orphaned
-/// rather than killed, which is fine: nothing reads its result and it exits on
-/// its own network timeout.
-pub(crate) fn branch_merge_gate_with_timeout(
-    repo_root: PathBuf,
-    checkout: PathBuf,
-    branch: String,
-) -> (WorktreeMergeGate, bool) {
-    resolve_gate_with_timeout(
-        move || branch_merge_gate(&repo_root, &checkout, &branch),
-        MERGE_GATE_TIMEOUT,
-    )
-}
-
-/// Bound any gate computation by `timeout`. Extracted from
-/// [`branch_merge_gate_with_timeout`] so the timeout policy is testable without
-/// shelling out to `gh`/git.
-fn resolve_gate_with_timeout<F>(work: F, timeout: std::time::Duration) -> (WorktreeMergeGate, bool)
-where
-    F: FnOnce() -> WorktreeMergeGate + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(work());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(gate) => (gate, false),
-        Err(_) => (WorktreeMergeGate::NotMerged, true),
-    }
-}
-
 /// `git branch -D <branch>` in `repo_root`. Only called once the merge gate
 /// produced positive evidence; -D because -d judges merges against the
 /// current HEAD, not the default branch.
@@ -1309,6 +1275,357 @@ pub(crate) fn delete_local_branch(repo_root: &std::path::Path, branch: &str) -> 
     }
     let root = repo_root.to_string_lossy().to_string();
     run_command_capture("git", &["-C", &root, "branch", "-D", branch], None).map(|_| ())
+}
+
+/// Everything the kill path decides about ONE checkout, resolved in one place.
+///
+/// `worktree.kill`, the kill dialog, the fleet sweep and `worktree.list --scan`
+/// all need the same three facts, and flock's recurring defect is one decision
+/// implemented twice (#124, #197, #199-#210, #390, #402). A list that computed
+/// "merged" on its own would be that defect pre-made — and it would compute it
+/// WRONG in the common case, because the obvious independent implementation is
+/// `git merge-base --is-ancestor`, which reports a squash-merged branch as
+/// unmerged (#287). So there is one resolver and this is its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeKillVerdict {
+    /// The checkout's branch, when it is on one.
+    pub branch: Option<String>,
+    /// The merge gate's evidence-based answer.
+    pub gate: WorktreeMergeGate,
+    /// The branch is the repo default or config-protected (#121), so the
+    /// branch is kept however good the merge evidence is. Independent of
+    /// `gate`: a protected branch is usually trivially "merged".
+    pub protected: bool,
+}
+
+impl WorktreeKillVerdict {
+    /// Positive merge evidence — the ONLY thing that permits a branch delete.
+    pub fn merged(&self) -> bool {
+        matches!(self.gate, WorktreeMergeGate::Merged { .. })
+    }
+
+    /// What proved it, when merged.
+    pub fn evidence(&self) -> Option<&str> {
+        match &self.gate {
+            WorktreeMergeGate::Merged { evidence } => Some(evidence.as_str()),
+            WorktreeMergeGate::NotMerged | WorktreeMergeGate::CheckoutMissing => None,
+        }
+    }
+
+    /// Nothing was judged: the checkout is not on disk (#360). Distinct from
+    /// an asked-and-answered "not merged", which sends the operator to go look
+    /// at a PR that may not exist.
+    pub fn checkout_missing(&self) -> bool {
+        matches!(self.gate, WorktreeMergeGate::CheckoutMissing)
+    }
+
+    /// Would this kill delete the local branch?
+    pub fn would_delete_branch(&self, keep_branch: bool) -> bool {
+        self.merged() && !keep_branch && !self.protected
+    }
+
+    /// Wire/label name for the verdict: `merged` | `not_merged` |
+    /// `checkout_missing`.
+    pub fn verdict_name(&self) -> &'static str {
+        match self.gate {
+            WorktreeMergeGate::Merged { .. } => "merged",
+            WorktreeMergeGate::NotMerged => "not_merged",
+            WorktreeMergeGate::CheckoutMissing => "checkout_missing",
+        }
+    }
+}
+
+/// Resolve the full kill verdict for one checkout: branch, merge gate, and the
+/// #121 protected-branch tiers, in the order the kill path needs them.
+///
+/// `extra_protected` is the `[worktrees] protected_branches` repo policy; it
+/// EXTENDS the hardcoded main/master floor and can never remove it.
+pub(crate) fn resolve_kill_verdict(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    extra_protected: &[String],
+) -> WorktreeKillVerdict {
+    let (branch, protected) = kill_verdict_facts(repo_root, checkout, extra_protected);
+    let gate = resolve_kill_gate(repo_root, checkout, branch.as_deref());
+    WorktreeKillVerdict {
+        branch,
+        gate,
+        protected,
+    }
+}
+
+/// The cheap half of the verdict: which branch the checkout is on, and whether
+/// #121 protects it. Local git only — no network, no `gh`.
+///
+/// Split out so the bounded resolvers can settle it on the calling thread and
+/// keep it even when the expensive half times out. A timeout that also lost
+/// the branch name would turn "we could not reach GitHub" into a dialog that
+/// cannot name what it is about.
+fn kill_verdict_facts(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    extra_protected: &[String],
+) -> (Option<String>, bool) {
+    let branch = checkout_branch_name(checkout);
+    let protected = branch.as_deref().is_some_and(|branch| {
+        is_protected_branch(
+            branch,
+            detect_default_branch(repo_root).as_deref(),
+            extra_protected,
+        )
+    });
+    (branch, protected)
+}
+
+/// The expensive half: the evidence-gated merge answer for a resolved branch.
+fn resolve_kill_gate(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    branch: Option<&str>,
+) -> WorktreeMergeGate {
+    match branch {
+        // A detached checkout has no branch to judge or delete, and a checkout
+        // that is gone has none to resolve — two different refusals that used
+        // to share one wording (#360).
+        None => gate_for_branchless_checkout(checkout),
+        Some(branch) => branch_merge_gate(repo_root, checkout, branch),
+    }
+}
+
+/// Collect `count` indexed results from `rx` under ONE shared wall-clock
+/// bound, `None` for every slot that did not arrive in time.
+///
+/// This is the timeout policy for every merge-gate batch, factored out so it
+/// is testable without shelling out to `gh`/git. Workers that miss the
+/// deadline keep running in the background — a genuinely hung `gh` is orphaned
+/// rather than killed, which is fine: nothing reads its result and it exits on
+/// its own network timeout.
+///
+/// One deadline for the whole batch, not one per job: the jobs run
+/// concurrently, so a shared bound is what makes twenty checkouts cost what
+/// one does, and it is the number the caller can actually reason about.
+fn collect_indexed_within<T>(
+    rx: &std::sync::mpsc::Receiver<(usize, T)>,
+    count: usize,
+    timeout: std::time::Duration,
+) -> Vec<Option<T>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    let mut outstanding = count;
+    while outstanding > 0 {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Ok((index, value)) = rx.recv_timeout(remaining) else {
+            break;
+        };
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(value);
+        }
+        outstanding -= 1;
+    }
+    slots
+}
+
+/// [`resolve_kill_verdict`] for MANY checkouts, bounded by the same wall clock
+/// a single one gets.
+///
+/// Returns one `(verdict, timed_out)` per input, in input order. A row that
+/// did not land inside the bound degrades to the safe `NotMerged` with
+/// `timed_out: true`, exactly as a single gate does — callers must render that
+/// as "not answered", never as "not merged". The branch name and the
+/// protected flag survive a timeout, because both are settled locally before
+/// the clock starts.
+///
+/// Resolved concurrently rather than in sequence because the expensive source
+/// is `gh pr view`, a network call with no timeout of its own: twenty rows in
+/// sequence is twenty round trips, and this runs on the request path. The
+/// deadline is shared, so the whole batch costs at most what one row does.
+pub(crate) fn resolve_kill_verdicts_bounded(
+    jobs: &[(PathBuf, PathBuf)],
+    extra_protected: &[String],
+) -> Vec<(WorktreeKillVerdict, bool)> {
+    let facts: Vec<(Option<String>, bool)> = jobs
+        .iter()
+        .map(|(repo_root, checkout)| kill_verdict_facts(repo_root, checkout, extra_protected))
+        .collect();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (index, (repo_root, checkout)) in jobs.iter().enumerate() {
+        let repo_root = repo_root.clone();
+        let checkout = checkout.clone();
+        let branch = facts[index].0.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let gate = resolve_kill_gate(&repo_root, &checkout, branch.as_deref());
+            let _ = tx.send((index, gate));
+        });
+    }
+    drop(tx);
+
+    let gates = collect_indexed_within(&rx, jobs.len(), MERGE_GATE_TIMEOUT);
+
+    facts
+        .into_iter()
+        .zip(gates)
+        .map(|((branch, protected), gate)| {
+            let timed_out = gate.is_none();
+            (
+                WorktreeKillVerdict {
+                    branch,
+                    gate: gate.unwrap_or(WorktreeMergeGate::NotMerged),
+                    protected,
+                },
+                timed_out,
+            )
+        })
+        .collect()
+}
+
+/// [`resolve_kill_verdict`] for ONE checkout, under the same bound (#119).
+///
+/// The kill dialog and the fleet sweep both call this from their worker
+/// threads, so the verdict a dialog renders and the verdict `worktree.kill`
+/// enforces are produced by the same code.
+pub(crate) fn resolve_kill_verdict_with_timeout(
+    repo_root: PathBuf,
+    checkout: PathBuf,
+    extra_protected: &[String],
+) -> (WorktreeKillVerdict, bool) {
+    resolve_kill_verdicts_bounded(&[(repo_root, checkout)], extra_protected)
+        .pop()
+        .expect("one job yields one verdict")
+}
+
+/// When work last happened on this checkout, as unix seconds — the last commit
+/// on its branch.
+///
+/// Deliberately NOT the directory mtime, which is the obvious answer and the
+/// wrong one: a `cargo` build rewrites `target/` and makes a checkout
+/// abandoned for three weeks look fresher than one edited this morning. The
+/// last commit answers "when did WORK happen", costs one cheap git call with
+/// no network, and — asked of the branch ref in the main checkout rather than
+/// of the checkout directory — still answers for a checkout that is no longer
+/// on disk.
+///
+/// The branch is read through [`branch_ref`] for the same reason every other
+/// commit-ish in this module is: a same-named tag outranks the branch in git's
+/// ambiguity order and would date the wrong history (#243). A detached or
+/// branchless checkout falls back to its own `HEAD`, which is the only thing
+/// there is to ask. `None` when git cannot answer — absence is not evidence.
+pub(crate) fn last_commit_unix_time(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    branch: Option<&str>,
+) -> Option<i64> {
+    let (dir, rev) = match branch {
+        Some(branch) => (repo_root, branch_ref(branch)),
+        None => (checkout, "HEAD".to_string()),
+    };
+    run_command_capture_periodic(
+        "git",
+        &[
+            "-C",
+            &dir.to_string_lossy(),
+            "log",
+            "-1",
+            "--format=%ct",
+            &rev,
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|out| out.trim().parse::<i64>().ok())
+}
+
+/// What the stale-first ordering sorts on. One key type because the CLI list
+/// and the TUI picker must not order the same checkouts differently — if they
+/// did, "which of these is stale" would have two answers depending on where
+/// you asked.
+pub(crate) struct StaleSortKey<'a> {
+    /// The repo's own checkout. Never a prune candidate, so it anchors the top
+    /// of the list rather than competing for the stalest slot.
+    pub is_main: bool,
+    /// Unix seconds of the last commit; `None` when git could not answer.
+    pub last_commit_at: Option<i64>,
+    /// Final tiebreak, so the order is total and stable across calls.
+    pub path: &'a std::path::Path,
+}
+
+/// Stale-first ordering: the main checkout, then linked checkouts oldest work
+/// first, then the ones whose age is unknown.
+///
+/// Alphabetical is the default that makes a list of twenty checkouts unordered
+/// noise; the question being asked is "what can go", so the candidates belong
+/// at the top. Unknown ages sort LAST rather than first even though a
+/// missing answer often means a missing checkout: absence is not evidence, and
+/// putting un-dated rows at the head of a prune list would be a claim about
+/// them that nothing was measured to support.
+///
+/// Age orders the list. It never decides anything — that is the merge gate's
+/// job, and a month-old checkout whose PR is still open is not prunable while
+/// an hour-old one whose PR merged is.
+pub(crate) fn stale_first_cmp(a: &StaleSortKey, b: &StaleSortKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    b.is_main
+        .cmp(&a.is_main)
+        .then_with(|| match (a.last_commit_at, b.last_commit_at) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| a.path.cmp(b.path))
+}
+
+/// Compact age for a timestamp, for a column that has about four columns to
+/// spend: `now`, `9m`, `3h`, `6d`, `5w`, `14mo`, `2y`.
+///
+/// A future timestamp (clock skew, a rewritten commit date) reads as `now`
+/// rather than as a negative age.
+pub(crate) fn relative_age_label(now_unix: i64, then_unix: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    // Weeks run to eight before months take over, rather than stopping at the
+    // 30-day month boundary. The abandoned checkouts this column exists for
+    // sit in the five-to-seven week band, and that is how their operator
+    // describes them — "1mo" for both five and eight weeks throws away the
+    // resolution exactly where the decision is made.
+    const WEEK_BAND: i64 = 8 * WEEK;
+
+    let seconds = now_unix.saturating_sub(then_unix);
+    if seconds < MINUTE {
+        return "now".to_string();
+    }
+    if seconds < HOUR {
+        return format!("{}m", seconds / MINUTE);
+    }
+    if seconds < DAY {
+        return format!("{}h", seconds / HOUR);
+    }
+    if seconds < WEEK {
+        return format!("{}d", seconds / DAY);
+    }
+    if seconds < WEEK_BAND {
+        return format!("{}w", seconds / WEEK);
+    }
+    if seconds < YEAR {
+        return format!("{}mo", seconds / MONTH);
+    }
+    format!("{}y", seconds / YEAR)
+}
+
+/// Unix seconds now, for the age column's "now". Zero when the clock is before
+/// the epoch, which only makes every age read as `now`.
+pub(crate) fn current_unix_time() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktree> {
@@ -2528,37 +2845,62 @@ prunable stale
     }
 
     #[test]
-    fn resolve_gate_with_timeout_returns_fast_result_untimed() {
-        let (gate, timed_out) = resolve_gate_with_timeout(
-            || WorktreeMergeGate::Merged {
+    fn a_gate_that_lands_in_time_is_not_marked_timed_out() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((
+            0,
+            WorktreeMergeGate::Merged {
                 evidence: "PR #1 merged".into(),
             },
-            std::time::Duration::from_secs(5),
-        );
+        ))
+        .unwrap();
+        drop(tx);
+        let slots = collect_indexed_within(&rx, 1, std::time::Duration::from_secs(5));
         assert_eq!(
-            gate,
-            WorktreeMergeGate::Merged {
+            slots,
+            vec![Some(WorktreeMergeGate::Merged {
                 evidence: "PR #1 merged".into()
-            }
+            })]
         );
-        assert!(!timed_out, "a fast gate must not be marked timed out");
     }
 
     #[test]
-    fn resolve_gate_with_timeout_degrades_to_not_merged_on_timeout() {
-        // The work outlives the timeout (simulating a hung `gh pr view`): the
-        // gate must degrade to the safe NotMerged and flag the timeout.
-        let (gate, timed_out) = resolve_gate_with_timeout(
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+    fn a_gate_slower_than_the_bound_is_left_unanswered() {
+        // The work outlives the timeout (a hung `gh pr view`). The slot stays
+        // empty rather than being filled with a verdict nothing produced —
+        // callers degrade it to the safe NotMerged AND flag the timeout, so
+        // "we could not ask" never renders as "we asked and got no".
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = tx.send((
+                0,
                 WorktreeMergeGate::Merged {
                     evidence: "too late".into(),
-                }
-            },
-            std::time::Duration::from_millis(30),
+                },
+            ));
+        });
+        let started = std::time::Instant::now();
+        let slots = collect_indexed_within(&rx, 1, std::time::Duration::from_millis(30));
+        assert_eq!(slots, vec![None]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "the bound must return without waiting for the slow worker"
         );
-        assert_eq!(gate, WorktreeMergeGate::NotMerged);
-        assert!(timed_out, "a gate slower than the bound must be timed out");
+    }
+
+    #[test]
+    fn one_slow_gate_does_not_discard_the_ones_that_answered() {
+        // A batch shares one deadline, so a wedged row must not cost the rows
+        // beside it their verdicts — the whole point of scanning a list.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((1, WorktreeMergeGate::NotMerged)).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = tx.send((0, WorktreeMergeGate::NotMerged));
+        });
+        let slots = collect_indexed_within(&rx, 2, std::time::Duration::from_millis(50));
+        assert_eq!(slots, vec![None, Some(WorktreeMergeGate::NotMerged)]);
     }
 
     #[test]
@@ -3203,6 +3545,260 @@ prunable stale
         let _ = std::fs::remove_dir_all(&ghost);
         let _ = std::fs::remove_dir_all(&detached);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn the_list_verdict_inherits_the_squash_merge_answer() {
+        // #396's whole reason for sharing one resolver. A squash-merged branch
+        // is not an ancestor of the default branch, so a list that asked the
+        // ancestry question itself would report landed work as unmerged — and
+        // that is not a hypothetical: three checkouts sat for five weeks
+        // looking like unpushed work at risk, while `flk worktree kill
+        // --dry-run` said merged the whole time.
+        //
+        // `branch_merge_gate_sees_a_squash_merge` (#287) is the gate's own
+        // test. This asserts the verdict the list renders is that same answer
+        // rather than a second derivation of it.
+        let repo = create_committed_repo("list-verdict-squash");
+        let checkout = unique_temp_path("list-verdict-squash-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/landed",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("new.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "work"]);
+
+        let verdict = resolve_kill_verdict(&repo, &checkout, &[]);
+        assert_eq!(verdict.branch.as_deref(), Some("feature/landed"));
+        assert!(!verdict.merged(), "unlanded work is not safe to delete");
+
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["merge", "--squash", "feature/landed"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "feature work (#1)"]);
+
+        // The ancestry question a hand-rolled list check would ask still says
+        // "no" here. The shared gate says yes, and the list follows it.
+        assert!(
+            run_command_capture(
+                "git",
+                &[
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "merge-base",
+                    "--is-ancestor",
+                    "refs/heads/feature/landed",
+                    &format!("refs/heads/{default}"),
+                ],
+                None,
+            )
+            .is_err(),
+            "a squash must leave the branch tip unreachable from the default branch"
+        );
+
+        let verdict = resolve_kill_verdict(&repo, &checkout, &[]);
+        assert!(verdict.merged(), "a squash-merged branch is safe to delete");
+        assert_eq!(
+            verdict.evidence(),
+            Some(format!("already in {default} (squashed or rebased)").as_str())
+        );
+        assert_eq!(verdict.verdict_name(), "merged");
+        assert!(verdict.would_delete_branch(false));
+        assert!(
+            !verdict.would_delete_branch(true),
+            "keep_branch still outranks the evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn kill_verdict_protects_the_repos_own_branches() {
+        // #121's tiers belong to the verdict, not to each dialog. The fleet
+        // sweep had no protected check at all: it fed the gate's `merged`
+        // straight into its tier, and the gate calls the default branch merged
+        // (trivially — it is contained in every remote ref), so only
+        // `delete_local_branch`'s main/master floor stood between a repo whose
+        // default is `develop` and `git branch -D develop` (#396).
+        let repo = create_committed_repo("kill-verdict-protected");
+        let default = detect_default_branch(&repo).expect("default branch");
+
+        let main_checkout = unique_temp_path("kill-verdict-protected-main");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "release/1.0",
+                main_checkout.to_str().unwrap(),
+            ],
+        );
+
+        // Unprotected by default...
+        let verdict = resolve_kill_verdict(&repo, &main_checkout, &[]);
+        assert_eq!(verdict.branch.as_deref(), Some("release/1.0"));
+        assert!(!verdict.protected);
+
+        // ...and protected by the repo's `protected_branches` policy, which
+        // only ever adds.
+        let verdict = resolve_kill_verdict(&repo, &main_checkout, &["release/1.0".to_string()]);
+        assert!(verdict.protected);
+        assert!(
+            !verdict.would_delete_branch(false),
+            "a protected branch is kept however good the evidence is"
+        );
+
+        // The default branch itself, checked out where git allows it.
+        assert!(
+            is_protected_branch(&default, Some(&default), &[]),
+            "the repo's default branch is protected without any config"
+        );
+
+        let _ = std::fs::remove_dir_all(&main_checkout);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn last_touched_dates_the_work_not_the_build_output() {
+        // The obvious answer — directory mtime — is the wrong one. A build
+        // that rewrites `target/` makes an abandoned checkout look fresher
+        // than one edited this morning, which is exactly what one of the
+        // audited worktrees did with its `target-nixrust/` (#396).
+        let repo = create_committed_repo("last-touched");
+        let checkout = unique_temp_path("last-touched-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/dated",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("work.txt"), "work\n").unwrap();
+        run_git(&checkout, &["add", "work.txt"]);
+        run_git(
+            &checkout,
+            &[
+                "-c",
+                "user.email=flock@example.invalid",
+                "-c",
+                "user.name=Flock Test",
+                "commit",
+                "--quiet",
+                "--date=2001-02-03T04:05:06+00:00",
+                "-m",
+                "dated work",
+            ],
+        );
+        let committed = run_command_capture(
+            "git",
+            &[
+                "-C",
+                checkout.to_str().unwrap(),
+                "log",
+                "-1",
+                "--format=%ct",
+                "HEAD",
+            ],
+            None,
+        )
+        .expect("commit time")
+        .parse::<i64>()
+        .expect("unix seconds");
+
+        // Build output written after the commit: newer on disk, irrelevant to
+        // when work happened.
+        std::fs::create_dir_all(checkout.join("target")).unwrap();
+        std::fs::write(checkout.join("target/artifact.bin"), "fresh\n").unwrap();
+
+        assert_eq!(
+            last_commit_unix_time(&repo, &checkout, Some("feature/dated")),
+            Some(committed),
+        );
+
+        // And it still answers once the checkout is gone: the question is
+        // about the branch, and the branch outlives the directory.
+        std::fs::remove_dir_all(&checkout).unwrap();
+        assert_eq!(
+            last_commit_unix_time(&repo, &checkout, Some("feature/dated")),
+            Some(committed),
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stale_first_puts_prune_candidates_at_the_top() {
+        let main = std::path::PathBuf::from("/repo/flock");
+        let old = std::path::PathBuf::from("/repo/flock-old");
+        let recent = std::path::PathBuf::from("/repo/flock-recent");
+        let undated = std::path::PathBuf::from("/repo/flock-undated");
+        let mut rows = [
+            StaleSortKey {
+                is_main: false,
+                last_commit_at: None,
+                path: &undated,
+            },
+            StaleSortKey {
+                is_main: false,
+                last_commit_at: Some(2_000),
+                path: &recent,
+            },
+            StaleSortKey {
+                is_main: true,
+                last_commit_at: Some(1_500),
+                path: &main,
+            },
+            StaleSortKey {
+                is_main: false,
+                last_commit_at: Some(1_000),
+                path: &old,
+            },
+        ];
+        rows.sort_by(stale_first_cmp);
+        assert_eq!(
+            rows.iter().map(|row| row.path).collect::<Vec<_>>(),
+            vec![
+                main.as_path(),
+                // The repo's own checkout anchors the top even though it is
+                // not the oldest: it is never a prune candidate.
+                old.as_path(),
+                recent.as_path(),
+                // Undated last. A missing answer is not evidence of age, and
+                // heading a prune list with un-dated rows would be a claim
+                // nothing measured.
+                undated.as_path(),
+            ]
+        );
+    }
+
+    #[test]
+    fn age_labels_fit_the_column() {
+        let now = 1_000_000_000;
+        assert_eq!(relative_age_label(now, now), "now");
+        assert_eq!(relative_age_label(now, now - 59), "now");
+        assert_eq!(relative_age_label(now, now - 9 * 60), "9m");
+        assert_eq!(relative_age_label(now, now - 3 * 3600), "3h");
+        assert_eq!(relative_age_label(now, now - 6 * 86_400), "6d");
+        assert_eq!(relative_age_label(now, now - 35 * 86_400), "5w");
+        assert_eq!(relative_age_label(now, now - 300 * 86_400), "10mo");
+        assert_eq!(relative_age_label(now, now - 800 * 86_400), "2y");
+        // Clock skew (or a rewritten commit date) reads as `now`, never as a
+        // negative age.
+        assert_eq!(relative_age_label(now, now + 5_000), "now");
     }
 
     #[test]

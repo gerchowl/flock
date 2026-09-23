@@ -142,15 +142,22 @@ flk workspace create --cwd ~/project --label api --no-focus
 ## Worktrees
 
 ```bash
-flk worktree list [--workspace ID | --cwd PATH] [--json]
+flk worktree list [--workspace ID | --cwd PATH] [--scan] [--json]
 flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
 flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
 flk worktree remove --workspace ID [--force] [--json]
+flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]
 ```
 
 Worktrees are normal Flock workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Flock creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
 
 `workspace close` closes Flock state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
+
+`worktree list` prints a table ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. `AGE` is the last commit on the branch — deliberately not the directory's mtime, which a build that rewrites `target/` makes meaningless. `--scan` adds a `VERDICT` column resolved through the same gate `worktree kill` runs, so a squash-merged branch reads `merged` here exactly as it does there; it is opt-in because it costs local Git plus a `gh` call per checkout. Absence of a verdict means "not scanned", never "not merged". `--json` prints the raw response, where the fields are `last_commit_at` and `kill_verdict`.
+
+`worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into the default branch, remote containment, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The repo's default branch and any `[worktrees] protected_branches` entry are kept under every path.
+
+A kill also sweeps the processes left in the checkout. Removing a worktree unlinks a directory but does not touch the processes whose working directory it was, and a `setsid` child is out of reach of the pane teardown — those keep running against a path that no longer exists. Once the checkout is removed and the workspace is closed, anything still alive from inside it gets `SIGTERM`, a grace period, then `SIGKILL`. Matching is against the leaf checkout exactly, never the parent directory worktrees of a repo share, and the calling process and the shell it was typed into are never signalled. The result JSON carries `processes` (what was standing there when the kill began), `orphans` (what outlived the teardown) and `orphans_surviving` (what outlived `SIGKILL`), each as `pid` plus command name; the same is summarised on stderr. `--keep-procs` reports without signalling anything, and `--dry-run` names what is standing in the checkout without touching it.
 
 ## Tabs
 
