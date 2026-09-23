@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
     AgentForkParams, EventData, EventEnvelope, EventKind, ResponseResult, WorktreeCreateParams,
-    WorktreeInfo, WorktreeKillParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
-    WorktreeSourceInfo,
+    WorktreeInfo, WorktreeKillParams, WorktreeListParams, WorktreeOpenParams, WorktreeProcessInfo,
+    WorktreeRemoveParams, WorktreeSourceInfo,
 };
 use crate::app::App;
 
@@ -22,6 +22,19 @@ impl ApiFailure {
             message: message.into(),
         }
     }
+}
+
+/// Put the sweep's findings on the wire (#400).
+fn process_infos(
+    processes: &[crate::worktree::processes::CheckoutProcess],
+) -> Vec<WorktreeProcessInfo> {
+    processes
+        .iter()
+        .map(|process| WorktreeProcessInfo {
+            pid: process.pid,
+            name: process.name.clone(),
+        })
+        .collect()
 }
 
 fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
@@ -793,6 +806,16 @@ impl App {
         let would_delete_branch = merged && !params.keep_branch && !protected;
 
         let checkout_path = space.checkout_path.display().to_string();
+        // #400: taken BEFORE the removal, because that is the only moment the
+        // kernel can still answer "whose cwd is this?" — the question the
+        // sweep is made of. The answer includes the workspace's own healthy
+        // pane shells, which is why nothing is decided from it yet.
+        let protected_pids = crate::worktree::processes::protected_pids(params.caller_pid);
+        let standing = crate::worktree::processes::processes_in_checkout(
+            &space.checkout_path,
+            &protected_pids,
+        );
+        let processes = process_infos(&standing);
         if params.dry_run {
             return encode_success(
                 id,
@@ -808,6 +831,10 @@ impl App {
                     branch_deleted: false,
                     would_delete_branch,
                     branch_delete_error: None,
+                    processes,
+                    orphans: Vec::new(),
+                    orphans_signaled: false,
+                    orphans_surviving: Vec::new(),
                 },
             );
         }
@@ -815,6 +842,27 @@ impl App {
         let workspace_id = match self.remove_worktree_checkout(ws_idx, &space, params.force) {
             Ok(workspace_id) => workspace_id,
             Err(failure) => return encode_error(id, failure.code, failure.message),
+        };
+
+        // The checkout is gone and the workspace is closed, so anything from
+        // the snapshot that is still alive is rooted in a directory that no
+        // longer exists. Those are the 48 spinners #400 measured.
+        let orphaned = crate::worktree::processes::survivors_after_teardown(&standing);
+        let orphans = process_infos(&orphaned);
+        let (orphans_signaled, orphans_surviving) = if orphaned.is_empty() || params.keep_processes
+        {
+            (false, Vec::new())
+        } else {
+            let surviving = crate::worktree::processes::terminate(&orphaned);
+            if !surviving.is_empty() {
+                let pids = crate::worktree::processes::pid_list(&surviving);
+                tracing::warn!(
+                    checkout = checkout_path.as_str(),
+                    pids,
+                    "worktree kill: processes outlived SIGKILL"
+                );
+            }
+            (true, process_infos(&surviving))
         };
 
         let mut branch_deleted = false;
@@ -842,6 +890,10 @@ impl App {
                 branch_deleted,
                 would_delete_branch,
                 branch_delete_error,
+                processes,
+                orphans,
+                orphans_signaled,
+                orphans_surviving,
             },
         )
     }
@@ -2110,6 +2162,158 @@ mod tests {
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
+    /// #400, end to end: `worktree.kill` names the processes standing in the
+    /// checkout, and the one that outlives the teardown is not running when
+    /// the call returns.
+    ///
+    /// The parked process is a GRANDCHILD of the test, reparented to init the
+    /// moment its shell exits — the same shape as the `setsid` spinners the
+    /// issue measured, and the reason flock's pane teardown never reached
+    /// them. The assertion that matters is the last one: it is about the
+    /// process table, which is where the 7.6 cores were.
+    #[tokio::test]
+    async fn api_worktree_kill_ends_the_processes_left_in_the_checkout() {
+        let repo = create_committed_repo("api-kill-procs-repo");
+        let checkout = unique_temp_path("api-kill-procs");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/procs",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        // The redirect keeps the background job from holding the output pipe
+        // open, which would make this read block forever.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done >/dev/null 2>&1 & echo $!")
+            .current_dir(&checkout)
+            .output()
+            .expect("park a process in the checkout");
+        let parked: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("the parked pid");
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: true,
+                dry_run: false,
+                keep_processes: false,
+                caller_pid: None,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            removed,
+            processes,
+            orphans,
+            orphans_signaled,
+            orphans_surviving,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+
+        assert!(removed);
+        assert!(
+            processes.iter().any(|process| process.pid == parked),
+            "the kill must name what was standing in the checkout: {processes:?}"
+        );
+        assert!(
+            orphans.iter().any(|process| process.pid == parked),
+            "a reparented process outlives the teardown: {orphans:?}"
+        );
+        assert!(orphans_signaled);
+        assert!(
+            orphans_surviving.is_empty(),
+            "a parked shell must not outlive TERM then KILL: {orphans_surviving:?}"
+        );
+        assert!(
+            !crate::platform::process_exists(parked),
+            "the orphan #400 measured must be gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&checkout);
+    }
+
+    /// `--keep-procs` asks for the report alone: the orphans are still named,
+    /// and they are still running. Reporting and acting are separate decisions
+    /// because only one of them is reversible.
+    #[tokio::test]
+    async fn api_worktree_kill_can_report_processes_without_ending_them() {
+        let repo = create_committed_repo("api-keep-procs-repo");
+        let checkout = unique_temp_path("api-keep-procs");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/keep-procs",
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done >/dev/null 2>&1 & echo $!")
+            .current_dir(&checkout)
+            .output()
+            .expect("park a process in the checkout");
+        let parked: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("the parked pid");
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: ws_id,
+                force: false,
+                keep_branch: true,
+                dry_run: false,
+                keep_processes: true,
+                caller_pid: None,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            orphans,
+            orphans_signaled,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+
+        assert!(orphans.iter().any(|process| process.pid == parked));
+        assert!(!orphans_signaled);
+        assert!(
+            crate::platform::process_exists(parked),
+            "--keep-procs reports and stops"
+        );
+
+        crate::platform::signal_processes(&[parked], crate::platform::Signal::Kill);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&checkout);
+    }
+
     /// The gate is the point: a merged branch is deletable, an unmerged one is
     /// not, and `force` does not widen that — it only covers a dirty checkout.
     /// This used to live in `flk worktree kill`, so a socket or MCP caller got
@@ -2144,6 +2348,8 @@ mod tests {
                 force: true,
                 keep_branch: false,
                 dry_run: false,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2182,6 +2388,8 @@ mod tests {
                 force: false,
                 keep_branch: false,
                 dry_run: false,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2226,6 +2434,8 @@ mod tests {
                 force: false,
                 keep_branch: false,
                 dry_run: true,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2285,6 +2495,8 @@ mod tests {
                 force: false,
                 keep_branch: false,
                 dry_run: true,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2328,6 +2540,8 @@ mod tests {
                 force: false,
                 keep_branch: false,
                 dry_run: true,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2400,6 +2614,8 @@ mod tests {
                 force: true,
                 keep_branch: false,
                 dry_run: true,
+                keep_processes: false,
+                caller_pid: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();

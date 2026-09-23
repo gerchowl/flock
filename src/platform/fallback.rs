@@ -31,6 +31,21 @@ pub fn session_processes(_child_pid: u32) -> Vec<u32> {
 }
 
 /// Unsupported platform stub.
+pub fn process_name(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn process_parent_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn all_process_ids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// Unsupported platform stub.
 pub fn signal_processes(_pids: &[u32], _signal: Signal) {}
 
 /// Unsupported platform stub.

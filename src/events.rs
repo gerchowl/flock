@@ -43,6 +43,11 @@ pub struct WorktreeRemoveResult {
     pub workspace_id: String,
     pub path: std::path::PathBuf,
     pub result: Result<(), String>,
+    /// Processes whose cwd was inside the checkout when the removal started
+    /// (#400). Captured up front because that is the last moment the kernel
+    /// can answer the question; whichever of these outlive the teardown are
+    /// the orphans.
+    pub standing: Vec<crate::worktree::processes::CheckoutProcess>,
 }
 
 /// Outcome of the fleet-wide kill sweep's git work (#81): one entry per linked
