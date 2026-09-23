@@ -3513,7 +3513,8 @@ mod tests {
                 origin_last_ok_secs: Some(origin_secs),
                 proxy_jump: Some("hub".into()),
                 icon: None,
-            });
+            })
+            .expect("fixture destination is a valid ssh target");
         entry.peer.ingested_at = Some(ingested);
         entry
     }

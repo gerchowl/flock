@@ -425,9 +425,48 @@ pub struct RelayedEntry {
 }
 
 /// Materialise a relayed wire entry into the shape every rendering surface
-/// already understands.
-pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> RelayedEntry {
-    RelayedEntry {
+/// already understands, or `None` if the entry is one this host will not dial.
+///
+/// This is the boundary that matters for #392: `ssh_target` and `proxy_jump`
+/// arrive verbatim from another host's gossip and end up in this machine's ssh
+/// argv, where a value beginning with `-` is an OPTION and `-oProxyCommand=...`
+/// runs a local command. Peers ride host-CA + tailnet rather than being
+/// strangers, but one compromised or misconfigured fleet member is enough, and
+/// choosing our ssh options is more authority than gossip is meant to carry.
+///
+/// A rejected row is DROPPED AND LOGGED, never fatal: the caller keeps
+/// iterating the snapshot, so a bad row costs the fleet that row and no other.
+pub fn relayed_entry_from_wire(
+    entry: crate::api::schema::RelayedFleetPeer,
+) -> Option<RelayedEntry> {
+    if !crate::remote::is_valid_ssh_destination(&entry.ssh_target) {
+        crate::logging::peer_relay_entry_rejected(
+            &entry.origin,
+            &entry.name,
+            "ssh_target",
+            &entry.ssh_target,
+        );
+        return None;
+    }
+    // An absent or empty `proxy_jump` means "dial directly" and is the normal
+    // case for a row that needs no hub in the middle; only a value that will
+    // actually reach `-o ProxyJump=` is checked.
+    if let Some(jump) = entry
+        .proxy_jump
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if !crate::remote::is_valid_ssh_proxy_jump(jump) {
+            crate::logging::peer_relay_entry_rejected(
+                &entry.origin,
+                &entry.name,
+                "proxy_jump",
+                jump,
+            );
+            return None;
+        }
+    }
+    Some(RelayedEntry {
         peer: PeerSummaryState {
             peer: entry.name,
             ssh_target: entry.ssh_target,
@@ -449,7 +488,7 @@ pub fn relayed_entry_from_wire(entry: crate::api::schema::RelayedFleetPeer) -> R
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
         },
-    }
+    })
 }
 
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
@@ -1063,6 +1102,121 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
 
 #[cfg(test)]
 mod tests {
+
+    /// A gossiped row with the destination and jump under test, everything
+    /// else inert. `origin` is the hub that relayed it — the name a drop must
+    /// carry, so an operator can tell which member of the fleet sent the row.
+    fn wire_peer(
+        ssh_target: &str,
+        proxy_jump: Option<&str>,
+    ) -> crate::api::schema::RelayedFleetPeer {
+        crate::api::schema::RelayedFleetPeer {
+            name: "spoke2.invalid".into(),
+            ssh_target: ssh_target.into(),
+            host: Some("spoke2.invalid".into()),
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: Some(3),
+            error: None,
+            origin: "anvil".into(),
+            origin_last_ok_secs: Some(3),
+            proxy_jump: proxy_jump.map(Into::into),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn a_gossiped_destination_that_would_become_an_ssh_option_is_dropped_and_logged() {
+        // #392: `ssh_target` arrives verbatim from another host and lands in
+        // THIS machine's ssh argv. A leading `-` makes it an option, and
+        // `-oProxyCommand=` is local command execution. The wire path is the
+        // one an attacker influences, so validating config alone is not a fix.
+        let logs = crate::logging::capture_logs(|| {
+            assert!(
+                super::relayed_entry_from_wire(wire_peer("-oProxyCommand=id", None)).is_none(),
+                "a destination starting with `-` must never reach an ssh argv"
+            );
+        });
+        assert!(
+            logs.contains("anvil"),
+            "the drop must name the sending peer: {logs}"
+        );
+        assert!(
+            logs.contains("ssh_target"),
+            "the drop must name the offending field: {logs}"
+        );
+
+        // A space is not injection here (no shell is involved) but it is still
+        // not a destination, and ssh would read the tail as another argument.
+        assert!(
+            super::relayed_entry_from_wire(wire_peer("lars@anvil -oProxyCommand=id", None))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_gossiped_proxy_jump_carrying_an_option_is_dropped_and_logged() {
+        // The second wire-controlled value: `proxy_jump` is interpolated into
+        // `-o ProxyJump=<value>`, so it needs the same rule.
+        let logs = crate::logging::capture_logs(|| {
+            assert!(super::relayed_entry_from_wire(wire_peer(
+                "lars@spoke2.invalid",
+                Some("-oProxyCommand=id")
+            ))
+            .is_none());
+        });
+        assert!(
+            logs.contains("proxy_jump") && logs.contains("anvil"),
+            "the drop must name the field and the sender: {logs}"
+        );
+
+        // ProxyJump is a comma-separated CHAIN and ssh dials every hop, so one
+        // bad hop rejects the chain even when the first one looks fine.
+        assert!(
+            super::relayed_entry_from_wire(wire_peer(
+                "lars@spoke2.invalid",
+                Some("hub,-oProxyCommand=id")
+            ))
+            .is_none(),
+            "every hop is a destination and must be validated as one"
+        );
+    }
+
+    #[test]
+    fn a_gossiped_ipv6_or_ported_destination_still_dials() {
+        // Pitfall 2 of #392: a rule written from the happy case would strand
+        // working fleets. Bracketed IPv6 literals, `:port` suffixes and
+        // multi-hop chains are all legitimate.
+        for target in [
+            "lars@spoke2.invalid",
+            "[::1]",
+            "lars@[fe80::1]:2222",
+            "spoke2.invalid:22",
+        ] {
+            let entry = super::relayed_entry_from_wire(wire_peer(target, Some("hub,anvil")))
+                .unwrap_or_else(|| panic!("{target} is a legitimate destination"));
+            assert_eq!(entry.peer.ssh_target, target);
+        }
+    }
+
+    #[test]
+    fn one_bad_gossiped_row_does_not_cost_the_fleet_its_other_rows() {
+        // Pitfall 3: rejection is per-ROW. The merge loop keeps iterating, so a
+        // hostile or typo'd entry drops itself and nothing else.
+        let wire = vec![
+            wire_peer("-oProxyCommand=id", None),
+            wire_peer("lars@spoke2.invalid", None),
+        ];
+        let kept: Vec<String> = wire
+            .into_iter()
+            .filter_map(super::relayed_entry_from_wire)
+            .map(|entry| entry.peer.ssh_target)
+            .collect();
+        assert_eq!(kept, vec!["lars@spoke2.invalid".to_string()]);
+    }
 
     #[test]
     fn shell_quoting_survives_spaces_and_quotes() {

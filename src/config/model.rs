@@ -485,6 +485,8 @@ pub struct Config {
     pub checks: crate::checks::ChecksConfig,
     /// `[fleet]` — limits on agent-initiated spawn (#329, ADR-0014).
     pub fleet: crate::spawn::FleetConfig,
+    /// `[spawn]` — what a spawned child's environment is made of (#397).
+    pub spawn: super::SpawnConfig,
     pub msg: MsgConfig,
     pub peers: Vec<PeerConfig>,
 }
