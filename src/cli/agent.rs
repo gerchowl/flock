@@ -639,6 +639,13 @@ fn print_agent_help() {
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
     eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
+    eprintln!(
+        "  --cwd also picks the SPACE: a cwd naming an already-open checkout joins that space"
+    );
+    eprintln!("    as a new tab, and --split then splits it rather than whatever is focused;");
+    eprintln!(
+        "    a cwd matching nothing gets a space of its own, and --workspace/--tab still win"
+    );
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"
