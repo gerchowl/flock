@@ -14,6 +14,16 @@
   <https://flock.dev/configuration>). The decision stands; only the location
   differs. `flk --default-config` pointed readers at the file that does not
   exist until this was corrected. The rest of this ADR is left as decided.
+- Amendment (2026-09-08): phase (d)'s "every SCALAR LEAF of `Config::default()`"
+  rule met its first map-of-lists in `[spawn.env]` (#397), and the rule holds
+  without a change: the walk skips arrays, so no `FLOCK_SPAWN_ENV_*` is
+  synthesized and the section is file-only. It is listed in
+  `BLOCKLIST_PREFIXES` the way `peers` is — as documentation of a decision
+  rather than as reachable behaviour — because the alternative is a reader
+  concluding the omission was an oversight. The judgement generalises: a
+  section that declares which variables cross into a child's environment is
+  not something a per-invocation env poke should be able to rewrite, so
+  file-only is the right layer for it and not merely the convenient one.
 
 ## Context
 

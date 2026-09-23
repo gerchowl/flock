@@ -153,6 +153,16 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     }
 }
 
+/// What a newly created tab's root pane runs.
+///
+/// Two shapes, not a shell config plus an `Option<argv>`: the argv form
+/// ignores the shell config entirely, and a caller that had to supply one it
+/// knew would be discarded was a caller being asked to lie (#390).
+pub(crate) enum TabSeed<'a> {
+    Shell(crate::pane::PaneShellConfig<'a>),
+    Argv(&'a [String]),
+}
+
 /// A named workspace containing tabs.
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
@@ -401,8 +411,34 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
-            shell_config,
-            None,
+            TabSeed::Shell(shell_config),
+        )
+    }
+
+    /// A tab whose root pane execs `argv` directly, with no shell in between —
+    /// the tab-shaped sibling of `split_pane_argv_command` (#390).
+    ///
+    /// `create_tab_with_runtime` has always been able to do this; until now
+    /// nothing could ask, because the only entry point hard-coded the shell
+    /// seed. An agent placed into an existing space needs the argv form for the
+    /// same reason `spawn_agent_workspace` does: `agent.start` is given a
+    /// command, not a prompt to type at a shell.
+    pub(crate) fn create_tab_argv_command(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        cwd: PathBuf,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        argv: &[String],
+    ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
+        self.create_tab_with_runtime(
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            TabSeed::Argv(argv),
         )
     }
 
@@ -413,8 +449,7 @@ impl Workspace {
         cwd: PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        shell_config: crate::pane::PaneShellConfig<'_>,
-        argv: Option<&[String]>,
+        seed: TabSeed<'_>,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         let number = self.next_public_tab_number;
         self.next_public_tab_number += 1;
@@ -432,8 +467,8 @@ impl Workspace {
             .map(|tab| tab.render_dirty.clone())
             .expect("workspace must always have at least one tab");
 
-        let (tab, terminal, runtime) = if let Some(argv) = argv {
-            Tab::new_argv_command(
+        let (tab, terminal, runtime) = match seed {
+            TabSeed::Argv(argv) => Tab::new_argv_command(
                 number,
                 cwd,
                 rows,
@@ -444,9 +479,8 @@ impl Workspace {
                 events,
                 render_notify,
                 render_dirty,
-            )?
-        } else {
-            Tab::new(
+            )?,
+            TabSeed::Shell(shell_config) => Tab::new(
                 number,
                 cwd,
                 rows,
@@ -457,7 +491,7 @@ impl Workspace {
                 events,
                 render_notify,
                 render_dirty,
-            )?
+            )?,
         };
         self.register_new_pane_with_number(tab.root_pane, pane_number);
         self.tabs.push(tab);

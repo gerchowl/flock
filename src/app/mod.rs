@@ -3710,6 +3710,440 @@ sidebar_pane_gap = 99
         }
     }
 
+    /// A real directory to point `--cwd` at, named after the test that owns it
+    /// (#268: never the process cwd, never a hardcoded FHS path).
+    fn cwd_fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("flock-390-{name}-{}", std::process::id()));
+        // Removed first so a rerun in the same process id starts from a known
+        // state rather than inheriting whatever a previous run left.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        std::fs::canonicalize(&dir).unwrap_or(dir)
+    }
+
+    /// Shut the PTY children these tests start. `live_program()` is a real
+    /// `sh` sitting on its pane's pty, so a test that just drops the app leaves
+    /// one per case — `focused_agent_start_records_previous_pane` drains for
+    /// exactly this reason.
+    fn drain_test_runtimes(app: &mut App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    fn membership_at(checkout_path: &std::path::Path) -> crate::workspace::WorktreeSpaceMembership {
+        crate::workspace::WorktreeSpaceMembership {
+            key: format!("{}/.git", checkout_path.display()),
+            label: "fixture".into(),
+            repo_root: checkout_path.to_path_buf(),
+            checkout_path: checkout_path.to_path_buf(),
+            is_linked_worktree: true,
+        }
+    }
+
+    /// A live-git identity for a checkout, i.e. what the periodic probe caches.
+    /// The resolver's SECOND arm reads this rather than membership, and a
+    /// workspace open on a plain checkout (no worktree membership) has only
+    /// this — which is the common case for `~/dotfiles`.
+    fn git_space_at(checkout_path: &std::path::Path) -> crate::workspace::GitSpaceMetadata {
+        crate::workspace::GitSpaceMetadata {
+            key: format!("{}/.git", checkout_path.display()),
+            checkout_key: checkout_path.display().to_string(),
+            label: "fixture".into(),
+            repo_root: checkout_path.to_path_buf(),
+            is_linked_worktree: false,
+            project_key: "dir:fixture".into(),
+        }
+    }
+
+    fn agent_start_with_cwd(cwd: Option<String>) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: "req_agent_start_390".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                argv: vec![crate::test_support::live_program()],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_cwd_naming_an_open_checkout_lands_in_that_space() {
+        // The whole of #390: `--cwd` named a checkout flock already has open,
+        // and the agent used to get a SECOND space for it anyway.
+        let checkout = cwd_fixture_dir("match");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+
+        assert_eq!(
+            app.state.workspaces.len(),
+            1,
+            "a cwd that names an open checkout must not mint a second space for it"
+        );
+        let ws = &app.state.workspaces[0];
+        assert_eq!(ws.tabs.len(), 2, "the agent arrives as a new tab");
+        assert_eq!(
+            ws.tabs[1].panes.len(),
+            1,
+            "and is that tab's ONLY pane — #364's property, kept"
+        );
+        assert_eq!(
+            ws.tabs[0].panes.len(),
+            1,
+            "the operator's existing tab is untouched"
+        );
+        assert_eq!(
+            ws.active_tab, 0,
+            "an unfocused start does not steal the view"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_cwd_that_matches_nothing_still_gets_its_own_space() {
+        // The #364 path, unchanged. Only a MATCH may change placement.
+        let checkout = cwd_fixture_dir("nomatch");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.worktree_space = Some(membership_at(&cwd_fixture_dir("nomatch-other")));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_vanished_checkout_never_wins_the_cwd_match() {
+        // #360: a workspace whose checkout is gone still STRING-matches, because
+        // membership survives and `canonical_or_original` hands back the
+        // original path. Matching it would start the agent in a directory that
+        // is not there. `is_dir` is the only thing that separates the two.
+        let checkout = cwd_fixture_dir("vanished");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("gone");
+        workspace.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        std::fs::remove_dir_all(&checkout).expect("remove the fixture checkout");
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "a checkout that is not on disk is not a placement target"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_with_no_cwd_matches_nothing_and_gets_its_own_space() {
+        // The pair to `..._naming_an_open_checkout_lands_in_that_space`: SAME
+        // workspace, same fixture checkout, and the only difference is that
+        // this call names no cwd. One lands in the space and one does not, so
+        // the placement is driven by the REQUESTED cwd and by nothing else.
+        //
+        // That distinction is load-bearing, because `agent_start_cwd` always
+        // yields something and its fallback is the server's own working
+        // directory — `$HOME` for a daemon launched from a login shell. A
+        // match run on the derived cwd would file every untargeted agent under
+        // whatever workspace happens to sit there, which is #364 rebuilt out
+        // of a default. (Asserted this way round rather than by reading the
+        // process cwd, which the `hermetic-tests` gate rightly forbids.)
+        let checkout = cwd_fixture_dir("nocwd");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response = app.handle_api_request(agent_start_with_cwd(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "no requested cwd means no cwd match, so the agent gets its own space"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            1,
+            "and the checkout's space is untouched"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_workspace_target_still_splits_rather_than_defaulting() {
+        // #365's direction, and the override. `--workspace` is somebody
+        // saying, so the cwd default must not reinterpret it.
+        let checkout = cwd_fixture_dir("explicit");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.worktree_space = Some(membership_at(&checkout));
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_start_390_explicit".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd: Some(checkout.display().to_string()),
+                workspace_id: Some(workspace_id),
+                tab_id: None,
+                split: None,
+                focus: false,
+                argv: vec![crate::test_support::live_program()],
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        let ws = &app.state.workspaces[0];
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(ws.tabs.len(), 1, "--workspace splits its target, as before");
+        assert_eq!(ws.tabs[0].panes.len(), 2);
+        drain_test_runtimes(&mut app);
+    }
+
+    fn agent_start_split_with_cwd(cwd: Option<String>) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: "req_agent_start_390_split".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd,
+                workspace_id: None,
+                tab_id: None,
+                split: Some(crate::api::schema::SplitDirection::Right),
+                focus: false,
+                argv: vec![crate::test_support::live_program()],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_with_a_matching_cwd_splits_that_space_not_the_focused_one() {
+        // A caller who named a checkout has said where the work lives, and
+        // "beside what I am looking at" is not an answer to it. For a headless
+        // caller the active workspace is not merely wrong but meaningless: it
+        // is whatever a human last focused. Four agents resumed over ssh with
+        // four DISTINCT `--cwd` all landed in one focused space because of
+        // this fallback.
+        let checkout = cwd_fixture_dir("split-match");
+        let mut app = test_app();
+        let mut matched = Workspace::test_new("dotfiles");
+        matched.worktree_space = Some(membership_at(&checkout));
+        let focused = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![matched, focused];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+
+        let response = app.handle_api_request(agent_start_split_with_cwd(Some(
+            checkout.display().to_string(),
+        )));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].panes.len(),
+            2,
+            "--split with a resolvable --cwd splits THAT space"
+        );
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].panes.len(),
+            1,
+            "and leaves the focused workspace alone"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn split_without_a_cwd_still_means_the_active_workspace() {
+        // The gesture `--split` exists for: "put this beside what I am looking
+        // at", with no target named. That reading survives, and it is the only
+        // one under which falling back to the active workspace is an answer to
+        // the question rather than a guess at it.
+        let mut app = test_app();
+        let matched = Workspace::test_new("dotfiles");
+        let focused = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![matched, focused];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+
+        let response = app.handle_api_request(agent_start_split_with_cwd(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].panes.len(),
+            2,
+            "no cwd to place by means --split still splits the active workspace"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn two_spaces_naming_one_checkout_take_the_first_rather_than_refusing() {
+        // A sibling space (#25) clones its source's membership precisely so the
+        // two group together, so both naming one checkout is the feature
+        // working, not a conflict. Every match is a right answer to "where does
+        // this checkout live"; the first is taken, which is the source before
+        // the siblings it seeded. Refusing here would punish the grouping this
+        // change creates.
+        let checkout = cwd_fixture_dir("ambiguous");
+        let mut app = test_app();
+        let mut source = Workspace::test_new("dotfiles");
+        source.worktree_space = Some(membership_at(&checkout));
+        let mut sibling = Workspace::test_new("dotfiles-agent");
+        sibling.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![source, sibling];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "two matches is still a placement, not a new space"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            2,
+            "the FIRST match takes it, deterministically — not the focused one"
+        );
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_plain_checkout_matches_on_live_git_identity_not_only_membership() {
+        // The resolver's second arm. A workspace opened on an ordinary checkout
+        // — `~/dotfiles`, not a linked worktree — carries NO
+        // `WorktreeSpaceMembership`; all it has is the git identity the
+        // periodic probe cached. That is the shape the reported bug actually
+        // had, so an implementation that only ever consulted membership would
+        // pass every other test here and fix nothing for the person who
+        // reported it.
+        let checkout = cwd_fixture_dir("gitspace");
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.cached_git_space = Some(git_space_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            1,
+            "a plain checkout is still a placement target"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn membership_wins_over_a_live_git_match_on_an_earlier_row() {
+        // Arm-major, not workspace-major. Scanning workspaces on the outside
+        // would let the weaker signal on row 0 beat the exact membership match
+        // on row 1, which is how a resolver that looks right places panes in
+        // the wrong space.
+        let checkout = cwd_fixture_dir("armorder");
+        let mut app = test_app();
+        let mut by_git = Workspace::test_new("live-git-row");
+        by_git.cached_git_space = Some(git_space_at(&checkout));
+        let mut by_membership = Workspace::test_new("membership-row");
+        by_membership.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![by_git, by_membership];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.workspaces[1].tabs.len(),
+            2,
+            "the membership match takes it even though it is the later row"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn workspace_tab_mode_gets_a_grouped_sibling_space_not_an_invisible_tab() {
+        // In `tab_mode = workspace` the inner-tab strip is never drawn, so a tab
+        // created here would be a pane the operator cannot see or reach — the
+        // bug `handle_tab_create` already documents. The agent gets a sibling
+        // space instead, carrying the source's membership so it groups with it.
+        let checkout = cwd_fixture_dir("wsmode");
+        let mut app = test_app();
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        let mut workspace = Workspace::test_new("dotfiles");
+        workspace.worktree_space = Some(membership_at(&checkout));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(app.state.workspaces.len(), 2, "a sibling space, not a tab");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(
+            app.state.workspaces[1].worktree_space().map(|s| &s.key),
+            app.state.workspaces[0].worktree_space().map(|s| &s.key),
+            "the sibling carries the source's membership, so it groups with it"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
     #[tokio::test]
     async fn an_untargeted_agent_start_gets_its_own_space_as_the_only_pane() {
         // Asking for an agent with no placement used to SPLIT the active

@@ -322,10 +322,13 @@ fn scrub_to_allowlist(
     let before = cmd.iter_full_env_as_str().count();
     // Read as `OsString`: a value the allowlist names is carried through byte
     // for byte, rather than being dropped for not being UTF-8.
-    let kept: Vec<(&'static str, std::ffi::OsString)> = allowlist
+    let kept: Vec<(&str, std::ffi::OsString)> = allowlist
         .keys()
         .iter()
-        .filter_map(|key| cmd.get_env(key).map(|value| (*key, value.to_os_string())))
+        .filter_map(|key| {
+            cmd.get_env(key)
+                .map(|value| (key.as_str(), value.to_os_string()))
+        })
         .collect();
 
     cmd.env_clear();
@@ -3115,9 +3118,26 @@ mod tests {
         std::env::remove_var("FLOCK_TEST_INHERITED");
     }
 
-    /// The allowlist for a claude child, resolved the way `agent.spawn` does.
+    /// The allowlist for a claude child, resolved the way `agent.spawn` does —
+    /// from the SHIPPED `[spawn.env]` default, which is what a fleet that
+    /// never writes a config gets.
     fn claude_allowlist() -> crate::spawn::allowlist::SpawnAllowlist {
-        crate::spawn::allowlist::for_argv(&["claude".to_string(), "prompt".to_string()])
+        crate::spawn::allowlist::for_argv(
+            &["claude".to_string(), "prompt".to_string()],
+            &crate::config::SpawnEnvConfig::default(),
+        )
+    }
+
+    /// The profile selector the shipped default declares for claude, read
+    /// from the declaration rather than restated here: since #397 the name is
+    /// the fleet's to choose, and these tests are about the mechanism that
+    /// carries whatever it chose.
+    fn declared_claude_selector() -> String {
+        crate::config::SpawnEnvConfig::default()
+            .keys_for(Some(crate::detect::Agent::Claude))
+            .first()
+            .expect("the shipped default declares a claude key")
+            .clone()
     }
 
     /// #347 / ADR-0014 §3, and the reason the deny-list was never enough: a
@@ -3155,11 +3175,12 @@ mod tests {
     /// there is not a subtle misbehaviour but a failure to exec.
     #[test]
     fn the_allowlist_keeps_what_the_agent_cli_needs_to_start() {
+        let selector = declared_claude_selector();
         let probes = [
             ("PATH", "/probe/bin"),
             ("HOME", "/probe/home"),
             ("LANG", "en_US.UTF-8"),
-            (crate::spawn::env::CLAUDE_CONFIG_DIR, "/probe/profile"),
+            (selector.as_str(), "/probe/profile"),
         ];
         for (key, value) in probes {
             std::env::set_var(key, value);
@@ -3260,10 +3281,13 @@ mod tests {
     fn no_denied_key_is_on_any_agent_kinds_allowlist() {
         for kind in crate::spawn::AgentKind::supported() {
             let kind = crate::spawn::AgentKind::parse(kind).expect("supported kinds parse");
-            let allowlist = crate::spawn::allowlist::for_argv(&kind.argv(&probe_prompt()));
+            let allowlist = crate::spawn::allowlist::for_argv(
+                &kind.argv(&probe_prompt()),
+                &crate::config::SpawnEnvConfig::default(),
+            );
             for denied in agent_spawn_denied_env() {
                 assert!(
-                    !allowlist.keys().contains(denied),
+                    !allowlist.keys().iter().any(|key| key == denied),
                     "{denied} is on both tables for {}; the deny sweep would undo the allow",
                     allowlist.agent()
                 );
@@ -3295,7 +3319,7 @@ mod tests {
             "the line must name the agent whose table was applied: {logged}"
         );
         assert!(
-            logged.contains(crate::spawn::env::CLAUDE_CONFIG_DIR),
+            logged.contains(&declared_claude_selector()),
             "the line must carry the resolved allowlist itself: {logged}"
         );
         assert!(
@@ -3348,30 +3372,25 @@ mod tests {
     /// the server does not have it, and allowed through when it does.
     #[test]
     fn an_argv_spawned_pane_carries_the_agent_profile_selector() {
+        let selector = declared_claude_selector();
         let mut cmd = CommandBuilder::new("/bin/sh");
         let scrub = set_pending_spawn_allowlist(claude_allowlist());
-        let profile = set_pending_spawn_env(vec![(
-            crate::spawn::env::CLAUDE_CONFIG_DIR.to_string(),
-            "/profiles/work".to_string(),
-        )]);
+        let profile = set_pending_spawn_env(vec![(selector.clone(), "/profiles/work".to_string())]);
         apply_pane_env(&mut cmd, PaneId::from_raw(21));
         drop(profile);
         drop(scrub);
 
         assert_eq!(
-            cmd.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR)
-                .and_then(|value| value.to_str()),
+            cmd.get_env(&selector).and_then(|value| value.to_str()),
             Some("/profiles/work"),
             "an agent-spawned child must run against the requester's profile,              not fall back to the default one"
         );
         assert!(
-            !agent_spawn_denied_env().contains(&crate::spawn::env::CLAUDE_CONFIG_DIR),
+            !agent_spawn_denied_env().contains(&selector.as_str()),
             "the profile selector is the requester's own identity handed down,              not an ambient credential to strip"
         );
         assert!(
-            claude_allowlist()
-                .keys()
-                .contains(&crate::spawn::env::CLAUDE_CONFIG_DIR),
+            claude_allowlist().keys().contains(&selector),
             "and a server that DOES have the selector must be allowed to pass it \
              through, not just to have it handed back"
         );
@@ -3397,9 +3416,10 @@ mod tests {
     /// would then be silently relocated with no error to explain it.
     #[test]
     fn an_aborted_spawn_does_not_relocate_the_next_panes_config_dir() {
+        let selector = declared_claude_selector();
         {
             let _guard = set_pending_spawn_env(vec![(
-                crate::spawn::env::CLAUDE_CONFIG_DIR.to_string(),
+                selector.clone(),
                 "/profiles/someone-else".to_string(),
             )]);
             // The spawn fails here, so `apply_pane_env` is never reached.
@@ -3413,8 +3433,8 @@ mod tests {
         let mut untouched = CommandBuilder::new("/bin/sh");
         apply_pane_env(&mut untouched, PaneId::from_raw(24));
         assert_eq!(
-            operator_pane.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR),
-            untouched.get_env(crate::spawn::env::CLAUDE_CONFIG_DIR),
+            operator_pane.get_env(&selector),
+            untouched.get_env(&selector),
             "an aborted agent spawn must not move the operator's own profile"
         );
     }
