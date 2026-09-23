@@ -146,10 +146,40 @@ pub(crate) fn build_worktree_remove_command(
     }
 }
 
-pub(crate) fn is_dirty_worktree_remove_error(message: &str) -> bool {
+/// Why git refused a `git worktree remove`, when the refusal is one `--force`
+/// clears (#351).
+///
+/// Both variants are escaped by the same flag for entirely different reasons,
+/// which is why this is an enum and not a bool: one confirmation is about
+/// losing work, the other is not, and telling the user the wrong one is how a
+/// clean checkout ends up behind a "dirty files will be deleted" warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeRemoveRefusal {
+    /// The checkout holds uncommitted or untracked files. Forcing deletes them.
+    Dirty,
+    /// The checkout contains a submodule. git runs `validate_no_submodules`
+    /// from inside `check_clean_worktree`, which it only reaches when
+    /// `--force` is absent, so forcing skips the check outright. It fires on
+    /// the presence of the gitlink alone: a pristine submodule refuses, and so
+    /// does one deinit'd down to an empty directory. Nothing about the
+    /// checkout being dirty is involved.
+    Submodules,
+}
+
+/// Read git's refusal off stderr. `None` means the failure is not one force
+/// can clear — a locked worktree, a missing registration, anything else — and
+/// the caller must surface it as the error it is.
+pub(crate) fn classify_worktree_remove_error(message: &str) -> Option<WorktreeRemoveRefusal> {
     let lower = message.to_ascii_lowercase();
-    lower.contains("contains modified or untracked files")
+    if lower.contains("contains modified or untracked files")
         && lower.contains("use --force to delete it")
+    {
+        return Some(WorktreeRemoveRefusal::Dirty);
+    }
+    if lower.contains("working trees containing submodules cannot be moved or removed") {
+        return Some(WorktreeRemoveRefusal::Submodules);
+    }
+    None
 }
 
 pub(crate) fn build_worktree_add_new_branch_command(
@@ -1412,7 +1442,7 @@ pub(crate) fn quarantine_worktree(
     .map_err(|err| {
         // Same-fs vs cross-fs is the classic failure mode. Callers can
         // key off the substring the same way the sweep keys off
-        // `is_dirty_worktree_remove_error`.
+        // `classify_worktree_remove_error`.
         format!(
             "git worktree move failed (checkout={}, dst={}): {err}",
             checkout.display(),
@@ -1863,6 +1893,62 @@ mod tests {
         repo
     }
 
+    /// git blocks the file transport for submodules by default, so a fixture
+    /// that clones one from a sibling temp dir has to opt back in.
+    fn run_git_over_file_protocol(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git command failed: git -C {} {}",
+            repo.display(),
+            args.join(" ")
+        );
+    }
+
+    /// A repo carrying a populated submodule, plus a linked worktree of it —
+    /// the shape that dead-ended #351 (`hyrr` with `nucl-parquet` inside).
+    /// Returns (main checkout, linked worktree path).
+    fn create_repo_with_submodule_worktree(name: &str) -> (PathBuf, PathBuf) {
+        let sub = create_committed_repo(&format!("{name}-sub"));
+        let repo = create_committed_repo(name);
+        run_git_over_file_protocol(
+            &repo,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                &sub.display().to_string(),
+                "sub",
+            ],
+        );
+        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
+        let checkout = repo.join("wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "issue/351-submodule",
+                &checkout.display().to_string(),
+            ],
+        );
+        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+        (repo, checkout)
+    }
+
     /// A committed repo wired to a fresh bare `origin` remote (no upstream
     /// tracking set yet) — the shape `prepare_peer_checkout` operates on.
     fn create_repo_with_bare_origin(name: &str) -> (PathBuf, PathBuf) {
@@ -2199,15 +2285,83 @@ prunable stale
 
     #[test]
     fn dirty_remove_error_detection_matches_git_force_hint() {
-        assert!(is_dirty_worktree_remove_error(
-            "fatal: '/w/flock' contains modified or untracked files, use --force to delete it"
-        ));
-        assert!(!is_dirty_worktree_remove_error(
-            "fatal: '/w/flock' is a missing but already registered worktree"
-        ));
-        assert!(!is_dirty_worktree_remove_error(
-            "fatal: '/w/flock' contains a locked worktree, use --force only if you know why"
-        ));
+        assert_eq!(
+            classify_worktree_remove_error(
+                "fatal: '/w/flock' contains modified or untracked files, use --force to delete it"
+            ),
+            Some(WorktreeRemoveRefusal::Dirty)
+        );
+        assert_eq!(
+            classify_worktree_remove_error(
+                "fatal: '/w/flock' is a missing but already registered worktree"
+            ),
+            None
+        );
+        // A locked worktree also names --force, and is deliberately NOT
+        // force-recoverable here: the lock is somebody saying "not yet".
+        assert_eq!(
+            classify_worktree_remove_error(
+                "fatal: '/w/flock' contains a locked worktree, use --force only if you know why"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn submodule_remove_error_is_classified_apart_from_dirty() {
+        assert_eq!(
+            classify_worktree_remove_error(
+                "fatal: working trees containing submodules cannot be moved or removed"
+            ),
+            Some(WorktreeRemoveRefusal::Submodules)
+        );
+    }
+
+    /// The refusal read off a real git, not off a string we wrote down (#351).
+    /// The checkout and its submodule are both clean, so a pass here is proof
+    /// the refusal has nothing to do with dirtiness — and that the force flag
+    /// really does clear it.
+    #[test]
+    fn real_git_refuses_submodule_worktree_until_forced() {
+        let (repo, checkout) = create_repo_with_submodule_worktree("submodule-refusal");
+        let checkout_str = checkout.display().to_string();
+
+        let status =
+            run_command_capture("git", &["-C", &checkout_str, "status", "--porcelain"], None)
+                .unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "fixture checkout is dirty: {status}"
+        );
+        let sub_status = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &checkout.join("sub").display().to_string(),
+                "status",
+                "--porcelain",
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(
+            sub_status.trim().is_empty(),
+            "fixture submodule is dirty: {sub_status}"
+        );
+
+        let err = run_worktree_command(&build_worktree_remove_command(&repo, &checkout, false))
+            .expect_err("git should refuse an unforced remove of a submodule worktree");
+        assert_eq!(
+            classify_worktree_remove_error(&err),
+            Some(WorktreeRemoveRefusal::Submodules),
+            "unrecognized git refusal: {err}"
+        );
+
+        run_worktree_command(&build_worktree_remove_command(&repo, &checkout, true))
+            .expect("--force clears the submodule refusal");
+        assert!(!checkout.exists());
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

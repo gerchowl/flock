@@ -251,12 +251,7 @@ pub(crate) fn remove_worktree_popup_rect(
     centered_popup_rect(area, 72, 10 + extra)
 }
 
-pub(crate) fn remove_worktree_button_rects(inner: Rect, force_confirmation: bool) -> (Rect, Rect) {
-    let primary_label = if force_confirmation {
-        "delete anyway"
-    } else {
-        "remove"
-    };
+pub(crate) fn remove_worktree_button_rects(inner: Rect, primary_label: &str) -> (Rect, Rect) {
     let rects = action_button_row_rects(
         inner,
         &[
@@ -754,10 +749,19 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
             rows[3],
         );
     }
-    if remove.force_confirmation {
+    // The two refusals git clears with the same flag mean opposite things to
+    // the user, so they do not share one line (#351).
+    if let Some(refusal) = remove.force_confirmation {
+        let warning = match refusal {
+            crate::worktree::WorktreeRemoveRefusal::Dirty => {
+                " Dirty or untracked files will be permanently deleted."
+            }
+            crate::worktree::WorktreeRemoveRefusal::Submodules => {
+                " git will not remove a worktree with submodules unforced."
+            }
+        };
         frame.render_widget(
-            Paragraph::new(" Dirty or untracked files will be permanently deleted.")
-                .style(Style::default().fg(app.palette.red)),
+            Paragraph::new(warning).style(Style::default().fg(app.palette.red)),
             rows[4],
         );
     }
@@ -779,9 +783,8 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     let tail = Rect::new(tail.x, tail.y, tail.width, tail.height.saturating_sub(1));
     render_remove_worktree_stakes(app, frame, tail, remove);
 
-    let forced = remove.force_confirmation || remove.force;
-    let (remove_rect, cancel_rect) = remove_worktree_button_rects(inner, forced);
-    let remove_label = if forced { "delete anyway" } else { "remove" };
+    let remove_label = remove.primary_label();
+    let (remove_rect, cancel_rect) = remove_worktree_button_rects(inner, remove_label);
     render_action_button_focused(
         frame,
         remove_rect,
@@ -1687,7 +1690,7 @@ mod tests {
             path: "/repo/flock-issue".into(),
             error: None,
             removing: false,
-            force_confirmation: false,
+            force_confirmation: None,
             focus: RemoveWorktreeControl::Remove,
             force: false,
             probe,
