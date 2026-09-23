@@ -694,10 +694,18 @@ impl App {
             force,
         );
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
-            let code = if !force && crate::worktree::is_dirty_worktree_remove_error(&err) {
-                "dirty_worktree_requires_force"
-            } else {
-                "worktree_remove_failed"
+            // Both codes mean "rerun with force"; they differ in what the
+            // caller is agreeing to lose, which is the whole reason git has
+            // two refusals behind one flag (#351).
+            let code = match crate::worktree::classify_worktree_remove_error(&err) {
+                Some(_) if force => "worktree_remove_failed",
+                Some(crate::worktree::WorktreeRemoveRefusal::Dirty) => {
+                    "dirty_worktree_requires_force"
+                }
+                Some(crate::worktree::WorktreeRemoveRefusal::Submodules) => {
+                    "submodule_worktree_requires_force"
+                }
+                None => "worktree_remove_failed",
             };
             return Err(ApiFailure::new(code, err));
         }
@@ -2471,6 +2479,107 @@ mod tests {
         assert_eq!(app.state.workspaces.len(), 1);
 
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// git blocks the file transport for submodules by default, so a fixture
+    /// cloning one from a sibling temp dir has to opt back in.
+    fn run_git_over_file_protocol(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git command failed: git -C {} {}",
+            repo.display(),
+            args.join(" ")
+        );
+    }
+
+    /// #351: a clean checkout that merely holds a submodule is refused by git
+    /// too, and the socket has to say so in a way a caller can act on —
+    /// `worktree_remove_failed` reads as "give up", not "retry with force".
+    #[test]
+    fn api_worktree_remove_requires_force_for_submodule_checkout() {
+        let sub = create_committed_repo("api-worktree-submodule-sub");
+        let repo = create_committed_repo("api-worktree-submodule-repo");
+        run_git_over_file_protocol(
+            &repo,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                &sub.display().to_string(),
+                "sub",
+            ],
+        );
+        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
+        let checkout = unique_temp_path("api-worktree-submodule-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-submodule-remove",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+
+        let mut app = app_with_parent(&repo);
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&repo).unwrap().key,
+            label: "api-worktree-submodule-repo".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces.push(child);
+        app.state.ensure_test_terminals();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: child_id.clone(),
+                force: false,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "submodule_worktree_requires_force");
+        assert!(checkout.exists());
+        assert_eq!(app.state.workspaces.len(), 2);
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: child_id,
+                force: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeRemoved { forced, .. } = success.result else {
+            panic!("expected worktree_removed response: {response}");
+        };
+        assert!(forced);
+        assert!(!checkout.exists());
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(sub);
     }
 
     /// #175 ADR-0005: a workspace close announces itself exactly once, whether

@@ -412,7 +412,8 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
         return Ok(match code {
             "not_linked_worktree" | "workspace_not_found" => 2,
-            "dirty_worktree_requires_force" => 4,
+            // 4 is the retryable class: the same call with --force clears it.
+            "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => 4,
             _ => 1,
         });
     }
