@@ -771,6 +771,76 @@ mod tests {
     }
 
     #[test]
+    fn the_worktree_picker_paints_each_checkout_s_age() {
+        // #396: every row in this picker was a name and a path, so a checkout
+        // abandoned five weeks ago and one branched this morning looked the
+        // same. The age rides the path line, right-aligned, so the title line
+        // keeps its width for the branch name.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("main")];
+        app.active = Some(0);
+        app.selected = 0;
+        let now = crate::worktree::current_unix_time();
+        app.worktree_open = Some(crate::app::state::WorktreeOpenState {
+            source_workspace_id: "w_1".into(),
+            source_existing_membership: None,
+            source_checkout_path: "/repo/flock".into(),
+            source_repo_root: "/repo/flock".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "flock".into(),
+            entries: vec![
+                crate::app::state::WorktreeOpenEntry {
+                    path: "/repo/flock-stale".into(),
+                    branch: Some("worktree/stale".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                    last_commit_at: Some(now - 35 * 86_400),
+                },
+                crate::app::state::WorktreeOpenEntry {
+                    path: "/repo/flock-undated".into(),
+                    branch: Some("worktree/undated".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                    last_commit_at: None,
+                },
+            ],
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            error: None,
+        });
+        app.mode = Mode::OpenExistingWorktree;
+
+        let area = Rect::new(0, 0, 120, 30);
+        compute_view(&mut app, area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let painted = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            painted.contains("/repo/flock-stale"),
+            "expected the stale row's path, got:\n{painted}"
+        );
+        assert!(
+            painted.contains("5w"),
+            "expected the stale row's age, got:\n{painted}"
+        );
+        // An undated row shows its path and no number: an unanswered question
+        // must not render as an age.
+        assert!(
+            painted.contains("/repo/flock-undated"),
+            "expected the undated row's path, got:\n{painted}"
+        );
+    }
+
+    #[test]
     fn mobile_width_uses_header_and_full_width_terminal() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];

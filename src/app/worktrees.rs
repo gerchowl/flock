@@ -39,6 +39,32 @@ fn kill_all_row_label(
     label
 }
 
+/// Order the worktree picker so prune candidates surface: the repo's own
+/// checkout, then linked checkouts oldest work first (#396).
+///
+/// Uses [`crate::worktree::stale_first_cmp`], the same comparator
+/// `worktree.list` sorts with. Two orderings would mean "which of these is
+/// stale" had two answers depending on whether you asked the TUI or the CLI.
+fn sort_worktree_entries_stale_first(
+    entries: &mut [WorktreeOpenEntry],
+    repo_root: &std::path::Path,
+) {
+    let repo_root = crate::worktree::canonical_or_original(repo_root);
+    fn key<'entry>(
+        entry: &'entry WorktreeOpenEntry,
+        repo_root: &std::path::Path,
+    ) -> crate::worktree::StaleSortKey<'entry> {
+        crate::worktree::StaleSortKey {
+            is_main: crate::worktree::canonical_or_original(&entry.path) == repo_root,
+            last_commit_at: entry.last_commit_at,
+            path: entry.path.as_path(),
+        }
+    }
+    entries.sort_by(|left, right| {
+        crate::worktree::stale_first_cmp(&key(left, &repo_root), &key(right, &repo_root))
+    });
+}
+
 /// Resolve the branch-session dialog's editable seed (#159) into the fork's
 /// opening prompt: substitute the `<branch>` token with the final branch name.
 /// An empty seed stays empty, so [`crate::agent_resume::append_pivot_message`]
@@ -579,31 +605,26 @@ impl App {
 
         let workspace_id = ws.id.clone();
         let event_tx = self.event_tx.clone();
+        let protected_branches = self.state.config.worktrees.protected_branches.clone();
         std::thread::spawn(move || {
-            let branch = crate::worktree::checkout_branch_name(&checkout);
-            let (gate, timed_out) = match branch.clone() {
-                Some(branch) => crate::worktree::branch_merge_gate_with_timeout(
-                    repo_root.clone(),
-                    checkout.clone(),
-                    branch,
-                ),
-                // No branch has two causes — a detached HEAD and a checkout
-                // that is gone — and only one of them is about a branch (#360).
-                None => (
-                    crate::worktree::gate_for_branchless_checkout(&checkout),
-                    false,
-                ),
-            };
+            // One resolver for branch + merge gate + #121 protection, shared
+            // with the sweep, `worktree.kill` and `worktree.list --scan`.
+            let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                repo_root.clone(),
+                checkout.clone(),
+                &protected_branches,
+            );
             // #325: what the kill would destroy, collected on the same worker
             // that resolved the gate — the dialog holds its confirm until both
             // land, so the user never authorises an unnamed set.
-            let probe = crate::worktree::probe_kill_targets(&checkout, branch.as_deref());
+            let probe = crate::worktree::probe_kill_targets(&checkout, verdict.branch.as_deref());
             let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                 crate::events::WorktreeKillGateResult {
                     workspace_id,
                     path: checkout,
-                    branch,
-                    gate,
+                    branch: verdict.branch,
+                    gate: verdict.gate,
+                    protected: verdict.protected,
                     timed_out,
                     probe: Some(probe),
                 },
@@ -622,24 +643,10 @@ impl App {
             return;
         }
         // #121: is this the repo's default (or a configured protected) branch?
-        // Decide BEFORE borrowing `remove` mutably — needs `remove.repo_root`
-        // and `config`, both immutable borrows of `self.state`. `is_protected_
-        // branch` carries the main/master floor even if detection returns None.
-        let protected = match self.state.worktree_remove.as_ref() {
-            Some(remove)
-                if remove.workspace_id == result.workspace_id && remove.path == result.path =>
-            {
-                result.branch.as_deref().is_some_and(|branch| {
-                    let default = crate::worktree::detect_default_branch(&remove.repo_root);
-                    crate::worktree::is_protected_branch(
-                        branch,
-                        default.as_deref(),
-                        &self.state.config.worktrees.protected_branches,
-                    )
-                })
-            }
-            _ => false,
-        };
+        // Settled by the worker as part of the one verdict, rather than
+        // recomputed here — this was the second of the three places that each
+        // decided it (or, in the sweep's case, did not) (#396).
+        let protected = result.protected;
 
         let Some(remove) = &mut self.state.worktree_remove else {
             return;
@@ -740,6 +747,7 @@ impl App {
                 dirty,
                 working_agent,
                 merge_gate,
+                protected: false,
                 tier,
                 status: WorktreeKillRowStatus::Pending,
             });
@@ -759,26 +767,21 @@ impl App {
             let workspace_id = row.workspace_id.clone();
             let repo_root = row.repo_root.clone();
             let checkout = row.checkout.clone();
-            let branch = row.branch.clone();
             let event_tx = self.event_tx.clone();
+            let protected_branches = self.state.config.worktrees.protected_branches.clone();
             std::thread::spawn(move || {
-                let (gate, timed_out) = match branch.clone() {
-                    Some(branch) => crate::worktree::branch_merge_gate_with_timeout(
-                        repo_root.clone(),
-                        checkout.clone(),
-                        branch,
-                    ),
-                    None => (
-                        crate::worktree::gate_for_branchless_checkout(&checkout),
-                        false,
-                    ),
-                };
+                let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                    repo_root.clone(),
+                    checkout.clone(),
+                    &protected_branches,
+                );
                 let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                     crate::events::WorktreeKillGateResult {
                         workspace_id,
                         path: checkout,
-                        branch,
-                        gate,
+                        branch: verdict.branch,
+                        gate: verdict.gate,
+                        protected: verdict.protected,
                         timed_out,
                         // The sweep renders per-row tiers, not a file list, and
                         // would pay the probe once per worktree for it (#325).
@@ -808,11 +811,20 @@ impl App {
         else {
             return;
         };
+        // A protected branch is kept however good the evidence is (#121), and
+        // the gate calls the repo's default branch merged — trivially, since
+        // it is contained in every remote ref. The sweep never applied those
+        // tiers: it fed `merged` straight into the tier, so a repo whose
+        // default is `develop`, or one with a configured `protected_branches`
+        // entry, had only `delete_local_branch`'s main/master floor between it
+        // and `git branch -D` (#396). Feeding `merged: false` demotes the row
+        // to a checkout-only removal, which is what the single kill does.
         let merged = matches!(
             result.gate,
             crate::worktree::WorktreeMergeGate::Merged { .. }
-        );
+        ) && !result.protected;
         row.branch = result.branch;
+        row.protected = result.protected;
         row.merge_gate = Some(result.gate);
         row.tier = crate::worktree::classify_kill_tier(KillFacts {
             is_main: row.checkout_is_main(),
@@ -1060,7 +1072,7 @@ impl App {
                 return;
             }
         };
-        let entries = list
+        let mut entries = list
             .into_iter()
             .filter(|entry| !entry.is_bare && !entry.is_prunable)
             .map(|entry| {
@@ -1098,12 +1110,18 @@ impl App {
                 });
                 WorktreeOpenEntry {
                     is_linked_worktree: entry_checkout_path != repo_checkout_path,
+                    last_commit_at: crate::worktree::last_commit_unix_time(
+                        &space.repo_root,
+                        &entry.path,
+                        entry.branch.as_deref(),
+                    ),
                     path: entry.path,
                     branch: entry.branch,
                     already_open_ws_idx,
                 }
             })
             .collect::<Vec<_>>();
+        sort_worktree_entries_stale_first(&mut entries, &space.repo_root);
 
         if entries.is_empty() {
             self.show_action_notice("No Git worktrees found for this repo.");
@@ -1985,6 +2003,7 @@ mod tests {
                 branch: Some("worktree/issue".into()),
                 is_linked_worktree: true,
                 already_open_ws_idx: Some(1),
+                last_commit_at: None,
             }],
             selected: 0,
             query: String::new(),
@@ -2023,18 +2042,21 @@ mod tests {
                     branch: Some("main".into()),
                     is_linked_worktree: false,
                     already_open_ws_idx: Some(0),
+                    last_commit_at: None,
                 },
                 WorktreeOpenEntry {
                     path: "/repo/fd-cleanup".into(),
                     branch: Some("fd-cleanup".into()),
                     is_linked_worktree: true,
                     already_open_ws_idx: None,
+                    last_commit_at: None,
                 },
                 WorktreeOpenEntry {
                     path: "/repo/bell-forward-macos-bounce".into(),
                     branch: Some("bell-forward-macos-bounce".into()),
                     is_linked_worktree: true,
                     already_open_ws_idx: None,
+                    last_commit_at: None,
                 },
             ],
             selected: 0,
@@ -3565,6 +3587,7 @@ mod tests {
             gate: crate::worktree::WorktreeMergeGate::Merged {
                 evidence: "PR #7 merged".into(),
             },
+            protected: false,
             timed_out: false,
             probe: None,
         });
@@ -3581,6 +3604,152 @@ mod tests {
         assert!(remove.delete_branch);
         assert!(!remove.branch_protected);
         assert!(!remove.gate_timed_out);
+    }
+
+    fn sweep_row(branch: &str) -> WorktreeKillRow {
+        WorktreeKillRow {
+            workspace_id: "ws".into(),
+            label: branch.into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            checkout: std::path::PathBuf::from("/repo/flock-issue"),
+            managed: true,
+            branch: Some(branch.into()),
+            dirty: false,
+            working_agent: false,
+            merge_gate: None,
+            protected: false,
+            tier: crate::worktree::KillTier::CheckoutOnly,
+            status: WorktreeKillRowStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn the_sweep_keeps_a_protected_branch_the_single_kill_would_keep() {
+        // #396: the sweep fed the gate's `merged` straight into its tier and
+        // never consulted #121's tiers, so a repo whose default branch is
+        // `develop` — or one with a configured `protected_branches` entry —
+        // had only `delete_local_branch`'s main/master floor between it and
+        // `git branch -D`. The single kill has refused this all along; the two
+        // now read the same verdict.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row("develop")],
+            executing: false,
+            force_dirty: false,
+        });
+
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            branch: Some("develop".into()),
+            gate: crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "merged into main".into(),
+            },
+            protected: true,
+            timed_out: false,
+            probe: None,
+        });
+
+        let row = &app.state.worktree_kill_all.as_ref().unwrap().rows[0];
+        assert!(row.protected);
+        assert_eq!(
+            row.tier,
+            crate::worktree::KillTier::CheckoutOnly,
+            "a protected branch is a checkout-only removal, never a branch delete"
+        );
+        assert_eq!(
+            crate::worktree::planned_action(row.tier, true),
+            KillAction::CheckoutOnly,
+            "force does not reach a protected branch either"
+        );
+    }
+
+    #[test]
+    fn the_sweep_still_deletes_an_unprotected_merged_branch() {
+        // The neighbour of the case above: the protection fix must not turn
+        // every merged row into a checkout-only one.
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row("feature/landed")],
+            executing: false,
+            force_dirty: false,
+        });
+
+        app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+            workspace_id: "ws".into(),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            branch: Some("feature/landed".into()),
+            gate: crate::worktree::WorktreeMergeGate::Merged {
+                evidence: "already in main (squashed or rebased)".into(),
+            },
+            protected: false,
+            timed_out: false,
+            probe: None,
+        });
+
+        let row = &app.state.worktree_kill_all.as_ref().unwrap().rows[0];
+        assert_eq!(
+            row.tier,
+            crate::worktree::KillTier::KillBranch { dirty: false }
+        );
+    }
+
+    #[test]
+    fn the_picker_orders_checkouts_the_way_the_list_does() {
+        // #396: the CLI list and the TUI picker sort through one comparator,
+        // so "which of these is stale" cannot have two answers depending on
+        // where it was asked.
+        let repo = std::path::PathBuf::from("/repo/flock");
+        let mut entries = vec![
+            WorktreeOpenEntry {
+                path: "/repo/flock-recent".into(),
+                branch: Some("worktree/recent".into()),
+                is_linked_worktree: true,
+                already_open_ws_idx: None,
+                last_commit_at: Some(2_000),
+            },
+            WorktreeOpenEntry {
+                path: "/repo/flock-undated".into(),
+                branch: Some("worktree/undated".into()),
+                is_linked_worktree: true,
+                already_open_ws_idx: None,
+                last_commit_at: None,
+            },
+            WorktreeOpenEntry {
+                path: "/repo/flock".into(),
+                branch: Some("main".into()),
+                is_linked_worktree: false,
+                already_open_ws_idx: Some(0),
+                last_commit_at: Some(1_500),
+            },
+            WorktreeOpenEntry {
+                path: "/repo/flock-old".into(),
+                branch: Some("worktree/old".into()),
+                is_linked_worktree: true,
+                already_open_ws_idx: None,
+                last_commit_at: Some(1_000),
+            },
+        ];
+        sort_worktree_entries_stale_first(&mut entries, &repo);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.display_name())
+                .collect::<Vec<_>>(),
+            vec![
+                "main",
+                "worktree/old",
+                "worktree/recent",
+                "worktree/undated"
+            ]
+        );
+        assert_eq!(entries[1].age_label(1_000 + 40 * 86_400), "5w");
+        assert_eq!(
+            entries[3].age_label(1_000),
+            "",
+            "an undated row shows no age rather than a number nothing measured"
+        );
     }
 
     fn kill_dialog_state(branch: &str) -> WorktreeRemoveState {
@@ -3616,6 +3785,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            protected: false,
             timed_out: false,
             probe: None,
         });
@@ -3653,6 +3823,10 @@ mod tests {
         // #121 outranks #325: force is a way past the merge gate, not a way to
         // delete main. The guard clears `delete_branch` when the gate resolves,
         // and that is what the execution path checks first.
+        //
+        // Which branches ARE protected is decided once, in the worker's
+        // verdict (`kill_verdict_protects_the_repos_own_branches`), not a
+        // second time here (#396) — this asserts the dialog obeys it.
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(kill_dialog_state("main"));
         app.state.mode = Mode::ConfirmRemoveWorktree;
@@ -3662,6 +3836,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("main".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            protected: true,
             timed_out: false,
             probe: None,
         });
@@ -3691,6 +3866,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            protected: false,
             timed_out: false,
             probe: Some(probe.clone()),
         });
@@ -3829,6 +4005,11 @@ mod tests {
         // The gate says "merged" (the default branch is trivially contained in
         // every downstream remote ref), but it is the repo's default branch —
         // the guard must pin it checkout-only and never build `git branch -D`.
+        //
+        // Which branches are protected is decided in the worker's verdict now
+        // (`kill_verdict_protects_the_repos_own_branches`), so the two answers
+        // cannot drift; this asserts the dialog honours it even against
+        // positive merge evidence.
         app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
             workspace_id: "ws".into(),
             path: std::path::PathBuf::from("/repo/flock-issue"),
@@ -3836,6 +4017,7 @@ mod tests {
             gate: crate::worktree::WorktreeMergeGate::Merged {
                 evidence: "contained in origin/latest".into(),
             },
+            protected: true,
             timed_out: false,
             probe: None,
         });
@@ -3880,6 +4062,7 @@ mod tests {
             path: std::path::PathBuf::from("/repo/flock-issue"),
             branch: Some("feature/x".into()),
             gate: crate::worktree::WorktreeMergeGate::NotMerged,
+            protected: false,
             timed_out: true,
             probe: None,
         });

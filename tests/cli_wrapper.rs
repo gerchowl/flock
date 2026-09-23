@@ -1840,6 +1840,20 @@ fn worktree_management_commands_work() {
         listed_entry["open_workspace_id"].as_str(),
         Some(child_workspace_id.as_str())
     );
+    // #396: every row is dated with the last commit on its branch, so the
+    // list can be ordered by what is stale. The repo was committed to moments
+    // ago by this test, so the field is present — what is asserted is that it
+    // reaches the wire, not what it equals.
+    assert!(
+        listed_entry["last_commit_at"].is_i64(),
+        "expected a dated row, got {listed_entry}"
+    );
+    // A plain list scans nothing, and an absent verdict must not be a null a
+    // client would read as a judgement.
+    assert!(
+        listed_entry.get("kill_verdict").is_none(),
+        "an unscanned row must carry no verdict, got {listed_entry}"
+    );
 
     let opened = run_cli_json(
         &socket_path,

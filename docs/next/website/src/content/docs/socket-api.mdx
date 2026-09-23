@@ -73,7 +73,7 @@ Raw socket method names use dot notation:
 | Notification | `notification.show`, `notification.list`, `notification.ack` |
 | Handoff | `handoff.list`, `handoff.read` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
-| Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
+| Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove`, `worktree.kill` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
@@ -144,7 +144,11 @@ Built-in checks:
 - **`hibernation`** — pure fold, OFF by default. Selects Idle-past-`idle_threshold_secs` or Done-past-`done_threshold_secs` panes and dispatches `agent.hibernate` server-side. Never touches Blocked / Working / Unknown / Idle-unseen. Failures (no resume plan) emit `check_errored` once per episode.
 - **`issue_guard`** — polls the configured GitHub repos via the `gh` CLI, parses a `flk-trigger` fenced block from ISSUE BODIES only (never comments), and dispatches the trigger's action when the author matches the configured `owner`. Non-owner bodies are audited via `trigger_ignored`; broken blocks emit `trigger_errored` and post a comment back on the issue. Dedupe by `run_id` (when set on the block) or hash of the body; the dedupe set persists across server restarts by seeding from the durable log's `trigger_fired` events. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
 
-Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
+Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
+
+`worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
+
+`worktree.kill` accepts `path` as well as `workspace_id`, so a checkout no workspace has open is still killable through the gate instead of by hand. A path that IS open resolves to its workspace and closes it with the checkout; the response's `workspace_id` is omitted when no workspace held the checkout.
 
 ## Socket transport
 

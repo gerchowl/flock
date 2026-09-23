@@ -1062,6 +1062,10 @@ pub struct WorktreeKillRow {
     /// None while the merge gate is still resolving (linked rows only); always
     /// Some for main-checkout rows (which need no gate).
     pub merge_gate: Option<crate::worktree::WorktreeMergeGate>,
+    /// The branch is the repo default or config-protected (#121). The sweep
+    /// keeps it: the tier is computed as if the gate found no evidence, so the
+    /// row removes the checkout and leaves the branch (#396).
+    pub protected: bool,
     /// The action tier, recomputed as the gate resolves.
     pub tier: crate::worktree::KillTier,
     /// Per-row execution status.
@@ -1111,6 +1115,13 @@ pub struct WorktreeOpenEntry {
     pub branch: Option<String>,
     pub is_linked_worktree: bool,
     pub already_open_ws_idx: Option<usize>,
+    /// Unix seconds of the last commit on this checkout's branch (#396).
+    ///
+    /// The picker's rows were identical apart from a name, so a checkout
+    /// abandoned five weeks ago and one branched this morning read the same.
+    /// `None` when git could not answer — those sort last rather than being
+    /// presented as the oldest.
+    pub last_commit_at: Option<i64>,
 }
 
 impl WorktreeOpenEntry {
@@ -1122,6 +1133,15 @@ impl WorktreeOpenEntry {
                 .map(str::to_owned)
                 .unwrap_or_else(|| self.path.display().to_string())
         })
+    }
+
+    /// Compact age for the row's second line: `5w`, `3d`, `2h`. Empty when
+    /// git could not date the branch — an unanswered question renders as
+    /// nothing, never as a number.
+    pub(crate) fn age_label(&self, now_unix: i64) -> String {
+        self.last_commit_at
+            .map(|at| crate::worktree::relative_age_label(now_unix, at))
+            .unwrap_or_default()
     }
 
     pub(crate) fn status_label(&self) -> &'static str {

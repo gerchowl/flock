@@ -553,6 +553,14 @@ pub struct WorktreeListParams {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Resolve each row's `kill_verdict` through the kill gate (#396).
+    ///
+    /// Opt-in because it costs local git plus a `gh pr view` per checkout, and
+    /// spawning `gh` is not free — measured at ~158x curl's exec cost under
+    /// macOS Gatekeeper. A plain list stays cheap; the verdict is asked for
+    /// when someone is actually deciding what to prune.
+    #[serde(default)]
+    pub scan: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -604,9 +612,20 @@ pub struct WorktreeRemoveParams {
 /// itself, which meant an agent over the socket or MCP got the destructive half
 /// with none of the evidence requirement and none of the protected-branch tiers
 /// (#121).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorktreeKillParams {
-    pub workspace_id: String,
+    /// The open workspace whose checkout to kill. Optional since #396: the
+    /// checkouts most worth pruning are exactly the ones nobody has open, and
+    /// a workspace-only address left them reachable by no flock verb at all —
+    /// which is how they got removed with raw `git worktree remove` instead,
+    /// the mistake that produced #360.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// The checkout to kill, addressed by path. Exactly one of this and
+    /// `workspace_id` is required. A path that IS open as a workspace is
+    /// routed through the workspace, so the workspace is closed with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Remove the checkout even when it has uncommitted or untracked changes.
     /// Never widens the BRANCH decision — an unmerged branch survives `force`.
     #[serde(default)]
@@ -1815,7 +1834,10 @@ pub enum ResponseResult {
         forced: bool,
     },
     WorktreeKilled {
-        workspace_id: String,
+        /// The workspace that was closed with the checkout. Absent when the
+        /// kill was addressed by path and no workspace had it open (#396).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
         checkout_path: String,
         branch: Option<String>,
         /// Whether the branch's work is recorded elsewhere. The ONLY thing that
@@ -2093,6 +2115,52 @@ pub struct WorktreeInfo {
     /// PR". Absence is not evidence here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<PrInfo>,
+    /// When work last happened on this checkout's branch: the last commit's
+    /// unix timestamp (#396).
+    ///
+    /// Not the directory's mtime, which is the obvious field and the wrong
+    /// one — a build that rewrites `target/` makes a checkout abandoned for
+    /// three weeks look fresher than one edited this morning. `None` when git
+    /// could not answer; the list sorts those last rather than treating an
+    /// unanswered question as evidence of age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_at: Option<i64>,
+    /// The kill gate's verdict for this checkout (#396).
+    ///
+    /// **Present only when the request asked for it** (`scan: true`). Absence
+    /// means "not scanned", NOT "not merged" — resolving it runs local git and
+    /// a `gh pr view` per row, which is why it is not paid on every list call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_verdict: Option<KillVerdictInfo>,
+}
+
+/// What `flk worktree kill` would decide about one checkout, as carried on the
+/// wire (#396).
+///
+/// Resolved by the SAME `resolve_kill_verdict` the kill path itself runs, not
+/// by a second implementation next to the list. That matters most for the
+/// common case: a squash-merged branch is not an ancestor of the default
+/// branch, so the obvious independent check (`git merge-base --is-ancestor`)
+/// calls landed work unmerged, and a list that said so would send operators
+/// to rescue work that was never at risk (#287).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KillVerdictInfo {
+    /// `merged` | `not_merged` | `checkout_missing`.
+    ///
+    /// `checkout_missing` is not a judgement about the branch: the checkout is
+    /// not on disk, so there was no question to put to git (#360).
+    pub verdict: String,
+    /// What proved it, when merged — `already in main (squashed or rebased)`,
+    /// `PR #351 merged`, `contained in origin/main`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// The branch is the repo default or config-protected (#121), so a kill
+    /// removes the checkout and keeps the branch however good the evidence is.
+    pub protected: bool,
+    /// The gate did not finish inside its bound. `not_merged` is then the safe
+    /// degradation, not an answer — treat it as unknown.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 /// A branch's GitHub PR, as carried on the wire (#332).
@@ -3531,6 +3599,8 @@ mod tests {
                     open_workspace_id: Some("w_1".into()),
                     label: "flock".into(),
                     pr: None,
+                    last_commit_at: None,
+                    kill_verdict: None,
                 },
             },
         };
@@ -3832,9 +3902,15 @@ mod pr_info_tests {
             open_workspace_id: None,
             label: "flock".into(),
             pr: None,
+            last_commit_at: None,
+            kill_verdict: None,
         };
         let json = serde_json::to_string(&worktree).expect("serialisable");
         assert!(!json.contains("\"pr\""), "{json}");
+        // Same contract for the #396 fields: an unscanned row must not
+        // serialise a null verdict, which a client would read as a judgement.
+        assert!(!json.contains("\"kill_verdict\""), "{json}");
+        assert!(!json.contains("\"last_commit_at\""), "{json}");
 
         let with_pr = WorktreeInfo {
             pr: Some(PrInfo {

@@ -36,6 +36,18 @@ fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
     }
 }
 
+/// The checkout one `worktree.kill` acts on, however it was addressed.
+struct KillTarget {
+    /// The open workspace holding it, when one does — it is closed with the
+    /// checkout.
+    workspace_idx: Option<usize>,
+    /// The MAIN checkout root: where `git worktree remove` and `git branch -D`
+    /// run.
+    repo_root: PathBuf,
+    /// The linked checkout being removed.
+    checkout: PathBuf,
+}
+
 struct WorktreeSource {
     workspace_idx: Option<usize>,
     source_checkout_path: PathBuf,
@@ -58,10 +70,14 @@ impl App {
             Ok(entries) => entries,
             Err(err) => return encode_error(id, "worktree_list_failed", err),
         };
-        let worktrees = entries
+        let mut worktrees: Vec<WorktreeInfo> = entries
             .into_iter()
             .map(|entry| self.worktree_info_for_entry(&source, entry))
             .collect();
+        self.sort_worktrees_stale_first(&source, &mut worktrees);
+        if params.scan {
+            self.scan_worktree_kill_verdicts(&source, &mut worktrees);
+        }
 
         encode_success(
             id,
@@ -682,17 +698,16 @@ impl App {
     /// `worktree.remove` and the gated `worktree.kill` so the dirty-vs-force
     /// rule and the workspace teardown cannot drift apart. Returns the public
     /// workspace id.
-    fn remove_worktree_checkout(
-        &mut self,
-        ws_idx: usize,
-        space: &crate::workspace::WorktreeSpaceMembership,
+    /// `git worktree remove`, with the refusal classification every caller
+    /// needs. Split from [`Self::remove_worktree_checkout`] so a kill
+    /// addressed by path (#396) — which has no workspace to close — cannot
+    /// grow a second copy of the error mapping.
+    fn run_worktree_remove(
+        repo_root: &Path,
+        checkout: &Path,
         force: bool,
-    ) -> Result<String, ApiFailure> {
-        let command = crate::worktree::build_worktree_remove_command(
-            &space.repo_root,
-            &space.checkout_path,
-            force,
-        );
+    ) -> Result<(), ApiFailure> {
+        let command = crate::worktree::build_worktree_remove_command(repo_root, checkout, force);
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
             // Both codes mean "rerun with force"; they differ in what the
             // caller is agreeing to lose, which is the whole reason git has
@@ -709,6 +724,16 @@ impl App {
             };
             return Err(ApiFailure::new(code, err));
         }
+        Ok(())
+    }
+
+    fn remove_worktree_checkout(
+        &mut self,
+        ws_idx: usize,
+        space: &crate::workspace::WorktreeSpaceMembership,
+        force: bool,
+    ) -> Result<String, ApiFailure> {
+        Self::run_worktree_remove(&space.repo_root, &space.checkout_path, force)?;
 
         let workspace_id = self.public_workspace_id(ws_idx);
         let still_same_linked_worktree = {
@@ -740,70 +765,37 @@ impl App {
         id: String,
         params: WorktreeKillParams,
     ) -> String {
-        let Some(ws_idx) = self.parse_workspace_id(&params.workspace_id) else {
-            return encode_error(
-                id,
-                "workspace_not_found",
-                format!("workspace {} not found", params.workspace_id),
-            );
-        };
-        // #197: the action view, as for every other worktree mutation.
-        let Some(space) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.worktree_space_here().cloned())
-            .filter(|space| space.is_linked_worktree)
-        else {
-            return encode_error(
-                id,
-                "not_linked_worktree",
-                "workspace is not a linked worktree checkout",
-            );
+        let target = match self.resolve_kill_target(&params) {
+            Ok(target) => target,
+            Err(err) => return encode_error(id, err.code, err.message),
         };
 
-        let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
-        let gate = match branch.as_deref() {
-            // A detached checkout has no branch to judge or delete, and a
-            // checkout that is gone has none to resolve — two different
-            // refusals that used to share one wording (#360).
-            None => crate::worktree::gate_for_branchless_checkout(&space.checkout_path),
-            Some(branch) => {
-                crate::worktree::branch_merge_gate(&space.repo_root, &space.checkout_path, branch)
-            }
-        };
-        let checkout_missing = matches!(gate, crate::worktree::WorktreeMergeGate::CheckoutMissing);
-        let (merged, evidence) = match gate {
-            crate::worktree::WorktreeMergeGate::Merged { evidence } => (true, Some(evidence)),
-            crate::worktree::WorktreeMergeGate::NotMerged
-            | crate::worktree::WorktreeMergeGate::CheckoutMissing => (false, None),
-        };
-        // #121: default and config-protected branches are never auto-deleted,
-        // however good the merge evidence is. The CLI never consulted these
-        // tiers — it relied on `delete_local_branch`'s main/master floor, so a
-        // repo whose default is `develop` had only that floor.
-        let protected = branch.as_deref().is_some_and(|branch| {
-            let default = crate::worktree::detect_default_branch(&space.repo_root);
-            crate::worktree::is_protected_branch(
-                branch,
-                default.as_deref(),
-                &self.state.config.worktrees.protected_branches,
-            )
-        });
-        let would_delete_branch = merged && !params.keep_branch && !protected;
+        // ONE resolver, shared with the kill dialog, the fleet sweep and
+        // `worktree.list --scan` (#396). A second "is this merged" next to any
+        // of them would drift — and would drift wrong, since the obvious
+        // independent implementation calls a squash-merged branch unmerged
+        // (#287).
+        let verdict = crate::worktree::resolve_kill_verdict(
+            &target.repo_root,
+            &target.checkout,
+            &self.state.config.worktrees.protected_branches,
+        );
+        let would_delete_branch = verdict.would_delete_branch(params.keep_branch);
 
-        let checkout_path = space.checkout_path.display().to_string();
+        let checkout_path = target.checkout.display().to_string();
         if params.dry_run {
             return encode_success(
                 id,
                 ResponseResult::WorktreeKilled {
-                    workspace_id: self.public_workspace_id(ws_idx),
+                    workspace_id: target
+                        .workspace_idx
+                        .map(|idx| self.public_workspace_id(idx)),
                     checkout_path,
-                    branch,
-                    merged,
-                    evidence,
-                    checkout_missing,
-                    protected,
+                    branch: verdict.branch.clone(),
+                    merged: verdict.merged(),
+                    evidence: verdict.evidence().map(str::to_string),
+                    checkout_missing: verdict.checkout_missing(),
+                    protected: verdict.protected,
                     removed: false,
                     branch_deleted: false,
                     would_delete_branch,
@@ -812,16 +804,44 @@ impl App {
             );
         }
 
-        let workspace_id = match self.remove_worktree_checkout(ws_idx, &space, params.force) {
-            Ok(workspace_id) => workspace_id,
-            Err(failure) => return encode_error(id, failure.code, failure.message),
+        let workspace_id = match target.workspace_idx {
+            // Through the workspace whenever one holds this checkout, so the
+            // workspace is closed with it. Removing the directory behind
+            // flock's back is exactly what left four workspaces pointing at
+            // directories that no longer existed (#360).
+            Some(ws_idx) => {
+                let Some(space) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.worktree_space_here().cloned())
+                else {
+                    return encode_error(
+                        id,
+                        "not_linked_worktree",
+                        "workspace is not a linked worktree checkout",
+                    );
+                };
+                match self.remove_worktree_checkout(ws_idx, &space, params.force) {
+                    Ok(workspace_id) => Some(workspace_id),
+                    Err(failure) => return encode_error(id, failure.code, failure.message),
+                }
+            }
+            None => {
+                if let Err(failure) =
+                    Self::run_worktree_remove(&target.repo_root, &target.checkout, params.force)
+                {
+                    return encode_error(id, failure.code, failure.message);
+                }
+                None
+            }
         };
 
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
         if would_delete_branch {
-            if let Some(branch) = branch.as_deref() {
-                match crate::worktree::delete_local_branch(&space.repo_root, branch) {
+            if let Some(branch) = verdict.branch.as_deref() {
+                match crate::worktree::delete_local_branch(&target.repo_root, branch) {
                     Ok(()) => branch_deleted = true,
                     Err(err) => branch_delete_error = Some(err),
                 }
@@ -833,17 +853,110 @@ impl App {
             ResponseResult::WorktreeKilled {
                 workspace_id,
                 checkout_path,
-                branch,
-                merged,
-                evidence,
-                checkout_missing,
-                protected,
+                branch: verdict.branch.clone(),
+                merged: verdict.merged(),
+                evidence: verdict.evidence().map(str::to_string),
+                checkout_missing: verdict.checkout_missing(),
+                protected: verdict.protected,
                 removed: true,
                 branch_deleted,
                 would_delete_branch,
                 branch_delete_error,
             },
         )
+    }
+
+    /// Which checkout a kill is about, and the workspace holding it when there
+    /// is one.
+    ///
+    /// Two addresses, one target. `workspace_id` is the original; `path`
+    /// (#396) exists because the checkouts most worth pruning are the ones
+    /// nobody has open, and they were reachable by no flock verb at all — so
+    /// they got removed with raw `git worktree remove` instead, which is the
+    /// mistake that produced #360. A path that IS open resolves to its
+    /// workspace, so the two addresses never do different things to the same
+    /// checkout.
+    fn resolve_kill_target(
+        &mut self,
+        params: &WorktreeKillParams,
+    ) -> Result<KillTarget, ApiFailure> {
+        match (params.workspace_id.as_deref(), params.path.as_deref()) {
+            (Some(_), Some(_)) => Err(ApiFailure::new(
+                "invalid_request",
+                "only one of workspace_id or path may be supplied",
+            )),
+            (None, None) => Err(ApiFailure::new(
+                "invalid_request",
+                "exactly one of workspace_id or path is required",
+            )),
+            (Some(workspace_id), None) => {
+                let Some(ws_idx) = self.parse_workspace_id(workspace_id) else {
+                    return Err(ApiFailure::new(
+                        "workspace_not_found",
+                        format!("workspace {workspace_id} not found"),
+                    ));
+                };
+                // #197: the action view, as for every other worktree mutation.
+                let Some(space) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.worktree_space_here().cloned())
+                    .filter(|space| space.is_linked_worktree)
+                else {
+                    return Err(ApiFailure::new(
+                        "not_linked_worktree",
+                        "workspace is not a linked worktree checkout",
+                    ));
+                };
+                Ok(KillTarget {
+                    workspace_idx: Some(ws_idx),
+                    repo_root: space.repo_root,
+                    checkout: space.checkout_path,
+                })
+            }
+            (None, Some(path)) => {
+                let path = absolute_user_path(path)?;
+                let canonical = crate::worktree::canonical_or_original(&path);
+                if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&canonical) {
+                    if let Some(space) = self
+                        .state
+                        .workspaces
+                        .get(ws_idx)
+                        .and_then(|ws| ws.worktree_space_here().cloned())
+                        .filter(|space| space.is_linked_worktree)
+                    {
+                        return Ok(KillTarget {
+                            workspace_idx: Some(ws_idx),
+                            repo_root: space.repo_root,
+                            checkout: space.checkout_path,
+                        });
+                    }
+                }
+                let space = crate::workspace::git_space_metadata(&canonical).ok_or_else(|| {
+                    // A checkout git cannot read is not killable by path:
+                    // there is no repo to run `git worktree remove` in, and
+                    // guessing one would aim a destructive verb from a
+                    // derivation nothing verified. The workspace form still
+                    // reaches it, because a workspace remembers its repo.
+                    ApiFailure::new(
+                        "not_git_worktree",
+                        "path is not a readable Git work tree; kill it through its workspace",
+                    )
+                })?;
+                if !space.is_linked_worktree {
+                    return Err(ApiFailure::new(
+                        "not_linked_worktree",
+                        "path is the repo's main checkout, not a linked worktree",
+                    ));
+                }
+                Ok(KillTarget {
+                    workspace_idx: None,
+                    repo_root: crate::worktree::main_root_from_common_dir(Path::new(&space.key)),
+                    checkout: space.repo_root,
+                })
+            }
+        }
     }
 
     fn resolve_worktree_source(
@@ -1188,6 +1301,7 @@ impl App {
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
         let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
         let open_idx = self.open_workspace_idx_for_checkout(&canonical_path);
+        let branch_for_age = entry.branch.clone();
         WorktreeInfo {
             path: entry.path.display().to_string(),
             branch: entry.branch,
@@ -1204,6 +1318,84 @@ impl App {
                 .and_then(|idx| self.state.workspaces.get(idx))
                 .and_then(|ws| ws.pr_state())
                 .map(crate::api::schema::PrInfo::from_state),
+            last_commit_at: crate::worktree::last_commit_unix_time(
+                &repo_root,
+                &canonical_path,
+                branch_for_age.as_deref(),
+            ),
+            // Resolved only when the caller asked to scan (#396): a verdict
+            // costs a `gh pr view` per row, and absence must read as "not
+            // scanned" rather than as "not merged".
+            kill_verdict: None,
+        }
+    }
+
+    /// Order the list so prune candidates surface: the repo's own checkout,
+    /// then linked checkouts oldest work first (#396).
+    ///
+    /// Shares [`crate::worktree::stale_first_cmp`] with the TUI's worktree
+    /// picker. Two orderings would mean "which of these is stale" had two
+    /// answers depending on which surface you asked.
+    fn sort_worktrees_stale_first(&self, source: &WorktreeSource, worktrees: &mut [WorktreeInfo]) {
+        let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
+        worktrees.sort_by(|left, right| {
+            let key = |info: &WorktreeInfo| {
+                let path = crate::worktree::canonical_or_original(Path::new(&info.path));
+                (path == repo_root, info.last_commit_at, info.path.clone())
+            };
+            let (left_main, left_age, left_path) = key(left);
+            let (right_main, right_age, right_path) = key(right);
+            crate::worktree::stale_first_cmp(
+                &crate::worktree::StaleSortKey {
+                    is_main: left_main,
+                    last_commit_at: left_age,
+                    path: Path::new(&left_path),
+                },
+                &crate::worktree::StaleSortKey {
+                    is_main: right_main,
+                    last_commit_at: right_age,
+                    path: Path::new(&right_path),
+                },
+            )
+        });
+    }
+
+    /// Fill in each row's `kill_verdict` through the SAME resolver
+    /// `worktree.kill` runs (#396).
+    ///
+    /// Bare and main-checkout rows are skipped: neither is a kill target, and
+    /// asking the gate about the default branch costs a `gh` round trip to
+    /// learn what #121 already refuses. Every remaining row is resolved
+    /// concurrently under one shared deadline, so a fleet of twenty checkouts
+    /// costs what one does.
+    fn scan_worktree_kill_verdicts(&self, source: &WorktreeSource, worktrees: &mut [WorktreeInfo]) {
+        let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
+        let targets: Vec<usize> = worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| info.is_linked_worktree && !info.is_bare)
+            .map(|(index, _)| index)
+            .collect();
+        let jobs: Vec<(PathBuf, PathBuf)> = targets
+            .iter()
+            .map(|index| {
+                (
+                    repo_root.clone(),
+                    crate::worktree::canonical_or_original(Path::new(&worktrees[*index].path)),
+                )
+            })
+            .collect();
+        let verdicts = crate::worktree::resolve_kill_verdicts_bounded(
+            &jobs,
+            &self.state.config.worktrees.protected_branches,
+        );
+        for (index, (verdict, timed_out)) in targets.into_iter().zip(verdicts) {
+            worktrees[index].kill_verdict = Some(crate::api::schema::KillVerdictInfo {
+                verdict: verdict.verdict_name().to_string(),
+                evidence: verdict.evidence().map(str::to_string),
+                protected: verdict.protected,
+                timed_out,
+            });
         }
     }
 
@@ -1215,6 +1407,7 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let membership = ws.worktree_space_here()?;
         let branch = crate::workspace::git_branch(&membership.checkout_path);
+        let branch_for_age = branch.clone();
         let is_detached = branch.is_none();
         Some(WorktreeInfo {
             path: membership.checkout_path.display().to_string(),
@@ -1226,6 +1419,12 @@ impl App {
             open_workspace_id: Some(self.public_workspace_id(ws_idx)),
             label: source.repo_name.clone(),
             pr: ws.pr_state().map(crate::api::schema::PrInfo::from_state),
+            last_commit_at: crate::worktree::last_commit_unix_time(
+                &membership.repo_root,
+                &membership.checkout_path,
+                branch_for_age.as_deref(),
+            ),
+            kill_verdict: None,
         })
     }
 
@@ -1817,6 +2016,297 @@ mod tests {
         let _ = std::fs::remove_dir_all(repo);
     }
 
+    /// Commit `file` in `checkout` with an explicit COMMITTER date, so a test
+    /// can build a fleet with a known age spread.
+    ///
+    /// `--date` sets only the author date; the list reads `%ct`, the committer
+    /// date, which is the one that moves when work is rebased or amended —
+    /// i.e. the one that answers "when was this checkout last worked on".
+    fn commit_dated(checkout: &Path, file: &str, date: &str) {
+        std::fs::write(checkout.join(file), "work\n").unwrap();
+        run_git(checkout, &["add", file]);
+        let status = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(checkout)
+            .args([
+                "-c",
+                "user.email=flock@example.invalid",
+                "-c",
+                "user.name=Flock Test",
+                "commit",
+                "--quiet",
+                "--date",
+                date,
+                "-m",
+                "dated work",
+            ])
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_COMMITTER_NAME", "Flock Test")
+            .env("GIT_COMMITTER_EMAIL", "flock@example.invalid")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "dated commit failed in {}",
+            checkout.display()
+        );
+    }
+
+    #[test]
+    fn api_worktree_list_dates_each_row_and_orders_stale_first() {
+        // #396: `worktree.list` said what existed and nothing about what was
+        // old, so twenty checkouts were unordered noise and deciding what to
+        // prune meant leaving flock.
+        let repo = create_committed_repo("api-worktree-list-stale-repo");
+        let old = unique_temp_path("api-worktree-list-stale-old");
+        let recent = unique_temp_path("api-worktree-list-stale-recent");
+        for (path, branch) in [(&old, "worktree/old"), (&recent, "worktree/recent")] {
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+        }
+        commit_dated(&old, "old.txt", "2001-02-03T04:05:06+00:00");
+        commit_dated(&recent, "recent.txt", "2021-02-03T04:05:06+00:00");
+
+        let mut app = app_with_parent(&repo);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                cwd: None,
+                scan: false,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeList { worktrees, .. } = success.result else {
+            panic!("expected worktree_list response");
+        };
+
+        assert_eq!(
+            worktrees
+                .iter()
+                .map(|entry| entry.branch.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![
+                // The repo's own checkout first — never a prune candidate.
+                crate::worktree::detect_default_branch(&repo).expect("default branch"),
+                "worktree/old".to_string(),
+                "worktree/recent".to_string(),
+            ],
+            "prune candidates surface, oldest work first"
+        );
+        let dated = worktrees
+            .iter()
+            .find(|entry| entry.branch.as_deref() == Some("worktree/old"))
+            .unwrap();
+        assert_eq!(
+            dated.last_commit_at,
+            Some(981_173_106),
+            "the row carries the branch's last commit, not the directory's mtime"
+        );
+        assert!(
+            worktrees.iter().all(|entry| entry.kill_verdict.is_none()),
+            "a plain list must not pay for the gate, and must not imply a verdict"
+        );
+
+        for checkout in [&old, &recent] {
+            let remove = crate::worktree::build_worktree_remove_command(&repo, checkout, true);
+            crate::worktree::run_worktree_command(&remove).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn api_worktree_list_scan_reports_what_the_kill_would_decide() {
+        // The anti-drift assertion for #396. The list's verdict and the kill's
+        // verdict are the same resolver, so a squash-merged branch — the case
+        // that made three landed checkouts look like work at risk for five
+        // weeks — reads `merged` in BOTH, on the same evidence string.
+        let repo = create_committed_repo("api-worktree-scan-repo");
+        let checkout = unique_temp_path("api-worktree-scan-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/landed",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        commit_dated(&checkout, "landed.txt", "2021-02-03T04:05:06+00:00");
+        run_git(&repo, &["merge", "--squash", "worktree/landed"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "landed work (#1)"]);
+
+        let mut app = app_with_parent(&repo);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                cwd: None,
+                scan: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeList { worktrees, .. } = success.result else {
+            panic!("expected worktree_list response");
+        };
+        let scanned = worktrees
+            .iter()
+            .find(|entry| entry.branch.as_deref() == Some("worktree/landed"))
+            .unwrap()
+            .kill_verdict
+            .clone()
+            .expect("a scanned row carries a verdict");
+        assert_eq!(scanned.verdict, "merged");
+        assert!(!scanned.protected);
+        assert!(!scanned.timed_out);
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: None,
+                path: Some(checkout.display().to_string()),
+                dry_run: true,
+                ..WorktreeKillParams::default()
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            merged, evidence, ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed response");
+        };
+        assert!(merged, "the kill agrees the branch is safe to delete");
+        assert_eq!(
+            evidence, scanned.evidence,
+            "one gate, so the list and the kill cite the same evidence"
+        );
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_kill_by_path_reaches_a_checkout_nobody_has_open() {
+        // The prune candidates are exactly the checkouts no workspace holds,
+        // and `worktree.kill` could only be addressed by workspace id — so the
+        // rows the verdict marks safe were reachable by no flock verb, and got
+        // removed with raw `git worktree remove` instead. That is the mistake
+        // that produced #360.
+        let repo = create_committed_repo("api-worktree-kill-path-repo");
+        let checkout = unique_temp_path("api-worktree-kill-path-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/landed-by-path",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        commit_dated(&checkout, "landed.txt", "2021-02-03T04:05:06+00:00");
+        run_git(&repo, &["merge", "--squash", "worktree/landed-by-path"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "landed work (#2)"]);
+
+        let mut app = app_with_parent(&repo);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: None,
+                path: Some(checkout.display().to_string()),
+                ..WorktreeKillParams::default()
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            workspace_id,
+            removed,
+            merged,
+            branch_deleted,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed response, got {response}");
+        };
+        assert!(merged);
+        assert!(removed);
+        assert!(branch_deleted, "the gate's evidence permits the delete");
+        assert!(
+            workspace_id.is_none(),
+            "no workspace held this checkout, so none is reported closed"
+        );
+        assert!(!checkout.exists());
+        assert!(!branch_exists(&repo, "worktree/landed-by-path"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn api_worktree_kill_refuses_a_path_that_is_the_main_checkout() {
+        // `--path` must not become a way to point the destructive verb at the
+        // repo itself; the workspace form has always refused that (#197).
+        let repo = create_committed_repo("api-worktree-kill-path-main-repo");
+        let mut app = app_with_parent(&repo);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: None,
+                path: Some(repo.display().to_string()),
+                ..WorktreeKillParams::default()
+            }),
+        });
+        assert!(
+            response.contains("not_linked_worktree"),
+            "expected a refusal, got {response}"
+        );
+        assert!(repo.exists());
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn api_worktree_kill_needs_exactly_one_address() {
+        let repo = create_committed_repo("api-worktree-kill-address-repo");
+        let mut app = app_with_parent(&repo);
+        for params in [
+            WorktreeKillParams::default(),
+            WorktreeKillParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                path: Some(repo.display().to_string()),
+                ..WorktreeKillParams::default()
+            },
+        ] {
+            let response = app.handle_api_request(Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeKill(params),
+            });
+            assert!(
+                response.contains("invalid_request"),
+                "expected a refusal, got {response}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
     #[test]
     fn api_worktree_list_reports_open_workspace_ids() {
         let repo = create_committed_repo("api-worktree-list-repo");
@@ -1844,6 +2334,7 @@ mod tests {
             method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 cwd: None,
+                scan: false,
             }),
         });
 
@@ -1894,10 +2385,12 @@ mod tests {
             crate::api::schema::Method::WorktreeList(WorktreeListParams {
                 workspace_id: Some(child_id),
                 cwd: None,
+                scan: false,
             }),
             crate::api::schema::Method::WorktreeList(WorktreeListParams {
                 workspace_id: None,
                 cwd: Some(checkout.display().to_string()),
+                scan: false,
             }),
         ] {
             let response = app.handle_api_request(Request {
@@ -1951,6 +2444,7 @@ mod tests {
             method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 cwd: None,
+                scan: false,
             }),
         });
 
@@ -2140,7 +2634,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: true,
                 keep_branch: false,
                 dry_run: false,
@@ -2178,7 +2673,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: false,
                 keep_branch: false,
                 dry_run: false,
@@ -2222,7 +2718,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: false,
                 keep_branch: false,
                 dry_run: true,
@@ -2281,7 +2778,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: false,
                 keep_branch: false,
                 dry_run: true,
@@ -2324,7 +2822,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: false,
                 keep_branch: false,
                 dry_run: true,
@@ -2396,7 +2895,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: ws_id,
+                workspace_id: Some(ws_id),
+                path: None,
                 force: true,
                 keep_branch: false,
                 dry_run: true,
