@@ -535,6 +535,7 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
     let mut dry_run = false;
     let mut force = false;
     let mut keep_branch = false;
+    let mut keep_procs = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -567,6 +568,12 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
                 keep_branch = true;
                 index += 1;
             }
+            // #400: the processes left in the checkout are reported either
+            // way. This asks flock to report and stop, rather than end them.
+            "--keep-procs" => {
+                keep_procs = true;
+                index += 1;
+            }
             "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
@@ -577,7 +584,7 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 
     if workspace_id.is_some() == path.is_some() {
         eprintln!(
-            "usage: flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--json]"
+            "usage: flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
         );
         return Ok(2);
     }
@@ -594,6 +601,12 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
             force,
             keep_branch,
             dry_run,
+            keep_processes: keep_procs,
+            // So the sweep can tell this command — and the shell it was typed
+            // into — apart from the orphans it is there to end (#400). Both
+            // have their own cwd in the checkout when a kill is run from
+            // inside it.
+            caller_pid: Some(std::process::id()),
         }),
     })?;
 
@@ -610,6 +623,10 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 
     let result = response.pointer("/result").cloned().unwrap_or_default();
     println!("{result}");
+    // #400: stdout is JSON a script pipes away, so the process sweep also says
+    // its piece on stderr. A kill that leaves spinners behind used to mention
+    // them nowhere at all.
+    eprint_process_sweep(&result, dry_run);
     let merged = result
         .get("merged")
         .and_then(|v| v.as_bool())
@@ -619,6 +636,67 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         return Ok(if merged { 0 } else { 3 });
     }
     Ok(0)
+}
+
+/// How many pids one line names before it stops counting. The measured case
+/// was 48 orphans; printing all of them is a wall, printing none is the bug.
+const MAX_LISTED_PROCESSES: usize = 12;
+
+/// Render `[{"pid":123,"name":"zsh"}, …]` as `123 zsh, 124 claude (+3 more)`.
+fn describe_processes(value: Option<&serde_json::Value>) -> Option<(usize, String)> {
+    let entries = value?.as_array()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut described: Vec<String> = entries
+        .iter()
+        .take(MAX_LISTED_PROCESSES)
+        .map(|entry| {
+            let pid = entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            match entry.get("name").and_then(|v| v.as_str()) {
+                Some(name) => format!("{pid} {name}"),
+                None => pid.to_string(),
+            }
+        })
+        .collect();
+    if entries.len() > described.len() {
+        let rest = entries.len() - described.len();
+        described.push(format!("+{rest} more"));
+    }
+    Some((entries.len(), described.join(", ")))
+}
+
+/// Say on stderr what the sweep found and what it did (#400).
+fn eprint_process_sweep(result: &serde_json::Value, dry_run: bool) {
+    if dry_run {
+        if let Some((count, listed)) = describe_processes(result.get("processes")) {
+            eprintln!(
+                "worktree kill: {count} process(es) are running in this checkout; a real kill ends whatever outlives the teardown: {listed}"
+            );
+        }
+        return;
+    }
+
+    let Some((count, listed)) = describe_processes(result.get("orphans")) else {
+        return;
+    };
+    if result
+        .get("orphans_signaled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "worktree kill: ended {count} process(es) left in the removed checkout: {listed}"
+        );
+    } else {
+        eprintln!(
+            "worktree kill: {count} process(es) are still running in the removed checkout and were left alone (--keep-procs): {listed}"
+        );
+    }
+
+    if let Some((count, listed)) = describe_processes(result.get("orphans_surviving")) {
+        eprintln!("worktree kill: {count} process(es) outlived SIGKILL: {listed}");
+    }
 }
 
 fn print_worktree_help() {
@@ -632,7 +710,7 @@ fn print_worktree_help() {
     );
     eprintln!("  flk worktree remove --workspace ID [--force] [--json]");
     eprintln!(
-        "  flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--json]"
+        "  flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
     );
     eprintln!("  flk worktree quarantine-list");
     eprintln!("  flk worktree unquarantine <quarantined-path> <destination>");

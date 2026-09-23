@@ -636,6 +636,16 @@ pub struct WorktreeKillParams {
     /// Resolve and report the plan without touching anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Report the processes left standing in the removed checkout without
+    /// signalling them (#400). They are always reported; this decides only
+    /// whether flock ends them.
+    #[serde(default)]
+    pub keep_processes: bool,
+    /// The pid that asked for this kill, so the sweep never signals the
+    /// caller or the shell it was typed into — both of which have their own
+    /// cwd inside the checkout when a kill is run from in there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1862,6 +1872,24 @@ pub enum ResponseResult {
         would_delete_branch: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch_delete_error: Option<String>,
+        /// Processes whose working directory was inside the checkout when the
+        /// kill began — the workspace's own pane shells included, since a
+        /// live worktree always has some. A dry run reports these and stops.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        processes: Vec<WorktreeProcessInfo>,
+        /// The ones still alive after the checkout was removed and the
+        /// workspace torn down: orphans by construction, since their working
+        /// directory no longer exists (#400).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        orphans: Vec<WorktreeProcessInfo>,
+        /// Whether flock signalled `orphans` (false for a dry run, and when
+        /// `keep_processes` asked for the report alone).
+        #[serde(default)]
+        orphans_signaled: bool,
+        /// Orphans that outlived `SIGTERM` and then `SIGKILL`. Always empty
+        /// when nothing was signalled.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        orphans_surviving: Vec<WorktreeProcessInfo>,
     },
     TabInfo {
         tab: TabInfo,
@@ -2087,6 +2115,19 @@ pub struct WorktreeSourceInfo {
     pub source_checkout_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace_id: Option<String>,
+}
+
+/// One process found standing in a worktree checkout (#400).
+///
+/// `name` is the short command name — `ps`'s `COMM`. It is what makes a pid
+/// list readable, and it is also how flock re-identifies the process after the
+/// removal: a pid freed mid-teardown can be recycled, and signalling the new
+/// owner is exactly the mistake the sweep exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeProcessInfo {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

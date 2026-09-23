@@ -92,14 +92,54 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
-fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
+/// `(comm, ppid, pgrp)` from `/proc/<pid>/stat`.
+///
+/// The comm field is parenthesised and may itself contain spaces or a closing
+/// paren, so the split point is the LAST `)`, never the first whitespace. The
+/// numeric fields are counted from after it: state, ppid, pgrp.
+fn process_stat(pid: u32) -> Option<(String, i32, i32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = stat.rfind(')')?;
     let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
     let rest = stat.get(close + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
+    let ppid: i32 = fields.get(1)?.parse().ok()?;
     let pgrp: i32 = fields.get(2)?.parse().ok()?;
+    Some((comm, ppid, pgrp))
+}
+
+fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
+    let (comm, _ppid, pgrp) = process_stat(pid)?;
     Some((pgrp, comm))
+}
+
+/// The short command name, as `ps` prints it under `COMM`.
+pub fn process_name(pid: u32) -> Option<String> {
+    process_stat(pid).map(|(comm, _, _)| comm)
+}
+
+/// The parent process id, or `None` once the process is gone.
+pub fn process_parent_id(pid: u32) -> Option<u32> {
+    let (_, ppid, _) = process_stat(pid)?;
+    u32::try_from(ppid).ok()
+}
+
+/// Every live process id, from the numeric entries under `/proc`.
+pub fn all_process_ids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(pid) = name.parse::<u32>() {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 fn process_argv(pid: u32) -> Option<Vec<String>> {
@@ -129,24 +169,10 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         return Vec::new();
     };
 
-    let mut pids = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
-            continue;
-        };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if process_session_id(pid) == Some(session_id) {
-            pids.push(pid);
-        }
-    }
-    pids
+    all_process_ids()
+        .into_iter()
+        .filter(|pid| process_session_id(*pid) == Some(session_id))
+        .collect()
 }
 
 pub fn signal_processes(pids: &[u32], signal: Signal) {

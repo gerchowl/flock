@@ -1630,12 +1630,21 @@ impl App {
         let workspace_id = remove.workspace_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
+            // #400: taken before git unlinks the directory, because after it
+            // does there is no cwd left to match against. The workspace's own
+            // pane shells are in here too — nothing is decided until the
+            // teardown has had its chance to end them.
+            let standing = crate::worktree::processes::processes_in_checkout(
+                &path,
+                &crate::worktree::processes::protected_pids(None),
+            );
             let result = crate::worktree::run_worktree_command(&command);
             let _ =
                 event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(WorktreeRemoveResult {
                     workspace_id,
                     path,
                     result,
+                    standing,
                 }));
         });
     }
@@ -1811,6 +1820,38 @@ impl App {
             }
         }
     }
+    /// End whatever outlived the checkout, and say how many (#400).
+    ///
+    /// The pane teardown has already run, so every process still standing here
+    /// is one it could not reach — a `setsid` child is out of its process
+    /// group by design — and its working directory is now a path that does not
+    /// exist. Nothing in that tree is still worth doing.
+    ///
+    /// Signalling happens off the main loop: `SIGTERM`, a grace period and
+    /// `SIGKILL` take up to two seconds, and the TUI must not stop redrawing
+    /// for them. The count is known immediately, which is what the notice
+    /// needs.
+    fn sweep_orphaned_checkout_processes(
+        &mut self,
+        standing: &[crate::worktree::processes::CheckoutProcess],
+    ) {
+        let orphans = crate::worktree::processes::survivors_after_teardown(standing);
+        if orphans.is_empty() {
+            return;
+        }
+        self.show_action_notice(format!(
+            "ended {} process(es) left in the removed checkout",
+            orphans.len()
+        ));
+        std::thread::spawn(move || {
+            let surviving = crate::worktree::processes::terminate(&orphans);
+            if !surviving.is_empty() {
+                let pids = crate::worktree::processes::pid_list(&surviving);
+                tracing::warn!(pids, "worktree remove: processes outlived SIGKILL");
+            }
+        });
+    }
+
     pub(crate) fn handle_worktree_remove_finished(&mut self, result: WorktreeRemoveResult) {
         let Some(remove) = &mut self.state.worktree_remove else {
             return;
@@ -1886,6 +1927,7 @@ impl App {
                         self.state.close_selected_workspace();
                     }
                 }
+                self.sweep_orphaned_checkout_processes(&result.standing);
                 self.state.mode = if self.state.active.is_some() {
                     Mode::Terminal
                 } else {
@@ -2381,6 +2423,7 @@ mod tests {
                 "fatal: '/w/flock/dirty' contains modified or untracked files, use --force to delete it"
                     .into(),
             ),
+            standing: Vec::new(),
         });
 
         let remove = app.state.worktree_remove.unwrap();
@@ -2418,6 +2461,7 @@ mod tests {
             workspace_id: "ws".into(),
             path,
             result: Err("fatal: '/w/flock/missing' is not a working tree".into()),
+            standing: Vec::new(),
         });
 
         let remove = app.state.worktree_remove.unwrap();
@@ -4185,6 +4229,7 @@ mod tests {
             workspace_id: "ws".into(),
             path: checkout.clone(),
             result: Ok(()),
+            standing: Vec::new(),
         });
 
         // Branch deletion runs on a worker thread; poll for it.
@@ -4242,6 +4287,7 @@ mod tests {
             workspace_id: "ws".into(),
             path: std::path::PathBuf::from("/tmp/x"),
             result: Ok(()),
+            standing: Vec::new(),
         });
 
         std::thread::sleep(std::time::Duration::from_millis(200));
