@@ -826,13 +826,25 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         return Vec::new();
     }
 
-    all_pids()
+    all_process_ids()
         .into_iter()
         .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == target_session)
         .collect()
 }
 
-fn all_pids() -> Vec<u32> {
+/// The short command name, as `ps` prints it under `COMM`.
+pub fn process_name(pid: u32) -> Option<String> {
+    comm_from_bsdinfo(&process_bsdinfo(pid)?)
+}
+
+/// The parent process id, or `None` once the process is gone.
+pub fn process_parent_id(pid: u32) -> Option<u32> {
+    Some(process_bsdinfo(pid)?.pbi_ppid)
+}
+
+/// Every live process id. Darwin has no `/proc`, so this is `proc_listallpids`
+/// — the same question `/proc`'s numeric entries answer on Linux.
+pub fn all_process_ids() -> Vec<u32> {
     let initial_count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let mut capacity = if initial_count > 0 {
         initial_count as usize + 128
