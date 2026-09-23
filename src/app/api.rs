@@ -404,7 +404,13 @@ impl App {
                         // (origin's reading plus however long it has sat here),
                         // not the capture-time reading, so a hub that has gone
                         // quiet cannot keep winning against one still polling.
-                        let materialised = crate::peers::relayed_entry_from_wire(entry);
+                        // #392: a row whose ssh_target or proxy_jump this host
+                        // refuses to dial is dropped and logged, and the rest of
+                        // the snapshot still merges.
+                        let Some(materialised) = crate::peers::relayed_entry_from_wire(entry)
+                        else {
+                            continue;
+                        };
                         let challenger_age = materialised.peer.carried_age_secs();
                         let insert = match self.state.relayed_fleet_cache.get(&host_key) {
                             Some(existing) => {

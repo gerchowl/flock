@@ -8,6 +8,25 @@
 - Decision owner: operator. Design consolidated from two independent
   fresh-context reviews (capability-boundary and wire-contract) run on the
   #329 proposal, both of which refused that proposal as filed.
+- Amendment (2026-09-08): §3's allowlist stands, and so does its inversion —
+  `env_clear()` plus an explicit set, decided here and shipped in #383. What
+  changes with #397 is who writes one half of the table. The keys whose
+  absence changes WHICH ACCOUNT the child runs as are now DECLARED BY THE
+  FLEET in `[spawn.env]` (`crate::config::SpawnEnvConfig`), keyed by agent
+  name and merged over a compiled default, so a fleet whose agents find their
+  credentials differently no longer waits for a flock release to say so. That
+  declaration feeds the carry (`spawn::env`) and the allowlist
+  (`spawn::allowlist`) from ONE table, so a variable cannot be resolved from
+  the requester and then cleared by the scrub. Two things stay flock's: the
+  scrub itself, which is the security property rather than the policy; and the
+  refusal, since a declared key that is absent still produces
+  `agent_profile_unresolved` rather than a child that starts on the default
+  profile. The credential-shaped keys §3 lists (`ANTHROPIC_*`) stay compiled
+  in for a reason worth stating — the declared list carries a refusal, and a
+  missing `ANTHROPIC_API_KEY` must not refuse a spawn. Different semantics,
+  different table. The `AgentKind` enum stays closed; a config key names an
+  agent flock already detects and an unknown one is a diagnostic, not a parse
+  error.
 
 ## Context
 

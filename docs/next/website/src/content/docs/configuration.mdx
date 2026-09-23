@@ -577,6 +577,37 @@ issue is untrusted input.
 
 Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
 
+## Spawn environment
+
+The `[spawn.env]` section declares **which environment variables each agent CLI needs carried into a child flock launches for an agent** (#397). It is keyed by the agent name flock detects, and each value is a list of exact variable names.
+
+```toml
+[spawn.env]
+claude = ["CLAUDE_CONFIG_DIR"]   # the shipped default
+# codex = ["CODEX_HOME"]         # a fleet whose Codex installs need their own key
+# claude = []                    # a fleet that pins one account per host
+```
+
+An agent-initiated spawn execs its child from argv with no shell in between — that is what keeps a hostile prompt inert — and the cost of that property is that the child never runs shell init. Anything a login shell would have exported is therefore missing, and for a variable that selects *which account a CLI runs as* the result is worse than a clean failure: the child falls back to the CLI's own default home, starts, looks healthy in the pane, bills the wrong account, and writes its history somewhere nobody is watching. `CLAUDE_CONFIG_DIR` is the case flock ships a default for, because on a fleet that picks a profile with a shell function it is shell-session state rather than process-tree state — an interactive pane inherits it, an argv-spawned pane does not.
+
+Three things are worth knowing before you write an entry.
+
+**A declaration replaces the compiled default for that agent; it does not extend it.** Writing `claude = ["MY_PROFILE_VAR"]` means the child carries that variable and *not* `CLAUDE_CONFIG_DIR`. This is what lets a fleet that needs nothing carried write `claude = []` and mean it — a table that could only grow would make the default permanent. Declaring one agent leaves every other agent on its default, so `codex = [...]` alone does not un-declare `claude`.
+
+**The same table feeds both halves of the child's environment.** A declared key is carried down from the requesting process *and* allowlisted through the `env_clear()` scrub that agent-spawned children start from. Because there is one declaration rather than two lists, a variable cannot be resolved by one half and then cleared by the other.
+
+**A declared key that cannot be resolved refuses the spawn.** If flock cannot read the requester's environment, or the value names a directory that is not there, the spawn stops with `agent_profile_unresolved` instead of starting a child on the default profile. That refusal is the point of declaring a key, so the bar for an entry is narrow: variables whose absence silently changes *which account* the child runs as — not everything the child might find useful. A variable that is simply unset on the requester is not an error; it means the requester is on the CLI's own default and so is the child.
+
+Credential variables an agent CLI reads directly (`ANTHROPIC_API_KEY` and its siblings) are **not** configured here and stay on flock's built-in allowlist. They carry no refusal: a missing API key means this deployment does not use one, not that the spawn should stop.
+
+Entries are validated at startup. An agent name this flock does not detect, a wildcard such as `ANTHROPIC_*` (only exact names are matched), and a name containing `=` or whitespace are each reported as a config diagnostic and skipped — never a parse failure, so one config shared across a fleet does not cost a node running an older flock the rest of its table.
+
+There is no `FLOCK_SPAWN_ENV_*` environment override. This section is file-only by design: which variables cross into a child's environment is not a decision a per-invocation env poke should be able to rewrite.
+
+:::caution
+`config.local.toml` merges over `config.toml` with **arrays appended**. An empty list in the overlay therefore cannot clear a list the base file set — write the removal in the file that declared it. Replacement applies to the compiled default; between the two file layers, lists add.
+:::
+
 ## Environment variables
 
 | Variable | Purpose |

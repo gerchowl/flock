@@ -121,10 +121,29 @@ Use `flk agent ...` commands when you want a terminal to be treated as an agent 
 Spawn an agent into Flock from a script:
 
 ```bash
-flk agent start reviewer --cwd ~/project --split right -- pi
+flk agent start reviewer --cwd ~/project -- pi
 ```
 
-You can place that agent in a specific workspace or tab:
+`--cwd` decides **where the agent lives as well as where its process starts**. If
+`~/project` is a checkout Flock already has open, the agent joins that space as a
+new tab rather than getting a space of its own. If nothing matches — an unopened
+checkout, a plain directory, a path that is not there — it gets its own space, as
+before. Either way the agent is the only pane of a tab nobody else is in.
+
+Under `tab_mode = "workspace"`, where a "tab" is a sibling workspace, the agent
+gets a sibling space grouped with the matched one instead of an inner tab.
+
+`--split` follows the same rule. With a `--cwd` that matches an open checkout it
+splits **that** workspace; with no `--cwd` it splits whatever is focused, which
+is the "put this beside what I am looking at" gesture:
+
+```bash
+flk agent start reviewer --split right -- pi     # beside what you are looking at
+flk agent start reviewer --cwd ~/project --split right -- pi   # beside ~/project
+```
+
+Naming a placement explicitly always wins over the `--cwd` default, and starts
+the agent in that target's checkout:
 
 ```bash
 flk agent start docs --workspace 1 --tab 1-1 -- claude

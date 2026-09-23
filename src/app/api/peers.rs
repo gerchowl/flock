@@ -991,7 +991,8 @@ mod tests {
                 origin_last_ok_secs: Some(4),
                 proxy_jump: Some("anvil".into()),
                 icon: None,
-            }),
+            })
+            .expect("fixture destination is a valid ssh target"),
         );
 
         let prepared = app
@@ -1044,7 +1045,8 @@ mod tests {
                 origin_last_ok_secs: Some(3),
                 proxy_jump: Some("anvil".into()),
                 icon: None,
-            }),
+            })
+            .expect("fixture destination is a valid ssh target"),
         );
 
         let entries = app.own_relayed_fleet();

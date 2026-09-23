@@ -3176,6 +3176,28 @@ pub(crate) fn peer_stream_fallback(peer: &str, err: &str) {
     );
 }
 
+/// A gossiped fleet row carried an ssh destination or `ProxyJump` this host
+/// refuses to hand OpenSSH (#392), so the row was dropped.
+///
+/// WARN, and it names `sender` — the hub the row arrived from — as well as the
+/// row and the value: a drop that logged neither would make a host silently
+/// vanish from the band with no way to tell a hostile peer from a typo'd
+/// `[[peers]]` entry two hops away. The drop is per-ROW on purpose; the rest of
+/// the snapshot still lands, so one bad row cannot cost the fleet its others.
+pub(crate) fn peer_relay_entry_rejected(sender: &str, peer: &str, field: &str, value: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.relay.entry_rejected",
+        subsystem = "peers",
+        outcome = "rejected",
+        sender,
+        peer,
+        field,
+        value,
+        "dropping gossiped peer with an invalid ssh destination"
+    );
+}
+
 /// The relay accepted a connection from a hub. Marks the far end of a held
 /// connection as actually running — without it, "the hub sees nothing" cannot
 /// be told apart from "the relay never started".
