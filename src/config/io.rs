@@ -533,6 +533,18 @@ fn validate_peers(
             ));
             return false;
         }
+        // #392: the destination is pushed straight into ssh's argv, where a
+        // leading `-` makes it an OPTION rather than a host. Validate the
+        // EFFECTIVE target rather than the `ssh` field, because an unset `ssh`
+        // falls back to the name and the name would then reach argv unchecked.
+        let target = peer.ssh_target();
+        if !crate::remote::is_valid_ssh_destination(target) {
+            diagnostics.push(format!(
+                "invalid [[peers]] ssh destination \"{target}\" for \"{}\"; entry ignored",
+                peer.name
+            ));
+            return false;
+        }
         true
     });
 }
@@ -936,6 +948,78 @@ ssh = "anvil-dev"
         assert_eq!(loaded.diagnostics.len(), 2);
         assert!(loaded.diagnostics[0].contains("missing name"));
         assert!(loaded.diagnostics[1].contains("duplicate"));
+    }
+
+    #[test]
+    fn load_live_config_drops_peers_whose_ssh_destination_could_become_an_ssh_option() {
+        // #392: the destination is pushed into ssh's argv, so a value starting
+        // with `-` is an OPTION and `-oProxyCommand=` is local command
+        // execution. Nothing here reaches a shell, so this is argv-position
+        // confusion rather than injection, and the answer is refusal.
+        let loaded = load_live_config_from_str(
+            r#"
+[[peers]]
+name = "sneaky"
+ssh = "-oProxyCommand=id"
+
+[[peers]]
+name = "spaced"
+ssh = "host with spaces"
+
+[[peers]]
+name = "-oProxyCommand=id"
+
+[[peers]]
+name = "anvil"
+"#,
+        )
+        .unwrap();
+
+        // Only the well-formed entry survives; the name-fallback entry is
+        // caught too, because an unset `ssh` makes the NAME the destination.
+        let targets: Vec<&str> = loaded
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.ssh_target())
+            .collect();
+        assert_eq!(targets, vec!["anvil"]);
+        assert_eq!(loaded.diagnostics.len(), 3, "{:?}", loaded.diagnostics);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .all(|d| d.contains("invalid [[peers]] ssh destination")),
+            "each drop must name itself: {:?}",
+            loaded.diagnostics
+        );
+        assert!(
+            loaded.diagnostics.iter().any(|d| d.contains("sneaky")),
+            "the diagnostic must name the peer: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_live_config_keeps_ipv6_and_port_bearing_peer_destinations() {
+        // The #392 charset is written from what real destinations need, not
+        // from the happy case: a bracketed IPv6 literal and a `user@host:port`
+        // must still dial.
+        let loaded = load_live_config_from_str(
+            r#"
+[[peers]]
+name = "loop"
+ssh = "lars@[fe80::1]:2222"
+
+[[peers]]
+name = "ported"
+ssh = "lars@anvil.tail22bd7c.ts.net:22"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.peers.len(), 2, "{:?}", loaded.diagnostics);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
     #[test]
