@@ -2013,17 +2013,72 @@ fn write_keepalive_ssh_config() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Is `value` safe to hand OpenSSH as a dial destination?
+///
+/// The rule that carries the weight is the leading `-`. OpenSSH parses a
+/// destination beginning with `-` as an OPTION, and `-oProxyCommand=...` is an
+/// arbitrary LOCAL command run by whoever spawned ssh. Nothing on this path
+/// goes through a shell, so quoting would change nothing and would leave the
+/// next reader with the wrong model of the danger; and OpenSSH does not
+/// document `--` as an end-of-options marker for the destination, so argv
+/// position cannot be relied on either. Rejecting is the fix: a destination
+/// that needs escaping is not a destination.
+///
+/// The charset is drawn from what real destinations need, not from the happy
+/// case — `user@host`, a `:port` suffix, and bracketed IPv6 literals
+/// (`[::1]`, `lars@[fe80::1]:22`) all pass. Whitespace, `=`, `,` and every
+/// shell metacharacter do not.
+///
+/// Both ends of the trust boundary use this: `[[peers]]` at config load
+/// (`crate::config`) and the gossiped fleet snapshot at ingest
+/// (`crate::peers::relayed_entry_from_wire`). The wire path is the one an
+/// attacker influences, so validating only the config path would look like a
+/// fix without being one.
+pub(crate) fn is_valid_ssh_destination(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') {
+        return false;
+    }
+    value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@' | ':' | '[' | ']')
+    })
+}
+
+/// Is `chain` safe to hand OpenSSH as a `ProxyJump` value?
+///
+/// `ProxyJump` takes a COMMA-SEPARATED CHAIN of hops, and ssh dials every one
+/// of them, so each hop is a destination in its own right and is validated as
+/// one. Checking the chain as a single string would reject every legitimate
+/// multi-hop route. An empty chain is rejected here; callers encode "no jump"
+/// as `None` or an empty string and never reach this.
+pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
+    !chain.is_empty() && chain.split(',').all(is_valid_ssh_destination)
+}
+
 /// Assemble the argv (minus the `ssh` program itself) the bridge dial will
 /// execute. Split out so unit tests can assert the presence and ordering of
 /// `-o ProxyJump=<hub>` for a snapshot-derived launch (#101 part 3) without
 /// spawning a real SSH child.
+///
+/// Refuses a destination or a `ProxyJump` that fails
+/// [`is_valid_ssh_destination`] (#392). Both values are already validated at
+/// the two entry points that mint them — config load and gossip ingest — so
+/// this check is defence in depth, and it is the one that does not depend on
+/// enumerating the sources correctly. The warm-slot target list already reaches
+/// here by a third route (a fleet snapshot handed down the attach leg), and
+/// this is the last gate before any of them becomes argv.
 fn bridge_dial_argv(
     target: &str,
     remote_flock: &RemoteFlock,
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
     proxy_jump: Option<&str>,
-) -> Vec<String> {
+) -> io::Result<Vec<String>> {
+    if !is_valid_ssh_destination(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to dial an invalid ssh destination: {target:?}"),
+        ));
+    }
     let mut argv: Vec<String> = Vec::new();
     if let Some(ssh_config) = keepalive_ssh_config {
         argv.push("-F".to_string());
@@ -2034,6 +2089,12 @@ fn bridge_dial_argv(
     // directly. `-o ProxyJump=<hub>` sits BEFORE the noninteractive-opts pack
     // so the two form one cohesive OpenSSH option run.
     if let Some(jump) = proxy_jump.filter(|value| !value.is_empty()) {
+        if !is_valid_ssh_proxy_jump(jump) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to dial through an invalid ssh proxy jump: {jump:?}"),
+            ));
+        }
         argv.push("-o".to_string());
         argv.push(format!("ProxyJump={jump}"));
     }
@@ -2043,7 +2104,7 @@ fn bridge_dial_argv(
     }
     argv.push(target.to_string());
     argv.push(remote_bridge_command(remote_flock, session_name));
-    argv
+    Ok(argv)
 }
 
 fn bridge_connection(
@@ -2063,7 +2124,7 @@ fn bridge_connection(
         session_name,
         keepalive_ssh_config,
         proxy_jump,
-    );
+    )?;
     for arg in &argv {
         command.arg(arg);
     }
@@ -2283,7 +2344,8 @@ mod tests {
         });
         let session = crate::session::DEFAULT_SESSION_NAME;
 
-        let with_jump = bridge_dial_argv("lars@spoke2", &remote_flock, session, None, Some("hub"));
+        let with_jump = bridge_dial_argv("lars@spoke2", &remote_flock, session, None, Some("hub"))
+            .expect("a well-formed target and jump build an argv");
         assert!(
             with_jump.contains(&"-o".to_string()),
             "argv must include the -o flag: {with_jump:?}"
@@ -2307,17 +2369,82 @@ mod tests {
             "ProxyJump must precede the target: {with_jump:?}"
         );
 
-        let without = bridge_dial_argv("lars@sage", &remote_flock, session, None, None);
+        let without = bridge_dial_argv("lars@sage", &remote_flock, session, None, None)
+            .expect("a well-formed target builds an argv");
         assert!(
             !without.iter().any(|arg| arg.starts_with("ProxyJump=")),
             "no proxy_jump = no ProxyJump argv: {without:?}"
         );
         // Empty-string proxy_jump = None semantically; must not add `-o ProxyJump=`.
-        let empty = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(""));
+        let empty = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(""))
+            .expect("an empty jump is `no jump`, not an invalid one");
         assert!(
             !empty.iter().any(|arg| arg.starts_with("ProxyJump")),
             "empty proxy_jump must not emit ProxyJump: {empty:?}"
         );
+    }
+
+    #[test]
+    fn bridge_dial_argv_refuses_a_destination_that_openssh_would_read_as_an_option() {
+        // #392, defence in depth. Both entry points — `[[peers]]` at config
+        // load and the gossiped snapshot at ingest — already validate, so
+        // reaching here means a third source appeared; this is the gate that
+        // keeps such a source from silently reopening the hole.
+        //
+        // The danger is argv POSITION, not quoting: `TracedCommand` is
+        // execve-shaped and no shell ever sees these strings, so escaping
+        // would change nothing. OpenSSH simply parses a leading `-` as an
+        // option, and `-oProxyCommand=...` runs a local command.
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let session = crate::session::DEFAULT_SESSION_NAME;
+
+        for target in [
+            "-oProxyCommand=id",
+            "-tt",
+            "lars@sage -oProxyCommand=id",
+            "",
+        ] {
+            let err = bridge_dial_argv(target, &remote_flock, session, None, None)
+                .expect_err("an invalid destination must not build an argv");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "target {target:?}");
+        }
+
+        // The same for the second wire-controlled value, including one bad hop
+        // in an otherwise fine chain.
+        for jump in ["-oProxyCommand=id", "hub,-oProxyCommand=id", "hub,,anvil"] {
+            let err = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(jump))
+                .expect_err("an invalid proxy jump must not build an argv");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "jump {jump:?}");
+        }
+    }
+
+    #[test]
+    fn bridge_dial_argv_still_dials_ipv6_literals_and_ported_destinations() {
+        // A too-strict rule would break working fleets, so the charset is
+        // written from what destinations actually need (#392 pitfall 2).
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let session = crate::session::DEFAULT_SESSION_NAME;
+
+        for target in [
+            "[::1]",
+            "lars@[fe80::1]:2222",
+            "lars@anvil.tail22bd7c.ts.net:22",
+            "anvil-dev",
+        ] {
+            let argv = bridge_dial_argv(target, &remote_flock, session, None, Some("hub,anvil"))
+                .unwrap_or_else(|err| panic!("{target} is a legitimate destination: {err}"));
+            assert!(
+                argv.contains(&target.to_string()),
+                "target must reach the argv: {argv:?}"
+            );
+            assert!(argv.contains(&"ProxyJump=hub,anvil".to_string()));
+        }
     }
 
     #[test]
