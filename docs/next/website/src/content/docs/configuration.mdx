@@ -577,6 +577,19 @@ issue is untrusted input.
 
 Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
 
+## Agent messages
+
+The `[msg]` section governs agent-to-agent messages arriving at this node.
+
+```toml
+[msg]
+enabled = true            # accept agent messages at all
+allow_from = ["*"]        # hosts whose agents may message this node's agents
+blocking_per_hour = 6     # `blocking` messages one sender may send per rolling hour
+```
+
+`blocking` is the top message tier (ADR-0018): on top of what `needs_reply` does, it puts the recipient in the operator's attention cycle and, when the recipient has muted itself, files an operator notification. Because the sender declares it, every sender would like to use it, so it carries a budget of its own on top of the general 20 messages a minute. Past the budget a `blocking` message is not refused: it is delivered as `needs_reply` — still read, still waking its recipient — and the send result's `warnings` say it was downgraded. `0` downgrades every `blocking` message. The budget is counted on the receiving node, per agent that node attested itself; every unattested sender, which includes every message relayed from another host, shares one bucket, since their identities are claims. That is safe because spending the budget only ever downgrades.
+
 ## Spawn environment
 
 The `[spawn.env]` section declares **which environment variables each agent CLI needs carried into a child flock launches for an agent** (#397). It is keyed by the agent name flock detects, and each value is a list of exact variable names.
@@ -623,6 +636,34 @@ deferral_relay_concurrency = 4   # mute deferrals to other hosts in flight at on
 `enabled` and `allow_from` are enforced by the receiver, which is the only party that cannot be bypassed. A node with `enabled = false` still sends. `allow_from` is open by default because a flock fleet is already one trust domain. Narrow it with host names, for example `allow_from = ["mba22"]`.
 
 A mute answers (`flock_msg_mute`, `flk msg mute`). Every `needs_reply` sender it defers gets one automatic reply with the mute's `reason` and the time it lifts. `mute_reason_max_chars` bounds that reason: a longer one is truncated, never refused, so a mute cannot fail over its own explanation. A deferral to a sender on another host is an ssh hop, and one mute over a full inbox can owe many of them. `deferral_relay_concurrency` caps how many run at once, and the rest wait their turn.
+## Waking idle agents
+
+An agent that has already stopped cannot be told about new mail by its own stop hook — the hook only fires at the end of a turn. So when a message that wants an answer (any intent but `fyi`) is queued for an **idle Claude pane**, flock types one fixed sentence into that pane and presses Enter (ADR-0018):
+
+```text
+You have N unread message(s) from other agents. Read them with the `flock_msg_read` tool.
+```
+
+The count is the only thing that varies. The sender's name, the subject and the body never appear in it — the agent still reads the message itself through the tool. The keys live in the `[msg]` section:
+
+```toml
+[msg]
+idle_wake = true                     # the kill switch
+idle_wake_settle_ms = 2000           # idle this long, continuously, before flock types
+idle_wake_operator_quiet_ms = 15000  # no input from you in the pane for this long
+idle_wake_fresh_ms = 2500            # the screen must have shown the idle prompt this recently
+```
+
+Flock types only when **all** of the following hold, and checks them again at the moment it types:
+
+- The agent has been idle for the settle window, and that is current. The screen must be showing Claude's idle prompt and have been read recently. A pane whose screen cannot be read is not treated as idle, and neither is a hook report that has gone quiet.
+- Nobody typed into the pane within the quiet window. Keystrokes from an attached client, pastes, and `agent.send` / `pane.send-text` / `pane.send-keys` calls all count, but flock's own wake sentence does not. If you type in the moment between the sentence and its Enter, the Enter is not sent, and the sentence stays in the prompt for you to keep or delete. Flock does not try to erase it, and it types nothing more into that pane until the agent reads its inbox or starts working.
+- The fleet is not paused and the recipient has not muted itself with `msg.mute`. These are the same checks that apply to the stop hook's wake.
+- Claude's input box on screen is empty. A draft you left there is never typed next to or submitted, however long ago you typed it.
+- The agent is Claude. Other agents do not have the inbox tool the sentence names, so they are never typed into and find their mail at their next turn boundary.
+- Flock has not already typed a wake for these messages. It types once per batch of mail. Once the agent reads its inbox or starts working, a *new* message can wake it again. Mail it was already told about is re-announced by the stop hook at the end of its next turn, not by more typing.
+
+Which messages have already been announced is held in memory, so after a server restart any still-unread mail can earn one more wake. Set `idle_wake = false` to turn it off. Agents then find mail only at a turn boundary, as before. Each wake is logged as `msg.idle_wake.fired` at INFO, and each Enter that was held back as `msg.idle_wake.abandoned`. Suppressions are logged at DEBUG, once per change of reason.
 
 ## Environment variables
 

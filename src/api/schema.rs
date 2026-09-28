@@ -127,6 +127,14 @@ pub enum Method {
     MsgRead(MsgReadParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
+    /// #410: a spoke's held relay collecting the messages this server hands up
+    /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
+    #[serde(rename = "msg.uplink_take")]
+    MsgUplinkTake(MsgUplinkTakeParams),
+    /// #410: the hub's answer to a message a spoke handed up, sent back down
+    /// the same relay.
+    #[serde(rename = "msg.uplink_result")]
+    MsgUplinkResult(MsgUplinkResultParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
     #[serde(rename = "msg.mute")]
@@ -860,12 +868,15 @@ pub struct LineageNode {
 /// sent so far had its "answer me" in the last line of a ~2.5k-character body,
 /// where a recipient reading the envelope cannot see it at all.
 ///
-/// Two values on purpose. #316's third `blocking` tier is escalation
-/// machinery — a wake decision, an attention-surface entry, a cost on the
-/// sender — and is deferred there. This enum says what the sender WANTS, not
-/// how hard flock should knock, and nothing in the wake path reads it: the
-/// wake still carries a count and a tool name (ADR-0008). A tier can be added
-/// later without moving what is here.
+/// Three tiers (ADR-0018 §1). The intent says what the sender WANTS; flock
+/// decides how hard to knock from it, and no sender text ever reaches the
+/// wake (ADR-0008) — the wake still carries a count and a tool name.
+///
+/// | intent | turn-boundary nudge | attention surface | operator escalation |
+/// | --- | --- | --- | --- |
+/// | `fyi` | no | no | no |
+/// | `needs_reply` | yes | no | no |
+/// | `blocking` | yes | yes | when the recipient is muted |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MsgIntent {
@@ -875,6 +886,11 @@ pub enum MsgIntent {
     Fyi,
     /// The sender is owed a reply.
     NeedsReply,
+    /// The sender cannot proceed until the recipient answers. Everything
+    /// `needs_reply` does, plus an attention-surface entry of its own and an
+    /// operator escalation when the recipient is muted — so it costs the
+    /// sender a tighter rate limit (`[msg] blocking_per_hour`).
+    Blocking,
 }
 
 impl MsgIntent {
@@ -886,6 +902,34 @@ impl MsgIntent {
         match self {
             Self::Fyi => "fyi",
             Self::NeedsReply => "needs_reply",
+            Self::Blocking => "blocking",
+        }
+    }
+
+    /// Every tier, in escalating order. The MCP schema's enum and the tests
+    /// that pin it iterate this, so a tier added here cannot be missing from
+    /// the tool surface without a test saying so (#320's drift lesson).
+    pub const ALL: [Self; 3] = [Self::Fyi, Self::NeedsReply, Self::Blocking];
+
+    /// Whether a queued message of this intent may wake its recipient
+    /// (ADR-0018 §1). `fyi` never costs the recipient a turn: it is read the
+    /// next time the inbox is read for any reason. Every wake decision asks
+    /// this one question, so the tiers cannot disagree about what wakes.
+    #[must_use]
+    pub fn wakes(self) -> bool {
+        !matches!(self, Self::Fyi)
+    }
+
+    /// Parse a spelling that arrived over the cross-host relay, where the
+    /// sender may run a newer build than this one (ADR-0018 §1). An unknown
+    /// tier is read as `needs_reply`: version skew fails toward the recipient
+    /// hearing about it, never toward silence. The flag is true when that
+    /// degradation happened, so the caller can log it.
+    #[must_use]
+    pub fn from_wire_relayed(value: &str) -> (Self, bool) {
+        match Self::from_wire(value) {
+            Some(intent) => (intent, false),
+            None => (Self::NeedsReply, true),
         }
     }
 
@@ -897,6 +941,7 @@ impl MsgIntent {
         match value.trim() {
             "fyi" => Some(Self::Fyi),
             "needs_reply" | "needs-reply" => Some(Self::NeedsReply),
+            "blocking" => Some(Self::Blocking),
             _ => None,
         }
     }
@@ -961,6 +1006,51 @@ pub struct MsgSendParams {
     /// receiver had to guess, and guessed its own host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_host: Option<String>,
+    /// The spelling a relay carried when this build did not recognise it
+    /// (ADR-0018 §1). The receiving CLI has already read it as `needs_reply`;
+    /// this travels on so the SERVER — the process with a log — records the
+    /// skew, instead of the note dying on the stderr of an ssh-invoked CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_unrecognised: Option<String>,
+}
+
+/// One message a spoke hands up to its hub (#410).
+///
+/// A spoke has no `[[peers]]` — deliberately, the fleet refuses N×N trust —
+/// so the only channel it has to the rest of the fleet is the relay the hub
+/// holds INTO it. The frame rides that relay upward as a push, the hub runs
+/// its ordinary `msg.send` on `message`, and the answer comes back down keyed
+/// by `uplink_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UplinkFrame {
+    /// Correlates the hub's answer with the send waiting for it. The message's
+    /// own `correlation_id` is the idempotency key end to end; this one only
+    /// pairs a result with its caller.
+    pub uplink_id: String,
+    /// The send as the spoke attested it: `from_agent` and `from_host` are the
+    /// ORIGINATING sender, never the hub.
+    pub message: MsgSendParams,
+}
+
+/// `msg.uplink_take` — the relay collecting frames to push up (#410).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgUplinkTakeParams {
+    /// Frames the relay has already written up the pipe. Until a frame is
+    /// acknowledged it is re-offered, so a relay that died between taking a
+    /// frame and writing it does not lose the message; the recipient's mailbox
+    /// dedupes on `correlation_id`, so a re-offer cannot double-deliver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ack: Vec<String>,
+}
+
+/// `msg.uplink_result` — the hub's answer to one handed-up frame (#410).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MsgUplinkResultParams {
+    pub uplink_id: String,
+    /// The hub's own name for itself: what the spoke reports as `via <hub>`.
+    pub hub: String,
+    /// The hub's `msg.send` response, verbatim: a success or an error body.
+    pub response: serde_json::Value,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,
@@ -1955,10 +2045,26 @@ pub enum ResponseResult {
     },
     MsgQueued {
         correlation_id: String,
-        /// "queued" | "duplicate"
+        /// "queued" | "duplicate" | "relayed"
         state: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
+        /// Host the message was handed to, when it left this server (#410).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_host: Option<String>,
+        /// How it left (#410): `direct` when this server dialled the
+        /// recipient's host itself, `via <hub>` when it went up a hub's relay.
+        /// Absent for a message queued here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// #410: the frames a spoke's relay should push up to its hub.
+    MsgUplinkFrames {
+        frames: Vec<UplinkFrame>,
+    },
+    /// #410: whether an uplink result matched a send still waiting for it.
+    MsgUplinkResultAck {
+        matched: bool,
     },
     MsgList {
         messages: Vec<QueuedMessageInfo>,
@@ -1978,6 +2084,9 @@ pub enum ResponseResult {
         to_host: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
+        /// `direct` or `via <hub>` (#410), for a message that left this server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -2657,6 +2766,17 @@ pub enum EventData {
         /// reproduce or debug the hop.
         route: String,
         relayed_at_ms: u64,
+        /// The relayed message's tier (ADR-0018 §1). Kept so an answer
+        /// arriving back from that host can be recognised as one, and woken
+        /// for, after the question itself has left this server. Defaulted so
+        /// an older log reads back as `fyi`.
+        #[serde(default)]
+        intent: MsgIntent,
+        /// The hub the message was handed UP to, when this server had no edge
+        /// of its own to the recipient's host (#410). `route` then names that
+        /// hub too; this field is what says the hop was not direct.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
     },
     /// A muted recipient answered one message with an automatic `fyi`
     /// deferral (ADR-0018 §3).

@@ -20,7 +20,7 @@ enum ResolvedTarget {
 
 use super::responses::{encode_error, encode_error_with_data, encode_success};
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -80,7 +80,7 @@ fn deferral_body(muted_until_ms: u64, reason: Option<&str>) -> String {
     )
 }
 
-fn mint_correlation_id() -> String {
+pub(super) fn mint_correlation_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -90,6 +90,65 @@ fn mint_correlation_id() -> String {
     )
 }
 
+/// Whose `blocking` budget a message spends (ADR-0018 §1): an identity this
+/// server attested from process ancestry, and nothing a caller asserted.
+///
+/// An attested agent is keyed by its id, one attested only as a pane by that
+/// pane. EVERY unattested sender — each relayed message, each socket client
+/// outside a pane — shares one bucket, because on that path both `from_agent`
+/// and `from_host` are claims: keying on them let a caller mint fresh budget
+/// per invented name, or name a real agent and spend its budget for it. One
+/// shared bucket is safe because a spent budget downgrades rather than
+/// refuses ([`App::apply_blocking_budget`]), so nobody can be silenced by
+/// someone else exhausting it. The key space is therefore bounded by the
+/// panes on this server, plus one.
+fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
+    match (attested_agent, from_pane) {
+        (Some(agent), _) => agent.to_string(),
+        (None, Some(pane)) => format!("pane/{pane}"),
+        (None, None) => UNATTESTED_BLOCKING_BUCKET.to_string(),
+    }
+}
+
+/// The one budget every unattested `blocking` sender shares.
+const UNATTESTED_BLOCKING_BUCKET: &str = "unattested";
+
+/// Send-result warnings naming why a `blocking` message went in as
+/// `needs_reply`.
+const BLOCKING_BUDGET_SPENT: &str = "blocking_budget_spent_sent_as_needs_reply";
+const BLOCKING_DISABLED: &str = "blocking_disabled_sent_as_needs_reply";
+
+/// The escalation text: who is blocked, on whom, and how many times over.
+fn escalation_body(sender: &str, recipient: &str, count: usize) -> String {
+    format!(
+        "{count} blocking message{} from {sender} to pane {recipient}, which has muted its \
+         wakes — decide who yields",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// The sender host a relay stamps on a message it hands on.
+///
+/// This host, unless the message is one a spoke handed up and this hub's
+/// uplink path vouched for its edge (#410) — then that edge's configured name,
+/// so the hub does not become the apparent sender (pitfall 1, #213). An
+/// unattested socket caller's own `from_host` is never believed here, or any
+/// process on this machine could make a peer see a message "from" a host it
+/// never came from.
+pub(super) fn relay_sender_host(attested_locally: bool, vouched: Option<&str>) -> String {
+    match vouched {
+        Some(vouched) if !attested_locally => vouched.to_string(),
+        _ => crate::app::short_host_name(),
+    }
+}
+
+/// Why a wake may not fire, whichever channel asked.
+pub(crate) struct WakeSuppression {
+    pub reason: &'static str,
+    /// When the mute lifts, for a `muted` suppression.
+    pub muted_until_ms: Option<u64>,
+}
+
 /// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Messages are queued per
 /// recipient pane and delivered at the recipient's next settled turn
 /// boundary — never mid-turn (§8.3). Sender identity is stamped from API
@@ -97,9 +156,49 @@ fn mint_correlation_id() -> String {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
+        self.send_message(id, params, None)
+    }
+
+    /// `msg.send`, with `vouched` naming the spoke edge when — and only when —
+    /// this is the hub delivering a frame that spoke handed up (#410). Passed
+    /// as an argument, never read from params or left in shared state, so no
+    /// wire caller can claim it and no early return can leak it.
+    pub(super) fn send_message(
+        &mut self,
+        id: String,
+        params: MsgSendParams,
+        vouched: Option<&str>,
+    ) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
+        }
+        // An asserted sender is an identity or it is nothing (ADR-0018 §1).
+        // Both fields reach operator surfaces — the attention label, the
+        // escalation notification — so a claim that is not shaped like an
+        // id is refused here rather than rendered there. Every relay builds
+        // these from server-minted values, so only a hand-made request fails.
+        if let Some(agent) = params
+            .from_agent
+            .as_deref()
+            .filter(|agent| !crate::terminal::AgentId::is_well_formed(agent))
+        {
+            return encode_error(
+                id,
+                "invalid_request",
+                format!("from_agent {agent:?} is not an agent id"),
+            );
+        }
+        if let Some(host) = params
+            .from_host
+            .as_deref()
+            .filter(|host| !crate::app::mailboxes::is_host_name(host))
+        {
+            return encode_error(
+                id,
+                "invalid_request",
+                format!("from_host {host:?} is not a host name"),
+            );
         }
 
         // Resolved to another host: hand the message to the server that owns
@@ -107,12 +206,14 @@ impl App {
         // implementation, wherever the sender was.
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            Err((code, message)) => return encode_error(id, code, message),
+            Err((code, message)) => {
+                return self.hand_up_or_refuse(id, &params.to, &body, &params, code, message)
+            }
         };
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
             ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params)
+                return self.relay_message_to_host(id, &location, &body, params, vouched)
             }
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -182,6 +283,9 @@ impl App {
 
         let now = now_ms();
         let sender_key = from_pane.clone().unwrap_or_else(|| "unknown".into());
+        let blocking_key = blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref());
+        let (applied_intent, downgrade) =
+            self.apply_blocking_budget(params.intent, &blocking_key, now);
         if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
             return encode_error(
                 id,
@@ -195,8 +299,19 @@ impl App {
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
         let mut warnings = Vec::new();
+        warnings.extend(downgrade.map(str::to_string));
         if from_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
+        }
+        // ADR-0018 §1: the receiving CLI already read an unknown relayed tier
+        // as `needs_reply`. Recorded here because this is the process with a
+        // log; the relay's own stderr is thrown away on success.
+        if let Some(raw) = &params.intent_unrecognised {
+            crate::logging::msg_intent_unrecognised(
+                raw,
+                params.from_host.as_deref().unwrap_or("unknown"),
+            );
+            warnings.push("intent_unrecognised_read_as_needs_reply".to_string());
         }
         let message = PendingMessage {
             correlation_id: correlation_id.clone(),
@@ -210,10 +325,10 @@ impl App {
             in_reply_to: params.in_reply_to,
             enqueued_at_ms: now,
             delivery_attempts: 0,
-            intent: params.intent,
+            intent: applied_intent,
         };
 
-        self.queue_message(id, message, warnings)
+        self.queue_message_tiered(id, message, warnings, &blocking_key)
     }
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
@@ -274,7 +389,22 @@ impl App {
         };
         let reply_resolved = match self.resolve_message_target(&reply_target) {
             Ok(resolved) => resolved,
-            Err((code, message)) => return encode_error(id, code, message),
+            // #410: a reply whose original sender this server cannot place —
+            // a spoke answering a message that came down from its hub — goes
+            // back UP the same way, and the hub places it.
+            Err((code, message)) => {
+                let as_send = MsgSendParams {
+                    from_agent: None,
+                    from_host: None,
+                    to: reply_target.clone(),
+                    body: body.clone(),
+                    correlation_id: params.reply_correlation_id.clone(),
+                    in_reply_to: Some(params.correlation_id.clone()),
+                    intent: params.intent,
+                    intent_unrecognised: None,
+                };
+                return self.hand_up_or_refuse(id, &reply_target, &body, &as_send, code, message);
+            }
         };
         let (to_ws_idx, to_pane_id) = match reply_resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
@@ -293,7 +423,9 @@ impl App {
                         correlation_id: params.reply_correlation_id.clone(),
                         in_reply_to: Some(params.correlation_id.clone()),
                         intent: params.intent,
+                        intent_unrecognised: None,
                     },
+                    None,
                 );
             }
         };
@@ -316,6 +448,9 @@ impl App {
 
         let now = now_ms();
         let sender_key = from_pane.clone().unwrap_or_else(|| "unknown".into());
+        let blocking_key = blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref());
+        let (applied_intent, downgrade) =
+            self.apply_blocking_budget(params.intent, &blocking_key, now);
         if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
             return encode_error(
                 id,
@@ -329,6 +464,7 @@ impl App {
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
         let mut warnings = Vec::new();
+        warnings.extend(downgrade.map(str::to_string));
         if from_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
@@ -344,12 +480,12 @@ impl App {
             in_reply_to: Some(params.correlation_id.clone()),
             enqueued_at_ms: now,
             delivery_attempts: 0,
-            intent: params.intent,
+            intent: applied_intent,
         };
         // Telemetry only records a reply the mailbox actually accepted: a
         // full mailbox or a duplicate must not bump round_trips or leave a
         // MessageReplied with no matching queued/delivered pair.
-        let response = self.queue_message(id, message, warnings);
+        let response = self.queue_message_tiered(id, message, warnings, &blocking_key);
         if response.contains("\"state\":\"queued\"") {
             let round_trips = self.mailboxes.bump_round_trips(&root);
             self.emit_event(EventEnvelope {
@@ -408,6 +544,7 @@ impl App {
                         outcome_known: true,
                         to_host: None,
                         route: None,
+                        path: None,
                         detail: Some("waiting in a local inbox, not yet read".into()),
                     });
                 }
@@ -415,8 +552,20 @@ impl App {
                     correlation_id,
                     to_host,
                     route,
+                    via,
                     ..
                 } if *correlation_id == params.correlation_id => {
+                    // #410: say whether the hop was ours or a hub's.
+                    let (path, how) = match via {
+                        Some(hub) => (
+                            format!("via {hub}"),
+                            format!("handed up to {hub}, which delivered it to {to_host}"),
+                        ),
+                        None => (
+                            "direct".to_string(),
+                            format!("handed to {to_host} via [[peers]] {route}"),
+                        ),
+                    };
                     found = Some(ResponseResult::MsgStatus {
                         correlation_id: params.correlation_id.clone(),
                         state: "relayed".into(),
@@ -425,9 +574,9 @@ impl App {
                         outcome_known: false,
                         to_host: Some(to_host.clone()),
                         route: Some(route.clone()),
+                        path: Some(path),
                         detail: Some(format!(
-                            "handed to {to_host} via [[peers]] {route}; whether it was read is \
-                             recorded there, not here"
+                            "{how}; whether it was read is recorded there, not here"
                         )),
                     });
                 }
@@ -443,6 +592,7 @@ impl App {
                         outcome_known: true,
                         to_host: None,
                         route: None,
+                        path: None,
                         detail: Some(outcome.clone()),
                     });
                 }
@@ -515,6 +665,40 @@ impl App {
             Err(refusal) => return refusal,
         };
 
+        if let Some(suppression) = self.wake_suppression(&pane, now_ms()) {
+            return encode_success(
+                id,
+                ResponseResult::MsgWake {
+                    count: 0,
+                    suppressed: Some(suppression.reason.into()),
+                    muted_until_ms: suppression.muted_until_ms,
+                },
+            );
+        }
+
+        // ADR-0018 §1: the wake reads intent. Only a message that wakes can
+        // start a nudge, but once one does, the count names the `fyi` mail
+        // too, so the read it prompts clears the inbox rather than leaving the
+        // notices for a turn that may never come.
+        let count = self.mailboxes.wake_count(&pane);
+        let suppressed =
+            (count == 0 && self.mailboxes.queued_len(&pane) > 0).then(|| "fyi_only".to_string());
+        encode_success(
+            id,
+            ResponseResult::MsgWake {
+                count,
+                suppressed,
+                muted_until_ms: None,
+            },
+        )
+    }
+
+    /// Whether flock may interrupt `pane`'s agent about its mail at all — the
+    /// ONE decision behind both wake channels: the stop hook's turn-boundary
+    /// nudge (`msg.wake`) and the typed idle wake (ADR-0018 §2). Two copies of
+    /// these gates would be two chances for a paused fleet or a muted agent to
+    /// be interrupted anyway.
+    pub(crate) fn wake_suppression(&mut self, pane: &str, now: u64) -> Option<WakeSuppression> {
         // US-9 (#175 S3 commit 3). Pause halts what FLOCK initiates and
         // exempts human agency on purpose — an operator can still type into a
         // paused pane. A wake is neither: it is flock interrupting an agent
@@ -526,36 +710,17 @@ impl App {
         // replaced it inherited no gate. A paused fleet went on returning
         // `decision: block` to every agent at every turn boundary.
         if self.fleet_pause.paused {
-            return encode_success(
-                id,
-                ResponseResult::MsgWake {
-                    count: 0,
-                    suppressed: Some("fleet_paused".into()),
-                    muted_until_ms: None,
-                },
-            );
-        }
-
-        let now = now_ms();
-        if let Some(until) = self.mailboxes.muted_until(&pane, now) {
-            return encode_success(
-                id,
-                ResponseResult::MsgWake {
-                    count: 0,
-                    suppressed: Some("muted".into()),
-                    muted_until_ms: Some(until),
-                },
-            );
-        }
-
-        encode_success(
-            id,
-            ResponseResult::MsgWake {
-                count: self.mailboxes.queued_len(&pane),
-                suppressed: None,
+            return Some(WakeSuppression {
+                reason: "fleet_paused",
                 muted_until_ms: None,
-            },
-        )
+            });
+        }
+        self.mailboxes
+            .muted_until(pane, now)
+            .map(|until| WakeSuppression {
+                reason: "muted",
+                muted_until_ms: Some(until),
+            })
     }
 
     /// `msg.mute` — a recipient declining to be woken for a bounded window.
@@ -584,6 +749,9 @@ impl App {
         let muted_until_ms =
             self.mailboxes
                 .set_mute(&pane, params.seconds, now_ms(), reason.clone());
+        // ADR-0018 §4: blocking mail already waiting when the mute lands is the
+        // same disagreement as blocking mail arriving during one.
+        self.escalate_muted_blocking(&pane);
         let mut deferred = 0;
         if muted_until_ms != 0 {
             for message in self.mailboxes.owed_deferrals(&pane) {
@@ -647,7 +815,7 @@ impl App {
                     .get(&ws.pane_state(resolved.pane_id)?.attached_terminal_id)?;
                 Some(terminal.agent_id.to_string())
             });
-        let deferral_correlation_id = format!("{}:deferred", message.correlation_id);
+        let deferral_correlation_id = crate::app::mailboxes::deferral_id(&message.correlation_id);
         let body = deferral_body(muted_until_ms, reason.as_deref());
 
         let resolved = match self.resolve_message_target(&target) {
@@ -764,7 +932,10 @@ impl App {
                     Some(&relay.correlation_id),
                     MsgIntent::Fyi,
                 )
-                .map_err(|failure| failure.message(&relay.to_host));
+                .map_err(|failure| {
+                    let reason = crate::peers::SshFailureReason::classify(failure.detail());
+                    failure.hop_message(&from_host, &relay.to_host, reason)
+                });
                 let _ = event_tx.blocking_send(crate::events::AppEvent::MsgDeferralRelayed(
                     crate::events::MsgDeferralRelay { result, ..relay },
                 ));
@@ -801,6 +972,8 @@ impl App {
                 to_host: relay.to_host,
                 route: relay.route.clone(),
                 relayed_at_ms: now_ms(),
+                intent: MsgIntent::Fyi,
+                via: None,
             },
         });
         self.emit_message_deferred(
@@ -883,6 +1056,8 @@ impl App {
             });
         }
         messages.sort_by_key(|message| message.enqueued_at_ms);
+        self.sync_blocking_mail();
+        self.idle_wake_on_read(&pane);
         encode_success(id, ResponseResult::MsgRead { messages })
     }
 
@@ -898,32 +1073,57 @@ impl App {
         location: &crate::app::directory::AgentLocation,
         body: &str,
         params: MsgSendParams,
+        vouched: Option<&str>,
     ) -> String {
         let host = location.host.as_str();
         let to_agent = location.agent_id.as_str();
         let Some(peer) = self.peer_for_location(location) else {
-            return encode_error(
+            // #410: no edge of our own. A spoke hands the message up the relay
+            // its hub holds — the fix for "not in [[peers]]" is NOT to add the
+            // N×N trust the topology refuses.
+            if let Some(response) = self.try_hand_up(&id, to_agent, body, &params) {
+                return response;
+            }
+            let me = crate::app::short_host_name();
+            return encode_error_with_data(
                 id,
                 "peer_not_configured",
-                format!(
-                    "agent lives on {host}, which is not in this server's [[peers]] — add it to \
-                     reach that agent"
-                ),
+                if params.from_host.is_some() {
+                    format!(
+                        "agent lives on {host}, which {me} has no [[peers]] edge to — and a \
+                         message that already crossed a hub is not handed on again"
+                    )
+                } else {
+                    format!(
+                        "agent lives on {host}, which is not in this server's [[peers]], and no \
+                         hub holds a relay to {me} to hand the message up to"
+                    )
+                },
+                serde_json::json!({ "hop": me, "retryable": false }),
             );
         };
+        // #410 loop guard. A message that arrived from another host is handed
+        // on only over a DIRECT edge, so it crosses at most one hub and cannot
+        // bounce spoke → hub → spoke → hub. Relayed routes are for messages
+        // that start here.
+        if params.from_host.is_some() && !location.direct {
+            let me = crate::app::short_host_name();
+            return encode_error_with_data(
+                id,
+                "forward_limit",
+                format!(
+                    "{me} knows {to_agent} only through {}, and a message that already crossed \
+                     a hub is not forwarded a second time",
+                    peer.name
+                ),
+                serde_json::json!({ "hop": me, "retryable": false }),
+            );
+        }
 
         // The sender is whoever asked, attested locally where possible.
-        let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
-        let from_agent = sender
-            .and_then(|(ws_idx, pane_id)| {
-                let ws = self.state.workspaces.get(ws_idx)?;
-                let terminal = self
-                    .state
-                    .terminals
-                    .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
-                Some(terminal.agent_id.to_string())
-            })
-            .or_else(|| params.from_agent.clone());
+        let attested = self.attested_sender_agent();
+        let from_host = relay_sender_host(attested.is_some(), vouched);
+        let from_agent = attested.or_else(|| params.from_agent.clone());
         let Some(from_agent) = from_agent else {
             return encode_error(
                 id,
@@ -946,7 +1146,7 @@ impl App {
             &peer,
             to_agent,
             &from_agent,
-            &crate::app::short_host_name(),
+            &from_host,
             body,
             &correlation_id,
             in_reply_to,
@@ -968,14 +1168,26 @@ impl App {
                         to_host: host.to_string(),
                         route: peer.name.clone(),
                         relayed_at_ms: now_ms(),
+                        intent: params.intent,
+                        via: (!location.direct).then(|| peer.name.clone()),
                     },
                 });
+                if params.intent.wakes() {
+                    self.mailboxes
+                        .record_relayed_question(correlation_id.clone());
+                }
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
                         correlation_id,
                         state: "relayed".into(),
                         warnings: Vec::new(),
+                        to_host: Some(host.to_string()),
+                        path: Some(if location.direct {
+                            "direct".into()
+                        } else {
+                            format!("via {}", peer.name)
+                        }),
                     },
                 )
             }
@@ -985,16 +1197,25 @@ impl App {
             // a refusal — the same failure that used to arrive as flag text
             // welded to the front of somebody's message body, with a success
             // reported to the sender.
-            Err(failure) => encode_error_with_data(
-                id,
-                failure.code(),
-                failure.message(host),
-                serde_json::json!({
-                    "retryable": failure.retryable(),
-                    "peer": peer.name,
-                    "detail": failure.detail(),
-                }),
-            ),
+            // #410: the failure names the hop that failed — which machine
+            // could not reach which — and why, so a message that crossed a hub
+            // first reports the leg that broke rather than a generic miss.
+            Err(failure) => {
+                let me = crate::app::short_host_name();
+                let reason = crate::peers::SshFailureReason::classify(failure.detail());
+                encode_error_with_data(
+                    id,
+                    failure.code(),
+                    failure.hop_message(&me, host, reason),
+                    serde_json::json!({
+                        "retryable": failure.retryable(),
+                        "peer": peer.name,
+                        "detail": failure.detail(),
+                        "hop": format!("{me} → {host}"),
+                        "reason": reason.as_str(),
+                    }),
+                )
+            }
         }
     }
 
@@ -1023,6 +1244,138 @@ impl App {
             .cloned()
     }
 
+    /// The `blocking` tier's own budget (ADR-0018 §1): the intent the message
+    /// is actually queued with, and the warning that says so when it differs.
+    ///
+    /// Spent — or switched off with `blocking_per_hour = 0` — means the message
+    /// DOWNGRADES to `needs_reply` rather than being refused. `blocking` is a
+    /// courtesy tier: what it adds is the operator's attention, and a sender
+    /// over budget has had its share of that. Refusing instead would let
+    /// whoever exhausts a shared budget silence the senders behind it; the
+    /// downgraded message still wakes its recipient, so nobody loses being
+    /// heard. The slot itself is spent only once the message is queued
+    /// ([`Self::queue_message_tiered`]).
+    pub(super) fn apply_blocking_budget(
+        &mut self,
+        intent: crate::api::schema::MsgIntent,
+        sender_key: &str,
+        now: u64,
+    ) -> (crate::api::schema::MsgIntent, Option<&'static str>) {
+        use crate::api::schema::MsgIntent;
+        if intent != MsgIntent::Blocking {
+            return (intent, None);
+        }
+        let per_hour = self.state.config.msg.blocking_per_hour;
+        if per_hour == 0 {
+            return (MsgIntent::NeedsReply, Some(BLOCKING_DISABLED));
+        }
+        match self
+            .mailboxes
+            .blocking_retry_after(sender_key, now, per_hour)
+        {
+            Ok(()) => (intent, None),
+            Err(_) => (MsgIntent::NeedsReply, Some(BLOCKING_BUDGET_SPENT)),
+        }
+    }
+
+    /// [`Self::queue_message`] plus what a tier costs and triggers once the
+    /// message is actually in the mailbox: the blocking budget is spent, a
+    /// muted recipient's disagreement reaches the operator, and the attention
+    /// surface learns the pane has mail waiting on it.
+    fn queue_message_tiered(
+        &mut self,
+        id: String,
+        message: PendingMessage,
+        warnings: Vec<String>,
+        blocking_key: &str,
+    ) -> String {
+        let blocking = message.intent == crate::api::schema::MsgIntent::Blocking;
+        let to_pane = message.to_pane.clone();
+        let enqueued_at_ms = message.enqueued_at_ms;
+        let response = self.queue_message(id, message, warnings);
+        if blocking && response.contains("\"state\":\"queued\"") {
+            self.mailboxes.record_blocking(blocking_key, enqueued_at_ms);
+            self.escalate_muted_blocking(&to_pane);
+            self.sync_blocking_mail();
+        }
+        response
+    }
+
+    /// ADR-0018 §4: a `blocking` message for a muted recipient is a
+    /// disagreement about urgency, and neither side wins it silently — the
+    /// operator is told. Sender, recipient and count only: the body never
+    /// leaves the inbox (ADR-0008). Once per message.
+    pub(super) fn escalate_muted_blocking(&mut self, pane: &str) {
+        if self.mailboxes.muted_until(pane, now_ms()).is_none() {
+            return;
+        }
+        for (sender, count) in self.mailboxes.take_unescalated_blocking(pane) {
+            let _ = self.handle_notification_show(
+                format!("msg:escalate:{pane}"),
+                crate::api::schema::NotificationShowParams {
+                    title: "blocking message for a muted agent".to_string(),
+                    body: Some(escalation_body(&sender, pane, count)),
+                    position: None,
+                    sound: crate::api::schema::NotificationShowSound::Request,
+                },
+            );
+        }
+    }
+
+    /// Mirror the mailbox's waiting `blocking` mail into UI state, where the
+    /// attention cycle and the agents panel read it.
+    pub(crate) fn sync_blocking_mail(&mut self) {
+        self.state.blocking_mail = self.mailboxes.blocking_mail();
+    }
+
+    /// The fleet-global id of the agent making the current API call, from
+    /// its process ancestry. `None` when the caller is in no pane — an
+    /// operator shell, the relay, a hub forwarding for a spoke.
+    pub(super) fn attested_sender_agent(&mut self) -> Option<String> {
+        let (ws_idx, pane_id) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let terminal = self
+            .state
+            .terminals
+            .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+        Some(terminal.agent_id.to_string())
+    }
+
+    /// A target this server could not place: hand it up to the hub when this
+    /// is a spoke that has one (#410), else refuse — and when the refusal is
+    /// "nowhere in the fleet" on a server with no edges at all, say that the
+    /// fleet it searched was only itself.
+    fn hand_up_or_refuse(
+        &mut self,
+        id: String,
+        target: &MessageTarget,
+        body: &str,
+        params: &MsgSendParams,
+        code: &'static str,
+        message: String,
+    ) -> String {
+        let MessageTarget::Agent { agent } = target else {
+            return encode_error(id, code, message);
+        };
+        if code != "msg_target_not_found" {
+            return encode_error(id, code, message);
+        }
+        if let Some(response) = self.try_hand_up(&id, agent, body, params) {
+            return response;
+        }
+        if self.state.peers.is_empty() && params.from_host.is_none() {
+            return encode_error(
+                id,
+                code,
+                format!(
+                    "{message} — this server has no [[peers]] and no hub holds a relay to it, \
+                     so it could only search itself"
+                ),
+            );
+        }
+        encode_error(id, code, message)
+    }
+
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
     /// answer the caller.
     ///
@@ -1036,6 +1389,7 @@ impl App {
         warnings: Vec<String>,
     ) -> String {
         let correlation_id = message.correlation_id.clone();
+        let to_pane = message.to_pane.clone();
         let event = queued_event(&message);
         let owed = self
             .mailboxes
@@ -1054,12 +1408,15 @@ impl App {
                         self.defer_message(&message, until, reason);
                     }
                 }
+                self.idle_wake_on_enqueue(&to_pane);
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
                         correlation_id,
                         state: "queued".into(),
                         warnings,
+                        to_host: None,
+                        path: None,
                     },
                 )
             }
@@ -1069,6 +1426,8 @@ impl App {
                     correlation_id,
                     state: "duplicate".into(),
                     warnings,
+                    to_host: None,
+                    path: None,
                 },
             ),
             EnqueueOutcome::MailboxFull => encode_error(
@@ -1191,6 +1550,7 @@ impl App {
             return;
         }
         let now = now_ms();
+        let mut dropped_any = false;
         for expired in self.mailboxes.expire(now) {
             self.emit_event(EventEnvelope {
                 event: EventKind::MessageDelivered,
@@ -1202,6 +1562,10 @@ impl App {
                     latency_ms: now.saturating_sub(expired.enqueued_at_ms),
                 },
             });
+            dropped_any = true;
+        }
+        if dropped_any {
+            self.sync_blocking_mail();
         }
     }
 }
@@ -1252,6 +1616,26 @@ mod tests {
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
+            },
+        )
+    }
+
+    /// [`basic_send`] at a tier that wakes: under ADR-0018 an `fyi` never
+    /// does, so a test about the wake has to send something that can.
+    fn waking_send(app: &mut crate::app::App, correlation: &str, body: &str) -> String {
+        let to = pane_target(app, 1);
+        send(
+            app,
+            MsgSendParams {
+                from_agent: None,
+                from_host: None,
+                to: MessageTarget::Pane { pane: to },
+                body: body.into(),
+                correlation_id: Some(correlation.into()),
+                in_reply_to: None,
+                intent: MsgIntent::NeedsReply,
+                intent_unrecognised: None,
             },
         )
     }
@@ -1341,6 +1725,7 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1358,6 +1743,7 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1376,6 +1762,7 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1473,6 +1860,7 @@ mod tests {
                 correlation_id: Some("c-remote".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1502,6 +1890,7 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1536,6 +1925,7 @@ mod tests {
                     correlation_id: Some(cid.into()),
                     in_reply_to: None,
                     intent: MsgIntent::Fyi,
+                    intent_unrecognised: None,
                 }),
             })
         };
@@ -1608,6 +1998,8 @@ mod tests {
                 to_host: "anvil-dev".into(),
                 route: "anvil".into(),
                 relayed_at_ms: 1,
+                intent: MsgIntent::Fyi,
+                via: None,
             },
         });
         let response = app.handle_api_request(Request {
@@ -1683,6 +2075,7 @@ mod tests {
                 correlation_id: Some("c-unreachable".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1739,6 +2132,7 @@ mod tests {
                 correlation_id: Some("c-relayed".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
+                intent_unrecognised: None,
             }),
         });
         assert!(!response.contains("\"error\""), "{response}");
@@ -1897,7 +2291,7 @@ mod tests {
     async fn a_paused_fleet_suppresses_the_wake_but_still_lists() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         let pane = pane_target(&app, 1);
-        basic_send(&mut app, "c-wake-pause", "hi");
+        waking_send(&mut app, "c-wake-pause", "hi");
 
         assert_eq!(
             wake(&mut app, &pane),
@@ -1931,7 +2325,7 @@ mod tests {
     async fn a_muted_pane_is_not_woken_and_keeps_its_mail() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         let pane = pane_target(&app, 1);
-        basic_send(&mut app, "c-mute-1", "before the mute");
+        waking_send(&mut app, "c-mute-1", "before the mute");
 
         let response = app.handle_api_request(Request {
             id: "req".into(),
@@ -1955,7 +2349,7 @@ mod tests {
 
         // Mail keeps arriving while muted — the mute is on the wake, not the
         // delivery.
-        basic_send(&mut app, "c-mute-2", "during the mute");
+        waking_send(&mut app, "c-mute-2", "during the mute");
         assert_eq!(
             queued_count(&mut app),
             2,
@@ -2239,6 +2633,374 @@ mod tests {
         );
     }
 
+    // ---- ADR-0018 tiers (#408) -------------------------------------------
+
+    /// A `msg.send` off the wire, from a named sender, with a given tier.
+    fn tiered_send(
+        app: &mut crate::app::App,
+        to: &str,
+        cid: &str,
+        intent: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": {
+                "to": { "type": "pane", "pane": to },
+                "body": body,
+                "correlation_id": cid,
+                "intent": intent,
+                "from_agent": "agent_reviewer",
+            },
+        })));
+        serde_json::from_str(&response).expect("json response")
+    }
+
+    fn mute(app: &mut crate::app::App, pane: &str, seconds: u64) {
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+                pane: Some(pane.to_string()),
+                seconds,
+                reason: None,
+            }),
+        });
+        assert!(response.contains("\"result\""), "{response}");
+    }
+
+    /// The operator's notification log, as `notification.list` reports it.
+    fn filed_notifications(app: &mut crate::app::App) -> Vec<serde_json::Value> {
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "notification.list",
+            "params": {},
+        })));
+        let value: serde_json::Value = serde_json::from_str(&response).expect("json");
+        value["result"]["notifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn an_fyi_only_inbox_is_not_woken_and_names_why() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        tiered_send(&mut app, &pane, "c-n1", "fyi", "landed");
+        assert_eq!(wake(&mut app, &pane), (0, Some("fyi_only".into())));
+        tiered_send(&mut app, &pane, "c-n2", "blocking", "rebase please");
+        assert_eq!(
+            wake(&mut app, &pane),
+            (2, None),
+            "a waking tier opens the wake, and the notice rides along"
+        );
+        read_inbox(&mut app, &pane);
+        assert_eq!(
+            wake(&mut app, &pane),
+            (0, None),
+            "an empty inbox is not a suppression"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_blocking_budget_downgrades_and_still_delivers() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.blocking_per_hour = 2;
+        let pane = pane_target(&app, 1);
+        for cid in ["c-b1", "c-b2"] {
+            let answer = tiered_send(&mut app, &pane, cid, "blocking", "stuck");
+            assert!(
+                !answer.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+                "{answer}"
+            );
+        }
+        // Over budget: queued, not refused — as `needs_reply`, and it says so.
+        let over = tiered_send(&mut app, &pane, "c-b3", "blocking", "stuck");
+        assert_eq!(over["result"]["state"], "queued", "{over}");
+        assert!(
+            over.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "the sender is told it was downgraded: {over}"
+        );
+        assert_eq!(
+            app.state.blocking_mail.get(&pane).map(|mail| mail.count),
+            Some(2),
+            "a downgraded message earns no attention entry"
+        );
+
+        // A duplicate spends nothing.
+        app.state.config.msg.blocking_per_hour = 3;
+        let duplicate = tiered_send(&mut app, &pane, "c-b1", "blocking", "stuck");
+        assert_eq!(duplicate["result"]["state"], "duplicate", "{duplicate}");
+        let fresh = tiered_send(&mut app, &pane, "c-b5", "blocking", "stuck");
+        assert!(
+            !fresh.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "{fresh}"
+        );
+
+        let inbox = read_inbox(&mut app, &pane);
+        let tiers: Vec<_> = inbox
+            .iter()
+            .map(|message| (message.correlation_id.as_str(), message.intent))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                ("c-b1", MsgIntent::Blocking),
+                ("c-b2", MsgIntent::Blocking),
+                ("c-b3", MsgIntent::NeedsReply),
+                ("c-b5", MsgIntent::Blocking),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_mail_for_a_muted_recipient_reaches_the_operator_once_and_without_its_body() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+
+        // Not muted: no disagreement, nothing for the operator.
+        tiered_send(&mut app, &pane, "c-e0", "blocking", "SECRET BODY zero");
+        assert!(filed_notifications(&mut app).is_empty());
+
+        // Muting with blocking mail already waiting is the same disagreement.
+        mute(&mut app, &pane, 600);
+        let filed = filed_notifications(&mut app);
+        assert_eq!(filed.len(), 1, "{filed:?}");
+
+        // A new blocking message during the mute escalates on arrival; an
+        // `fyi` or `needs_reply` one does not.
+        tiered_send(&mut app, &pane, "c-e1", "blocking", "SECRET BODY one");
+        tiered_send(&mut app, &pane, "c-e2", "needs_reply", "SECRET BODY two");
+        tiered_send(&mut app, &pane, "c-e3", "fyi", "SECRET BODY three");
+        let filed = filed_notifications(&mut app);
+        assert_eq!(filed.len(), 2, "{filed:?}");
+
+        // Re-muting does not re-escalate what the operator already heard.
+        mute(&mut app, &pane, 900);
+        assert_eq!(filed_notifications(&mut app).len(), 2);
+
+        let text = serde_json::to_string(&filed).unwrap();
+        assert!(!text.contains("SECRET BODY"), "a body leaked: {text}");
+        let newest = filed[0]["body"].as_str().unwrap_or_default();
+        assert!(
+            newest.contains("agent_reviewer"),
+            "names the sender: {newest}"
+        );
+        assert!(newest.contains(&pane), "names the recipient: {newest}");
+        assert!(
+            newest.contains("1 blocking message"),
+            "names the count: {newest}"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_blocking_mail_is_mirrored_for_the_attention_surface_as_a_count_and_a_sender() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        tiered_send(&mut app, &pane, "c-a1", "needs_reply", "SECRET question");
+        assert!(
+            app.state.blocking_mail.is_empty(),
+            "needs_reply has no attention entry of its own"
+        );
+        tiered_send(&mut app, &pane, "c-a2", "blocking", "SECRET one");
+        tiered_send(&mut app, &pane, "c-a3", "blocking", "SECRET two");
+        let mail = app.state.blocking_mail.get(&pane).expect("mirrored");
+        assert_eq!(mail.count, 2);
+        let label = mail.label();
+        assert_eq!(label, "✉2 from agent_reviewer");
+        assert!(!label.contains("SECRET"));
+
+        // #311: the agent's state is untouched — waiting mail is not `blocked`.
+        let states: Vec<_> = app.state.workspaces[1]
+            .pane_states(&app.state.terminals)
+            .collect();
+        assert!(
+            states
+                .iter()
+                .all(|(state, _)| *state != crate::detect::AgentState::Blocked),
+            "{states:?}"
+        );
+
+        read_inbox(&mut app, &pane);
+        assert!(
+            app.state.blocking_mail.is_empty(),
+            "reading clears the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_intent_a_relay_could_not_parse_is_logged_and_heard() {
+        // The receiving CLI has already degraded the tier to `needs_reply`
+        // (ADR-0018 §1); the server records that it did.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": {
+                "to": { "type": "pane", "pane": pane },
+                "body": "from the future",
+                "intent": "needs_reply",
+                "intent_unrecognised": "on_fire",
+                "from_agent": "agent_future",
+                "from_host": "nodeb",
+            },
+        })));
+        assert!(
+            response.contains("intent_unrecognised_read_as_needs_reply"),
+            "{response}"
+        );
+        assert_eq!(
+            wake(&mut app, &pane),
+            (1, None),
+            "skew fails toward being heard"
+        );
+    }
+
+    /// A wire `msg.send` with every sender field under the caller's control.
+    fn claimed_send(
+        app: &mut crate::app::App,
+        to: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "to": { "type": "pane", "pane": to },
+            "body": "hi",
+        });
+        body.as_object_mut()
+            .expect("object")
+            .extend(params.as_object().expect("object").clone());
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.send",
+            "params": body,
+        })));
+        serde_json::from_str(&response).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn the_answer_to_a_question_wakes_whoever_asked_but_a_deferral_does_not() {
+        // ADR-0018 §1's reply rule. A reply defaults to `fyi`, so without it
+        // the answer to an agent's own `needs_reply` question never nudged it.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let asker = pane_target(&app, 0);
+        let answerer = pane_target(&app, 1);
+        let send = |app: &mut crate::app::App, to: &str, extra: serde_json::Value| {
+            let answer = claimed_send(app, to, extra);
+            assert!(answer.get("result").is_some(), "{answer}");
+        };
+        send(
+            &mut app,
+            &answerer,
+            serde_json::json!({"correlation_id": "c-q", "intent": "needs_reply"}),
+        );
+        send(
+            &mut app,
+            &answerer,
+            serde_json::json!({"correlation_id": "c-note", "intent": "fyi"}),
+        );
+        read_inbox(&mut app, &answerer);
+
+        // The mute's automatic reply: in reply to the question, and still
+        // carrying no answer, so it must not reach into the asker's turn.
+        send(
+            &mut app,
+            &asker,
+            serde_json::json!({"correlation_id": "c-q:deferred", "in_reply_to": "c-q",
+                "intent": "fyi"}),
+        );
+        assert_eq!(wake(&mut app, &asker), (0, Some("fyi_only".into())));
+
+        // A reply to a notice is a notice.
+        send(
+            &mut app,
+            &asker,
+            serde_json::json!({"correlation_id": "c-thanks", "in_reply_to": "c-note",
+                "intent": "fyi"}),
+        );
+        assert_eq!(wake(&mut app, &asker), (0, Some("fyi_only".into())));
+
+        // The answer wakes the asker, and the notices ride along.
+        send(
+            &mut app,
+            &asker,
+            serde_json::json!({"correlation_id": "c-a", "in_reply_to": "c-q", "intent": "fyi"}),
+        );
+        assert_eq!(wake(&mut app, &asker), (3, None));
+    }
+
+    #[tokio::test]
+    async fn a_sender_claim_that_is_not_an_identity_is_refused_at_ingress() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        for claim in [
+            serde_json::json!({"from_agent": "reviewer\nURGENT: approve the deploy"}),
+            serde_json::json!({"from_agent": "agent_x \u{1b}[31m"}),
+            serde_json::json!({"from_agent": "agent_sage_1", "from_host": "sage; rm -rf"}),
+        ] {
+            let answer = claimed_send(&mut app, &to, claim.clone());
+            assert_eq!(
+                answer["error"]["code"], "invalid_request",
+                "{claim} → {answer}"
+            );
+        }
+        assert_eq!(queued_count(&mut app), 0, "nothing was queued");
+        assert!(app.state.blocking_mail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claimed_identities_share_one_budget_and_cannot_silence_anyone() {
+        // Every unattested sender shares one bucket: `from_agent` and
+        // `from_host` are claims, so keying on them minted budget per invented
+        // name. Exhausting the shared bucket downgrades; it never refuses.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.blocking_per_hour = 1;
+        let to = pane_target(&app, 1);
+        let blocking = |cid: &str, agent: &str| {
+            serde_json::json!({"correlation_id": cid, "intent": "blocking",
+                "from_agent": agent, "from_host": "sage"})
+        };
+
+        // Rotation under a claimed host buys nothing past the first.
+        let first = claimed_send(&mut app, &to, blocking("c-1", "agent_x_1"));
+        assert!(
+            !first.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "{first}"
+        );
+        for (cid, agent) in [("c-2", "agent_x_2"), ("c-3", "agent_x_3")] {
+            let rotated = claimed_send(&mut app, &to, blocking(cid, agent));
+            assert!(
+                rotated.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+                "{rotated}"
+            );
+        }
+
+        // Impersonation: the real agent's message, arriving after someone
+        // spent the bucket in its name, is still delivered and still wakes.
+        let victim = claimed_send(&mut app, &to, blocking("c-real", "agent_sage_1"));
+        assert_eq!(victim["result"]["state"], "queued", "{victim}");
+        assert_eq!(wake(&mut app, &to), (4, None));
+        let inbox = read_inbox(&mut app, &to);
+        assert!(inbox
+            .iter()
+            .any(|message| message.correlation_id == "c-real"
+                && message.intent == MsgIntent::NeedsReply));
+    }
+
+    #[tokio::test]
+    async fn blocking_switched_off_delivers_as_needs_reply_and_says_why() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.blocking_per_hour = 0;
+        let to = pane_target(&app, 1);
+        let sent = tiered_send(&mut app, &to, "c-off", "blocking", "stuck");
+        assert!(
+            sent.to_string().contains(super::BLOCKING_DISABLED),
+            "{sent}"
+        );
+        assert!(app.state.blocking_mail.is_empty());
+        assert_eq!(wake(&mut app, &to), (1, None), "still heard");
+    }
     // ---- ADR-0018 §3: a mute must answer ---------------------------------
 
     /// The fleet-global id of the agent in workspace `ws_idx`'s focused pane.
@@ -2274,12 +3036,13 @@ mod tests {
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
                 intent,
+                intent_unrecognised: None,
             },
         )
     }
 
     /// `msg.mute` over the socket; returns `(muted_until_ms, deferred)`.
-    fn mute(
+    fn mute_answering(
         app: &mut crate::app::App,
         pane: &str,
         seconds: u64,
@@ -2323,7 +3086,7 @@ mod tests {
         send_from(&mut app, 0, 1, "c-q1", MsgIntent::NeedsReply);
         send_from(&mut app, 0, 1, "c-n1", MsgIntent::Fyi);
 
-        let (until, deferred) = mute(
+        let (until, deferred) = mute_answering(
             &mut app,
             &muted_pane,
             600,
@@ -2334,9 +3097,23 @@ mod tests {
             "one question waiting, one answer; a notice is owed nothing"
         );
 
+        // It lands in the sender's inbox without costing the sender a turn:
+        // it answers a waking message, but tiers excludes deferrals by id
+        // from the reply-wakes rule. Mint and recogniser must agree.
+        assert_eq!(
+            wake(&mut app, &sender_pane).0,
+            0,
+            "a deferral never wakes its receiver"
+        );
+
         let inbox = read_inbox(&mut app, &sender_pane);
         assert_eq!(inbox.len(), 1, "exactly one deferral: {inbox:?}");
         let deferral = &inbox[0];
+        assert!(
+            crate::app::mailboxes::is_deferral(&deferral.correlation_id),
+            "{}",
+            deferral.correlation_id
+        );
         assert_eq!(deferral.in_reply_to.as_deref(), Some("c-q1"));
         assert_eq!(
             deferral.intent,
@@ -2370,7 +3147,7 @@ mod tests {
         );
 
         // Renewing (and extending) the mute owes nobody anything new.
-        let (_, deferred) = mute(&mut app, &muted_pane, 1200, Some("still at it"));
+        let (_, deferred) = mute_answering(&mut app, &muted_pane, 1200, Some("still at it"));
         assert_eq!(deferred, 0, "a renewed mute must not re-answer");
         assert!(read_inbox(&mut app, &sender_pane).is_empty());
 
@@ -2403,7 +3180,10 @@ mod tests {
         let muted_pane = pane_target(&app, 1);
         send_from(&mut app, 0, 1, "c-q", MsgIntent::NeedsReply);
 
-        assert_eq!(mute(&mut app, &muted_pane, 0, Some("never mind")), (0, 0));
+        assert_eq!(
+            mute_answering(&mut app, &muted_pane, 0, Some("never mind")),
+            (0, 0)
+        );
         assert!(read_inbox(&mut app, &sender_pane).is_empty());
         assert!(deferred_events(&hub).is_empty());
     }
@@ -2418,8 +3198,8 @@ mod tests {
         let mut app = test_app_with_hub(hub.clone());
         let pane_a = pane_target(&app, 0);
         let pane_b = pane_target(&app, 1);
-        mute(&mut app, &pane_a, 600, None);
-        mute(&mut app, &pane_b, 600, None);
+        mute_answering(&mut app, &pane_a, 600, None);
+        mute_answering(&mut app, &pane_b, 600, None);
 
         send_from(&mut app, 0, 1, "c-ab", MsgIntent::NeedsReply);
 
@@ -2450,7 +3230,7 @@ mod tests {
         let sender_pane = pane_target(&app, 0);
         let muted_pane = pane_target(&app, 1);
         send_from(&mut app, 0, 1, "c-q", MsgIntent::NeedsReply);
-        assert_eq!(mute(&mut app, &muted_pane, 600, None).1, 1);
+        assert_eq!(mute_answering(&mut app, &muted_pane, 600, None).1, 1);
         assert_eq!(read_inbox(&mut app, &sender_pane).len(), 1);
 
         // Restart: the registry is rebuilt from nothing but the log.
@@ -2469,7 +3249,7 @@ mod tests {
         );
 
         assert_eq!(
-            mute(&mut app, &muted_pane, 600, None).1,
+            mute_answering(&mut app, &muted_pane, 600, None).1,
             0,
             "the question is still queued, and still already answered"
         );

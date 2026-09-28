@@ -38,6 +38,15 @@ pub(crate) struct AgentLocation {
     /// answer came from, so it should hand that back rather than make the
     /// caller re-derive it.
     pub(crate) route: Option<String>,
+    /// `true` when `route` reaches the agent's own host — a local agent, or
+    /// one a configured peer reported about itself. `false` for a relayed
+    /// entry, whose route is the hub that relayed it (#410): the message goes
+    /// to that hub, which then makes the last hop itself.
+    ///
+    /// The distinction is the loop guard. A message that arrived from another
+    /// host is only ever handed on over a DIRECT route, so it crosses at most
+    /// one hub and can never bounce spoke → hub → spoke → hub.
+    pub(crate) direct: bool,
 }
 
 /// A directory row as the gossip layer holds it: where the agent is, plus the
@@ -78,6 +87,7 @@ impl App {
                         pane_id: self.state.public_pane_id(ws_idx, *pane_id)?,
                         local: true,
                         route: None,
+                        direct: true,
                     });
                 }
             }
@@ -122,6 +132,7 @@ impl App {
                             pane_id: agent.pane_id.clone(),
                             local: false,
                             route: route.clone(),
+                            direct: true,
                         },
                         agent: agent.agent.clone(),
                         status: agent.status,
@@ -140,10 +151,14 @@ impl App {
                             host: host.clone(),
                             pane_id: agent.pane_id.clone(),
                             local: false,
-                            // A relayed entry is reachable only via the origin
-                            // that relayed it; we have no direct edge, so there
-                            // is no route of our own.
-                            route: None,
+                            // A relayed entry is reachable only via the peer
+                            // that relayed it (#410). That peer polls the
+                            // agent's host itself, so handing the message to it
+                            // is one hop and its ordinary `msg.send` makes the
+                            // next. `None` only for an entry that predates the
+                            // field — there is then no edge to name.
+                            route: entry.via.clone(),
+                            direct: false,
                         },
                         agent: agent.agent.clone(),
                         status: agent.status,

@@ -81,6 +81,10 @@ fn unknown_option(command: &str, flag: &str, known: &[&str]) -> String {
 struct SendArgs {
     repo: Option<String>,
     intent: MsgIntent,
+    /// A `--intent` spelling this build does not know, kept until the whole
+    /// argv is read: whether it is a refusal or a degradation depends on
+    /// whether this is a relay, and `--from-host` may come after it.
+    unknown_intent: Option<String>,
     correlation_id: Option<String>,
     in_reply_to: Option<String>,
     agent: Option<String>,
@@ -100,6 +104,7 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
     let mut parsed = SendArgs {
         repo: None,
         intent: MsgIntent::default(),
+        unknown_intent: None,
         correlation_id: None,
         in_reply_to: None,
         agent: None,
@@ -146,12 +151,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             // noticing is the one worth forcing.
             "--intent" => {
                 let raw = value()?;
-                let Some(intent) = MsgIntent::from_wire(&raw) else {
-                    return Err(format!(
-                        "unknown --intent {raw:?}: expected fyi or needs-reply"
-                    ));
-                };
+                let (intent, unknown) = MsgIntent::from_wire_relayed(&raw);
                 parsed.intent = intent;
+                parsed.unknown_intent = unknown.then_some(raw);
                 index += 2;
             }
             "--json" => index += 1,
@@ -179,12 +181,33 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             }
         }
     }
+    // ADR-0018 §1. A relayed send comes from a peer that may run a newer
+    // build, so a tier this build does not know is read as `needs_reply`:
+    // skew fails toward the recipient hearing about it. An operator typing
+    // `--intent` by hand gets the refusal instead — a typo is not skew.
+    if let Some(raw) = &parsed.unknown_intent {
+        if parsed.from_host.is_none() {
+            return Err(format!(
+                "unknown --intent {raw:?}: expected {}",
+                intent_spellings()
+            ));
+        }
+    }
     Ok(parsed)
+}
+
+/// The tiers this build accepts, for a refusal to name.
+fn intent_spellings() -> String {
+    MsgIntent::ALL
+        .iter()
+        .map(|intent| intent.as_wire())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn msg_send(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
-         [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID] [--from-agent ID] \
+         [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] \
          [-- <text starting with dashes>]";
     let parsed = match parse_send_args(args) {
         Ok(parsed) => parsed,
@@ -196,6 +219,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     let SendArgs {
         repo,
         intent,
+        unknown_intent,
         correlation_id,
         in_reply_to,
         agent,
@@ -233,6 +257,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             correlation_id,
             in_reply_to,
             intent,
+            intent_unrecognised: unknown_intent,
         }),
     })?)
 }
@@ -296,7 +321,8 @@ fn parse_reply_args(args: &[String]) -> Result<(MsgIntent, Vec<String>), String>
                 };
                 let Some(parsed) = MsgIntent::from_wire(value) else {
                     return Err(format!(
-                        "unknown --intent {value:?}: expected fyi or needs-reply"
+                        "unknown --intent {value:?}: expected {}",
+                        intent_spellings()
                     ));
                 };
                 intent = parsed;
@@ -321,7 +347,7 @@ fn parse_reply_args(args: &[String]) -> Result<(MsgIntent, Vec<String>), String>
 
 fn msg_reply(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk msg reply <correlation_id> <text...> \
-         [--intent fyi|needs-reply] [-- <text starting with dashes>]";
+         [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]";
     let (intent, positional) = match parse_reply_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -477,13 +503,14 @@ fn msg_mute(args: &[String]) -> std::io::Result<i32> {
 fn print_msg_help() {
     eprintln!("flk msg commands:");
     eprintln!(
-        "  flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply] \
+        "  flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] \
          [--correlation-id ID] [--reply-to ID]"
     );
-    eprintln!("  flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply]");
+    eprintln!("  flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking]");
     eprintln!(
-        "  --intent needs-reply marks a message as owed an answer; it rides the envelope, \
-         so the recipient sees it without reading the body (default: fyi)"
+        "  --intent rides the envelope: fyi never wakes the recipient (default); needs-reply \
+         nudges it at its next turn boundary; blocking also surfaces it to the operator, \
+         under a tighter rate limit"
     );
     eprintln!("  flk msg list [--pane TARGET]");
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");

@@ -8,13 +8,14 @@ mod fleet;
 mod handoffs;
 mod integrations;
 mod lineage;
-mod messages;
+pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
 mod responses;
 mod revert;
 mod spawn;
 mod tabs;
+mod uplink;
 pub(crate) mod workspaces;
 mod worktrees;
 
@@ -155,6 +156,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if let AppEvent::UplinkForwarded {
+            spoke,
+            message,
+            respond_to,
+        } = ev
+        {
+            let response = self.forward_uplinked_message(&spoke, message);
+            let _ = respond_to.send(response);
+            return;
+        }
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
@@ -329,6 +340,9 @@ impl App {
                 // so the reap knows what to compare against.
                 self.peer_poll_health.mark_started(now);
                 let event_tx = self.event_tx.clone();
+                // #410: where a held relay hands the frames its spoke pushes
+                // up. Refreshed every round, so it always points at this loop.
+                crate::peer_stream::set_uplink_sink(event_tx.clone());
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
                     // sends, so the fetch must not be able to unwind past it
@@ -407,10 +421,13 @@ impl App {
                         // #392: a row whose ssh_target or proxy_jump this host
                         // refuses to dial is dropped and logged, and the rest of
                         // the snapshot still merges.
-                        let Some(materialised) = crate::peers::relayed_entry_from_wire(entry)
+                        let Some(mut materialised) = crate::peers::relayed_entry_from_wire(entry)
                         else {
                             continue;
                         };
+                        // #410: remember which edge told us, so a message for
+                        // this row's agents has a route instead of a refusal.
+                        materialised.via = Some(fetch.peer.clone());
                         let challenger_age = materialised.peer.carried_age_secs();
                         let insert = match self.state.relayed_fleet_cache.get(&host_key) {
                             Some(existing) => {
@@ -463,7 +480,15 @@ impl App {
                         summary.latency_ms.unwrap_or_default(),
                     );
                 }
-                Err(error) => summary.error = Some(error),
+                // #410 P1: lead with WHICH kind of broken, so the servers band
+                // and `flk peers summary` can say "auth refused" rather than
+                // only that the peer is down.
+                Err(error) => {
+                    summary.error = Some(match crate::peers::SshFailureReason::classify(&error) {
+                        crate::peers::SshFailureReason::Other => error,
+                        reason => format!("{}: {error}", reason.describe()),
+                    })
+                }
             }
             // Drop relay rows nothing has refreshed for long enough that they
             // carry no information (#101). Without this the cache only ever
@@ -1208,6 +1233,8 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        // #410: a park is only ever for the request that set it.
+        let _ = self.uplink.take_pending_park();
 
         let response = match request.method {
             Method::ServerStop(_) => {
@@ -1306,6 +1333,12 @@ impl App {
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
+            Method::MsgUplinkTake(params) => {
+                return self.handle_msg_uplink_take(request.id, params)
+            }
+            Method::MsgUplinkResult(params) => {
+                return self.handle_msg_uplink_result(request.id, params)
+            }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
@@ -1685,7 +1718,11 @@ mod tests {
         ));
         let summary = &app.state.peer_summaries[0];
         assert_eq!(summary.workspaces.len(), 1);
-        assert_eq!(summary.error.as_deref(), Some("ssh: connect timed out"));
+        assert_eq!(
+            summary.error.as_deref(),
+            Some("timed out: ssh: connect timed out"),
+            "the failure leads with its kind (#410 P1)"
+        );
 
         // Unknown peers (removed from config mid-flight) are ignored.
         app.handle_internal_event(AppEvent::PeerSummaryFetched(

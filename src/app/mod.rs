@@ -10,6 +10,7 @@ mod agents;
 mod api;
 pub(crate) mod fleet_pause;
 pub(crate) mod hibernation;
+pub(crate) mod idle_wake;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 mod api_helpers;
@@ -30,6 +31,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod uplink;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -131,6 +133,12 @@ pub struct App {
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
+    /// Messages this server is handing up to its hub, and the requests parked
+    /// on them (#410). In memory on purpose: a parked request dies with the
+    /// connection that made it, so there is nothing a restart could resume.
+    pub(crate) uplink: crate::app::uplink::Uplink,
+    /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
+    pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -576,6 +584,7 @@ impl App {
             request_branch_session: None,
             request_kill_worktree: None,
             request_kill_all_worktrees: false,
+            blocking_mail: std::collections::HashMap::new(),
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             pending_ui_events: Vec::new(),
@@ -861,6 +870,8 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
+            uplink: Default::default(),
+            idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             event_hub,
             last_focus,
             no_session,
@@ -883,6 +894,9 @@ impl App {
         // Sync the render-facing pause banner from the persisted state so
         // a paused fleet renders the banner immediately on restart.
         Self::sync_fleet_pause_banner(&this.fleet_pause, &mut this.state);
+        // ADR-0018 §4: blocking mail restored from the log is still waiting on
+        // its recipient, so the attention surface shows it from the first frame.
+        this.sync_blocking_mail();
         // #372 / ADR-0016: rebuild the operator's notification list from the
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.

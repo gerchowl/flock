@@ -422,6 +422,10 @@ pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
 pub struct RelayedEntry {
     /// The relayed peer, in the same shape as a locally polled one.
     pub peer: PeerSummaryState,
+    /// The `[[peers]]` entry whose poll delivered this row (#410): the edge a
+    /// message for one of its agents is handed to. Stamped at merge time, where
+    /// the answering peer is known; `None` straight off the wire.
+    pub via: Option<String>,
 }
 
 /// Materialise a relayed wire entry into the shape every rendering surface
@@ -488,6 +492,7 @@ pub fn relayed_entry_from_wire(
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
         },
+        via: None,
     })
 }
 
@@ -803,19 +808,42 @@ pub fn send_peer_message(
     // A command this host refuses to build never leaves the machine, so it is
     // a refusal too — and a terminal one. Retrying an id that cannot be
     // shell-quoted safely produces the same answer forever.
-    let remote = peer_message_command(
-        to_agent,
-        from_agent,
-        from_host,
-        body,
-        correlation_id,
-        in_reply_to,
-        intent,
-    )
-    .map_err(PeerMessageFailure::Refused)?;
-    run_peer_ssh_status(peer, &remote)
-        .map(|_| ())
-        .map_err(classify_message_failure)
+    let attempt = |intent| {
+        let remote = peer_message_command(
+            to_agent,
+            from_agent,
+            from_host,
+            body,
+            correlation_id,
+            in_reply_to,
+            intent,
+        )
+        .map_err(PeerMessageFailure::Refused)?;
+        run_peer_ssh_status(peer, &remote)
+            .map(|_| ())
+            .map_err(classify_message_failure)
+    };
+    match attempt(intent) {
+        // ADR-0018 §1, the other direction of skew. A peer that predates
+        // `blocking` but has #380 refuses the tier by name; asking again as
+        // `needs_reply` keeps the message heard — it still nudges — and only
+        // loses the escalation that peer could not have performed anyway.
+        Err(PeerMessageFailure::Refused(detail))
+            if intent == crate::api::schema::MsgIntent::Blocking && refused_the_intent(&detail) =>
+        {
+            attempt(crate::api::schema::MsgIntent::NeedsReply)
+        }
+        outcome => outcome,
+    }
+}
+
+/// Whether a peer's refusal was about the intent VALUE — the one refusal a
+/// retry at a lower tier can answer. Matched on `unknown --intent`, the
+/// refusal every build since #280 prints for a tier it does not know; the bare
+/// flag name is not enough, because the unknown-option refusal lists every
+/// flag a build understands, `--intent` among them.
+fn refused_the_intent(detail: &str) -> bool {
+    detail.contains("unknown --intent")
 }
 
 /// Why a relayed message did not land on the peer that owns the recipient.
@@ -858,10 +886,104 @@ impl PeerMessageFailure {
         }
     }
 
-    pub fn message(&self, host: &str) -> String {
+    /// The caller-facing message, naming the hop as a whole — which machine
+    /// failed to reach which, and how (#410). Once a message can cross a hub,
+    /// "could not reach ksb" no longer says enough: the reader needs to know it
+    /// was the HUB that could not, so it is not chasing the spoke's own network.
+    pub fn hop_message(&self, from: &str, host: &str, reason: SshFailureReason) -> String {
         match self {
-            Self::Unreachable(detail) => format!("could not reach {host}: {detail}"),
-            Self::Refused(detail) => format!("the relay to {host} was refused: {detail}"),
+            Self::Unreachable(detail) => {
+                format!(
+                    "{from} cannot reach {host} ({}): {detail}",
+                    reason.describe()
+                )
+            }
+            Self::Refused(detail) => format!("{host} refused the relay from {from}: {detail}"),
+        }
+    }
+}
+
+/// Why an ssh dial failed, read from ssh's own last stderr line (#410 P1).
+///
+/// ssh has no machine-readable failure status — every transport failure is
+/// exit 255 — so the reason has to come from its words. Coarse on purpose:
+/// the operator question is "which kind of broken", and each kind has a
+/// different fix (start sshd, fix the key, accept the host key, wait).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureReason {
+    ConnectRefused,
+    AuthRefused,
+    HostKey,
+    Timeout,
+    /// The `ProxyJump` host answered and the hop BEYOND it did not. Observed
+    /// as `Connection closed by UNKNOWN port 65535` (#406): the first hop
+    /// worked, which is exactly what a bare "unreachable" hides.
+    JumpHopRefused,
+    UnknownHost,
+    /// The far side has no `flk` on its PATH.
+    NoFlk,
+    Other,
+}
+
+impl SshFailureReason {
+    pub fn classify(detail: &str) -> Self {
+        let lowered = detail.to_ascii_lowercase();
+        if lowered.contains("unknown port 65535")
+            || lowered.contains("stdio forwarding failed")
+            || lowered.contains("channel 0: open failed")
+        {
+            Self::JumpHopRefused
+        } else if lowered.contains("permission denied")
+            || lowered.contains("authentication")
+            || lowered.contains("too many authentication failures")
+        {
+            Self::AuthRefused
+        } else if lowered.contains("host key verification failed")
+            || lowered.contains("remote host identification has changed")
+            || lowered.contains("no matching host key")
+        {
+            Self::HostKey
+        } else if lowered.contains("connection refused") {
+            Self::ConnectRefused
+        } else if lowered.contains("timed out") || lowered.contains("timeout") {
+            Self::Timeout
+        } else if lowered.contains("could not resolve hostname")
+            || lowered.contains("name or service not known")
+            || lowered.contains("nodename nor servname")
+        {
+            Self::UnknownHost
+        } else if lowered.contains("flk: not found") || lowered.contains("flk: command not found") {
+            Self::NoFlk
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Stable wire token, for `error.data.reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectRefused => "connect_refused",
+            Self::AuthRefused => "auth_refused",
+            Self::HostKey => "host_key",
+            Self::Timeout => "timeout",
+            Self::JumpHopRefused => "jump_hop_refused",
+            Self::UnknownHost => "unknown_host",
+            Self::NoFlk => "no_flk",
+            Self::Other => "other",
+        }
+    }
+
+    /// Short human phrase, for messages and the servers band.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ConnectRefused => "connection refused",
+            Self::AuthRefused => "auth refused",
+            Self::HostKey => "host key rejected",
+            Self::Timeout => "timed out",
+            Self::JumpHopRefused => "jump host reached, next hop refused",
+            Self::UnknownHost => "unknown host",
+            Self::NoFlk => "no flk on the far side",
+            Self::Other => "ssh failed",
         }
     }
 }
@@ -938,10 +1060,7 @@ fn peer_message_command(
     // roll-forward window, so it stays until the fleet has crossed #380.
     let intent_flag = match intent {
         crate::api::schema::MsgIntent::Fyi => String::new(),
-        crate::api::schema::MsgIntent::NeedsReply => format!(
-            " --intent {}",
-            crate::api::schema::MsgIntent::NeedsReply.as_wire()
-        ),
+        stamped => format!(" --intent {}", stamped.as_wire()),
     };
     // Quote ONCE, at the outside. The body is caller-supplied and cannot be
     // validated like the ids, so it must never reach the remote shell as
@@ -1309,6 +1428,79 @@ mod tests {
     }
 
     #[test]
+    fn a_blocking_relay_carries_its_tier_and_a_peer_refusing_it_is_recognised() {
+        // ADR-0018 §1: the tier rides the envelope across the hop, so the
+        // escalation happens on the recipient's own server.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "I cannot merge until you rebase",
+            "c-blocking",
+            None,
+            crate::api::schema::MsgIntent::Blocking,
+        )
+        .expect("valid ids");
+        assert!(command.contains("--intent blocking"), "{command}");
+
+        // What a peer that has #380 but predates the tier prints: the refusal
+        // the relay retries at `needs_reply` rather than surfacing as a
+        // failure. Any other refusal is not the intent's fault.
+        assert!(super::refused_the_intent(
+            "unknown --intent \"blocking\": expected fyi or needs-reply"
+        ));
+        // The unknown-option refusal names `--intent` in its list of what
+        // the build understands; that must not trigger a second ssh hop.
+        assert!(!super::refused_the_intent(
+            "flk msg send: unknown option \"--from-host\" — this build understands --repo \
+             --intent --correlation-id --reply-to --agent --from-agent --json, and `--` ends \
+             flag parsing so a body may begin with dashes"
+        ));
+    }
+
+    #[test]
+    fn an_ssh_failure_names_which_kind_of_broken() {
+        // #410 P1: "unreachable" hides the fix. Each of these has a different
+        // one, and the #406 case — a ProxyJump whose SECOND hop was refused —
+        // must not read as the first hop being down.
+        use super::SshFailureReason as R;
+        for (stderr, expected) in [
+            (
+                "ssh: connect to host ksb port 22: Connection refused",
+                R::ConnectRefused,
+            ),
+            ("lars@ksb: Permission denied (publickey).", R::AuthRefused),
+            ("Host key verification failed.", R::HostKey),
+            (
+                "ssh: connect to host ksb port 22: Operation timed out",
+                R::Timeout,
+            ),
+            ("Connection closed by UNKNOWN port 65535", R::JumpHopRefused),
+            (
+                "ssh: Could not resolve hostname ksb: nodename nor servname provided",
+                R::UnknownHost,
+            ),
+            ("sh: 1: flk: not found", R::NoFlk),
+            ("something else entirely", R::Other),
+        ] {
+            assert_eq!(R::classify(stderr), expected, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn a_hop_failure_names_both_ends_and_the_reason() {
+        let failure = super::PeerMessageFailure::Unreachable(
+            "ssh: connect to host ksb port 22: Connection refused".into(),
+        );
+        let reason = super::SshFailureReason::classify(failure.detail());
+        let message = failure.hop_message("mba22", "ksb", reason);
+        assert!(
+            message.starts_with("mba22 cannot reach ksb (connection refused)"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_peer_that_refuses_is_not_a_peer_that_was_never_reached() {
         // #380. Both used to arrive as "could not reach {host}", which is a
         // lie about the second and the wrong advice about both: an unreachable
@@ -1324,9 +1516,11 @@ mod tests {
         assert_eq!(refused.code(), "peer_refused_message");
         assert!(!refused.retryable(), "the identical relay is refused again");
         assert!(
-            refused.message("sage").contains("--intent"),
+            refused
+                .hop_message("mba22", "sage", super::SshFailureReason::Other)
+                .contains("--intent"),
             "the peer's own words ARE the diagnosis and must survive the hop: {}",
-            refused.message("sage")
+            refused.hop_message("mba22", "sage", super::SshFailureReason::Other)
         );
 
         for (exit_code, what) in [

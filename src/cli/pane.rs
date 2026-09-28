@@ -490,7 +490,7 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 /// It is a heuristic, and the docs say so. A TUI that has not started reading
 /// stdin at all misses the text as well as the Enter, and no gap fixes that —
 /// `agent start --wait-ready` is the answer to that half.
-const PANE_RUN_SUBMIT_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+pub(crate) const PANE_RUN_SUBMIT_GAP: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// One step of a `pane run`, so the ordering contract is a value that can be
 /// asserted on rather than a shape buried in a socket conversation.

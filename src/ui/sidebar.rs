@@ -2407,12 +2407,28 @@ fn peer_server_rows(
         // #164: the icon degrades with the row — a lit icon beside a struck-out
         // host reads as a half-painted bug; identity dims as one unit.
         let name = server_name_spans(peer.icon.as_deref(), &host, mode, ghost_style);
-        let title_rest = vec![Span::styled(
+        let mut title_rest = vec![Span::styled(
             age,
             Style::default()
                 .fg(p.overlay0)
                 .add_modifier(Modifier::ITALIC),
         )];
+        // #410 P1: say HOW the dial failed when ssh said so — "auth refused"
+        // and "jump host reached, next hop refused" have different fixes, and
+        // a bare broken link hides which one this is.
+        if let Some(reason) = peer
+            .error
+            .as_deref()
+            .map(crate::peers::SshFailureReason::classify)
+            .filter(|reason| *reason != crate::peers::SshFailureReason::Other)
+        {
+            title_rest.push(Span::styled(
+                format!(" {}", reason.describe()),
+                Style::default()
+                    .fg(p.overlay0)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
         let mut health: Vec<Span<'static>> = Vec::new();
         if let Some(system) = peer.system.as_ref() {
             health = server_health_spans(
@@ -3206,8 +3222,24 @@ fn render_agent_detail(
         let jump_prefix = agents_jump_bound
             .then(|| ordinal.map_or_else(|| "  ".to_string(), |n| format!("{n} ")));
         let jump_cols = jump_prefix.as_ref().map_or(0, |s| s.chars().count());
-        let prefix_cols =
-            jump_cols + 4 + agent_code.chars().count() + usize::from(!agent_code.is_empty());
+        // ADR-0018 §4: a pane another agent is blocked on says so under its
+        // own label — never by borrowing the `blocked` icon, whose meaning is
+        // "waiting on input" (#311).
+        let mail_label = detail
+            .remote
+            .is_none()
+            .then(|| app.public_pane_id(detail.ws_idx, detail.pane_id))
+            .flatten()
+            .and_then(|pane| app.blocking_mail.get(&pane))
+            .map(crate::app::mailboxes::BlockingMail::label);
+        let mail_cols = mail_label
+            .as_ref()
+            .map_or(0, |label| label.chars().count() + 1);
+        let prefix_cols = jump_cols
+            + 4
+            + agent_code.chars().count()
+            + usize::from(!agent_code.is_empty())
+            + mail_cols;
         let location_budget = (body.width as usize).saturating_sub(prefix_cols);
         // #303: the server segment follows the viewer's `server_label` mode,
         // so the panel names a server exactly as the band and the spaces list
@@ -3238,6 +3270,13 @@ fn render_agent_detail(
         ]);
         if !agent_code.is_empty() {
             spans.push(Span::styled(agent_code, agent_style));
+            spans.push(Span::styled(" ", Style::default()));
+        }
+        if let Some(label) = mail_label {
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
+            ));
             spans.push(Span::styled(" ", Style::default()));
         }
         spans.push(Span::styled(location, location_style));

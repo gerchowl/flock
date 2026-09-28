@@ -1189,6 +1189,54 @@ mod tests {
         app
     }
 
+    /// #393: `flock_agent_read` / `flock_pane_read` were documented as marking
+    /// the pane seen, and agents were told to "use sparingly". Neither handler
+    /// touches `seen` — only operator view transitions do — so the claim
+    /// steered agents off a read that never moved the attention queue. Driven
+    /// off the wire, both verbs, from both starting values: an "unchanged"
+    /// that only held for one of them would be a read that sets `seen`.
+    #[tokio::test]
+    async fn api_pane_read_leaves_seen_untouched() {
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("read");
+        let pane_id = ws.tabs[0].root_pane;
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 0, b"hello"),
+        );
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let public = app.public_pane_id(0, pane_id).expect("public id");
+        let seen = |app: &App| app.state.workspaces[0].tabs[0].panes[&pane_id].seen;
+
+        for start in [false, true] {
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .expect("pane")
+                .seen = start;
+            for request in [
+                serde_json::json!({"id": "r", "method": "pane.read",
+                    "params": {"pane_id": public, "source": "recent"}}),
+                serde_json::json!({"id": "r", "method": "agent.read",
+                    "params": {"target": public, "source": "recent"}}),
+            ] {
+                let response = app.handle_api_request(
+                    serde_json::from_value(request.clone()).expect("a request a client sends"),
+                );
+                assert!(response.contains("\"result\""), "{request} → {response}");
+                assert_eq!(seen(&app), start, "{request} changed `seen`");
+            }
+        }
+    }
+
     #[test]
     fn api_pane_close_closes_linked_worktree_workspace_only() {
         let mut app = app_with_linked_worktree();
