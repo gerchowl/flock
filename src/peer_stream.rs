@@ -406,6 +406,29 @@ pub fn request(
     method: &str,
     params: serde_json::Value,
 ) -> Result<String, String> {
+    request_over(peer, method, params, true)
+}
+
+/// Hand a spoke this hub's view of the rest of the fleet (#410), over the
+/// connection already held to it — never a fresh one. Gossip used to flow only
+/// up, from pollee to poller, so a spoke that polls nobody knew nothing past
+/// itself. A spoke too old to know the method answers with an error line,
+/// which is ignored: it simply keeps its old, empty view.
+pub fn push_hub_fleet(peer: &PeerConfig, fleet: Vec<crate::api::schema::RelayedFleetPeer>) {
+    let params = serde_json::json!({
+        "hub": crate::app::short_host_name(),
+        "fleet": fleet,
+    });
+    let _ = request_over(peer, "peers.hub_fleet", params, false);
+}
+
+/// `spawn: false` sends only over a connection that is already held.
+fn request_over(
+    peer: &PeerConfig,
+    method: &str,
+    params: serde_json::Value,
+    spawn: bool,
+) -> Result<String, String> {
     // Outer lock is held only long enough to find the slot; the request itself
     // runs under the per-peer lock so one slow peer cannot stall the others.
     let slot = {
@@ -445,6 +468,9 @@ pub fn request(
     }
 
     if slot.stream.is_none() {
+        if !spawn {
+            return Err("no held connection".into());
+        }
         slot.stream = Some(PeerStream::spawn(peer)?);
         slot.target = peer.ssh_target().to_string();
     }

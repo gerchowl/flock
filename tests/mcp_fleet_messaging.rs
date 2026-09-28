@@ -552,6 +552,25 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
             }
         },
     );
+    // Down-gossip: nodea polls nobody, yet it now KNOWS carol — the hub pushes
+    // its view of the fleet down the relay it holds — and knows her only
+    // through nodeb.
+    let listing = wait_for("carol to reach nodea's directory", GOSSIP_TIMEOUT, || {
+        let listing = alice.call_tool("flock_agent_list", json!({}));
+        fleet_row(&listing, &carol.agent_id).map(|_| listing.clone())
+    });
+    let row = fleet_row(&listing, &carol.agent_id).expect("just found it");
+    assert_eq!(row["host"], "nodec", "{row}");
+    assert_eq!(row["route"], "nodeb", "known via the hub: {row}");
+    assert_eq!(row["local"], false, "{row}");
+
+    // And the servers band on nodea shows nodec, marked as known via nodeb.
+    let mut client = node_a.attach_sized(160, 40);
+    // The band is ~26 cells wide, so match the part that survives truncation.
+    fleet::wait_for_row(&mut client, "via nod", GOSSIP_TIMEOUT)
+        .unwrap_or_else(|screen| panic!("nodea's band should mark nodec via nodeb: {screen}"));
+    drop(client);
+
     assert_eq!(queued["state"], "relayed", "send: {queued}");
     assert_eq!(
         queued["path"], "via nodeb",

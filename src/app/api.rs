@@ -343,6 +343,19 @@ impl App {
                 // #410: where a held relay hands the frames its spoke pushes
                 // up. Refreshed every round, so it always points at this loop.
                 crate::peer_stream::set_uplink_sink(event_tx.clone());
+                // #410: what this hub knows about the REST of the fleet, for
+                // the spoke it is about to poll. Gossip used to flow only up,
+                // so a spoke — which polls nobody — never learned anything.
+                // Its own row is left out; the spoke drops rows about itself
+                // anyway, and sending them would only be noise.
+                let down_fleet: Vec<crate::api::schema::RelayedFleetPeer> = self
+                    .own_relayed_fleet()
+                    .into_iter()
+                    .filter(|row| {
+                        !row.name.eq_ignore_ascii_case(&peer.name)
+                            && row.ssh_target != peer.ssh_target()
+                    })
+                    .collect();
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
                     // sends, so the fetch must not be able to unwind past it
@@ -357,6 +370,11 @@ impl App {
                     let fetch = crate::peers::fetch_with_panic_guard(&peer_name, || {
                         crate::peers::fetch_peer_summary(&peer)
                     });
+                    // Down-gossip rides the held relay only: it is worth one
+                    // line on a connection already open, never a fresh ssh.
+                    if fetch.result.is_ok() {
+                        crate::peer_stream::push_hub_fleet(&peer, down_fleet);
+                    }
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });
             }
@@ -396,56 +414,11 @@ impl App {
                     // prevention rides on the origin field: we drop entries
                     // whose origin is us (the ONE full-cycle we could see —
                     // hub A polls hub B, hub B relayed A's own peers back).
-                    let self_host = crate::app::api::peers::short_host_name();
-                    let self_host_lower = self_host.to_ascii_lowercase();
-                    for entry in payload.relayed_fleet {
-                        if entry.origin.eq_ignore_ascii_case(&self_host) {
-                            continue;
-                        }
-                        let host_key = entry
-                            .host
-                            .as_deref()
-                            .filter(|host| !host.is_empty())
-                            .unwrap_or(&entry.ssh_target)
-                            .to_ascii_lowercase();
-                        if host_key == self_host_lower {
-                            // Never store an entry about ourselves as a
-                            // relayed row — the self row lives on the
-                            // origin_summary path.
-                            continue;
-                        }
-                        // Freshest-wins across hubs. Compared on the LIVE age
-                        // (origin's reading plus however long it has sat here),
-                        // not the capture-time reading, so a hub that has gone
-                        // quiet cannot keep winning against one still polling.
-                        // #392: a row whose ssh_target or proxy_jump this host
-                        // refuses to dial is dropped and logged, and the rest of
-                        // the snapshot still merges.
-                        let Some(mut materialised) = crate::peers::relayed_entry_from_wire(entry)
-                        else {
-                            continue;
-                        };
-                        // #410: remember which edge told us, so a message for
-                        // this row's agents has a route instead of a refusal.
-                        materialised.via = Some(fetch.peer.clone());
-                        let challenger_age = materialised.peer.carried_age_secs();
-                        let insert = match self.state.relayed_fleet_cache.get(&host_key) {
-                            Some(existing) => {
-                                match (existing.peer.carried_age_secs(), challenger_age) {
-                                    (Some(cur), Some(new)) => new <= cur,
-                                    (None, Some(_)) => true,
-                                    (Some(_), None) => false,
-                                    (None, None) => true,
-                                }
-                            }
-                            None => true,
-                        };
-                        if insert {
-                            self.state
-                                .relayed_fleet_cache
-                                .insert(host_key, materialised);
-                        }
-                    }
+                    crate::peers::merge_relayed_fleet(
+                        &mut self.state.relayed_fleet_cache,
+                        payload.relayed_fleet,
+                        &fetch.peer,
+                    );
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
@@ -1275,6 +1248,9 @@ impl App {
                 return self.handle_handoff_read(request.id, params);
             }
             Method::PeersSummary(_) => return self.handle_peers_summary(request.id),
+            Method::PeersHubFleet(params) => {
+                return self.handle_peers_hub_fleet(request.id, params)
+            }
             Method::PeersCheckoutPrepare(params) => {
                 return self.handle_peers_checkout_prepare(request.id, params)
             }

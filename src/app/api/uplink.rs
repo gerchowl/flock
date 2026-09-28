@@ -92,6 +92,10 @@ impl App {
     /// Answer what has waited too long: takes (empty, so the relay asks again)
     /// and sends the hub never answered.
     pub(crate) fn expire_uplink(&mut self) {
+        // #410 down-gossip: a hub evicts relayed rows when a poll lands, but a
+        // spoke polls nobody — rows its hub pushed would never age OUT once
+        // the hub went quiet, only go stale. Same eviction, on this tick.
+        self.state.evict_expired_relayed_entries();
         let heartbeat = self.uplink_heartbeat();
         let expired = self.uplink.expire(Instant::now(), heartbeat);
         for take in expired.takes {

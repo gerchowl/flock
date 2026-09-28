@@ -1993,16 +1993,25 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
             }
             Some(crate::app::state::PeerSwitchRequest::RelayedPeer { ref host_key, .. }) => {
                 // A two-hop peer, known to us only because one of our peers
-                // relayed it. It reads exactly like a directly-polled row —
-                // the band shows the FLEET, not our routing table.
-                let Some(peer) = app
-                    .relayed_fleet_cache
-                    .get(host_key)
-                    .map(|entry| &entry.peer)
-                else {
+                // relayed it. It reads like a directly-polled row — the band
+                // shows the FLEET, not our routing table — plus one chip,
+                // `via <hub>` (#410): its freshness is the relayer's, and on
+                // a spoke, which polls nobody, that is the only thing saying
+                // why a row goes stale when the hub goes quiet.
+                let Some(entry) = app.relayed_fleet_cache.get(host_key) else {
                     continue;
                 };
-                peer_server_rows(peer, p, app.server_label)
+                let mut build = peer_server_rows(&entry.peer, p, app.server_label);
+                // Leading, not trailing: the band is narrow, and the latency
+                // after it is the relayer's measurement, not ours — the less
+                // important of the two to lose to truncation.
+                if let Some(via) = entry.via.as_deref() {
+                    build.title_rest.insert(
+                        0,
+                        Span::styled(format!("via {via} "), Style::default().fg(p.overlay0)),
+                    );
+                }
+                build
             }
             // Origin-workspace rows fold into the spaces list rather than the band —
             // the home row already stands for the origin server here.

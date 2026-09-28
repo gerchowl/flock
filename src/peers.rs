@@ -496,6 +496,64 @@ pub fn relayed_entry_from_wire(
     })
 }
 
+/// Merge relayed rows that `via` told us about into the relay cache.
+///
+/// The ONE merge, shared by the two directions gossip now flows (#410): rows a
+/// polled peer relays UP to its poller, and rows a hub pushes DOWN to a spoke
+/// it polls. Two copies of this loop would be two answers to "which reading of
+/// that host wins", and that drift is the defect the directory exists to stop.
+///
+/// Loop prevention rides on the origin field: an entry whose origin is us (the
+/// one full cycle we could see — hub A polls hub B, B relayed A's own peers
+/// back) and an entry ABOUT us are both dropped. Freshest-wins across sources,
+/// on the LIVE age (origin's reading plus dwell here), so a source that has
+/// gone quiet cannot keep winning against one still polling. #392: a row whose
+/// ssh_target or proxy_jump this host refuses to dial is dropped and logged,
+/// and the rest still merges.
+pub(crate) fn merge_relayed_fleet(
+    cache: &mut std::collections::HashMap<String, RelayedEntry>,
+    entries: Vec<crate::api::schema::RelayedFleetPeer>,
+    via: &str,
+) {
+    let self_host = crate::app::short_host_name();
+    let self_host_lower = self_host.to_ascii_lowercase();
+    for entry in entries {
+        if entry.origin.eq_ignore_ascii_case(&self_host) {
+            continue;
+        }
+        let host_key = entry
+            .host
+            .as_deref()
+            .filter(|host| !host.is_empty())
+            .unwrap_or(&entry.ssh_target)
+            .to_ascii_lowercase();
+        if host_key == self_host_lower {
+            // Never store an entry about ourselves as a relayed row — the self
+            // row lives on the origin_summary path.
+            continue;
+        }
+        let Some(mut materialised) = relayed_entry_from_wire(entry) else {
+            continue;
+        };
+        // #410: remember which edge told us, so a message for this row's
+        // agents has a route instead of a refusal.
+        materialised.via = Some(via.to_string());
+        let challenger_age = materialised.peer.carried_age_secs();
+        let insert = match cache.get(&host_key) {
+            Some(existing) => match (existing.peer.carried_age_secs(), challenger_age) {
+                (Some(cur), Some(new)) => new <= cur,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => true,
+            },
+            None => true,
+        };
+        if insert {
+            cache.insert(host_key, materialised);
+        }
+    }
+}
+
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {

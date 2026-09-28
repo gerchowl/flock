@@ -74,6 +74,9 @@ pub enum Method {
     TabClose(TabTarget),
     #[serde(rename = "peers.summary")]
     PeersSummary(EmptyParams),
+    /// #410: a hub hands the spoke it polls its view of the rest of the fleet.
+    #[serde(rename = "peers.hub_fleet")]
+    PeersHubFleet(PeersHubFleetParams),
     #[serde(rename = "peers.checkout_prepare")]
     PeersCheckoutPrepare(PeersCheckoutPrepareParams),
     #[serde(rename = "agent.list")]
@@ -3151,6 +3154,22 @@ pub struct PeerAgentSummary {
 /// own short host, and the answering server NEVER re-relays entries it received
 /// via relay (only its own polled peers). Result: entries travel exactly one
 /// hop.
+/// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
+///
+/// Gossip otherwise flows only UP: a poller learns what its pollee relays. A
+/// spoke polls nobody, so without this it knew nothing past itself — no
+/// status for the other spokes in its servers band, no directory rows for
+/// their agents. The hub now sends its own polled peers down the relay it
+/// already holds, and the spoke merges them exactly as a poller merges a
+/// pollee's `relayed_fleet`: validated, freshest-wins, routed via the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersHubFleetParams {
+    /// The hub's own name: the route the spoke records for these rows.
+    pub hub: String,
+    #[serde(default)]
+    pub fleet: Vec<RelayedFleetPeer>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedFleetPeer {
     /// Peer name (config-owned label on the origin's `[[peers]]`).
