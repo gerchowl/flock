@@ -30,6 +30,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod uplink;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -131,6 +132,10 @@ pub struct App {
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
+    /// Messages this server is handing up to its hub, and the requests parked
+    /// on them (#410). In memory on purpose: a parked request dies with the
+    /// connection that made it, so there is nothing a restart could resume.
+    pub(crate) uplink: crate::app::uplink::Uplink,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -861,6 +866,7 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
+            uplink: Default::default(),
             event_hub,
             last_focus,
             no_session,

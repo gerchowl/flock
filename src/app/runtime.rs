@@ -66,7 +66,7 @@ impl App {
         self.current_api_peer_pid = msg.peer_pid;
         let response = self.handle_api_request(msg.request);
         self.current_api_peer_pid = None;
-        let _ = msg.respond_to.send(response);
+        self.respond_or_park(msg.respond_to, response);
         self.sync_prefix_input_source(previous_mode);
         changed
     }
@@ -236,6 +236,7 @@ impl App {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the headless loop (the #25 dual-loop lesson).
         self.expire_undeliverable_messages();
+        self.expire_uplink();
         for update in &settled {
             self.emit_pane_state_update(update);
         }

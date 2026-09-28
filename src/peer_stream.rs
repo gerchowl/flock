@@ -91,6 +91,16 @@ fn line_is_push(line: &str) -> bool {
         .is_ok_and(|value| value.get("push").is_some_and(|push| !push.is_null()))
 }
 
+/// The push kind a spoke uses to hand a message up to its hub (#410).
+pub(crate) const UPLINK_PUSH: &str = "msg.uplink";
+
+/// Whether a push line is a message handed up rather than a summary. Parsed,
+/// like [`line_is_push`], never matched as text.
+fn push_is_uplink(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|value| value.get("push").and_then(|push| push.as_str()) == Some(UPLINK_PUSH))
+}
+
 /// Split the relay's inbound lines: pushes to the single-slot buffer, every
 /// other line to whoever is waiting on a response.
 ///
@@ -105,8 +115,19 @@ fn route_relay_lines<R: BufRead>(
     reader: R,
     responses: &std::sync::mpsc::Sender<String>,
     push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
+    uplinks: &std::sync::mpsc::Sender<String>,
 ) {
     for line in reader.lines().map_while(Result::ok) {
+        // #410: a message a spoke handed up is a push too, but NOT a summary.
+        // It must never land in the one-slot summary buffer — a summary would
+        // overwrite it, or it would answer a poll as though it were one — and
+        // it is not coalesced: every frame is a message someone is waiting on.
+        // Checked first, so the summary path below keeps its at-most-one-per-
+        // window shape untouched.
+        if push_is_uplink(&line) {
+            let _ = uplinks.send(line);
+            continue;
+        }
         // A push carries `push` where a response carries `id`, so routing
         // needs no guessing. Anything else is a response and belongs to
         // whoever is waiting on the channel — including a line that is not
@@ -153,8 +174,20 @@ impl PeerStream {
         let (tx, lines) = std::sync::mpsc::channel();
         let latest_push = Arc::new(Mutex::new(None));
         let push_slot = Arc::clone(&latest_push);
+        let (uplink_tx, uplink_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
-            route_relay_lines(BufReader::new(stdout), &tx, &push_slot);
+            route_relay_lines(BufReader::new(stdout), &tx, &push_slot, &uplink_tx);
+        });
+        // One thread per handed-up frame, off the reader: forwarding runs the
+        // hub's own `msg.send`, which can spend a whole ssh timeout on the
+        // next hop, and the reader must keep delivering poll responses while
+        // it does.
+        let spoke = peer.clone();
+        std::thread::spawn(move || {
+            for line in uplink_rx {
+                let spoke = spoke.clone();
+                std::thread::spawn(move || forward_uplinked_frame(&spoke, &line));
+            }
         });
 
         Ok(Self {
@@ -201,6 +234,57 @@ impl PeerStream {
             )),
             Err(RecvTimeoutError::Disconnected) => Err("connection closed".into()),
         }
+    }
+}
+
+/// Hub side of #410: deliver a message `spoke` handed up, then send the
+/// outcome back down the same relay.
+///
+/// Forwarded through this server's OWN socket as `msg.uplink_forward`, so the
+/// hub's ordinary `msg.send` does the delivery — one implementation, wherever
+/// the sender was — and the edge check (a spoke speaks only for its own host)
+/// runs on the main loop, where the spoke's reported host is known.
+fn forward_uplinked_frame(spoke: &PeerConfig, line: &str) {
+    let Some(frame) = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("frame").cloned())
+        .and_then(|frame| serde_json::from_value::<crate::api::schema::UplinkFrame>(frame).ok())
+    else {
+        crate::logging::uplink_result_undelivered(&spoke.name, "", "unparseable uplink frame");
+        return;
+    };
+    let uplink_id = frame.uplink_id.clone();
+    let forward = crate::api::schema::Request {
+        id: format!("uplink-forward:{uplink_id}"),
+        method: crate::api::schema::Method::MsgUplinkForward(
+            crate::api::schema::MsgUplinkForwardParams {
+                spoke: spoke.name.clone(),
+                message: frame.message,
+            },
+        ),
+    };
+    let response = match crate::api::client::ApiClient::local().request_value(&forward) {
+        Ok(response) => response,
+        Err(err) => serde_json::json!({
+            "id": forward.id,
+            "error": {
+                "code": "hub_unavailable",
+                "message": format!("the hub's own server did not answer: {err}"),
+            },
+        }),
+    };
+    crate::logging::uplink_frame_forwarded(
+        &spoke.name,
+        &uplink_id,
+        response.get("result").is_some(),
+    );
+    let result = serde_json::json!({
+        "uplink_id": uplink_id,
+        "hub": crate::app::short_host_name(),
+        "response": response,
+    });
+    if let Err(err) = request(spoke, "msg.uplink_result", result) {
+        crate::logging::uplink_result_undelivered(&spoke.name, &uplink_id, &err);
     }
 }
 
@@ -464,7 +548,8 @@ mod tests {
             r#"{"id":"stream-2","result":{"host":"anvil"}}"#,
             "\n",
         );
-        route_relay_lines(Cursor::new(wire), &tx, &push_slot);
+        let (uplink_tx, _uplinks) = std::sync::mpsc::channel();
+        route_relay_lines(Cursor::new(wire), &tx, &push_slot, &uplink_tx);
         drop(tx);
 
         let routed: Vec<String> = responses.iter().collect();
@@ -487,6 +572,44 @@ mod tests {
             pushed.as_ref().map(|(_, line)| line.as_str()),
             Some(r#"{"push":"peers.summary","result":{"host":"anvil"}}"#),
             "the push is delivered exactly once, to the push slot"
+        );
+    }
+
+    /// #410 pitfall 4: a message a spoke hands up rides the same relay as its
+    /// summaries, and neither may starve or clobber the other. The frame must
+    /// reach the forwarder, never the one-slot summary buffer, and the summary
+    /// slot must still hold the summary.
+    #[test]
+    fn an_uplinked_message_is_not_mistaken_for_a_summary_push() {
+        use std::io::Cursor;
+
+        let (tx, responses) = std::sync::mpsc::channel();
+        let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
+            Arc::new(Mutex::new(None));
+        let (uplink_tx, uplinks) = std::sync::mpsc::channel();
+
+        let wire = concat!(
+            r#"{"push":"peers.summary","result":{"host":"sage"}}"#,
+            "\n",
+            r#"{"push":"msg.uplink","frame":{"uplink_id":"u1"}}"#,
+            "\n",
+            r#"{"id":"stream-1","result":{"host":"sage"}}"#,
+            "\n",
+            r#"{"push":"msg.uplink","frame":{"uplink_id":"u2"}}"#,
+            "\n",
+        );
+        route_relay_lines(Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        drop(tx);
+        drop(uplink_tx);
+
+        let frames: Vec<String> = uplinks.iter().collect();
+        assert_eq!(frames.len(), 2, "every frame is forwarded, none coalesced");
+        assert!(frames[0].contains("u1") && frames[1].contains("u2"));
+        assert_eq!(responses.iter().count(), 1, "the response still pairs");
+        let pushed = push_slot.lock().expect("push slot").take();
+        assert!(
+            pushed.is_some_and(|(_, line)| line.contains("peers.summary")),
+            "the summary slot holds the summary, not a message"
         );
     }
 
@@ -535,10 +658,12 @@ mod tests {
         let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
             Arc::new(Mutex::new(None));
 
+        let (uplink_tx, _uplinks) = std::sync::mpsc::channel();
         route_relay_lines(
             Cursor::new("ssh: connect to host anvil port 22: \"push\"\n"),
             &tx,
             &push_slot,
+            &uplink_tx,
         );
         drop(tx);
 

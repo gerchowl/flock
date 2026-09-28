@@ -3301,6 +3301,51 @@ pub(crate) fn peer_push_subscribe_failed(err: &str) {
     );
 }
 
+/// A spoke handed a message up and the hub forwarded it (#410). Debug: one
+/// line per cross-host message on the hub, which is traffic, not an incident.
+pub(crate) fn uplink_frame_forwarded(spoke: &str, uplink_id: &str, answered: bool) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.uplink.forwarded",
+        subsystem = "peers",
+        outcome = if answered { "ok" } else { "error" },
+        spoke,
+        uplink_id,
+        "forwarded a message a spoke handed up"
+    );
+}
+
+/// The hub could not carry its answer back down to the spoke that handed a
+/// message up (#410). WARN: the spoke's sender is left waiting for an answer
+/// that will never come, and times out without learning what happened.
+pub(crate) fn uplink_result_undelivered(spoke: &str, uplink_id: &str, err: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.uplink.result_undelivered",
+        subsystem = "peers",
+        outcome = "error",
+        spoke,
+        uplink_id,
+        err,
+        "could not return an uplinked message's outcome to its spoke"
+    );
+}
+
+/// The relay's uplink pull stopped for good (#410): the local server refused
+/// `msg.uplink_take`, most likely because it predates it. WARN for the same
+/// reason as a refused push subscription — otherwise indistinguishable from a
+/// node that simply never sends anything.
+pub(crate) fn uplink_pull_stopped(err: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.uplink.pull_stopped",
+        subsystem = "peers",
+        outcome = "error",
+        err,
+        "relay uplink pull refused; this node cannot hand messages up to its hub"
+    );
+}
+
 pub(crate) fn config_edit_rollback_write_failed(target: &Path, err: &str) {
     tracing::warn!(
         event = "config.edit.rollback",
