@@ -517,6 +517,11 @@ impl App {
             return;
         }
 
+        if let AppEvent::MsgDeferralRelayed(relay) = ev {
+            self.handle_msg_deferral_relayed(relay);
+            return;
+        }
+
         if let AppEvent::WorktreeKillGateFinished(result) = ev {
             self.handle_worktree_kill_gate_finished(result);
             return;

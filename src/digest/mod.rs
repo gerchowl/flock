@@ -430,6 +430,19 @@ pub(crate) fn local_ymd_utc(now_ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// UTC `YYYY-MM-DDTHH:MM:SSZ` from ms-since-epoch — an absolute time a
+/// reader on any host, in any timezone, can act on without knowing ours.
+pub(crate) fn utc_timestamp(ms: u64) -> String {
+    let date = local_ymd_utc(ms);
+    let secs_of_day = (ms / 1000) % 86_400;
+    format!(
+        "{date}T{:02}:{:02}:{:02}Z",
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60
+    )
+}
+
 /// Howard Hinnant's algorithm (public domain): days since 1970-01-01 →
 /// civil `(year, month, day)`. Correct for the full Gregorian range;
 /// unit-tested against a handful of known dates.
@@ -673,6 +686,14 @@ mod tests {
         assert_eq!(local_ymd_utc(18_321 * 86_400_000), "2020-02-29");
         // Task's "today": 2026-08-01. Days = 20_666.
         assert_eq!(local_ymd_utc(20_666 * 86_400_000), "2026-08-01");
+    }
+
+    #[test]
+    fn utc_timestamp_carries_the_time_of_day() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        // 2026-08-01 13:05:09.750 UTC — sub-second truncates, never rounds up.
+        let ms = 20_666 * 86_400_000 + ((13 * 60 + 5) * 60 + 9) * 1000 + 750;
+        assert_eq!(utc_timestamp(ms), "2026-08-01T13:05:09Z");
     }
 
     #[test]

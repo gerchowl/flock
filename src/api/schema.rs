@@ -1148,6 +1148,11 @@ pub struct MsgMuteParams {
     pub pane: Option<String>,
     /// How long to stay muted. Clamped to the cap; 0 clears the mute.
     pub seconds: u64,
+    /// Why, in the muting agent's words (ADR-0018 §3). Quoted to every
+    /// sender the mute defers, next to the time it lifts. Sanitised and
+    /// bounded like a message body — it IS a message body, once it lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1695,6 +1700,9 @@ pub enum EventKind {
     MessageDelivered,
     MessageReplied,
     MessageRelayed,
+    /// ADR-0018 §3: a muted recipient answered a waiting message with an
+    /// automatic deferral. See `EventData::MessageDeferred`.
+    MessageDeferred,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -1766,6 +1774,7 @@ impl EventKind {
             | Self::MessageDelivered
             | Self::MessageReplied
             | Self::MessageRelayed
+            | Self::MessageDeferred
             | Self::CheckRan
             | Self::CheckFired
             | Self::CheckErrored
@@ -2103,6 +2112,14 @@ pub enum ResponseResult {
     MsgMute {
         /// When the mute expires, in ms since epoch; 0 when it was cleared.
         muted_until_ms: u64,
+        /// How many already-waiting senders this mute answered with a
+        /// deferral (ADR-0018 §3). NOT a delivery count: a local sender's
+        /// deferral is in its inbox, but one to another host counts when it
+        /// is queued for its ssh hop, and that hop can still fail. A failed
+        /// hop is logged and its message re-owed, so the next mute retries
+        /// it.
+        #[serde(default)]
+        deferred: usize,
     },
     PaneInfo {
         pane: PaneInfo,
@@ -2760,6 +2777,32 @@ pub enum EventData {
         /// hub too; this field is what says the hop was not direct.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<String>,
+    },
+    /// A muted recipient answered one message with an automatic `fyi`
+    /// deferral (ADR-0018 §3).
+    ///
+    /// Durable for two reasons. It is the audit fact that the sender was told
+    /// — a mute that answers nobody is the silence §3 exists to end, so the
+    /// answer has to be checkable. And `seed_from_events` folds it back into
+    /// the "already deferred" set, so a restart followed by a fresh mute does
+    /// not tell the same sender twice about the same message.
+    MessageDeferred {
+        /// The message that was deferred — also the deferral's `in_reply_to`.
+        correlation_id: String,
+        /// The automatic reply's own id.
+        deferral_correlation_id: String,
+        /// The muted recipient's pane.
+        pane: String,
+        /// When the mute lifts, in ms since epoch — the deadline the body
+        /// states.
+        muted_until_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// `[[peers]]` entry the deferral was relayed through, when the
+        /// sender is on another host. Absent for a local sender.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+        deferred_at_ms: u64,
     },
     MessageDelivered {
         correlation_id: String,
