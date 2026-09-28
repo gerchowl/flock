@@ -212,6 +212,19 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
     agents::detect(agent, screen_content)
 }
 
+/// Whether the agent's input box is on screen and EMPTY — `None` when this
+/// agent's box cannot be read at all (ADR-0018 §2). The idle wake types only
+/// into an empty box: text already there is somebody's unsent draft, and a
+/// sentence appended to it would be submitted along with it.
+pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool> {
+    match agent {
+        Agent::Claude => {
+            agents::claude_code::prompt_input(screen_content).map(|typed| typed.is_empty())
+        }
+        _ => None,
+    }
+}
+
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
     agent.is_some_and(|agent| agents::should_skip_state_update(agent, screen_content))
 }
@@ -1150,6 +1163,21 @@ mod tests {
     fn claude_idle_prompt_box() {
         let screen = "Task complete.\n─────────────\n❯ \n─────────────";
         assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_prompt_input_reads_what_is_typed_and_only_that() {
+        let empty = "Task complete.\n─────────────\n❯\u{a0}\n─────────────\n  ~/P/flock";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, empty), Some(true));
+
+        let draft = "Task complete.\n─────────────\n❯ half a thought\n─────────────";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, draft), Some(false));
+
+        let wrapped = "─────────────\n❯ \n  continued draft\n─────────────";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, wrapped), Some(false));
+
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, "no box at all"), None);
+        assert_eq!(agent_prompt_is_empty(Agent::Codex, empty), None);
     }
 
     #[test]

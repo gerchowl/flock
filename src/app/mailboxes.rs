@@ -341,6 +341,27 @@ impl MailboxRegistry {
         self.queues.get(pane).map_or(0, VecDeque::len)
     }
 
+    /// Panes holding at least one message worth waking an agent for
+    /// (ADR-0018 §1). The idle wake's per-tick question, answered from memory
+    /// and without allocating.
+    pub(crate) fn wakeable_panes(&self) -> impl Iterator<Item = &str> {
+        self.queues
+            .iter()
+            .filter(|(_, queue)| queue.iter().any(|message| intent_wakes(message.intent)))
+            .map(|(pane, _)| pane.as_str())
+    }
+
+    /// Correlation ids of one pane's queued messages that may wake it.
+    pub(crate) fn wakeable_ids(&self, pane: &str) -> Vec<String> {
+        self.queues.get(pane).map_or_else(Vec::new, |queue| {
+            queue
+                .iter()
+                .filter(|message| intent_wakes(message.intent))
+                .map(|message| message.correlation_id.clone())
+                .collect()
+        })
+    }
+
     pub(crate) fn queued_infos(
         &self,
         pane: Option<&str>,
@@ -364,6 +385,13 @@ impl MailboxRegistry {
         messages.sort_by_key(|message| message.enqueued_at_ms);
         messages
     }
+}
+
+/// Whether a message of this intent may cost its recipient a turn
+/// (ADR-0018 §1): everything but `fyi`. An `fyi` still waits in the inbox and
+/// is counted by a wake some other message earned — it just never earns one.
+pub(crate) fn intent_wakes(intent: MsgIntent) -> bool {
+    !matches!(intent, MsgIntent::Fyi)
 }
 
 #[cfg(test)]

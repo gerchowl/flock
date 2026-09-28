@@ -393,6 +393,60 @@ pub(crate) fn transcript_unreadable(session_id: &str, reason: &str) {
     );
 }
 
+/// An idle wake decided not to type (ADR-0018 §2). DEBUG, and emitted only
+/// when a pane's reason CHANGES: a suppression can hold for as long as an
+/// agent works, and the tick that re-evaluates it runs every loop.
+pub(crate) fn idle_wake_suppressed(pane: &str, reason: &str) {
+    tracing::debug!(
+        event = "msg.idle_wake.suppressed",
+        subsystem = "msg",
+        outcome = "skipped",
+        pane,
+        reason,
+        "idle wake suppressed"
+    );
+}
+
+/// The wake sentence was typed; its Enter follows one gap later.
+pub(crate) fn idle_wake_typed(pane: &str, count: usize) {
+    tracing::debug!(
+        event = "msg.idle_wake.typed",
+        subsystem = "msg",
+        outcome = "ok",
+        pane,
+        count,
+        "idle wake typed"
+    );
+}
+
+/// An idle agent was woken. INFO: flock typing into a pane on its own
+/// initiative is exactly what an operator must be able to find afterwards,
+/// and it happens at most once per batch of mail.
+pub(crate) fn idle_wake_fired(pane: &str, count: usize) {
+    tracing::info!(
+        event = "msg.idle_wake.fired",
+        subsystem = "msg",
+        outcome = "ok",
+        pane,
+        count,
+        "idle agent woken for its mail"
+    );
+}
+
+/// A typed wake whose Enter was withheld because something changed in the
+/// gap — the sentence is left unsubmitted in the prompt. INFO for the same
+/// reason as a fired one: it is flock text sitting in someone's pane.
+pub(crate) fn idle_wake_abandoned(pane: &str, reason: &str) {
+    tracing::info!(
+        event = "msg.idle_wake.abandoned",
+        subsystem = "msg",
+        outcome = "skipped",
+        pane,
+        reason,
+        "idle wake typed but not submitted"
+    );
+}
+
 pub(crate) fn pane_spawned(pane_id: u32, pid: u32) {
     tracing::info!(
         event = "pane.spawned",

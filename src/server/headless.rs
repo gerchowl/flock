@@ -3400,6 +3400,8 @@ impl HeadlessServer {
         // mirrored in the TUI runtime loop (the #25 dual-loop lesson).
         self.app.expire_undeliverable_messages();
         self.app.expire_uplink();
+        // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
+        self.app.tick_idle_wakes(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }

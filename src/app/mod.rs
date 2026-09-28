@@ -10,6 +10,7 @@ mod agents;
 mod api;
 pub(crate) mod fleet_pause;
 pub(crate) mod hibernation;
+pub(crate) mod idle_wake;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 mod api_helpers;
@@ -136,6 +137,8 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
+    pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -867,6 +870,7 @@ impl App {
                 mailboxes
             },
             uplink: Default::default(),
+            idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             event_hub,
             last_focus,
             no_session,

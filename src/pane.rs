@@ -709,8 +709,42 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// When input last reached this pane from anyone but flock itself
+    /// (ADR-0018 §2) — the idle wake's "flock does not type over a human".
+    operator_input: OperatorInputClock,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
+}
+
+/// The last moment operator input was written to a pane (ADR-0018 §2).
+///
+/// Stamped at the one place every forwarded write passes through — the
+/// runtime's `send_bytes` / `try_send_bytes` — rather than at each caller, so
+/// a keystroke from an attached client, a paste, a mouse report and an
+/// `agent.send` / `pane.send-text` API call all count without each of those
+/// paths having to remember to. The idle wake writes through
+/// [`PaneRuntime::try_send_flock_authored`], which does NOT stamp: if flock's
+/// own sentence reset the quiet window, the wake would suppress its own Enter.
+///
+/// Anything else flock writes on its own (a resume command, a focus report)
+/// does stamp. That errs toward not typing, which is the safe direction.
+#[derive(Debug, Default)]
+struct OperatorInputClock {
+    last: Cell<Option<std::time::Instant>>,
+}
+
+impl OperatorInputClock {
+    fn stamp(&self) {
+        self.stamp_at(std::time::Instant::now());
+    }
+
+    fn stamp_at(&self, at: std::time::Instant) {
+        self.last.set(Some(at));
+    }
+
+    fn last(&self) -> Option<std::time::Instant> {
+        self.last.get()
+    }
 }
 
 enum PaneRuntimeIo {
@@ -1414,6 +1448,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            operator_input: OperatorInputClock::default(),
             detect_handle,
         })
     }
@@ -1839,6 +1874,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            operator_input: OperatorInputClock::default(),
             detect_handle,
         })
     }
@@ -1995,11 +2031,35 @@ impl PaneRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.operator_input.stamp();
         self.io.send_bytes(bytes).await
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.operator_input.stamp();
         self.io.try_send_bytes(bytes)
+    }
+
+    /// Write bytes flock authored on its own initiative, WITHOUT counting them
+    /// as operator input. Only the idle wake (ADR-0018 §2) uses this; see
+    /// [`OperatorInputClock`] for why everything else stamps.
+    pub fn try_send_flock_authored(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.io.try_send_bytes(bytes)
+    }
+
+    /// When operator input last reached this pane, if it ever has.
+    pub fn last_operator_input_at(&self) -> Option<std::time::Instant> {
+        self.operator_input.last()
+    }
+
+    /// Pretend operator input arrived at `at`, so a quiet-window test does not
+    /// have to sleep through the window.
+    #[cfg(test)]
+    pub(crate) fn test_stamp_operator_input_at(&self, at: std::time::Instant) {
+        self.operator_input.stamp_at(at);
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -2196,6 +2256,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                operator_input: OperatorInputClock::default(),
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2526,6 +2587,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            operator_input: OperatorInputClock::default(),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2554,6 +2616,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            operator_input: OperatorInputClock::default(),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
