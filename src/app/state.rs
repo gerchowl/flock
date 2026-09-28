@@ -2777,7 +2777,25 @@ impl AppState {
         //
         // Ordered by host key: the cache is a HashMap, and iterating it
         // directly reshuffles these rows between renders.
-        let mut relayed: Vec<_> = self.relayed_fleet_cache.iter().collect();
+        //
+        // #424: a hub-pushed row about the client's HOME is left out while a
+        // snapshot is carried. The origin slot stands for that machine and
+        // absorbs such readings as they arrive, so this only skips one stored
+        // before the client attached, which would render home twice.
+        let origin_key = self
+            .fleet_snapshot
+            .as_ref()
+            .map(|snapshot| crate::peers::normalized_host_key(&snapshot.origin));
+        let mut relayed: Vec<_> = self
+            .relayed_fleet_cache
+            .iter()
+            .filter(|(_, entry)| {
+                !(entry.hub_pushed
+                    && origin_key.as_deref().is_some_and(|origin| {
+                        crate::peers::normalized_host_key(&row_host_key(&entry.peer)) == origin
+                    }))
+            })
+            .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         candidates.extend(relayed.into_iter().map(|(host_key, entry)| {
             (

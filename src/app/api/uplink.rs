@@ -1320,6 +1320,7 @@ mod tests {
             Method::PeersHubFleet(crate::api::schema::PeersHubFleetParams {
                 hub: "attacker".into(),
                 fleet: Vec::new(),
+                hub_self: None,
             }),
         ] {
             let response = value(&app.handle_api_request(Request {

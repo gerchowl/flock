@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn servers_band_renders_self_row_first_with_two_line_peers() {
+    fn servers_band_renders_self_row_in_place_with_two_line_peers() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1325,21 +1325,27 @@ mod tests {
         assert_ne!(header, Rect::default());
         assert!(buffer_row_text(buffer, header, header.y).contains("servers"));
 
-        // The local server anchors the band: first row, marked as current,
-        // with the status line's health glyphs on its second line.
-        let self_title = buffer_row_text(buffer, header, header.y + 1);
+        // The peer renders on its two-line hit-area; the self rows carry no
+        // card, so clicking them stays a no-op. Which of the two comes first
+        // is the fleet-wide host order (#422), not "self on top".
+        let card = &app.view.server_card_areas[0];
+        assert_eq!(card.rect.height, 2);
+        let self_y = if card.rect.y == header.y + 1 {
+            header.y + 3
+        } else {
+            assert_eq!(card.rect.y, header.y + 3);
+            header.y + 1
+        };
+        // The local server's row carries the status line's health glyphs on
+        // its second line.
+        let self_title = buffer_row_text(buffer, header, self_y);
         assert!(
             self_title.contains(&crate::app::short_host_name()),
             "{self_title}"
         );
-        let self_health = buffer_row_text(buffer, header, header.y + 2);
+        let self_health = buffer_row_text(buffer, header, self_y + 1);
         assert!(self_health.contains("\u{f0ee0}  42%"), "{self_health}");
 
-        // The peer renders below on its two-line hit-area; the self rows
-        // above it carry no card, so clicking them stays a no-op.
-        let card = &app.view.server_card_areas[0];
-        assert_eq!(card.rect.y, header.y + 3);
-        assert_eq!(card.rect.height, 2);
         let peer_title = buffer_row_text(buffer, card.rect, card.rect.y);
         assert!(peer_title.contains("anvil"), "{peer_title}");
         assert!(peer_title.contains("34ms"), "{peer_title}");

@@ -414,11 +414,23 @@ pub fn request(
 /// up, from pollee to poller, so a spoke that polls nobody knew nothing past
 /// itself. A spoke too old to know the method answers with an error line,
 /// which is ignored: it simply keeps its old, empty view.
-pub fn push_hub_fleet(peer: &PeerConfig, fleet: Vec<crate::api::schema::RelayedFleetPeer>) {
-    let params = serde_json::json!({
-        "hub": crate::app::short_host_name(),
-        "fleet": fleet,
-    });
+///
+/// `hub_self` is this hub's own row (#424): `fleet` never includes the hub, so
+/// without it a client that switched here from the hub only had a copy of the
+/// hub frozen at switch time.
+pub fn push_hub_fleet(
+    peer: &PeerConfig,
+    fleet: Vec<crate::api::schema::RelayedFleetPeer>,
+    hub_self: Option<Box<crate::api::schema::RelayedFleetPeer>>,
+) {
+    let params = crate::api::schema::PeersHubFleetParams {
+        hub: crate::app::short_host_name(),
+        fleet,
+        hub_self,
+    };
+    let Ok(params) = serde_json::to_value(params) else {
+        return;
+    };
     let _ = request_over(peer, "peers.hub_fleet", params, false);
 }
 

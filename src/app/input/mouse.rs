@@ -2177,11 +2177,17 @@ mod tests {
         app.state.peer_summaries = vec![peer];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
 
-        // The self row (the two lines under the header) has no hit-area:
-        // clicking yourself must never request a server switch.
+        // The self row has no hit-area: clicking yourself must never request
+        // a server switch. It sorts among the peers by host (#422), so it is
+        // whichever two of the band's four lines the peer's card leaves.
         let header = app.state.view.servers_header_rect;
         assert_ne!(header, Rect::default());
-        for row in [header.y + 1, header.y + 2] {
+        let peer_rect = app.state.view.server_card_areas[0].rect;
+        let self_rows: Vec<u16> = (header.y + 1..header.y + 5)
+            .filter(|row| !(peer_rect.y..peer_rect.y + peer_rect.height).contains(row))
+            .collect();
+        assert_eq!(self_rows.len(), 2, "{self_rows:?}");
+        for row in self_rows {
             app.handle_mouse(mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 header.x + 2,
@@ -2465,12 +2471,21 @@ mod tests {
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
 
-        // Right-click the self row (the two lines under the band header).
+        // Right-click the self row: the band line no card covers (#422 sorts
+        // self among the peers, so it is not necessarily first).
         let header = app.state.view.servers_header_rect;
+        let cards = app.state.view.server_card_areas.clone();
+        let self_y = (header.y + 1..header.y + 5)
+            .find(|y| {
+                !cards
+                    .iter()
+                    .any(|card| (card.rect.y..card.rect.y + card.rect.height).contains(y))
+            })
+            .expect("a self row");
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Right),
             header.x + 2,
-            header.y + 1,
+            self_y,
         ));
         assert_eq!(app.state.mode, Mode::ContextMenu);
         handle_context_menu_key(
@@ -2508,13 +2523,21 @@ mod tests {
             origin_summary: None,
             received_at: std::time::Instant::now(),
         });
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
+        // Tall enough that the whole band (home sorts after anvil and self)
+        // gets its rows.
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 60));
 
-        // The home row is the first card with a snapshot present. Its
-        // origin's workspaces are never in the spaces list, so "only this
-        // server" would always show nothing — no menu.
-        let card = app.state.view.server_card_areas[0].clone();
-        assert_eq!(card.target, crate::app::state::PeerSwitchRequest::Home);
+        // The home row's card, wherever it sorts (#422). Its origin's
+        // workspaces are never in the spaces list, so "only this server" would
+        // always show nothing — no menu.
+        let card = app
+            .state
+            .view
+            .server_card_areas
+            .iter()
+            .find(|card| card.target == crate::app::state::PeerSwitchRequest::Home)
+            .expect("a home card")
+            .clone();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Right),
             card.rect.x + 2,

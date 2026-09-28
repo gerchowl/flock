@@ -403,6 +403,67 @@ impl FleetSnapshotState {
     }
 }
 
+impl FleetSnapshotState {
+    /// Take the rows a hub pushed down that are about this snapshot's ORIGIN
+    /// (#424), and hand back the rest for the ordinary relay merge.
+    ///
+    /// The origin summary is the only view a spoke has of the server the
+    /// client came from, and it was stamped once, at switch time. A fresher
+    /// reading of that same machine replaces it in place, so renames and new
+    /// spaces there show up here, while the row keeps what makes it the home
+    /// row: it still switches via the reserved home target, never an ssh dial,
+    /// whatever target the reading names. Storing such a reading as a relayed
+    /// row instead would render the home machine twice.
+    pub fn absorb_origin_rows(
+        &mut self,
+        rows: Vec<crate::api::schema::RelayedFleetPeer>,
+    ) -> Vec<crate::api::schema::RelayedFleetPeer> {
+        let origin_key = normalized_host_key(&self.origin);
+        let (about_origin, rest): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| {
+            normalized_host_key(row.host.as_deref().unwrap_or(&row.name)) == origin_key
+        });
+        for row in about_origin {
+            let Some(entry) = relayed_entry_from_wire(row) else {
+                continue;
+            };
+            let mut reading = entry.peer;
+            let fresher = match (
+                self.origin_summary
+                    .as_ref()
+                    .and_then(PeerSummaryState::carried_age_secs),
+                reading.carried_age_secs(),
+            ) {
+                (Some(current), Some(new)) => new <= current,
+                (None, _) => true,
+                (Some(_), None) => false,
+            };
+            if !fresher {
+                continue;
+            }
+            reading.ssh_target = crate::protocol::HOME_SWITCH_TARGET.to_string();
+            reading.proxy_jump = None;
+            self.origin_summary = Some(reading);
+        }
+        rest
+    }
+}
+
+/// A host identity every viewer derives the same way (#422): lowercased, any
+/// `user@` prefix dropped, and cut at the first dot so `sage`, `sage.local` and
+/// a tailnet `sage.tail1234.ts.net` are one machine. An IP address is kept
+/// whole — cutting it would fold unrelated hosts together.
+pub fn normalized_host_key(raw: &str) -> String {
+    let host = raw.rsplit_once('@').map_or(raw, |(_, host)| host).trim();
+    let lower = host.to_ascii_lowercase();
+    if lower.parse::<std::net::IpAddr>().is_ok() {
+        return lower;
+    }
+    match lower.split_once('.') {
+        Some((short, _)) if !short.is_empty() => short.to_string(),
+        _ => lower,
+    }
+}
+
 /// Carried-snapshot peer cap (env-var transport between attach legs — see
 /// `to_wire`). Far above any realistic personal fleet.
 pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
@@ -2469,5 +2530,16 @@ Last login: banner noise
             tracker.should_poll_now("sage", t0 + Duration::from_secs(9), Duration::from_secs(2)),
             "peer dropped from config, then re-added, starts fresh"
         );
+    }
+
+    #[test]
+    fn normalized_host_key_is_one_spelling_per_machine() {
+        // #422: every viewer must derive the same key for the same machine.
+        for raw in ["sage", "SAGE", "sage.local", "lars@sage.tail1234.ts.net"] {
+            assert_eq!(normalized_host_key(raw), "sage", "{raw}");
+        }
+        // An address is kept whole: cutting it would fold unrelated hosts.
+        assert_eq!(normalized_host_key("100.64.0.7"), "100.64.0.7");
+        assert_eq!(normalized_host_key("lars@::1"), "::1");
     }
 }
