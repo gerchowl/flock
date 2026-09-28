@@ -868,11 +868,10 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::CloseWorkspace => {
             if let Some(ws_idx) = workspace_action_target(state, context) {
-                state.selected = ws_idx;
                 if state.confirm_close {
-                    super::modal::open_confirm_close(state);
+                    super::modal::open_confirm_close(state, ws_idx);
                 } else {
-                    state.close_selected_workspace();
+                    state.close_workspace(ws_idx);
                     leave_navigate_mode(state);
                 }
             }
@@ -2321,7 +2320,7 @@ last_pane = "prefix+tab"
 
         execute_navigate_action(&mut state, NavigateAction::ClosePane);
 
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.confirm_close_target_idx(), 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
         assert_eq!(state.workspaces.len(), 2);
     }

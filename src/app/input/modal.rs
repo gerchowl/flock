@@ -627,23 +627,27 @@ pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
     }
 }
 
-pub(super) fn open_confirm_close(state: &mut AppState) {
+pub(super) fn open_confirm_close(state: &mut AppState, ws_idx: usize) {
     state.confirm_close_whole_space = false;
+    state.confirm_close_target = state.workspaces.get(ws_idx).map(|ws| ws.id.clone());
     state.mode = Mode::ConfirmClose;
 }
 
 /// Confirm-close for the whole-space affordance (#62): on accept, close every
 /// member of the selected workspace's space.
-pub(super) fn open_confirm_close_space(state: &mut AppState) {
+pub(super) fn open_confirm_close_space(state: &mut AppState, ws_idx: usize) {
     state.confirm_close_whole_space = true;
+    state.confirm_close_target = state.workspaces.get(ws_idx).map(|ws| ws.id.clone());
     state.mode = Mode::ConfirmClose;
 }
 
 pub(super) fn confirm_close_accept(state: &mut AppState) {
+    let target = state.confirm_close_target_idx();
+    state.confirm_close_target = None;
     if std::mem::take(&mut state.confirm_close_whole_space) {
-        state.close_selected_space();
+        state.close_space_of(target);
     } else {
-        state.close_selected_workspace();
+        state.close_workspace(target);
     }
     if state.workspaces.is_empty() {
         state.mode = Mode::Navigate;
@@ -654,6 +658,7 @@ pub(super) fn confirm_close_accept(state: &mut AppState) {
 
 pub(super) fn confirm_close_cancel(state: &mut AppState) {
     state.confirm_close_whole_space = false;
+    state.confirm_close_target = None;
     state.mode = Mode::Navigate;
 }
 
@@ -715,11 +720,10 @@ pub(super) fn apply_context_menu_action(
             Some("Close group" | "Close local checkout"),
         ) => {
             if let Some(head_idx) = crate::ui::space_head_idx(state, &key) {
-                state.selected = head_idx;
                 if state.confirm_close {
-                    open_confirm_close_space(state);
+                    open_confirm_close_space(state, head_idx);
                 } else {
-                    state.close_selected_space();
+                    state.close_space_of(head_idx);
                     state.mode = Mode::Navigate;
                 }
             } else {
@@ -783,11 +787,10 @@ pub(super) fn apply_context_menu_action(
             | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close"),
         ) => {
-            state.selected = ws_idx;
             if state.confirm_close {
-                open_confirm_close(state);
+                open_confirm_close(state, ws_idx);
             } else {
-                state.close_selected_workspace();
+                state.close_workspace(ws_idx);
                 state.mode = Mode::Navigate;
             }
         }
@@ -795,11 +798,10 @@ pub(super) fn apply_context_menu_action(
         // the space-row (group head) context menu and closes every member,
         // unlike plain "Close" which now closes only the selected workspace.
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Close group")) => {
-            state.selected = ws_idx;
             if state.confirm_close {
-                open_confirm_close_space(state);
+                open_confirm_close_space(state, ws_idx);
             } else {
-                state.close_selected_space();
+                state.close_space_of(ws_idx);
                 state.mode = Mode::Navigate;
             }
         }
@@ -1395,7 +1397,7 @@ mod tests {
 
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
 
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.confirm_close_target_idx(), 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
 
         confirm_close_accept(&mut state);
@@ -1442,7 +1444,7 @@ mod tests {
 
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
 
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.confirm_close_target_idx(), 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
         assert_eq!(state.workspaces.len(), 2);
     }

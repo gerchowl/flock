@@ -725,6 +725,7 @@ impl App {
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
             confirm_close_whole_space: false,
+            confirm_close_target: None,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -4302,6 +4303,87 @@ sidebar_pane_gap = 99
         assert!(app.state.workspaces.is_empty());
     }
 
+    fn pane_close_request(app: &mut App, ws_idx: usize) -> serde_json::Value {
+        let pane = app.state.workspaces[ws_idx].tabs[0].root_pane;
+        let pane_id = app.pane_info(ws_idx, pane).unwrap().pane_id;
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_close_419".into(),
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id,
+            }),
+        });
+        serde_json::from_str(&response).unwrap()
+    }
+
+    /// Workspaces `w0..wN`, each in the linked-worktree space its `keys` entry
+    /// names (empty = none).
+    fn app_with_spaces_419(keys: &[&str]) -> App {
+        let mut app = test_app();
+        app.state.workspaces = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| {
+                let mut ws = Workspace::test_new(&format!("w{idx}"));
+                if !key.is_empty() {
+                    ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+                        key: (*key).into(),
+                        label: (*key).into(),
+                        repo_root: format!("/repo/{key}").into(),
+                        checkout_path: format!("/repo/{key}-{idx}").into(),
+                        is_linked_worktree: true,
+                    });
+                }
+                ws
+            })
+            .collect();
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    fn focus_names(app: &App) -> (String, String) {
+        let name = |idx: Option<usize>| {
+            idx.and_then(|idx| app.state.workspaces.get(idx))
+                .map(|ws| ws.display_name())
+                .unwrap_or_default()
+        };
+        (name(app.state.active), name(Some(app.state.selected)))
+    }
+
+    #[test]
+    fn pane_close_request_emptying_a_background_workspace_leaves_the_operator_in_place() {
+        // #419: the agent's close empties `w0`, a LOWER index than both the
+        // operator's active `w2` and their sidebar cursor on `w1`.
+        let mut app = app_with_spaces_419(&["", "", ""]);
+        app.state.active = Some(2);
+        app.state.selected = 1;
+
+        let response = pane_close_request(&mut app, 0);
+
+        assert_eq!(response["result"]["type"], "ok");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(focus_names(&app), ("w2".to_string(), "w1".to_string()));
+    }
+
+    #[test]
+    fn keyboard_and_socket_close_of_the_active_space_land_on_the_same_workspace() {
+        // #419: one focus rule for every door. `w3` is active and the
+        // operator's cursor rests on another row.
+        let setup = || {
+            let mut app = app_with_spaces_419(&["X", "Y", "Y", "X"]);
+            app.state.active = Some(3);
+            app.state.selected = 2;
+            app
+        };
+        let mut keyboard = setup();
+        keyboard.state.close_pane();
+        let mut socket = setup();
+        pane_close_request(&mut socket, 3);
+
+        assert_eq!(keyboard.state.workspaces.len(), 3);
+        assert_eq!(focus_names(&keyboard), focus_names(&socket));
+        assert_eq!(focus_names(&socket), ("w0".to_string(), "w2".to_string()));
+    }
+
     #[test]
     fn pane_close_request_requires_confirmation_before_closing_parent_worktree_group() {
         let mut app = test_app();
@@ -4339,7 +4421,10 @@ sidebar_pane_gap = 99
 
         assert_eq!(response["error"]["code"], "confirmation_required");
         assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.selected, 0);
+        // #419: an agent's request names the dialog's target, not the
+        // operator's cursor.
+        assert_eq!(app.state.confirm_close_target_idx(), 0);
+        assert_eq!(app.state.selected, 1);
         assert_eq!(app.state.workspaces.len(), 2);
     }
 

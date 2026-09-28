@@ -2762,29 +2762,43 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub fn close_selected_workspace(&mut self) {
-        // Close ONLY the selected workspace (#62): closing the main checkout no
-        // longer tears down the whole space — the remaining worktree members and
-        // remote rows keep the space alive on their own membership keys. The
-        // close-whole-space affordance lives on the space row's context menu
-        // (`close_selected_space`).
-        if self.workspaces.is_empty() {
+        self.close_workspace(self.selected);
+    }
+
+    /// Close the workspace at `ws_idx` (#419). Every door names its target by
+    /// index here — none writes the operator's `selected` to name it.
+    ///
+    /// Closes ONLY that workspace (#62): closing the main checkout no longer
+    /// tears down the whole space — the remaining worktree members and remote
+    /// rows keep the space alive on their own membership keys. The
+    /// close-whole-space affordance is [`Self::close_space_of`].
+    pub(crate) fn close_workspace(&mut self, ws_idx: usize) {
+        if ws_idx >= self.workspaces.len() {
             return;
         }
-        self.close_workspace_indices(vec![self.selected]);
+        self.close_workspace_indices(vec![ws_idx]);
     }
 
     /// Close every member of the selected workspace's space (#62) — the
     /// explicit close-whole-space affordance from the space row's context menu.
     /// Falls back to closing just the selected workspace when it has no space
     /// membership.
+    #[cfg(test)]
     pub fn close_selected_space(&mut self) {
-        if self.workspaces.is_empty() {
+        self.close_space_of(self.selected);
+    }
+
+    /// Close every member of `ws_idx`'s space, or just `ws_idx` when it has no
+    /// space membership. The index-named twin of [`Self::close_selected_space`].
+    pub(crate) fn close_space_of(&mut self, ws_idx: usize) {
+        if ws_idx >= self.workspaces.len() {
             return;
         }
         let indices = self
             .workspaces
-            .get(self.selected)
+            .get(ws_idx)
             .and_then(|ws| ws.worktree_space_here())
             .map(|space| {
                 // #197: the action view on both sides — closing "this space"
@@ -2801,14 +2815,22 @@ impl AppState {
                     .collect::<Vec<_>>()
             })
             .filter(|indices| !indices.is_empty())
-            .unwrap_or_else(|| vec![self.selected]);
+            .unwrap_or_else(|| vec![ws_idx]);
         self.close_workspace_indices(indices);
     }
 
     /// Remove the given workspace indices, dropping their unattached terminals
     /// and re-anchoring selection/active/scroll. Shared by single-workspace and
     /// whole-space closes (#62).
+    ///
+    /// Focus follows one rule whichever door the close came through (#419):
+    /// `active` and `selected` are carried across the removal by workspace id,
+    /// so closing a space the operator is not on never moves them. Only when
+    /// the active space itself closes does focus move, to
+    /// [`Self::close_successor_id`].
     pub(crate) fn close_workspace_indices(&mut self, close_indices: Vec<usize>) {
+        let mut close_indices = close_indices;
+        close_indices.retain(|idx| *idx < self.workspaces.len());
         if close_indices.is_empty() {
             return;
         }
@@ -2829,9 +2851,30 @@ impl AppState {
                     .push(crate::app::state::PendingUiEvent::WorkspaceClosed { workspace_id });
             }
         }
-        let mut close_indices = close_indices;
         close_indices.sort_unstable();
         close_indices.dedup();
+
+        let closed_ids = close_indices
+            .iter()
+            .map(|idx| self.workspaces[*idx].id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let id_at = |state: &Self, idx: Option<usize>| {
+            idx.and_then(|idx| state.workspaces.get(idx))
+                .map(|ws| ws.id.clone())
+        };
+        let selected_id = id_at(self, Some(self.selected)).filter(|id| !closed_ids.contains(id));
+        let active_id = match self.active {
+            Some(idx) => id_at(self, Some(idx)).filter(|id| !closed_ids.contains(id)),
+            None => selected_id.clone(),
+        };
+        // With no surviving active space, anchor the successor on the closed
+        // active one, or on the closed selection when nothing was active.
+        let successor = if active_id.is_some() {
+            None
+        } else {
+            self.close_successor_id(self.active.unwrap_or(self.selected), &closed_ids)
+        };
+
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
         }
@@ -2843,10 +2886,21 @@ impl AppState {
             self.tab_scroll = 0;
             self.tab_scroll_follow_active = true;
         } else {
-            if self.selected >= self.workspaces.len() {
-                self.selected = self.workspaces.len() - 1;
+            let index_of =
+                |state: &Self, id: &str| state.workspaces.iter().position(|ws| ws.id == id);
+            let active = active_id
+                .as_deref()
+                .and_then(|id| index_of(self, id))
+                .or_else(|| successor.as_deref().and_then(|id| index_of(self, id)))
+                .unwrap_or(0);
+            if active_id.is_none() {
+                self.restore_history_focus(active);
             }
-            self.set_active_workspace(Some(self.selected));
+            self.selected = selected_id
+                .as_deref()
+                .and_then(|id| index_of(self, id))
+                .unwrap_or(active);
+            self.set_active_workspace(Some(active));
             self.workspace_scroll = self
                 .workspace_scroll
                 .min(self.workspaces.len().saturating_sub(1));
@@ -2858,6 +2912,92 @@ impl AppState {
         // now-orphaned collapse state so a future same-key checkout starts
         // expanded (#155).
         self.reconcile_collapsed_space_keys();
+    }
+
+    /// Where focus goes when the active space closes (#419), as a workspace
+    /// id resolved BEFORE the removal. `anchor` is the closing active index.
+    ///
+    /// 1. the previously focused space, from the same history `last_pane`
+    ///    walks, when it is still open;
+    /// 2. else the nearest open sibling in the same repo space, by display
+    ///    order;
+    /// 3. else the nearest open workspace in display order — never `Vec`
+    ///    order, which is not what the sidebar shows.
+    fn close_successor_id(
+        &self,
+        anchor: usize,
+        closed_ids: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        if let Some(previous) = self.previous_pane_focus.as_ref() {
+            if !closed_ids.contains(&previous.workspace_id)
+                && self
+                    .workspaces
+                    .iter()
+                    .any(|ws| ws.id == previous.workspace_id)
+            {
+                return Some(previous.workspace_id.clone());
+            }
+        }
+
+        // Display order, with rows hidden inside a collapsed group appended so
+        // an anchor or sibling that is out of view still has a position.
+        let mut order = self.visible_workspace_order();
+        let hidden = (0..self.workspaces.len())
+            .filter(|idx| !order.contains(idx))
+            .collect::<Vec<_>>();
+        order.extend(hidden);
+        let anchor_pos = order.iter().position(|idx| *idx == anchor).unwrap_or(0);
+        let open = |idx: &usize| !closed_ids.contains(&self.workspaces[*idx].id);
+        // Nearest by display distance; a tie goes to the row below, the one
+        // that slides up into the closed row's place.
+        let nearest = |candidates: &mut dyn Iterator<Item = (usize, usize)>| {
+            candidates
+                .min_by_key(|(pos, _)| (pos.abs_diff(anchor_pos), *pos < anchor_pos))
+                .map(|(_, idx)| self.workspaces[idx].id.clone())
+        };
+
+        let anchor_key = self
+            .workspaces
+            .get(anchor)
+            .and_then(|ws| ws.repo_group_key());
+        if let Some(key) = anchor_key {
+            let sibling = nearest(
+                &mut order
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, idx)| open(idx))
+                    .filter(|(_, idx)| self.workspaces[*idx].repo_group_key() == Some(key)),
+            );
+            if sibling.is_some() {
+                return sibling;
+            }
+        }
+        nearest(
+            &mut order
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, idx)| open(idx)),
+        )
+    }
+
+    /// When the successor came from the focus history, land on the very pane
+    /// that was focused there, not just its workspace. The history slot is
+    /// spent either way: the space it would toggle back to is gone.
+    fn restore_history_focus(&mut self, ws_idx: usize) {
+        if let Some(target) = self.previous_pane_focus.take() {
+            if let Some((target_ws, tab_idx)) = self.pane_focus_target_indices(&target) {
+                if target_ws == ws_idx {
+                    if let Some(ws) = self.workspaces.get_mut(ws_idx) {
+                        ws.switch_tab(tab_idx);
+                        if let Some(tab) = ws.tabs.get_mut(tab_idx) {
+                            tab.layout.focus_pane(target.pane_id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn refresh_tab_bar_view(&mut self) {
@@ -3018,9 +3158,18 @@ impl AppState {
             })
     }
 
+    /// The workspace index the confirm-close dialog acts on (#419): its
+    /// recorded target when that workspace is still open, else `selected`.
+    pub(crate) fn confirm_close_target_idx(&self) -> usize {
+        self.confirm_close_target
+            .as_deref()
+            .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
+            .unwrap_or(self.selected)
+    }
+
     pub(crate) fn confirm_implicit_worktree_group_close(&mut self, ws_idx: usize) -> bool {
         if self.confirm_close && self.workspace_close_would_close_worktree_group(ws_idx) {
-            self.selected = ws_idx;
+            self.confirm_close_target = self.workspaces.get(ws_idx).map(|ws| ws.id.clone());
             self.mode = Mode::ConfirmClose;
             true
         } else {
@@ -3094,9 +3243,8 @@ impl AppState {
             .is_some_and(|ws| ws.close_focused());
         if should_close_workspace {
             if let Some(active) = active {
-                self.selected = active;
+                self.close_workspace(active);
             }
-            self.close_selected_workspace();
         } else {
             self.remove_unattached_terminal_ids(terminal_ids);
         }
@@ -3127,9 +3275,8 @@ impl AppState {
             .is_some_and(|ws| ws.tabs.len() <= 1);
         if should_close_workspace {
             if let Some(active) = self.active {
-                self.selected = active;
+                self.close_workspace(active);
             }
-            self.close_selected_workspace();
             return false;
         }
         if let Some(ws_idx) = self.active {
@@ -7977,7 +8124,9 @@ mod tests {
 
         assert!(deferred);
         assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.selected, 0);
+        // #419: the dialog names its target; the operator's cursor stays put.
+        assert_eq!(state.confirm_close_target_idx(), 0);
+        assert_eq!(state.selected, 1);
         assert_eq!(state.workspaces.len(), 2);
     }
 
@@ -8007,7 +8156,9 @@ mod tests {
 
         assert!(deferred);
         assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.selected, 0);
+        // #419: the dialog names its target; the operator's cursor stays put.
+        assert_eq!(state.confirm_close_target_idx(), 0);
+        assert_eq!(state.selected, 1);
         assert_eq!(state.workspaces.len(), 2);
     }
 
@@ -9090,5 +9241,89 @@ mod tests {
             "the deferred item stays flagged in the attention queue",
         );
         assert!(!state.workspaces[0].panes.get(&pane_a).unwrap().seen);
+    }
+
+    /// A same-repo-space member keyed `key` (#419 fixtures). Linked, so no
+    /// close of it asks to close a worktree group.
+    fn space_member(key: &str, ws_idx: usize) -> crate::workspace::WorktreeSpaceMembership {
+        crate::workspace::WorktreeSpaceMembership {
+            key: key.into(),
+            label: key.into(),
+            repo_root: format!("/repo/{key}").into(),
+            checkout_path: format!("/repo/{key}-{ws_idx}").into(),
+            is_linked_worktree: true,
+        }
+    }
+
+    /// Workspaces `w0..wN`, each in the repo space its `keys` entry names
+    /// (empty = none). Active and selected on `w0`, no focus history.
+    fn app_with_spaces(keys: &[&str]) -> AppState {
+        let names = (0..keys.len())
+            .map(|idx| format!("w{idx}"))
+            .collect::<Vec<_>>();
+        let mut state = app_with_workspaces(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        for (idx, key) in keys.iter().enumerate() {
+            if !key.is_empty() {
+                state.workspaces[idx].worktree_space = Some(space_member(key, idx));
+            }
+        }
+        state
+    }
+
+    fn name_at(state: &AppState, idx: Option<usize>) -> String {
+        idx.and_then(|idx| state.workspaces.get(idx))
+            .map(|ws| ws.display_name())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn closing_a_lower_background_workspace_keeps_active_and_selected_by_id() {
+        let mut state = app_with_spaces(&["", "", "", ""]);
+        state.active = Some(3);
+        state.selected = 2;
+
+        state.close_workspace(0);
+
+        assert_eq!(name_at(&state, state.active), "w3");
+        assert_eq!(name_at(&state, Some(state.selected)), "w2");
+    }
+
+    #[test]
+    fn closing_the_active_space_returns_to_the_previously_focused_one() {
+        let mut state = app_with_spaces(&["", "", "", ""]);
+        state.switch_workspace_tab(3, 0);
+        state.switch_workspace_tab(1, 0);
+
+        state.close_workspace(1);
+
+        // Not `w2`, which slid into the closed `Vec` slot.
+        assert_eq!(name_at(&state, state.active), "w3");
+        assert_eq!(name_at(&state, Some(state.selected)), "w3");
+    }
+
+    #[test]
+    fn closing_the_active_space_without_history_lands_on_a_same_space_sibling() {
+        // Display order is w0 w3 (space X), then w1 w2 (space Y).
+        let mut state = app_with_spaces(&["X", "Y", "Y", "X"]);
+        assert_eq!(state.visible_workspace_order(), vec![0, 3, 1, 2]);
+        state.active = Some(3);
+        state.selected = 3;
+
+        state.close_workspace(3);
+
+        // `w1` is as near in display order, but it is another repo's space.
+        assert_eq!(name_at(&state, state.active), "w0");
+    }
+
+    #[test]
+    fn closing_the_active_space_without_history_or_sibling_lands_on_the_display_neighbour() {
+        // Display order w0 w2 w1 w3: `w0`'s display neighbour is `w2`, while
+        // its `Vec` neighbour is `w1`.
+        let mut state = app_with_spaces(&["", "X", "", "X"]);
+        assert_eq!(state.visible_workspace_order(), vec![0, 2, 1, 3]);
+
+        state.close_workspace(0);
+
+        assert_eq!(name_at(&state, state.active), "w2");
     }
 }
