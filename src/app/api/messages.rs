@@ -818,8 +818,37 @@ impl App {
         let deferral_correlation_id = crate::app::mailboxes::deferral_id(&message.correlation_id);
         let body = deferral_body(muted_until_ms, reason.as_deref());
 
+        // #410: a sender this spoke cannot reach itself is reached through the
+        // hub, the way the message came — ADR-0018 §3's deferral must ride
+        // the same route as any other reply.
+        let deferral_up = |muter_agent: &Option<String>| MsgSendParams {
+            from_agent: muter_agent.clone(),
+            from_host: None,
+            to: target.clone(),
+            body: body.clone(),
+            correlation_id: Some(deferral_correlation_id.clone()),
+            in_reply_to: Some(message.correlation_id.clone()),
+            intent: MsgIntent::Fyi,
+            intent_unrecognised: None,
+        };
         let resolved = match self.resolve_message_target(&target) {
             Ok(resolved) => resolved,
+            Err((code, _))
+                if code == "msg_target_not_found"
+                    && matches!(&target, MessageTarget::Agent { agent }
+                        if self.hand_up_detached(agent, deferral_up(&muter_agent))) =>
+            {
+                self.mailboxes.mark_deferred(&message.correlation_id);
+                self.emit_message_deferred(
+                    &message.correlation_id,
+                    deferral_correlation_id,
+                    &message.to_pane,
+                    muted_until_ms,
+                    reason,
+                    Some("via hub".into()),
+                );
+                return true;
+            }
             Err((code, detail)) => {
                 tracing::warn!(
                     correlation_id = message.correlation_id.as_str(),
@@ -879,7 +908,21 @@ impl App {
             }
             ResolvedTarget::Remote(location) => {
                 let Some(peer) = self.peer_for_location(&location) else {
-                    return false;
+                    // No edge of our own: up the hub's relay, as the message
+                    // for this agent would go (#410).
+                    if !self.hand_up_detached(&location.agent_id, deferral_up(&muter_agent)) {
+                        return false;
+                    }
+                    self.mailboxes.mark_deferred(&message.correlation_id);
+                    self.emit_message_deferred(
+                        &message.correlation_id,
+                        deferral_correlation_id,
+                        &message.to_pane,
+                        muted_until_ms,
+                        reason,
+                        Some("via hub".into()),
+                    );
+                    return true;
                 };
                 let Some(from_agent) = muter_agent else {
                     return false;

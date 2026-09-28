@@ -842,6 +842,13 @@ pub fn process_parent_id(pid: u32) -> Option<u32> {
     Some(process_bsdinfo(pid)?.pbi_ppid)
 }
 
+/// When the process started, in microseconds since the epoch. Together with
+/// the pid it names ONE process: a reused pid has a later start time.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let info = process_bsdinfo(pid)?;
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
 /// Every live process id. Darwin has no `/proc`, so this is `proc_listallpids`
 /// — the same question `/proc`'s numeric entries answer on Linux.
 pub fn all_process_ids() -> Vec<u32> {

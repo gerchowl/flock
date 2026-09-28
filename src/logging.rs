@@ -3428,6 +3428,21 @@ pub(crate) fn peer_push_unknown_kind(peer: &str, kind: &str) {
     );
 }
 
+/// Another process holds this node's relay binding, so the hub's relay cannot
+/// carry messages or fleet rows (#410). WARN, rate-limited by the caller: a
+/// real relay kept out is invisible otherwise.
+pub(crate) fn relay_attach_blocked(err: &str, attempts: u64) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.relay.attach_blocked",
+        subsystem = "peers",
+        outcome = "refused",
+        err,
+        attempts,
+        "another process holds this node's relay binding; retrying"
+    );
+}
+
 /// The relay's uplink pull stopped for good (#410): the local server refused
 /// `msg.uplink_take`, most likely because it predates it. WARN for the same
 /// reason as a refused push subscription — otherwise indistinguishable from a

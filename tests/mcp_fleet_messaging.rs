@@ -48,7 +48,8 @@ const PAIR_AB: &[NodeSpec] = &[
 /// `[[peers]]`, and the two spokes carry none — no reverse trust, no N×N keys.
 /// The only way off a spoke is the relay the hub holds INTO it.
 const HUB_SPOKES: &[NodeSpec] = &[
-    NodeSpec::new("nodea", "alpha", &[]),
+    // Wide enough that a relayed server row's `via nodeb` is not truncated.
+    NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
     NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
     NodeSpec::new("nodec", "gamma", &[]),
 ];
@@ -689,6 +690,65 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
             }
         },
     );
+    // Down-gossip: nodea polls nobody, yet it now KNOWS carol — the hub pushes
+    // its view of the fleet down the relay it holds — and knows her only
+    // through nodeb.
+    let listing = wait_for("carol to reach nodea's directory", GOSSIP_TIMEOUT, || {
+        let listing = alice.call_tool("flock_agent_list", json!({}));
+        fleet_row(&listing, &carol.agent_id).map(|_| listing.clone())
+    });
+    let row = fleet_row(&listing, &carol.agent_id).expect("just found it");
+    assert_eq!(row["host"], "nodec", "{row}");
+    assert_eq!(row["route"], "nodeb", "known via the hub: {row}");
+    assert_eq!(row["local"], false, "{row}");
+
+    // And the servers band on nodea shows nodec, marked as known via nodeb.
+    let mut client = node_a.attach_sized(160, 40);
+    fleet::wait_for_row(&mut client, "via nodeb", GOSSIP_TIMEOUT)
+        .unwrap_or_else(|screen| panic!("nodea's band should mark nodec via nodeb: {screen}"));
+    drop(client);
+
+    // Only the relay bound to nodea's uplink may speak for the hub. This test
+    // process is a foreign pid on nodea's socket: its forged fleet row is
+    // refused and never reaches the directory, and so are the uplink methods
+    // that would let it take pending messages or fake the hub's answer.
+    let forged = json!({
+        "id": "t:forge-fleet",
+        "method": "peers.hub_fleet",
+        "params": {
+            "hub": "nodeb",
+            "fleet": [{
+                "name": "evilhost",
+                "ssh_target": "lars@attacker.example",
+                "host": "evilhost",
+                "workspaces": [{
+                    "id": "w1", "workspace": "x", "status": "idle",
+                    "agents": [{"agent_id": "agent_evil_1", "pane_id": "w1:p1", "status": "idle"}],
+                }],
+                "age_secs": 0,
+                "origin": "nodeb",
+                "origin_last_ok_secs": 0,
+                "proxy_jump": "attacker.example",
+            }],
+        },
+    });
+    for request in [
+        forged.to_string(),
+        r#"{"id":"t:take","method":"msg.uplink_take","params":{}}"#.to_string(),
+        r#"{"id":"t:result","method":"msg.uplink_result","params":{"uplink_id":"up:x","hub":"nodeb","response":{}}}"#.to_string(),
+    ] {
+        let answer: Value = serde_json::from_str(&node_a.api(&request)).expect("parses");
+        assert_eq!(
+            answer["error"]["code"], "not_the_relay",
+            "a foreign pid is refused: {answer}"
+        );
+    }
+    let listing = alice.call_tool("flock_agent_list", json!({}));
+    assert!(
+        fleet_row(&listing, "agent_evil_1").is_none(),
+        "the forged row never reached the directory: {listing}"
+    );
+
     assert_eq!(queued["state"], "relayed", "send: {queued}");
     assert_eq!(
         queued["path"], "via nodeb",
@@ -797,6 +857,69 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         !inbox.to_string().contains("forged via the hub"),
         "the forged forward was never relayed: {inbox}"
     );
+
+    // #408's tiers ride the route too: a `blocking` message handed up keeps
+    // its intent across both hops, so nodec's server decides how hard to knock
+    // with the sender's own stamp.
+    let blocking = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "blocked on you",
+            "correlation_id": "c-410-blocking",
+            "intent": "blocking",
+        }),
+    );
+    assert_eq!(blocking["path"], "via nodeb", "{blocking}");
+    let arrived = wait_for("the blocking message to land on nodec", RPC_TIMEOUT, || {
+        let inbox = carol.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(arrived["intent"], "blocking", "{arrived}");
+    assert_eq!(arrived["from_host"], "nodea", "{arrived}");
+
+    // ADR-0018 §3 rides the route too: carol mutes, so a question from alice
+    // is answered by carol's OWN server with a deferral — and nodec cannot
+    // reach nodea itself, so that deferral goes up nodeb's relay and back
+    // down to alice like any other reply.
+    carol.call_tool(
+        "flock_msg_mute",
+        json!({"seconds": 600, "reason": "deep in a refactor"}),
+    );
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "are you there?",
+            "correlation_id": "c-410-muted",
+            "intent": "needs_reply",
+        }),
+    );
+    let deferral = wait_for("carol's deferral to reach nodea", RPC_TIMEOUT, || {
+        let inbox = alice.call_tool("flock_msg_read", json!({}));
+        inbox["messages"]
+            .as_array()?
+            .iter()
+            .find(|message| message["in_reply_to"] == "c-410-muted")
+            .cloned()
+    });
+    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
+    assert_eq!(
+        deferral["from_agent"],
+        carol.agent_id.as_str(),
+        "{deferral}"
+    );
+    assert_eq!(
+        deferral["intent"], "fyi",
+        "a deferral is fyi by construction: {deferral}"
+    );
+    assert!(
+        deferral["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("deep in a refactor")),
+        "the reason survives both hops: {deferral}"
+    );
+    carol.call_tool("flock_msg_mute", json!({"seconds": 0}));
 
     // Break the hub's edge to nodec. The failure is nodeb's hop, and the
     // sender on nodea is told so — which machine could not reach which, and

@@ -103,7 +103,56 @@ impl App {
     /// [`RelayedFleetPeer`] entries, stamped with the answering server as
     /// `origin`. Never includes `state.relayed_fleet_cache` — that would
     /// re-relay entries that already travelled one hop.
-    fn own_relayed_fleet(&self) -> Vec<RelayedFleetPeer> {
+    /// `peers.hub_fleet` — the hub that polls this server shares what it knows
+    /// about the rest of the fleet (#410).
+    ///
+    /// Merged through the ONE relay merge, so every row passes
+    /// `relayed_entry_from_wire` (#392: an ssh_target or proxy_jump this host
+    /// will not dial is dropped and logged) and freshest-wins against rows
+    /// from any other source. Each row routes via the hub, which is what a
+    /// message for one of its agents then hands up to.
+    ///
+    /// Accepted only from the relay bound by `peers.relay_attach`, and the rows
+    /// it carries are display-only: a spoke holds no key to anything, so it
+    /// never dials a hub-pushed row's ssh target at all.
+    ///
+    /// Never re-relayed: this server's own `relayed_fleet` is built from the
+    /// peers IT polls, not from this cache, so the hub's view cannot come back
+    /// up as the spoke's own.
+    pub(super) fn handle_peers_hub_fleet(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PeersHubFleetParams,
+    ) -> String {
+        // Only the relay bound to this server's uplink may speak for the hub —
+        // the one ingress to the relay cache that listens on a socket rather
+        // than reading its own ssh stdout, so it gets the same binding as the
+        // uplink methods (#410 review).
+        if let Some(refusal) = self.refuse_unless_relay(&id, "peers.hub_fleet") {
+            return refusal;
+        }
+        // The name recorded for this relay binding; the frame's own claim only
+        // ever seeds it, on the binding's first frame. No wire fallback.
+        let Some(hub) = self.uplink.record_hub(&params.hub) else {
+            return super::responses::encode_error(
+                id,
+                "not_the_relay",
+                "peers.hub_fleet arrived with no relay bound",
+            );
+        };
+        crate::peers::merge_hub_pushed_fleet(
+            &mut self.state.relayed_fleet_cache,
+            params.fleet,
+            &hub,
+        );
+        self.state.evict_expired_relayed_entries();
+        self.render_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_notify.notify_one();
+        super::responses::encode_success(id, crate::api::schema::ResponseResult::Ok {})
+    }
+
+    pub(super) fn own_relayed_fleet(&self) -> Vec<RelayedFleetPeer> {
         let origin = short_host_name();
         self.state
             .peer_summaries
@@ -464,7 +513,12 @@ impl App {
                 })
             }
             PeerSwitchRequest::RelayedPeer { host_key, ws_idx } => {
-                let entry = &self.state.relayed_fleet_cache.get(&host_key)?.peer;
+                let relayed = self.state.relayed_fleet_cache.get(&host_key)?;
+                // #410: a row a hub pushed down is display-only — never dialled.
+                if relayed.hub_pushed {
+                    return None;
+                }
+                let entry = &relayed.peer;
                 let ssh_target = entry.ssh_target.clone();
                 let name = entry.host.clone().unwrap_or_else(|| entry.peer.clone());
                 let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
@@ -540,7 +594,16 @@ impl App {
             .map(crate::peers::peer_to_wire)
             .map(stamp_proxy_jump)
             .collect();
-        let mut relayed: Vec<_> = self.state.relayed_fleet_cache.iter().collect();
+        // #410: never a row a hub pushed down. It is another server's view that
+        // THIS node never verified, and display-only here — but a snapshot row
+        // is dialled on the next server, on a click and by warm slots with no
+        // click at all, so carrying it on would undo display-only one hop later.
+        let mut relayed: Vec<_> = self
+            .state
+            .relayed_fleet_cache
+            .iter()
+            .filter(|(_, entry)| !entry.hub_pushed)
+            .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         ours.extend(
             relayed
@@ -1016,6 +1079,144 @@ mod tests {
         assert!(
             !targets.contains(&"lars@anvil"),
             "hop target excluded: {targets:?}"
+        );
+    }
+
+    fn hub_row(name: &str, ssh_target: &str, age: u64) -> crate::api::schema::RelayedFleetPeer {
+        crate::api::schema::RelayedFleetPeer {
+            name: name.into(),
+            ssh_target: ssh_target.into(),
+            host: Some(name.into()),
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: Some(age),
+            error: None,
+            origin: "hub".into(),
+            origin_last_ok_secs: Some(age),
+            proxy_jump: Some("hub".into()),
+            icon: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spoke_learns_the_fleet_its_hub_pushes_down_and_routes_it_via_the_hub() {
+        // #410: a spoke polls nobody, so gossip — which only flowed UP — left
+        // it knowing nothing past itself. The hub's push is merged through the
+        // same validated, freshest-wins path a poller uses.
+        let mut app = test_app();
+        // Only the relay bound to this server's uplink may push (#416 review),
+        // this live test process stands in for it.
+        let relay = std::process::id();
+        let started = crate::platform::process_start_time(relay).expect("own start time");
+        app.uplink
+            .attach_relay(relay, started, crate::platform::process_start_time)
+            .expect("bound");
+        app.current_api_peer_pid = Some(relay);
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "down".into(),
+            method: crate::api::schema::Method::PeersHubFleet(
+                crate::api::schema::PeersHubFleetParams {
+                    hub: "hub".into(),
+                    fleet: vec![
+                        hub_row("ksb", "lars@ksb", 2),
+                        // #392: a row this host will not dial is dropped.
+                        hub_row("evil", "-oProxyCommand=touch /tmp/x", 1),
+                        // A row about this server itself is never stored.
+                        hub_row(&crate::app::short_host_name(), "self", 1),
+                    ],
+                },
+            ),
+        });
+        assert!(response.contains("\"result\""), "{response}");
+        // A later push naming a different hub is heard under the FIRST name.
+        let _ = app.handle_api_request(crate::api::schema::Request {
+            id: "down2".into(),
+            method: crate::api::schema::Method::PeersHubFleet(
+                crate::api::schema::PeersHubFleetParams {
+                    hub: "impostor".into(),
+                    fleet: vec![hub_row("ksb", "lars@ksb", 1)],
+                },
+            ),
+        });
+        app.current_api_peer_pid = None;
+
+        let keys: Vec<&String> = app.state.relayed_fleet_cache.keys().collect();
+        assert_eq!(keys, vec!["ksb"], "only the valid, foreign row: {keys:?}");
+        let entry = app.state.relayed_fleet_cache["ksb"].clone();
+        assert_eq!(entry.via.as_deref(), Some("hub"), "routed via the hub");
+        assert!(entry.hub_pushed, "display-only");
+        assert_eq!(
+            entry.peer.proxy_jump.as_deref(),
+            Some("hub"),
+            "nothing about where it would be dialled comes from the row"
+        );
+        // Display-only: clicking it dials nothing, whatever its ssh target says.
+        assert!(
+            app.prepare_switch_server(crate::app::state::PeerSwitchRequest::RelayedPeer {
+                host_key: "ksb".into(),
+                ws_idx: None,
+            })
+            .is_none(),
+            "a hub-pushed row is never switched to"
+        );
+        // Nor carried on: the snapshot the next attach leg takes — which that
+        // server dials on a click and warms with no click — leaves it out.
+        let snapshot = app.outgoing_fleet_snapshot("lars@elsewhere");
+        assert!(
+            snapshot
+                .peers
+                .iter()
+                .all(|peer| peer.ssh_target != "lars@ksb" && peer.name != "ksb"),
+            "a hub-pushed row never crosses a leap: {:?}",
+            snapshot
+                .peers
+                .iter()
+                .map(|peer| &peer.name)
+                .collect::<Vec<_>>()
+        );
+        // So the next server's warm slots — which dial with no click — never
+        // see it: fed exactly the way the client feeds them.
+        let carried: Vec<String> = snapshot
+            .peers
+            .iter()
+            .map(|peer| peer.ssh_target.clone())
+            .collect();
+        let warmed = crate::client::slots::warm_all_targets(&[], &carried, 8);
+        assert!(
+            !format!("{warmed:?}").contains("lars@ksb"),
+            "never warm-dialled downstream: {warmed:?}"
+        );
+
+        // Honest freshness: once the hub stops pushing, the row goes stale on
+        // its own clock rather than looking live forever.
+        let stale_after = app.state.config.gossip.stale_after().as_secs();
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(stale_after + 1);
+        assert!(
+            entry.peer.is_stale_at(later, stale_after),
+            "a row nobody refreshes ages into stale"
+        );
+
+        // Aged OUT, too, not just stale: the spoke's own tick evicts it once no
+        // push has refreshed it for the relay TTL.
+        let ttl = stale_after * crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE;
+        app.state.relayed_fleet_cache.insert(
+            "old".into(),
+            crate::peers::relayed_entry_from_wire(hub_row("old", "lars@old", ttl + 5))
+                .expect("valid"),
+        );
+        app.expire_uplink();
+        assert!(
+            !app.state.relayed_fleet_cache.contains_key("old"),
+            "an expired row is removed on the tick"
+        );
+
+        // And the hub's view never comes back up as this server's own.
+        assert!(
+            app.own_relayed_fleet().is_empty(),
+            "a spoke with no peers relays nothing, whatever its hub told it"
         );
     }
 
