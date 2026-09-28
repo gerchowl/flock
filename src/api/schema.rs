@@ -2683,6 +2683,12 @@ pub enum EventData {
         /// reproduce or debug the hop.
         route: String,
         relayed_at_ms: u64,
+        /// The relayed message's tier (ADR-0018 §1). Kept so an answer
+        /// arriving back from that host can be recognised as one, and woken
+        /// for, after the question itself has left this server. Defaulted so
+        /// an older log reads back as `fyi`.
+        #[serde(default)]
+        intent: MsgIntent,
     },
     MessageDelivered {
         correlation_id: String,

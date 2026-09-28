@@ -49,9 +49,29 @@ its inbox for any reason, and a nudge fired for another message reports it in
 the count. The intent is what the SENDER wants; flock decides how hard to knock
 from it, and no sender text ever reaches the wake.
 
+**An answer wakes whoever asked.** A message whose `in_reply_to` names a
+`needs_reply` or `blocking` message wakes its recipient as if it were
+`needs_reply`, whatever its own stamp. A reply's own intent says whether the
+reply *asks something back*, and it defaults to `fyi` because answering is what
+a reply normally does; without this rule the answer to an agent's own question
+would never nudge it, and the question would be asked and then not heard. The
+one exception is the §3 deferral: it is `in_reply_to` a waking message by
+construction, but it carries no answer, only "later", so it stays non-waking —
+otherwise a mute would reach back into the sender's turn, which is exactly the
+interruption §3's deferral exists to replace.
+
 `blocking` is sender-declared and therefore sender-abusable, so it carries a
 cost: its own per-sender rate limit, tighter than the general one, declared in
-config (`[msg] blocking_per_hour`) rather than compiled in.
+config (`[msg] blocking_per_hour`) rather than compiled in. The budget is keyed
+on the identity the receiving server can stand behind — the sender its own
+process ancestry attested, or, for a relayed message, the relaying host paired
+with the id it claims — never on a caller-chosen id alone, so one sender cannot
+spend another's budget or mint itself a fresh one.
+
+Sender identity shown on an operator surface — the attention label, the
+escalation notification — is a validated agent id or a server-minted pane id,
+never caller text: an identity that fails the agent-id format is refused at
+ingress, and a surface with nothing validated to show says "unknown sender".
 
 An intent a receiving server does not recognise — version skew across the relay
 — is treated as `needs_reply`: skew fails toward the recipient hearing about

@@ -124,12 +124,15 @@ pub(super) fn table() -> &'static [Tool] {
                           hard flock knocks: `fyi` never wakes the recipient — \
                           it is read whenever the inbox next is; \
                           `needs_reply` nudges it to read at its next turn \
-                          boundary (and wakes it if idle); `blocking` means \
+                          boundary (and, once idle wake is enabled, wakes \
+                          it if idle); `blocking` means \
                           you cannot proceed without an answer — it does \
                           everything `needs_reply` does, also puts the \
                           recipient in the operator's attention list, and \
                           escalates to the operator if the recipient has \
-                          muted itself. `blocking` is rate-limited per sender \
+                          muted itself. A reply to your `needs_reply` or \
+                          `blocking` message wakes you whatever its own \
+                          stamp. `blocking` is rate-limited per sender \
                           (a few per hour; `msg_blocking_rate_limited` \
                           carries `retry_after_ms`), so spend it only when \
                           you are actually stuck. Intent rides the envelope, \

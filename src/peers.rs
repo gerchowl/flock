@@ -832,11 +832,13 @@ pub fn send_peer_message(
     }
 }
 
-/// Whether a peer's refusal was about `--intent` — the one refusal a retry at
-/// a lower tier can answer. Matched on the flag name, which is the part of the
-/// remote CLI's refusal every build since #380 has printed.
+/// Whether a peer's refusal was about the intent VALUE — the one refusal a
+/// retry at a lower tier can answer. Matched on `unknown --intent`, the
+/// refusal every build since #280 prints for a tier it does not know; the bare
+/// flag name is not enough, because the unknown-option refusal lists every
+/// flag a build understands, `--intent` among them.
 fn refused_the_intent(detail: &str) -> bool {
-    detail.contains("--intent")
+    detail.contains("unknown --intent")
 }
 
 /// Why a relayed message did not land on the peer that owns the recipient.
@@ -1348,8 +1350,12 @@ mod tests {
         assert!(super::refused_the_intent(
             "unknown --intent \"blocking\": expected fyi or needs-reply"
         ));
+        // The unknown-option refusal names `--intent` in its list of what
+        // the build understands; that must not trigger a second ssh hop.
         assert!(!super::refused_the_intent(
-            "flk msg send: unknown option \"--from-host\""
+            "flk msg send: unknown option \"--from-host\" — this build understands --repo \
+             --intent --correlation-id --reply-to --agent --from-agent --json, and `--` ends \
+             flag parsing so a body may begin with dashes"
         ));
     }
 

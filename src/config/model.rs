@@ -1094,7 +1094,8 @@ pub struct MsgConfig {
     /// `blocking` is sender-declared and therefore sender-abusable — every
     /// agent thinks its message is the urgent one — so it carries its own
     /// budget, far tighter than the general per-minute one, on top of it.
-    /// `0` refuses `blocking` outright; senders can still say `needs_reply`.
+    /// `0` refuses `blocking` outright (`msg_blocking_disabled`); senders can
+    /// still say `needs_reply`.
     pub blocking_per_hour: usize,
 }
 

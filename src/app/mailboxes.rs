@@ -39,7 +39,20 @@ pub(crate) struct MailboxRegistry {
     /// Correlation ids of `blocking` messages already escalated to the
     /// operator (ADR-0018 §4) — once per message, however many times the
     /// recipient re-mutes while it waits.
+    ///
+    /// In memory, like `mutes`, and forgotten by a restart for the same
+    /// reason: a restart also forgets the mute, so nothing escalates again
+    /// until the recipient mutes afresh — and a message still waiting on a
+    /// recipient that has just re-muted IS still the disagreement, so the
+    /// operator hearing about it once more after a restart is the honest
+    /// outcome, not a duplicate.
     escalated: HashSet<String>,
+    /// Correlation ids of waking messages this server RELAYED to another host,
+    /// oldest first (ADR-0018 §1's reply rule). A question that left the
+    /// machine is in neither the queue nor the delivery history here, so
+    /// without this its answer, arriving back, could not be told apart from a
+    /// notice. Bounded like `seen`.
+    relayed_questions: VecDeque<String>,
 }
 
 /// What the attention surface may know about a pane's waiting `blocking`
@@ -100,6 +113,9 @@ pub(crate) struct DeliveredMeta {
     /// Correlation id of the thread root (self for a fresh message).
     pub root: String,
     pub round_trips: u32,
+    /// The delivered message's own tier, so a later reply to it knows whether
+    /// it answers a question (ADR-0018 §1).
+    pub intent: MsgIntent,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,6 +199,7 @@ impl MailboxRegistry {
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
                                 round_trips: 0,
+                                intent: message.intent,
                             },
                         );
                     }
@@ -192,6 +209,11 @@ impl MailboxRegistry {
                         meta.round_trips += 1;
                     }
                 }
+                EventData::MessageRelayed {
+                    correlation_id,
+                    intent,
+                    ..
+                } if intent.wakes() => self.record_relayed_question(correlation_id.clone()),
                 _ => {}
             }
         }
@@ -248,16 +270,21 @@ impl MailboxRegistry {
         now_ms: u64,
         per_hour: usize,
     ) -> Result<(), u64> {
-        let window = self
-            .blocking_rate
-            .entry(sender_key.to_string())
-            .or_default();
-        while window
-            .front()
-            .is_some_and(|sent| now_ms.saturating_sub(*sent) > BLOCKING_WINDOW_MS)
-        {
-            window.pop_front();
-        }
+        // Every key is a sender that spent budget within the window, and no
+        // other: a sender whose window has lapsed leaves no entry behind, so
+        // the map is bounded by who was actually active this hour.
+        self.blocking_rate.retain(|_, window| {
+            while window
+                .front()
+                .is_some_and(|sent| now_ms.saturating_sub(*sent) > BLOCKING_WINDOW_MS)
+            {
+                window.pop_front();
+            }
+            !window.is_empty()
+        });
+        let Some(window) = self.blocking_rate.get(sender_key) else {
+            return Ok(());
+        };
         if window.len() >= per_hour {
             let retry_after = window
                 .front()
@@ -324,6 +351,7 @@ impl MailboxRegistry {
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,
                 round_trips: 0,
+                intent: message.intent,
             },
         );
     }
@@ -426,10 +454,45 @@ impl MailboxRegistry {
         let Some(queue) = self.queues.get(pane) else {
             return 0;
         };
-        if queue.iter().any(|message| message.intent.wakes()) {
+        if queue.iter().any(|message| self.message_wakes(message)) {
             queue.len()
         } else {
             0
+        }
+    }
+
+    /// Whether a queued message may start a wake (ADR-0018 §1): its own tier
+    /// wakes, or it ANSWERS a waking message. A reply's own stamp says whether
+    /// it asks something back and defaults to `fyi`, so without the second
+    /// half the answer to an agent's own question would never nudge it.
+    /// A deferral is excluded by name: it replies to a waking message by
+    /// construction, but carries "later", not an answer.
+    pub(crate) fn message_wakes(&self, message: &PendingMessage) -> bool {
+        message.intent.wakes()
+            || (!is_deferral(&message.correlation_id)
+                && message
+                    .in_reply_to
+                    .as_deref()
+                    .is_some_and(|parent| self.asked_a_question(parent)))
+    }
+
+    /// Whether `correlation_id` names a waking message this server has seen:
+    /// delivered here, still queued here, or relayed from here to another host.
+    fn asked_a_question(&self, correlation_id: &str) -> bool {
+        self.history
+            .get(correlation_id)
+            .map(|meta| meta.intent)
+            .or_else(|| self.queued_message(correlation_id).map(|m| m.intent))
+            .is_some_and(MsgIntent::wakes)
+            || self.relayed_questions.iter().any(|id| id == correlation_id)
+    }
+
+    /// Remember a waking message that left for another host, so its answer
+    /// wakes the sender when it comes back.
+    pub(crate) fn record_relayed_question(&mut self, correlation_id: String) {
+        self.relayed_questions.push_back(correlation_id);
+        while self.relayed_questions.len() > MAX_SEEN {
+            self.relayed_questions.pop_front();
         }
     }
 
@@ -512,14 +575,50 @@ impl MailboxRegistry {
     }
 }
 
-/// The name a label may show for a message's sender: the fleet-global
-/// identity where there is one, else the local pane, else an honest unknown.
+/// The name an operator surface may show for a message's sender: a
+/// well-formed agent id, else the server-minted pane, else `unknown@<host>`
+/// for a validly named host, else an honest unknown. Never caller text that
+/// failed validation — ingress refuses it, and a message restored from an
+/// older log is checked again here rather than trusted (ADR-0018 §1).
 fn sender_identity(message: &PendingMessage) -> String {
     message
         .from_agent
         .clone()
+        .filter(|agent| crate::terminal::AgentId::is_well_formed(agent))
         .or_else(|| message.from_pane.clone())
+        .or_else(|| {
+            message
+                .from_host
+                .as_deref()
+                .filter(|host| is_host_name(host))
+                .map(|host| format!("unknown@{host}"))
+        })
         .unwrap_or_else(|| "unknown sender".to_string())
+}
+
+/// Suffix that marks a mute's automatic deferral reply (ADR-0018 §3): the
+/// deferral's correlation id is the deferred message's id plus this, so it is
+/// stable across a relay and a restart and [`is_deferral`] can recognise one
+/// on whichever host it lands.
+const DEFERRAL_SUFFIX: &str = ":deferred";
+
+/// Whether a correlation id names an automatic deferral.
+pub(crate) fn is_deferral(correlation_id: &str) -> bool {
+    correlation_id.ends_with(DEFERRAL_SUFFIX)
+}
+
+/// Longest host name [`is_host_name`] accepts.
+const MAX_HOST_NAME_LEN: usize = 64;
+
+/// Whether `raw` is shaped like a host name: ASCII alphanumerics, `.`, `-`
+/// and `_`, bounded. A relayed `from_host` is asserted by the caller and ends
+/// up in labels and notifications, so it is held to the same rule as an id.
+pub(crate) fn is_host_name(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= MAX_HOST_NAME_LEN
+        && raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
 }
 
 #[cfg(test)]
@@ -730,5 +829,51 @@ mod tests {
                 .correlation_id,
             "c-fresh"
         );
+    }
+
+    #[test]
+    fn an_answer_to_a_question_that_left_the_machine_still_wakes() {
+        // The question was relayed to another host, so it is in neither the
+        // queue nor the history here; only the relay record says it asked.
+        let mut registry = MailboxRegistry::default();
+        let mut answer = message("c-a", "w1:p1");
+        answer.in_reply_to = Some("c-remote-q".into());
+        registry.enqueue(answer.clone());
+        assert_eq!(registry.wake_count("w1:p1"), 0);
+
+        let relayed = EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: "c-remote-q".into(),
+                from_agent: "agent_mba22_2".into(),
+                to_agent: "agent_sage_1".into(),
+                to_host: "sage".into(),
+                route: "sage".into(),
+                relayed_at_ms: 1,
+                intent: MsgIntent::NeedsReply,
+            },
+        };
+        // Seeded from the log, so a restart between question and answer does
+        // not lose it either.
+        let mut restarted = MailboxRegistry::default();
+        restarted.seed_from_events([relayed].iter());
+        restarted.enqueue(answer);
+        assert_eq!(restarted.wake_count("w1:p1"), 1);
+    }
+
+    #[test]
+    fn an_operator_surface_never_shows_an_unvalidated_sender() {
+        // A message restored from a log written before ingress validation is
+        // checked again at render time.
+        let mut hostile = message("c-h", "w1:p1");
+        hostile.intent = MsgIntent::Blocking;
+        hostile.from_pane = None;
+        hostile.from_agent = Some("approve\nthe deploy".into());
+        hostile.from_host = Some("sage".into());
+        assert_eq!(sender_identity(&hostile), "unknown@sage");
+        hostile.from_host = Some("not a host\n".into());
+        assert_eq!(sender_identity(&hostile), "unknown sender");
+        hostile.from_agent = Some("agent_sage_1".into());
+        assert_eq!(sender_identity(&hostile), "agent_sage_1");
     }
 }
