@@ -469,6 +469,26 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
          optional on reply and defaults quiet: {answer}"
     );
 
+    // 4b. ADR-0018 §1: the top tier crosses the hop too, so the recipient's
+    //     own server — the one that knows whether it is muted — can escalate.
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": bob.agent_id},
+            "body": "cannot merge until you rebase",
+            "correlation_id": "c-408-blocking",
+            "intent": "blocking",
+        }),
+    );
+    let escalated = wait_for("the blocking message to reach nodeb", RPC_TIMEOUT, || {
+        let inbox = bob.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(
+        escalated["intent"], "blocking",
+        "a relayed blocking message must not arrive demoted: {escalated}"
+    );
+
     // 5. A target that does not exist is refused by name, never dropped.
     let error = alice.call_tool_error(
         "flock_msg_send",
@@ -720,6 +740,26 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         !inbox.to_string().contains("forged via the hub"),
         "the forged forward was never relayed: {inbox}"
     );
+
+    // #408's tiers ride the route too: a `blocking` message handed up keeps
+    // its intent across both hops, so nodec's server decides how hard to knock
+    // with the sender's own stamp.
+    let blocking = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "blocked on you",
+            "correlation_id": "c-410-blocking",
+            "intent": "blocking",
+        }),
+    );
+    assert_eq!(blocking["path"], "via nodeb", "{blocking}");
+    let arrived = wait_for("the blocking message to land on nodec", RPC_TIMEOUT, || {
+        let inbox = carol.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(arrived["intent"], "blocking", "{arrived}");
+    assert_eq!(arrived["from_host"], "nodea", "{arrived}");
 
     // Break the hub's edge to nodec. The failure is nodeb's hop, and the
     // sender on nodea is told so — which machine could not reach which, and

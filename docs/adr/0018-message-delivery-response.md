@@ -49,9 +49,39 @@ its inbox for any reason, and a nudge fired for another message reports it in
 the count. The intent is what the SENDER wants; flock decides how hard to knock
 from it, and no sender text ever reaches the wake.
 
+**An answer wakes whoever asked.** A message whose `in_reply_to` names a
+`needs_reply` or `blocking` message wakes its recipient as if it were
+`needs_reply`, whatever its own stamp. A reply's own intent says whether the
+reply *asks something back*, and it defaults to `fyi` because answering is what
+a reply normally does; without this rule the answer to an agent's own question
+would never nudge it, and the question would be asked and then not heard. The
+one exception is the §3 deferral: it is `in_reply_to` a waking message by
+construction, but it carries no answer, only "later", so it stays non-waking —
+otherwise a mute would reach back into the sender's turn, which is exactly the
+interruption §3's deferral exists to replace. The rule reaches as far as the
+server remembers the question — its delivery history and its record of
+questions relayed away, both bounded — so an answer to a question that has aged
+out of both is read at its own stamp.
+
 `blocking` is sender-declared and therefore sender-abusable, so it carries a
 cost: its own per-sender rate limit, tighter than the general one, declared in
-config (`[msg] blocking_per_hour`) rather than compiled in.
+config (`[msg] blocking_per_hour`) rather than compiled in. A spent budget
+**downgrades** the message to `needs_reply` — it is still delivered and still
+wakes, and the send result says it was downgraded — rather than refusing it:
+`blocking` is a courtesy tier, and what it adds (the operator's attention) is
+exactly what a sender over budget has had its share of. The budget is keyed only
+on what the receiving server itself attested: an agent its process ancestry
+proved, keyed by that agent. Every unattested sender — each relayed message and
+each socket client outside a pane — shares ONE bucket, because on that path both
+the sender id and its host are claims, and keying on a claim lets a caller mint
+a fresh budget per invented name or spend a real agent's by naming it. Sharing
+is safe precisely because exhausting the budget only downgrades: nobody can
+silence anyone by spending it.
+
+Sender identity shown on an operator surface — the attention label, the
+escalation notification — is a validated agent id or a server-minted pane id,
+never caller text: an identity that fails the agent-id format is refused at
+ingress, and a surface with nothing validated to show says "unknown sender".
 
 An intent a receiving server does not recognise — version skew across the relay
 — is treated as `needs_reply`: skew fails toward the recipient hearing about
@@ -96,6 +126,10 @@ the mute is set — produces exactly one automatic reply to its sender:
 - `in_reply_to` the message's `correlation_id`;
 - intent `fyi` **by construction**, so two mutually deferring agents cannot
   ping-pong;
+- correlation id `<the message's correlation_id>:deferred`. The suffix is the
+  contract §1's reply rule keys on: it is how a server recognises a deferral —
+  which replies to a waking message by construction — and keeps it from waking
+  the sender, on whichever host it lands;
 - a body stating that the recipient deferred, the reason if one was given, and
   the time the mute lifts — a deadline the sender can act on.
 

@@ -73,10 +73,14 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_agent_read",
-            description: "Read recent output from an agent's pane. Reading \
-                          marks the pane seen, which affects the operator's \
-                          attention ordering — use sparingly. `target` accepts \
-                          a public pane id, terminal id, or unique agent name.",
+            description: "Read recent output from an agent's pane — the \
+                          terminal as drawn, hard-wrapped at the pane's \
+                          width. Read-only: it changes no pane state and \
+                          does not move the operator's attention ordering. \
+                          For what the agent actually said, \
+                          `flock_agent_history` reads its conversation \
+                          instead. `target` accepts a public pane id, \
+                          terminal id, or unique agent name.",
             input_schema: schema_agent_read,
             build: build_agent_read,
         },
@@ -113,17 +117,29 @@ pub(super) fn table() -> &'static [Tool] {
                           on THIS server and cannot leave it. Queued to the \
                           recipient's inbox, which it reads with \
                           `flock_msg_read` — flock never types into a \
-                          session. It is nudged to read at its next turn \
-                          boundary, so a recipient that is ALREADY idle is \
-                          not reached until something else prompts it: this \
-                          is a queue, not an interrupt. `correlation_id` is \
-                          your idempotency key. The recipient sees a sender \
-                          stamp, reply instructions, and your `intent`, which \
-                          is required: `needs_reply` if this message asks for \
-                          an answer, `fyi` if it does not. It rides the \
-                          envelope, so the recipient acts on it before reading \
-                          the body — do not bury the request in the last line \
-                          of a long message and stamp the whole thing `fyi`. \
+                          session. This is a queue, not an interrupt. \
+                          `correlation_id` is your idempotency key. The \
+                          recipient sees a sender stamp, reply instructions, \
+                          and your `intent`, which is required and decides how \
+                          hard flock knocks: `fyi` never wakes the recipient — \
+                          it is read whenever the inbox next is; \
+                          `needs_reply` nudges it to read at its next turn \
+                          boundary, or wakes it if it is already idle; \
+                          `blocking` means \
+                          you cannot proceed without an answer — it does \
+                          everything `needs_reply` does, also puts the \
+                          recipient in the operator's attention list, and \
+                          escalates to the operator if the recipient has \
+                          muted itself. A reply to your `needs_reply` or \
+                          `blocking` message wakes you whatever its own \
+                          stamp. `blocking` has a small per-sender budget (a \
+                          few per hour); past it the message is still \
+                          delivered, as `needs_reply`, and the result's \
+                          `warnings` say it was downgraded — so spend it only \
+                          when you are actually stuck. Intent rides the envelope, \
+                          so the recipient acts on it before reading the body \
+                          — do not bury the request in the last line of a \
+                          long message and stamp the whole thing `fyi`. \
                           Limits: 20 messages/min, 32 \
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
@@ -194,8 +210,8 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_pane_read",
-            description: "Read a pane's recent output. Reading marks the pane \
-                          seen — same caveat as `flock_agent_read`.",
+            description: "Read a pane's recent output. Read-only, like \
+                          `flock_agent_read`: it changes no pane state.",
             input_schema: schema_pane_read,
             build: build_pane_read,
         },
@@ -228,10 +244,9 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_agent_history",
             description: "Read an agent's CONVERSATION from its session \
                           transcript — the prompts and replies themselves, \
-                          not the pane's wrapped terminal output. Safe to \
-                          poll: it touches no pane state, so unlike \
-                          `flock_agent_read` it never moves the operator's \
-                          attention ordering. `detail` chooses how much of \
+                          not the pane's wrapped terminal output that \
+                          `flock_agent_read` returns. Safe to poll: it \
+                          touches no pane state. `detail` chooses how much of \
                           each turn you get: `reply` (prose only), \
                           `collapsed` (adds one line per tool call), `full` \
                           (adds tool output). Omit `cursor` for the latest \
@@ -441,8 +456,8 @@ fn schema_msg_send() -> Value {
             },
             "intent": {
                 "type": "string",
-                "enum": ["fyi", "needs_reply"],
-                "description": "Are you owed an answer? `needs_reply` if this message asks for one, `fyi` if it does not. Required, and deliberately so: this rides the envelope, so the recipient can act on it before reading a word of the body — which is the whole point, and only works if you actually decide. A question stamped `fyi` is worse than no stamp, because it reads as though you meant it.",
+                "enum": intent_enum(),
+                "description": "How much you need from the recipient. `fyi`: no answer owed, and it never wakes them. `needs_reply`: you are owed an answer; they are nudged at their next turn boundary. `blocking`: you cannot proceed until they answer; as `needs_reply`, plus the operator sees it — rate-limited, so reserve it for being stuck. Required, and deliberately so: this rides the envelope, so the recipient can act on it before reading a word of the body — which is the whole point, and only works if you actually decide. A question stamped `fyi` is worse than no stamp, because it reads as though you meant it.",
             },
         },
         "required": ["to", "body", "intent"],
@@ -468,8 +483,8 @@ fn schema_msg_reply() -> Value {
             },
             "intent": {
                 "type": "string",
-                "enum": ["fyi", "needs_reply"],
-                "description": "Whether your reply itself asks for an answer. Optional, defaulting to `fyi`: answering is what a reply normally does, so unlike `flock_msg_send` there is a correct default here. Pass `needs_reply` when you are asking something back.",
+                "enum": intent_enum(),
+                "description": "Whether your reply itself asks for an answer. Optional, defaulting to `fyi`: answering is what a reply normally does, so unlike `flock_msg_send` there is a correct default here. Pass `needs_reply` when you are asking something back, `blocking` only when you cannot proceed without it (same tiers and limits as `flock_msg_send`).",
             },
         },
         "required": ["correlation_id", "body"],
@@ -632,6 +647,7 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         // envelope, and the receiver trusts it more for looking deliberate.
         // Refusing the call is the cheapest forcing function there is.
         intent: required_intent(&args, "intent")?,
+        intent_unrecognised: None,
     }))
 }
 
@@ -640,15 +656,35 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
 /// Separate from `required_string` so the refusal names the two legal values:
 /// a model that guessed a third one has to be told what the choices are, or it
 /// guesses again.
+/// The `intent` enum, generated from the tiers themselves so the schema can
+/// never offer fewer than the server accepts (#320's drift lesson).
+fn intent_enum() -> Vec<&'static str> {
+    crate::api::schema::MsgIntent::ALL
+        .iter()
+        .map(|intent| intent.as_wire())
+        .collect()
+}
+
+/// The legal spellings, quoted, for a refusal to name.
+fn intent_choices() -> String {
+    intent_enum()
+        .iter()
+        .map(|wire| format!("{wire:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn required_intent(args: &Value, key: &str) -> Result<crate::api::schema::MsgIntent, McpError> {
     let raw = args.get(key).and_then(Value::as_str).ok_or_else(|| {
         McpError::invalid_params(format!(
-            "`{key}` is required: \"needs_reply\" if you are owed an answer, \"fyi\" if not"
+            "`{key}` is required: \"needs_reply\" if you are owed an answer, \"fyi\" if not, \
+             \"blocking\" if you cannot proceed without one"
         ))
     })?;
     crate::api::schema::MsgIntent::from_wire(raw).ok_or_else(|| {
         McpError::invalid_params(format!(
-            "invalid `{key}`: {raw:?} — expected \"fyi\" or \"needs_reply\""
+            "invalid `{key}`: {raw:?} — expected one of {}",
+            intent_choices()
         ))
     })
 }
@@ -666,7 +702,8 @@ fn optional_intent(args: &Value, key: &str) -> Result<crate::api::schema::MsgInt
                 .ok_or_else(|| McpError::invalid_params(format!("`{key}` must be a string")))?;
             crate::api::schema::MsgIntent::from_wire(raw).ok_or_else(|| {
                 McpError::invalid_params(format!(
-                    "invalid `{key}`: {raw:?} — expected \"fyi\" or \"needs_reply\""
+                    "invalid `{key}`: {raw:?} — expected one of {}",
+                    intent_choices()
                 ))
             })
         }
@@ -1123,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn the_send_schema_advertises_intent_as_required_and_binary() {
+    fn the_send_schema_advertises_intent_as_required_and_three_tiered() {
         // The builder and the advertisement are hand-written in two places and
         // have drifted before (#320: the `agent` target shape was missing from
         // the schema for the whole life of the MCP surface). A required
@@ -1144,15 +1181,80 @@ mod tests {
             .iter()
             .map(|value| value.as_str().expect("strings"))
             .collect();
-        // Exactly the two wire spellings, and no third tier: #316's `blocking`
-        // is escalation machinery deferred there, not a value here.
+        // Exactly the three wire spellings (ADR-0018 §1).
         assert_eq!(
             values,
             vec![
                 crate::api::schema::MsgIntent::Fyi.as_wire(),
                 crate::api::schema::MsgIntent::NeedsReply.as_wire(),
+                crate::api::schema::MsgIntent::Blocking.as_wire(),
             ]
         );
+    }
+
+    #[test]
+    fn every_intent_tier_is_expressible_through_both_message_tools() {
+        use crate::api::schema::MsgIntent;
+        // #320's lesson: a value the server understands and the advertisement
+        // omits is a value no agent will ever send. The match is exhaustive on
+        // purpose — a new tier fails to compile here until someone decides
+        // how it reaches the tool surface, instead of silently not reaching it.
+        for intent in MsgIntent::ALL {
+            match intent {
+                MsgIntent::Fyi | MsgIntent::NeedsReply | MsgIntent::Blocking => {}
+            }
+            for schema in [schema_msg_send(), schema_msg_reply()] {
+                let advertised = schema["properties"]["intent"]["enum"]
+                    .as_array()
+                    .expect("intent declares an enum")
+                    .iter()
+                    .any(|value| value.as_str() == Some(intent.as_wire()));
+                assert!(advertised, "{intent:?} missing from {schema}");
+            }
+            let Method::MsgSend(params) = build_msg_send(json!({
+                "to": {"type": "pane", "pane": "w1:p2"},
+                "body": "x",
+                "intent": intent.as_wire(),
+            }))
+            .expect("advertised tier is accepted") else {
+                panic!("expected MsgSend");
+            };
+            assert_eq!(params.intent, intent);
+            let Method::MsgReply(params) = build_msg_reply(json!({
+                "correlation_id": "c-1",
+                "body": "x",
+                "intent": intent.as_wire(),
+            }))
+            .expect("advertised tier is accepted") else {
+                panic!("expected MsgReply");
+            };
+            assert_eq!(params.intent, intent);
+        }
+        // The tool text must say what each tier costs, or the enum is a list
+        // of words an agent has to guess the meaning of.
+        let send = table()
+            .iter()
+            .find(|tool| tool.name == "flock_msg_send")
+            .expect("send tool");
+        for wire in ["fyi", "needs_reply", "blocking"] {
+            assert!(send.description.contains(wire), "{wire} undocumented");
+        }
+    }
+
+    #[test]
+    fn no_read_tool_claims_to_mark_the_pane_seen() {
+        // #393: `agent.read` / `pane.read` never touched `seen`, and the
+        // descriptions said they did — which taught agents to avoid the one
+        // read that was always safe. `api_pane_read_leaves_seen_untouched`
+        // pins the behaviour; this pins the words to it.
+        for tool in table() {
+            assert!(
+                !tool.description.contains("marks the pane")
+                    && !tool.description.contains("sparingly"),
+                "{} still claims a read changes pane state",
+                tool.name
+            );
+        }
     }
 
     #[test]
