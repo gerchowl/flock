@@ -602,14 +602,17 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "needs_reply",
         }),
     );
-    let deferral = wait_for(
+    let arrived = wait_for(
         "the arrival-time deferral to reach nodea",
         RPC_TIMEOUT,
         || {
             let inbox = alice.call_tool("flock_msg_read", json!({}));
-            inbox["messages"].as_array()?.first().cloned()
+            let messages = inbox["messages"].as_array()?.clone();
+            (!messages.is_empty()).then_some(messages)
         },
     );
+    assert_eq!(arrived.len(), 1, "exactly one deferral: {arrived:?}");
+    let deferral = &arrived[0];
     assert_eq!(deferral["in_reply_to"], "c-408-during", "{deferral}");
     assert_eq!(deferral["intent"], "fyi", "{deferral}");
 
@@ -919,10 +922,13 @@ fn a_mute_answers_a_sender_on_another_spoke_through_the_hub() {
     // 2. Arriving into the mute: the hub's relay into nodec is what delivers
     // the question, and the deferral goes back up the same hub.
     alice.call_tool("flock_msg_send", ask("c-hub-during"));
-    let deferral = wait_for("the arrival-time deferral", RPC_TIMEOUT, || {
+    let arrived = wait_for("the arrival-time deferral", RPC_TIMEOUT, || {
         let inbox = alice.call_tool("flock_msg_read", json!({}));
-        inbox["messages"].as_array()?.first().cloned()
+        let messages = inbox["messages"].as_array()?.clone();
+        (!messages.is_empty()).then_some(messages)
     });
+    assert_eq!(arrived.len(), 1, "exactly one deferral: {arrived:?}");
+    let deferral = &arrived[0];
     assert_eq!(deferral["in_reply_to"], "c-hub-during", "{deferral}");
     assert_eq!(
         deferral["from_agent"],
