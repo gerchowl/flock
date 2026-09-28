@@ -126,11 +126,6 @@ pub(crate) struct Uplink {
     takes: Vec<ParkedTake>,
     last_take_at: Option<Instant>,
     pending_park: Option<Park>,
-    /// Set only while the HUB runs `msg.send` for a frame a spoke handed up:
-    /// the configured `[[peers]]` name of that spoke. In-process on purpose —
-    /// the "this sender's host was vouched for" fact must never be readable
-    /// from wire params, or any caller could assert it.
-    vouched_origin: Option<String>,
 }
 
 impl Uplink {
@@ -145,14 +140,6 @@ impl Uplink {
         }
         self.last_take_at
             .is_some_and(|at| now.saturating_duration_since(at) <= heartbeat)
-    }
-
-    pub(crate) fn set_vouched_origin(&mut self, host: Option<String>) {
-        self.vouched_origin = host;
-    }
-
-    pub(crate) fn vouched_origin(&self) -> Option<&str> {
-        self.vouched_origin.as_deref()
     }
 
     /// Queue a frame for the hub and park its sender.

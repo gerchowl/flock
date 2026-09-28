@@ -379,7 +379,6 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgMute(_) => "msg.mute",
         Method::MsgUplinkTake(_) => "msg.uplink_take",
         Method::MsgUplinkResult(_) => "msg.uplink_result",
-        Method::MsgUplinkForward(_) => "msg.uplink_forward",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneMove(_) => "pane.move",
         Method::PaneList(_) => "pane.list",

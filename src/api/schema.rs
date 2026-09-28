@@ -135,10 +135,6 @@ pub enum Method {
     /// the same relay.
     #[serde(rename = "msg.uplink_result")]
     MsgUplinkResult(MsgUplinkResultParams),
-    /// #410: the hub side — a message a spoke handed up, forwarded through the
-    /// ordinary `msg.send` path with the spoke vouched for as the edge.
-    #[serde(rename = "msg.uplink_forward")]
-    MsgUplinkForward(MsgUplinkForwardParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
     #[serde(rename = "msg.mute")]
@@ -1012,17 +1008,6 @@ pub struct MsgUplinkResultParams {
     pub hub: String,
     /// The hub's `msg.send` response, verbatim: a success or an error body.
     pub response: serde_json::Value,
-}
-
-/// `msg.uplink_forward` — the hub forwarding a frame one of its spokes handed
-/// up (#410).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MsgUplinkForwardParams {
-    /// The `[[peers]]` name of the spoke whose relay carried the frame. The
-    /// hub vouches for this edge and nothing else: the frame's `from_host`
-    /// must be the host that spoke reports, or it is refused.
-    pub spoke: String,
-    pub message: MsgSendParams,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,

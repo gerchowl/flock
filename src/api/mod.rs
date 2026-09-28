@@ -43,7 +43,6 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::MsgSend(_)
             | Method::MsgRead(_)
             | Method::MsgReply(_)
-            | Method::MsgUplinkForward(_)
             | Method::PaneSplit(_)
             | Method::PaneMove(_)
             | Method::PaneRename(_)

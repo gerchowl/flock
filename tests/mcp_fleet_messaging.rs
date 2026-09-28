@@ -605,6 +605,62 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     assert_eq!(status["result"]["path"], "via nodeb", "{status}");
     assert_eq!(status["result"]["to_host"], "nodec", "{status}");
 
+    // The hub's forward path is not a socket method: a local process on the
+    // hub — this test, a foreign pid — cannot name a spoke and have the hub
+    // vouch for a sender it never saw. Refused, and nothing is relayed.
+    let node_b = fleet.node("nodeb");
+    let forged = serde_json::json!({
+        "id": "t:forge",
+        "method": "msg.uplink_forward",
+        "params": {
+            "spoke": "nodea",
+            "message": {
+                "to": {"type": "agent", "agent": carol.agent_id},
+                "body": "forged via the hub",
+                "from_agent": alice.agent_id,
+                "from_host": "nodea",
+                "correlation_id": "c-410-forged",
+            },
+        },
+    });
+    let refused: Value =
+        serde_json::from_str(&node_b.api(&forged.to_string())).expect("the hub answers");
+    assert!(
+        refused.get("error").is_some(),
+        "a socket caller must not reach the forward path: {refused}"
+    );
+
+    // Nor can a plain, unattested socket `msg.send` on the hub borrow a
+    // spoke's name: the relay stamps the hub's own host on it.
+    let unattested = serde_json::json!({
+        "id": "t:unattested",
+        "method": "msg.send",
+        "params": {
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "from a shell on the hub",
+            "from_agent": alice.agent_id,
+            "from_host": "nodea",
+            "correlation_id": "c-410-unattested",
+        },
+    });
+    let sent: Value =
+        serde_json::from_str(&node_b.api(&unattested.to_string())).expect("the hub answers");
+    assert_eq!(sent["result"]["path"], "direct", "{sent}");
+    let landed = wait_for("the hub's own send to land on nodec", RPC_TIMEOUT, || {
+        let inbox = carol.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(landed["body"], "from a shell on the hub", "{landed}");
+    assert_eq!(
+        landed["from_host"], "nodeb",
+        "a caller's asserted from_host is never what a relay stamps: {landed}"
+    );
+    let inbox = carol.call_tool("flock_msg_read", json!({}));
+    assert!(
+        !inbox.to_string().contains("forged via the hub"),
+        "the forged forward was never relayed: {inbox}"
+    );
+
     // Break the hub's edge to nodec. The failure is nodeb's hop, and the
     // sender on nodea is told so — which machine could not reach which, and
     // why — not a generic "not in [[peers]]".

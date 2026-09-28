@@ -156,6 +156,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if let AppEvent::UplinkForwarded {
+            spoke,
+            message,
+            respond_to,
+        } = ev
+        {
+            let response = self.forward_uplinked_message(&spoke, message);
+            let _ = respond_to.send(response);
+            return;
+        }
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
@@ -330,6 +340,9 @@ impl App {
                 // so the reap knows what to compare against.
                 self.peer_poll_health.mark_started(now);
                 let event_tx = self.event_tx.clone();
+                // #410: where a held relay hands the frames its spoke pushes
+                // up. Refreshed every round, so it always points at this loop.
+                crate::peer_stream::set_uplink_sink(event_tx.clone());
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
                     // sends, so the fetch must not be able to unwind past it
@@ -1320,9 +1333,6 @@ impl App {
             }
             Method::MsgUplinkResult(params) => {
                 return self.handle_msg_uplink_result(request.id, params)
-            }
-            Method::MsgUplinkForward(params) => {
-                return self.handle_msg_uplink_forward(request.id, params)
             }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),

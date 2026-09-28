@@ -1,19 +1,20 @@
 //! `msg.uplink_*` — a spoke's messages ride up the relay its hub holds (#410).
 //!
-//! Both halves live here. On the SPOKE: `hand_up_message` parks a send behind
-//! a frame, `msg.uplink_take` gives frames to the relay, and
-//! `msg.uplink_result` resolves the parked send with the hub's answer. On the
-//! HUB: `msg.uplink_forward` takes a frame one of its spokes handed up and
-//! runs the ordinary `msg.send` on it — the hub already knows how to reach
-//! every spoke, so there is still exactly one delivery implementation.
+//! Both halves live here. On the SPOKE: `try_hand_up` parks a send behind a
+//! frame, `msg.uplink_take` gives frames to the relay, and `msg.uplink_result`
+//! resolves the parked send with the hub's answer. On the HUB:
+//! `forward_uplinked_message` — reached in-process from the relay reader,
+//! never from the socket — runs the ordinary `msg.send` on a frame a spoke
+//! handed up; the hub already knows how to reach every spoke, so there is
+//! still exactly one delivery implementation.
 //!
 //! The state machine is `crate::app::uplink`; this file is the wire around it.
 
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, MessageTarget, MsgSendParams, MsgUplinkForwardParams,
-    MsgUplinkResultParams, MsgUplinkTakeParams, ResponseResult, UplinkFrame,
+    EventData, EventEnvelope, EventKind, MessageTarget, MsgSendParams, MsgUplinkResultParams,
+    MsgUplinkTakeParams, ResponseResult, UplinkFrame,
 };
 use crate::app::uplink::ParkedSend;
 use crate::app::App;
@@ -303,19 +304,24 @@ impl App {
         )
     }
 
-    /// `msg.uplink_forward` — the HUB side: a spoke handed a message up its
-    /// relay; deliver it with the ordinary `msg.send`.
+    /// The HUB side: a spoke handed a message up its relay; deliver it with
+    /// the ordinary `msg.send`.
+    ///
+    /// Reached only from `AppEvent::UplinkForwarded`, which only the relay
+    /// reader for an edge THIS hub dialled produces. It is deliberately not a
+    /// socket method: as one, any local process — an agent in a pane included
+    /// — could name a spoke and have the hub vouch for a sender it never saw.
     ///
     /// The hub vouches for the edge and for nothing else (#410 pitfall 1). The
     /// sender stays the one the spoke attested, and the one thing the hub can
-    /// check — that a frame arriving over spoke S claims to come from S's own
-    /// host — it does check, so a spoke cannot speak for another machine.
-    pub(super) fn handle_msg_uplink_forward(
+    /// check — that a frame arriving over spoke S claims to come from S — it
+    /// does check, so a spoke cannot speak for another machine.
+    pub(crate) fn forward_uplinked_message(
         &mut self,
-        id: String,
-        params: MsgUplinkForwardParams,
+        spoke: &str,
+        mut message: MsgSendParams,
     ) -> String {
-        let MsgUplinkForwardParams { spoke, mut message } = params;
+        let id = "uplink-forward".to_string();
         // Bound to the edge THIS hub configured and dialled, never to what the
         // spoke says about itself: a spoke's summary `host` is self-reported,
         // so vouching against it would let a cloned or compromised spoke speak
@@ -324,7 +330,7 @@ impl App {
             .state
             .peers
             .iter()
-            .find(|peer| peer.name.eq_ignore_ascii_case(&spoke))
+            .find(|peer| peer.name.eq_ignore_ascii_case(spoke))
             .cloned()
         else {
             return encode_error(
@@ -368,9 +374,8 @@ impl App {
         // process ancestry is the server itself and attests nobody. Clearing
         // it is what keeps the hub from being stamped as the sender.
         let pid = self.current_api_peer_pid.take();
-        self.uplink.set_vouched_origin(message.from_host.clone());
-        let response = self.handle_msg_send(id, message);
-        self.uplink.set_vouched_origin(None);
+        let vouched = peer.name.clone();
+        let response = self.send_message(id, message, Some(&vouched));
         self.current_api_peer_pid = pid;
         response
     }
@@ -437,9 +442,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{
-        AgentStatus, MessageTarget, Method, MsgIntent, MsgSendParams, MsgUplinkForwardParams,
-        MsgUplinkResultParams, MsgUplinkTakeParams, PeerAgentSummary, PeerWorkspaceSummary,
-        Request,
+        AgentStatus, MessageTarget, Method, MsgIntent, MsgSendParams, MsgUplinkResultParams,
+        MsgUplinkTakeParams, PeerAgentSummary, PeerWorkspaceSummary, Request,
     };
     use crate::config::Config;
 
@@ -686,13 +690,7 @@ mod tests {
         ];
         let mut message = send_to("agent_nowhere_1");
         message.from_host = Some("ksb".into());
-        let response = value(&app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgUplinkForward(MsgUplinkForwardParams {
-                spoke: "sage".into(),
-                message,
-            }),
-        }));
+        let response = value(&app.forward_uplinked_message("sage", message));
         assert_eq!(
             response["error"]["code"], "uplink_sender_mismatch",
             "{response}"
@@ -702,17 +700,7 @@ mod tests {
         // is a plain miss: a forwarded message is never handed up again.
         let mut message = send_to("agent_nowhere_1");
         message.from_host = Some("sage".into());
-        let response = value(&app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgUplinkForward(MsgUplinkForwardParams {
-                spoke: "sage".into(),
-                message,
-            }),
-        }));
-        assert!(
-            app.uplink.vouched_origin().is_none(),
-            "the vouch lives only for the forward it was made for"
-        );
+        let response = value(&app.forward_uplinked_message("sage", message));
         assert_eq!(
             response["error"]["code"], "msg_target_not_found",
             "{response}"
@@ -770,17 +758,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unattested_caller_cannot_make_a_relay_stamp_another_host() {
-        // Blocker B of the #414 review: only the in-process vouch from
-        // `msg.uplink_forward` may put a foreign host on a relayed message. A
-        // socket caller's own `from_host` is never believed by the relay.
-        let mut app = test_app();
+    async fn no_socket_caller_can_reach_the_forward_path() {
+        // Re-review of #414: as a socket method, the forward let any local
+        // process — an agent in a pane included — name a spoke and have the
+        // hub vouch for a sender it never saw. It is in-process only now, so
+        // the wire has no spelling for it at all.
+        let request = r#"{"id":"x","method":"msg.uplink_forward","params":{"spoke":"sage","message":{"to":{"type":"agent","agent":"a"},"body":"b","from_host":"sage","from_agent":"a"}}}"#;
+        assert!(
+            serde_json::from_str::<Request>(request).is_err(),
+            "msg.uplink_forward must not parse as a request"
+        );
+    }
+
+    #[test]
+    fn a_relay_stamps_a_foreign_host_only_for_a_vouched_forward() {
+        use super::super::messages::relay_sender_host;
         let me = crate::app::short_host_name();
-        assert_eq!(app.relay_sender_host(false), me, "unvouched, unattested");
-        app.uplink.set_vouched_origin(Some("sage".into()));
-        assert_eq!(app.relay_sender_host(false), "sage", "vouched by the hub");
+        assert_eq!(relay_sender_host(false, None), me, "unvouched, unattested");
         assert_eq!(
-            app.relay_sender_host(true),
+            relay_sender_host(false, Some("sage")),
+            "sage",
+            "vouched by the hub's in-process uplink path"
+        );
+        assert_eq!(
+            relay_sender_host(true, Some("sage")),
             me,
             "a locally attested sender is always this host"
         );
@@ -789,30 +790,37 @@ mod tests {
     #[tokio::test]
     async fn a_hub_stamps_the_configured_edge_not_the_spokes_self_report() {
         // Blocker A: a spoke configured as `anvil` that calls itself `vm-dev`
-        // may hand up as vm-dev (its unique self-report), but what the hub
-        // vouches for is the edge it dialled.
+        // may hand up as vm-dev (its unique self-report), but the origin the
+        // recipient reads is the edge the hub dialled.
         let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].focused_pane_id().expect("pane");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let local_agent = app.state.terminals[&terminal_id].agent_id.to_string();
+        let pane = app.locate_agent(&local_agent).expect("local").pane_id;
+
         app.state.peers = vec![crate::config::PeerConfig {
             name: "anvil".into(),
             ..Default::default()
         }];
         app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
-        let mut message = send_to("agent_vm-dev_1");
+        let mut message = send_to(&local_agent);
+        message.from_agent = Some("agent_vm-dev_1".into());
         message.from_host = Some("vm-dev".into());
-        message.to = MessageTarget::Agent {
-            agent: "agent_nowhere_1".into(),
-        };
-        let response = value(&app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgUplinkForward(MsgUplinkForwardParams {
-                spoke: "anvil".into(),
-                message,
-            }),
+        let queued = value(&app.forward_uplinked_message("anvil", message));
+        assert_eq!(queued["result"]["state"], "queued", "{queued}");
+
+        let inbox = value(&app.handle_api_request(Request {
+            id: "read".into(),
+            method: Method::MsgRead(crate::api::schema::MsgReadParams { pane: Some(pane) }),
         }));
-        // Past the vouch, into ordinary delivery: a clean miss, not a refusal.
-        assert_eq!(
-            response["error"]["code"], "msg_target_not_found",
-            "{response}"
-        );
+        let delivered = &inbox["result"]["messages"][0];
+        assert_eq!(delivered["from_host"], "anvil", "{inbox}");
+        assert_eq!(delivered["from_agent"], "agent_vm-dev_1", "{inbox}");
     }
 }

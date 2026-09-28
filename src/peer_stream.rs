@@ -287,13 +287,34 @@ impl PeerStream {
     }
 }
 
+/// Where relay readers hand the frames their spokes push up: this hub's
+/// main loop (#410). Set by the poll dispatch, which already owns the sender.
+type UplinkSink = Mutex<Option<tokio::sync::mpsc::Sender<crate::events::AppEvent>>>;
+
+fn uplink_sink() -> &'static UplinkSink {
+    static SINK: OnceLock<UplinkSink> = OnceLock::new();
+    SINK.get_or_init(Default::default)
+}
+
+pub(crate) fn set_uplink_sink(sink: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    if let Ok(mut slot) = uplink_sink().lock() {
+        *slot = Some(sink);
+    }
+}
+
+/// How long a forward worker waits for the main loop's answer. Above the
+/// hub's own ssh timeout for the next hop, so a slow-but-successful delivery
+/// is not reported as lost; a property of that hop, not a preference.
+const UPLINK_FORWARD_ANSWER: Duration = Duration::from_secs(45);
+
 /// Hub side of #410: deliver a message `spoke` handed up, then send the
 /// outcome back down the same relay.
 ///
-/// Forwarded through this server's OWN socket as `msg.uplink_forward`, so the
-/// hub's ordinary `msg.send` does the delivery — one implementation, wherever
-/// the sender was — and the edge check (a spoke speaks only for its own host)
-/// runs on the main loop, where the spoke's reported host is known.
+/// Handed to the main loop IN-PROCESS, as `AppEvent::UplinkForwarded`, never
+/// through this hub's socket: the spoke identity attached here comes from the
+/// `PeerConfig` of the edge this hub dialled, and a socket method would let
+/// any local process name a spoke instead. The main loop then runs the hub's
+/// ordinary `msg.send` — one delivery implementation, wherever the sender was.
 fn forward_uplinked_frame(spoke: &PeerConfig, line: &str) {
     let Some(frame) = serde_json::from_str::<serde_json::Value>(line)
         .ok()
@@ -304,25 +325,33 @@ fn forward_uplinked_frame(spoke: &PeerConfig, line: &str) {
         return;
     };
     let uplink_id = frame.uplink_id.clone();
-    let forward = crate::api::schema::Request {
-        id: format!("uplink-forward:{uplink_id}"),
-        method: crate::api::schema::Method::MsgUplinkForward(
-            crate::api::schema::MsgUplinkForwardParams {
-                spoke: spoke.name.clone(),
-                message: frame.message,
-            },
-        ),
-    };
-    let response = match crate::api::client::ApiClient::local().request_value(&forward) {
-        Ok(response) => response,
-        Err(err) => serde_json::json!({
-            "id": forward.id,
+    let sink = uplink_sink().lock().ok().and_then(|slot| slot.clone());
+    let (respond_to, answer) = std::sync::mpsc::channel();
+    let delivered = sink.is_some_and(|sink| {
+        sink.blocking_send(crate::events::AppEvent::UplinkForwarded {
+            spoke: spoke.name.clone(),
+            message: frame.message,
+            respond_to,
+        })
+        .is_ok()
+    });
+    let response = if delivered {
+        answer
+            .recv_timeout(UPLINK_FORWARD_ANSWER)
+            .ok()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        serde_json::json!({
+            "id": "uplink-forward",
             "error": {
                 "code": "hub_unavailable",
-                "message": format!("the hub's own server did not answer: {err}"),
+                "message": "the hub's own server did not answer the forward",
             },
-        }),
-    };
+        })
+    });
     crate::logging::uplink_frame_forwarded(
         &spoke.name,
         &uplink_id,

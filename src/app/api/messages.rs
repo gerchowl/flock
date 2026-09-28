@@ -37,6 +37,21 @@ pub(super) fn mint_correlation_id() -> String {
     )
 }
 
+/// The sender host a relay stamps on a message it hands on.
+///
+/// This host, unless the message is one a spoke handed up and this hub's
+/// uplink path vouched for its edge (#410) — then that edge's configured name,
+/// so the hub does not become the apparent sender (pitfall 1, #213). An
+/// unattested socket caller's own `from_host` is never believed here, or any
+/// process on this machine could make a peer see a message "from" a host it
+/// never came from.
+pub(super) fn relay_sender_host(attested_locally: bool, vouched: Option<&str>) -> String {
+    match vouched {
+        Some(vouched) if !attested_locally => vouched.to_string(),
+        _ => crate::app::short_host_name(),
+    }
+}
+
 /// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Messages are queued per
 /// recipient pane and delivered at the recipient's next settled turn
 /// boundary — never mid-turn (§8.3). Sender identity is stamped from API
@@ -44,6 +59,19 @@ pub(super) fn mint_correlation_id() -> String {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
+        self.send_message(id, params, None)
+    }
+
+    /// `msg.send`, with `vouched` naming the spoke edge when — and only when —
+    /// this is the hub delivering a frame that spoke handed up (#410). Passed
+    /// as an argument, never read from params or left in shared state, so no
+    /// wire caller can claim it and no early return can leak it.
+    pub(super) fn send_message(
+        &mut self,
+        id: String,
+        params: MsgSendParams,
+        vouched: Option<&str>,
+    ) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
@@ -61,7 +89,7 @@ impl App {
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
             ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params)
+                return self.relay_message_to_host(id, &location, &body, params, vouched)
             }
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -257,6 +285,7 @@ impl App {
                         in_reply_to: Some(params.correlation_id.clone()),
                         intent: params.intent,
                     },
+                    None,
                 );
             }
         };
@@ -616,6 +645,7 @@ impl App {
         location: &crate::app::directory::AgentLocation,
         body: &str,
         params: MsgSendParams,
+        vouched: Option<&str>,
     ) -> String {
         let route = location.route.as_deref().unwrap_or_default();
         let host = location.host.as_str();
@@ -681,7 +711,7 @@ impl App {
 
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();
-        let from_host = self.relay_sender_host(attested.is_some());
+        let from_host = relay_sender_host(attested.is_some(), vouched);
         let from_agent = attested.or_else(|| params.from_agent.clone());
         let Some(from_agent) = from_agent else {
             return encode_error(
@@ -784,21 +814,6 @@ impl App {
             .terminals
             .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
         Some(terminal.agent_id.to_string())
-    }
-
-    /// The sender host a relay stamps on a message it hands on.
-    ///
-    /// This host, unless the message is one a spoke handed up and the hub's
-    /// uplink handler vouched for its edge (#410) — then the spoke's host, so
-    /// the hub does not become the apparent sender (pitfall 1, #213). The
-    /// vouch is carried IN-PROCESS: an unattested socket caller's own
-    /// `from_host` is never believed here, or any process on this machine
-    /// could make a peer see a message "from" a host it never came from.
-    pub(super) fn relay_sender_host(&self, attested_locally: bool) -> String {
-        match self.uplink.vouched_origin() {
-            Some(vouched) if !attested_locally => vouched.to_string(),
-            _ => crate::app::short_host_name(),
-        }
     }
 
     /// A target this server could not place: hand it up to the hub when this
