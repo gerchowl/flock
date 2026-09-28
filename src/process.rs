@@ -35,6 +35,14 @@ const TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_ARG_LOG_CHARS: usize = 512;
 const ARG_TRUNCATED_MARKER: &str = "…[truncated]";
 
+/// Lines of a failed command's stderr kept in its `process.exec` record
+/// (#418). The error is the LAST thing a tool prints — ssh's banners and motd
+/// come first — and a few lines above it are the context that names the cause
+/// (`Permission denied` after the key it offered). More is a log flood.
+pub(crate) const STDERR_TAIL_LINES: usize = 3;
+/// Cap for the `stderr_tail` field, same budget and reasoning as the argv cap.
+pub(crate) const MAX_STDERR_LOG_CHARS: usize = 512;
+
 /// A `std::process::Command` that logs its invocation through the
 /// `crate::logging` facade when it runs. Callers build it exactly like a
 /// `Command`, but call `output_traced()` / `status_traced()` / `spawn_traced()`
@@ -45,6 +53,9 @@ pub(crate) struct TracedCommand {
     subsystem: &'static str,
     program: String,
     cadence: ExecCadence,
+    /// Narrows a periodic command's edge key below `subsystem/program`. See
+    /// [`TracedCommand::edge_scope`].
+    edge_scope: Option<String>,
 }
 
 /// How often this command runs — the input that picks the level a completed
@@ -90,6 +101,7 @@ impl TracedCommand {
             subsystem,
             program: program_display,
             cadence: ExecCadence::default(),
+            edge_scope: None,
         }
     }
 
@@ -104,6 +116,7 @@ impl TracedCommand {
             subsystem,
             program,
             cadence: ExecCadence::default(),
+            edge_scope: None,
         }
     }
 
@@ -116,6 +129,44 @@ impl TracedCommand {
     pub(crate) fn periodic(&mut self) -> &mut Self {
         self.cadence = ExecCadence::Periodic;
         self
+    }
+
+    /// Track a periodic command's edges per `scope` rather than per program.
+    ///
+    /// The edge map keys on `subsystem/program`, which is right for a sampler
+    /// and wrong for one program pointed at many targets: the peer poll runs
+    /// `ssh` against every peer, so one peer failing while another succeeds
+    /// flipped the shared key on every tick and each flip was a fresh WARN or
+    /// "recovered" INFO (#418). Scoped by peer, each target has its own edge.
+    pub(crate) fn edge_scope(&mut self, scope: impl Into<String>) -> &mut Self {
+        self.edge_scope = Some(scope.into());
+        self
+    }
+
+    /// Report a run that produced an exit status. `stderr` is what was
+    /// captured, if anything was; its tail rides a FAILURE's record only.
+    fn report_completed(
+        &self,
+        args: &str,
+        status: ExitStatus,
+        stderr: Option<&[u8]>,
+        duration_ms: u64,
+    ) {
+        let stderr_tail = (!status.success())
+            .then(|| stderr.and_then(shape_stderr_tail))
+            .flatten();
+        crate::logging::process_exec_completed(
+            self.subsystem,
+            &self.program,
+            args,
+            Some(status),
+            duration_ms,
+            crate::logging::ExecReport {
+                cadence: self.cadence,
+                edge_scope: self.edge_scope.as_deref(),
+                stderr_tail: stderr_tail.as_deref(),
+            },
+        );
     }
 
     pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
@@ -271,14 +322,9 @@ impl TracedCommand {
         })();
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
-            Ok(output) => crate::logging::process_exec_completed(
-                self.subsystem,
-                &self.program,
-                &args,
-                Some(output.status),
-                duration_ms,
-                self.cadence,
-            ),
+            Ok(output) => {
+                self.report_completed(&args, output.status, Some(&output.stderr), duration_ms)
+            }
             Err(err) => crate::logging::process_exec_failed(
                 self.subsystem,
                 &self.program,
@@ -317,14 +363,9 @@ impl TracedCommand {
         })();
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
-            Ok(output) => crate::logging::process_exec_completed(
-                self.subsystem,
-                &self.program,
-                &args,
-                Some(output.status),
-                duration_ms,
-                self.cadence,
-            ),
+            Ok(output) => {
+                self.report_completed(&args, output.status, Some(&output.stderr), duration_ms)
+            }
             Err(err) => crate::logging::process_exec_failed(
                 self.subsystem,
                 &self.program,
@@ -349,14 +390,7 @@ impl TracedCommand {
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(output) => {
-                crate::logging::process_exec_completed(
-                    self.subsystem,
-                    &self.program,
-                    &args,
-                    Some(output.status),
-                    duration_ms,
-                    self.cadence,
-                );
+                self.report_completed(&args, output.status, Some(&output.stderr), duration_ms);
             }
             Err(err) => {
                 crate::logging::process_exec_failed(
@@ -381,14 +415,7 @@ impl TracedCommand {
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(status) => {
-                crate::logging::process_exec_completed(
-                    self.subsystem,
-                    &self.program,
-                    &args,
-                    Some(*status),
-                    duration_ms,
-                    self.cadence,
-                );
+                self.report_completed(&args, *status, None, duration_ms);
             }
             Err(err) => {
                 crate::logging::process_exec_failed(
@@ -467,6 +494,35 @@ fn redact_arg(arg: &str) -> String {
         }
     }
     arg.to_string()
+}
+
+/// Shape a failed command's captured stderr into a bounded, credential-masked
+/// tail for its log record: the last [`STDERR_TAIL_LINES`] non-blank lines,
+/// joined with ` | `, capped at [`MAX_STDERR_LOG_CHARS`] from the END so the
+/// error line itself is what survives. `None` when there is nothing to say.
+///
+/// Before #418 the capture was dropped: 2,229 failed dials a day logged as
+/// "process exec exited non-zero" with ssh's `Permission denied` nowhere.
+pub(crate) fn shape_stderr_tail(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join(" | ");
+    let tail = crate::report::redact::mask_credentials(&tail);
+    if tail.len() <= MAX_STDERR_LOG_CHARS {
+        return Some(tail);
+    }
+    let mut cut = tail.len() - MAX_STDERR_LOG_CHARS;
+    while !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    Some(format!("{ARG_TRUNCATED_MARKER}{}", &tail[cut..]))
 }
 
 /// Shape a `Command`'s argv into a single log-safe string: args joined with
@@ -688,6 +744,87 @@ mod tests {
                 "token reached the log ({subsystem}): {out}"
             );
         }
+    }
+
+    /// #418: a failure's own words reach its record — only the tail, with
+    /// credentials masked. The lines come through the environment, not argv,
+    /// so the `args` field cannot be what makes the assertions pass.
+    #[test]
+    fn a_failed_run_logs_its_stderr_tail_masked_and_bounded() {
+        let fake = format!("{}{}", "ghp_", "q".repeat(20));
+        let out = capture_logs(|| {
+            let _ = TracedCommand::new("/bin/sh", "test-stderr-tail")
+                .args([
+                    "-c",
+                    "echo \"$L1\" >&2; echo \"$L2\" >&2; echo \"$L3\" >&2; echo \"$L4\" >&2; exit 255",
+                ])
+                .env("L1", "a-banner-line")
+                .env("L2", "an-offered-key-line")
+                .env("L3", format!("token: {fake}"))
+                .env("L4", "Permission denied (publickey).")
+                .output_traced_with_timeout(Duration::from_secs(10));
+        });
+        assert!(out.contains("stderr_tail="), "{out}");
+        assert!(out.contains("Permission denied (publickey)."), "{out}");
+        assert!(
+            out.contains("an-offered-key-line"),
+            "context above the error: {out}"
+        );
+        assert!(
+            !out.contains("a-banner-line"),
+            "only the tail is kept: {out}"
+        );
+        assert!(!out.contains(&fake), "credential reached the log: {out}");
+    }
+
+    #[test]
+    fn a_successful_run_carries_no_stderr() {
+        let out = capture_logs(|| {
+            let _ = TracedCommand::new("/bin/sh", "test-stderr-ok")
+                .args(["-c", "echo \"$L1\" >&2"])
+                .env("L1", "harmless-progress-noise")
+                .output_traced();
+        });
+        assert!(!out.contains("harmless-progress-noise"), "{out}");
+    }
+
+    #[test]
+    fn an_oversized_stderr_keeps_its_end() {
+        let long = format!("{} the-actual-error", "x".repeat(4 * MAX_STDERR_LOG_CHARS));
+        let tail = shape_stderr_tail(long.as_bytes()).expect("non-empty");
+        assert!(tail.ends_with("the-actual-error"), "{tail}");
+        assert!(tail.len() <= MAX_STDERR_LOG_CHARS + ARG_TRUNCATED_MARKER.len());
+        assert_eq!(
+            shape_stderr_tail(b"  \n\n"),
+            None,
+            "blank stderr says nothing"
+        );
+    }
+
+    /// #418: one program pointed at many peers. Keyed per program, peer A
+    /// failing while peer B worked flipped a shared edge on every tick; keyed
+    /// per scope, each peer has its own.
+    #[test]
+    fn edge_scope_gives_each_target_its_own_edge() {
+        let tick = |scope: &str, script: &str| {
+            capture_logs(|| {
+                let _ = TracedCommand::new("/bin/sh", "test-edge-scope")
+                    .args(["-c", script])
+                    .periodic()
+                    .edge_scope(scope)
+                    .status_traced();
+            })
+        };
+        assert!(tick("a", "exit 1").contains("WARN"));
+        assert!(!tick("b", "exit 0").contains("recovered"), "b never failed");
+        assert!(
+            !tick("a", "exit 1").contains("WARN"),
+            "a is still failing the same way; b's success is not a's edge"
+        );
+        assert!(
+            tick("b", "exit 1").contains("WARN"),
+            "b's own first failure"
+        );
     }
 
     /// The whole point: a child that never exits must not take its caller with

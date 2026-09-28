@@ -918,6 +918,15 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// Directories holding this user's launchd session dirs
+/// (`com.apple.launchd.*/Listeners`), where a dead inherited `SSH_AUTH_SOCK`
+/// is re-resolved without spawning `launchctl` (#418). `/var/run` is where
+/// the fleet's Macs keep them; older releases used `/private/tmp`, and
+/// listing a directory that holds none costs one failed `readdir`.
+pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
+    &["/var/run", "/private/tmp"]
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {

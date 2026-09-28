@@ -441,6 +441,13 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+/// Linux has no launchd session directory to re-resolve an agent socket
+/// from; a dead inherited `SSH_AUTH_SOCK` is detected and reported instead
+/// (#418).
+pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
+    &[]
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {
