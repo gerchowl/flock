@@ -144,7 +144,11 @@ pub(super) fn table() -> &'static [Tool] {
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
                           the fleet), `peer_not_configured` (found it, but \
-                          its host is not in this server's peers), \
+                          no edge or hub reaches its host), \
+                          `peer_unreachable` (a hop failed; the message names \
+                          which machine could not reach which, and why), \
+                          `uplink_timeout` (handed to the hub, no answer — \
+                          retrying with the same `correlation_id` is safe), \
                           `msg_not_allowed` (the receiver declines), \
                           `sender_unresolved` (a cross-host send needs an \
                           attestable sender, so it must come from inside a \

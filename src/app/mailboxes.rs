@@ -883,6 +883,7 @@ mod tests {
                 to_host: "sage".into(),
                 route: "sage".into(),
                 relayed_at_ms: 1,
+                via: None,
                 intent: MsgIntent::NeedsReply,
             },
         };

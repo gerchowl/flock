@@ -127,6 +127,14 @@ pub enum Method {
     MsgRead(MsgReadParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
+    /// #410: a spoke's held relay collecting the messages this server hands up
+    /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
+    #[serde(rename = "msg.uplink_take")]
+    MsgUplinkTake(MsgUplinkTakeParams),
+    /// #410: the hub's answer to a message a spoke handed up, sent back down
+    /// the same relay.
+    #[serde(rename = "msg.uplink_result")]
+    MsgUplinkResult(MsgUplinkResultParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
     #[serde(rename = "msg.mute")]
@@ -1004,6 +1012,45 @@ pub struct MsgSendParams {
     /// skew, instead of the note dying on the stderr of an ssh-invoked CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_unrecognised: Option<String>,
+}
+
+/// One message a spoke hands up to its hub (#410).
+///
+/// A spoke has no `[[peers]]` — deliberately, the fleet refuses N×N trust —
+/// so the only channel it has to the rest of the fleet is the relay the hub
+/// holds INTO it. The frame rides that relay upward as a push, the hub runs
+/// its ordinary `msg.send` on `message`, and the answer comes back down keyed
+/// by `uplink_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UplinkFrame {
+    /// Correlates the hub's answer with the send waiting for it. The message's
+    /// own `correlation_id` is the idempotency key end to end; this one only
+    /// pairs a result with its caller.
+    pub uplink_id: String,
+    /// The send as the spoke attested it: `from_agent` and `from_host` are the
+    /// ORIGINATING sender, never the hub.
+    pub message: MsgSendParams,
+}
+
+/// `msg.uplink_take` — the relay collecting frames to push up (#410).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgUplinkTakeParams {
+    /// Frames the relay has already written up the pipe. Until a frame is
+    /// acknowledged it is re-offered, so a relay that died between taking a
+    /// frame and writing it does not lose the message; the recipient's mailbox
+    /// dedupes on `correlation_id`, so a re-offer cannot double-deliver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ack: Vec<String>,
+}
+
+/// `msg.uplink_result` — the hub's answer to one handed-up frame (#410).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MsgUplinkResultParams {
+    pub uplink_id: String,
+    /// The hub's own name for itself: what the spoke reports as `via <hub>`.
+    pub hub: String,
+    /// The hub's `msg.send` response, verbatim: a success or an error body.
+    pub response: serde_json::Value,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,
@@ -1989,10 +2036,26 @@ pub enum ResponseResult {
     },
     MsgQueued {
         correlation_id: String,
-        /// "queued" | "duplicate"
+        /// "queued" | "duplicate" | "relayed"
         state: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
+        /// Host the message was handed to, when it left this server (#410).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_host: Option<String>,
+        /// How it left (#410): `direct` when this server dialled the
+        /// recipient's host itself, `via <hub>` when it went up a hub's relay.
+        /// Absent for a message queued here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// #410: the frames a spoke's relay should push up to its hub.
+    MsgUplinkFrames {
+        frames: Vec<UplinkFrame>,
+    },
+    /// #410: whether an uplink result matched a send still waiting for it.
+    MsgUplinkResultAck {
+        matched: bool,
     },
     MsgList {
         messages: Vec<QueuedMessageInfo>,
@@ -2012,6 +2075,9 @@ pub enum ResponseResult {
         to_host: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
+        /// `direct` or `via <hub>` (#410), for a message that left this server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -2689,6 +2755,11 @@ pub enum EventData {
         /// an older log reads back as `fyi`.
         #[serde(default)]
         intent: MsgIntent,
+        /// The hub the message was handed UP to, when this server had no edge
+        /// of its own to the recipient's host (#410). `route` then names that
+        /// hub too; this field is what says the hop was not direct.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
     },
     MessageDelivered {
         correlation_id: String,

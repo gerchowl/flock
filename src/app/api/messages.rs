@@ -27,7 +27,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn mint_correlation_id() -> String {
+pub(super) fn mint_correlation_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -74,6 +74,21 @@ fn escalation_body(sender: &str, recipient: &str, count: usize) -> String {
     )
 }
 
+/// The sender host a relay stamps on a message it hands on.
+///
+/// This host, unless the message is one a spoke handed up and this hub's
+/// uplink path vouched for its edge (#410) — then that edge's configured name,
+/// so the hub does not become the apparent sender (pitfall 1, #213). An
+/// unattested socket caller's own `from_host` is never believed here, or any
+/// process on this machine could make a peer see a message "from" a host it
+/// never came from.
+pub(super) fn relay_sender_host(attested_locally: bool, vouched: Option<&str>) -> String {
+    match vouched {
+        Some(vouched) if !attested_locally => vouched.to_string(),
+        _ => crate::app::short_host_name(),
+    }
+}
+
 /// Why a wake may not fire, whichever channel asked.
 pub(crate) struct WakeSuppression {
     pub reason: &'static str,
@@ -88,6 +103,19 @@ pub(crate) struct WakeSuppression {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
+        self.send_message(id, params, None)
+    }
+
+    /// `msg.send`, with `vouched` naming the spoke edge when — and only when —
+    /// this is the hub delivering a frame that spoke handed up (#410). Passed
+    /// as an argument, never read from params or left in shared state, so no
+    /// wire caller can claim it and no early return can leak it.
+    pub(super) fn send_message(
+        &mut self,
+        id: String,
+        params: MsgSendParams,
+        vouched: Option<&str>,
+    ) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
@@ -125,12 +153,14 @@ impl App {
         // implementation, wherever the sender was.
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            Err((code, message)) => return encode_error(id, code, message),
+            Err((code, message)) => {
+                return self.hand_up_or_refuse(id, &params.to, &body, &params, code, message)
+            }
         };
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
             ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params)
+                return self.relay_message_to_host(id, &location, &body, params, vouched)
             }
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -306,7 +336,22 @@ impl App {
         };
         let reply_resolved = match self.resolve_message_target(&reply_target) {
             Ok(resolved) => resolved,
-            Err((code, message)) => return encode_error(id, code, message),
+            // #410: a reply whose original sender this server cannot place —
+            // a spoke answering a message that came down from its hub — goes
+            // back UP the same way, and the hub places it.
+            Err((code, message)) => {
+                let as_send = MsgSendParams {
+                    from_agent: None,
+                    from_host: None,
+                    to: reply_target.clone(),
+                    body: body.clone(),
+                    correlation_id: params.reply_correlation_id.clone(),
+                    in_reply_to: Some(params.correlation_id.clone()),
+                    intent: params.intent,
+                    intent_unrecognised: None,
+                };
+                return self.hand_up_or_refuse(id, &reply_target, &body, &as_send, code, message);
+            }
         };
         let (to_ws_idx, to_pane_id) = match reply_resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
@@ -327,6 +372,7 @@ impl App {
                         intent: params.intent,
                         intent_unrecognised: None,
                     },
+                    None,
                 );
             }
         };
@@ -445,6 +491,7 @@ impl App {
                         outcome_known: true,
                         to_host: None,
                         route: None,
+                        path: None,
                         detail: Some("waiting in a local inbox, not yet read".into()),
                     });
                 }
@@ -452,8 +499,20 @@ impl App {
                     correlation_id,
                     to_host,
                     route,
+                    via,
                     ..
                 } if *correlation_id == params.correlation_id => {
+                    // #410: say whether the hop was ours or a hub's.
+                    let (path, how) = match via {
+                        Some(hub) => (
+                            format!("via {hub}"),
+                            format!("handed up to {hub}, which delivered it to {to_host}"),
+                        ),
+                        None => (
+                            "direct".to_string(),
+                            format!("handed to {to_host} via [[peers]] {route}"),
+                        ),
+                    };
                     found = Some(ResponseResult::MsgStatus {
                         correlation_id: params.correlation_id.clone(),
                         state: "relayed".into(),
@@ -462,9 +521,9 @@ impl App {
                         outcome_known: false,
                         to_host: Some(to_host.clone()),
                         route: Some(route.clone()),
+                        path: Some(path),
                         detail: Some(format!(
-                            "handed to {to_host} via [[peers]] {route}; whether it was read is \
-                             recorded there, not here"
+                            "{how}; whether it was read is recorded there, not here"
                         )),
                     });
                 }
@@ -480,6 +539,7 @@ impl App {
                         outcome_known: true,
                         to_host: None,
                         route: None,
+                        path: None,
                         detail: Some(outcome.clone()),
                     });
                 }
@@ -696,6 +756,7 @@ impl App {
         location: &crate::app::directory::AgentLocation,
         body: &str,
         params: MsgSendParams,
+        vouched: Option<&str>,
     ) -> String {
         let route = location.route.as_deref().unwrap_or_default();
         let host = location.host.as_str();
@@ -717,28 +778,52 @@ impl App {
             })
             .cloned()
         else {
-            return encode_error(
+            // #410: no edge of our own. A spoke hands the message up the relay
+            // its hub holds — the fix for "not in [[peers]]" is NOT to add the
+            // N×N trust the topology refuses.
+            if let Some(response) = self.try_hand_up(&id, to_agent, body, &params) {
+                return response;
+            }
+            let me = crate::app::short_host_name();
+            return encode_error_with_data(
                 id,
                 "peer_not_configured",
-                format!(
-                    "agent lives on {host}, which is not in this server's [[peers]] — add it to \
-                     reach that agent"
-                ),
+                if params.from_host.is_some() {
+                    format!(
+                        "agent lives on {host}, which {me} has no [[peers]] edge to — and a \
+                         message that already crossed a hub is not handed on again"
+                    )
+                } else {
+                    format!(
+                        "agent lives on {host}, which is not in this server's [[peers]], and no \
+                         hub holds a relay to {me} to hand the message up to"
+                    )
+                },
+                serde_json::json!({ "hop": me, "retryable": false }),
             );
         };
+        // #410 loop guard. A message that arrived from another host is handed
+        // on only over a DIRECT edge, so it crosses at most one hub and cannot
+        // bounce spoke → hub → spoke → hub. Relayed routes are for messages
+        // that start here.
+        if params.from_host.is_some() && !location.direct {
+            let me = crate::app::short_host_name();
+            return encode_error_with_data(
+                id,
+                "forward_limit",
+                format!(
+                    "{me} knows {to_agent} only through {}, and a message that already crossed \
+                     a hub is not forwarded a second time",
+                    peer.name
+                ),
+                serde_json::json!({ "hop": me, "retryable": false }),
+            );
+        }
 
         // The sender is whoever asked, attested locally where possible.
-        let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
-        let from_agent = sender
-            .and_then(|(ws_idx, pane_id)| {
-                let ws = self.state.workspaces.get(ws_idx)?;
-                let terminal = self
-                    .state
-                    .terminals
-                    .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
-                Some(terminal.agent_id.to_string())
-            })
-            .or_else(|| params.from_agent.clone());
+        let attested = self.attested_sender_agent();
+        let from_host = relay_sender_host(attested.is_some(), vouched);
+        let from_agent = attested.or_else(|| params.from_agent.clone());
         let Some(from_agent) = from_agent else {
             return encode_error(
                 id,
@@ -761,7 +846,7 @@ impl App {
             &peer,
             to_agent,
             &from_agent,
-            &crate::app::short_host_name(),
+            &from_host,
             body,
             &correlation_id,
             in_reply_to,
@@ -784,6 +869,7 @@ impl App {
                         route: peer.name.clone(),
                         relayed_at_ms: now_ms(),
                         intent: params.intent,
+                        via: (!location.direct).then(|| peer.name.clone()),
                     },
                 });
                 if params.intent.wakes() {
@@ -796,6 +882,12 @@ impl App {
                         correlation_id,
                         state: "relayed".into(),
                         warnings: Vec::new(),
+                        to_host: Some(host.to_string()),
+                        path: Some(if location.direct {
+                            "direct".into()
+                        } else {
+                            format!("via {}", peer.name)
+                        }),
                     },
                 )
             }
@@ -805,16 +897,25 @@ impl App {
             // a refusal — the same failure that used to arrive as flag text
             // welded to the front of somebody's message body, with a success
             // reported to the sender.
-            Err(failure) => encode_error_with_data(
-                id,
-                failure.code(),
-                failure.message(host),
-                serde_json::json!({
-                    "retryable": failure.retryable(),
-                    "peer": peer.name,
-                    "detail": failure.detail(),
-                }),
-            ),
+            // #410: the failure names the hop that failed — which machine
+            // could not reach which — and why, so a message that crossed a hub
+            // first reports the leg that broke rather than a generic miss.
+            Err(failure) => {
+                let me = crate::app::short_host_name();
+                let reason = crate::peers::SshFailureReason::classify(failure.detail());
+                encode_error_with_data(
+                    id,
+                    failure.code(),
+                    failure.hop_message(&me, host, reason),
+                    serde_json::json!({
+                        "retryable": failure.retryable(),
+                        "peer": peer.name,
+                        "detail": failure.detail(),
+                        "hop": format!("{me} → {host}"),
+                        "reason": reason.as_str(),
+                    }),
+                )
+            }
         }
     }
 
@@ -902,6 +1003,54 @@ impl App {
         self.state.blocking_mail = self.mailboxes.blocking_mail();
     }
 
+    /// The fleet-global id of the agent making the current API call, from
+    /// its process ancestry. `None` when the caller is in no pane — an
+    /// operator shell, the relay, a hub forwarding for a spoke.
+    pub(super) fn attested_sender_agent(&mut self) -> Option<String> {
+        let (ws_idx, pane_id) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let terminal = self
+            .state
+            .terminals
+            .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+        Some(terminal.agent_id.to_string())
+    }
+
+    /// A target this server could not place: hand it up to the hub when this
+    /// is a spoke that has one (#410), else refuse — and when the refusal is
+    /// "nowhere in the fleet" on a server with no edges at all, say that the
+    /// fleet it searched was only itself.
+    fn hand_up_or_refuse(
+        &mut self,
+        id: String,
+        target: &MessageTarget,
+        body: &str,
+        params: &MsgSendParams,
+        code: &'static str,
+        message: String,
+    ) -> String {
+        let MessageTarget::Agent { agent } = target else {
+            return encode_error(id, code, message);
+        };
+        if code != "msg_target_not_found" {
+            return encode_error(id, code, message);
+        }
+        if let Some(response) = self.try_hand_up(&id, agent, body, params) {
+            return response;
+        }
+        if self.state.peers.is_empty() && params.from_host.is_none() {
+            return encode_error(
+                id,
+                code,
+                format!(
+                    "{message} — this server has no [[peers]] and no hub holds a relay to it, \
+                     so it could only search itself"
+                ),
+            );
+        }
+        encode_error(id, code, message)
+    }
+
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
     /// answer the caller.
     fn queue_message(
@@ -942,6 +1091,8 @@ impl App {
                         correlation_id,
                         state: "queued".into(),
                         warnings,
+                        to_host: None,
+                        path: None,
                     },
                 )
             }
@@ -951,6 +1102,8 @@ impl App {
                     correlation_id,
                     state: "duplicate".into(),
                     warnings,
+                    to_host: None,
+                    path: None,
                 },
             ),
             EnqueueOutcome::MailboxFull => encode_error(
@@ -1522,6 +1675,7 @@ mod tests {
                 route: "anvil".into(),
                 relayed_at_ms: 1,
                 intent: MsgIntent::Fyi,
+                via: None,
             },
         });
         let response = app.handle_api_request(Request {

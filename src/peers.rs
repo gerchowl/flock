@@ -422,6 +422,10 @@ pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
 pub struct RelayedEntry {
     /// The relayed peer, in the same shape as a locally polled one.
     pub peer: PeerSummaryState,
+    /// The `[[peers]]` entry whose poll delivered this row (#410): the edge a
+    /// message for one of its agents is handed to. Stamped at merge time, where
+    /// the answering peer is known; `None` straight off the wire.
+    pub via: Option<String>,
 }
 
 /// Materialise a relayed wire entry into the shape every rendering surface
@@ -488,6 +492,7 @@ pub fn relayed_entry_from_wire(
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
         },
+        via: None,
     })
 }
 
@@ -881,10 +886,104 @@ impl PeerMessageFailure {
         }
     }
 
-    pub fn message(&self, host: &str) -> String {
+    /// The caller-facing message, naming the hop as a whole — which machine
+    /// failed to reach which, and how (#410). Once a message can cross a hub,
+    /// "could not reach ksb" no longer says enough: the reader needs to know it
+    /// was the HUB that could not, so it is not chasing the spoke's own network.
+    pub fn hop_message(&self, from: &str, host: &str, reason: SshFailureReason) -> String {
         match self {
-            Self::Unreachable(detail) => format!("could not reach {host}: {detail}"),
-            Self::Refused(detail) => format!("the relay to {host} was refused: {detail}"),
+            Self::Unreachable(detail) => {
+                format!(
+                    "{from} cannot reach {host} ({}): {detail}",
+                    reason.describe()
+                )
+            }
+            Self::Refused(detail) => format!("{host} refused the relay from {from}: {detail}"),
+        }
+    }
+}
+
+/// Why an ssh dial failed, read from ssh's own last stderr line (#410 P1).
+///
+/// ssh has no machine-readable failure status — every transport failure is
+/// exit 255 — so the reason has to come from its words. Coarse on purpose:
+/// the operator question is "which kind of broken", and each kind has a
+/// different fix (start sshd, fix the key, accept the host key, wait).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureReason {
+    ConnectRefused,
+    AuthRefused,
+    HostKey,
+    Timeout,
+    /// The `ProxyJump` host answered and the hop BEYOND it did not. Observed
+    /// as `Connection closed by UNKNOWN port 65535` (#406): the first hop
+    /// worked, which is exactly what a bare "unreachable" hides.
+    JumpHopRefused,
+    UnknownHost,
+    /// The far side has no `flk` on its PATH.
+    NoFlk,
+    Other,
+}
+
+impl SshFailureReason {
+    pub fn classify(detail: &str) -> Self {
+        let lowered = detail.to_ascii_lowercase();
+        if lowered.contains("unknown port 65535")
+            || lowered.contains("stdio forwarding failed")
+            || lowered.contains("channel 0: open failed")
+        {
+            Self::JumpHopRefused
+        } else if lowered.contains("permission denied")
+            || lowered.contains("authentication")
+            || lowered.contains("too many authentication failures")
+        {
+            Self::AuthRefused
+        } else if lowered.contains("host key verification failed")
+            || lowered.contains("remote host identification has changed")
+            || lowered.contains("no matching host key")
+        {
+            Self::HostKey
+        } else if lowered.contains("connection refused") {
+            Self::ConnectRefused
+        } else if lowered.contains("timed out") || lowered.contains("timeout") {
+            Self::Timeout
+        } else if lowered.contains("could not resolve hostname")
+            || lowered.contains("name or service not known")
+            || lowered.contains("nodename nor servname")
+        {
+            Self::UnknownHost
+        } else if lowered.contains("flk: not found") || lowered.contains("flk: command not found") {
+            Self::NoFlk
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Stable wire token, for `error.data.reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectRefused => "connect_refused",
+            Self::AuthRefused => "auth_refused",
+            Self::HostKey => "host_key",
+            Self::Timeout => "timeout",
+            Self::JumpHopRefused => "jump_hop_refused",
+            Self::UnknownHost => "unknown_host",
+            Self::NoFlk => "no_flk",
+            Self::Other => "other",
+        }
+    }
+
+    /// Short human phrase, for messages and the servers band.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ConnectRefused => "connection refused",
+            Self::AuthRefused => "auth refused",
+            Self::HostKey => "host key rejected",
+            Self::Timeout => "timed out",
+            Self::JumpHopRefused => "jump host reached, next hop refused",
+            Self::UnknownHost => "unknown host",
+            Self::NoFlk => "no flk on the far side",
+            Self::Other => "ssh failed",
         }
     }
 }
@@ -1360,6 +1459,48 @@ mod tests {
     }
 
     #[test]
+    fn an_ssh_failure_names_which_kind_of_broken() {
+        // #410 P1: "unreachable" hides the fix. Each of these has a different
+        // one, and the #406 case — a ProxyJump whose SECOND hop was refused —
+        // must not read as the first hop being down.
+        use super::SshFailureReason as R;
+        for (stderr, expected) in [
+            (
+                "ssh: connect to host ksb port 22: Connection refused",
+                R::ConnectRefused,
+            ),
+            ("lars@ksb: Permission denied (publickey).", R::AuthRefused),
+            ("Host key verification failed.", R::HostKey),
+            (
+                "ssh: connect to host ksb port 22: Operation timed out",
+                R::Timeout,
+            ),
+            ("Connection closed by UNKNOWN port 65535", R::JumpHopRefused),
+            (
+                "ssh: Could not resolve hostname ksb: nodename nor servname provided",
+                R::UnknownHost,
+            ),
+            ("sh: 1: flk: not found", R::NoFlk),
+            ("something else entirely", R::Other),
+        ] {
+            assert_eq!(R::classify(stderr), expected, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn a_hop_failure_names_both_ends_and_the_reason() {
+        let failure = super::PeerMessageFailure::Unreachable(
+            "ssh: connect to host ksb port 22: Connection refused".into(),
+        );
+        let reason = super::SshFailureReason::classify(failure.detail());
+        let message = failure.hop_message("mba22", "ksb", reason);
+        assert!(
+            message.starts_with("mba22 cannot reach ksb (connection refused)"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_peer_that_refuses_is_not_a_peer_that_was_never_reached() {
         // #380. Both used to arrive as "could not reach {host}", which is a
         // lie about the second and the wrong advice about both: an unreachable
@@ -1375,9 +1516,11 @@ mod tests {
         assert_eq!(refused.code(), "peer_refused_message");
         assert!(!refused.retryable(), "the identical relay is refused again");
         assert!(
-            refused.message("sage").contains("--intent"),
+            refused
+                .hop_message("mba22", "sage", super::SshFailureReason::Other)
+                .contains("--intent"),
             "the peer's own words ARE the diagnosis and must survive the hop: {}",
-            refused.message("sage")
+            refused.hop_message("mba22", "sage", super::SshFailureReason::Other)
         );
 
         for (exit_code, what) in [

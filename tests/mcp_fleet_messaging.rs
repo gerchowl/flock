@@ -44,6 +44,15 @@ const PAIR_AB: &[NodeSpec] = &[
     NodeSpec::new("nodeb", "beta", &["nodea"]),
 ];
 
+/// Hub and spokes, the fleet's real shape (#410): only `nodeb` carries
+/// `[[peers]]`, and the two spokes carry none — no reverse trust, no N×N keys.
+/// The only way off a spoke is the relay the hub holds INTO it.
+const HUB_SPOKES: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "alpha", &[]),
+    NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
+    NodeSpec::new("nodec", "gamma", &[]),
+];
+
 const GOSSIP_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -204,6 +213,20 @@ impl PanedMcp {
             .unwrap_or_else(|| panic!("{name} returned no text content: {response}"));
         serde_json::from_str(text)
             .unwrap_or_else(|e| panic!("{name} content is not JSON: {text} ({e})"))
+    }
+
+    /// Call a tool and return its payload or its refusal, for a caller that
+    /// has to tell the two apart.
+    fn try_call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, Value> {
+        let response = self.request("tools/call", json!({"name": name, "arguments": arguments}));
+        if let Some(error) = response.get("error") {
+            return Err(error.clone());
+        }
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} returned no text content: {response}"));
+        Ok(serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("{name} content is not JSON: {text} ({e})")))
     }
 
     /// Call a tool expecting a refusal, and return the error object.
@@ -495,5 +518,193 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     assert!(
         message.contains(&bob.pane_id),
         "a pane id used as an agent id must be refused, not resolved: {message}"
+    );
+}
+
+/// #410, the acceptance case. A spoke messages another spoke through the hub,
+/// and the answer comes back the same way — with neither spoke holding a key
+/// to anything.
+///
+/// Before this, `nodea` could not message `nodec` at all: it has no
+/// `[[peers]]`, so the relay refused with `peer_not_configured` and advised
+/// adding the very N×N trust the topology refuses. The message now goes UP the
+/// relay `nodeb` holds into `nodea`, `nodeb` delivers it with its ordinary
+/// `msg.send`, and the outcome — including a failure on `nodeb`'s own hop —
+/// comes back down to the sender.
+#[test]
+fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
+    for spec in HUB_SPOKES {
+        if spec.name != "nodeb" {
+            assert!(spec.peers.is_empty(), "no spoke may carry [[peers]]");
+        }
+    }
+    let fleet = fleet::spawn("mcp-hub-spokes", HUB_SPOKES);
+    let node_a = fleet.node("nodea");
+
+    let mut alice = PanedMcp::start(node_a, &fleet.base);
+    let mut carol = PanedMcp::start(fleet.node("nodec"), &fleet.base);
+
+    // Sent until the fleet has converged: nodeb's relay into nodea is up, and
+    // nodeb's poll of nodec has seen carol. Until then the refusal says which
+    // of the two is missing — nodea has no hub yet, or the hub has not heard
+    // of carol — and the same correlation id on every attempt means a retry
+    // cannot deliver twice.
+    let send = json!({
+        "to": {"type": "agent", "agent": carol.agent_id},
+        "body": "ping from spoke a",
+        "correlation_id": "c-410-hub",
+        "intent": "needs_reply",
+    });
+    let queued = wait_for(
+        "nodeb to hold a relay into nodea",
+        GOSSIP_TIMEOUT,
+        || match alice.try_call_tool("flock_msg_send", send.clone()) {
+            Ok(queued) => Some(queued),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("no hub holds a relay")
+                        || text
+                            .contains("handed up to nodeb, which could not deliver it: no agent"),
+                    "the only acceptable refusals are the not-yet-converged ones: {text}"
+                );
+                None
+            }
+        },
+    );
+    assert_eq!(queued["state"], "relayed", "send: {queued}");
+    assert_eq!(
+        queued["path"], "via nodeb",
+        "the send result says which hub carried it: {queued}"
+    );
+    assert_eq!(queued["to_host"], "nodec", "and where it went: {queued}");
+
+    // It arrives on nodec as ALICE's, from nodea — the hub vouched for its
+    // edge and did not become the sender.
+    let delivered = wait_for("the message to land on nodec", RPC_TIMEOUT, || {
+        let inbox = carol.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(delivered["body"], "ping from spoke a");
+    assert_eq!(
+        delivered["from_agent"],
+        alice.agent_id.as_str(),
+        "the originating sender survives both hops: {delivered}"
+    );
+    assert_eq!(
+        delivered["from_host"], "nodea",
+        "and names the spoke it came from, never the hub: {delivered}"
+    );
+    assert_eq!(delivered["replyable"], true, "{delivered}");
+    assert_eq!(delivered["intent"], "needs_reply", "{delivered}");
+
+    // The reply: nodec cannot place alice either, so it goes up nodeb's
+    // relay into nodec, and nodeb delivers it down to nodea.
+    let replied = carol.call_tool(
+        "flock_msg_reply",
+        json!({"correlation_id": "c-410-hub", "body": "pong from spoke c"}),
+    );
+    assert_eq!(replied["path"], "via nodeb", "reply: {replied}");
+
+    let answer = wait_for("the reply to reach nodea", RPC_TIMEOUT, || {
+        let inbox = alice.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(answer["body"], "pong from spoke c");
+    assert_eq!(answer["from_agent"], carol.agent_id.as_str(), "{answer}");
+    assert_eq!(answer["from_host"], "nodec", "{answer}");
+    assert_eq!(answer["in_reply_to"], "c-410-hub", "{answer}");
+
+    // The sender's own log says how it went, too.
+    let status: Value =
+        serde_json::from_str(&node_a.api(
+            r#"{"id":"t:status","method":"msg.status","params":{"correlation_id":"c-410-hub"}}"#,
+        ))
+        .expect("msg.status parses");
+    assert_eq!(status["result"]["state"], "relayed", "{status}");
+    assert_eq!(status["result"]["path"], "via nodeb", "{status}");
+    assert_eq!(status["result"]["to_host"], "nodec", "{status}");
+
+    // The hub's forward path is not a socket method: a local process on the
+    // hub — this test, a foreign pid — cannot name a spoke and have the hub
+    // vouch for a sender it never saw. Refused, and nothing is relayed.
+    let node_b = fleet.node("nodeb");
+    let forged = serde_json::json!({
+        "id": "t:forge",
+        "method": "msg.uplink_forward",
+        "params": {
+            "spoke": "nodea",
+            "message": {
+                "to": {"type": "agent", "agent": carol.agent_id},
+                "body": "forged via the hub",
+                "from_agent": alice.agent_id,
+                "from_host": "nodea",
+                "correlation_id": "c-410-forged",
+            },
+        },
+    });
+    let refused: Value =
+        serde_json::from_str(&node_b.api(&forged.to_string())).expect("the hub answers");
+    assert!(
+        refused.get("error").is_some(),
+        "a socket caller must not reach the forward path: {refused}"
+    );
+
+    // Nor can a plain, unattested socket `msg.send` on the hub borrow a
+    // spoke's name: the relay stamps the hub's own host on it.
+    let unattested = serde_json::json!({
+        "id": "t:unattested",
+        "method": "msg.send",
+        "params": {
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "from a shell on the hub",
+            "from_agent": alice.agent_id,
+            "from_host": "nodea",
+            "correlation_id": "c-410-unattested",
+        },
+    });
+    let sent: Value =
+        serde_json::from_str(&node_b.api(&unattested.to_string())).expect("the hub answers");
+    assert_eq!(sent["result"]["path"], "direct", "{sent}");
+    let landed = wait_for("the hub's own send to land on nodec", RPC_TIMEOUT, || {
+        let inbox = carol.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(landed["body"], "from a shell on the hub", "{landed}");
+    assert_eq!(
+        landed["from_host"], "nodeb",
+        "a caller's asserted from_host is never what a relay stamps: {landed}"
+    );
+    let inbox = carol.call_tool("flock_msg_read", json!({}));
+    assert!(
+        !inbox.to_string().contains("forged via the hub"),
+        "the forged forward was never relayed: {inbox}"
+    );
+
+    // Break the hub's edge to nodec. The failure is nodeb's hop, and the
+    // sender on nodea is told so — which machine could not reach which, and
+    // why — not a generic "not in [[peers]]".
+    fleet.refuse_ssh_to("nodec");
+    let error = alice.call_tool_error(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "this one cannot land",
+            "correlation_id": "c-410-broken",
+            "intent": "fyi",
+        }),
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("nodeb cannot reach nodec"),
+        "the failure names the hop that broke: {text}"
+    );
+    assert!(
+        text.contains("connection refused"),
+        "and why it broke: {text}"
+    );
+    assert!(
+        !text.contains("[[peers]]"),
+        "never the generic peers refusal: {text}"
     );
 }
