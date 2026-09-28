@@ -53,6 +53,9 @@ pub(crate) struct ParkedSend {
     /// a question relayed away (ADR-0018 §1's reply rule). `fyi` until the
     /// caller says otherwise.
     pub(crate) intent: crate::api::schema::MsgIntent,
+    /// Set when this send is a mute's automatic deferral (ADR-0018 §3): the
+    /// record the hub's answer settles, since there is no caller to answer.
+    pub(crate) deferral: Option<Box<crate::events::MsgDeferralRelay>>,
     deadline: Instant,
     /// `None` until the transport attaches it, and forever when the request
     /// did not come through a transport that can park (a direct in-process
@@ -74,6 +77,7 @@ impl ParkedSend {
             from_agent,
             to_agent,
             intent: crate::api::schema::MsgIntent::Fyi,
+            deferral: None,
             deadline,
             respond_to: None,
         }
@@ -156,6 +160,18 @@ impl Uplink {
         });
         self.sends.insert(uplink_id.clone(), send);
         self.pending_park = Some(Park::Send { uplink_id });
+    }
+
+    /// Queue a frame whose send has no caller waiting on it — a deferral
+    /// raised inside another request. Unlike [`Self::hand_up`] it leaves the
+    /// pending park alone, so the request it rode in on is answered normally.
+    pub(crate) fn hand_up_detached(&mut self, frame: UplinkFrame, send: ParkedSend) {
+        let uplink_id = frame.uplink_id.clone();
+        self.outbound.push_back(Outbound {
+            frame,
+            offered_at: None,
+        });
+        self.sends.insert(uplink_id, send);
     }
 
     /// A relay asks for frames. Returns them now if any are due; otherwise
@@ -348,6 +364,30 @@ mod tests {
             "agent_c_1".into(),
             deadline,
         )
+    }
+
+    /// A deferral is handed up from INSIDE another request — the mute, or
+    /// the send that arrived into it. Parking would capture that request's
+    /// response behind a frame it has nothing to do with; the frame must
+    /// still go up, and still be answerable.
+    #[test]
+    fn a_detached_hand_up_parks_nobody_but_is_still_carried_and_completed() {
+        let mut uplink = Uplink::default();
+        let now = Instant::now();
+        uplink.hand_up_detached(frame("up-d"), parked(now + HEARTBEAT));
+        assert_eq!(
+            uplink.take_pending_park(),
+            None,
+            "the surrounding request is answered normally"
+        );
+        let frames = uplink
+            .take("take-1".into(), &[], now, HEARTBEAT)
+            .expect("the frame is due");
+        assert_eq!(frames.len(), 1);
+        assert!(
+            uplink.complete("up-d").is_some(),
+            "the hub's answer resolves it"
+        );
     }
 
     #[test]

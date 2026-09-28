@@ -821,6 +821,20 @@ impl App {
         let resolved = match self.resolve_message_target(&target) {
             Ok(resolved) => resolved,
             Err((code, detail)) => {
+                // A spoke cannot place an agent on another spoke — it has no
+                // directory edge to one. Its hub can (#410), exactly as for
+                // an ordinary reply.
+                if let (MessageTarget::Agent { agent }, "msg_target_not_found") = (&target, code) {
+                    return self.defer_via_hub(
+                        message,
+                        agent,
+                        muter_agent,
+                        deferral_correlation_id,
+                        body,
+                        muted_until_ms,
+                        reason,
+                    );
+                }
                 tracing::warn!(
                     correlation_id = message.correlation_id.as_str(),
                     code,
@@ -879,7 +893,16 @@ impl App {
             }
             ResolvedTarget::Remote(location) => {
                 let Some(peer) = self.peer_for_location(&location) else {
-                    return false;
+                    // Known, but not over an edge of ours: up to the hub.
+                    return self.defer_via_hub(
+                        message,
+                        &location.agent_id,
+                        muter_agent,
+                        deferral_correlation_id,
+                        body,
+                        muted_until_ms,
+                        reason,
+                    );
                 };
                 let Some(from_agent) = muter_agent else {
                     return false;
@@ -906,6 +929,84 @@ impl App {
                 true
             }
         }
+    }
+
+    /// Send a deferral up the relay this spoke's hub holds (#410), for a
+    /// sender this server has no `[[peers]]` edge to.
+    ///
+    /// The sender identity is `muter_agent`: the agent in the LOCAL pane that
+    /// muted, resolved by this server from its own pane table. It is passed
+    /// in-process all the way into the frame and never read from anything a
+    /// caller sent — the API call that triggered this deferral is the ORIGINAL
+    /// sender's (or an operator's), so the attested-caller rule `try_hand_up`
+    /// uses would name the wrong agent, and a wire-supplied sender on a relay
+    /// path is exactly what #410's review refused.
+    #[allow(clippy::too_many_arguments)]
+    fn defer_via_hub(
+        &mut self,
+        message: &PendingMessage,
+        to_agent: &str,
+        muter_agent: Option<String>,
+        deferral_correlation_id: String,
+        body: String,
+        muted_until_ms: u64,
+        reason: Option<String>,
+    ) -> bool {
+        let Some(from_agent) = muter_agent else {
+            return false;
+        };
+        // Claimed now, like a direct hop; the hub's answer settles it
+        // ([`Self::settle_hub_deferral`]).
+        self.mailboxes.mark_deferred(&message.correlation_id);
+        let relay = crate::events::MsgDeferralRelay {
+            correlation_id: message.correlation_id.clone(),
+            deferral_correlation_id,
+            pane: message.to_pane.clone(),
+            muted_until_ms,
+            reason,
+            from_agent,
+            to_agent: to_agent.to_string(),
+            // Not known here: the hub places the recipient.
+            to_host: String::new(),
+            route: String::new(),
+            result: Ok(()),
+        };
+        if self.hand_up_deferral(&body, relay) {
+            return true;
+        }
+        tracing::warn!(
+            correlation_id = message.correlation_id.as_str(),
+            "mute deferral: the sender is only reachable through a hub, and no hub holds a \
+             relay to this server; the next mute retries it"
+        );
+        self.mailboxes.unmark_deferred(&message.correlation_id);
+        false
+    }
+
+    /// The hub's answer to a deferral handed up to it (or its timeout).
+    pub(super) fn settle_hub_deferral(
+        &mut self,
+        relay: crate::events::MsgDeferralRelay,
+        hub: Option<&str>,
+        outcome: Result<(), String>,
+    ) {
+        if let Err(detail) = outcome {
+            tracing::warn!(
+                correlation_id = relay.correlation_id.as_str(),
+                detail = detail.as_str(),
+                "mute deferral handed up to the hub was not delivered; the next mute retries it"
+            );
+            self.mailboxes.unmark_deferred(&relay.correlation_id);
+            return;
+        }
+        self.emit_message_deferred(
+            &relay.correlation_id,
+            relay.deferral_correlation_id,
+            &relay.pane,
+            relay.muted_until_ms,
+            relay.reason,
+            hub.map(str::to_string),
+        );
     }
 
     /// Start queued cross-host deferral hops, up to

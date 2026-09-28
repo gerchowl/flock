@@ -825,3 +825,119 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "never the generic peers refusal: {text}"
     );
 }
+
+/// ADR-0018 §3 over #410's hub: a mute on one spoke answers a sender on
+/// ANOTHER spoke, whom it can reach only up the relay the hub holds into it.
+///
+/// The deferral's sender is the muted agent, attested by its own server from
+/// its own pane table and carried into the uplink frame in-process — the
+/// triggering API call is the original sender's (or the hub's relay), so
+/// nothing a caller put on the wire can name it. The hub then stamps the host
+/// from the edge it configured, exactly as for any handed-up message.
+#[test]
+fn a_mute_answers_a_sender_on_another_spoke_through_the_hub() {
+    let fleet = fleet::spawn("mcp-hub-mute", HUB_SPOKES);
+    let node_a = fleet.node("nodea");
+    let mut alice = PanedMcp::start(node_a, &fleet.base);
+    let mut carol = PanedMcp::start(fleet.node("nodec"), &fleet.base);
+
+    // Converge the way the #410 case does: the same correlation id on every
+    // attempt, so a retry cannot deliver twice.
+    let carol_id = carol.agent_id.clone();
+    let ask = |cid: &str| {
+        json!({
+            "to": {"type": "agent", "agent": carol_id},
+            "body": format!("question {cid}"),
+            "correlation_id": cid,
+            "intent": "needs_reply",
+        })
+    };
+    let sent = wait_for("the hub to carry a→c", GOSSIP_TIMEOUT, || {
+        alice
+            .try_call_tool("flock_msg_send", ask("c-hub-before"))
+            .ok()
+    });
+    assert_eq!(sent["path"], "via nodeb", "{sent}");
+    wait_for("the question to land on nodec", RPC_TIMEOUT, || {
+        let queued = carol.call_tool("flock_msg_list", json!({"pane": carol.pane_id}));
+        (!queued["messages"].as_array()?.is_empty()).then_some(())
+    });
+
+    // 1. Waiting before the mute.
+    let muted = carol.call_tool(
+        "flock_msg_mute",
+        json!({"seconds": 600, "reason": "reviewing a spike"}),
+    );
+    assert_eq!(muted["deferred"], 1, "{muted}");
+
+    let wake_count = |node: &fleet::Node, pane: &str| -> u64 {
+        let response: Value = serde_json::from_str(&node.api(&format!(
+            r#"{{"id":"t:wake","method":"msg.wake","params":{{"pane":"{pane}"}}}}"#
+        )))
+        .expect("msg.wake parses");
+        response["result"]["count"].as_u64().expect("count")
+    };
+    let pending = wait_for(
+        "the deferral to reach nodea via the hub",
+        RPC_TIMEOUT,
+        || {
+            let queued = alice.call_tool("flock_msg_list", json!({"pane": alice.pane_id}));
+            let messages = queued["messages"].as_array()?.clone();
+            (!messages.is_empty()).then_some(messages)
+        },
+    );
+    assert_eq!(pending.len(), 1, "exactly one deferral: {pending:?}");
+    assert_eq!(
+        wake_count(node_a, &alice.pane_id),
+        0,
+        "a deferral must not cost its receiver a turn"
+    );
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    let deferral = &inbox["messages"][0];
+    assert_eq!(deferral["in_reply_to"], "c-hub-before", "{deferral}");
+    assert_eq!(
+        deferral["correlation_id"], "c-hub-before:deferred",
+        "{deferral}"
+    );
+    assert_eq!(deferral["intent"], "fyi", "{deferral}");
+    assert_eq!(
+        deferral["from_agent"],
+        carol.agent_id.as_str(),
+        "the muted agent speaks, not the hub and not the asker: {deferral}"
+    );
+    assert_eq!(
+        deferral["from_host"], "nodec",
+        "the host is the hub's configured edge to the spoke: {deferral}"
+    );
+    assert!(
+        deferral["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("reviewing a spike")),
+        "{deferral}"
+    );
+
+    // 2. Arriving into the mute: the hub's relay into nodec is what delivers
+    // the question, and the deferral goes back up the same hub.
+    alice.call_tool("flock_msg_send", ask("c-hub-during"));
+    let deferral = wait_for("the arrival-time deferral", RPC_TIMEOUT, || {
+        let inbox = alice.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(deferral["in_reply_to"], "c-hub-during", "{deferral}");
+    assert_eq!(
+        deferral["from_agent"],
+        carol.agent_id.as_str(),
+        "{deferral}"
+    );
+
+    // 3. Renewing answers nobody twice.
+    let renewed = carol.call_tool("flock_msg_mute", json!({"seconds": 900}));
+    assert_eq!(renewed["deferred"], 0, "{renewed}");
+    thread::sleep(Duration::from_secs(2));
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        inbox["messages"].as_array().map(Vec::len),
+        Some(0),
+        "no second deferral: {inbox}"
+    );
+}

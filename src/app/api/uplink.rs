@@ -102,7 +102,15 @@ impl App {
             take.answer(response);
         }
         let secs = self.uplink_timeout().as_secs();
-        for (send, taken) in expired.sends {
+        for (mut send, taken) in expired.sends {
+            if let Some(relay) = send.deferral.take() {
+                self.settle_hub_deferral(
+                    *relay,
+                    None,
+                    Err(format!("no answer from the hub within {secs}s")),
+                );
+                continue;
+            }
             let message = if taken {
                 format!(
                     "handed up to the hub's relay, but no answer came back within {secs}s — the \
@@ -131,6 +139,52 @@ impl App {
     /// has already crossed a hub and is not forwarded again — or when no hub
     /// holds a relay into this server. The caller then refuses in its own
     /// words, which name why.
+    /// Hand a mute's deferral up to the hub (ADR-0018 §3 over #410). `false`
+    /// when no hub holds a relay into this server.
+    ///
+    /// Unlike [`Self::try_hand_up`] this answers no caller: it runs inside
+    /// some OTHER request (the mute, or the send that arrived into it), so it
+    /// must not ask the transport to park that request's response. The hub's
+    /// answer is settled in-process instead ([`Self::handle_msg_uplink_result`]).
+    /// The sender is `relay.from_agent`, which the caller resolved from its
+    /// own pane table — never from the wire.
+    pub(super) fn hand_up_deferral(
+        &mut self,
+        body: &str,
+        relay: crate::events::MsgDeferralRelay,
+    ) -> bool {
+        if !self.uplink_attached() {
+            return false;
+        }
+        let frame = UplinkFrame {
+            uplink_id: mint_uplink_id(&relay.deferral_correlation_id),
+            message: MsgSendParams {
+                to: MessageTarget::Agent {
+                    agent: relay.to_agent.clone(),
+                },
+                body: body.to_string(),
+                intent: crate::api::schema::MsgIntent::Fyi,
+                correlation_id: Some(relay.deferral_correlation_id.clone()),
+                in_reply_to: Some(relay.correlation_id.clone()),
+                from_agent: Some(relay.from_agent.clone()),
+                from_host: Some(crate::app::short_host_name()),
+                intent_unrecognised: None,
+            },
+        };
+        let now = Instant::now();
+        let mut parked = ParkedSend::new(
+            format!("deferral:{}", relay.correlation_id),
+            relay.deferral_correlation_id.clone(),
+            relay.from_agent.clone(),
+            relay.to_agent.clone(),
+            now + self.uplink_timeout(),
+        );
+        parked.deferral = Some(Box::new(relay));
+        self.uplink.hand_up_detached(frame, parked);
+        self.feed_parked_take(now);
+        true
+    }
+
     pub(super) fn try_hand_up(
         &mut self,
         id: &str,
@@ -223,10 +277,17 @@ impl App {
         id: String,
         params: MsgUplinkResultParams,
     ) -> String {
-        let Some(send) = self.uplink.complete(&params.uplink_id) else {
+        let Some(mut send) = self.uplink.complete(&params.uplink_id) else {
             return encode_success(id, ResponseResult::MsgUplinkResultAck { matched: false });
         };
         let response = self.uplinked_outcome(&send, &params);
+        if let Some(relay) = send.deferral.take() {
+            let outcome = match params.response.get("error") {
+                Some(error) => Err(error.to_string()),
+                None => Ok(()),
+            };
+            self.settle_hub_deferral(*relay, Some(&params.hub), outcome);
+        }
         send.answer(response);
         encode_success(id, ResponseResult::MsgUplinkResultAck { matched: true })
     }
