@@ -8,7 +8,7 @@ mod fleet;
 mod handoffs;
 mod integrations;
 mod lineage;
-mod messages;
+pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
 mod responses;

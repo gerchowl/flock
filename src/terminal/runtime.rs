@@ -327,6 +327,25 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    /// Write flock-authored bytes without counting them as operator input
+    /// (ADR-0018 §2). The idle wake is the only caller.
+    pub fn try_send_flock_authored(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_flock_authored(bytes)
+    }
+
+    /// When operator input last reached this pane, if it ever has.
+    pub fn last_operator_input_at(&self) -> Option<std::time::Instant> {
+        self.0.last_operator_input_at()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stamp_operator_input_at(&self, at: std::time::Instant) {
+        self.0.test_stamp_operator_input_at(at);
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }

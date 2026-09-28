@@ -1056,6 +1056,65 @@ impl TerminalState {
         self.hook_authority.is_some() && !self.hook_authority_is_fresh(now)
     }
 
+    /// Why this pane is not safe to type an idle wake into right now, or
+    /// `None` when it is (ADR-0018 §2). A reason, not a bool, so every
+    /// suppression can be logged with its cause.
+    ///
+    /// `Idle` alone is not enough — #316 pitfall 1: a stale `Idle` typed into
+    /// is an agent's input corrupted mid-turn. So the state must have held for
+    /// `settle`, and whoever decided it must still be current:
+    ///
+    /// - a hook decided it, and is inside its TTL — a fresh report is the
+    ///   strongest evidence there is;
+    /// - a hook reported and went quiet (#309) — its `Idle` counts for
+    ///   nothing, and the pane is judged by the screen alone, as below;
+    /// - the screen decided it (Claude always: it is a reserved native source,
+    ///   so its hooks never set authority) — then the screen must POSITIVELY
+    ///   show the idle prompt, observed within `fresh`. A screen the detector
+    ///   could not classify defaults to `Idle` and is exactly what must not be
+    ///   typed into. The detector re-publishes a stable visible idle well
+    ///   inside any sensible `fresh`, so a live idle pane stays fresh.
+    pub(crate) fn idle_wake_blocker(
+        &self,
+        now: Instant,
+        settle: Duration,
+        fresh: Duration,
+    ) -> Option<&'static str> {
+        if self.state != AgentState::Idle {
+            return Some("not_idle");
+        }
+        let settled = self
+            .state_changed_at
+            .and_then(|since| now.checked_duration_since(since))
+            .is_some_and(|held| held >= settle);
+        if !settled {
+            return Some("not_settled");
+        }
+        if self.last_state_authority == StateAuthority::Hook && !self.hook_authority_expired(now) {
+            return None;
+        }
+        if !self.fallback_visible_idle {
+            // Reported separately because it is the #309 shape: a hook that
+            // went quiet is not evidence, and the screen has not proven idle.
+            return Some(if self.hook_authority_expired(now) {
+                "stale_hook"
+            } else {
+                "idle_not_visible"
+            });
+        }
+        let observed_recently = self
+            .fallback_observed_at
+            .and_then(|observed| now.checked_duration_since(observed))
+            .is_some_and(|age| age <= fresh);
+        (!observed_recently).then_some("stale_screen")
+    }
+
+    /// When the settle window of the current state ends, if the state has a
+    /// known start — the moment an unsettled `Idle` becomes wakeable.
+    pub(crate) fn state_settles_at(&self, settle: Duration) -> Option<Instant> {
+        self.state_changed_at.map(|since| since + settle)
+    }
+
     fn visible_idle_stales_hook(&self, now: Instant) -> bool {
         self.stale_hook_idle_since
             .is_some_and(|since| now.duration_since(since) >= STALE_HOOK_IDLE_GRACE)
@@ -3502,6 +3561,85 @@ mod tests {
         assert_eq!(
             change.effective_state_change.unwrap().authority,
             StateAuthority::HookExpired
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0018 §2: when an Idle is trustworthy enough to type into.
+    // ------------------------------------------------------------------
+
+    const WAKE_SETTLE: Duration = Duration::from_secs(2);
+    const WAKE_FRESH: Duration = Duration::from_millis(2500);
+
+    fn hook_idle(terminal: &mut TerminalState, at: Instant) {
+        terminal.set_hook_authority_with_custom_status_at(
+            "flock:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+            at,
+        );
+    }
+
+    #[test]
+    fn a_fresh_settled_hook_idle_is_wakeable() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        hook_idle(&mut terminal, now);
+        let later = now + WAKE_SETTLE;
+        assert_eq!(
+            terminal.idle_wake_blocker(now, WAKE_SETTLE, WAKE_FRESH),
+            Some("not_settled")
+        );
+        assert_eq!(
+            terminal.idle_wake_blocker(later, WAKE_SETTLE, WAKE_FRESH),
+            None
+        );
+    }
+
+    /// #309's shape, from the wake's side: a hook that said "idle" and then
+    /// went quiet is not evidence of anything. With no screen proof, no wake.
+    #[test]
+    fn an_expired_hook_idle_is_not_wakeable_without_screen_proof() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        hook_idle(&mut terminal, now);
+        let after = now + HOOK_AUTHORITY_TTL + Duration::from_secs(1);
+        assert_eq!(
+            terminal.idle_wake_blocker(after, WAKE_SETTLE, WAKE_FRESH),
+            Some("stale_hook")
+        );
+    }
+
+    /// ...but the screen can still prove it, the same as for a pane that
+    /// never had a hook. Otherwise any agent idle longer than the hook TTL —
+    /// the 131-minute case ADR-0018 opens with — could never be reached.
+    #[test]
+    fn an_expired_hook_defers_to_a_fresh_visible_idle() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        hook_idle(&mut terminal, now);
+        let after = now + HOOK_AUTHORITY_TTL + Duration::from_secs(1);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            after,
+        );
+        assert_eq!(
+            terminal.idle_wake_blocker(after, WAKE_SETTLE, WAKE_FRESH),
+            None
+        );
+        assert_eq!(
+            terminal.idle_wake_blocker(after + WAKE_FRESH * 2, WAKE_SETTLE, WAKE_FRESH),
+            Some("stale_screen"),
+            "a screen observation ages out like a hook does"
         );
     }
 

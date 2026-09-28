@@ -10,6 +10,7 @@ mod agents;
 mod api;
 pub(crate) mod fleet_pause;
 pub(crate) mod hibernation;
+pub(crate) mod idle_wake;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 mod api_helpers;
@@ -131,6 +132,8 @@ pub struct App {
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
+    /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
+    pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -861,6 +864,7 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
+            idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             event_hub,
             last_focus,
             no_session,
