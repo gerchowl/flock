@@ -31,7 +31,28 @@ pub(crate) struct MailboxRegistry {
     /// thing to do with one across a restart is forget it — which fails OPEN,
     /// the only direction that cannot strand a message. Queues are the
     /// durable half; this is a live preference about interruptions.
-    mutes: HashMap<String, u64>,
+    mutes: HashMap<String, Mute>,
+    /// Correlation ids a muted recipient has already answered with a
+    /// deferral (ADR-0018 §3). "Exactly one" is enforced here, not by the
+    /// caller remembering: re-muting, extending a mute, or a restart
+    /// followed by a fresh mute must not tell the same sender twice.
+    ///
+    /// Unlike `mutes` this IS seeded from the durable log (`MessageDeferred`),
+    /// because forgetting it fails the wrong way — a duplicate answer, not a
+    /// missing one.
+    ///
+    /// A mark lives exactly as long as its message is QUEUED — dropped when
+    /// it is read or expires, and never by the `seen` window. That window is
+    /// the newest `MAX_SEEN` ids server-wide, while a question can wait up to
+    /// `UNDELIVERED_TTL_MS`; tying the mark to the window let a busy fleet
+    /// evict the mark of a question still sitting in an inbox, and the next
+    /// mute answered it again. Queue lifetime bounds the set just as well:
+    /// it can never hold more than the queues do.
+    deferred: HashSet<String>,
+    /// Cross-host deferral hops waiting for a slot, and how many are running.
+    /// See `App::pump_deferral_hops`.
+    deferral_hops: VecDeque<DeferralHop>,
+    deferral_hops_running: usize,
     /// Sender → recent `blocking` send timestamps (ms), for the tier's own
     /// hourly budget (ADR-0018 §1). Separate from `rate` so a sender's
     /// ordinary traffic cannot spend its escalation budget, or vice versa.
@@ -57,6 +78,20 @@ pub(crate) struct MailboxRegistry {
     relayed_questions: HashSet<String>,
     /// Insertion order of `relayed_questions`, for eviction.
     relayed_questions_order: VecDeque<String>,
+}
+
+/// One cross-host deferral waiting to be sent (ADR-0018 §3).
+pub(crate) struct DeferralHop {
+    pub peer: crate::config::PeerConfig,
+    pub body: String,
+    pub relay: crate::events::MsgDeferralRelay,
+}
+
+/// A live receiver-side mute: when it lifts, and why, in the muter's words.
+#[derive(Debug, Clone)]
+struct Mute {
+    until_ms: u64,
+    reason: Option<String>,
 }
 
 /// What the attention surface may know about a pane's waiting `blocking`
@@ -188,6 +223,7 @@ impl MailboxRegistry {
                     order.push(correlation_id.clone());
                 }
                 EventData::MessageDelivered { correlation_id, .. } => {
+                    self.deferred.remove(correlation_id);
                     if let Some(message) = queued.remove(correlation_id) {
                         let root = message
                             .in_reply_to
@@ -212,6 +248,14 @@ impl MailboxRegistry {
                     if let Some(meta) = self.history.get_mut(correlation_id) {
                         meta.round_trips += 1;
                     }
+                }
+                // Only while the message is still pending: a mark outlives
+                // nothing but its queue entry, and the `MessageDelivered`
+                // arm above drops it when that entry goes.
+                EventData::MessageDeferred { correlation_id, .. }
+                    if queued.contains_key(correlation_id) =>
+                {
+                    self.deferred.insert(correlation_id.clone());
                 }
                 EventData::MessageRelayed {
                     correlation_id,
@@ -334,6 +378,7 @@ impl MailboxRegistry {
     /// the recipient either took the message or never asked (ADR-0008).
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
         let message = self.queues.get_mut(pane_id)?.pop_front()?;
+        self.deferred.remove(&message.correlation_id);
         // A message that left the queue can never be escalated again, so its
         // marker is dead weight.
         self.escalated.remove(&message.correlation_id);
@@ -402,6 +447,7 @@ impl MailboxRegistry {
                 now_ms.saturating_sub(message.enqueued_at_ms) > UNDELIVERED_TTL_MS
             }) {
                 if let Some(message) = queue.pop_front() {
+                    self.deferred.remove(&message.correlation_id);
                     self.escalated.remove(&message.correlation_id);
                     expired.push(message);
                 }
@@ -418,22 +464,97 @@ impl MailboxRegistry {
     /// receiver asking for two hours has still said "not now"; answering with
     /// an error would leave it un-muted, which is the opposite of what it
     /// asked for and the kind of refusal an agent retries in a loop.
-    pub(crate) fn set_mute(&mut self, pane: &str, seconds: u64, now_ms: u64) -> u64 {
+    ///
+    /// `reason` replaces the previous one rather than accumulating: a renewed
+    /// mute says why NOW.
+    pub(crate) fn set_mute(
+        &mut self,
+        pane: &str,
+        seconds: u64,
+        now_ms: u64,
+        reason: Option<String>,
+    ) -> u64 {
         if seconds == 0 {
             self.mutes.remove(pane);
             return 0;
         }
         let until = now_ms.saturating_add(seconds.min(MAX_MUTE_SECONDS).saturating_mul(1000));
-        self.mutes.insert(pane.to_string(), until);
+        self.mutes.insert(
+            pane.to_string(),
+            Mute {
+                until_ms: until,
+                reason,
+            },
+        );
         until
+    }
+
+    /// The live mute's reason, if the pane is muted and gave one.
+    pub(crate) fn mute_reason(&mut self, pane: &str, now_ms: u64) -> Option<String> {
+        self.muted_until(pane, now_ms)?;
+        self.mutes.get(pane)?.reason.clone()
+    }
+
+    /// Messages queued for `pane` that a mute owes an answer (ADR-0018 §3):
+    /// every waking message not already answered. An `fyi` is never owed
+    /// one — nothing was asked, so there is nothing to defer.
+    pub(crate) fn owed_deferrals(&self, pane: &str) -> Vec<PendingMessage> {
+        self.queues
+            .get(pane)
+            .into_iter()
+            .flat_map(|queue| queue.iter())
+            .filter(|message| self.owes_deferral(message))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `message` still needs a deferral. The one predicate both
+    /// triggers — a mute being set, and a message arriving into one — ask,
+    /// so they cannot disagree about what is owed.
+    ///
+    /// Keyed on the message's OWN tier ([`MsgIntent::wakes`]), deliberately
+    /// not on [`Self::message_wakes`]: an `fyi` answer to the muted agent's
+    /// own question wakes it, but its sender asked nothing, so nothing is
+    /// owed. A deferral is `fyi` by construction and so is never owed one.
+    pub(crate) fn owes_deferral(&self, message: &PendingMessage) -> bool {
+        message.intent.wakes() && !self.deferred.contains(&message.correlation_id)
+    }
+
+    /// Record that `correlation_id` has been answered. Returns false when it
+    /// already was — the caller must then send nothing.
+    pub(crate) fn mark_deferred(&mut self, correlation_id: &str) -> bool {
+        self.deferred.insert(correlation_id.to_string())
+    }
+
+    pub(crate) fn push_deferral_hop(&mut self, hop: DeferralHop) {
+        self.deferral_hops.push_back(hop);
+    }
+
+    /// Hand out as many queued hops as fit under `cap` running at once, and
+    /// count them as running.
+    pub(crate) fn start_deferral_hops(&mut self, cap: usize) -> Vec<DeferralHop> {
+        let free = cap.saturating_sub(self.deferral_hops_running);
+        let take = free.min(self.deferral_hops.len());
+        self.deferral_hops_running += take;
+        self.deferral_hops.drain(..take).collect()
+    }
+
+    pub(crate) fn finish_deferral_hop(&mut self) {
+        self.deferral_hops_running = self.deferral_hops_running.saturating_sub(1);
+    }
+
+    /// Withdraw a claim whose answer never left: a cross-host deferral the
+    /// peer could not be reached for. Unclaimed, the next mute retries it.
+    pub(crate) fn unmark_deferred(&mut self, correlation_id: &str) {
+        self.deferred.remove(correlation_id);
     }
 
     /// The pane's live mute expiry, or `None` when it is not muted. Expired
     /// entries are dropped as they are read, so a pane that muted once does
     /// not hold an entry for the life of the server.
     pub(crate) fn muted_until(&mut self, pane: &str, now_ms: u64) -> Option<u64> {
-        match self.mutes.get(pane) {
-            Some(&until) if until > now_ms => Some(until),
+        match self.mutes.get(pane).map(|mute| mute.until_ms) {
+            Some(until) if until > now_ms => Some(until),
             Some(_) => {
                 self.mutes.remove(pane);
                 None
@@ -635,6 +756,12 @@ fn sender_identity(message: &PendingMessage) -> String {
 /// on whichever host it lands.
 const DEFERRAL_SUFFIX: &str = ":deferred";
 
+/// The correlation id of the automatic deferral answering `correlation_id`.
+/// The only place one is minted, so it always satisfies [`is_deferral`].
+pub(crate) fn deferral_id(correlation_id: &str) -> String {
+    format!("{correlation_id}{DEFERRAL_SUFFIX}")
+}
+
 /// Whether a correlation id names an automatic deferral.
 pub(crate) fn is_deferral(correlation_id: &str) -> bool {
     correlation_id.ends_with(DEFERRAL_SUFFIX)
@@ -798,7 +925,7 @@ mod tests {
         let mut registry = MailboxRegistry::default();
         let now = 1_000_000;
 
-        let until = registry.set_mute("pane-1", MAX_MUTE_SECONDS * 4, now);
+        let until = registry.set_mute("pane-1", MAX_MUTE_SECONDS * 4, now, None);
         assert_eq!(
             until,
             now + MAX_MUTE_SECONDS * 1000,
@@ -806,7 +933,7 @@ mod tests {
         );
         assert_eq!(registry.muted_until("pane-1", now), Some(until));
 
-        assert_eq!(registry.set_mute("pane-1", 0, now), 0, "zero clears");
+        assert_eq!(registry.set_mute("pane-1", 0, now, None), 0, "zero clears");
         assert_eq!(registry.muted_until("pane-1", now), None);
     }
 
@@ -816,7 +943,7 @@ mod tests {
     fn an_expired_mute_is_swept_as_it_is_read() {
         let mut registry = MailboxRegistry::default();
         let now = 1_000_000;
-        let until = registry.set_mute("pane-1", 60, now);
+        let until = registry.set_mute("pane-1", 60, now, None);
 
         assert_eq!(registry.muted_until("pane-1", until - 1), Some(until));
         assert_eq!(
@@ -841,6 +968,131 @@ mod tests {
         assert_eq!(registry.queued_len("pane-1"), 2);
         assert_eq!(registry.queued_len("pane-2"), 1);
         assert_eq!(registry.queued_len("pane-3"), 0);
+    }
+
+    fn question(correlation: &str, to: &str) -> PendingMessage {
+        PendingMessage {
+            intent: MsgIntent::NeedsReply,
+            ..message(correlation, to)
+        }
+    }
+
+    /// Review of #411: the dedupe window is the newest `MAX_SEEN` ids
+    /// server-wide, and a question can wait far longer than it takes a busy
+    /// fleet to push its id out. Its deferral mark must survive that — it
+    /// belongs to the queue entry, not to the window.
+    #[test]
+    fn a_deferral_mark_outlives_the_dedupe_window_while_its_message_waits() {
+        let mut registry = MailboxRegistry::default();
+        let waiting = question("c-waiting", "pane-muted");
+        registry.enqueue(waiting.clone());
+        assert!(registry.mark_deferred("c-waiting"));
+
+        // Push c-waiting out of the seen window, spreading the traffic over
+        // enough panes that no mailbox fills.
+        for index in 0..=MAX_SEEN {
+            let pane = format!("pane-{}", index / MAX_QUEUED_PER_PANE);
+            assert_eq!(
+                registry.enqueue(message(&format!("c-noise-{index}"), &pane)),
+                EnqueueOutcome::Queued
+            );
+        }
+        assert!(
+            !registry.seen.contains("c-waiting"),
+            "precondition: the id has left the dedupe window"
+        );
+        assert_eq!(registry.queued_len("pane-muted"), 1, "but is still queued");
+
+        assert!(
+            !registry.owes_deferral(&waiting),
+            "a question still in an inbox keeps its mark, or a re-mute answers it twice"
+        );
+        assert!(registry.owed_deferrals("pane-muted").is_empty());
+
+        // Once read, the entry — and with it the mark — is gone.
+        registry.pop_next("pane-muted").expect("still queued");
+        assert!(!registry.deferred.contains("c-waiting"));
+    }
+
+    /// The seed keeps a mark exactly while its message is still pending.
+    #[test]
+    fn a_seeded_deferral_mark_follows_its_message_out_of_the_queue() {
+        let deferred_event = |correlation: &str| EventEnvelope {
+            event: EventKind::MessageDeferred,
+            data: EventData::MessageDeferred {
+                correlation_id: correlation.into(),
+                deferral_correlation_id: format!("{correlation}:deferred"),
+                pane: "w1:p2".into(),
+                muted_until_ms: 10,
+                reason: None,
+                route: None,
+                deferred_at_ms: 2,
+            },
+        };
+        let waiting = question("c-waiting", "w1:p2");
+        let read = question("c-read", "w1:p2");
+        let events = [
+            queued_event(&waiting),
+            queued_event(&read),
+            deferred_event("c-waiting"),
+            deferred_event("c-read"),
+            delivered_event("c-read"),
+        ];
+        let mut registry = MailboxRegistry::default();
+        registry.seed_from_events(events.iter());
+
+        assert!(
+            !registry.owes_deferral(&waiting),
+            "still queued, still answered"
+        );
+        assert!(
+            !registry.deferred.contains("c-read"),
+            "a read message holds no mark"
+        );
+    }
+
+    /// Review of #411: one mute can owe a whole inbox of cross-host
+    /// deferrals. They go out at most `cap` at a time, in order, and a
+    /// finished hop frees exactly one slot.
+    #[test]
+    fn deferral_hops_are_capped_and_start_in_order() {
+        let hop = |correlation: &str| DeferralHop {
+            peer: crate::config::PeerConfig::default(),
+            body: String::new(),
+            relay: crate::events::MsgDeferralRelay {
+                correlation_id: correlation.into(),
+                deferral_correlation_id: format!("{correlation}:deferred"),
+                pane: "w1:p2".into(),
+                muted_until_ms: 0,
+                reason: None,
+                from_agent: "agent_a".into(),
+                to_agent: "agent_b".into(),
+                to_host: "far".into(),
+                route: "far".into(),
+                result: Ok(()),
+            },
+        };
+        let ids = |hops: Vec<DeferralHop>| -> Vec<String> {
+            hops.into_iter()
+                .map(|hop| hop.relay.correlation_id)
+                .collect()
+        };
+        let mut registry = MailboxRegistry::default();
+        for index in 0..5 {
+            registry.push_deferral_hop(hop(&format!("c-{index}")));
+        }
+
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-0", "c-1"]);
+        assert!(
+            registry.start_deferral_hops(2).is_empty(),
+            "no slot until one finishes"
+        );
+        registry.finish_deferral_hop();
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-2"]);
+        registry.finish_deferral_hop();
+        registry.finish_deferral_hop();
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-3", "c-4"]);
+        assert!(registry.start_deferral_hops(2).is_empty(), "queue drained");
     }
 
     #[test]

@@ -383,6 +383,7 @@ async fn a_muted_recipient_is_not_woken_until_the_mute_lifts() {
         method: Method::MsgMute(MsgMuteParams {
             pane: Some(pane.clone()),
             seconds: 60,
+            reason: None,
         }),
     });
     send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
@@ -393,7 +394,7 @@ async fn a_muted_recipient_is_not_woken_until_the_mute_lifts() {
         "wake when it lifts"
     );
 
-    app.mailboxes.set_mute(&pane, 0, 0);
+    app.mailboxes.set_mute(&pane, 0, 0, None);
     claude_idle_for(&mut app, settled());
     app.tick_idle_wakes(Instant::now());
     assert_eq!(

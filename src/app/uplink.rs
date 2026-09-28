@@ -219,6 +219,19 @@ impl Uplink {
         Some(relay.hub.get_or_insert_with(|| claimed.to_string()).clone())
     }
 
+    /// Queue a frame nobody waits on — flock's own automatic reply, such as a
+    /// mute's deferral (#410). Tracked like any other so the hub's answer and
+    /// the timeout still resolve it, but the request that caused it is
+    /// answered at once rather than parked.
+    pub(crate) fn hand_up_detached(&mut self, frame: UplinkFrame, send: ParkedSend) {
+        let uplink_id = frame.uplink_id.clone();
+        self.outbound.push_back(Outbound {
+            frame,
+            offered_at: None,
+        });
+        self.sends.insert(uplink_id, send);
+    }
+
     /// Queue a frame for the hub and park its sender.
     pub(crate) fn hand_up(&mut self, frame: UplinkFrame, send: ParkedSend) {
         let uplink_id = frame.uplink_id.clone();

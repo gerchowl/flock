@@ -1,5 +1,5 @@
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, MessageTarget, MsgListParams, MsgReadParams,
+    EventData, EventEnvelope, EventKind, MessageTarget, MsgIntent, MsgListParams, MsgReadParams,
     MsgReplyParams, MsgSendParams, MsgStatusParams, ResponseResult,
 };
 use crate::app::mailboxes::{EnqueueOutcome, PendingMessage};
@@ -25,6 +25,59 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+/// The durable record of a queued message — the mailbox's restart source.
+fn queued_event(message: &PendingMessage) -> EventData {
+    EventData::MessageQueued {
+        correlation_id: message.correlation_id.clone(),
+        from_pane: message.from_pane.clone(),
+        from_agent: message.from_agent.clone(),
+        from_host: message.from_host.clone(),
+        from_repo: message.from_repo.clone(),
+        to_pane: message.to_pane.clone(),
+        to_repo: message.to_repo.clone(),
+        cross_repo: match (&message.from_repo, &message.to_repo) {
+            (Some(from), Some(to)) => from != to,
+            _ => false,
+        },
+        in_reply_to: message.in_reply_to.clone(),
+        enqueued_at_ms: message.enqueued_at_ms,
+        intent: message.intent,
+        body: message.body.clone(),
+    }
+}
+
+/// A mute's `reason`, made fit to quote to other agents: control sequences
+/// stripped by the same sanitiser message bodies go through, folded onto one
+/// line, and cut to `max_chars`. `None` when nothing is left to say.
+fn bound_mute_reason(reason: &str, max_chars: usize) -> Option<String> {
+    let cleaned = crate::app::api_helpers::sanitize_reported_prompt(reason);
+    let folded = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() || max_chars == 0 {
+        return None;
+    }
+    if folded.chars().count() <= max_chars {
+        return Some(folded);
+    }
+    let mut cut: String = folded.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    Some(cut)
+}
+
+/// What a deferred sender reads (ADR-0018 §3): that it was deferred, why if
+/// the recipient said, and the absolute time the mute lifts — a deadline the
+/// sender can plan around, in UTC so it means the same on every host.
+fn deferral_body(muted_until_ms: u64, reason: Option<&str>) -> String {
+    let until = crate::digest::utc_timestamp(muted_until_ms);
+    let reason = reason
+        .map(|reason| format!(" Reason given: {reason}."))
+        .unwrap_or_default();
+    format!(
+        "Automatic reply: the recipient has muted its inbox and deferred your message until \
+         {until} (muted_until_ms={muted_until_ms}).{reason} Your message is still queued and \
+         nothing was lost; expect an answer after the mute lifts. This notice needs no reply."
+    )
 }
 
 pub(super) fn mint_correlation_id() -> String {
@@ -676,6 +729,11 @@ impl App {
     /// It is not gated on the pause, because it only ever removes wakes — a
     /// receiver quieting itself inside a paused fleet is asking for less, and
     /// refusing that would be pause working against its own purpose.
+    ///
+    /// A mute must answer (ADR-0018 §3): every waking message ALREADY waiting
+    /// is deferred here, and every one that arrives while the mute holds is
+    /// deferred as it is queued ([`Self::queue_message`]). A clear
+    /// (`seconds: 0`) owes nobody anything and sends nothing.
     pub(super) fn handle_msg_mute(
         &mut self,
         id: String,
@@ -685,11 +743,313 @@ impl App {
             Ok(pane) => pane,
             Err(refusal) => return refusal,
         };
-        let muted_until_ms = self.mailboxes.set_mute(&pane, params.seconds, now_ms());
+        let reason = params.reason.as_deref().and_then(|reason| {
+            bound_mute_reason(reason, self.state.config.msg.mute_reason_max_chars)
+        });
+        let muted_until_ms =
+            self.mailboxes
+                .set_mute(&pane, params.seconds, now_ms(), reason.clone());
         // ADR-0018 §4: blocking mail already waiting when the mute lands is the
         // same disagreement as blocking mail arriving during one.
         self.escalate_muted_blocking(&pane);
-        encode_success(id, ResponseResult::MsgMute { muted_until_ms })
+        let mut deferred = 0;
+        if muted_until_ms != 0 {
+            for message in self.mailboxes.owed_deferrals(&pane) {
+                if self.defer_message(&message, muted_until_ms, reason.clone()) {
+                    deferred += 1;
+                }
+            }
+        }
+        encode_success(
+            id,
+            ResponseResult::MsgMute {
+                muted_until_ms,
+                deferred,
+            },
+        )
+    }
+
+    /// Answer one message on behalf of its muted recipient (ADR-0018 §3).
+    /// Returns whether an answer was sent (or, cross-host, dispatched).
+    ///
+    /// The answer is an ordinary reply in every respect that matters to the
+    /// sender: `in_reply_to` the message, addressed by the sender's
+    /// fleet-global identity first, and routed through the same
+    /// resolve-then-relay path `msg.reply` uses, so a sender on another host
+    /// hears it the way it would hear a real answer. What it is NOT is
+    /// sender-shaped: it speaks for the muted pane, never for whoever's API
+    /// call happened to trigger it — at arrival time that caller is the
+    /// sender itself.
+    ///
+    /// Intent is `fyi` by construction, never copied, so two agents muted at
+    /// each other cannot ping-pong deferrals (#316 pitfall 7): a deferral is
+    /// never owed a deferral.
+    fn defer_message(
+        &mut self,
+        message: &PendingMessage,
+        muted_until_ms: u64,
+        reason: Option<String>,
+    ) -> bool {
+        if !self.mailboxes.owes_deferral(message) {
+            return false;
+        }
+        let target = match (&message.from_agent, &message.from_pane) {
+            (Some(agent), _) => MessageTarget::Agent {
+                agent: agent.clone(),
+            },
+            (None, Some(pane)) => MessageTarget::Pane { pane: pane.clone() },
+            // An anonymous sender has no address. Nothing can reach it, so
+            // there is nothing to claim.
+            (None, None) => return false,
+        };
+        // The muted pane is the deferral's sender. Resolved from the
+        // message's own recipient, not from the API caller.
+        let muter_agent = self
+            .resolve_terminal_target(&message.to_pane)
+            .ok()
+            .and_then(|resolved| {
+                let ws = self.state.workspaces.get(resolved.ws_idx)?;
+                let terminal = self
+                    .state
+                    .terminals
+                    .get(&ws.pane_state(resolved.pane_id)?.attached_terminal_id)?;
+                Some(terminal.agent_id.to_string())
+            });
+        let deferral_correlation_id = crate::app::mailboxes::deferral_id(&message.correlation_id);
+        let body = deferral_body(muted_until_ms, reason.as_deref());
+
+        // #410: a sender this spoke cannot reach itself is reached through the
+        // hub, the way the message came — ADR-0018 §3's deferral must ride
+        // the same route as any other reply.
+        let deferral_up = |muter_agent: &Option<String>| MsgSendParams {
+            from_agent: muter_agent.clone(),
+            from_host: None,
+            to: target.clone(),
+            body: body.clone(),
+            correlation_id: Some(deferral_correlation_id.clone()),
+            in_reply_to: Some(message.correlation_id.clone()),
+            intent: MsgIntent::Fyi,
+            intent_unrecognised: None,
+        };
+        let resolved = match self.resolve_message_target(&target) {
+            Ok(resolved) => resolved,
+            Err((code, _))
+                if code == "msg_target_not_found"
+                    && matches!(&target, MessageTarget::Agent { agent }
+                        if self.hand_up_detached(agent, deferral_up(&muter_agent))) =>
+            {
+                self.mailboxes.mark_deferred(&message.correlation_id);
+                self.emit_message_deferred(
+                    &message.correlation_id,
+                    deferral_correlation_id,
+                    &message.to_pane,
+                    muted_until_ms,
+                    reason,
+                    Some("via hub".into()),
+                );
+                return true;
+            }
+            Err((code, detail)) => {
+                tracing::warn!(
+                    correlation_id = message.correlation_id.as_str(),
+                    code,
+                    detail = detail.as_str(),
+                    "mute deferral: the sender is no longer reachable"
+                );
+                return false;
+            }
+        };
+        match resolved {
+            ResolvedTarget::Local(ws_idx, pane_id) => {
+                let Some(to_pane) = self.public_pane_id(ws_idx, pane_id) else {
+                    return false;
+                };
+                let deferral = PendingMessage {
+                    correlation_id: deferral_correlation_id.clone(),
+                    body,
+                    from_pane: Some(message.to_pane.clone()),
+                    from_agent: muter_agent,
+                    from_host: Some(crate::app::short_host_name()),
+                    from_repo: message.to_repo.clone(),
+                    to_pane,
+                    to_repo: self.workspace_repo_label(ws_idx),
+                    in_reply_to: Some(message.correlation_id.clone()),
+                    enqueued_at_ms: now_ms(),
+                    delivery_attempts: 0,
+                    intent: MsgIntent::Fyi,
+                };
+                // Straight to the mailbox rather than through `queue_message`:
+                // the deferral is `fyi`, so it could not trigger another, but
+                // not having the recursion at all is cheaper than proving it
+                // terminates.
+                let event = queued_event(&deferral);
+                match self.mailboxes.enqueue(deferral) {
+                    EnqueueOutcome::Queued => self.emit_event(EventEnvelope {
+                        event: EventKind::MessageQueued,
+                        data: event,
+                    }),
+                    // Already answered, by a run whose `MessageDeferred` never
+                    // made it to disk. The sender has its answer.
+                    EnqueueOutcome::Duplicate => {}
+                    // No room in the sender's own inbox. Leave it unclaimed so
+                    // the next mute retries once the sender has read.
+                    EnqueueOutcome::MailboxFull => return false,
+                }
+                self.mailboxes.mark_deferred(&message.correlation_id);
+                self.emit_message_deferred(
+                    &message.correlation_id,
+                    deferral_correlation_id,
+                    &message.to_pane,
+                    muted_until_ms,
+                    reason,
+                    None,
+                );
+                true
+            }
+            ResolvedTarget::Remote(location) => {
+                let Some(peer) = self.peer_for_location(&location) else {
+                    // No edge of our own: up the hub's relay, as the message
+                    // for this agent would go (#410).
+                    if !self.hand_up_detached(&location.agent_id, deferral_up(&muter_agent)) {
+                        return false;
+                    }
+                    self.mailboxes.mark_deferred(&message.correlation_id);
+                    self.emit_message_deferred(
+                        &message.correlation_id,
+                        deferral_correlation_id,
+                        &message.to_pane,
+                        muted_until_ms,
+                        reason,
+                        Some("via hub".into()),
+                    );
+                    return true;
+                };
+                let Some(from_agent) = muter_agent else {
+                    return false;
+                };
+                // Claim before the hop, so a mute renewed while it is in
+                // flight does not dispatch a second one. A failed hop
+                // withdraws the claim ([`Self::handle_msg_deferral_relayed`]).
+                self.mailboxes.mark_deferred(&message.correlation_id);
+                let relay = crate::events::MsgDeferralRelay {
+                    correlation_id: message.correlation_id.clone(),
+                    deferral_correlation_id,
+                    pane: message.to_pane.clone(),
+                    muted_until_ms,
+                    reason,
+                    from_agent,
+                    to_agent: location.agent_id.clone(),
+                    to_host: location.host.clone(),
+                    route: peer.name.clone(),
+                    result: Ok(()),
+                };
+                self.mailboxes
+                    .push_deferral_hop(crate::app::mailboxes::DeferralHop { peer, body, relay });
+                self.pump_deferral_hops();
+                true
+            }
+        }
+    }
+
+    /// Start queued cross-host deferral hops, up to
+    /// `[msg] deferral_relay_concurrency` at once.
+    ///
+    /// Bounded because one mute can owe many: a mute over a full inbox of
+    /// remote questions is 32 hops, and one thread per hop would be 32
+    /// concurrent ssh sessions, most of them to the same few hosts. The rest
+    /// wait in FIFO order and start as earlier hops finish.
+    fn pump_deferral_hops(&mut self) {
+        let cap = self.state.config.msg.deferral_relay_concurrency.max(1);
+        for hop in self.mailboxes.start_deferral_hops(cap) {
+            let crate::app::mailboxes::DeferralHop { peer, body, relay } = hop;
+            let event_tx = self.event_tx.clone();
+            let from_host = crate::app::short_host_name();
+            std::thread::spawn(move || {
+                let result = crate::peers::send_peer_message(
+                    &peer,
+                    &relay.to_agent,
+                    &relay.from_agent,
+                    &from_host,
+                    &body,
+                    &relay.deferral_correlation_id,
+                    Some(&relay.correlation_id),
+                    MsgIntent::Fyi,
+                )
+                .map_err(|failure| {
+                    let reason = crate::peers::SshFailureReason::classify(failure.detail());
+                    failure.hop_message(&from_host, &relay.to_host, reason)
+                });
+                let _ = event_tx.blocking_send(crate::events::AppEvent::MsgDeferralRelayed(
+                    crate::events::MsgDeferralRelay { result, ..relay },
+                ));
+            });
+        }
+    }
+
+    /// Record the outcome of a cross-host deferral's hop.
+    pub(crate) fn handle_msg_deferral_relayed(&mut self, relay: crate::events::MsgDeferralRelay) {
+        self.mailboxes.finish_deferral_hop();
+        self.record_deferral_hop(relay);
+        self.pump_deferral_hops();
+    }
+
+    fn record_deferral_hop(&mut self, relay: crate::events::MsgDeferralRelay) {
+        if let Err(detail) = &relay.result {
+            tracing::warn!(
+                correlation_id = relay.correlation_id.as_str(),
+                route = relay.route.as_str(),
+                detail = detail.as_str(),
+                "mute deferral could not reach the sender's host; the next mute retries it"
+            );
+            self.mailboxes.unmark_deferred(&relay.correlation_id);
+            return;
+        }
+        // The same audit fact every relayed message leaves behind, so the
+        // deferral is not the one cross-host send missing from this log.
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: relay.deferral_correlation_id.clone(),
+                from_agent: relay.from_agent,
+                to_agent: relay.to_agent,
+                to_host: relay.to_host,
+                route: relay.route.clone(),
+                relayed_at_ms: now_ms(),
+                intent: MsgIntent::Fyi,
+                via: None,
+            },
+        });
+        self.emit_message_deferred(
+            &relay.correlation_id,
+            relay.deferral_correlation_id,
+            &relay.pane,
+            relay.muted_until_ms,
+            relay.reason,
+            Some(relay.route),
+        );
+    }
+
+    fn emit_message_deferred(
+        &mut self,
+        correlation_id: &str,
+        deferral_correlation_id: String,
+        pane: &str,
+        muted_until_ms: u64,
+        reason: Option<String>,
+        route: Option<String>,
+    ) {
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageDeferred,
+            data: EventData::MessageDeferred {
+                correlation_id: correlation_id.to_string(),
+                deferral_correlation_id,
+                pane: pane.to_string(),
+                muted_until_ms,
+                reason,
+                route,
+                deferred_at_ms: now_ms(),
+            },
+        });
     }
 
     /// `msg.read` — the recipient consumes its inbox (ADR-0008).
@@ -758,26 +1118,9 @@ impl App {
         params: MsgSendParams,
         vouched: Option<&str>,
     ) -> String {
-        let route = location.route.as_deref().unwrap_or_default();
         let host = location.host.as_str();
         let to_agent = location.agent_id.as_str();
-        // Route by the peer entry the DIRECTORY answered from, not by the name
-        // the far machine calls itself. Those differ in any normal fleet — a
-        // peer configured as `anvil` reports its hostname as `vm-dev` — and
-        // matching on the reported host is exactly why the first live
-        // cross-host send came back "not in this server's [[peers]]". Falls
-        // back to the host for a directory answer that carried no route.
-        let Some(peer) = self
-            .state
-            .peers
-            .iter()
-            .find(|peer| {
-                (!route.is_empty() && peer.name.eq_ignore_ascii_case(route))
-                    || peer.name.eq_ignore_ascii_case(host)
-                    || peer.ssh_target().eq_ignore_ascii_case(host)
-            })
-            .cloned()
-        else {
+        let Some(peer) = self.peer_for_location(location) else {
             // #410: no edge of our own. A spoke hands the message up the relay
             // its hub holds — the fix for "not in [[peers]]" is NOT to add the
             // N×N trust the topology refuses.
@@ -919,6 +1262,31 @@ impl App {
         }
     }
 
+    /// The `[[peers]]` entry that reaches `location`.
+    ///
+    /// Route by the peer entry the DIRECTORY answered from, not by the name
+    /// the far machine calls itself. Those differ in any normal fleet — a
+    /// peer configured as `anvil` reports its hostname as `vm-dev` — and
+    /// matching on the reported host is exactly why the first live
+    /// cross-host send came back "not in this server's [[peers]]". Falls
+    /// back to the host for a directory answer that carried no route.
+    fn peer_for_location(
+        &self,
+        location: &crate::app::directory::AgentLocation,
+    ) -> Option<crate::config::PeerConfig> {
+        let route = location.route.as_deref().unwrap_or_default();
+        let host = location.host.as_str();
+        self.state
+            .peers
+            .iter()
+            .find(|peer| {
+                (!route.is_empty() && peer.name.eq_ignore_ascii_case(route))
+                    || peer.name.eq_ignore_ascii_case(host)
+                    || peer.ssh_target().eq_ignore_ascii_case(host)
+            })
+            .cloned()
+    }
+
     /// The `blocking` tier's own budget (ADR-0018 §1): the intent the message
     /// is actually queued with, and the warning that says so when it differs.
     ///
@@ -1053,6 +1421,10 @@ impl App {
 
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
     /// answer the caller.
+    ///
+    /// Also the arrival half of ADR-0018 §3: a waking message queued for a
+    /// muted recipient is answered with a deferral as it lands, so the
+    /// sender learns the deadline now rather than when the mute lifts.
     fn queue_message(
         &mut self,
         id: String,
@@ -1061,29 +1433,24 @@ impl App {
     ) -> String {
         let correlation_id = message.correlation_id.clone();
         let to_pane = message.to_pane.clone();
-        let event = EventData::MessageQueued {
-            correlation_id: correlation_id.clone(),
-            from_pane: message.from_pane.clone(),
-            from_agent: message.from_agent.clone(),
-            from_host: message.from_host.clone(),
-            from_repo: message.from_repo.clone(),
-            to_pane: message.to_pane.clone(),
-            to_repo: message.to_repo.clone(),
-            cross_repo: match (&message.from_repo, &message.to_repo) {
-                (Some(from), Some(to)) => from != to,
-                _ => false,
-            },
-            in_reply_to: message.in_reply_to.clone(),
-            enqueued_at_ms: message.enqueued_at_ms,
-            intent: message.intent,
-            body: message.body.clone(),
-        };
+        let event = queued_event(&message);
+        let owed = self
+            .mailboxes
+            .owes_deferral(&message)
+            .then(|| message.clone());
         match self.mailboxes.enqueue(message) {
             EnqueueOutcome::Queued => {
                 self.emit_event(EventEnvelope {
                     event: EventKind::MessageQueued,
                     data: event,
                 });
+                if let Some(message) = owed {
+                    let now = now_ms();
+                    if let Some(until) = self.mailboxes.muted_until(&message.to_pane, now) {
+                        let reason = self.mailboxes.mute_reason(&message.to_pane, now);
+                        self.defer_message(&message, until, reason);
+                    }
+                }
                 self.idle_wake_on_enqueue(&to_pane);
                 encode_success(
                     id,
@@ -2008,10 +2375,11 @@ mod tests {
             method: Method::MsgMute(crate::api::schema::MsgMuteParams {
                 pane: Some(pane.clone()),
                 seconds: 600,
+                reason: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::MsgMute { muted_until_ms } = success.result else {
+        let ResponseResult::MsgMute { muted_until_ms, .. } = success.result else {
             panic!("expected msg_mute: {response}");
         };
         assert!(muted_until_ms > 0, "a mute must name when it lifts");
@@ -2039,6 +2407,7 @@ mod tests {
             method: Method::MsgMute(crate::api::schema::MsgMuteParams {
                 pane: Some(pane.clone()),
                 seconds: 0,
+                reason: None,
             }),
         });
         assert_eq!(
@@ -2337,6 +2706,7 @@ mod tests {
             method: Method::MsgMute(crate::api::schema::MsgMuteParams {
                 pane: Some(pane.to_string()),
                 seconds,
+                reason: None,
             }),
         });
         assert!(response.contains("\"result\""), "{response}");
@@ -2673,5 +3043,281 @@ mod tests {
         );
         assert!(app.state.blocking_mail.is_empty());
         assert_eq!(wake(&mut app, &to), (1, None), "still heard");
+    }
+    // ---- ADR-0018 §3: a mute must answer ---------------------------------
+
+    /// The fleet-global id of the agent in workspace `ws_idx`'s focused pane.
+    fn agent_id_of(app: &crate::app::App, ws_idx: usize) -> String {
+        let ws = &app.state.workspaces[ws_idx];
+        let pane_id = ws.focused_pane_id().expect("pane");
+        let terminal_id = &ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id;
+        app.state.terminals[terminal_id].agent_id.to_string()
+    }
+
+    /// A send FROM workspace `from_ws`'s agent. The test process has no pane
+    /// ancestry, so the sender is asserted the way a relay asserts it —
+    /// which is also what makes the message answerable.
+    fn send_from(
+        app: &mut crate::app::App,
+        from_ws: usize,
+        to_ws: usize,
+        correlation: &str,
+        intent: MsgIntent,
+    ) -> String {
+        let from_agent = agent_id_of(app, from_ws);
+        let to = pane_target(app, to_ws);
+        send(
+            app,
+            MsgSendParams {
+                from_agent: Some(from_agent),
+                from_host: None,
+                to: MessageTarget::Pane { pane: to },
+                body: format!("question {correlation}"),
+                correlation_id: Some(correlation.into()),
+                in_reply_to: None,
+                intent,
+                intent_unrecognised: None,
+            },
+        )
+    }
+
+    /// `msg.mute` over the socket; returns `(muted_until_ms, deferred)`.
+    fn mute_answering(
+        app: &mut crate::app::App,
+        pane: &str,
+        seconds: u64,
+        reason: Option<&str>,
+    ) -> (u64, usize) {
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.mute",
+            "params": {"pane": pane, "seconds": seconds, "reason": reason},
+        })));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgMute {
+            muted_until_ms,
+            deferred,
+        } = success.result
+        else {
+            panic!("expected msg_mute: {response}");
+        };
+        (muted_until_ms, deferred)
+    }
+
+    fn deferred_events(hub: &crate::api::EventHub) -> Vec<EventData> {
+        hub.events_after(0)
+            .into_iter()
+            .map(|(_, envelope)| envelope.data)
+            .filter(|data| matches!(data, EventData::MessageDeferred { .. }))
+            .collect()
+    }
+
+    /// The whole contract through the socket: a question already waiting
+    /// when the mute is set is answered, once, with the reason and the lift
+    /// time; a notice is not; renewing the mute answers nobody twice; a
+    /// question arriving into the mute is answered as it lands.
+    #[tokio::test]
+    async fn a_mute_answers_each_waiting_question_exactly_once() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let sender_pane = pane_target(&app, 0);
+        let muted_pane = pane_target(&app, 1);
+
+        send_from(&mut app, 0, 1, "c-q1", MsgIntent::NeedsReply);
+        send_from(&mut app, 0, 1, "c-n1", MsgIntent::Fyi);
+
+        let (until, deferred) = mute_answering(
+            &mut app,
+            &muted_pane,
+            600,
+            Some("deep in a refactor\u{1b}[31m\nback soon"),
+        );
+        assert_eq!(
+            deferred, 1,
+            "one question waiting, one answer; a notice is owed nothing"
+        );
+
+        // It lands in the sender's inbox without costing the sender a turn:
+        // it answers a waking message, but tiers excludes deferrals by id
+        // from the reply-wakes rule. Mint and recogniser must agree.
+        assert_eq!(
+            wake(&mut app, &sender_pane).0,
+            0,
+            "a deferral never wakes its receiver"
+        );
+
+        let inbox = read_inbox(&mut app, &sender_pane);
+        assert_eq!(inbox.len(), 1, "exactly one deferral: {inbox:?}");
+        let deferral = &inbox[0];
+        assert!(
+            crate::app::mailboxes::is_deferral(&deferral.correlation_id),
+            "{}",
+            deferral.correlation_id
+        );
+        assert_eq!(deferral.in_reply_to.as_deref(), Some("c-q1"));
+        assert_eq!(
+            deferral.intent,
+            MsgIntent::Fyi,
+            "a deferral must never itself ask for an answer (#316 pitfall 7)"
+        );
+        assert_eq!(
+            deferral.from_agent.as_deref(),
+            Some(agent_id_of(&app, 1).as_str()),
+            "the deferral speaks for the muted agent, not for whoever triggered it"
+        );
+        assert!(
+            deferral.body.contains(&crate::digest::utc_timestamp(until)),
+            "the body names the absolute time the mute lifts: {}",
+            deferral.body
+        );
+        assert!(
+            deferral.body.contains("deep in a refactor back soon"),
+            "the reason is quoted, folded onto one line: {}",
+            deferral.body
+        );
+        assert!(
+            !deferral.body.contains('\u{1b}'),
+            "the reason goes through the body sanitiser: {:?}",
+            deferral.body
+        );
+        assert_eq!(
+            deferred_events(&hub).len(),
+            1,
+            "one durable record per deferral"
+        );
+
+        // Renewing (and extending) the mute owes nobody anything new.
+        let (_, deferred) = mute_answering(&mut app, &muted_pane, 1200, Some("still at it"));
+        assert_eq!(deferred, 0, "a renewed mute must not re-answer");
+        assert!(read_inbox(&mut app, &sender_pane).is_empty());
+
+        // A question arriving INTO the mute is answered as it lands, with the
+        // renewed mute's reason.
+        send_from(&mut app, 0, 1, "c-q2", MsgIntent::NeedsReply);
+        let inbox = read_inbox(&mut app, &sender_pane);
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+        assert_eq!(inbox[0].in_reply_to.as_deref(), Some("c-q2"));
+        assert!(inbox[0].body.contains("still at it"), "{}", inbox[0].body);
+
+        // A notice arriving into the mute is not.
+        send_from(&mut app, 0, 1, "c-n2", MsgIntent::Fyi);
+        assert!(read_inbox(&mut app, &sender_pane).is_empty());
+
+        // Every original is still waiting for the muted agent: deferral costs
+        // the sender latency, never the message.
+        let waiting = read_inbox(&mut app, &muted_pane);
+        let ids: Vec<&str> = waiting.iter().map(|m| m.correlation_id.as_str()).collect();
+        assert_eq!(ids, ["c-q1", "c-n1", "c-q2", "c-n2"]);
+        assert_eq!(deferred_events(&hub).len(), 2);
+    }
+
+    /// `seconds: 0` clears. Nothing was deferred, so nothing is said.
+    #[tokio::test]
+    async fn clearing_a_mute_tells_nobody_anything() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let sender_pane = pane_target(&app, 0);
+        let muted_pane = pane_target(&app, 1);
+        send_from(&mut app, 0, 1, "c-q", MsgIntent::NeedsReply);
+
+        assert_eq!(
+            mute_answering(&mut app, &muted_pane, 0, Some("never mind")),
+            (0, 0)
+        );
+        assert!(read_inbox(&mut app, &sender_pane).is_empty());
+        assert!(deferred_events(&hub).is_empty());
+    }
+
+    /// Two agents muted at each other: A's question is deferred by B, and
+    /// B's deferral — `fyi` by construction — is owed nothing by A. Without
+    /// that, each deferral would answer the last until a rate limit stopped
+    /// them.
+    #[tokio::test]
+    async fn two_muted_agents_cannot_ping_pong_deferrals() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let pane_a = pane_target(&app, 0);
+        let pane_b = pane_target(&app, 1);
+        mute_answering(&mut app, &pane_a, 600, None);
+        mute_answering(&mut app, &pane_b, 600, None);
+
+        send_from(&mut app, 0, 1, "c-ab", MsgIntent::NeedsReply);
+
+        assert_eq!(
+            deferred_events(&hub).len(),
+            1,
+            "one deferral, and it ends there"
+        );
+        let a_inbox = read_inbox(&mut app, &pane_a);
+        assert_eq!(a_inbox.len(), 1);
+        assert_eq!(a_inbox[0].intent, MsgIntent::Fyi);
+        assert!(
+            !a_inbox[0].body.contains("Reason given"),
+            "no reason given, none invented: {}",
+            a_inbox[0].body
+        );
+        assert_eq!(read_inbox(&mut app, &pane_b).len(), 1, "only the original");
+    }
+
+    /// The "already deferred" set survives a restart through the durable
+    /// log. Mutes do not (they fail open), so the realistic sequence is:
+    /// deferred, restart, the agent mutes again — and must not re-answer a
+    /// question it already answered.
+    #[tokio::test]
+    async fn a_restart_does_not_repeat_a_deferral() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let sender_pane = pane_target(&app, 0);
+        let muted_pane = pane_target(&app, 1);
+        send_from(&mut app, 0, 1, "c-q", MsgIntent::NeedsReply);
+        assert_eq!(mute_answering(&mut app, &muted_pane, 600, None).1, 1);
+        assert_eq!(read_inbox(&mut app, &sender_pane).len(), 1);
+
+        // Restart: the registry is rebuilt from nothing but the log.
+        let events: Vec<EventEnvelope> = hub
+            .events_after(0)
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .collect();
+        app.mailboxes = crate::app::mailboxes::MailboxRegistry::default();
+        app.mailboxes.seed_from_events(events.iter());
+        assert!(
+            app.mailboxes
+                .muted_until(&muted_pane, super::now_ms())
+                .is_none(),
+            "precondition: a mute does not survive a restart"
+        );
+
+        assert_eq!(
+            mute_answering(&mut app, &muted_pane, 600, None).1,
+            0,
+            "the question is still queued, and still already answered"
+        );
+        assert!(read_inbox(&mut app, &sender_pane).is_empty());
+        assert_eq!(deferred_events(&hub).len(), 1);
+        assert_eq!(
+            read_inbox(&mut app, &muted_pane).len(),
+            1,
+            "the original itself survived the restart"
+        );
+    }
+
+    #[test]
+    fn a_mute_reason_is_bounded_and_blank_means_none() {
+        assert_eq!(super::bound_mute_reason("  \n\t ", 200), None);
+        assert_eq!(super::bound_mute_reason("fine", 0), None);
+        assert_eq!(
+            super::bound_mute_reason("abcdef", 4).as_deref(),
+            Some("abc\u{2026}"),
+            "truncated to the cap, ellipsis included"
+        );
+        assert_eq!(
+            super::bound_mute_reason("äöü", 3).as_deref(),
+            Some("äöü"),
+            "the cap counts characters, not bytes"
+        );
     }
 }

@@ -252,6 +252,43 @@ impl App {
         ))
     }
 
+    /// Hand up a message flock itself sends on a spoke's behalf (#410) — a
+    /// mute's deferral reply, today — to the hub, without parking the request
+    /// that produced it. `false` when no hub holds a relay into this server.
+    pub(super) fn hand_up_detached(&mut self, to_agent: &str, message: MsgSendParams) -> bool {
+        if !self.uplink_attached() {
+            return false;
+        }
+        let (Some(from_agent), Some(correlation_id)) =
+            (message.from_agent.clone(), message.correlation_id.clone())
+        else {
+            return false;
+        };
+        let frame = UplinkFrame {
+            uplink_id: mint_uplink_id(&correlation_id),
+            message: MsgSendParams {
+                to: MessageTarget::Agent {
+                    agent: to_agent.to_string(),
+                },
+                from_host: Some(crate::app::short_host_name()),
+                ..message
+            },
+        };
+        let now = Instant::now();
+        self.uplink.hand_up_detached(
+            frame,
+            ParkedSend::new(
+                "detached".into(),
+                correlation_id,
+                from_agent,
+                to_agent.to_string(),
+                now + self.uplink_timeout(),
+            ),
+        );
+        self.feed_parked_take(now);
+        true
+    }
+
     /// `peers.relay_attach` — the hub's relay binds this server's uplink to
     /// its own process (#410 review).
     ///

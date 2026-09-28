@@ -522,6 +522,123 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     );
 }
 
+/// ADR-0018 §3 across a machine boundary: a mute must answer a sender on
+/// ANOTHER host the same way it answers a local one, through the ordinary
+/// reply path. Both triggers, because they take different roads home:
+///
+/// - a question already waiting when the mute is set is answered from the
+///   mute call itself;
+/// - a question arriving INTO the mute is answered while the relayed send
+///   that carried it is still being handled — the sender's server is at that
+///   moment inside its own ssh hop to us. A deferral sent back synchronously
+///   would wait on a server that is waiting on it.
+#[test]
+fn a_mute_answers_a_sender_on_another_host() {
+    let fleet = fleet::spawn("mcp-fleet-mute", PAIR_AB);
+    let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+
+    // Each side has to be able to name the other: the question goes a→b,
+    // the deferral b→a.
+    wait_for("nodeb's agent in nodea's directory", GOSSIP_TIMEOUT, || {
+        let listing = alice.call_tool("flock_agent_list", json!({}));
+        fleet_row(&listing, &bob.agent_id).map(|_| ())
+    });
+    wait_for("nodea's agent in nodeb's directory", GOSSIP_TIMEOUT, || {
+        let listing = bob.call_tool("flock_agent_list", json!({}));
+        fleet_row(&listing, &alice.agent_id).map(|_| ())
+    });
+
+    // 1. Waiting before the mute.
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": bob.agent_id},
+            "body": "are you free to review?",
+            "correlation_id": "c-408-before",
+            "intent": "needs_reply",
+        }),
+    );
+    wait_for("the question to land on nodeb", RPC_TIMEOUT, || {
+        let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
+        (!queued["messages"].as_array()?.is_empty()).then_some(())
+    });
+
+    let muted = bob.call_tool(
+        "flock_msg_mute",
+        json!({"seconds": 600, "reason": "mid-rebase"}),
+    );
+    let until = muted["muted_until_ms"].as_u64().expect("lift time");
+    assert!(until > 0, "{muted}");
+    assert_eq!(
+        muted["deferred"], 1,
+        "the waiting question is answered: {muted}"
+    );
+
+    let deferral = wait_for("the deferral to reach nodea", RPC_TIMEOUT, || {
+        let inbox = alice.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(deferral["in_reply_to"], "c-408-before", "{deferral}");
+    assert_eq!(
+        deferral["intent"], "fyi",
+        "never a question back: {deferral}"
+    );
+    assert_eq!(deferral["from_agent"], bob.agent_id.as_str(), "{deferral}");
+    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
+    let body = deferral["body"].as_str().expect("body");
+    assert!(body.contains("mid-rebase"), "the reason travels: {body}");
+    assert!(
+        body.contains(&format!("muted_until_ms={until}")),
+        "the deadline travels: {body}"
+    );
+
+    // 2. Arriving into the mute.
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": bob.agent_id},
+            "body": "ping again",
+            "correlation_id": "c-408-during",
+            "intent": "needs_reply",
+        }),
+    );
+    let deferral = wait_for(
+        "the arrival-time deferral to reach nodea",
+        RPC_TIMEOUT,
+        || {
+            let inbox = alice.call_tool("flock_msg_read", json!({}));
+            inbox["messages"].as_array()?.first().cloned()
+        },
+    );
+    assert_eq!(deferral["in_reply_to"], "c-408-during", "{deferral}");
+    assert_eq!(deferral["intent"], "fyi", "{deferral}");
+
+    // 3. Renewing answers nobody twice, and a notice is owed nothing.
+    let renewed = bob.call_tool("flock_msg_mute", json!({"seconds": 900}));
+    assert_eq!(renewed["deferred"], 0, "{renewed}");
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": bob.agent_id},
+            "body": "just so you know",
+            "intent": "fyi",
+        }),
+    );
+    wait_for("the notice to land on nodeb", RPC_TIMEOUT, || {
+        let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
+        (queued["messages"].as_array()?.len() == 3).then_some(())
+    });
+    // Give a stray deferral the same window a real one got to arrive.
+    thread::sleep(Duration::from_secs(2));
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        inbox["messages"].as_array().map(Vec::len),
+        Some(0),
+        "no second deferral, and none for a notice: {inbox}"
+    );
+}
+
 /// #410, the acceptance case. A spoke messages another spoke through the hub,
 /// and the answer comes back the same way — with neither spoke holding a key
 /// to anything.
@@ -760,6 +877,49 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     });
     assert_eq!(arrived["intent"], "blocking", "{arrived}");
     assert_eq!(arrived["from_host"], "nodea", "{arrived}");
+
+    // ADR-0018 §3 rides the route too: carol mutes, so a question from alice
+    // is answered by carol's OWN server with a deferral — and nodec cannot
+    // reach nodea itself, so that deferral goes up nodeb's relay and back
+    // down to alice like any other reply.
+    carol.call_tool(
+        "flock_msg_mute",
+        json!({"seconds": 600, "reason": "deep in a refactor"}),
+    );
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": carol.agent_id},
+            "body": "are you there?",
+            "correlation_id": "c-410-muted",
+            "intent": "needs_reply",
+        }),
+    );
+    let deferral = wait_for("carol's deferral to reach nodea", RPC_TIMEOUT, || {
+        let inbox = alice.call_tool("flock_msg_read", json!({}));
+        inbox["messages"]
+            .as_array()?
+            .iter()
+            .find(|message| message["in_reply_to"] == "c-410-muted")
+            .cloned()
+    });
+    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
+    assert_eq!(
+        deferral["from_agent"],
+        carol.agent_id.as_str(),
+        "{deferral}"
+    );
+    assert_eq!(
+        deferral["intent"], "fyi",
+        "a deferral is fyi by construction: {deferral}"
+    );
+    assert!(
+        deferral["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("deep in a refactor")),
+        "the reason survives both hops: {deferral}"
+    );
+    carol.call_tool("flock_msg_mute", json!({"seconds": 0}));
 
     // Break the hub's edge to nodec. The failure is nodeb's hop, and the
     // sender on nodea is told so — which machine could not reach which, and

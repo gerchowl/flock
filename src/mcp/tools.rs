@@ -203,8 +203,17 @@ pub(super) fn table() -> &'static [Tool] {
                           queued meanwhile. It costs you latency, never a \
                           message. Capped at 30 minutes, and cleared by a \
                           server restart — a preference, not a promise, so \
-                          renew it if you still want quiet. `seconds: 0` \
-                          clears it. Omit `pane` to mute yourself.",
+                          renew it if you still want quiet. A mute is not \
+                          silent: every sender whose `needs_reply` message is \
+                          waiting or arrives while muted gets ONE automatic \
+                          `fyi` reply saying you deferred it, your `reason` \
+                          if you give one, and the exact time the mute lifts \
+                          — so give a reason and do answer after it lifts. \
+                          The result's `deferred` counts deferrals SENT, not \
+                          delivered: one to another host can still fail its \
+                          hop, and is then retried by your next mute. \
+                          `seconds: 0` clears it and tells nobody anything. \
+                          Omit `pane` to mute yourself.",
             input_schema: schema_msg_mute,
             build: build_msg_mute,
         },
@@ -741,6 +750,10 @@ fn schema_msg_mute() -> Value {
                 "type": "string",
                 "description": "Whose wake to suppress. Omit for your own pane.",
             },
+            "reason": {
+                "type": "string",
+                "description": "Why you are deferring, quoted to each sender you defer alongside the time the mute lifts. One short line; long reasons are truncated.",
+            },
         },
         "required": ["seconds"],
         "additionalProperties": false,
@@ -754,6 +767,7 @@ fn build_msg_mute(args: Value) -> Result<Method, McpError> {
             .get("seconds")
             .and_then(Value::as_u64)
             .ok_or_else(|| McpError::invalid_params("`seconds` is required (0 clears the mute)"))?,
+        reason: optional_string(&args, "reason")?,
     }))
 }
 

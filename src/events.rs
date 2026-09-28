@@ -272,6 +272,11 @@ pub enum AppEvent {
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(WorktreeRemoveResult),
     WorktreeKillGateFinished(WorktreeKillGateResult),
+    /// A mute's deferral to a sender on another host finished its hop
+    /// (ADR-0018 §3). The hop runs off the event loop: it is an ssh to the
+    /// sender's server, which may be the very server still waiting on THIS
+    /// one to answer the relayed send that triggered it.
+    MsgDeferralRelayed(MsgDeferralRelay),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
     WorktreeKillAllFinished(WorktreeKillAllResult),
     /// One script check completed on a runner-spawned worker thread
@@ -282,4 +287,25 @@ pub enum AppEvent {
         outcome: crate::checks::Outcome,
         duration_ms: u64,
     },
+}
+
+/// Outcome of one cross-host deferral (ADR-0018 §3), carrying everything the
+/// App needs to record it — or to withdraw its claim so a later mute retries.
+#[derive(Debug, Clone)]
+pub struct MsgDeferralRelay {
+    /// The deferred message.
+    pub correlation_id: String,
+    pub deferral_correlation_id: String,
+    /// The muted recipient's pane.
+    pub pane: String,
+    pub muted_until_ms: u64,
+    pub reason: Option<String>,
+    /// The muted recipient's identity — the deferral's sender.
+    pub from_agent: String,
+    /// The original sender — the deferral's recipient.
+    pub to_agent: String,
+    pub to_host: String,
+    /// `[[peers]]` entry the hop went through.
+    pub route: String,
+    pub result: Result<(), String>,
 }

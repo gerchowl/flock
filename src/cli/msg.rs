@@ -447,10 +447,16 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
 /// arriving and `flk msg list` keeps showing it. `0` clears. The operator
 /// path exists alongside the agent's `flock_msg_mute` so a mute an agent set
 /// on itself can always be lifted from outside it.
+///
+/// A mute answers (ADR-0018 §3): every sender whose `needs_reply` message
+/// waits or arrives while it holds is told, once, with `--reason` if given and
+/// the time the mute lifts.
 fn msg_mute(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: flk msg mute <seconds> [--pane TARGET]   (0 clears)";
+    const USAGE: &str =
+        "usage: flk msg mute <seconds> [--pane TARGET] [--reason TEXT]   (0 clears)";
     let mut pane = None;
     let mut seconds = None;
+    let mut reason = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -460,6 +466,14 @@ fn msg_mute(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 pane = Some(value.clone());
+                index += 2;
+            }
+            "--reason" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --reason");
+                    return Ok(2);
+                };
+                reason = Some(value.clone());
                 index += 2;
             }
             other => {
@@ -478,7 +492,11 @@ fn msg_mute(args: &[String]) -> std::io::Result<i32> {
     };
     super::print_response(&super::send_request(&Request {
         id: "cli:msg:mute".into(),
-        method: Method::MsgMute(crate::api::schema::MsgMuteParams { pane, seconds }),
+        method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+            pane,
+            seconds,
+            reason,
+        }),
     })?)
 }
 
@@ -498,8 +516,8 @@ fn print_msg_help() {
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
     eprintln!("  flk msg status <correlation_id>  what became of a message you sent");
     eprintln!(
-        "  flk msg mute <seconds> [--pane TARGET]  stop waking a recipient; 0 clears, \
-         mail still arrives"
+        "  flk msg mute <seconds> [--pane TARGET] [--reason TEXT]  stop waking a recipient; \
+         0 clears, mail still arrives, and each needs-reply sender is told once when it lifts"
     );
     eprintln!(
         "  --  ends flag parsing: everything after it is body text, so a message may begin \

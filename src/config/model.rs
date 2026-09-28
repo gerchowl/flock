@@ -1088,6 +1088,16 @@ pub struct MsgConfig {
     /// against no threat model. Narrow it when that stops being true:
     /// `allow_from = ["mba22"]`.
     pub allow_from: Vec<String>,
+    /// Longest `reason` a mute may carry, in characters (ADR-0018 §3).
+    /// Longer is truncated, not refused: the reason is quoted to every
+    /// sender the mute defers, so it is bounded like any other body, and a
+    /// mute must never fail over its own explanation. Default: 200.
+    pub mute_reason_max_chars: usize,
+    /// How many mute deferrals to other hosts may be in flight at once
+    /// (ADR-0018 §3). Each is an ssh hop; one mute over a full inbox of
+    /// remote questions owes up to a mailbox's worth, and the rest wait for
+    /// a slot rather than opening that many sessions at once. Default: 4.
+    pub deferral_relay_concurrency: usize,
     /// How many `blocking` messages one sender may send per rolling hour
     /// (ADR-0018 §1). Default: 6.
     ///
@@ -1138,6 +1148,8 @@ impl Default for MsgConfig {
         Self {
             enabled: true,
             allow_from: vec!["*".to_string()],
+            mute_reason_max_chars: 200,
+            deferral_relay_concurrency: 4,
             blocking_per_hour: 6,
             uplink_timeout_secs: 45,
             uplink_heartbeat_secs: 20,
