@@ -236,6 +236,8 @@ impl App {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the headless loop (the #25 dual-loop lesson).
         self.expire_undeliverable_messages();
+        // ADR-0018 §2: mail that became wakeable since it was queued.
+        self.tick_idle_wakes(now);
         for update in &settled {
             self.emit_pane_state_update(update);
         }
@@ -645,6 +647,9 @@ impl App {
                 .then_some(())
                 .and_then(|()| self.issue_guard.next_poll_deadline()),
             self.pending_agent_resume_deadline,
+            // ADR-0018 §2: a settle, quiet window or mute that lifts, or the
+            // Enter of a typed idle wake, must not wait for unrelated traffic.
+            self.idle_wake.next_deadline(),
             // #36: a notification held behind `[ui.toast] delay_seconds` must
             // wake an otherwise quiet loop, or it lands only on the next
             // unrelated tick.

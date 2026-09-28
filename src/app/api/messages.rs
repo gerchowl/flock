@@ -20,7 +20,7 @@ enum ResolvedTarget {
 
 use super::responses::{encode_error, encode_error_with_data, encode_success};
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -35,6 +35,13 @@ fn mint_correlation_id() -> String {
         now_ms(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Why a wake may not fire, whichever channel asked.
+pub(crate) struct WakeSuppression {
+    pub reason: &'static str,
+    /// When the mute lifts, for a `muted` suppression.
+    pub muted_until_ms: Option<u64>,
 }
 
 /// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Messages are queued per
@@ -462,35 +469,13 @@ impl App {
             Err(refusal) => return refusal,
         };
 
-        // US-9 (#175 S3 commit 3). Pause halts what FLOCK initiates and
-        // exempts human agency on purpose — an operator can still type into a
-        // paused pane. A wake is neither: it is flock interrupting an agent
-        // on its own initiative, so it sits on the halted side of that line.
-        //
-        // This gate is a restoration, not a new rule. Pause used to hold the
-        // mailbox by gating `deliver_due_messages`; ADR-0008 (#216) deleted
-        // that drain along with the keystrokes, and the stop-hook wake that
-        // replaced it inherited no gate. A paused fleet went on returning
-        // `decision: block` to every agent at every turn boundary.
-        if self.fleet_pause.paused {
+        if let Some(suppression) = self.wake_suppression(&pane, now_ms()) {
             return encode_success(
                 id,
                 ResponseResult::MsgWake {
                     count: 0,
-                    suppressed: Some("fleet_paused".into()),
-                    muted_until_ms: None,
-                },
-            );
-        }
-
-        let now = now_ms();
-        if let Some(until) = self.mailboxes.muted_until(&pane, now) {
-            return encode_success(
-                id,
-                ResponseResult::MsgWake {
-                    count: 0,
-                    suppressed: Some("muted".into()),
-                    muted_until_ms: Some(until),
+                    suppressed: Some(suppression.reason.into()),
+                    muted_until_ms: suppression.muted_until_ms,
                 },
             );
         }
@@ -503,6 +488,36 @@ impl App {
                 muted_until_ms: None,
             },
         )
+    }
+
+    /// Whether flock may interrupt `pane`'s agent about its mail at all — the
+    /// ONE decision behind both wake channels: the stop hook's turn-boundary
+    /// nudge (`msg.wake`) and the typed idle wake (ADR-0018 §2). Two copies of
+    /// these gates would be two chances for a paused fleet or a muted agent to
+    /// be interrupted anyway.
+    pub(crate) fn wake_suppression(&mut self, pane: &str, now: u64) -> Option<WakeSuppression> {
+        // US-9 (#175 S3 commit 3). Pause halts what FLOCK initiates and
+        // exempts human agency on purpose — an operator can still type into a
+        // paused pane. A wake is neither: it is flock interrupting an agent
+        // on its own initiative, so it sits on the halted side of that line.
+        //
+        // This gate is a restoration, not a new rule. Pause used to hold the
+        // mailbox by gating `deliver_due_messages`; ADR-0008 (#216) deleted
+        // that drain along with the keystrokes, and the stop-hook wake that
+        // replaced it inherited no gate. A paused fleet went on returning
+        // `decision: block` to every agent at every turn boundary.
+        if self.fleet_pause.paused {
+            return Some(WakeSuppression {
+                reason: "fleet_paused",
+                muted_until_ms: None,
+            });
+        }
+        self.mailboxes
+            .muted_until(pane, now)
+            .map(|until| WakeSuppression {
+                reason: "muted",
+                muted_until_ms: Some(until),
+            })
     }
 
     /// `msg.mute` — a recipient declining to be woken for a bounded window.
@@ -571,6 +586,7 @@ impl App {
             });
         }
         messages.sort_by_key(|message| message.enqueued_at_ms);
+        self.idle_wake_on_read(&pane);
         encode_success(id, ResponseResult::MsgRead { messages })
     }
 
@@ -712,6 +728,7 @@ impl App {
         warnings: Vec<String>,
     ) -> String {
         let correlation_id = message.correlation_id.clone();
+        let to_pane = message.to_pane.clone();
         let event = EventData::MessageQueued {
             correlation_id: correlation_id.clone(),
             from_pane: message.from_pane.clone(),
@@ -735,6 +752,7 @@ impl App {
                     event: EventKind::MessageQueued,
                     data: event,
                 });
+                self.idle_wake_on_enqueue(&to_pane);
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
