@@ -37,30 +37,33 @@ fn mint_correlation_id() -> String {
     )
 }
 
-/// Whose `blocking` budget a message spends (ADR-0018 §1): the identity the
-/// server can stand behind, never a caller's claim on its own.
+/// Whose `blocking` budget a message spends (ADR-0018 §1): an identity this
+/// server attested from process ancestry, and nothing a caller asserted.
 ///
-/// An agent this server attested from process ancestry is keyed by its id,
-/// and one attested only as a pane by that pane. Anything else is a claim,
-/// scoped by the host that claims it: a relayed sender is `host/agent`, so a
-/// peer cannot spend another host's senders' budget by naming them, and a
-/// claim with no host shares one bucket rather than minting a fresh budget
-/// per invented id. An unattested caller holds this server's socket, which is
-/// already operator-level access; the budget exists for agents, and every
-/// agent is attested on the server it runs on.
-fn blocking_budget_key(
-    attested_agent: Option<&str>,
-    from_pane: Option<&str>,
-    claimed_host: Option<&str>,
-    claimed_agent: Option<&str>,
-) -> String {
-    match (attested_agent, from_pane, claimed_host) {
-        (Some(agent), _, _) => agent.to_string(),
-        (None, Some(pane), _) => format!("pane/{pane}"),
-        (None, None, Some(host)) => format!("{host}/{}", claimed_agent.unwrap_or("unknown")),
-        (None, None, None) => "unattested".to_string(),
+/// An attested agent is keyed by its id, one attested only as a pane by that
+/// pane. EVERY unattested sender — each relayed message, each socket client
+/// outside a pane — shares one bucket, because on that path both `from_agent`
+/// and `from_host` are claims: keying on them let a caller mint fresh budget
+/// per invented name, or name a real agent and spend its budget for it. One
+/// shared bucket is safe because a spent budget downgrades rather than
+/// refuses ([`App::apply_blocking_budget`]), so nobody can be silenced by
+/// someone else exhausting it. The key space is therefore bounded by the
+/// panes on this server, plus one.
+fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
+    match (attested_agent, from_pane) {
+        (Some(agent), _) => agent.to_string(),
+        (None, Some(pane)) => format!("pane/{pane}"),
+        (None, None) => UNATTESTED_BLOCKING_BUCKET.to_string(),
     }
 }
+
+/// The one budget every unattested `blocking` sender shares.
+const UNATTESTED_BLOCKING_BUCKET: &str = "unattested";
+
+/// Send-result warnings naming why a `blocking` message went in as
+/// `needs_reply`.
+const BLOCKING_BUDGET_SPENT: &str = "blocking_budget_spent_sent_as_needs_reply";
+const BLOCKING_DISABLED: &str = "blocking_disabled_sent_as_needs_reply";
 
 /// The escalation text: who is blocked, on whom, and how many times over.
 fn escalation_body(sender: &str, recipient: &str, count: usize) -> String {
@@ -197,15 +200,9 @@ impl App {
 
         let now = now_ms();
         let sender_key = from_pane.clone().unwrap_or_else(|| "unknown".into());
-        let blocking_key = blocking_budget_key(
-            attested_agent.as_deref(),
-            from_pane.as_deref(),
-            params.from_host.as_deref(),
-            params.from_agent.as_deref(),
-        );
-        if let Err(refusal) = self.admit_blocking(&id, params.intent, &blocking_key, now) {
-            return refusal;
-        }
+        let blocking_key = blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref());
+        let (applied_intent, downgrade) =
+            self.apply_blocking_budget(params.intent, &blocking_key, now);
         if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
             return encode_error(
                 id,
@@ -219,6 +216,7 @@ impl App {
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
         let mut warnings = Vec::new();
+        warnings.extend(downgrade.map(str::to_string));
         if from_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
@@ -244,7 +242,7 @@ impl App {
             in_reply_to: params.in_reply_to,
             enqueued_at_ms: now,
             delivery_attempts: 0,
-            intent: params.intent,
+            intent: applied_intent,
         };
 
         self.queue_message_tiered(id, message, warnings, &blocking_key)
@@ -351,11 +349,9 @@ impl App {
 
         let now = now_ms();
         let sender_key = from_pane.clone().unwrap_or_else(|| "unknown".into());
-        let blocking_key =
-            blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref(), None, None);
-        if let Err(refusal) = self.admit_blocking(&id, params.intent, &blocking_key, now) {
-            return refusal;
-        }
+        let blocking_key = blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref());
+        let (applied_intent, downgrade) =
+            self.apply_blocking_budget(params.intent, &blocking_key, now);
         if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
             return encode_error(
                 id,
@@ -369,6 +365,7 @@ impl App {
             .filter(|explicit| !explicit.trim().is_empty())
             .unwrap_or_else(mint_correlation_id);
         let mut warnings = Vec::new();
+        warnings.extend(downgrade.map(str::to_string));
         if from_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
@@ -384,7 +381,7 @@ impl App {
             in_reply_to: Some(params.correlation_id.clone()),
             enqueued_at_ms: now,
             delivery_attempts: 0,
-            intent: params.intent,
+            intent: applied_intent,
         };
         // Telemetry only records a reply the mailbox actually accepted: a
         // full mailbox or a duplicate must not bump round_trips or leave a
@@ -821,44 +818,38 @@ impl App {
         }
     }
 
-    /// The `blocking` tier's own budget (ADR-0018 §1). Checked before the
-    /// general limiter so a refused escalation does not also spend a
-    /// general slot; the slot itself is spent only once the message is
-    /// queued ([`Self::queue_message_tiered`]).
-    fn admit_blocking(
+    /// The `blocking` tier's own budget (ADR-0018 §1): the intent the message
+    /// is actually queued with, and the warning that says so when it differs.
+    ///
+    /// Spent — or switched off with `blocking_per_hour = 0` — means the message
+    /// DOWNGRADES to `needs_reply` rather than being refused. `blocking` is a
+    /// courtesy tier: what it adds is the operator's attention, and a sender
+    /// over budget has had its share of that. Refusing instead would let
+    /// whoever exhausts a shared budget silence the senders behind it; the
+    /// downgraded message still wakes its recipient, so nobody loses being
+    /// heard. The slot itself is spent only once the message is queued
+    /// ([`Self::queue_message_tiered`]).
+    pub(super) fn apply_blocking_budget(
         &mut self,
-        id: &str,
         intent: crate::api::schema::MsgIntent,
         sender_key: &str,
         now: u64,
-    ) -> Result<(), String> {
-        if intent != crate::api::schema::MsgIntent::Blocking {
-            return Ok(());
+    ) -> (crate::api::schema::MsgIntent, Option<&'static str>) {
+        use crate::api::schema::MsgIntent;
+        if intent != MsgIntent::Blocking {
+            return (intent, None);
         }
         let per_hour = self.state.config.msg.blocking_per_hour;
-        // Zero is a policy, not a spent budget: no wait would ever make it
-        // succeed, so a retry-after would be a lie the sender acts on.
         if per_hour == 0 {
-            return Err(encode_error(
-                id.to_string(),
-                "msg_blocking_disabled",
-                "this node does not accept blocking messages ([msg] blocking_per_hour = 0); \
-                 send as needs_reply",
-            ));
+            return (MsgIntent::NeedsReply, Some(BLOCKING_DISABLED));
         }
-        self.mailboxes
+        match self
+            .mailboxes
             .blocking_retry_after(sender_key, now, per_hour)
-            .map_err(|retry_after_ms| {
-                encode_error_with_data(
-                    id.to_string(),
-                    "msg_blocking_rate_limited",
-                    format!(
-                        "blocking budget spent ({per_hour}/hour, see [msg] blocking_per_hour); \
-                         retry in {retry_after_ms} ms, or send as needs_reply"
-                    ),
-                    serde_json::json!({ "retry_after_ms": retry_after_ms }),
-                )
-            })
+        {
+            Ok(()) => (intent, None),
+            Err(_) => (MsgIntent::NeedsReply, Some(BLOCKING_BUDGET_SPENT)),
+        }
     }
 
     /// [`Self::queue_message`] plus what a tier costs and triggers once the
@@ -2232,35 +2223,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_has_its_own_budget_and_the_refusal_says_when_to_retry() {
+    async fn a_spent_blocking_budget_downgrades_and_still_delivers() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         app.state.config.msg.blocking_per_hour = 2;
         let pane = pane_target(&app, 1);
         for cid in ["c-b1", "c-b2"] {
             let answer = tiered_send(&mut app, &pane, cid, "blocking", "stuck");
-            assert!(answer.get("result").is_some(), "{answer}");
+            assert!(
+                !answer.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+                "{answer}"
+            );
         }
-        let refused = tiered_send(&mut app, &pane, "c-b3", "blocking", "stuck");
-        assert_eq!(
-            refused["error"]["code"], "msg_blocking_rate_limited",
-            "{refused}"
-        );
+        // Over budget: queued, not refused — as `needs_reply`, and it says so.
+        let over = tiered_send(&mut app, &pane, "c-b3", "blocking", "stuck");
+        assert_eq!(over["result"]["state"], "queued", "{over}");
         assert!(
-            refused["error"]["data"]["retry_after_ms"]
-                .as_u64()
-                .is_some_and(|ms| ms > 0),
-            "{refused}"
+            over.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "the sender is told it was downgraded: {over}"
         );
-        // Only the escalation is rationed: the same sender can still ask.
-        let asked = tiered_send(&mut app, &pane, "c-b4", "needs_reply", "stuck");
-        assert!(asked.get("result").is_some(), "{asked}");
+        assert_eq!(
+            app.state.blocking_mail.get(&pane).map(|mail| mail.count),
+            Some(2),
+            "a downgraded message earns no attention entry"
+        );
 
-        // A duplicate is not a second escalation, so it spends nothing.
+        // A duplicate spends nothing.
         app.state.config.msg.blocking_per_hour = 3;
         let duplicate = tiered_send(&mut app, &pane, "c-b1", "blocking", "stuck");
         assert_eq!(duplicate["result"]["state"], "duplicate", "{duplicate}");
         let fresh = tiered_send(&mut app, &pane, "c-b5", "blocking", "stuck");
-        assert!(fresh.get("result").is_some(), "{fresh}");
+        assert!(
+            !fresh.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "{fresh}"
+        );
+
+        let inbox = read_inbox(&mut app, &pane);
+        let tiers: Vec<_> = inbox
+            .iter()
+            .map(|message| (message.correlation_id.as_str(), message.intent))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                ("c-b1", MsgIntent::Blocking),
+                ("c-b2", MsgIntent::Blocking),
+                ("c-b3", MsgIntent::NeedsReply),
+                ("c-b5", MsgIntent::Blocking),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2459,85 +2469,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claimed_id_cannot_mint_budget_or_spend_another_hosts() {
+    async fn claimed_identities_share_one_budget_and_cannot_silence_anyone() {
+        // Every unattested sender shares one bucket: `from_agent` and
+        // `from_host` are claims, so keying on them minted budget per invented
+        // name. Exhausting the shared bucket downgrades; it never refuses.
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         app.state.config.msg.blocking_per_hour = 1;
         let to = pane_target(&app, 1);
-        let blocking = |cid: &str, extra: serde_json::Value| {
-            let mut params = serde_json::json!({"correlation_id": cid, "intent": "blocking"});
-            params
-                .as_object_mut()
-                .expect("object")
-                .extend(extra.as_object().expect("object").clone());
-            params
+        let blocking = |cid: &str, agent: &str| {
+            serde_json::json!({"correlation_id": cid, "intent": "blocking",
+                "from_agent": agent, "from_host": "sage"})
         };
 
-        // No host to scope the claim: rotating ids is one bucket, not many.
-        let first = claimed_send(
-            &mut app,
-            &to,
-            blocking("c-1", serde_json::json!({"from_agent": "agent_a_1"})),
+        // Rotation under a claimed host buys nothing past the first.
+        let first = claimed_send(&mut app, &to, blocking("c-1", "agent_x_1"));
+        assert!(
+            !first.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+            "{first}"
         );
-        assert!(first.get("result").is_some(), "{first}");
-        let rotated = claimed_send(
-            &mut app,
-            &to,
-            blocking("c-2", serde_json::json!({"from_agent": "agent_a_2"})),
-        );
-        assert_eq!(
-            rotated["error"]["code"], "msg_blocking_rate_limited",
-            "{rotated}"
-        );
+        for (cid, agent) in [("c-2", "agent_x_2"), ("c-3", "agent_x_3")] {
+            let rotated = claimed_send(&mut app, &to, blocking(cid, agent));
+            assert!(
+                rotated.to_string().contains(super::BLOCKING_BUDGET_SPENT),
+                "{rotated}"
+            );
+        }
 
-        // A relayed sender is scoped by the host that relayed it: naming the
-        // same agent from another host does not spend the first host's budget.
-        let sage = claimed_send(
-            &mut app,
-            &to,
-            blocking(
-                "c-3",
-                serde_json::json!({"from_agent": "agent_x_1", "from_host": "sage"}),
-            ),
-        );
-        assert!(sage.get("result").is_some(), "{sage}");
-        let anvil = claimed_send(
-            &mut app,
-            &to,
-            blocking(
-                "c-4",
-                serde_json::json!({"from_agent": "agent_x_1", "from_host": "anvil"}),
-            ),
-        );
-        assert!(anvil.get("result").is_some(), "{anvil}");
-        let sage_again = claimed_send(
-            &mut app,
-            &to,
-            blocking(
-                "c-5",
-                serde_json::json!({"from_agent": "agent_x_1", "from_host": "sage"}),
-            ),
-        );
-        assert_eq!(
-            sage_again["error"]["code"], "msg_blocking_rate_limited",
-            "{sage_again}"
-        );
+        // Impersonation: the real agent's message, arriving after someone
+        // spent the bucket in its name, is still delivered and still wakes.
+        let victim = claimed_send(&mut app, &to, blocking("c-real", "agent_sage_1"));
+        assert_eq!(victim["result"]["state"], "queued", "{victim}");
+        assert_eq!(wake(&mut app, &to), (4, None));
+        let inbox = read_inbox(&mut app, &to);
+        assert!(inbox
+            .iter()
+            .any(|message| message.correlation_id == "c-real"
+                && message.intent == MsgIntent::NeedsReply));
     }
 
     #[tokio::test]
-    async fn blocking_switched_off_is_a_policy_refusal_not_a_wait() {
+    async fn blocking_switched_off_delivers_as_needs_reply_and_says_why() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         app.state.config.msg.blocking_per_hour = 0;
         let to = pane_target(&app, 1);
-        let refused = tiered_send(&mut app, &to, "c-off", "blocking", "stuck");
-        assert_eq!(
-            refused["error"]["code"], "msg_blocking_disabled",
-            "{refused}"
-        );
+        let sent = tiered_send(&mut app, &to, "c-off", "blocking", "stuck");
         assert!(
-            refused["error"].get("data").is_none(),
-            "no retry-after to act on: {refused}"
+            sent.to_string().contains(super::BLOCKING_DISABLED),
+            "{sent}"
         );
-        let asked = tiered_send(&mut app, &to, "c-on", "needs_reply", "stuck");
-        assert!(asked.get("result").is_some(), "{asked}");
+        assert!(app.state.blocking_mail.is_empty());
+        assert_eq!(wake(&mut app, &to), (1, None), "still heard");
     }
 }

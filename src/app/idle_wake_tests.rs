@@ -185,6 +185,52 @@ async fn an_fyi_never_costs_a_turn() {
     assert!(drain(&mut pty).is_empty());
 }
 
+/// ADR-0018 §1's reply rule, through the idle wake: the recipient asked a
+/// question, went idle, and the answer comes back stamped `fyi` (a reply's
+/// default). It has to reach the asker, or the question was asked and never
+/// heard; the mute's deferral, also `in_reply_to` the question, must not.
+#[tokio::test]
+async fn an_fyi_answer_to_its_own_question_idle_wakes_the_asker_but_a_deferral_does_not() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let other = {
+        let pane_id = app.state.workspaces[0].focused_pane_id().expect("pane");
+        app.public_pane_id(0, pane_id).expect("public id")
+    };
+    let wire = |app: &mut App, to: &str, cid: &str, in_reply_to: Option<&str>, intent: &str| {
+        app.handle_api_request(
+            serde_json::from_value(serde_json::json!({
+                "id": "req",
+                "method": "msg.send",
+                "params": {
+                    "to": {"type": "pane", "pane": to},
+                    "body": format!("the answer: {MARKER}"),
+                    "correlation_id": cid,
+                    "in_reply_to": in_reply_to,
+                    "intent": intent,
+                },
+            }))
+            .expect("a request a client sends"),
+        )
+    };
+    // The asker's question, read on the other side.
+    wire(&mut app, &other, "c-q", None, "needs_reply");
+    read_inbox(&mut app, &other);
+    claude_idle_for(&mut app, settled());
+
+    wire(&mut app, &pane, "c-q:deferred", Some("c-q"), "fyi");
+    tick_past_gap(&mut app);
+    assert!(drain(&mut pty).is_empty(), "a deferral carries no answer");
+
+    wire(&mut app, &pane, "c-a", Some("c-q"), "fyi");
+    let typed = drain(&mut pty);
+    assert_eq!(typed, vec![super::idle_wake_text(2).into_bytes()]);
+    assert!(!String::from_utf8_lossy(&typed[0]).contains(MARKER));
+}
+
 #[tokio::test]
 async fn the_count_includes_waiting_fyis_but_nothing_else_about_them() {
     let Rig {

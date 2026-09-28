@@ -132,10 +132,11 @@ pub(super) fn table() -> &'static [Tool] {
                           escalates to the operator if the recipient has \
                           muted itself. A reply to your `needs_reply` or \
                           `blocking` message wakes you whatever its own \
-                          stamp. `blocking` is rate-limited per sender \
-                          (a few per hour; `msg_blocking_rate_limited` \
-                          carries `retry_after_ms`), so spend it only when \
-                          you are actually stuck. Intent rides the envelope, \
+                          stamp. `blocking` has a small per-sender budget (a \
+                          few per hour); past it the message is still \
+                          delivered, as `needs_reply`, and the result's \
+                          `warnings` say it was downgraded — so spend it only \
+                          when you are actually stuck. Intent rides the envelope, \
                           so the recipient acts on it before reading the body \
                           — do not bury the request in the last line of a \
                           long message and stamp the whole thing `fyi`. \

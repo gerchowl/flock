@@ -58,15 +58,25 @@ would never nudge it, and the question would be asked and then not heard. The
 one exception is the §3 deferral: it is `in_reply_to` a waking message by
 construction, but it carries no answer, only "later", so it stays non-waking —
 otherwise a mute would reach back into the sender's turn, which is exactly the
-interruption §3's deferral exists to replace.
+interruption §3's deferral exists to replace. The rule reaches as far as the
+server remembers the question — its delivery history and its record of
+questions relayed away, both bounded — so an answer to a question that has aged
+out of both is read at its own stamp.
 
 `blocking` is sender-declared and therefore sender-abusable, so it carries a
 cost: its own per-sender rate limit, tighter than the general one, declared in
-config (`[msg] blocking_per_hour`) rather than compiled in. The budget is keyed
-on the identity the receiving server can stand behind — the sender its own
-process ancestry attested, or, for a relayed message, the relaying host paired
-with the id it claims — never on a caller-chosen id alone, so one sender cannot
-spend another's budget or mint itself a fresh one.
+config (`[msg] blocking_per_hour`) rather than compiled in. A spent budget
+**downgrades** the message to `needs_reply` — it is still delivered and still
+wakes, and the send result says it was downgraded — rather than refusing it:
+`blocking` is a courtesy tier, and what it adds (the operator's attention) is
+exactly what a sender over budget has had its share of. The budget is keyed only
+on what the receiving server itself attested: an agent its process ancestry
+proved, keyed by that agent. Every unattested sender — each relayed message and
+each socket client outside a pane — shares ONE bucket, because on that path both
+the sender id and its host are claims, and keying on a claim lets a caller mint
+a fresh budget per invented name or spend a real agent's by naming it. Sharing
+is safe precisely because exhausting the budget only downgrades: nobody can
+silence anyone by spending it.
 
 Sender identity shown on an operator surface — the attention label, the
 escalation notification — is a validated agent id or a server-minted pane id,
@@ -116,6 +126,10 @@ the mute is set — produces exactly one automatic reply to its sender:
 - `in_reply_to` the message's `correlation_id`;
 - intent `fyi` **by construction**, so two mutually deferring agents cannot
   ping-pong;
+- correlation id `<the message's correlation_id>:deferred`. The suffix is the
+  contract §1's reply rule keys on: it is how a server recognises a deferral —
+  which replies to a waking message by construction — and keeps it from waking
+  the sender, on whichever host it lands;
 - a body stating that the recipient deferred, the reason if one was given, and
   the time the mute lifts — a deadline the sender can act on.
 

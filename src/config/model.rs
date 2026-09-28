@@ -1094,8 +1094,8 @@ pub struct MsgConfig {
     /// `blocking` is sender-declared and therefore sender-abusable — every
     /// agent thinks its message is the urgent one — so it carries its own
     /// budget, far tighter than the general per-minute one, on top of it.
-    /// `0` refuses `blocking` outright (`msg_blocking_disabled`); senders can
-    /// still say `needs_reply`.
+    /// Past it, a `blocking` message is still delivered, as `needs_reply`,
+    /// and the send result says so. `0` downgrades every `blocking` message.
     pub blocking_per_hour: usize,
     /// Wake an idle agent that has mail by typing a fixed sentence into its
     /// pane (ADR-0018 §2). Default: true. The kill switch: false leaves agents

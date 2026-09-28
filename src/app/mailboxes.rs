@@ -51,8 +51,12 @@ pub(crate) struct MailboxRegistry {
     /// oldest first (ADR-0018 §1's reply rule). A question that left the
     /// machine is in neither the queue nor the delivery history here, so
     /// without this its answer, arriving back, could not be told apart from a
-    /// notice. Bounded like `seen`.
-    relayed_questions: VecDeque<String>,
+    /// notice. Bounded like `seen`: an answer to a question older than the
+    /// newest `MAX_SEEN` no longer wakes, exactly as a reply to a delivered
+    /// message that aged out of `history` does not.
+    relayed_questions: HashSet<String>,
+    /// Insertion order of `relayed_questions`, for eviction.
+    relayed_questions_order: VecDeque<String>,
 }
 
 /// What the attention surface may know about a pane's waiting `blocking`
@@ -478,21 +482,29 @@ impl MailboxRegistry {
 
     /// Whether `correlation_id` names a waking message this server has seen:
     /// delivered here, still queued here, or relayed from here to another host.
+    /// Bounded memory, so bounded reach: a question that has aged out of both
+    /// `history` and `relayed_questions` is forgotten, and an answer to it
+    /// arriving later is read at its own stamp.
     fn asked_a_question(&self, correlation_id: &str) -> bool {
         self.history
             .get(correlation_id)
             .map(|meta| meta.intent)
             .or_else(|| self.queued_message(correlation_id).map(|m| m.intent))
             .is_some_and(MsgIntent::wakes)
-            || self.relayed_questions.iter().any(|id| id == correlation_id)
+            || self.relayed_questions.contains(correlation_id)
     }
 
     /// Remember a waking message that left for another host, so its answer
     /// wakes the sender when it comes back.
     pub(crate) fn record_relayed_question(&mut self, correlation_id: String) {
-        self.relayed_questions.push_back(correlation_id);
-        while self.relayed_questions.len() > MAX_SEEN {
-            self.relayed_questions.pop_front();
+        if !self.relayed_questions.insert(correlation_id.clone()) {
+            return;
+        }
+        self.relayed_questions_order.push_back(correlation_id);
+        while self.relayed_questions_order.len() > MAX_SEEN {
+            if let Some(oldest) = self.relayed_questions_order.pop_front() {
+                self.relayed_questions.remove(&oldest);
+            }
         }
     }
 
