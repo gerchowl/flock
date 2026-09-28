@@ -1770,7 +1770,7 @@ mod tests {
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
-        let dead_agent = "ssh agent unreachable (SSH_AUTH_SOCK agent.sock refuses connections): \
+        let dead_agent = "ssh agent unreachable (SSH_AUTH_SOCK refuses connections): \
                           Permission denied (publickey)."
             .to_string();
         let fail = |app: &mut App| {
@@ -1829,9 +1829,15 @@ mod tests {
         let dial = row.dial.expect("a persisted failure is reported");
         assert_eq!(dial.reason.as_deref(), Some("agent_unreachable"));
         assert_eq!(dial.consecutive_failures, 2);
+        assert_eq!(
+            dial.stream_reason.as_deref(),
+            Some("agent_unreachable"),
+            "no relay stream is said out loud, as a token"
+        );
+        let wire = serde_json::to_string(&dial).expect("serialize");
         assert!(
-            dial.stream_error.is_some(),
-            "no relay stream is said out loud"
+            !wire.contains("Permission denied"),
+            "ssh's free text must not leave the machine: {wire}"
         );
 
         let recovered = crate::logging::capture_logs(|| {

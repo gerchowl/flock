@@ -222,6 +222,11 @@ enum EntryKind {
 
 /// Whether `path` is a `kind` owned by `uid`, judged without following a
 /// symlink — a link planted in a shared directory must not redirect the scan.
+///
+/// A session DIRECTORY must also be private (no group or other permission
+/// bits, as launchd creates it: 0700). Ownership alone is not enough: in a
+/// directory others can write to, someone else could swap the socket out from
+/// under the check.
 #[cfg(unix)]
 fn owned_by(path: &Path, uid: u32, kind: EntryKind) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -229,11 +234,16 @@ fn owned_by(path: &Path, uid: u32, kind: EntryKind) -> bool {
         return false;
     };
     let kind_ok = match kind {
-        EntryKind::Dir => meta.file_type().is_dir(),
+        EntryKind::Dir => meta.file_type().is_dir() && meta.mode() & PRIVATE_DIR_FORBIDDEN == 0,
         EntryKind::Socket => meta.file_type().is_socket(),
     };
     kind_ok && meta.uid() == uid
 }
+
+/// Permission bits a launchd session directory must not have: any group or
+/// other access.
+#[cfg(unix)]
+const PRIVATE_DIR_FORBIDDEN: u32 = 0o077;
 
 #[cfg(not(unix))]
 fn owned_by(_path: &Path, _uid: u32, _kind: EntryKind) -> bool {
@@ -261,9 +271,12 @@ mod tests {
         drop(UnixListener::bind(path).expect("bind dead socket"));
     }
 
+    /// A session dir shaped like launchd's: private to the user (0700).
     fn session_dir(root: &Path, id: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let dir = root.join(format!("{LAUNCHD_SESSION_PREFIX}{id}"));
         std::fs::create_dir_all(&dir).expect("session dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         dir.join("Listeners")
     }
 
@@ -358,6 +371,26 @@ mod tests {
 
         let resolver = AgentResolver::new(None, vec![root.clone()], uid());
         assert_eq!(resolver.resolve(), AgentSocket::Unset);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #418 review: a session dir others can write to is not trusted, even
+    /// when this user owns it and the socket in it answers.
+    #[test]
+    fn a_session_dir_open_to_others_is_never_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture_root("mode");
+        let current = session_dir(&root, "s");
+        let _listener = UnixListener::bind(&current).expect("bind");
+        let dir = current.parent().expect("session dir").to_path_buf();
+        for mode in [0o770, 0o707, 0o755] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let resolver = AgentResolver::new(None, vec![root.clone()], uid());
+            assert_eq!(resolver.resolve(), AgentSocket::Unset, "mode {mode:o}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let resolver = AgentResolver::new(None, vec![root.clone()], uid());
+        assert_eq!(resolver.resolve(), AgentSocket::Live(current));
         let _ = std::fs::remove_dir_all(&root);
     }
 

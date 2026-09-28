@@ -354,7 +354,10 @@ impl PeerSummaryState {
                 .failing_since
                 .is_some()
                 .then(|| self.dial.failing_secs(now)),
-            stream_error: self.stream_error.clone(),
+            stream_reason: self
+                .stream_error
+                .as_deref()
+                .map(|detail| SshFailureReason::classify(detail).as_str().to_string()),
         })
     }
 
@@ -1350,6 +1353,11 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
 /// already rejected ControlMaster for. flock's fast path is its own held
 /// stream; the one-shot fallback is the rare path and can afford an honest
 /// handshake.
+///
+/// Scope: these reach only the ssh flock starts. A `ProxyJump` in the
+/// operator's ssh config runs its own child ssh for the jump hop, which reads
+/// the config afresh and does NOT inherit `ControlMaster=no` — that hop can
+/// still ride a mux.
 pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 12] = [
     "-o",
     "BatchMode=yes",
@@ -1393,10 +1401,11 @@ pub(crate) fn attribute_dial_failure(
         crate::platform::ssh_agent::AgentSocket::Dead(path)
             if SshFailureReason::classify(&detail) == SshFailureReason::AuthRefused =>
         {
-            format!(
-                "ssh agent unreachable (SSH_AUTH_SOCK {} refuses connections): {detail}",
-                path.display()
-            )
+            // The path is NOT in this text: `error` is relayed to other hosts,
+            // and this machine's socket path is none of their business. It is
+            // logged locally, once, as `ssh.agent.unreachable`.
+            let _ = path;
+            format!("ssh agent unreachable (SSH_AUTH_SOCK refuses connections): {detail}")
         }
         _ => detail,
     }
@@ -1861,7 +1870,10 @@ mod tests {
             blamed.contains("Permission denied"),
             "ssh's words kept: {blamed}"
         );
-        assert!(blamed.contains(&socket.display().to_string()), "{blamed}");
+        assert!(
+            !blamed.contains(&socket.display().to_string()),
+            "the local socket path must not ride the relayed error: {blamed}"
+        );
 
         let refused = "ssh: connect to host sage port 22: Connection refused".to_string();
         assert_eq!(

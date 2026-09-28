@@ -236,9 +236,20 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
     }
     let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
     for row in &rows {
-        println!("{:width$}  {}", row.name, peer_status_line(row));
+        println!("{:width$}  {}", printable(&row.name), peer_status_line(row));
     }
     Ok(0)
+}
+
+/// Text from another host made safe for this terminal: control sequences
+/// stripped, line breaks flattened. `error` is ssh's last stderr line, and a
+/// far side's shell rc can print anything there — an escape sequence in it
+/// would otherwise be executed by the operator's terminal.
+fn printable(text: &str) -> String {
+    crate::control_bytes::strip(text)
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect()
 }
 
 /// The status column for one peer. Pure, so the wording is testable without
@@ -247,7 +258,7 @@ fn peer_status_line(row: &crate::api::schema::RelayedFleetPeer) -> String {
     let dial = row.dial.as_ref();
     let mut line = match (dial.and_then(|dial| dial.reason.as_deref()), &row.error) {
         (Some(reason), error) => {
-            let mut down = format!("down  {reason}");
+            let mut down = format!("down  {}", printable(reason));
             if let Some(dial) = dial {
                 down.push_str(&format!(" ({} polls", dial.consecutive_failures));
                 if let Some(secs) = dial.failing_secs {
@@ -256,20 +267,20 @@ fn peer_status_line(row: &crate::api::schema::RelayedFleetPeer) -> String {
                 down.push(')');
             }
             if let Some(error) = error {
-                down.push_str(&format!(": {error}"));
+                down.push_str(&format!(": {}", printable(error)));
             }
             down
         }
         // Failed once: a blip until it persists past one poll, so no reason
         // is claimed for it yet.
-        (None, Some(error)) => format!("retry {error}"),
+        (None, Some(error)) => format!("retry {}", printable(error)),
         (None, None) => match row.latency_ms {
             Some(ms) => format!("ok    {ms}ms"),
             None => "ok".to_string(),
         },
     };
-    if let Some(stream) = dial.and_then(|dial| dial.stream_error.as_deref()) {
-        line.push_str(&format!("  [no relay stream: {stream}]"));
+    if let Some(stream) = dial.and_then(|dial| dial.stream_reason.as_deref()) {
+        line.push_str(&format!("  [no relay stream: {}]", printable(stream)));
     }
     line
 }
@@ -823,6 +834,40 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    /// #418 review: `error` is ssh's last stderr line from another host, and
+    /// a shell rc on the far side can print escape sequences into it. The
+    /// status view must never hand them to the operator's terminal.
+    #[test]
+    fn peer_status_strips_control_sequences_from_remote_text() {
+        let row = crate::api::schema::RelayedFleetPeer {
+            dial: Some(crate::api::schema::PeerDialReport {
+                reason: Some("auth_refused".into()),
+                consecutive_failures: 3,
+                failing_secs: Some(45),
+                stream_reason: Some("auth\u{1b}]52;c;cHduZWQ=\u{7}_refused".into()),
+            }),
+            name: "sage".into(),
+            ssh_target: "sage".into(),
+            host: None,
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: None,
+            error: Some("\u{1b}[2J\u{1b}[31mPermission denied\r\nmore".into()),
+            origin: "hub".into(),
+            origin_last_ok_secs: None,
+            proxy_jump: None,
+            icon: None,
+        };
+        let line = super::peer_status_line(&row);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("down  auth_refused (3 polls, 45s)"), "{line}");
+        assert!(line.contains("Permission denied more"), "{line}");
+        assert!(line.contains("[no relay stream: auth_refused]"), "{line}");
+    }
 
     /// #4, the whole bug in one assertion. A burst that ENDS inside the
     /// debounce window must still ship its final state.

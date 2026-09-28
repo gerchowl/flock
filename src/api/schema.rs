@@ -3322,6 +3322,9 @@ pub struct RelayedFleetPeer {
 
 /// The dial half of a peer's health, as the polling server sees it (#418).
 ///
+/// Every field is a classification or a count, never free text: this crosses
+/// machines (see `stream_reason`).
+///
 /// Separate from `error` (the last poll's own words) because an operator's
 /// question is different: not "what did the last poll say" but "which kind of
 /// broken has this edge been, for how long" — and whether the push path is
@@ -3339,11 +3342,17 @@ pub struct PeerDialReport {
     /// Seconds since the current run of failures began.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_secs: Option<u64>,
-    /// Why establishing a held relay stream last failed, when no stream is
-    /// held for that reason. Independent of `reason`: polls can succeed over
-    /// the one-shot fallback while this is set.
+    /// Classification token for why establishing a held relay stream last
+    /// failed, when no stream is held for that reason. Independent of
+    /// `reason`: polls can succeed over the one-shot fallback while this is
+    /// set.
+    ///
+    /// A token, never ssh's words: this block is served by `peers.summary`
+    /// and pushed to every spoke, and stderr carries host names, local paths
+    /// and whatever the far side's shell printed (#300). The full text stays
+    /// in this machine's session log (`peer.stream.unavailable`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_error: Option<String>,
+    pub stream_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
