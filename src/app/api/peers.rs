@@ -131,7 +131,15 @@ impl App {
         if let Some(refusal) = self.refuse_unless_relay(&id, "peers.hub_fleet") {
             return refusal;
         }
-        let hub = self.uplink.record_hub(&params.hub).unwrap_or(params.hub);
+        // The name recorded for this relay binding; the frame's own claim only
+        // ever seeds it, on the binding's first frame. No wire fallback.
+        let Some(hub) = self.uplink.record_hub(&params.hub) else {
+            return super::responses::encode_error(
+                id,
+                "not_the_relay",
+                "peers.hub_fleet arrived with no relay bound",
+            );
+        };
         crate::peers::merge_hub_pushed_fleet(
             &mut self.state.relayed_fleet_cache,
             params.fleet,
@@ -586,7 +594,16 @@ impl App {
             .map(crate::peers::peer_to_wire)
             .map(stamp_proxy_jump)
             .collect();
-        let mut relayed: Vec<_> = self.state.relayed_fleet_cache.iter().collect();
+        // #410: never a row a hub pushed down. It is another server's view that
+        // THIS node never verified, and display-only here — but a snapshot row
+        // is dialled on the next server, on a click and by warm slots with no
+        // click at all, so carrying it on would undo display-only one hop later.
+        let mut relayed: Vec<_> = self
+            .state
+            .relayed_fleet_cache
+            .iter()
+            .filter(|(_, entry)| !entry.hub_pushed)
+            .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         ours.extend(
             relayed
@@ -1090,10 +1107,14 @@ mod tests {
         // it knowing nothing past itself. The hub's push is merged through the
         // same validated, freshest-wins path a poller uses.
         let mut app = test_app();
-        // Only the relay bound to this server's uplink may push (#416 review).
-        const RELAY_PID: u32 = u32::MAX - 7;
-        app.uplink.attach_relay(RELAY_PID, |_| true).expect("bound");
-        app.current_api_peer_pid = Some(RELAY_PID);
+        // Only the relay bound to this server's uplink may push (#416 review),
+        // this live test process stands in for it.
+        let relay = std::process::id();
+        let started = crate::platform::process_start_time(relay).expect("own start time");
+        app.uplink
+            .attach_relay(relay, started, crate::platform::process_start_time)
+            .expect("bound");
+        app.current_api_peer_pid = Some(relay);
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "down".into(),
             method: crate::api::schema::Method::PeersHubFleet(
@@ -1140,6 +1161,33 @@ mod tests {
             })
             .is_none(),
             "a hub-pushed row is never switched to"
+        );
+        // Nor carried on: the snapshot the next attach leg takes — which that
+        // server dials on a click and warms with no click — leaves it out.
+        let snapshot = app.outgoing_fleet_snapshot("lars@elsewhere");
+        assert!(
+            snapshot
+                .peers
+                .iter()
+                .all(|peer| peer.ssh_target != "lars@ksb" && peer.name != "ksb"),
+            "a hub-pushed row never crosses a leap: {:?}",
+            snapshot
+                .peers
+                .iter()
+                .map(|peer| &peer.name)
+                .collect::<Vec<_>>()
+        );
+        // So the next server's warm slots — which dial with no click — never
+        // see it: fed exactly the way the client feeds them.
+        let carried: Vec<String> = snapshot
+            .peers
+            .iter()
+            .map(|peer| peer.ssh_target.clone())
+            .collect();
+        let warmed = crate::client::slots::warm_all_targets(&[], &carried, 8);
+        assert!(
+            !format!("{warmed:?}").contains("lars@ksb"),
+            "never warm-dialled downstream: {warmed:?}"
         );
 
         // Honest freshness: once the hub stops pushing, the row goes stale on

@@ -526,6 +526,7 @@ fn attach_relay(socket: &std::path::Path) -> bool {
         "method": "peers.relay_attach",
         "params": {},
     });
+    let mut blocked_attempts: u64 = 0;
     loop {
         let Ok(line) = relay_local_request(socket, &request) else {
             std::thread::sleep(UPLINK_RETRY);
@@ -539,6 +540,14 @@ fn attach_relay(socket: &std::path::Path) -> bool {
             return true;
         };
         if error.get("code").and_then(|code| code.as_str()) == Some("relay_already_attached") {
+            // Never silently: another process holding the binding for long is
+            // either the hub's previous connection failing to die or a
+            // squatter, and either wants an operator's eyes. Logged on
+            // attempts 1, 2, 4, 8, … so a long hold stays a few lines.
+            blocked_attempts += 1;
+            if blocked_attempts.is_power_of_two() {
+                crate::logging::relay_attach_blocked(&error.to_string(), blocked_attempts);
+            }
             std::thread::sleep(UPLINK_RETRY);
             continue;
         }

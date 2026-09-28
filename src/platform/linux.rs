@@ -118,6 +118,16 @@ pub fn process_name(pid: u32) -> Option<String> {
     process_stat(pid).map(|(comm, _, _)| comm)
 }
 
+/// When the process started, in clock ticks since boot (`/proc/<pid>/stat`
+/// field 22). Together with the pid it names ONE process: a reused pid has a
+/// later start time.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    // Fields after `comm` start at field 3 (state), so field 22 is index 19.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// The parent process id, or `None` once the process is gone.
 pub fn process_parent_id(pid: u32) -> Option<u32> {
     let (_, ppid, _) = process_stat(pid)?;

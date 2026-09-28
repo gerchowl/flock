@@ -145,6 +145,10 @@ pub(crate) struct Uplink {
 #[derive(Debug, Clone)]
 struct AttachedRelay {
     pid: u32,
+    /// The process's start time. A pid alone names a slot the OS reuses; the
+    /// pair names one process, so a new process that inherits a dead relay's
+    /// pid is not the relay.
+    started: u64,
     /// The hub's name, recorded once from the first frame this relay carried
     /// and then fixed for the attachment: a later frame cannot rename it.
     hub: Option<String>,
@@ -164,27 +168,48 @@ impl Uplink {
             .is_some_and(|at| now.saturating_duration_since(at) <= heartbeat)
     }
 
-    /// Bind the uplink to relay process `pid`. Refused while a DIFFERENT
-    /// relay that is still alive holds it — a live relay is never displaced,
-    /// so taking over the uplink means outliving the real one first.
+    /// Bind the uplink to the relay process `(pid, started)`. Refused while a
+    /// DIFFERENT relay that is still alive holds it — a live relay is never
+    /// displaced, so taking over the uplink means outliving the real one
+    /// first. `start_of` reads a pid's start time now; a bound relay whose
+    /// pid no longer reports its recorded start time is dead, whatever
+    /// process holds the pid today.
     pub(crate) fn attach_relay(
         &mut self,
         pid: u32,
-        alive: impl Fn(u32) -> bool,
+        started: u64,
+        start_of: impl Fn(u32) -> Option<u64>,
     ) -> Result<(), u32> {
         match &self.relay {
-            Some(current) if current.pid == pid => Ok(()),
-            Some(current) if alive(current.pid) => Err(current.pid),
+            Some(current) if current.pid == pid && current.started == started => Ok(()),
+            Some(current) if start_of(current.pid) == Some(current.started) => Err(current.pid),
             _ => {
-                self.relay = Some(AttachedRelay { pid, hub: None });
+                self.relay = Some(AttachedRelay {
+                    pid,
+                    started,
+                    hub: None,
+                });
                 Ok(())
             }
         }
     }
 
-    /// Whether `pid` is the attached relay.
-    pub(crate) fn is_relay(&self, pid: Option<u32>) -> bool {
-        matches!((&self.relay, pid), (Some(relay), Some(pid)) if relay.pid == pid)
+    /// Whether `pid` is the attached relay, re-validated now: the bound relay
+    /// must still be the same process. One that has died is unbound on the
+    /// spot, so its successor can attach and a pid reuser inherits nothing.
+    pub(crate) fn is_relay(
+        &mut self,
+        pid: Option<u32>,
+        start_of: impl Fn(u32) -> Option<u64>,
+    ) -> bool {
+        let Some(relay) = &self.relay else {
+            return false;
+        };
+        if start_of(relay.pid) != Some(relay.started) {
+            self.relay = None;
+            return false;
+        }
+        pid == Some(relay.pid)
     }
 
     /// The hub's name for this attachment: the first `claimed` wins, and every
@@ -399,16 +424,17 @@ mod tests {
 
     #[test]
     fn a_live_relay_is_never_displaced_and_the_hub_name_is_fixed() {
+        let alive = |pid: u32| (pid == 100).then_some(7);
         let mut uplink = Uplink::default();
-        assert!(uplink.attach_relay(100, |_| true).is_ok());
+        assert!(uplink.attach_relay(100, 7, alive).is_ok());
         assert_eq!(
-            uplink.attach_relay(200, |_| true),
+            uplink.attach_relay(200, 9, alive),
             Err(100),
             "a second process cannot take the uplink from a live relay"
         );
-        assert!(uplink.is_relay(Some(100)));
-        assert!(!uplink.is_relay(Some(200)));
-        assert!(!uplink.is_relay(None), "an unreadable pid is nobody");
+        assert!(uplink.is_relay(Some(100), alive));
+        assert!(!uplink.is_relay(Some(200), alive));
+        assert!(!uplink.is_relay(None, alive), "an unreadable pid is nobody");
 
         assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
         assert_eq!(
@@ -419,9 +445,27 @@ mod tests {
 
         // The real relay died (the hub reconnected): its successor attaches,
         // and names its hub afresh.
-        assert!(uplink.attach_relay(300, |pid| pid != 100).is_ok());
-        assert!(uplink.is_relay(Some(300)));
+        let dead = |_: u32| None;
+        assert!(uplink.attach_relay(300, 11, dead).is_ok());
+        assert!(uplink.is_relay(Some(300), |pid| (pid == 300).then_some(11)));
         assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
+    }
+
+    #[test]
+    fn a_process_that_reuses_a_dead_relays_pid_is_not_the_relay() {
+        // Re-review of #416: bound by pid alone, whatever process the OS hands
+        // the dead relay's pid to next would BE the relay.
+        let mut uplink = Uplink::default();
+        assert!(uplink.attach_relay(100, 7, |_| Some(7)).is_ok());
+        let reused = |pid: u32| (pid == 100).then_some(99);
+        assert!(
+            !uplink.is_relay(Some(100), reused),
+            "same pid, later start time: a different process"
+        );
+        assert!(
+            uplink.attach_relay(400, 12, reused).is_ok(),
+            "and the dead relay's binding is gone, so its successor attaches"
+        );
     }
 
     #[test]

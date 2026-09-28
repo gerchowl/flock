@@ -349,6 +349,12 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
         cmd.env("SHELL", "/bin/sh");
         cmd.env_remove("FLOCK_ENV");
         cmd.env("FLOCK_DISABLE_SOUND", "1");
+        // A spoke binds only a relay descended from sshd (#410). Here the fake
+        // ssh runs the relay as a descendant of the POLLING node's own `flk`
+        // server instead, and macOS will not run a copied system shell under
+        // another name, so the harness names that ancestor. Honoured by debug
+        // builds only; a release build always requires sshd.
+        cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
         let outer_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{outer_path}", shim_dir.display()));
 

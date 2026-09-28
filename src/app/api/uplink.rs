@@ -32,6 +32,45 @@ fn now_ms() -> u64 {
 /// keyed from the OS's randomness keeps it unpredictable, so a stray process
 /// cannot forge a `msg.uplink_result` for a send it never saw even if the
 /// relay binding were ever bypassed.
+/// How far up the process tree to look for sshd. The real chain is sshd →
+/// (sshd-session) → login shell → `sh -lc` → flk; the bound is generous, and
+/// finite so a cycle in a racing process table cannot hang the check.
+const SSHD_ANCESTRY_DEPTH: usize = 16;
+
+/// The ancestor a relay must descend from: `sshd` (which also matches macOS's
+/// `sshd-session` and Linux's `sshd:` privsep child).
+///
+/// Debug builds let the multi-node test harness name a different one: its
+/// fake ssh runs the relay under the polling node's own server, and macOS
+/// refuses to run a copied system shell renamed to stand in for sshd. A
+/// release build never reads the variable.
+fn relay_ancestor() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(name) = std::env::var("FLOCK_TEST_RELAY_ANCESTOR") {
+        return name;
+    }
+    "sshd".to_string()
+}
+
+/// Whether `pid` was started by an ssh session: some ancestor is sshd.
+fn descends_from_sshd(pid: u32) -> bool {
+    let ancestor = relay_ancestor();
+    let mut current = pid;
+    for _ in 0..SSHD_ANCESTRY_DEPTH {
+        let Some(parent) = crate::platform::process_parent_id(current) else {
+            return false;
+        };
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        if crate::platform::process_name(parent).is_some_and(|name| name.starts_with(&ancestor)) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn mint_uplink_id(correlation_id: &str) -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,9 +258,15 @@ impl App {
     /// The relay methods ride the local socket, which every same-user process
     /// can reach. Without a binding, a stray process could take a spoke's
     /// pending messages, forge the hub's answers, or plant fleet rows. The
-    /// binding is the caller's socket peer pid, refused when it cannot be
-    /// read, refused from inside a pane, and never displacing a relay that is
-    /// still alive.
+    /// binding is the caller's socket peer pid AND that process's start time
+    /// (so a reused pid is not the relay), refused when either cannot be read,
+    /// refused from inside a pane, refused unless the caller descends from
+    /// sshd — the real relay is started by the hub's ssh session — and never
+    /// displacing a relay that is still alive.
+    ///
+    /// Same-user is still the boundary: `ssh localhost flk peers relay` has
+    /// sshd for a parent too. What this closes is the casual squatter — a
+    /// detached shell, a launchd job, a script — and the pane agent.
     pub(super) fn handle_peers_relay_attach(&mut self, id: String) -> String {
         let Some(pid) = self.current_api_peer_pid else {
             return encode_error(
@@ -237,9 +282,23 @@ impl App {
                 "a relay is started by the hub's ssh session, never from inside a pane",
             );
         }
+        let Some(started) = crate::platform::process_start_time(pid) else {
+            return encode_error(
+                id,
+                "relay_unattestable",
+                "the caller's start time could not be read, so it cannot be told from a pid reuser",
+            );
+        };
+        if !descends_from_sshd(pid) {
+            return encode_error(
+                id,
+                "relay_not_from_ssh",
+                "a relay is started by the hub's ssh session; this caller has no sshd ancestor",
+            );
+        }
         match self
             .uplink
-            .attach_relay(pid, crate::platform::process_exists)
+            .attach_relay(pid, started, crate::platform::process_start_time)
         {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
             Err(holder) => encode_error(
@@ -251,8 +310,12 @@ impl App {
     }
 
     /// The refusal for a relay-only method called by anyone but the relay.
-    pub(super) fn refuse_unless_relay(&self, id: &str, method: &str) -> Option<String> {
-        (!self.uplink.is_relay(self.current_api_peer_pid)).then(|| {
+    pub(super) fn refuse_unless_relay(&mut self, id: &str, method: &str) -> Option<String> {
+        let caller = self.current_api_peer_pid;
+        (!self
+            .uplink
+            .is_relay(caller, crate::platform::process_start_time))
+        .then(|| {
             encode_error(
                 id.to_string(),
                 "not_the_relay",
@@ -592,22 +655,31 @@ mod tests {
         rx
     }
 
-    /// A pid no process has, standing in for the hub's relay. Bound directly,
-    /// since `peers.relay_attach` would check that it is alive.
-    const RELAY_PID: u32 = u32::MAX - 7;
+    /// This test process stands in for the hub's relay: it is alive and has a
+    /// real start time, which the binding re-checks on every call. Bound
+    /// directly, since `peers.relay_attach` also wants an sshd ancestor.
+    fn relay_pid() -> u32 {
+        std::process::id()
+    }
+
+    fn bind_relay(app: &mut crate::app::App) {
+        let pid = relay_pid();
+        let started = crate::platform::process_start_time(pid).expect("own start time");
+        app.uplink
+            .attach_relay(pid, started, crate::platform::process_start_time)
+            .expect("no relay bound yet");
+    }
 
     /// Run a request as the bound relay would: from the relay's pid.
     fn as_relay(app: &mut crate::app::App, request: Request) -> String {
-        app.current_api_peer_pid = Some(RELAY_PID);
+        app.current_api_peer_pid = Some(relay_pid());
         let response = app.handle_api_request(request);
         app.current_api_peer_pid = None;
         response
     }
 
     fn attach_relay(app: &mut crate::app::App) -> std::sync::mpsc::Receiver<String> {
-        app.uplink
-            .attach_relay(RELAY_PID, |_| true)
-            .expect("no relay bound yet");
+        bind_relay(app);
         let (tx, rx) = std::sync::mpsc::channel();
         let response = as_relay(
             app,
@@ -942,7 +1014,7 @@ mod tests {
         let _sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
         let uplink_id = app.uplink.complete_peek_for_test().expect("waiting");
 
-        app.current_api_peer_pid = Some(RELAY_PID - 1);
+        app.current_api_peer_pid = Some(relay_pid().wrapping_add(1_000_000));
         for method in [
             Method::MsgUplinkTake(MsgUplinkTakeParams::default()),
             Method::MsgUplinkResult(MsgUplinkResultParams {
@@ -968,18 +1040,19 @@ mod tests {
             "the frame is still waiting for the REAL relay"
         );
 
-        // A live relay cannot be displaced by a second attach.
-        app.current_api_peer_pid = Some(std::process::id());
+        // A second attach from a process with no sshd ancestor — this test's
+        // parent, say — is refused, and cannot displace the live relay.
+        let parent = crate::platform::process_parent_id(relay_pid()).expect("a parent");
+        app.current_api_peer_pid = Some(parent);
         let displaced = value(&app.handle_api_request(Request {
             id: "attach".into(),
             method: Method::PeersRelayAttach(crate::api::schema::EmptyParams {}),
         }));
         app.current_api_peer_pid = None;
-        assert!(
-            displaced["error"]["code"] == "relay_already_attached"
-                || displaced["result"].is_object(),
-            "{displaced}"
-        );
+        assert!(displaced["error"].is_object(), "{displaced}");
+        assert!(app
+            .uplink
+            .is_relay(Some(relay_pid()), crate::platform::process_start_time));
     }
 
     #[test]

@@ -49,6 +49,11 @@ pub fn all_process_ids() -> Vec<u32> {
 pub fn signal_processes(_pids: &[u32], _signal: Signal) {}
 
 /// Unsupported platform stub.
+pub fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn process_exists(_pid: u32) -> bool {
     false
 }
