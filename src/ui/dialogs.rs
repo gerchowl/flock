@@ -1311,14 +1311,12 @@ fn render_open_worktree_search(
 
 fn confirm_close_overlay_text(app: &AppState) -> (String, String) {
     let target = app.confirm_close_target_idx();
-    let ws_name = app
-        .workspaces
-        .get(target)
+    let ws_name = target
+        .and_then(|idx| app.workspaces.get(idx))
         .map(|ws| ws.display_name())
         .unwrap_or_else(|| "?".to_string());
-    let selected_space = app
-        .workspaces
-        .get(target)
+    let selected_space = target
+        .and_then(|idx| app.workspaces.get(idx))
         .and_then(|ws| ws.worktree_space_here());
     // The whole-space close (#62) is an explicit affordance now, signalled by
     // the flag — NOT inferred from the selection being a non-linked parent.
@@ -1348,8 +1346,8 @@ fn confirm_close_overlay_text(app: &AppState) -> (String, String) {
             .map(|ws| ws.layout.pane_count())
             .sum()
     } else {
-        app.workspaces
-            .get(target)
+        target
+            .and_then(|idx| app.workspaces.get(idx))
             .map(|ws| ws.layout.pane_count())
             .unwrap_or(0)
     };

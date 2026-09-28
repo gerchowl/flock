@@ -642,7 +642,11 @@ pub(super) fn open_confirm_close_space(state: &mut AppState, ws_idx: usize) {
 }
 
 pub(super) fn confirm_close_accept(state: &mut AppState) {
-    let target = state.confirm_close_target_idx();
+    let Some(target) = state.confirm_close_target_idx() else {
+        // The workspace it asked about is already gone (#419).
+        confirm_close_cancel(state);
+        return;
+    };
     state.confirm_close_target = None;
     if std::mem::take(&mut state.confirm_close_whole_space) {
         state.close_space_of(target);
@@ -1316,6 +1320,22 @@ mod tests {
     }
 
     #[test]
+    fn confirm_close_accept_after_its_target_vanished_closes_nothing() {
+        // #419: the target is gone (removed behind the dialog's back); accept
+        // must not fall back to the row under the cursor.
+        let mut state = state_with_workspaces(&["a", "b", "c"]);
+        open_confirm_close(&mut state, 1);
+        state.workspaces.remove(1);
+        state.selected = 1;
+
+        confirm_close_accept(&mut state);
+
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Navigate);
+        assert_eq!(state.confirm_close_target, None);
+    }
+
+    #[test]
     fn confirm_close_keyboard_actions_are_direct_not_focused() {
         let mut state = state_with_workspaces(&["a", "b"]);
         state.mode = Mode::ConfirmClose;
@@ -1395,7 +1415,7 @@ mod tests {
 
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
 
-        assert_eq!(state.confirm_close_target_idx(), 0);
+        assert_eq!(state.confirm_close_target_idx(), Some(0));
         assert_eq!(state.mode, Mode::ConfirmClose);
 
         confirm_close_accept(&mut state);

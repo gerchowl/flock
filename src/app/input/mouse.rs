@@ -3322,7 +3322,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.confirm_close_target_idx(), 1);
+        assert_eq!(app.state.confirm_close_target_idx(), Some(1));
 
         let popup = app.state.confirm_close_rect();
         let inner = Rect::new(

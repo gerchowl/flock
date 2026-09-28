@@ -4315,27 +4315,9 @@ sidebar_pane_gap = 99
         serde_json::from_str(&response).unwrap()
     }
 
-    /// Workspaces `w0..wN`, each in the linked-worktree space its `keys` entry
-    /// names (empty = none).
     fn app_with_spaces_419(keys: &[&str]) -> App {
         let mut app = test_app();
-        app.state.workspaces = keys
-            .iter()
-            .enumerate()
-            .map(|(idx, key)| {
-                let mut ws = Workspace::test_new(&format!("w{idx}"));
-                if !key.is_empty() {
-                    ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
-                        key: (*key).into(),
-                        label: (*key).into(),
-                        repo_root: format!("/repo/{key}").into(),
-                        checkout_path: format!("/repo/{key}-{idx}").into(),
-                        is_linked_worktree: true,
-                    });
-                }
-                ws
-            })
-            .collect();
+        app.state.workspaces = Workspace::test_in_spaces(keys);
         app.state.ensure_test_terminals();
         app
     }
@@ -4362,6 +4344,44 @@ sidebar_pane_gap = 99
         assert_eq!(response["result"]["type"], "ok");
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(focus_names(&app), ("w2".to_string(), "w1".to_string()));
+    }
+
+    #[test]
+    fn pane_close_request_taking_the_confirm_dialogs_target_drops_the_dialog() {
+        // #419: the operator's confirm asks about `w1`; an agent closes `w1`
+        // first. Accepting must not close `w2`, the row under the cursor.
+        let mut app = app_with_spaces_419(&["", "", ""]);
+        app.state.active = Some(0);
+        app.state.selected = 2;
+        app.state.confirm_close_target = Some(app.state.workspaces[1].id.clone());
+        app.state.mode = Mode::ConfirmClose;
+
+        let target_id = app.state.workspaces[1].id.clone();
+
+        pane_close_request(&mut app, 1);
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.state.confirm_close_target, None);
+
+        // Even a dialog that survived with the stale target accepts as a no-op.
+        app.state.confirm_close_target = Some(target_id);
+        app.state.mode = Mode::ConfirmClose;
+        input::handle_confirm_close_key(
+            &mut app.state,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::empty(),
+            ),
+        );
+        assert_eq!(app.state.mode, Mode::Navigate);
+        let names = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.display_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["w0", "w2"]);
+        assert_eq!(focus_names(&app), ("w0".to_string(), "w2".to_string()));
     }
 
     #[test]
