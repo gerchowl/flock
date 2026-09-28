@@ -151,7 +151,15 @@ impl App {
             take.answer(response);
         }
         let secs = self.uplink_timeout().as_secs();
-        for (send, taken) in expired.sends {
+        for (mut send, taken) in expired.sends {
+            if let Some(relay) = send.deferral.take() {
+                self.settle_hub_deferral(
+                    *relay,
+                    None,
+                    Err(format!("no answer from the hub within {secs}s")),
+                );
+                continue;
+            }
             let message = if taken {
                 format!(
                     "handed up to the hub's relay, but no answer came back within {secs}s — the \
@@ -180,6 +188,15 @@ impl App {
     /// has already crossed a hub and is not forwarded again — or when no hub
     /// holds a relay into this server. The caller then refuses in its own
     /// words, which name why.
+    ///
+    /// The sender is ONLY one this server attests from the caller's process
+    /// ancestry. There is deliberately no fallback to a `from_agent` the
+    /// caller supplied: the hub vouches for this spoke's edge and relays the
+    /// frame as whatever sender it names, so a caller-supplied one would let
+    /// any local process outside a pane speak as any agent id it can spell.
+    /// A message relayed IN from another host never reaches here (it carries
+    /// `from_host`, and is not handed on again), so the relay's own
+    /// `--from-agent` leg is unaffected.
     pub(super) fn try_hand_up(
         &mut self,
         id: &str,
@@ -192,15 +209,15 @@ impl App {
         }
         // Attested HERE, where the sender's process ancestry is. The hub has
         // no way to attest it and must not become the apparent sender (#213).
-        let from_agent = self
-            .attested_sender_agent()
-            .or_else(|| params.from_agent.clone());
-        let Some(from_agent) = from_agent else {
+        // Refused rather than handed up anonymously: the hub refuses a frame
+        // with no sender anyway, and saying so here names the actual fix.
+        let Some(from_agent) = self.attested_sender_agent() else {
             return Some(encode_error(
                 id.to_string(),
                 "sender_unresolved",
-                "cross-host delivery needs a sender identity: call from inside a pane, or pass \
-                 from_agent",
+                "a message handed up to the hub needs a sender this server can attest: send it \
+                 from inside an agent's pane (a caller-supplied from_agent is not trusted on \
+                 this path)",
             ));
         };
         let correlation_id = params
@@ -255,7 +272,16 @@ impl App {
     /// Hand up a message flock itself sends on a spoke's behalf (#410) — a
     /// mute's deferral reply, today — to the hub, without parking the request
     /// that produced it. `false` when no hub holds a relay into this server.
-    pub(super) fn hand_up_detached(&mut self, to_agent: &str, message: MsgSendParams) -> bool {
+    ///
+    /// `deferral` is the record the hub's answer settles
+    /// ([`Self::settle_hub_deferral`]): delivered is recorded, refused or
+    /// timed out releases the claim so the next mute retries.
+    pub(super) fn hand_up_detached(
+        &mut self,
+        to_agent: &str,
+        message: MsgSendParams,
+        deferral: Option<crate::events::MsgDeferralRelay>,
+    ) -> bool {
         if !self.uplink_attached() {
             return false;
         }
@@ -275,16 +301,15 @@ impl App {
             },
         };
         let now = Instant::now();
-        self.uplink.hand_up_detached(
-            frame,
-            ParkedSend::new(
-                "detached".into(),
-                correlation_id,
-                from_agent,
-                to_agent.to_string(),
-                now + self.uplink_timeout(),
-            ),
+        let mut parked = ParkedSend::new(
+            "detached".into(),
+            correlation_id,
+            from_agent,
+            to_agent.to_string(),
+            now + self.uplink_timeout(),
         );
+        parked.deferral = deferral.map(Box::new);
+        self.uplink.hand_up_detached(frame, parked);
         self.feed_parked_take(now);
         true
     }
@@ -392,10 +417,17 @@ impl App {
         if let Some(hub) = self.uplink.record_hub(&params.hub) {
             params.hub = hub;
         }
-        let Some(send) = self.uplink.complete(&params.uplink_id) else {
+        let Some(mut send) = self.uplink.complete(&params.uplink_id) else {
             return encode_success(id, ResponseResult::MsgUplinkResultAck { matched: false });
         };
         let response = self.uplinked_outcome(&send, &params);
+        if let Some(relay) = send.deferral.take() {
+            let outcome = match params.response.get("error") {
+                Some(error) => Err(error.to_string()),
+                None => Ok(()),
+            };
+            self.settle_hub_deferral(*relay, Some(&params.hub), outcome);
+        }
         send.answer(response);
         encode_success(id, ResponseResult::MsgUplinkResultAck { matched: true })
     }
@@ -659,11 +691,50 @@ mod tests {
         state
     }
 
+    /// Give the app an agent pane whose child is this test process, so a
+    /// request sent with [`send_as_agent`] is attested as that agent — the
+    /// only sender a hand-up carries. Returns the agent id.
+    fn attest_caller(app: &mut crate::app::App) -> String {
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("spoke")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace has a pane");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        let agent_id = app.state.terminals[&terminal_id].agent_id.to_string();
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        agent_id
+    }
+
+    /// [`via_transport`] from inside the pane [`attest_caller`] set up.
+    fn send_as_agent(
+        app: &mut crate::app::App,
+        params: MsgSendParams,
+    ) -> std::sync::mpsc::Receiver<String> {
+        app.current_api_peer_pid = Some(std::process::id());
+        let rx = via_transport(app, Method::MsgSend(params));
+        app.current_api_peer_pid = None;
+        rx
+    }
+
+    /// A frame as it arrives at the HUB off a spoke's relay: the spoke
+    /// attested its sender, so the frame names one.
+    fn frame_from_spoke(agent: &str) -> MsgSendParams {
+        MsgSendParams {
+            from_agent: Some("agent_spoke_1".into()),
+            ..send_to(agent)
+        }
+    }
+
     fn send_to(agent: &str) -> MsgSendParams {
         MsgSendParams {
-            // No pane to attest from in a unit test, so the sender is asserted
-            // — the same shape a CLI caller outside a pane uses.
-            from_agent: Some("agent_spoke_1".into()),
+            // No asserted sender: a hand-up carries only an attested one
+            // ([`send_as_agent`]).
+            from_agent: None,
             from_host: None,
             to: MessageTarget::Agent {
                 agent: agent.into(),
@@ -753,13 +824,193 @@ mod tests {
         );
     }
 
+    /// Review of #417: the hub relays a handed-up frame AS whatever sender
+    /// it names. A process on the spoke that is in no pane — a foreign pid —
+    /// must not be able to name one: supplying a real local agent's id buys it
+    /// nothing, and nothing is handed up.
+    #[tokio::test]
+    async fn an_unattested_caller_cannot_hand_up_as_a_local_agent() {
+        let mut app = test_app();
+        let real_agent = attest_caller(&mut app);
+        let take = attach_relay(&mut app);
+
+        // A foreign pid: no pane's descendant, so ancestry attests nobody.
+        app.current_api_peer_pid = Some(1);
+        let response = value(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: Some(real_agent),
+                ..send_to("agent_far_1")
+            }),
+        }));
+        app.current_api_peer_pid = None;
+        assert_eq!(response["error"]["code"], "sender_unresolved", "{response}");
+        assert!(
+            take.try_recv().is_err(),
+            "no frame reached the relay, so the hub has nothing to vouch for"
+        );
+        assert_eq!(app.uplink.outbound_len(), 0);
+    }
+
+    // ---- ADR-0018 §3 over the hub: a failed deferral is retried ----------
+
+    /// A spoke with one local pane holding a `needs_reply` from an agent on
+    /// another spoke — unplaceable here, so its deferral must go up the hub.
+    /// Returns the muted pane.
+    fn spoke_with_a_remote_question(app: &mut crate::app::App, cid: &str) -> String {
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("spoke")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace has a pane");
+        let pane = app.public_pane_id(0, pane_id).expect("public id");
+        // Relayed in by the hub: asserted sender and host, no local ancestry.
+        let queued = value(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: Some("agent_far_1".into()),
+                from_host: Some("far".into()),
+                to: MessageTarget::Pane { pane: pane.clone() },
+                correlation_id: Some(cid.into()),
+                ..send_to("unused")
+            }),
+        }));
+        assert_eq!(queued["result"]["state"], "queued", "{queued}");
+        pane
+    }
+
+    /// `msg.mute` on `pane`; returns how many senders it deferred.
+    fn mute_count(app: &mut crate::app::App, pane: &str) -> u64 {
+        let muted = value(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+                pane: Some(pane.into()),
+                seconds: 600,
+                reason: None,
+            }),
+        }));
+        muted["result"]["deferred"]
+            .as_u64()
+            .expect("deferred count")
+    }
+
+    fn deferred_events(app: &crate::app::App) -> usize {
+        app.event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    envelope.data,
+                    crate::api::schema::EventData::MessageDeferred { .. }
+                )
+            })
+            .count()
+    }
+
+    /// The hub's answer to the oldest waiting frame, from the bound relay.
+    fn hub_answers(app: &mut crate::app::App, response: serde_json::Value) {
+        let uplink_id = app
+            .uplink
+            .complete_peek_for_test()
+            .expect("a frame is waiting");
+        as_relay(
+            app,
+            Request {
+                id: "r".into(),
+                method: Method::MsgUplinkResult(MsgUplinkResultParams {
+                    uplink_id,
+                    hub: "hub".into(),
+                    response,
+                }),
+            },
+        );
+    }
+
+    /// Review of #417: a deferral the hub REFUSES must release its claim, or
+    /// the question is marked answered while its sender heard nothing — and
+    /// the next mute must then actually send it.
+    #[tokio::test]
+    async fn a_deferral_the_hub_refuses_is_retried_by_the_next_mute() {
+        let mut app = test_app();
+        let _take = attach_relay(&mut app);
+        let pane = spoke_with_a_remote_question(&mut app, "c-refused");
+
+        assert_eq!(mute_count(&mut app, &pane), 1, "handed up");
+        assert_eq!(
+            deferred_events(&app),
+            0,
+            "not recorded as sent before the hub says so"
+        );
+        hub_answers(
+            &mut app,
+            serde_json::json!({
+                "id": "uplink-forward",
+                "error": {"code": "peer_unreachable", "message": "hub cannot reach far"},
+            }),
+        );
+        assert_eq!(
+            deferred_events(&app),
+            0,
+            "a refused deferral is not recorded"
+        );
+        assert_eq!(app.uplink.outbound_len(), 0);
+
+        assert_eq!(
+            mute_count(&mut app, &pane),
+            1,
+            "the claim was released, so the next mute owes it again"
+        );
+        assert_eq!(app.uplink.outbound_len(), 1, "and hands it up again");
+
+        // This time the hub delivers: recorded once, and never owed again.
+        hub_answers(
+            &mut app,
+            serde_json::json!({
+                "id": "uplink-forward",
+                "result": {"type": "msg_queued", "correlation_id": "c-refused:deferred",
+                           "state": "relayed", "to_host": "far"},
+            }),
+        );
+        assert_eq!(deferred_events(&app), 1);
+        assert_eq!(mute_count(&mut app, &pane), 0, "answered once, for good");
+    }
+
+    /// The same for a hub that never answers: the uplink timeout releases the
+    /// claim, and the next mute retries. (A hub that took the frame and went
+    /// quiet may have delivered it; the recipient dedupes the retry on the
+    /// deferral's correlation id.)
+    #[tokio::test]
+    async fn a_deferral_the_hub_never_answers_is_retried_by_the_next_mute() {
+        let mut config = Config::default();
+        config.msg.uplink_timeout_secs = 1;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app =
+            crate::app::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let _take = attach_relay(&mut app);
+        let pane = spoke_with_a_remote_question(&mut app, "c-silent");
+
+        assert_eq!(mute_count(&mut app, &pane), 1);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        app.expire_uplink();
+        assert_eq!(
+            app.uplink.outbound_len(),
+            0,
+            "the timed-out frame is dropped"
+        );
+        assert_eq!(deferred_events(&app), 0);
+
+        assert_eq!(mute_count(&mut app, &pane), 1, "released, so retried");
+        assert_eq!(app.uplink.outbound_len(), 1);
+    }
+
     #[tokio::test]
     async fn a_spoke_hands_up_and_the_sender_hears_the_hubs_real_outcome() {
         let mut app = test_app();
+        let spoke_agent = attest_caller(&mut app);
         let take = attach_relay(&mut app);
         assert!(take.try_recv().is_err(), "an idle relay's take parks");
 
-        let sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
+        let sender = send_as_agent(&mut app, send_to("agent_far_1"));
         assert!(
             sender.try_recv().is_err(),
             "the sender waits for the hub rather than being told a hopeful 'queued'"
@@ -768,7 +1019,11 @@ mod tests {
         // The parked take is fed at once, carrying the ORIGINATING sender.
         let frames = value(&take.try_recv().expect("the relay is handed the frame"));
         let frame = &frames["result"]["frames"][0];
-        assert_eq!(frame["message"]["from_agent"], "agent_spoke_1", "{frame}");
+        assert_eq!(
+            frame["message"]["from_agent"],
+            spoke_agent.as_str(),
+            "{frame}"
+        );
         assert_eq!(
             frame["message"]["from_host"],
             crate::app::short_host_name(),
@@ -833,8 +1088,9 @@ mod tests {
     #[tokio::test]
     async fn the_hubs_refusal_reaches_the_sender_naming_the_hop_that_broke() {
         let mut app = test_app();
+        attest_caller(&mut app);
         let _take = attach_relay(&mut app);
-        let sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
+        let sender = send_as_agent(&mut app, send_to("agent_far_1"));
         let uplink_id = app
             .uplink
             .complete_peek_for_test()
@@ -875,8 +1131,9 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app =
             crate::app::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        attest_caller(&mut app);
         let _take = attach_relay(&mut app);
-        let sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
+        let sender = send_as_agent(&mut app, send_to("agent_far_1"));
         std::thread::sleep(std::time::Duration::from_millis(1100));
         app.expire_uplink();
         let answer = value(&sender.try_recv().expect("answered on expiry"));
@@ -905,7 +1162,7 @@ mod tests {
             peer_with_agent("sage", "ksb", "agent_sage_1"),
             peer_with_agent("ksb", "ksb", "agent_ksb_1"),
         ];
-        let mut message = send_to("agent_nowhere_1");
+        let mut message = frame_from_spoke("agent_nowhere_1");
         message.from_host = Some("ksb".into());
         let response = value(&app.forward_uplinked_message("sage", message));
         assert_eq!(
@@ -915,7 +1172,7 @@ mod tests {
 
         // From its own host it is forwarded — and a target the hub cannot place
         // is a plain miss: a forwarded message is never handed up again.
-        let mut message = send_to("agent_nowhere_1");
+        let mut message = frame_from_spoke("agent_nowhere_1");
         message.from_host = Some("sage".into());
         let response = value(&app.forward_uplinked_message("sage", message));
         assert_eq!(
@@ -965,7 +1222,7 @@ mod tests {
         );
         assert!(!located.direct);
 
-        let mut forwarded = send_to("agent_ksb_1");
+        let mut forwarded = frame_from_spoke("agent_ksb_1");
         forwarded.from_host = Some("sage".into());
         let response = value(&app.handle_api_request(Request {
             id: "req".into(),
@@ -1026,7 +1283,7 @@ mod tests {
             ..Default::default()
         }];
         app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
-        let mut message = send_to(&local_agent);
+        let mut message = frame_from_spoke(&local_agent);
         message.from_agent = Some("agent_vm-dev_1".into());
         message.from_host = Some("vm-dev".into());
         let queued = value(&app.forward_uplinked_message("anvil", message));
@@ -1047,8 +1304,9 @@ mod tests {
         // so without a binding any same-user process could take a spoke's
         // pending messages or forge the hub's answer to them.
         let mut app = test_app();
+        attest_caller(&mut app);
         let _take = attach_relay(&mut app);
-        let _sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
+        let _sender = send_as_agent(&mut app, send_to("agent_far_1"));
         let uplink_id = app.uplink.complete_peek_for_test().expect("waiting");
 
         app.current_api_peer_pid = Some(relay_pid().wrapping_add(1_000_000));

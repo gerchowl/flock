@@ -831,22 +831,35 @@ impl App {
             intent: MsgIntent::Fyi,
             intent_unrecognised: None,
         };
+        // What the hub's answer settles (`settle_hub_deferral`): recorded as
+        // sent once the hub confirms, released for the next mute otherwise.
+        let hub_record = |to_agent: &str| {
+            Some(crate::events::MsgDeferralRelay {
+                correlation_id: message.correlation_id.clone(),
+                deferral_correlation_id: deferral_correlation_id.clone(),
+                pane: message.to_pane.clone(),
+                muted_until_ms,
+                reason: reason.clone(),
+                from_agent: muter_agent.clone()?,
+                to_agent: to_agent.to_string(),
+                // Not known here: the hub places the recipient.
+                to_host: String::new(),
+                route: String::new(),
+                result: Ok(()),
+            })
+        };
         let resolved = match self.resolve_message_target(&target) {
             Ok(resolved) => resolved,
             Err((code, _))
                 if code == "msg_target_not_found"
                     && matches!(&target, MessageTarget::Agent { agent }
-                        if self.hand_up_detached(agent, deferral_up(&muter_agent))) =>
+                    if self.hand_up_detached(
+                        agent,
+                        deferral_up(&muter_agent),
+                        hub_record(agent),
+                    )) =>
             {
                 self.mailboxes.mark_deferred(&message.correlation_id);
-                self.emit_message_deferred(
-                    &message.correlation_id,
-                    deferral_correlation_id,
-                    &message.to_pane,
-                    muted_until_ms,
-                    reason,
-                    Some("via hub".into()),
-                );
                 return true;
             }
             Err((code, detail)) => {
@@ -910,18 +923,14 @@ impl App {
                 let Some(peer) = self.peer_for_location(&location) else {
                     // No edge of our own: up the hub's relay, as the message
                     // for this agent would go (#410).
-                    if !self.hand_up_detached(&location.agent_id, deferral_up(&muter_agent)) {
+                    if !self.hand_up_detached(
+                        &location.agent_id,
+                        deferral_up(&muter_agent),
+                        hub_record(&location.agent_id),
+                    ) {
                         return false;
                     }
                     self.mailboxes.mark_deferred(&message.correlation_id);
-                    self.emit_message_deferred(
-                        &message.correlation_id,
-                        deferral_correlation_id,
-                        &message.to_pane,
-                        muted_until_ms,
-                        reason,
-                        Some("via hub".into()),
-                    );
                     return true;
                 };
                 let Some(from_agent) = muter_agent else {
@@ -949,6 +958,35 @@ impl App {
                 true
             }
         }
+    }
+
+    /// The hub's answer to a deferral handed up to it, or its timeout
+    /// ([`Self::hand_up_detached`]). The claim was taken at hand-up so a mute
+    /// renewed meanwhile sends nothing twice; delivered is recorded, anything
+    /// else releases it and the next mute retries.
+    pub(super) fn settle_hub_deferral(
+        &mut self,
+        relay: crate::events::MsgDeferralRelay,
+        hub: Option<&str>,
+        outcome: Result<(), String>,
+    ) {
+        if let Err(detail) = outcome {
+            tracing::warn!(
+                correlation_id = relay.correlation_id.as_str(),
+                detail = detail.as_str(),
+                "mute deferral handed up to the hub was not delivered; the next mute retries it"
+            );
+            self.mailboxes.unmark_deferred(&relay.correlation_id);
+            return;
+        }
+        self.emit_message_deferred(
+            &relay.correlation_id,
+            relay.deferral_correlation_id,
+            &relay.pane,
+            relay.muted_until_ms,
+            relay.reason,
+            hub.map(|hub| format!("via {hub}")),
+        );
     }
 
     /// Start queued cross-host deferral hops, up to

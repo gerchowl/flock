@@ -603,14 +603,17 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "needs_reply",
         }),
     );
-    let deferral = wait_for(
+    let arrived = wait_for(
         "the arrival-time deferral to reach nodea",
         RPC_TIMEOUT,
         || {
             let inbox = alice.call_tool("flock_msg_read", json!({}));
-            inbox["messages"].as_array()?.first().cloned()
+            let messages = inbox["messages"].as_array()?.clone();
+            (!messages.is_empty()).then_some(messages)
         },
     );
+    assert_eq!(arrived.len(), 1, "exactly one deferral: {arrived:?}");
+    let deferral = &arrived[0];
     assert_eq!(deferral["in_reply_to"], "c-408-during", "{deferral}");
     assert_eq!(deferral["intent"], "fyi", "{deferral}");
 
@@ -895,14 +898,37 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
             "intent": "needs_reply",
         }),
     );
-    let deferral = wait_for("carol's deferral to reach nodea", RPC_TIMEOUT, || {
-        let inbox = alice.call_tool("flock_msg_read", json!({}));
-        inbox["messages"]
+    // Peek first, so the wake can be asked about while it is still queued.
+    wait_for("carol's deferral to reach nodea", RPC_TIMEOUT, || {
+        let queued = alice.call_tool("flock_msg_list", json!({"pane": alice.pane_id}));
+        queued["messages"]
             .as_array()?
             .iter()
-            .find(|message| message["in_reply_to"] == "c-410-muted")
-            .cloned()
+            .any(|message| message["in_reply_to"] == "c-410-muted")
+            .then_some(())
     });
+    let wake: Value = serde_json::from_str(&node_a.api(&format!(
+        r#"{{"id":"t:wake","method":"msg.wake","params":{{"pane":"{}"}}}}"#,
+        alice.pane_id
+    )))
+    .expect("msg.wake parses");
+    assert_eq!(
+        wake["result"]["count"], 0,
+        "a deferral must not cost its receiver a turn: {wake}"
+    );
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    let deferrals: Vec<&Value> = inbox["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["in_reply_to"] == "c-410-muted")
+        .collect();
+    assert_eq!(deferrals.len(), 1, "exactly one deferral: {inbox}");
+    let deferral = deferrals[0];
+    assert_eq!(
+        deferral["correlation_id"], "c-410-muted:deferred",
+        "{deferral}"
+    );
     assert_eq!(deferral["from_host"], "nodec", "{deferral}");
     assert_eq!(
         deferral["from_agent"],
