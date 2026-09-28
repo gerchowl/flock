@@ -269,6 +269,7 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     crate::logging::peer_relay_started(pushing);
     if pushing {
         start_summary_push(socket.clone());
+        start_uplink_pull(socket.clone());
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -427,6 +428,104 @@ fn start_summary_push(socket: std::path::PathBuf) {
             crate::logging::peer_push_emitted(coalesced);
         }
     });
+}
+
+/// Carry messages this node hands UP to the hub that holds this relay (#410).
+///
+/// A spoke has no `[[peers]]`, so this relay — the hub's ssh edge into it — is
+/// the only way a message for another host can leave. The pull long-polls the
+/// local server's `msg.uplink_take`: the server parks the request until a
+/// frame is due or its heartbeat window passes, so an idle node costs one
+/// request per window and a message leaves the moment it is sent. The asking
+/// is also how the server knows a hub is attached at all.
+///
+/// Its own thread and its own push kind, separate from the summary pusher:
+/// a message must never wait behind the summary debounce, and must never be
+/// coalesced away the way a superseded summary safely is (pitfall 4). Frames
+/// are acknowledged on the NEXT take, only after they are written, so a relay
+/// that dies mid-write leaves them to be re-offered rather than lost.
+fn start_uplink_pull(socket: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let mut ack: Vec<String> = Vec::new();
+        loop {
+            let request = serde_json::json!({
+                "id": "relay-uplink",
+                "method": "msg.uplink_take",
+                "params": { "ack": ack },
+            });
+            let line = match relay_local_request(&socket, &request) {
+                Ok(line) => line,
+                // No server right now (restarting, not yet up): ask again
+                // later, keeping the acks owed.
+                Err(_) => {
+                    std::thread::sleep(UPLINK_RETRY);
+                    continue;
+                }
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                std::thread::sleep(UPLINK_RETRY);
+                continue;
+            };
+            // The server answered and said no — an older build without the
+            // method. It will say no forever, so stop and say so once.
+            if let Some(error) = value.get("error") {
+                crate::logging::uplink_pull_stopped(&error.to_string());
+                return;
+            }
+            ack.clear();
+            let frames = value
+                .get("result")
+                .and_then(|result| result.get("frames"))
+                .and_then(|frames| frames.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for frame in frames {
+                let Some(uplink_id) = frame
+                    .get("uplink_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let push = serde_json::json!({
+                    "push": crate::peer_stream::UPLINK_PUSH,
+                    "frame": frame,
+                });
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                // The hub hung up: this relay is ending, and the frame stays
+                // unacked for the next one to carry.
+                if writeln!(out, "{push}").is_err() || out.flush().is_err() {
+                    return;
+                }
+                ack.push(uplink_id);
+            }
+        }
+    });
+}
+
+/// How long the uplink pull waits before asking a local server that did not
+/// answer. Not configurable, for the reason `SUMMARY_PUSH_DEBOUNCE` is not: it
+/// only paces retries against a server that is not there, and the server's own
+/// heartbeat (`[msg] uplink_heartbeat_secs`) is what decides liveness.
+const UPLINK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One request to this node's own socket, answered by one line.
+fn relay_local_request(
+    socket: &std::path::Path,
+    request: &serde_json::Value,
+) -> std::io::Result<String> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    writeln!(stream, "{request}")?;
+    stream.flush()?;
+    let mut line = String::new();
+    if std::io::BufReader::new(stream).read_line(&mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "server closed without answering",
+        ));
+    }
+    Ok(line)
 }
 
 /// Trailing-edge debounce state, shared between the event reader and the

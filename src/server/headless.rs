@@ -2604,7 +2604,7 @@ impl HeadlessServer {
             self.app.current_api_peer_pid = None;
             response
         };
-        let _ = msg.respond_to.send(response);
+        self.app.respond_or_park(msg.respond_to, response);
         self.reassert_geometry_if_active_focus_changed(focus_before);
 
         // Forward new toast state only when a client-local delivery mode is selected.
@@ -3399,6 +3399,7 @@ impl HeadlessServer {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the TUI runtime loop (the #25 dual-loop lesson).
         self.app.expire_undeliverable_messages();
+        self.app.expire_uplink();
         // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_idle_wakes(now);
         for update in &settled {

@@ -119,6 +119,15 @@ pub enum AppEvent {
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).
     PeerSummaryFetched(crate::peers::PeerSummaryFetch),
+    /// #410: a message the spoke `spoke` handed up its relay, for this hub's
+    /// main loop to deliver. In-process on purpose: the only producer is the
+    /// relay reader for the edge this hub dialled, so no socket caller can
+    /// present itself as a spoke's vouched-for frame.
+    UplinkForwarded {
+        spoke: String,
+        message: crate::api::schema::MsgSendParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    },
     /// Cross-machine checkout (#125), read-only probe (`push=false`): the peer
     /// reported its branch's working-tree / push state, feeding the confirm
     /// dialog before any mutation. `generation` discards a stale leg whose

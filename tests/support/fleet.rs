@@ -180,6 +180,12 @@ impl Fleet {
             .unwrap_or_else(|| panic!("no node named {name} in the fleet"))
     }
 
+    /// Make every new ssh dial to `name` fail with "Connection refused", as a
+    /// broken edge would (#410). Held connections are unaffected.
+    pub fn refuse_ssh_to(&self, name: &str) {
+        fs::write(self.base.join(format!("refuse-ssh-{name}")), b"").unwrap();
+    }
+
     /// The `<namespace>/<repo>` identity a node's workspace renders under.
     pub fn project_label(repo: &str) -> String {
         format!("{REPO_NAMESPACE}/{repo}")
@@ -271,8 +277,13 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
             path.config_home.display(),
         ));
     }
+    // An edge can be broken mid-test (#410): a marker file named for the
+    // target makes every NEW dial to it fail the way a real refused connect
+    // does — ssh's own words, ssh's own exit status. Connections already held
+    // stay up, exactly as a real network partition would leave them.
     shim.push_str(&format!(
-        "  *) echo \"fake-ssh: unknown target $prev\" >&2; exit 255 ;;\nesac\nFLOCK_SOCKET_PATH=\"$SOCK\" XDG_CONFIG_HOME=\"$CFG\" PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
+        "  *) echo \"fake-ssh: unknown target $prev\" >&2; exit 255 ;;\nesac\nif [ -e '{}'/\"refuse-ssh-$prev\" ]; then echo \"ssh: connect to host $prev port 22: Connection refused\" >&2; exit 255; fi\nFLOCK_SOCKET_PATH=\"$SOCK\" XDG_CONFIG_HOME=\"$CFG\" PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
+        base.display(),
         bin_dir.display(),
     ));
     let shim_path = shim_dir.join("ssh");

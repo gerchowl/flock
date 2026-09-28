@@ -31,6 +31,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod uplink;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -132,6 +133,10 @@ pub struct App {
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
+    /// Messages this server is handing up to its hub, and the requests parked
+    /// on them (#410). In memory on purpose: a parked request dies with the
+    /// connection that made it, so there is nothing a restart could resume.
+    pub(crate) uplink: crate::app::uplink::Uplink,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
@@ -864,6 +869,7 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
+            uplink: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             event_hub,
             last_focus,
