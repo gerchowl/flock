@@ -445,6 +445,26 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
          optional on reply and defaults quiet: {answer}"
     );
 
+    // 4b. ADR-0018 §1: the top tier crosses the hop too, so the recipient's
+    //     own server — the one that knows whether it is muted — can escalate.
+    alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type": "agent", "agent": bob.agent_id},
+            "body": "cannot merge until you rebase",
+            "correlation_id": "c-408-blocking",
+            "intent": "blocking",
+        }),
+    );
+    let escalated = wait_for("the blocking message to reach nodeb", RPC_TIMEOUT, || {
+        let inbox = bob.call_tool("flock_msg_read", json!({}));
+        inbox["messages"].as_array()?.first().cloned()
+    });
+    assert_eq!(
+        escalated["intent"], "blocking",
+        "a relayed blocking message must not arrive demoted: {escalated}"
+    );
+
     // 5. A target that does not exist is refused by name, never dropped.
     let error = alice.call_tool_error(
         "flock_msg_send",

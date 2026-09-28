@@ -576,6 +576,7 @@ impl App {
             request_branch_session: None,
             request_kill_worktree: None,
             request_kill_all_worktrees: false,
+            blocking_mail: std::collections::HashMap::new(),
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             pending_ui_events: Vec::new(),
@@ -883,6 +884,9 @@ impl App {
         // Sync the render-facing pause banner from the persisted state so
         // a paused fleet renders the banner immediately on restart.
         Self::sync_fleet_pause_banner(&this.fleet_pause, &mut this.state);
+        // ADR-0018 §4: blocking mail restored from the log is still waiting on
+        // its recipient, so the attention surface shows it from the first frame.
+        this.sync_blocking_mail();
         // #372 / ADR-0016: rebuild the operator's notification list from the
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.

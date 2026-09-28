@@ -2179,6 +2179,12 @@ pub struct AppState {
     /// Fleet-wide worktree sweep requested (#81): drained on the main loop into
     /// the batch-confirm dialog.
     pub request_kill_all_worktrees: bool,
+    /// `blocking` agent mail waiting on each pane, keyed by public pane id
+    /// (ADR-0018 §4). A mirror of the mailbox the App owns, refreshed on every
+    /// change, so the attention cycle and the agents panel can rank and label
+    /// a pane without reaching into the mailbox. Counts and senders only.
+    pub(crate) blocking_mail:
+        std::collections::HashMap<String, crate::app::mailboxes::BlockingMail>,
     /// One-shot guard so the attention all-clear chime fires once per
     /// empty-queue episode instead of on every keypress.
     pub attention_all_clear_chimed: bool,
@@ -3223,6 +3229,7 @@ impl AppState {
             request_branch_session: None,
             request_kill_worktree: None,
             request_kill_all_worktrees: false,
+            blocking_mail: std::collections::HashMap::new(),
             attention_all_clear_chimed: false,
             pending_attention_chime: false,
             pending_ui_events: Vec::new(),

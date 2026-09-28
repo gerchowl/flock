@@ -599,6 +599,66 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// ADR-0018 §1, from where the value starts to where it is observed: a
+    /// `msg.send` as a client puts it on the socket, the `msg.wake` the stop
+    /// hook asks, and the hook's own decision about whether to block the turn.
+    /// A unit test on `wake_count` alone would pass with the handler still
+    /// reporting `queued_len` — the wiring is the thing under test.
+    #[tokio::test]
+    async fn an_inbox_of_only_fyi_never_blocks_the_turn_and_a_question_names_everything() {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("alpha"),
+            crate::workspace::Workspace::test_new("beta"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane = {
+            let pane_id = app.state.workspaces[1].focused_pane_id().expect("pane");
+            app.state.public_pane_id(1, pane_id).expect("public id")
+        };
+        let mut wire = |request: serde_json::Value| -> serde_json::Value {
+            let response = app.handle_api_request(
+                serde_json::from_value(request).expect("a request a client sends"),
+            );
+            serde_json::from_str(&response).expect("json response")
+        };
+        let send = |cid: &str, intent: &str| {
+            json!({"id": "req", "method": "msg.send", "params": {
+                "to": {"type": "pane", "pane": pane}, "body": "hi",
+                "correlation_id": cid, "intent": intent}})
+        };
+        let wake = json!({"id": "flock:hook:1", "method": "msg.wake",
+            "params": {"pane": pane}});
+
+        for cid in ["c-fyi-1", "c-fyi-2"] {
+            assert!(wire(send(cid, "fyi")).get("result").is_some());
+        }
+        let answered = wire(wake.clone());
+        assert_eq!(
+            mail_nudge(wake_count_from_response(&answered), false),
+            None,
+            "notices alone must not cost the recipient a turn: {answered}"
+        );
+
+        assert!(wire(send("c-question", "needs_reply"))
+            .get("result")
+            .is_some());
+        let answered = wire(wake);
+        let nudge = mail_nudge(wake_count_from_response(&answered), false)
+            .expect("a question wakes the recipient");
+        assert!(
+            nudge.contains("3 unread messages"),
+            "once a wake fires it names the notices too, so the read takes them: {nudge}"
+        );
+    }
+
     /// #316: the hook reads the wake count out of the wire by pointer, and a
     /// pointer that stops matching what the handler emits fails SILENTLY —
     /// the agent simply never hears about its mail again. So build the

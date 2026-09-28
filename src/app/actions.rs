@@ -161,15 +161,27 @@ pub(crate) struct VisibleAgent {
     /// local ages down to match) would make two local panes that changed in
     /// the same second unorderable, which is the case the resolution is for.
     pub(crate) age: Option<std::time::Duration>,
+    /// Another agent has queued a `blocking` message for this pane
+    /// (ADR-0018 §4). Its own signal, never folded into `state`: `blocked`
+    /// means waiting on input, and waiting mail is not that (#311, #316
+    /// pitfall 4). Always false for a remote row — the recipient's own server
+    /// owns that pane's inbox, and surfaces it there.
+    pub(crate) blocking_mail: bool,
 }
 
 impl VisibleAgent {
-    /// Attention priority: blocked first, then done-but-unseen. `None` means
-    /// this agent is not asking for anything.
+    /// Attention priority: blocked first, then a pane another agent is
+    /// blocked on, then done-but-unseen. `None` means nobody is asking this
+    /// agent for anything.
+    ///
+    /// Waiting mail ranks below `blocked` because an agent waiting on the
+    /// operator can only be moved by the operator, while one holding blocking
+    /// mail can still read it on its own.
     fn attention_group(&self) -> Option<u8> {
-        match (self.state, self.seen) {
-            (AgentState::Blocked, _) => Some(0),
-            (AgentState::Idle, false) => Some(1),
+        match (self.state, self.seen, self.blocking_mail) {
+            (AgentState::Blocked, _, _) => Some(0),
+            (_, _, true) => Some(1),
+            (AgentState::Idle, false, _) => Some(2),
             _ => None,
         }
     }
@@ -2529,6 +2541,9 @@ impl AppState {
                         // Local ages keep sub-second resolution — two panes
                         // that changed state in the same second still order.
                         age: detail.state_changed_at.map(|at| at.elapsed()),
+                        blocking_mail: self
+                            .public_pane_id(ws_idx, detail.pane_id)
+                            .is_some_and(|pane| self.blocking_mail.contains_key(&pane)),
                     });
                 }
             }
@@ -2558,6 +2573,7 @@ impl AppState {
                     state,
                     seen,
                     age: summary.status_age_secs.map(std::time::Duration::from_secs),
+                    blocking_mail: false,
                 });
             }
         }
@@ -5005,6 +5021,56 @@ mod tests {
         state.focus_attention_agent();
         assert_eq!(state.active, Some(2), "then unseen done");
         assert!(!state.pending_attention_chime);
+    }
+
+    /// ADR-0018 §4: a pane another agent is blocked on joins the attention
+    /// queue in a group of its own — after `blocked`, before done-unseen —
+    /// and it does so without its agent state being touched (#311).
+    #[test]
+    fn focus_attention_visits_a_pane_holding_blocking_mail_under_its_own_group() {
+        let mut state = app_with_workspaces(&["a", "b", "c"]);
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        let now = std::time::Instant::now();
+        for ws in 0..3 {
+            let pane = state.workspaces[ws].tabs[0].root_pane;
+            let tid = state.workspaces[ws].terminal_id(pane).cloned().unwrap();
+            let terminal = state.terminals.get_mut(&tid).unwrap();
+            let agent_state = match ws {
+                0 => AgentState::Idle,
+                1 => AgentState::Working,
+                _ => AgentState::Blocked,
+            };
+            terminal.set_detected_state(Some(Agent::Claude), agent_state);
+            terminal.state_changed_at = Some(now);
+        }
+        // a: done while away. b: working, and another agent is blocked on it.
+        let pane_a = state.workspaces[0].tabs[0].root_pane;
+        state.workspaces[0].panes.get_mut(&pane_a).unwrap().seen = false;
+        let pane_b = state.workspaces[1].tabs[0].root_pane;
+        let public_b = state.public_pane_id(1, pane_b).expect("public id");
+        state.blocking_mail.insert(
+            public_b,
+            crate::app::mailboxes::BlockingMail {
+                count: 1,
+                sender: "agent_reviewer".into(),
+                other_senders: 0,
+            },
+        );
+
+        state.focus_attention_agent();
+        assert_eq!(state.active, Some(2), "blocked first");
+        state.focus_attention_agent();
+        assert_eq!(state.active, Some(1), "then the pane with blocking mail");
+        state.focus_attention_agent();
+        assert_eq!(state.active, Some(0), "then done-unseen");
+
+        let tid = state.workspaces[1].terminal_id(pane_b).cloned().unwrap();
+        assert_eq!(
+            state.terminals[&tid].state,
+            AgentState::Working,
+            "waiting mail must not be expressed as the blocked state"
+        );
     }
 
     /// The same peer, with its agent BLOCKED for a good while — the oldest

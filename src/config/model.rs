@@ -1088,6 +1088,14 @@ pub struct MsgConfig {
     /// against no threat model. Narrow it when that stops being true:
     /// `allow_from = ["mba22"]`.
     pub allow_from: Vec<String>,
+    /// How many `blocking` messages one sender may send per rolling hour
+    /// (ADR-0018 §1). Default: 6.
+    ///
+    /// `blocking` is sender-declared and therefore sender-abusable — every
+    /// agent thinks its message is the urgent one — so it carries its own
+    /// budget, far tighter than the general per-minute one, on top of it.
+    /// `0` refuses `blocking` outright; senders can still say `needs_reply`.
+    pub blocking_per_hour: usize,
 }
 
 impl Default for MsgConfig {
@@ -1095,6 +1103,7 @@ impl Default for MsgConfig {
         Self {
             enabled: true,
             allow_from: vec!["*".to_string()],
+            blocking_per_hour: 6,
         }
     }
 }
@@ -1468,6 +1477,7 @@ mod tests {
         let narrowed = super::MsgConfig {
             enabled: true,
             allow_from: vec!["mba22".into()],
+            ..super::MsgConfig::default()
         };
         assert!(narrowed.accepts_from(Some("mba22")));
         assert!(
@@ -1483,6 +1493,7 @@ mod tests {
         let closed = super::MsgConfig {
             enabled: false,
             allow_from: vec!["*".into()],
+            ..super::MsgConfig::default()
         };
         assert!(!closed.accepts_from(Some("mba22")));
         assert!(

@@ -860,12 +860,15 @@ pub struct LineageNode {
 /// sent so far had its "answer me" in the last line of a ~2.5k-character body,
 /// where a recipient reading the envelope cannot see it at all.
 ///
-/// Two values on purpose. #316's third `blocking` tier is escalation
-/// machinery — a wake decision, an attention-surface entry, a cost on the
-/// sender — and is deferred there. This enum says what the sender WANTS, not
-/// how hard flock should knock, and nothing in the wake path reads it: the
-/// wake still carries a count and a tool name (ADR-0008). A tier can be added
-/// later without moving what is here.
+/// Three tiers (ADR-0018 §1). The intent says what the sender WANTS; flock
+/// decides how hard to knock from it, and no sender text ever reaches the
+/// wake (ADR-0008) — the wake still carries a count and a tool name.
+///
+/// | intent | turn-boundary nudge | attention surface | operator escalation |
+/// | --- | --- | --- | --- |
+/// | `fyi` | no | no | no |
+/// | `needs_reply` | yes | no | no |
+/// | `blocking` | yes | yes | when the recipient is muted |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MsgIntent {
@@ -875,6 +878,11 @@ pub enum MsgIntent {
     Fyi,
     /// The sender is owed a reply.
     NeedsReply,
+    /// The sender cannot proceed until the recipient answers. Everything
+    /// `needs_reply` does, plus an attention-surface entry of its own and an
+    /// operator escalation when the recipient is muted — so it costs the
+    /// sender a tighter rate limit (`[msg] blocking_per_hour`).
+    Blocking,
 }
 
 impl MsgIntent {
@@ -886,6 +894,34 @@ impl MsgIntent {
         match self {
             Self::Fyi => "fyi",
             Self::NeedsReply => "needs_reply",
+            Self::Blocking => "blocking",
+        }
+    }
+
+    /// Every tier, in escalating order. The MCP schema's enum and the tests
+    /// that pin it iterate this, so a tier added here cannot be missing from
+    /// the tool surface without a test saying so (#320's drift lesson).
+    pub const ALL: [Self; 3] = [Self::Fyi, Self::NeedsReply, Self::Blocking];
+
+    /// Whether a queued message of this intent may wake its recipient
+    /// (ADR-0018 §1). `fyi` never costs the recipient a turn: it is read the
+    /// next time the inbox is read for any reason. Every wake decision asks
+    /// this one question, so the tiers cannot disagree about what wakes.
+    #[must_use]
+    pub fn wakes(self) -> bool {
+        !matches!(self, Self::Fyi)
+    }
+
+    /// Parse a spelling that arrived over the cross-host relay, where the
+    /// sender may run a newer build than this one (ADR-0018 §1). An unknown
+    /// tier is read as `needs_reply`: version skew fails toward the recipient
+    /// hearing about it, never toward silence. The flag is true when that
+    /// degradation happened, so the caller can log it.
+    #[must_use]
+    pub fn from_wire_relayed(value: &str) -> (Self, bool) {
+        match Self::from_wire(value) {
+            Some(intent) => (intent, false),
+            None => (Self::NeedsReply, true),
         }
     }
 
@@ -897,6 +933,7 @@ impl MsgIntent {
         match value.trim() {
             "fyi" => Some(Self::Fyi),
             "needs_reply" | "needs-reply" => Some(Self::NeedsReply),
+            "blocking" => Some(Self::Blocking),
             _ => None,
         }
     }
@@ -961,6 +998,12 @@ pub struct MsgSendParams {
     /// receiver had to guess, and guessed its own host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_host: Option<String>,
+    /// The spelling a relay carried when this build did not recognise it
+    /// (ADR-0018 §1). The receiving CLI has already read it as `needs_reply`;
+    /// this travels on so the SERVER — the process with a log — records the
+    /// skew, instead of the note dying on the stderr of an ssh-invoked CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_unrecognised: Option<String>,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,

@@ -118,3 +118,63 @@ fn reply_refuses_unknown_flags_and_honours_the_terminator() {
     assert!(!stderr.contains("unknown option"), "{stderr}");
     assert!(!stderr.contains("usage: flk msg reply"), "{stderr}");
 }
+
+#[test]
+fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
+    // ADR-0018 §1. Driven through the binary for the reason the rest of this
+    // file is: the relay is `flk msg send` on the recipient's host, and its
+    // exit status is what the sender classifies.
+    let typed = flk_msg(&[
+        "send",
+        "--agent",
+        "agent_sage_1",
+        "--intent",
+        "on_fire",
+        "hello",
+    ]);
+    assert_eq!(
+        typed.status.code(),
+        Some(REFUSAL_EXIT),
+        "an operator's unknown tier is refused: {}",
+        stderr_of(&typed)
+    );
+    assert!(
+        stderr_of(&typed).contains("blocking"),
+        "and the refusal names the tiers this build knows: {}",
+        stderr_of(&typed)
+    );
+
+    // The same spelling arriving from a peer (it carries `--from-host`) is a
+    // newer build talking, and must be heard: parsing succeeds, and the
+    // command fails only on the server this test deliberately does not run.
+    let relayed = flk_msg(&[
+        "send",
+        "--agent",
+        "agent_sage_1",
+        "--from-agent",
+        "agent_mba22_2",
+        "--from-host",
+        "mba22",
+        "--intent",
+        "on_fire",
+        "--",
+        "hello",
+    ]);
+    let stderr = stderr_of(&relayed);
+    assert!(!stderr.contains("unknown --intent"), "{stderr}");
+    assert!(!stderr.contains("usage: flk msg send"), "{stderr}");
+
+    let blocking = flk_msg(&[
+        "send",
+        "--agent",
+        "agent_sage_1",
+        "--intent",
+        "blocking",
+        "hi",
+    ]);
+    assert!(
+        !stderr_of(&blocking).contains("unknown --intent"),
+        "{}",
+        stderr_of(&blocking)
+    );
+}

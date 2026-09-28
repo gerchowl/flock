@@ -32,6 +32,39 @@ pub(crate) struct MailboxRegistry {
     /// the only direction that cannot strand a message. Queues are the
     /// durable half; this is a live preference about interruptions.
     mutes: HashMap<String, u64>,
+    /// Sender → recent `blocking` send timestamps (ms), for the tier's own
+    /// hourly budget (ADR-0018 §1). Separate from `rate` so a sender's
+    /// ordinary traffic cannot spend its escalation budget, or vice versa.
+    blocking_rate: HashMap<String, VecDeque<u64>>,
+    /// Correlation ids of `blocking` messages already escalated to the
+    /// operator (ADR-0018 §4) — once per message, however many times the
+    /// recipient re-mutes while it waits.
+    escalated: HashSet<String>,
+}
+
+/// What the attention surface may know about a pane's waiting `blocking`
+/// mail: a count and a sender identity, never a body (#316 pitfall 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockingMail {
+    pub count: usize,
+    /// The oldest waiting sender — the one blocked longest.
+    pub sender: String,
+    /// How many OTHER senders are also waiting on this pane.
+    pub other_senders: usize,
+}
+
+impl BlockingMail {
+    /// The agents-panel label: `✉2 from <sender>`, `+N` when others are
+    /// waiting too. A count and an identity — the whole of what #316 pitfall 3
+    /// allows a wake-adjacent surface to say.
+    pub(crate) fn label(&self) -> String {
+        let others = if self.other_senders == 0 {
+            String::new()
+        } else {
+            format!(" +{}", self.other_senders)
+        };
+        format!("✉{} from {}{others}", self.count, self.sender)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +116,8 @@ const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// The window `[msg] blocking_per_hour` counts over.
+const BLOCKING_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// Ceiling on a receiver-side mute (#316). An unbounded mute is a black hole
 /// wearing a politeness hat; a bounded one has to be renewed, which is what
 /// makes it impossible to set and forget. Half an hour is long enough to
@@ -203,6 +238,43 @@ impl MailboxRegistry {
         Ok(())
     }
 
+    /// The `blocking` tier's own budget (ADR-0018 §1): `Err` carries the wait
+    /// in ms, like [`Self::admit_rate`]. Peek-only — [`Self::record_blocking`]
+    /// spends the slot once every other gate has admitted the message, so a
+    /// send refused for another reason does not cost the sender escalation.
+    pub(crate) fn blocking_retry_after(
+        &mut self,
+        sender_key: &str,
+        now_ms: u64,
+        per_hour: usize,
+    ) -> Result<(), u64> {
+        let window = self
+            .blocking_rate
+            .entry(sender_key.to_string())
+            .or_default();
+        while window
+            .front()
+            .is_some_and(|sent| now_ms.saturating_sub(*sent) > BLOCKING_WINDOW_MS)
+        {
+            window.pop_front();
+        }
+        if window.len() >= per_hour {
+            let retry_after = window
+                .front()
+                .map(|oldest| BLOCKING_WINDOW_MS.saturating_sub(now_ms.saturating_sub(*oldest)))
+                .unwrap_or(BLOCKING_WINDOW_MS);
+            return Err(retry_after.max(1));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_blocking(&mut self, sender_key: &str, now_ms: u64) {
+        self.blocking_rate
+            .entry(sender_key.to_string())
+            .or_default()
+            .push_back(now_ms);
+    }
+
     pub(crate) fn enqueue(&mut self, message: PendingMessage) -> EnqueueOutcome {
         if self.seen.contains(&message.correlation_id) {
             return EnqueueOutcome::Duplicate;
@@ -230,7 +302,11 @@ impl MailboxRegistry {
     /// message had to go back on the front. A pull read cannot half-fail —
     /// the recipient either took the message or never asked (ADR-0008).
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
-        self.queues.get_mut(pane_id)?.pop_front()
+        let message = self.queues.get_mut(pane_id)?.pop_front()?;
+        // A message that left the queue can never be escalated again, so its
+        // marker is dead weight.
+        self.escalated.remove(&message.correlation_id);
+        Some(message)
     }
 
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
@@ -294,6 +370,7 @@ impl MailboxRegistry {
                 now_ms.saturating_sub(message.enqueued_at_ms) > UNDELIVERED_TTL_MS
             }) {
                 if let Some(message) = queue.pop_front() {
+                    self.escalated.remove(&message.correlation_id);
                     expired.push(message);
                 }
             }
@@ -341,6 +418,75 @@ impl MailboxRegistry {
         self.queues.get(pane).map_or(0, VecDeque::len)
     }
 
+    /// The count a wake may name (ADR-0018 §1): zero unless at least one
+    /// queued message [`wakes`](MsgIntent::wakes), and otherwise EVERY queued
+    /// message — the `fyi` ones included, so the read the nudge prompts takes
+    /// them too. An inbox of nothing but `fyi` never costs a turn.
+    pub(crate) fn wake_count(&self, pane: &str) -> usize {
+        let Some(queue) = self.queues.get(pane) else {
+            return 0;
+        };
+        if queue.iter().any(|message| message.intent.wakes()) {
+            queue.len()
+        } else {
+            0
+        }
+    }
+
+    /// The `blocking` mail waiting on each pane, for the attention surface.
+    pub(crate) fn blocking_mail(&self) -> HashMap<String, BlockingMail> {
+        self.queues
+            .iter()
+            .filter_map(|(pane, queue)| {
+                let mut waiting = queue
+                    .iter()
+                    .filter(|message| message.intent == MsgIntent::Blocking);
+                let oldest = waiting.next()?;
+                let sender = sender_identity(oldest);
+                let mut count = 1;
+                let mut others: HashSet<String> = HashSet::new();
+                for message in waiting {
+                    count += 1;
+                    let other = sender_identity(message);
+                    if other != sender {
+                        others.insert(other);
+                    }
+                }
+                Some((
+                    pane.clone(),
+                    BlockingMail {
+                        count,
+                        sender,
+                        other_senders: others.len(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Queued `blocking` messages for `pane` not yet escalated, marked
+    /// escalated as they are returned (ADR-0018 §4: once per message). Grouped
+    /// by sender, as `(sender, count)`, oldest sender first.
+    pub(crate) fn take_unescalated_blocking(&mut self, pane: &str) -> Vec<(String, usize)> {
+        let Some(queue) = self.queues.get(pane) else {
+            return Vec::new();
+        };
+        let mut by_sender: Vec<(String, usize)> = Vec::new();
+        for message in queue {
+            if message.intent != MsgIntent::Blocking
+                || !self.escalated.insert(message.correlation_id.clone())
+            {
+                continue;
+            }
+            let sender = sender_identity(message);
+            match by_sender.iter_mut().find(|(known, _)| *known == sender) {
+                Some((_, count)) => *count += 1,
+                None => by_sender.push((sender, 1)),
+            }
+        }
+        by_sender
+    }
+
     pub(crate) fn queued_infos(
         &self,
         pane: Option<&str>,
@@ -364,6 +510,16 @@ impl MailboxRegistry {
         messages.sort_by_key(|message| message.enqueued_at_ms);
         messages
     }
+}
+
+/// The name a label may show for a message's sender: the fleet-global
+/// identity where there is one, else the local pane, else an honest unknown.
+fn sender_identity(message: &PendingMessage) -> String {
+    message
+        .from_agent
+        .clone()
+        .or_else(|| message.from_pane.clone())
+        .unwrap_or_else(|| "unknown sender".to_string())
 }
 
 #[cfg(test)]
