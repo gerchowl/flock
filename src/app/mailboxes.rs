@@ -31,7 +31,24 @@ pub(crate) struct MailboxRegistry {
     /// thing to do with one across a restart is forget it — which fails OPEN,
     /// the only direction that cannot strand a message. Queues are the
     /// durable half; this is a live preference about interruptions.
-    mutes: HashMap<String, u64>,
+    mutes: HashMap<String, Mute>,
+    /// Correlation ids a muted recipient has already answered with a
+    /// deferral (ADR-0018 §3). "Exactly one" is enforced here, not by the
+    /// caller remembering: re-muting, extending a mute, or a restart
+    /// followed by a fresh mute must not tell the same sender twice.
+    ///
+    /// Unlike `mutes` this IS seeded from the durable log (`MessageDeferred`),
+    /// because forgetting it fails the wrong way — a duplicate answer, not a
+    /// missing one. Bounded with `seen`: an id evicted from the dedupe window
+    /// is evicted here too.
+    deferred: HashSet<String>,
+}
+
+/// A live receiver-side mute: when it lifts, and why, in the muter's words.
+#[derive(Debug, Clone)]
+struct Mute {
+    until_ms: u64,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +174,14 @@ impl MailboxRegistry {
                         meta.round_trips += 1;
                     }
                 }
+                // Only for an id still in the dedupe window: one that rotated
+                // out cannot be queued any more, so there is nothing left to
+                // answer twice.
+                EventData::MessageDeferred { correlation_id, .. }
+                    if self.seen.contains(correlation_id) =>
+                {
+                    self.deferred.insert(correlation_id.clone());
+                }
                 _ => {}
             }
         }
@@ -177,6 +202,7 @@ impl MailboxRegistry {
                 if let Some(oldest) = self.seen_order.pop_front() {
                     self.seen.remove(&oldest);
                     self.history.remove(&oldest);
+                    self.deferred.remove(&oldest);
                 }
             }
         }
@@ -309,22 +335,76 @@ impl MailboxRegistry {
     /// receiver asking for two hours has still said "not now"; answering with
     /// an error would leave it un-muted, which is the opposite of what it
     /// asked for and the kind of refusal an agent retries in a loop.
-    pub(crate) fn set_mute(&mut self, pane: &str, seconds: u64, now_ms: u64) -> u64 {
+    ///
+    /// `reason` replaces the previous one rather than accumulating: a renewed
+    /// mute says why NOW.
+    pub(crate) fn set_mute(
+        &mut self,
+        pane: &str,
+        seconds: u64,
+        now_ms: u64,
+        reason: Option<String>,
+    ) -> u64 {
         if seconds == 0 {
             self.mutes.remove(pane);
             return 0;
         }
         let until = now_ms.saturating_add(seconds.min(MAX_MUTE_SECONDS).saturating_mul(1000));
-        self.mutes.insert(pane.to_string(), until);
+        self.mutes.insert(
+            pane.to_string(),
+            Mute {
+                until_ms: until,
+                reason,
+            },
+        );
         until
+    }
+
+    /// The live mute's reason, if the pane is muted and gave one.
+    pub(crate) fn mute_reason(&mut self, pane: &str, now_ms: u64) -> Option<String> {
+        self.muted_until(pane, now_ms)?;
+        self.mutes.get(pane)?.reason.clone()
+    }
+
+    /// Messages queued for `pane` that a mute owes an answer (ADR-0018 §3):
+    /// every waking message not already answered. An `fyi` is never owed
+    /// one — nothing was asked, so there is nothing to defer.
+    pub(crate) fn owed_deferrals(&self, pane: &str) -> Vec<PendingMessage> {
+        self.queues
+            .get(pane)
+            .into_iter()
+            .flat_map(|queue| queue.iter())
+            .filter(|message| self.owes_deferral(message))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `message` still needs a deferral. The one predicate both
+    /// triggers — a mute being set, and a message arriving into one — ask,
+    /// so they cannot disagree about what is owed.
+    pub(crate) fn owes_deferral(&self, message: &PendingMessage) -> bool {
+        !matches!(message.intent, MsgIntent::Fyi)
+            && !self.deferred.contains(&message.correlation_id)
+    }
+
+    /// Record that `correlation_id` has been answered. Returns false when it
+    /// already was — the caller must then send nothing.
+    pub(crate) fn mark_deferred(&mut self, correlation_id: &str) -> bool {
+        self.deferred.insert(correlation_id.to_string())
+    }
+
+    /// Withdraw a claim whose answer never left: a cross-host deferral the
+    /// peer could not be reached for. Unclaimed, the next mute retries it.
+    pub(crate) fn unmark_deferred(&mut self, correlation_id: &str) {
+        self.deferred.remove(correlation_id);
     }
 
     /// The pane's live mute expiry, or `None` when it is not muted. Expired
     /// entries are dropped as they are read, so a pane that muted once does
     /// not hold an entry for the life of the server.
     pub(crate) fn muted_until(&mut self, pane: &str, now_ms: u64) -> Option<u64> {
-        match self.mutes.get(pane) {
-            Some(&until) if until > now_ms => Some(until),
+        match self.mutes.get(pane).map(|mute| mute.until_ms) {
+            Some(until) if until > now_ms => Some(until),
             Some(_) => {
                 self.mutes.remove(pane);
                 None
@@ -510,7 +590,7 @@ mod tests {
         let mut registry = MailboxRegistry::default();
         let now = 1_000_000;
 
-        let until = registry.set_mute("pane-1", MAX_MUTE_SECONDS * 4, now);
+        let until = registry.set_mute("pane-1", MAX_MUTE_SECONDS * 4, now, None);
         assert_eq!(
             until,
             now + MAX_MUTE_SECONDS * 1000,
@@ -518,7 +598,7 @@ mod tests {
         );
         assert_eq!(registry.muted_until("pane-1", now), Some(until));
 
-        assert_eq!(registry.set_mute("pane-1", 0, now), 0, "zero clears");
+        assert_eq!(registry.set_mute("pane-1", 0, now, None), 0, "zero clears");
         assert_eq!(registry.muted_until("pane-1", now), None);
     }
 
@@ -528,7 +608,7 @@ mod tests {
     fn an_expired_mute_is_swept_as_it_is_read() {
         let mut registry = MailboxRegistry::default();
         let now = 1_000_000;
-        let until = registry.set_mute("pane-1", 60, now);
+        let until = registry.set_mute("pane-1", 60, now, None);
 
         assert_eq!(registry.muted_until("pane-1", until - 1), Some(until));
         assert_eq!(

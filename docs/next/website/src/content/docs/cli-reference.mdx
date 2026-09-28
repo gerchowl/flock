@@ -253,6 +253,7 @@ flk lineage <target> [--json]
 flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply] [--correlation-id ID] [--reply-to ID] [-- <text starting with dashes>]
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply] [-- <text starting with dashes>]
 flk msg list [--pane TARGET]
+flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
 flk checks list
 flk checks ack <name>
 flk checks run <name>
@@ -379,7 +380,7 @@ Exposed tools:
 | `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
-| `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. |
+| `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Same seen caveat as `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
 

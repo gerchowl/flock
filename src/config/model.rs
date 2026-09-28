@@ -1088,6 +1088,11 @@ pub struct MsgConfig {
     /// against no threat model. Narrow it when that stops being true:
     /// `allow_from = ["mba22"]`.
     pub allow_from: Vec<String>,
+    /// Longest `reason` a mute may carry, in characters (ADR-0018 §3).
+    /// Longer is truncated, not refused: the reason is quoted to every
+    /// sender the mute defers, so it is bounded like any other body, and a
+    /// mute must never fail over its own explanation. Default: 200.
+    pub mute_reason_max_chars: usize,
 }
 
 impl Default for MsgConfig {
@@ -1095,6 +1100,7 @@ impl Default for MsgConfig {
         Self {
             enabled: true,
             allow_from: vec!["*".to_string()],
+            mute_reason_max_chars: 200,
         }
     }
 }
@@ -1468,6 +1474,7 @@ mod tests {
         let narrowed = super::MsgConfig {
             enabled: true,
             allow_from: vec!["mba22".into()],
+            ..Default::default()
         };
         assert!(narrowed.accepts_from(Some("mba22")));
         assert!(
@@ -1483,6 +1490,7 @@ mod tests {
         let closed = super::MsgConfig {
             enabled: false,
             allow_from: vec!["*".into()],
+            ..Default::default()
         };
         assert!(!closed.accepts_from(Some("mba22")));
         assert!(
