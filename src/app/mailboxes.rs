@@ -39,9 +39,27 @@ pub(crate) struct MailboxRegistry {
     ///
     /// Unlike `mutes` this IS seeded from the durable log (`MessageDeferred`),
     /// because forgetting it fails the wrong way — a duplicate answer, not a
-    /// missing one. Bounded with `seen`: an id evicted from the dedupe window
-    /// is evicted here too.
+    /// missing one.
+    ///
+    /// A mark lives exactly as long as its message is QUEUED — dropped when
+    /// it is read or expires, and never by the `seen` window. That window is
+    /// the newest `MAX_SEEN` ids server-wide, while a question can wait up to
+    /// `UNDELIVERED_TTL_MS`; tying the mark to the window let a busy fleet
+    /// evict the mark of a question still sitting in an inbox, and the next
+    /// mute answered it again. Queue lifetime bounds the set just as well:
+    /// it can never hold more than the queues do.
     deferred: HashSet<String>,
+    /// Cross-host deferral hops waiting for a slot, and how many are running.
+    /// See `App::pump_deferral_hops`.
+    deferral_hops: VecDeque<DeferralHop>,
+    deferral_hops_running: usize,
+}
+
+/// One cross-host deferral waiting to be sent (ADR-0018 §3).
+pub(crate) struct DeferralHop {
+    pub peer: crate::config::PeerConfig,
+    pub body: String,
+    pub relay: crate::events::MsgDeferralRelay,
 }
 
 /// A live receiver-side mute: when it lifts, and why, in the muter's words.
@@ -150,6 +168,7 @@ impl MailboxRegistry {
                     order.push(correlation_id.clone());
                 }
                 EventData::MessageDelivered { correlation_id, .. } => {
+                    self.deferred.remove(correlation_id);
                     if let Some(message) = queued.remove(correlation_id) {
                         let root = message
                             .in_reply_to
@@ -174,11 +193,11 @@ impl MailboxRegistry {
                         meta.round_trips += 1;
                     }
                 }
-                // Only for an id still in the dedupe window: one that rotated
-                // out cannot be queued any more, so there is nothing left to
-                // answer twice.
+                // Only while the message is still pending: a mark outlives
+                // nothing but its queue entry, and the `MessageDelivered`
+                // arm above drops it when that entry goes.
                 EventData::MessageDeferred { correlation_id, .. }
-                    if self.seen.contains(correlation_id) =>
+                    if queued.contains_key(correlation_id) =>
                 {
                     self.deferred.insert(correlation_id.clone());
                 }
@@ -202,7 +221,6 @@ impl MailboxRegistry {
                 if let Some(oldest) = self.seen_order.pop_front() {
                     self.seen.remove(&oldest);
                     self.history.remove(&oldest);
-                    self.deferred.remove(&oldest);
                 }
             }
         }
@@ -256,7 +274,9 @@ impl MailboxRegistry {
     /// message had to go back on the front. A pull read cannot half-fail —
     /// the recipient either took the message or never asked (ADR-0008).
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
-        self.queues.get_mut(pane_id)?.pop_front()
+        let message = self.queues.get_mut(pane_id)?.pop_front()?;
+        self.deferred.remove(&message.correlation_id);
+        Some(message)
     }
 
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
@@ -320,6 +340,7 @@ impl MailboxRegistry {
                 now_ms.saturating_sub(message.enqueued_at_ms) > UNDELIVERED_TTL_MS
             }) {
                 if let Some(message) = queue.pop_front() {
+                    self.deferred.remove(&message.correlation_id);
                     expired.push(message);
                 }
             }
@@ -391,6 +412,23 @@ impl MailboxRegistry {
     /// already was — the caller must then send nothing.
     pub(crate) fn mark_deferred(&mut self, correlation_id: &str) -> bool {
         self.deferred.insert(correlation_id.to_string())
+    }
+
+    pub(crate) fn push_deferral_hop(&mut self, hop: DeferralHop) {
+        self.deferral_hops.push_back(hop);
+    }
+
+    /// Hand out as many queued hops as fit under `cap` running at once, and
+    /// count them as running.
+    pub(crate) fn start_deferral_hops(&mut self, cap: usize) -> Vec<DeferralHop> {
+        let free = cap.saturating_sub(self.deferral_hops_running);
+        let take = free.min(self.deferral_hops.len());
+        self.deferral_hops_running += take;
+        self.deferral_hops.drain(..take).collect()
+    }
+
+    pub(crate) fn finish_deferral_hop(&mut self) {
+        self.deferral_hops_running = self.deferral_hops_running.saturating_sub(1);
     }
 
     /// Withdraw a claim whose answer never left: a cross-host deferral the
@@ -633,6 +671,131 @@ mod tests {
         assert_eq!(registry.queued_len("pane-1"), 2);
         assert_eq!(registry.queued_len("pane-2"), 1);
         assert_eq!(registry.queued_len("pane-3"), 0);
+    }
+
+    fn question(correlation: &str, to: &str) -> PendingMessage {
+        PendingMessage {
+            intent: MsgIntent::NeedsReply,
+            ..message(correlation, to)
+        }
+    }
+
+    /// Review of #411: the dedupe window is the newest `MAX_SEEN` ids
+    /// server-wide, and a question can wait far longer than it takes a busy
+    /// fleet to push its id out. Its deferral mark must survive that — it
+    /// belongs to the queue entry, not to the window.
+    #[test]
+    fn a_deferral_mark_outlives_the_dedupe_window_while_its_message_waits() {
+        let mut registry = MailboxRegistry::default();
+        let waiting = question("c-waiting", "pane-muted");
+        registry.enqueue(waiting.clone());
+        assert!(registry.mark_deferred("c-waiting"));
+
+        // Push c-waiting out of the seen window, spreading the traffic over
+        // enough panes that no mailbox fills.
+        for index in 0..=MAX_SEEN {
+            let pane = format!("pane-{}", index / MAX_QUEUED_PER_PANE);
+            assert_eq!(
+                registry.enqueue(message(&format!("c-noise-{index}"), &pane)),
+                EnqueueOutcome::Queued
+            );
+        }
+        assert!(
+            !registry.seen.contains("c-waiting"),
+            "precondition: the id has left the dedupe window"
+        );
+        assert_eq!(registry.queued_len("pane-muted"), 1, "but is still queued");
+
+        assert!(
+            !registry.owes_deferral(&waiting),
+            "a question still in an inbox keeps its mark, or a re-mute answers it twice"
+        );
+        assert!(registry.owed_deferrals("pane-muted").is_empty());
+
+        // Once read, the entry — and with it the mark — is gone.
+        registry.pop_next("pane-muted").expect("still queued");
+        assert!(!registry.deferred.contains("c-waiting"));
+    }
+
+    /// The seed keeps a mark exactly while its message is still pending.
+    #[test]
+    fn a_seeded_deferral_mark_follows_its_message_out_of_the_queue() {
+        let deferred_event = |correlation: &str| EventEnvelope {
+            event: EventKind::MessageDeferred,
+            data: EventData::MessageDeferred {
+                correlation_id: correlation.into(),
+                deferral_correlation_id: format!("{correlation}:deferred"),
+                pane: "w1:p2".into(),
+                muted_until_ms: 10,
+                reason: None,
+                route: None,
+                deferred_at_ms: 2,
+            },
+        };
+        let waiting = question("c-waiting", "w1:p2");
+        let read = question("c-read", "w1:p2");
+        let events = [
+            queued_event(&waiting),
+            queued_event(&read),
+            deferred_event("c-waiting"),
+            deferred_event("c-read"),
+            delivered_event("c-read"),
+        ];
+        let mut registry = MailboxRegistry::default();
+        registry.seed_from_events(events.iter());
+
+        assert!(
+            !registry.owes_deferral(&waiting),
+            "still queued, still answered"
+        );
+        assert!(
+            !registry.deferred.contains("c-read"),
+            "a read message holds no mark"
+        );
+    }
+
+    /// Review of #411: one mute can owe a whole inbox of cross-host
+    /// deferrals. They go out at most `cap` at a time, in order, and a
+    /// finished hop frees exactly one slot.
+    #[test]
+    fn deferral_hops_are_capped_and_start_in_order() {
+        let hop = |correlation: &str| DeferralHop {
+            peer: crate::config::PeerConfig::default(),
+            body: String::new(),
+            relay: crate::events::MsgDeferralRelay {
+                correlation_id: correlation.into(),
+                deferral_correlation_id: format!("{correlation}:deferred"),
+                pane: "w1:p2".into(),
+                muted_until_ms: 0,
+                reason: None,
+                from_agent: "agent_a".into(),
+                to_agent: "agent_b".into(),
+                to_host: "far".into(),
+                route: "far".into(),
+                result: Ok(()),
+            },
+        };
+        let ids = |hops: Vec<DeferralHop>| -> Vec<String> {
+            hops.into_iter()
+                .map(|hop| hop.relay.correlation_id)
+                .collect()
+        };
+        let mut registry = MailboxRegistry::default();
+        for index in 0..5 {
+            registry.push_deferral_hop(hop(&format!("c-{index}")));
+        }
+
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-0", "c-1"]);
+        assert!(
+            registry.start_deferral_hops(2).is_empty(),
+            "no slot until one finishes"
+        );
+        registry.finish_deferral_hop();
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-2"]);
+        registry.finish_deferral_hop();
+        registry.finish_deferral_hop();
+        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-3", "c-4"]);
+        assert!(registry.start_deferral_hops(2).is_empty(), "queue drained");
     }
 
     #[test]

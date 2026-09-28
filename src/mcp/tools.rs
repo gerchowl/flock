@@ -189,6 +189,9 @@ pub(super) fn table() -> &'static [Tool] {
                           `fyi` reply saying you deferred it, your `reason` \
                           if you give one, and the exact time the mute lifts \
                           — so give a reason and do answer after it lifts. \
+                          The result's `deferred` counts deferrals SENT, not \
+                          delivered: one to another host can still fail its \
+                          hop, and is then retried by your next mute. \
                           `seconds: 0` clears it and tells nobody anything. \
                           Omit `pane` to mute yourself.",
             input_schema: schema_msg_mute,

@@ -2004,8 +2004,11 @@ pub enum ResponseResult {
         /// When the mute expires, in ms since epoch; 0 when it was cleared.
         muted_until_ms: u64,
         /// How many already-waiting senders this mute answered with a
-        /// deferral (ADR-0018 §3). A sender on another host counts once its
-        /// answer is dispatched, not once it lands.
+        /// deferral (ADR-0018 §3). NOT a delivery count: a local sender's
+        /// deferral is in its inbox, but one to another host counts when it
+        /// is queued for its ssh hop, and that hop can still fail. A failed
+        /// hop is logged and its message re-owed, so the next mute retries
+        /// it.
         #[serde(default)]
         deferred: usize,
     },

@@ -1093,6 +1093,11 @@ pub struct MsgConfig {
     /// sender the mute defers, so it is bounded like any other body, and a
     /// mute must never fail over its own explanation. Default: 200.
     pub mute_reason_max_chars: usize,
+    /// How many mute deferrals to other hosts may be in flight at once
+    /// (ADR-0018 §3). Each is an ssh hop; one mute over a full inbox of
+    /// remote questions owes up to a mailbox's worth, and the rest wait for
+    /// a slot rather than opening that many sessions at once. Default: 4.
+    pub deferral_relay_concurrency: usize,
 }
 
 impl Default for MsgConfig {
@@ -1101,6 +1106,7 @@ impl Default for MsgConfig {
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,
+            deferral_relay_concurrency: 4,
         }
     }
 }

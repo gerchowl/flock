@@ -732,31 +732,54 @@ impl App {
                     route: peer.name.clone(),
                     result: Ok(()),
                 };
-                let event_tx = self.event_tx.clone();
-                let from_host = crate::app::short_host_name();
-                std::thread::spawn(move || {
-                    let result = crate::peers::send_peer_message(
-                        &peer,
-                        &relay.to_agent,
-                        &relay.from_agent,
-                        &from_host,
-                        &body,
-                        &relay.deferral_correlation_id,
-                        Some(&relay.correlation_id),
-                        MsgIntent::Fyi,
-                    )
-                    .map_err(|failure| failure.message(&relay.to_host));
-                    let _ = event_tx.blocking_send(crate::events::AppEvent::MsgDeferralRelayed(
-                        crate::events::MsgDeferralRelay { result, ..relay },
-                    ));
-                });
+                self.mailboxes
+                    .push_deferral_hop(crate::app::mailboxes::DeferralHop { peer, body, relay });
+                self.pump_deferral_hops();
                 true
             }
         }
     }
 
+    /// Start queued cross-host deferral hops, up to
+    /// `[msg] deferral_relay_concurrency` at once.
+    ///
+    /// Bounded because one mute can owe many: a mute over a full inbox of
+    /// remote questions is 32 hops, and one thread per hop would be 32
+    /// concurrent ssh sessions, most of them to the same few hosts. The rest
+    /// wait in FIFO order and start as earlier hops finish.
+    fn pump_deferral_hops(&mut self) {
+        let cap = self.state.config.msg.deferral_relay_concurrency.max(1);
+        for hop in self.mailboxes.start_deferral_hops(cap) {
+            let crate::app::mailboxes::DeferralHop { peer, body, relay } = hop;
+            let event_tx = self.event_tx.clone();
+            let from_host = crate::app::short_host_name();
+            std::thread::spawn(move || {
+                let result = crate::peers::send_peer_message(
+                    &peer,
+                    &relay.to_agent,
+                    &relay.from_agent,
+                    &from_host,
+                    &body,
+                    &relay.deferral_correlation_id,
+                    Some(&relay.correlation_id),
+                    MsgIntent::Fyi,
+                )
+                .map_err(|failure| failure.message(&relay.to_host));
+                let _ = event_tx.blocking_send(crate::events::AppEvent::MsgDeferralRelayed(
+                    crate::events::MsgDeferralRelay { result, ..relay },
+                ));
+            });
+        }
+    }
+
     /// Record the outcome of a cross-host deferral's hop.
     pub(crate) fn handle_msg_deferral_relayed(&mut self, relay: crate::events::MsgDeferralRelay) {
+        self.mailboxes.finish_deferral_hop();
+        self.record_deferral_hop(relay);
+        self.pump_deferral_hops();
+    }
+
+    fn record_deferral_hop(&mut self, relay: crate::events::MsgDeferralRelay) {
         if let Err(detail) = &relay.result {
             tracing::warn!(
                 correlation_id = relay.correlation_id.as_str(),
