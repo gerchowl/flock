@@ -341,21 +341,25 @@ impl MailboxRegistry {
         self.queues.get(pane).map_or(0, VecDeque::len)
     }
 
-    /// Every pane holding at least one message worth waking an agent for,
-    /// paired with those messages' correlation ids (ADR-0018 §1). The idle
-    /// wake's per-tick question, answered from memory alone.
-    pub(crate) fn wakeable_by_pane(&self) -> Vec<(String, Vec<String>)> {
+    /// Panes holding at least one message worth waking an agent for
+    /// (ADR-0018 §1). The idle wake's per-tick question, answered from memory
+    /// and without allocating.
+    pub(crate) fn wakeable_panes(&self) -> impl Iterator<Item = &str> {
         self.queues
             .iter()
-            .filter_map(|(pane, queue)| {
-                let ids: Vec<String> = queue
-                    .iter()
-                    .filter(|message| intent_wakes(message.intent))
-                    .map(|message| message.correlation_id.clone())
-                    .collect();
-                (!ids.is_empty()).then(|| (pane.clone(), ids))
-            })
-            .collect()
+            .filter(|(_, queue)| queue.iter().any(|message| intent_wakes(message.intent)))
+            .map(|(pane, _)| pane.as_str())
+    }
+
+    /// Correlation ids of one pane's queued messages that may wake it.
+    pub(crate) fn wakeable_ids(&self, pane: &str) -> Vec<String> {
+        self.queues.get(pane).map_or_else(Vec::new, |queue| {
+            queue
+                .iter()
+                .filter(|message| intent_wakes(message.intent))
+                .map(|message| message.correlation_id.clone())
+                .collect()
+        })
     }
 
     pub(crate) fn queued_infos(

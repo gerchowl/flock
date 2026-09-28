@@ -109,6 +109,32 @@ pub(super) fn has_prompt_box(content: &str) -> bool {
         .any(|line| line.trim_start().starts_with('❯'))
 }
 
+/// What is typed into Claude's input box: the `❯` line's text plus any
+/// continuation lines up to the bottom border, whitespace-trimmed. `None`
+/// when no prompt box is on screen.
+pub(in crate::detect) fn prompt_input(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let top_border_index = claude_prompt_box_top_border_index(&lines)?;
+    let body: Vec<&str> = lines[top_border_index + 1..]
+        .iter()
+        .take_while(|line| !is_horizontal_rule(line))
+        .copied()
+        .collect();
+    let start = body
+        .iter()
+        .position(|line| line.trim_start().starts_with('❯'))?;
+    let mut typed = String::new();
+    for (offset, line) in body[start..].iter().enumerate() {
+        let line = if offset == 0 {
+            line.trim_start().trim_start_matches('❯')
+        } else {
+            line
+        };
+        typed.push_str(line.trim());
+    }
+    Some(typed)
+}
+
 /// Claude uses the same generic Select and Dialog widgets for both
 /// permission flows and ordinary slash/settings menus. Match only the
 /// permission and interview prompts that actually need user input.

@@ -20,6 +20,17 @@ const MARKER: &str = "ZEBRA-7731-sender-words";
 
 const GAP: Duration = crate::cli::pane::PANE_RUN_SUBMIT_GAP;
 
+/// Claude's input box, as the pane would draw it, with `typed` in it.
+fn claude_screen(typed: &str) -> Vec<u8> {
+    let rule = "─".repeat(40);
+    format!("\x1b[2J\x1b[HTask complete.\r\n{rule}\r\n❯ {typed}\r\n{rule}\r\n").into_bytes()
+}
+
+fn runtime(app: &App) -> &crate::terminal::TerminalRuntime {
+    app.lookup_runtime_sender(1, app.state.workspaces[1].focused_pane_id().unwrap())
+        .unwrap()
+}
+
 struct Rig {
     app: App,
     /// The recipient pane's public id.
@@ -41,6 +52,7 @@ fn rig() -> Rig {
     let mut recipient = crate::workspace::Workspace::test_new("beta");
     let focused = recipient.focused_pane_id().expect("pane");
     let (runtime, pty) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    runtime.test_process_pty_bytes(&claude_screen(""));
     recipient.tabs[0].runtimes.insert(focused, runtime);
     app.state.workspaces = vec![sender, recipient];
     app.state.ensure_test_terminals();
@@ -400,9 +412,7 @@ async fn operator_input_over_the_api_holds_the_wake_for_the_quiet_window() {
 
     // Once the operator has been quiet for the window, the wake goes.
     let quiet = Duration::from_millis(app.state.config.msg.idle_wake_operator_quiet_ms);
-    let runtime = app
-        .lookup_runtime_sender(1, app.state.workspaces[1].focused_pane_id().unwrap())
-        .unwrap();
+    let runtime = runtime(&app);
     runtime.test_stamp_operator_input_at(Instant::now() - quiet - Duration::from_secs(1));
     app.tick_idle_wakes(Instant::now());
     assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
@@ -442,9 +452,7 @@ async fn flocks_own_wake_does_not_count_as_operator_input() {
     tick_past_gap(&mut app);
     assert_eq!(drain(&mut pty).len(), 2, "sentence, then Enter");
 
-    let runtime = app
-        .lookup_runtime_sender(1, app.state.workspaces[1].focused_pane_id().unwrap())
-        .unwrap();
+    let runtime = runtime(&app);
     assert_eq!(
         runtime.last_operator_input_at(),
         None,
@@ -530,4 +538,85 @@ fn the_sentence_is_the_adr_constant() {
         "You have 2 unread message(s) from other agents. Read them with the \
          `flock_msg_read` tool."
     );
+}
+
+#[tokio::test]
+async fn a_draft_left_in_the_prompt_is_never_typed_next_to() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    // Typed long ago — outside any quiet window — and never sent.
+    runtime(&app).test_process_pty_bytes(&claude_screen("half a thought"));
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    tick_past_gap(&mut app);
+    assert!(
+        drain(&mut pty).is_empty(),
+        "the Enter would have submitted someone's draft with flock's sentence"
+    );
+}
+
+#[tokio::test]
+async fn a_screen_that_goes_stale_inside_the_gap_gets_no_enter() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    assert_eq!(drain(&mut pty).len(), 1, "sentence typed");
+
+    // The Enter comes due long after the last screen observation.
+    let fresh = Duration::from_millis(app.state.config.msg.idle_wake_fresh_ms);
+    app.tick_idle_wakes(Instant::now() + fresh + GAP + Duration::from_millis(5));
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn reading_the_inbox_inside_the_gap_drops_the_enter() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    assert_eq!(drain(&mut pty).len(), 1);
+    read_inbox(&mut app, &pane);
+    tick_past_gap(&mut app);
+    assert!(drain(&mut pty).is_empty());
+}
+
+/// A message relayed in from another host arrives as a `msg.send` carrying
+/// the far sender's identity, and must wake exactly as a local one does — on
+/// the recipient's own server, where its state is known (ADR-0018 §5).
+#[tokio::test]
+async fn a_message_relayed_from_another_host_wakes_the_same_way() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let response = app.handle_api_request(Request {
+        id: "req".into(),
+        method: Method::MsgSend(MsgSendParams {
+            from_agent: Some("agent_anvil_far".into()),
+            from_host: Some("anvil".into()),
+            to: MessageTarget::Pane { pane: pane.clone() },
+            body: format!("from the other host: {MARKER}"),
+            correlation_id: Some("relayed-1".into()),
+            in_reply_to: None,
+            intent: MsgIntent::NeedsReply,
+        }),
+    });
+    assert!(response.contains("\"queued\""), "{response}");
+    let typed = drain(&mut pty);
+    assert_eq!(typed, vec![super::idle_wake_text(1).into_bytes()]);
+    assert!(!String::from_utf8_lossy(&typed[0]).contains("anvil"));
+    tick_past_gap(&mut app);
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
 }

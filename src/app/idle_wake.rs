@@ -100,20 +100,25 @@ impl App {
         if !self.state.config.msg.idle_wake {
             return;
         }
-        let ids = self
-            .mailboxes
-            .wakeable_by_pane()
-            .into_iter()
-            .find(|(queued_for, _)| queued_for == pane)
-            .map(|(_, ids)| ids);
-        if let Some(ids) = ids {
+        let ids = self.mailboxes.wakeable_ids(pane);
+        if !ids.is_empty() {
             self.evaluate_idle_wake(pane, &ids, Instant::now());
         }
     }
 
-    /// The agent read its inbox: whatever was in flight has landed.
+    /// The agent read its inbox: whatever was in flight has landed. A wake
+    /// whose Enter was still pending is dropped here, and that is logged like
+    /// every other withheld Enter — its sentence is still in the prompt.
     pub(crate) fn idle_wake_on_read(&mut self, pane: &str) {
-        self.idle_wake.panes.remove(pane);
+        let pending_enter = self
+            .idle_wake
+            .panes
+            .remove(pane)
+            .and_then(|entry| entry.in_flight)
+            .is_some_and(|flight| flight.submit_at.is_some());
+        if pending_enter {
+            crate::logging::idle_wake_abandoned(pane, "inbox_read");
+        }
     }
 
     /// The loop tick — messages that became wakeable later (a mute expired,
@@ -124,18 +129,32 @@ impl App {
             self.idle_wake = IdleWakeTracker::default();
             return;
         }
-        let candidates = self.mailboxes.wakeable_by_pane();
+        self.idle_wake.next_deadline = None;
+        // Only panes this could ever type into. Mail for an agent without the
+        // inbox tool can sit for hours, and must not cost a scan of its ids
+        // on every tick of that time.
+        let candidates: Vec<String> = self
+            .mailboxes
+            .wakeable_panes()
+            .filter(|pane| self.pane_has_inbox_tool(pane))
+            .map(str::to_owned)
+            .collect();
         if candidates.is_empty() && self.idle_wake.panes.is_empty() {
-            self.idle_wake.next_deadline = None;
             return;
         }
-        self.idle_wake.next_deadline = None;
         self.idle_wake
             .panes
-            .retain(|pane, _| candidates.iter().any(|(queued_for, _)| queued_for == pane));
-        for (pane, ids) in candidates {
+            .retain(|pane, _| candidates.iter().any(|candidate| candidate == pane));
+        for pane in candidates {
+            let ids = self.mailboxes.wakeable_ids(&pane);
             self.evaluate_idle_wake(&pane, &ids, now);
         }
+    }
+
+    fn pane_has_inbox_tool(&self, pane: &str) -> bool {
+        self.parse_pane_id(pane)
+            .and_then(|(ws_idx, pane_id)| self.terminal_for_pane(ws_idx, pane_id))
+            .is_some_and(|terminal| has_inbox_tool(terminal.effective_known_agent()))
     }
 
     fn evaluate_idle_wake(&mut self, pane: &str, wakeable_ids: &[String], now: Instant) {
@@ -238,7 +257,8 @@ impl App {
         let Some(terminal) = self.terminal_for_pane(ws_idx, pane_id) else {
             return Decision::Suppressed("pane_gone");
         };
-        if !has_inbox_tool(terminal.effective_known_agent()) {
+        let agent = terminal.effective_known_agent();
+        if !has_inbox_tool(agent) {
             return Decision::Suppressed("no_inbox_tool");
         }
         if let Some(blocker) = terminal.idle_wake_blocker(now, settle, fresh) {
@@ -259,6 +279,17 @@ impl App {
                 self.idle_wake.note_deadline(quiet_until);
                 return Decision::Suppressed("operator_active");
             }
+        }
+        // Quiet is not the same as empty: a draft typed and left an hour ago
+        // is still in the box, and the Enter would submit it together with
+        // the sentence. Read off the screen here, at the keystroke, never on
+        // the tick.
+        match agent
+            .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
+        {
+            Some(true) => {}
+            Some(false) => return Decision::Suppressed("prompt_not_empty"),
+            None => return Decision::Suppressed("no_prompt_box"),
         }
 
         let count = self.mailboxes.queued_len(pane);
@@ -285,9 +316,19 @@ impl App {
 
     /// Press Enter on a wake typed one gap ago — after checking, once more,
     /// that nothing changed underneath it. A human who typed into the pane
-    /// since, or an agent that is no longer idle, gets no Enter: the sentence
-    /// is left in the prompt for whoever is there to keep or delete, which is
-    /// recoverable. Submitting a prompt a human was editing is not.
+    /// since, or an agent that is no longer fresh-and-idle, gets no Enter:
+    /// the sentence is left in the prompt for whoever is there to keep or
+    /// delete, which is recoverable. Submitting a prompt a human was editing
+    /// is not.
+    ///
+    /// Flock does NOT try to erase an abandoned sentence. It knows what it
+    /// wrote, but not what the agent made of it — a TUI may collapse a paste
+    /// into a single chip — so a counted run of backspaces could eat into
+    /// whatever sits before it. The wake also stays in flight after an
+    /// abandon, which fails safe: nothing more is typed into that pane until
+    /// its agent leaves `Idle` or reads its inbox, and even then the
+    /// empty-prompt gate refuses to type next to a sentence still sitting
+    /// there.
     fn submit_idle_wake(
         &mut self,
         pane: &str,
@@ -316,11 +357,16 @@ impl App {
         if let Some(suppression) = self.wake_suppression(pane, super::api::messages::now_ms()) {
             return abandon(self, suppression.reason);
         }
-        let still_idle = self
-            .terminal_for_pane(ws_idx, pane_id)
-            .is_some_and(|terminal| terminal.state == AgentState::Idle);
-        if !still_idle {
-            return abandon(self, "not_idle");
+        // The full freshness check, not just `state == Idle`: a screen that
+        // went stale or unreadable inside the gap is not evidence either. The
+        // settle is already proven, so it is not asked again.
+        let fresh = Duration::from_millis(self.state.config.msg.idle_wake_fresh_ms);
+        let blocker = match self.terminal_for_pane(ws_idx, pane_id) {
+            Some(terminal) => terminal.idle_wake_blocker(now, Duration::ZERO, fresh),
+            None => Some("pane_gone"),
+        };
+        if let Some(blocker) = blocker {
+            return abandon(self, blocker);
         }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return abandon(self, "pane_gone");
