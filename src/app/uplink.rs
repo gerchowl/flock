@@ -126,16 +126,33 @@ pub(crate) struct Uplink {
     takes: Vec<ParkedTake>,
     last_take_at: Option<Instant>,
     pending_park: Option<Park>,
+    /// Set only while the HUB runs `msg.send` for a frame a spoke handed up:
+    /// the configured `[[peers]]` name of that spoke. In-process on purpose —
+    /// the "this sender's host was vouched for" fact must never be readable
+    /// from wire params, or any caller could assert it.
+    vouched_origin: Option<String>,
 }
 
 impl Uplink {
     /// Whether a hub is holding a relay into this server right now.
+    ///
+    /// A live relay re-asks the instant a take is answered, so one heartbeat
+    /// since the last take is enough slack; anything longer only makes a send
+    /// behind a dead relay wait longer to be told so.
     pub(crate) fn is_attached(&self, now: Instant, heartbeat: Duration) -> bool {
         if !self.takes.is_empty() {
             return true;
         }
         self.last_take_at
-            .is_some_and(|at| now.saturating_duration_since(at) <= heartbeat * 2)
+            .is_some_and(|at| now.saturating_duration_since(at) <= heartbeat)
+    }
+
+    pub(crate) fn set_vouched_origin(&mut self, host: Option<String>) {
+        self.vouched_origin = host;
+    }
+
+    pub(crate) fn vouched_origin(&self) -> Option<&str> {
+        self.vouched_origin.as_deref()
     }
 
     /// Queue a frame for the hub and park its sender.
@@ -250,13 +267,28 @@ impl Uplink {
         self.sends.remove(uplink_id)
     }
 
-    /// Everything whose deadline has passed.
-    pub(crate) fn expire(&mut self, now: Instant) -> Expired {
+    /// Everything whose deadline has passed — and every send no relay ever
+    /// took once no relay is attached any more: nothing will carry it, so
+    /// waiting out its full timeout only delays the same answer.
+    pub(crate) fn expire(&mut self, now: Instant, heartbeat: Duration) -> Expired {
         let mut expired = Expired::default();
+        let (takes, kept): (Vec<ParkedTake>, Vec<ParkedTake>) = std::mem::take(&mut self.takes)
+            .into_iter()
+            .partition(|take| now >= take.deadline);
+        self.takes = kept;
+        expired.takes = takes;
+        let attached = self.is_attached(now, heartbeat);
+        let untaken = |uplink_id: &str, outbound: &VecDeque<Outbound>| {
+            outbound
+                .iter()
+                .any(|pending| pending.frame.uplink_id == uplink_id && pending.offered_at.is_none())
+        };
         let due: Vec<String> = self
             .sends
             .iter()
-            .filter(|(_, send)| now >= send.deadline)
+            .filter(|(uplink_id, send)| {
+                now >= send.deadline || (!attached && untaken(uplink_id, &self.outbound))
+            })
             .map(|(uplink_id, _)| uplink_id.clone())
             .collect();
         for uplink_id in due {
@@ -273,11 +305,6 @@ impl Uplink {
                 expired.sends.push((send, taken));
             }
         }
-        let (due, kept): (Vec<ParkedTake>, Vec<ParkedTake>) = std::mem::take(&mut self.takes)
-            .into_iter()
-            .partition(|take| now >= take.deadline);
-        self.takes = kept;
-        expired.takes = due;
         expired
     }
 
@@ -349,15 +376,15 @@ mod tests {
         // Parked: attached for as long as it is parked.
         assert!(uplink.is_attached(then + HEARTBEAT * 5, HEARTBEAT));
 
-        let expired = uplink.expire(then + HEARTBEAT);
+        let expired = uplink.expire(then + HEARTBEAT, HEARTBEAT);
         assert_eq!(expired.takes.len(), 1, "the parked take is answered empty");
         assert!(
             uplink.is_attached(then + HEARTBEAT, HEARTBEAT),
             "and the relay is still counted while it has time to ask again"
         );
         assert!(
-            !uplink.is_attached(then + HEARTBEAT * 3, HEARTBEAT),
-            "but not once it has gone two windows without asking"
+            !uplink.is_attached(then + HEARTBEAT * 2, HEARTBEAT),
+            "but not once it has gone a window without asking"
         );
     }
 
@@ -428,6 +455,24 @@ mod tests {
     }
 
     #[test]
+    fn a_send_no_relay_will_ever_take_fails_as_soon_as_the_relay_is_gone() {
+        // A relay that died leaves the send with nobody to carry it; the
+        // sender should hear that at once, not after the whole timeout.
+        let mut uplink = Uplink::default();
+        let now = Instant::now();
+        let _ = uplink.take("t".into(), &[], now, HEARTBEAT);
+        let _ = uplink.take_pending_park();
+        uplink.hand_up(frame("u1"), parked(now + HEARTBEAT * 10));
+        assert!(
+            uplink.expire(now, HEARTBEAT).sends.is_empty(),
+            "a relay that is still attached may yet take it"
+        );
+        let expired = uplink.expire(now + HEARTBEAT * 2, HEARTBEAT).sends;
+        assert_eq!(expired.len(), 1, "failed long before its own deadline");
+        assert!(!expired[0].1, "and reported as never taken");
+    }
+
+    #[test]
     fn a_timed_out_send_says_whether_any_hub_took_it_and_is_withdrawn() {
         let mut uplink = Uplink::default();
         let now = Instant::now();
@@ -441,7 +486,7 @@ mod tests {
         uplink.hand_up(frame("u-never"), untaken_send);
 
         let expired: HashMap<String, bool> = uplink
-            .expire(now + HEARTBEAT)
+            .expire(now + HEARTBEAT, HEARTBEAT)
             .sends
             .into_iter()
             .map(|(send, taken)| (send.correlation_id, taken))

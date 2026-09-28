@@ -91,7 +91,8 @@ impl App {
     /// Answer what has waited too long: takes (empty, so the relay asks again)
     /// and sends the hub never answered.
     pub(crate) fn expire_uplink(&mut self) {
-        let expired = self.uplink.expire(Instant::now());
+        let heartbeat = self.uplink_heartbeat();
+        let expired = self.uplink.expire(Instant::now(), heartbeat);
         for take in expired.takes {
             let response = encode_success(
                 take.request_id.clone(),
@@ -315,11 +316,16 @@ impl App {
         params: MsgUplinkForwardParams,
     ) -> String {
         let MsgUplinkForwardParams { spoke, mut message } = params;
-        let Some(summary) = self
+        // Bound to the edge THIS hub configured and dialled, never to what the
+        // spoke says about itself: a spoke's summary `host` is self-reported,
+        // so vouching against it would let a cloned or compromised spoke speak
+        // for any machine it chose to name (#213, one layer down).
+        let Some(peer) = self
             .state
-            .peer_summaries
+            .peers
             .iter()
-            .find(|summary| summary.peer.eq_ignore_ascii_case(&spoke))
+            .find(|peer| peer.name.eq_ignore_ascii_case(&spoke))
+            .cloned()
         else {
             return encode_error(
                 id,
@@ -329,20 +335,22 @@ impl App {
                 ),
             );
         };
-        let spoke_host = summary.host.clone().unwrap_or_else(|| summary.peer.clone());
-        match message.from_host.as_deref() {
-            Some(claimed) if claimed.eq_ignore_ascii_case(&spoke_host) => {}
-            claimed => {
-                return encode_error(
-                    id,
-                    "uplink_sender_mismatch",
-                    format!(
-                        "{spoke} (host {spoke_host}) handed up a message claiming to come from \
-                         {}; a spoke may only speak for its own host",
-                        claimed.unwrap_or("no host at all")
-                    ),
-                )
-            }
+        let claimed = message.from_host.clone().unwrap_or_default();
+        if let Err(why) = self.spoke_may_claim(&peer, &claimed) {
+            crate::logging::uplink_sender_refused(&peer.name, &claimed, &why);
+            return encode_error(
+                id,
+                "uplink_sender_mismatch",
+                format!(
+                    "{} handed up a message claiming to come from {}: {why}",
+                    peer.name,
+                    if claimed.is_empty() {
+                        "no host at all"
+                    } else {
+                        &claimed
+                    }
+                ),
+            );
         }
         if message.from_agent.is_none() {
             return encode_error(
@@ -351,14 +359,78 @@ impl App {
                 format!("{spoke} handed up a message with no sender identity"),
             );
         }
-        message.from_host = Some(spoke_host);
+        // What the recipient reads as the origin is the edge this hub
+        // CONFIGURED, not the name the spoke gave itself: the claim was only
+        // checked for consistency, the identity comes from config. The vouch
+        // then travels in-process, never on the wire.
+        message.from_host = Some(peer.name.clone());
         // The request came from this hub's own relay worker, not a pane: its
         // process ancestry is the server itself and attests nobody. Clearing
         // it is what keeps the hub from being stamped as the sender.
         let pid = self.current_api_peer_pid.take();
+        self.uplink.set_vouched_origin(message.from_host.clone());
         let response = self.handle_msg_send(id, message);
+        self.uplink.set_vouched_origin(None);
         self.current_api_peer_pid = pid;
         response
+    }
+
+    /// Whether a frame arriving over `peer`'s relay may claim `claimed` as its
+    /// host. The configured identity — the peer's name, or the host it is
+    /// dialled at — always may. The spoke's self-reported hostname may only
+    /// when no OTHER configured peer reports the same one: two edges claiming
+    /// one machine means at least one is lying, and the hub cannot tell which.
+    fn spoke_may_claim(
+        &self,
+        peer: &crate::config::PeerConfig,
+        claimed: &str,
+    ) -> Result<(), String> {
+        if claimed.is_empty() {
+            return Err("a frame must name its host".into());
+        }
+        let identity = |candidate: &crate::config::PeerConfig| {
+            let dialled = candidate.ssh_target();
+            let dialled_host = dialled.rsplit('@').next().unwrap_or(dialled);
+            claimed.eq_ignore_ascii_case(&candidate.name)
+                || claimed.eq_ignore_ascii_case(dialled_host)
+        };
+        if let Some(other) = self
+            .state
+            .peers
+            .iter()
+            .find(|other| !other.name.eq_ignore_ascii_case(&peer.name) && identity(other))
+        {
+            return Err(format!("that is the configured identity of {}", other.name));
+        }
+        if identity(peer) {
+            return Ok(());
+        }
+        let reports = |summary: &&crate::peers::PeerSummaryState| {
+            summary
+                .host
+                .as_deref()
+                .is_some_and(|host| host.eq_ignore_ascii_case(claimed))
+        };
+        let reporters: Vec<&str> = self
+            .state
+            .peer_summaries
+            .iter()
+            .filter(reports)
+            .map(|summary| summary.peer.as_str())
+            .collect();
+        match reporters.as_slice() {
+            [only] if only.eq_ignore_ascii_case(&peer.name) => Ok(()),
+            [] => Err(format!(
+                "that is not {}'s configured identity, and it has not reported that host",
+                peer.name
+            )),
+            [_] => Err(format!("{claimed} is another peer's host")),
+            many => Err(format!(
+                "{} peers ({}) report host {claimed}, so none of them can vouch for it",
+                many.len(),
+                many.join(", ")
+            )),
+        }
     }
 }
 
@@ -599,7 +671,19 @@ mod tests {
         // Pitfall 1: the hub must not launder identity. A frame that arrived
         // over the relay into `sage` may only speak for `sage`.
         let mut app = test_app();
-        app.state.peer_summaries = vec![peer_with_agent("sage", "sage", "agent_sage_1")];
+        app.state.peers = ["sage", "ksb"]
+            .into_iter()
+            .map(|name| crate::config::PeerConfig {
+                name: name.into(),
+                ..Default::default()
+            })
+            .collect();
+        // sage's own summary claims to BE ksb — a cloned VM, or a lie. The
+        // self-report must not be what the hub vouches against.
+        app.state.peer_summaries = vec![
+            peer_with_agent("sage", "ksb", "agent_sage_1"),
+            peer_with_agent("ksb", "ksb", "agent_ksb_1"),
+        ];
         let mut message = send_to("agent_nowhere_1");
         message.from_host = Some("ksb".into());
         let response = value(&app.handle_api_request(Request {
@@ -625,6 +709,10 @@ mod tests {
                 message,
             }),
         }));
+        assert!(
+            app.uplink.vouched_origin().is_none(),
+            "the vouch lives only for the forward it was made for"
+        );
         assert_eq!(
             response["error"]["code"], "msg_target_not_found",
             "{response}"
@@ -679,5 +767,52 @@ mod tests {
             method: Method::MsgSend(forwarded),
         }));
         assert_eq!(response["error"]["code"], "forward_limit", "{response}");
+    }
+
+    #[tokio::test]
+    async fn an_unattested_caller_cannot_make_a_relay_stamp_another_host() {
+        // Blocker B of the #414 review: only the in-process vouch from
+        // `msg.uplink_forward` may put a foreign host on a relayed message. A
+        // socket caller's own `from_host` is never believed by the relay.
+        let mut app = test_app();
+        let me = crate::app::short_host_name();
+        assert_eq!(app.relay_sender_host(false), me, "unvouched, unattested");
+        app.uplink.set_vouched_origin(Some("sage".into()));
+        assert_eq!(app.relay_sender_host(false), "sage", "vouched by the hub");
+        assert_eq!(
+            app.relay_sender_host(true),
+            me,
+            "a locally attested sender is always this host"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hub_stamps_the_configured_edge_not_the_spokes_self_report() {
+        // Blocker A: a spoke configured as `anvil` that calls itself `vm-dev`
+        // may hand up as vm-dev (its unique self-report), but what the hub
+        // vouches for is the edge it dialled.
+        let mut app = test_app();
+        app.state.peers = vec![crate::config::PeerConfig {
+            name: "anvil".into(),
+            ..Default::default()
+        }];
+        app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
+        let mut message = send_to("agent_vm-dev_1");
+        message.from_host = Some("vm-dev".into());
+        message.to = MessageTarget::Agent {
+            agent: "agent_nowhere_1".into(),
+        };
+        let response = value(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgUplinkForward(MsgUplinkForwardParams {
+                spoke: "anvil".into(),
+                message,
+            }),
+        }));
+        // Past the vouch, into ordinary delivery: a clean miss, not a refusal.
+        assert_eq!(
+            response["error"]["code"], "msg_target_not_found",
+            "{response}"
+        );
     }
 }

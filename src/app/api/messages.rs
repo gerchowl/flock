@@ -681,14 +681,7 @@ impl App {
 
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();
-        // The sender's host travels with it: this host when WE attested the
-        // sender, else what the caller asserted. Stamping our own name on a
-        // message we are only forwarding is how a hub would become the
-        // apparent sender (#410 pitfall 1, #213).
-        let from_host = match (&attested, &params.from_host) {
-            (None, Some(asserted)) => asserted.clone(),
-            _ => crate::app::short_host_name(),
-        };
+        let from_host = self.relay_sender_host(attested.is_some());
         let from_agent = attested.or_else(|| params.from_agent.clone());
         let Some(from_agent) = from_agent else {
             return encode_error(
@@ -791,6 +784,21 @@ impl App {
             .terminals
             .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
         Some(terminal.agent_id.to_string())
+    }
+
+    /// The sender host a relay stamps on a message it hands on.
+    ///
+    /// This host, unless the message is one a spoke handed up and the hub's
+    /// uplink handler vouched for its edge (#410) — then the spoke's host, so
+    /// the hub does not become the apparent sender (pitfall 1, #213). The
+    /// vouch is carried IN-PROCESS: an unattested socket caller's own
+    /// `from_host` is never believed here, or any process on this machine
+    /// could make a peer see a message "from" a host it never came from.
+    pub(super) fn relay_sender_host(&self, attested_locally: bool) -> String {
+        match self.uplink.vouched_origin() {
+            Some(vouched) if !attested_locally => vouched.to_string(),
+            _ => crate::app::short_host_name(),
+        }
     }
 
     /// A target this server could not place: hand it up to the hub when this

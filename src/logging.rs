@@ -3331,6 +3331,36 @@ pub(crate) fn uplink_result_undelivered(spoke: &str, uplink_id: &str, err: &str)
     );
 }
 
+/// A hub refused a frame whose claimed host its spoke edge cannot vouch for
+/// (#410). WARN: either a misconfigured spoke or one speaking for a machine it
+/// is not, and both deserve an operator's eyes.
+pub(crate) fn uplink_sender_refused(spoke: &str, claimed: &str, why: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.uplink.sender_refused",
+        subsystem = "peers",
+        outcome = "refused",
+        spoke,
+        claimed,
+        why,
+        "refused a handed-up message claiming a host its edge cannot vouch for"
+    );
+}
+
+/// A relay line carried a push kind this hub does not know (#410). Dropped
+/// rather than fed to the summary parser, where it would fail a poll.
+pub(crate) fn peer_push_unknown_kind(peer: &str, kind: &str) {
+    tracing::debug!(
+        target: "flock::peers",
+        event = "peer.push.unknown_kind",
+        subsystem = "peers",
+        outcome = "dropped",
+        peer,
+        kind,
+        "dropped a push of a kind this build does not know"
+    );
+}
+
 /// The relay's uplink pull stopped for good (#410): the local server refused
 /// `msg.uplink_take`, most likely because it predates it. WARN for the same
 /// reason as a refused push subscription — otherwise indistinguishable from a

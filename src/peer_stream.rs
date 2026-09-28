@@ -97,9 +97,31 @@ pub(crate) const UPLINK_PUSH: &str = "msg.uplink";
 /// Whether a push line is a message handed up rather than a summary. Parsed,
 /// like [`line_is_push`], never matched as text.
 fn push_is_uplink(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .is_ok_and(|value| value.get("push").and_then(|push| push.as_str()) == Some(UPLINK_PUSH))
+    push_kind(line).as_deref() == Some(UPLINK_PUSH)
 }
+
+/// The push kind a summary push carries.
+const SUMMARY_PUSH: &str = "peers.summary";
+
+fn push_kind(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("push")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Handed-up frames the hub will hold for one spoke before refusing more.
+///
+/// Bounds what a flooding (or compromised) spoke can cost the hub: frames past
+/// this are dropped and logged, and their senders time out with
+/// `taken_by_hub`, which is safe to retry. Far above any real message rate.
+const UPLINK_QUEUE_DEPTH: usize = 64;
+
+/// Frames forwarded concurrently per spoke. More than one, so a slow next hop
+/// (a whole ssh timeout) does not hold every other message behind it; few, so
+/// a flood cannot spawn a thread per frame.
+const UPLINK_FORWARD_WORKERS: usize = 4;
 
 /// Split the relay's inbound lines: pushes to the single-slot buffer, every
 /// other line to whoever is waiting on a response.
@@ -112,10 +134,11 @@ fn push_is_uplink(line: &str) -> bool {
 /// The dropped sender then disconnects the channel and every later request
 /// fails fast rather than waiting out the timeout.
 fn route_relay_lines<R: BufRead>(
+    peer: &str,
     reader: R,
     responses: &std::sync::mpsc::Sender<String>,
     push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
-    uplinks: &std::sync::mpsc::Sender<String>,
+    uplinks: &std::sync::mpsc::SyncSender<String>,
 ) {
     for line in reader.lines().map_while(Result::ok) {
         // #410: a message a spoke handed up is a push too, but NOT a summary.
@@ -125,7 +148,13 @@ fn route_relay_lines<R: BufRead>(
         // Checked first, so the summary path below keeps its at-most-one-per-
         // window shape untouched.
         if push_is_uplink(&line) {
-            let _ = uplinks.send(line);
+            if uplinks.try_send(line).is_err() {
+                crate::logging::uplink_result_undelivered(
+                    peer,
+                    "",
+                    "uplink queue full; frame dropped",
+                );
+            }
             continue;
         }
         // A push carries `push` where a response carries `id`, so routing
@@ -134,6 +163,12 @@ fn route_relay_lines<R: BufRead>(
         // JSON at all, which surfaces to the caller as a parse error rather
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
+            // A kind this build does not know is dropped, never fed to the
+            // summary parser, where it would fail the poll it answered.
+            if let Some(kind) = push_kind(&line).filter(|kind| kind != SUMMARY_PUSH) {
+                crate::logging::peer_push_unknown_kind(peer, &kind);
+                continue;
+            }
             if let Ok(mut slot) = push_slot.lock() {
                 *slot = Some((std::time::Instant::now(), line));
             }
@@ -174,21 +209,36 @@ impl PeerStream {
         let (tx, lines) = std::sync::mpsc::channel();
         let latest_push = Arc::new(Mutex::new(None));
         let push_slot = Arc::clone(&latest_push);
-        let (uplink_tx, uplink_rx) = std::sync::mpsc::channel::<String>();
+        let (uplink_tx, uplink_rx) = std::sync::mpsc::sync_channel::<String>(UPLINK_QUEUE_DEPTH);
+        let reader_peer = peer.name.clone();
         std::thread::spawn(move || {
-            route_relay_lines(BufReader::new(stdout), &tx, &push_slot, &uplink_tx);
+            route_relay_lines(
+                &reader_peer,
+                BufReader::new(stdout),
+                &tx,
+                &push_slot,
+                &uplink_tx,
+            );
         });
-        // One thread per handed-up frame, off the reader: forwarding runs the
-        // hub's own `msg.send`, which can spend a whole ssh timeout on the
-        // next hop, and the reader must keep delivering poll responses while
-        // it does.
-        let spoke = peer.clone();
-        std::thread::spawn(move || {
-            for line in uplink_rx {
-                let spoke = spoke.clone();
-                std::thread::spawn(move || forward_uplinked_frame(&spoke, &line));
-            }
-        });
+        // A small pool, off the reader: forwarding runs the hub's own
+        // `msg.send`, which can spend a whole ssh timeout on the next hop, and
+        // the reader must keep delivering poll responses while it does. The
+        // workers end when the reader does, dropping the queue's sender.
+        let uplink_rx = Arc::new(Mutex::new(uplink_rx));
+        for _ in 0..UPLINK_FORWARD_WORKERS {
+            let spoke = peer.clone();
+            let queue = Arc::clone(&uplink_rx);
+            std::thread::spawn(move || loop {
+                let next = match queue.lock() {
+                    Ok(queue) => queue.recv(),
+                    Err(_) => return,
+                };
+                let Ok(line) = next else {
+                    return;
+                };
+                forward_uplinked_frame(&spoke, &line);
+            });
+        }
 
         Ok(Self {
             child,
@@ -548,8 +598,8 @@ mod tests {
             r#"{"id":"stream-2","result":{"host":"anvil"}}"#,
             "\n",
         );
-        let (uplink_tx, _uplinks) = std::sync::mpsc::channel();
-        route_relay_lines(Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
+        route_relay_lines("anvil", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
         drop(tx);
 
         let routed: Vec<String> = responses.iter().collect();
@@ -586,7 +636,7 @@ mod tests {
         let (tx, responses) = std::sync::mpsc::channel();
         let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
             Arc::new(Mutex::new(None));
-        let (uplink_tx, uplinks) = std::sync::mpsc::channel();
+        let (uplink_tx, uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
 
         let wire = concat!(
             r#"{"push":"peers.summary","result":{"host":"sage"}}"#,
@@ -597,8 +647,10 @@ mod tests {
             "\n",
             r#"{"push":"msg.uplink","frame":{"uplink_id":"u2"}}"#,
             "\n",
+            r#"{"push":"some.future.kind","result":{"host":"not a summary"}}"#,
+            "\n",
         );
-        route_relay_lines(Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        route_relay_lines("sage", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
         drop(tx);
         drop(uplink_tx);
 
@@ -658,8 +710,9 @@ mod tests {
         let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
             Arc::new(Mutex::new(None));
 
-        let (uplink_tx, _uplinks) = std::sync::mpsc::channel();
+        let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
         route_relay_lines(
+            "anvil",
             Cursor::new("ssh: connect to host anvil port 22: \"push\"\n"),
             &tx,
             &push_slot,
