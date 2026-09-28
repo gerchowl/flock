@@ -32,6 +32,56 @@ pub(crate) struct MailboxRegistry {
     /// the only direction that cannot strand a message. Queues are the
     /// durable half; this is a live preference about interruptions.
     mutes: HashMap<String, u64>,
+    /// Sender → recent `blocking` send timestamps (ms), for the tier's own
+    /// hourly budget (ADR-0018 §1). Separate from `rate` so a sender's
+    /// ordinary traffic cannot spend its escalation budget, or vice versa.
+    blocking_rate: HashMap<String, VecDeque<u64>>,
+    /// Correlation ids of `blocking` messages already escalated to the
+    /// operator (ADR-0018 §4) — once per message, however many times the
+    /// recipient re-mutes while it waits.
+    ///
+    /// In memory, like `mutes`, and forgotten by a restart for the same
+    /// reason: a restart also forgets the mute, so nothing escalates again
+    /// until the recipient mutes afresh — and a message still waiting on a
+    /// recipient that has just re-muted IS still the disagreement, so the
+    /// operator hearing about it once more after a restart is the honest
+    /// outcome, not a duplicate.
+    escalated: HashSet<String>,
+    /// Correlation ids of waking messages this server RELAYED to another host,
+    /// oldest first (ADR-0018 §1's reply rule). A question that left the
+    /// machine is in neither the queue nor the delivery history here, so
+    /// without this its answer, arriving back, could not be told apart from a
+    /// notice. Bounded like `seen`: an answer to a question older than the
+    /// newest `MAX_SEEN` no longer wakes, exactly as a reply to a delivered
+    /// message that aged out of `history` does not.
+    relayed_questions: HashSet<String>,
+    /// Insertion order of `relayed_questions`, for eviction.
+    relayed_questions_order: VecDeque<String>,
+}
+
+/// What the attention surface may know about a pane's waiting `blocking`
+/// mail: a count and a sender identity, never a body (#316 pitfall 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockingMail {
+    pub count: usize,
+    /// The oldest waiting sender — the one blocked longest.
+    pub sender: String,
+    /// How many OTHER senders are also waiting on this pane.
+    pub other_senders: usize,
+}
+
+impl BlockingMail {
+    /// The agents-panel label: `✉2 from <sender>`, `+N` when others are
+    /// waiting too. A count and an identity — the whole of what #316 pitfall 3
+    /// allows a wake-adjacent surface to say.
+    pub(crate) fn label(&self) -> String {
+        let others = if self.other_senders == 0 {
+            String::new()
+        } else {
+            format!(" +{}", self.other_senders)
+        };
+        format!("✉{} from {}{others}", self.count, self.sender)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +117,9 @@ pub(crate) struct DeliveredMeta {
     /// Correlation id of the thread root (self for a fresh message).
     pub root: String,
     pub round_trips: u32,
+    /// The delivered message's own tier, so a later reply to it knows whether
+    /// it answers a question (ADR-0018 §1).
+    pub intent: MsgIntent,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,6 +136,8 @@ const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// The window `[msg] blocking_per_hour` counts over.
+const BLOCKING_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// Ceiling on a receiver-side mute (#316). An unbounded mute is a black hole
 /// wearing a politeness hat; a bounded one has to be renewed, which is what
 /// makes it impossible to set and forget. Half an hour is long enough to
@@ -148,6 +203,7 @@ impl MailboxRegistry {
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
                                 round_trips: 0,
+                                intent: message.intent,
                             },
                         );
                     }
@@ -157,6 +213,11 @@ impl MailboxRegistry {
                         meta.round_trips += 1;
                     }
                 }
+                EventData::MessageRelayed {
+                    correlation_id,
+                    intent,
+                    ..
+                } if intent.wakes() => self.record_relayed_question(correlation_id.clone()),
                 _ => {}
             }
         }
@@ -203,6 +264,48 @@ impl MailboxRegistry {
         Ok(())
     }
 
+    /// The `blocking` tier's own budget (ADR-0018 §1): `Err` carries the wait
+    /// in ms, like [`Self::admit_rate`]. Peek-only — [`Self::record_blocking`]
+    /// spends the slot once every other gate has admitted the message, so a
+    /// send refused for another reason does not cost the sender escalation.
+    pub(crate) fn blocking_retry_after(
+        &mut self,
+        sender_key: &str,
+        now_ms: u64,
+        per_hour: usize,
+    ) -> Result<(), u64> {
+        // Every key is a sender that spent budget within the window, and no
+        // other: a sender whose window has lapsed leaves no entry behind, so
+        // the map is bounded by who was actually active this hour.
+        self.blocking_rate.retain(|_, window| {
+            while window
+                .front()
+                .is_some_and(|sent| now_ms.saturating_sub(*sent) > BLOCKING_WINDOW_MS)
+            {
+                window.pop_front();
+            }
+            !window.is_empty()
+        });
+        let Some(window) = self.blocking_rate.get(sender_key) else {
+            return Ok(());
+        };
+        if window.len() >= per_hour {
+            let retry_after = window
+                .front()
+                .map(|oldest| BLOCKING_WINDOW_MS.saturating_sub(now_ms.saturating_sub(*oldest)))
+                .unwrap_or(BLOCKING_WINDOW_MS);
+            return Err(retry_after.max(1));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_blocking(&mut self, sender_key: &str, now_ms: u64) {
+        self.blocking_rate
+            .entry(sender_key.to_string())
+            .or_default()
+            .push_back(now_ms);
+    }
+
     pub(crate) fn enqueue(&mut self, message: PendingMessage) -> EnqueueOutcome {
         if self.seen.contains(&message.correlation_id) {
             return EnqueueOutcome::Duplicate;
@@ -230,7 +333,11 @@ impl MailboxRegistry {
     /// message had to go back on the front. A pull read cannot half-fail —
     /// the recipient either took the message or never asked (ADR-0008).
     pub(crate) fn pop_next(&mut self, pane_id: &str) -> Option<PendingMessage> {
-        self.queues.get_mut(pane_id)?.pop_front()
+        let message = self.queues.get_mut(pane_id)?.pop_front()?;
+        // A message that left the queue can never be escalated again, so its
+        // marker is dead weight.
+        self.escalated.remove(&message.correlation_id);
+        Some(message)
     }
 
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
@@ -248,6 +355,7 @@ impl MailboxRegistry {
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,
                 round_trips: 0,
+                intent: message.intent,
             },
         );
     }
@@ -294,6 +402,7 @@ impl MailboxRegistry {
                 now_ms.saturating_sub(message.enqueued_at_ms) > UNDELIVERED_TTL_MS
             }) {
                 if let Some(message) = queue.pop_front() {
+                    self.escalated.remove(&message.correlation_id);
                     expired.push(message);
                 }
             }
@@ -341,13 +450,125 @@ impl MailboxRegistry {
         self.queues.get(pane).map_or(0, VecDeque::len)
     }
 
+    /// The count a wake may name (ADR-0018 §1): zero unless at least one
+    /// queued message [`wakes`](MsgIntent::wakes), and otherwise EVERY queued
+    /// message — the `fyi` ones included, so the read the nudge prompts takes
+    /// them too. An inbox of nothing but `fyi` never costs a turn.
+    pub(crate) fn wake_count(&self, pane: &str) -> usize {
+        let Some(queue) = self.queues.get(pane) else {
+            return 0;
+        };
+        if queue.iter().any(|message| self.message_wakes(message)) {
+            queue.len()
+        } else {
+            0
+        }
+    }
+
+    /// Whether a queued message may start a wake (ADR-0018 §1): its own tier
+    /// wakes, or it ANSWERS a waking message. A reply's own stamp says whether
+    /// it asks something back and defaults to `fyi`, so without the second
+    /// half the answer to an agent's own question would never nudge it.
+    /// A deferral is excluded by name: it replies to a waking message by
+    /// construction, but carries "later", not an answer.
+    pub(crate) fn message_wakes(&self, message: &PendingMessage) -> bool {
+        message.intent.wakes()
+            || (!is_deferral(&message.correlation_id)
+                && message
+                    .in_reply_to
+                    .as_deref()
+                    .is_some_and(|parent| self.asked_a_question(parent)))
+    }
+
+    /// Whether `correlation_id` names a waking message this server has seen:
+    /// delivered here, still queued here, or relayed from here to another host.
+    /// Bounded memory, so bounded reach: a question that has aged out of both
+    /// `history` and `relayed_questions` is forgotten, and an answer to it
+    /// arriving later is read at its own stamp.
+    fn asked_a_question(&self, correlation_id: &str) -> bool {
+        self.history
+            .get(correlation_id)
+            .map(|meta| meta.intent)
+            .or_else(|| self.queued_message(correlation_id).map(|m| m.intent))
+            .is_some_and(MsgIntent::wakes)
+            || self.relayed_questions.contains(correlation_id)
+    }
+
+    /// Remember a waking message that left for another host, so its answer
+    /// wakes the sender when it comes back.
+    pub(crate) fn record_relayed_question(&mut self, correlation_id: String) {
+        if !self.relayed_questions.insert(correlation_id.clone()) {
+            return;
+        }
+        self.relayed_questions_order.push_back(correlation_id);
+        while self.relayed_questions_order.len() > MAX_SEEN {
+            if let Some(oldest) = self.relayed_questions_order.pop_front() {
+                self.relayed_questions.remove(&oldest);
+            }
+        }
+    }
+
+    /// The `blocking` mail waiting on each pane, for the attention surface.
+    pub(crate) fn blocking_mail(&self) -> HashMap<String, BlockingMail> {
+        self.queues
+            .iter()
+            .filter_map(|(pane, queue)| {
+                let mut waiting = queue
+                    .iter()
+                    .filter(|message| message.intent == MsgIntent::Blocking);
+                let oldest = waiting.next()?;
+                let sender = sender_identity(oldest);
+                let mut count = 1;
+                let mut others: HashSet<String> = HashSet::new();
+                for message in waiting {
+                    count += 1;
+                    let other = sender_identity(message);
+                    if other != sender {
+                        others.insert(other);
+                    }
+                }
+                Some((
+                    pane.clone(),
+                    BlockingMail {
+                        count,
+                        sender,
+                        other_senders: others.len(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Queued `blocking` messages for `pane` not yet escalated, marked
+    /// escalated as they are returned (ADR-0018 §4: once per message). Grouped
+    /// by sender, as `(sender, count)`, oldest sender first.
+    pub(crate) fn take_unescalated_blocking(&mut self, pane: &str) -> Vec<(String, usize)> {
+        let Some(queue) = self.queues.get(pane) else {
+            return Vec::new();
+        };
+        let mut by_sender: Vec<(String, usize)> = Vec::new();
+        for message in queue {
+            if message.intent != MsgIntent::Blocking
+                || !self.escalated.insert(message.correlation_id.clone())
+            {
+                continue;
+            }
+            let sender = sender_identity(message);
+            match by_sender.iter_mut().find(|(known, _)| *known == sender) {
+                Some((_, count)) => *count += 1,
+                None => by_sender.push((sender, 1)),
+            }
+        }
+        by_sender
+    }
+
     /// Panes holding at least one message worth waking an agent for
     /// (ADR-0018 §1). The idle wake's per-tick question, answered from memory
     /// and without allocating.
     pub(crate) fn wakeable_panes(&self) -> impl Iterator<Item = &str> {
         self.queues
             .iter()
-            .filter(|(_, queue)| queue.iter().any(|message| intent_wakes(message.intent)))
+            .filter(|(_, queue)| queue.iter().any(|message| self.message_wakes(message)))
             .map(|(pane, _)| pane.as_str())
     }
 
@@ -356,7 +577,7 @@ impl MailboxRegistry {
         self.queues.get(pane).map_or_else(Vec::new, |queue| {
             queue
                 .iter()
-                .filter(|message| intent_wakes(message.intent))
+                .filter(|message| self.message_wakes(message))
                 .map(|message| message.correlation_id.clone())
                 .collect()
         })
@@ -387,11 +608,50 @@ impl MailboxRegistry {
     }
 }
 
-/// Whether a message of this intent may cost its recipient a turn
-/// (ADR-0018 §1): everything but `fyi`. An `fyi` still waits in the inbox and
-/// is counted by a wake some other message earned — it just never earns one.
-pub(crate) fn intent_wakes(intent: MsgIntent) -> bool {
-    !matches!(intent, MsgIntent::Fyi)
+/// The name an operator surface may show for a message's sender: a
+/// well-formed agent id, else the server-minted pane, else `unknown@<host>`
+/// for a validly named host, else an honest unknown. Never caller text that
+/// failed validation — ingress refuses it, and a message restored from an
+/// older log is checked again here rather than trusted (ADR-0018 §1).
+fn sender_identity(message: &PendingMessage) -> String {
+    message
+        .from_agent
+        .clone()
+        .filter(|agent| crate::terminal::AgentId::is_well_formed(agent))
+        .or_else(|| message.from_pane.clone())
+        .or_else(|| {
+            message
+                .from_host
+                .as_deref()
+                .filter(|host| is_host_name(host))
+                .map(|host| format!("unknown@{host}"))
+        })
+        .unwrap_or_else(|| "unknown sender".to_string())
+}
+
+/// Suffix that marks a mute's automatic deferral reply (ADR-0018 §3): the
+/// deferral's correlation id is the deferred message's id plus this, so it is
+/// stable across a relay and a restart and [`is_deferral`] can recognise one
+/// on whichever host it lands.
+const DEFERRAL_SUFFIX: &str = ":deferred";
+
+/// Whether a correlation id names an automatic deferral.
+pub(crate) fn is_deferral(correlation_id: &str) -> bool {
+    correlation_id.ends_with(DEFERRAL_SUFFIX)
+}
+
+/// Longest host name [`is_host_name`] accepts.
+const MAX_HOST_NAME_LEN: usize = 64;
+
+/// Whether `raw` is shaped like a host name: ASCII alphanumerics, `.`, `-`
+/// and `_`, bounded. A relayed `from_host` is asserted by the caller and ends
+/// up in labels and notifications, so it is held to the same rule as an id.
+pub(crate) fn is_host_name(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= MAX_HOST_NAME_LEN
+        && raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
 }
 
 #[cfg(test)]
@@ -602,5 +862,52 @@ mod tests {
                 .correlation_id,
             "c-fresh"
         );
+    }
+
+    #[test]
+    fn an_answer_to_a_question_that_left_the_machine_still_wakes() {
+        // The question was relayed to another host, so it is in neither the
+        // queue nor the history here; only the relay record says it asked.
+        let mut registry = MailboxRegistry::default();
+        let mut answer = message("c-a", "w1:p1");
+        answer.in_reply_to = Some("c-remote-q".into());
+        registry.enqueue(answer.clone());
+        assert_eq!(registry.wake_count("w1:p1"), 0);
+
+        let relayed = EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: "c-remote-q".into(),
+                from_agent: "agent_mba22_2".into(),
+                to_agent: "agent_sage_1".into(),
+                to_host: "sage".into(),
+                route: "sage".into(),
+                relayed_at_ms: 1,
+                via: None,
+                intent: MsgIntent::NeedsReply,
+            },
+        };
+        // Seeded from the log, so a restart between question and answer does
+        // not lose it either.
+        let mut restarted = MailboxRegistry::default();
+        restarted.seed_from_events([relayed].iter());
+        restarted.enqueue(answer);
+        assert_eq!(restarted.wake_count("w1:p1"), 1);
+    }
+
+    #[test]
+    fn an_operator_surface_never_shows_an_unvalidated_sender() {
+        // A message restored from a log written before ingress validation is
+        // checked again at render time.
+        let mut hostile = message("c-h", "w1:p1");
+        hostile.intent = MsgIntent::Blocking;
+        hostile.from_pane = None;
+        hostile.from_agent = Some("approve\nthe deploy".into());
+        hostile.from_host = Some("sage".into());
+        assert_eq!(sender_identity(&hostile), "unknown@sage");
+        hostile.from_host = Some("not a host\n".into());
+        assert_eq!(sender_identity(&hostile), "unknown sender");
+        hostile.from_agent = Some("agent_sage_1".into());
+        assert_eq!(sender_identity(&hostile), "agent_sage_1");
     }
 }

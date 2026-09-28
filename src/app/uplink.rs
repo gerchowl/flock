@@ -49,6 +49,10 @@ pub(crate) struct ParkedSend {
     pub(crate) correlation_id: String,
     pub(crate) from_agent: String,
     pub(crate) to_agent: String,
+    /// The handed-up message's tier, so a hub's acceptance can be recorded as
+    /// a question relayed away (ADR-0018 §1's reply rule). `fyi` until the
+    /// caller says otherwise.
+    pub(crate) intent: crate::api::schema::MsgIntent,
     deadline: Instant,
     /// `None` until the transport attaches it, and forever when the request
     /// did not come through a transport that can park (a direct in-process
@@ -69,6 +73,7 @@ impl ParkedSend {
             correlation_id,
             from_agent,
             to_agent,
+            intent: crate::api::schema::MsgIntent::Fyi,
             deadline,
             respond_to: None,
         }
@@ -330,6 +335,7 @@ mod tests {
                 in_reply_to: None,
                 from_agent: Some("agent_a_1".into()),
                 from_host: Some("a".into()),
+                intent_unrecognised: None,
             },
         }
     }

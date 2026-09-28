@@ -808,19 +808,42 @@ pub fn send_peer_message(
     // A command this host refuses to build never leaves the machine, so it is
     // a refusal too — and a terminal one. Retrying an id that cannot be
     // shell-quoted safely produces the same answer forever.
-    let remote = peer_message_command(
-        to_agent,
-        from_agent,
-        from_host,
-        body,
-        correlation_id,
-        in_reply_to,
-        intent,
-    )
-    .map_err(PeerMessageFailure::Refused)?;
-    run_peer_ssh_status(peer, &remote)
-        .map(|_| ())
-        .map_err(classify_message_failure)
+    let attempt = |intent| {
+        let remote = peer_message_command(
+            to_agent,
+            from_agent,
+            from_host,
+            body,
+            correlation_id,
+            in_reply_to,
+            intent,
+        )
+        .map_err(PeerMessageFailure::Refused)?;
+        run_peer_ssh_status(peer, &remote)
+            .map(|_| ())
+            .map_err(classify_message_failure)
+    };
+    match attempt(intent) {
+        // ADR-0018 §1, the other direction of skew. A peer that predates
+        // `blocking` but has #380 refuses the tier by name; asking again as
+        // `needs_reply` keeps the message heard — it still nudges — and only
+        // loses the escalation that peer could not have performed anyway.
+        Err(PeerMessageFailure::Refused(detail))
+            if intent == crate::api::schema::MsgIntent::Blocking && refused_the_intent(&detail) =>
+        {
+            attempt(crate::api::schema::MsgIntent::NeedsReply)
+        }
+        outcome => outcome,
+    }
+}
+
+/// Whether a peer's refusal was about the intent VALUE — the one refusal a
+/// retry at a lower tier can answer. Matched on `unknown --intent`, the
+/// refusal every build since #280 prints for a tier it does not know; the bare
+/// flag name is not enough, because the unknown-option refusal lists every
+/// flag a build understands, `--intent` among them.
+fn refused_the_intent(detail: &str) -> bool {
+    detail.contains("unknown --intent")
 }
 
 /// Why a relayed message did not land on the peer that owns the recipient.
@@ -1037,10 +1060,7 @@ fn peer_message_command(
     // roll-forward window, so it stays until the fleet has crossed #380.
     let intent_flag = match intent {
         crate::api::schema::MsgIntent::Fyi => String::new(),
-        crate::api::schema::MsgIntent::NeedsReply => format!(
-            " --intent {}",
-            crate::api::schema::MsgIntent::NeedsReply.as_wire()
-        ),
+        stamped => format!(" --intent {}", stamped.as_wire()),
     };
     // Quote ONCE, at the outside. The body is caller-supplied and cannot be
     // validated like the ids, so it must never reach the remote shell as
@@ -1405,6 +1425,37 @@ mod tests {
         )
         .expect("valid ids");
         assert!(!command.contains("--intent"), "{command}");
+    }
+
+    #[test]
+    fn a_blocking_relay_carries_its_tier_and_a_peer_refusing_it_is_recognised() {
+        // ADR-0018 §1: the tier rides the envelope across the hop, so the
+        // escalation happens on the recipient's own server.
+        let command = super::peer_message_command(
+            "agent_sage_1",
+            "agent_mba22_2",
+            "mba22",
+            "I cannot merge until you rebase",
+            "c-blocking",
+            None,
+            crate::api::schema::MsgIntent::Blocking,
+        )
+        .expect("valid ids");
+        assert!(command.contains("--intent blocking"), "{command}");
+
+        // What a peer that has #380 but predates the tier prints: the refusal
+        // the relay retries at `needs_reply` rather than surfacing as a
+        // failure. Any other refusal is not the intent's fault.
+        assert!(super::refused_the_intent(
+            "unknown --intent \"blocking\": expected fyi or needs-reply"
+        ));
+        // The unknown-option refusal names `--intent` in its list of what
+        // the build understands; that must not trigger a second ssh hop.
+        assert!(!super::refused_the_intent(
+            "flk msg send: unknown option \"--from-host\" — this build understands --repo \
+             --intent --correlation-id --reply-to --agent --from-agent --json, and `--` ends \
+             flag parsing so a body may begin with dashes"
+        ));
     }
 
     #[test]

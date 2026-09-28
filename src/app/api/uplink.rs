@@ -175,19 +175,19 @@ impl App {
                     .filter(|explicit| !explicit.trim().is_empty()),
                 from_agent: Some(from_agent.clone()),
                 from_host: Some(crate::app::short_host_name()),
+                intent_unrecognised: None,
             },
         };
         let now = Instant::now();
-        self.uplink.hand_up(
-            frame,
-            ParkedSend::new(
-                id.to_string(),
-                correlation_id.clone(),
-                from_agent,
-                to_agent.to_string(),
-                now + self.uplink_timeout(),
-            ),
+        let mut parked = ParkedSend::new(
+            id.to_string(),
+            correlation_id.clone(),
+            from_agent,
+            to_agent.to_string(),
+            now + self.uplink_timeout(),
         );
+        parked.intent = params.intent;
+        self.uplink.hand_up(frame, parked);
         self.feed_parked_take(now);
         // Only reaches a caller that came in through no parking transport. A
         // socket caller is answered later, with the hub's outcome.
@@ -289,8 +289,13 @@ impl App {
                     route: hub.to_string(),
                     relayed_at_ms: now_ms(),
                     via: Some(hub.to_string()),
+                    intent: send.intent,
                 },
             });
+            if send.intent.wakes() {
+                self.mailboxes
+                    .record_relayed_question(send.correlation_id.clone());
+            }
         }
         encode_success(
             send.request_id.clone(),
@@ -498,6 +503,7 @@ mod tests {
             correlation_id: Some("c-410".into()),
             in_reply_to: None,
             intent: MsgIntent::NeedsReply,
+            intent_unrecognised: None,
         }
     }
 
