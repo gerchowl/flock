@@ -126,6 +126,23 @@ pub(crate) struct Uplink {
     takes: Vec<ParkedTake>,
     last_take_at: Option<Instant>,
     pending_park: Option<Park>,
+    /// The one `flk peers relay` process allowed to speak for the hub.
+    relay: Option<AttachedRelay>,
+}
+
+/// The relay bound to this server's uplink (#410 review).
+///
+/// The relay's methods arrive over the local socket, which any same-user
+/// process can reach. Binding them to ONE process — the relay the hub's ssh
+/// session started, identified by its socket peer pid — means a stray process
+/// cannot take a spoke's pending messages, forge the hub's answer to them, or
+/// plant fleet rows, unless it first displaces a relay that is still alive.
+#[derive(Debug, Clone)]
+struct AttachedRelay {
+    pid: u32,
+    /// The hub's name, recorded once from the first frame this relay carried
+    /// and then fixed for the attachment: a later frame cannot rename it.
+    hub: Option<String>,
 }
 
 impl Uplink {
@@ -140,6 +157,36 @@ impl Uplink {
         }
         self.last_take_at
             .is_some_and(|at| now.saturating_duration_since(at) <= heartbeat)
+    }
+
+    /// Bind the uplink to relay process `pid`. Refused while a DIFFERENT
+    /// relay that is still alive holds it — a live relay is never displaced,
+    /// so taking over the uplink means outliving the real one first.
+    pub(crate) fn attach_relay(
+        &mut self,
+        pid: u32,
+        alive: impl Fn(u32) -> bool,
+    ) -> Result<(), u32> {
+        match &self.relay {
+            Some(current) if current.pid == pid => Ok(()),
+            Some(current) if alive(current.pid) => Err(current.pid),
+            _ => {
+                self.relay = Some(AttachedRelay { pid, hub: None });
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether `pid` is the attached relay.
+    pub(crate) fn is_relay(&self, pid: Option<u32>) -> bool {
+        matches!((&self.relay, pid), (Some(relay), Some(pid)) if relay.pid == pid)
+    }
+
+    /// The hub's name for this attachment: the first `claimed` wins, and every
+    /// later claim is ignored in its favour.
+    pub(crate) fn record_hub(&mut self, claimed: &str) -> Option<String> {
+        let relay = self.relay.as_mut()?;
+        Some(relay.hub.get_or_insert_with(|| claimed.to_string()).clone())
     }
 
     /// Queue a frame for the hub and park its sender.
@@ -342,6 +389,33 @@ mod tests {
             "agent_c_1".into(),
             deadline,
         )
+    }
+
+    #[test]
+    fn a_live_relay_is_never_displaced_and_the_hub_name_is_fixed() {
+        let mut uplink = Uplink::default();
+        assert!(uplink.attach_relay(100, |_| true).is_ok());
+        assert_eq!(
+            uplink.attach_relay(200, |_| true),
+            Err(100),
+            "a second process cannot take the uplink from a live relay"
+        );
+        assert!(uplink.is_relay(Some(100)));
+        assert!(!uplink.is_relay(Some(200)));
+        assert!(!uplink.is_relay(None), "an unreadable pid is nobody");
+
+        assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
+        assert_eq!(
+            uplink.record_hub("attacker").as_deref(),
+            Some("mba22"),
+            "a later frame cannot rename the hub"
+        );
+
+        // The real relay died (the hub reconnected): its successor attaches,
+        // and names its hub afresh.
+        assert!(uplink.attach_relay(300, |pid| pid != 100).is_ok());
+        assert!(uplink.is_relay(Some(300)));
+        assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
     }
 
     #[test]

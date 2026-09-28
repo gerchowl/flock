@@ -447,6 +447,9 @@ fn start_summary_push(socket: std::path::PathBuf) {
 fn start_uplink_pull(socket: std::path::PathBuf) {
     std::thread::spawn(move || {
         let mut ack: Vec<String> = Vec::new();
+        if !attach_relay(&socket) {
+            return;
+        }
         loop {
             let request = serde_json::json!({
                 "id": "relay-uplink",
@@ -466,9 +469,17 @@ fn start_uplink_pull(socket: std::path::PathBuf) {
                 std::thread::sleep(UPLINK_RETRY);
                 continue;
             };
-            // The server answered and said no — an older build without the
-            // method. It will say no forever, so stop and say so once.
             if let Some(error) = value.get("error") {
+                // The binding was lost — the server restarted, say. Bind
+                // again rather than give up on a node that is still here.
+                if error.get("code").and_then(|code| code.as_str()) == Some("not_the_relay") {
+                    if !attach_relay(&socket) {
+                        return;
+                    }
+                    continue;
+                }
+                // Anything else is an older build without the method. It will
+                // say no forever, so stop and say so once.
                 crate::logging::uplink_pull_stopped(&error.to_string());
                 return;
             }
@@ -502,6 +513,38 @@ fn start_uplink_pull(socket: std::path::PathBuf) {
             }
         }
     });
+}
+
+/// Bind this relay to the local server's uplink (`peers.relay_attach`), so the
+/// relay methods it and the hub use are accepted from this process and no
+/// other. Retried while an older relay that is still alive holds the binding
+/// — the hub's previous connection winding down — or while no server is up.
+/// `false` when the server refuses for good: a build that predates binding.
+fn attach_relay(socket: &std::path::Path) -> bool {
+    let request = serde_json::json!({
+        "id": "relay-attach",
+        "method": "peers.relay_attach",
+        "params": {},
+    });
+    loop {
+        let Ok(line) = relay_local_request(socket, &request) else {
+            std::thread::sleep(UPLINK_RETRY);
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            std::thread::sleep(UPLINK_RETRY);
+            continue;
+        };
+        let Some(error) = value.get("error") else {
+            return true;
+        };
+        if error.get("code").and_then(|code| code.as_str()) == Some("relay_already_attached") {
+            std::thread::sleep(UPLINK_RETRY);
+            continue;
+        }
+        crate::logging::uplink_pull_stopped(&error.to_string());
+        return false;
+    }
 }
 
 /// How long the uplink pull waits before asking a local server that did not

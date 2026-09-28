@@ -61,6 +61,9 @@ pub struct NodeSpec {
     pub repo: &'static str,
     /// Node names this one polls. The shim resolves them by name.
     pub peers: &'static [&'static str],
+    /// Extra TOML appended to this node's config, for a case that needs a
+    /// setting the shared fixture does not carry.
+    pub extra_config: &'static str,
 }
 
 impl NodeSpec {
@@ -69,7 +72,17 @@ impl NodeSpec {
         repo: &'static str,
         peers: &'static [&'static str],
     ) -> Self {
-        Self { name, repo, peers }
+        Self {
+            name,
+            repo,
+            peers,
+            extra_config: "",
+        }
+    }
+
+    pub const fn with_config(mut self, extra_config: &'static str) -> Self {
+        self.extra_config = extra_config;
+        self
     }
 }
 
@@ -302,6 +315,7 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
             // dispatches on.
             config.push_str(&format!("\n[[peers]]\nname = \"{peer}\"\n"));
         }
+        config.push_str(spec.extra_config);
         // Debug builds read the flock-dev app dir; release builds read flock.
         for app_dir in ["flock", "flock-dev"] {
             let dir = path.config_home.join(app_dir);

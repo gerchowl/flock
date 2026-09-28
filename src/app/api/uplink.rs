@@ -28,13 +28,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// An uplink id nobody can guess: the counter keeps it unique, and a hash
+/// keyed from the OS's randomness keeps it unpredictable, so a stray process
+/// cannot forge a `msg.uplink_result` for a send it never saw even if the
+/// relay binding were ever bypassed.
 fn mint_uplink_id(correlation_id: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "up:{correlation_id}:{:x}",
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(count);
+    hasher.write_u64(now_ms());
+    format!("up:{correlation_id}:{count:x}:{:016x}", hasher.finish())
 }
 
 impl App {
@@ -207,12 +213,63 @@ impl App {
         ))
     }
 
+    /// `peers.relay_attach` — the hub's relay binds this server's uplink to
+    /// its own process (#410 review).
+    ///
+    /// The relay methods ride the local socket, which every same-user process
+    /// can reach. Without a binding, a stray process could take a spoke's
+    /// pending messages, forge the hub's answers, or plant fleet rows. The
+    /// binding is the caller's socket peer pid, refused when it cannot be
+    /// read, refused from inside a pane, and never displacing a relay that is
+    /// still alive.
+    pub(super) fn handle_peers_relay_attach(&mut self, id: String) -> String {
+        let Some(pid) = self.current_api_peer_pid else {
+            return encode_error(
+                id,
+                "relay_unattestable",
+                "this platform did not report the caller's pid, so no relay can be bound",
+            );
+        };
+        if self.parse_pane_id_or_peer("", Some(pid)).is_some() {
+            return encode_error(
+                id,
+                "not_from_a_pane",
+                "a relay is started by the hub's ssh session, never from inside a pane",
+            );
+        }
+        match self
+            .uplink
+            .attach_relay(pid, crate::platform::process_exists)
+        {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(holder) => encode_error(
+                id,
+                "relay_already_attached",
+                format!("relay pid {holder} holds this server's uplink and is still alive"),
+            ),
+        }
+    }
+
+    /// The refusal for a relay-only method called by anyone but the relay.
+    pub(super) fn refuse_unless_relay(&self, id: &str, method: &str) -> Option<String> {
+        (!self.uplink.is_relay(self.current_api_peer_pid)).then(|| {
+            encode_error(
+                id.to_string(),
+                "not_the_relay",
+                format!("{method} is accepted only from the relay bound by peers.relay_attach"),
+            )
+        })
+    }
+
     /// `msg.uplink_take` — the relay asks for frames to push up.
     pub(super) fn handle_msg_uplink_take(
         &mut self,
         id: String,
         params: MsgUplinkTakeParams,
     ) -> String {
+        if let Some(refusal) = self.refuse_unless_relay(&id, "msg.uplink_take") {
+            return refusal;
+        }
         let heartbeat = self.uplink_heartbeat();
         let frames = self
             .uplink
@@ -225,8 +282,16 @@ impl App {
     pub(super) fn handle_msg_uplink_result(
         &mut self,
         id: String,
-        params: MsgUplinkResultParams,
+        mut params: MsgUplinkResultParams,
     ) -> String {
+        if let Some(refusal) = self.refuse_unless_relay(&id, "msg.uplink_result") {
+            return refusal;
+        }
+        // The hub's name is the one recorded for this relay, not whatever this
+        // frame says: a relay speaks for one hub for as long as it is bound.
+        if let Some(hub) = self.uplink.record_hub(&params.hub) {
+            params.hub = hub;
+        }
         let Some(send) = self.uplink.complete(&params.uplink_id) else {
             return encode_success(id, ResponseResult::MsgUplinkResultAck { matched: false });
         };
@@ -521,8 +586,32 @@ mod tests {
         rx
     }
 
+    /// A pid no process has, standing in for the hub's relay. Bound directly,
+    /// since `peers.relay_attach` would check that it is alive.
+    const RELAY_PID: u32 = u32::MAX - 7;
+
+    /// Run a request as the bound relay would: from the relay's pid.
+    fn as_relay(app: &mut crate::app::App, request: Request) -> String {
+        app.current_api_peer_pid = Some(RELAY_PID);
+        let response = app.handle_api_request(request);
+        app.current_api_peer_pid = None;
+        response
+    }
+
     fn attach_relay(app: &mut crate::app::App) -> std::sync::mpsc::Receiver<String> {
-        via_transport(app, Method::MsgUplinkTake(MsgUplinkTakeParams::default()))
+        app.uplink
+            .attach_relay(RELAY_PID, |_| true)
+            .expect("no relay bound yet");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let response = as_relay(
+            app,
+            Request {
+                id: "req".into(),
+                method: Method::MsgUplinkTake(MsgUplinkTakeParams::default()),
+            },
+        );
+        app.respond_or_park(tx, response);
+        rx
     }
 
     fn value(line: &str) -> serde_json::Value {
@@ -574,23 +663,26 @@ mod tests {
         let uplink_id = frame["uplink_id"].as_str().expect("uplink id").to_string();
 
         // The hub answers: it relayed the message on to `ksb`.
-        let ack = value(&app.handle_api_request(Request {
-            id: "r2".into(),
-            method: Method::MsgUplinkResult(MsgUplinkResultParams {
-                uplink_id: uplink_id.clone(),
-                hub: "mba22".into(),
-                response: serde_json::json!({
-                    "id": "uplink-forward",
-                    "result": {
-                        "type": "msg_queued",
-                        "correlation_id": "c-410",
-                        "state": "relayed",
-                        "to_host": "ksb",
-                        "path": "direct",
-                    },
+        let ack = value(&as_relay(
+            &mut app,
+            Request {
+                id: "r2".into(),
+                method: Method::MsgUplinkResult(MsgUplinkResultParams {
+                    uplink_id: uplink_id.clone(),
+                    hub: "mba22".into(),
+                    response: serde_json::json!({
+                        "id": "uplink-forward",
+                        "result": {
+                            "type": "msg_queued",
+                            "correlation_id": "c-410",
+                            "state": "relayed",
+                            "to_host": "ksb",
+                            "path": "direct",
+                        },
+                    }),
                 }),
-            }),
-        }));
+            },
+        ));
         assert_eq!(ack["result"]["matched"], true);
 
         let answer = value(&sender.try_recv().expect("the sender is answered"));
@@ -609,14 +701,17 @@ mod tests {
         assert_eq!(status["result"]["path"], "via mba22", "{status}");
 
         // A re-offered frame answered twice resolves nothing the second time.
-        let again = value(&app.handle_api_request(Request {
-            id: "r4".into(),
-            method: Method::MsgUplinkResult(MsgUplinkResultParams {
-                uplink_id,
-                hub: "mba22".into(),
-                response: serde_json::json!({"result": {"state": "duplicate"}}),
-            }),
-        }));
+        let again = value(&as_relay(
+            &mut app,
+            Request {
+                id: "r4".into(),
+                method: Method::MsgUplinkResult(MsgUplinkResultParams {
+                    uplink_id,
+                    hub: "mba22".into(),
+                    response: serde_json::json!({"result": {"state": "duplicate"}}),
+                }),
+            },
+        ));
         assert_eq!(again["result"]["matched"], false);
     }
 
@@ -629,21 +724,24 @@ mod tests {
             .uplink
             .complete_peek_for_test()
             .expect("a frame is waiting");
-        app.handle_api_request(Request {
-            id: "r2".into(),
-            method: Method::MsgUplinkResult(MsgUplinkResultParams {
-                uplink_id,
-                hub: "mba22".into(),
-                response: serde_json::json!({
-                    "id": "uplink-forward",
-                    "error": {
-                        "code": "peer_unreachable",
-                        "message": "mba22 cannot reach ksb (auth refused): Permission denied",
-                        "data": {"hop": "mba22 → ksb", "reason": "auth_refused", "retryable": true},
-                    },
+        as_relay(
+            &mut app,
+            Request {
+                id: "r2".into(),
+                method: Method::MsgUplinkResult(MsgUplinkResultParams {
+                    uplink_id,
+                    hub: "mba22".into(),
+                    response: serde_json::json!({
+                        "id": "uplink-forward",
+                        "error": {
+                            "code": "peer_unreachable",
+                            "message": "mba22 cannot reach ksb (auth refused): Permission denied",
+                            "data": {"hop": "mba22 → ksb", "reason": "auth_refused", "retryable": true},
+                        },
+                    }),
                 }),
-            }),
-        });
+            },
+        );
         let answer = value(&sender.try_recv().expect("answered"));
         let message = answer["error"]["message"].as_str().unwrap_or_default();
         assert_eq!(answer["error"]["code"], "peer_unreachable", "{answer}");
@@ -826,5 +924,65 @@ mod tests {
         let delivered = &inbox["result"]["messages"][0];
         assert_eq!(delivered["from_host"], "anvil", "{inbox}");
         assert_eq!(delivered["from_agent"], "agent_vm-dev_1", "{inbox}");
+    }
+
+    #[tokio::test]
+    async fn only_the_bound_relay_may_take_answer_or_push() {
+        // #416 review, blocker 2: the relay methods are on the local socket,
+        // so without a binding any same-user process could take a spoke's
+        // pending messages or forge the hub's answer to them.
+        let mut app = test_app();
+        let _take = attach_relay(&mut app);
+        let _sender = via_transport(&mut app, Method::MsgSend(send_to("agent_far_1")));
+        let uplink_id = app.uplink.complete_peek_for_test().expect("waiting");
+
+        app.current_api_peer_pid = Some(RELAY_PID - 1);
+        for method in [
+            Method::MsgUplinkTake(MsgUplinkTakeParams::default()),
+            Method::MsgUplinkResult(MsgUplinkResultParams {
+                uplink_id: uplink_id.clone(),
+                hub: "attacker".into(),
+                response: serde_json::json!({"result": {"state": "relayed"}}),
+            }),
+            Method::PeersHubFleet(crate::api::schema::PeersHubFleetParams {
+                hub: "attacker".into(),
+                fleet: Vec::new(),
+            }),
+        ] {
+            let response = value(&app.handle_api_request(Request {
+                id: "forged".into(),
+                method,
+            }));
+            assert_eq!(response["error"]["code"], "not_the_relay", "{response}");
+        }
+        app.current_api_peer_pid = None;
+        assert_eq!(
+            app.uplink.complete_peek_for_test().as_deref(),
+            Some(uplink_id.as_str()),
+            "the frame is still waiting for the REAL relay"
+        );
+
+        // A live relay cannot be displaced by a second attach.
+        app.current_api_peer_pid = Some(std::process::id());
+        let displaced = value(&app.handle_api_request(Request {
+            id: "attach".into(),
+            method: Method::PeersRelayAttach(crate::api::schema::EmptyParams {}),
+        }));
+        app.current_api_peer_pid = None;
+        assert!(
+            displaced["error"]["code"] == "relay_already_attached"
+                || displaced["result"].is_object(),
+            "{displaced}"
+        );
+    }
+
+    #[test]
+    fn an_uplink_id_is_not_guessable_from_its_neighbour() {
+        let first = super::mint_uplink_id("c1");
+        let second = super::mint_uplink_id("c1");
+        assert_ne!(first, second);
+        let tail = |id: &str| id.rsplit(':').next().unwrap_or_default().to_string();
+        assert_eq!(tail(&first).len(), 16, "{first}");
+        assert_ne!(tail(&first), tail(&second), "the random half differs");
     }
 }

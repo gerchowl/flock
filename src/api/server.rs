@@ -379,6 +379,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgWake(_) => "msg.wake",
         Method::MsgMute(_) => "msg.mute",
         Method::MsgUplinkTake(_) => "msg.uplink_take",
+        Method::PeersRelayAttach(_) => "peers.relay_attach",
         Method::MsgUplinkResult(_) => "msg.uplink_result",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneMove(_) => "pane.move",

@@ -1307,6 +1307,7 @@ impl App {
             Method::MsgUplinkTake(params) => {
                 return self.handle_msg_uplink_take(request.id, params)
             }
+            Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),
             Method::MsgUplinkResult(params) => {
                 return self.handle_msg_uplink_result(request.id, params)
             }

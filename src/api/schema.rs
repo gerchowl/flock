@@ -134,6 +134,10 @@ pub enum Method {
     /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
     #[serde(rename = "msg.uplink_take")]
     MsgUplinkTake(MsgUplinkTakeParams),
+    /// #410: the hub's relay binds itself to this server's uplink. Every other
+    /// relay method is accepted only from the process that did.
+    #[serde(rename = "peers.relay_attach")]
+    PeersRelayAttach(EmptyParams),
     /// #410: the hub's answer to a message a spoke handed up, sent back down
     /// the same relay.
     #[serde(rename = "msg.uplink_result")]

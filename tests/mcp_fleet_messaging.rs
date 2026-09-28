@@ -48,7 +48,8 @@ const PAIR_AB: &[NodeSpec] = &[
 /// `[[peers]]`, and the two spokes carry none — no reverse trust, no N×N keys.
 /// The only way off a spoke is the relay the hub holds INTO it.
 const HUB_SPOKES: &[NodeSpec] = &[
-    NodeSpec::new("nodea", "alpha", &[]),
+    // Wide enough that a relayed server row's `via nodeb` is not truncated.
+    NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
     NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
     NodeSpec::new("nodec", "gamma", &[]),
 ];
@@ -566,10 +567,50 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
 
     // And the servers band on nodea shows nodec, marked as known via nodeb.
     let mut client = node_a.attach_sized(160, 40);
-    // The band is ~26 cells wide, so match the part that survives truncation.
-    fleet::wait_for_row(&mut client, "via nod", GOSSIP_TIMEOUT)
+    fleet::wait_for_row(&mut client, "via nodeb", GOSSIP_TIMEOUT)
         .unwrap_or_else(|screen| panic!("nodea's band should mark nodec via nodeb: {screen}"));
     drop(client);
+
+    // Only the relay bound to nodea's uplink may speak for the hub. This test
+    // process is a foreign pid on nodea's socket: its forged fleet row is
+    // refused and never reaches the directory, and so are the uplink methods
+    // that would let it take pending messages or fake the hub's answer.
+    let forged = json!({
+        "id": "t:forge-fleet",
+        "method": "peers.hub_fleet",
+        "params": {
+            "hub": "nodeb",
+            "fleet": [{
+                "name": "evilhost",
+                "ssh_target": "lars@attacker.example",
+                "host": "evilhost",
+                "workspaces": [{
+                    "id": "w1", "workspace": "x", "status": "idle",
+                    "agents": [{"agent_id": "agent_evil_1", "pane_id": "w1:p1", "status": "idle"}],
+                }],
+                "age_secs": 0,
+                "origin": "nodeb",
+                "origin_last_ok_secs": 0,
+                "proxy_jump": "attacker.example",
+            }],
+        },
+    });
+    for request in [
+        forged.to_string(),
+        r#"{"id":"t:take","method":"msg.uplink_take","params":{}}"#.to_string(),
+        r#"{"id":"t:result","method":"msg.uplink_result","params":{"uplink_id":"up:x","hub":"nodeb","response":{}}}"#.to_string(),
+    ] {
+        let answer: Value = serde_json::from_str(&node_a.api(&request)).expect("parses");
+        assert_eq!(
+            answer["error"]["code"], "not_the_relay",
+            "a foreign pid is refused: {answer}"
+        );
+    }
+    let listing = alice.call_tool("flock_agent_list", json!({}));
+    assert!(
+        fleet_row(&listing, "agent_evil_1").is_none(),
+        "the forged row never reached the directory: {listing}"
+    );
 
     assert_eq!(queued["state"], "relayed", "send: {queued}");
     assert_eq!(

@@ -484,8 +484,18 @@ fn request_over(
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
             slot.stream = None;
-            slot.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
-            crate::logging::peer_stream_closed(&peer.name, &err, RECONNECT_BACKOFF.as_secs());
+            // A best-effort extra (#410 down-gossip, `spawn: false`) must not
+            // cost the poll its connection for a whole backoff: the next poll
+            // reconnects at once, exactly as if this line had never been sent.
+            let backoff = if spawn {
+                RECONNECT_BACKOFF
+            } else {
+                Duration::ZERO
+            };
+            if spawn {
+                slot.retry_after = Some(std::time::Instant::now() + backoff);
+            }
+            crate::logging::peer_stream_closed(&peer.name, &err, backoff.as_secs());
             Err(err)
         }
     }
