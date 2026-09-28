@@ -3138,26 +3138,6 @@ impl AppState {
         }
     }
 
-    pub(crate) fn workspace_close_would_close_worktree_group(&self, ws_idx: usize) -> bool {
-        self.workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.worktree_space_here())
-            .filter(|space| !space.is_linked_worktree)
-            .is_some_and(|space| {
-                // Must agree with close_selected_space above, or the
-                // "closing the whole space?" prompt describes a different set
-                // than the close performs.
-                self.workspaces
-                    .iter()
-                    .filter(|ws| {
-                        ws.worktree_space_here()
-                            .is_some_and(|member| member.key == space.key)
-                    })
-                    .count()
-                    >= 2
-            })
-    }
-
     /// The workspace index the confirm-close dialog acts on (#419): its
     /// recorded target when that workspace is still open, else `selected`.
     pub(crate) fn confirm_close_target_idx(&self) -> usize {
@@ -3167,48 +3147,11 @@ impl AppState {
             .unwrap_or(self.selected)
     }
 
-    pub(crate) fn confirm_implicit_worktree_group_close(&mut self, ws_idx: usize) -> bool {
-        if self.confirm_close && self.workspace_close_would_close_worktree_group(ws_idx) {
-            self.confirm_close_target = self.workspaces.get(ws_idx).map(|ws| ws.id.clone());
-            self.mode = Mode::ConfirmClose;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn close_focused_pane_would_close_workspace(&self, ws_idx: usize) -> bool {
-        self.workspaces.get(ws_idx).is_some_and(|ws| {
-            let pane_count = ws
-                .active_tab()
-                .map(|tab| tab.layout.pane_count())
-                .unwrap_or(0);
-            pane_count <= 1 && ws.tabs.len() <= 1
-        })
-    }
-
-    pub(crate) fn close_pane_would_close_workspace(&self, ws_idx: usize, pane_id: PaneId) -> bool {
-        self.workspaces.get(ws_idx).is_some_and(|ws| {
-            ws.find_tab_index_for_pane(pane_id).is_some_and(|tab_idx| {
-                ws.tabs[tab_idx].layout.pane_count() <= 1 && ws.tabs.len() <= 1
-            })
-        })
-    }
-
-    /// Close the focused pane. Returns true when the close was deferred to confirmation.
-    pub fn close_pane(&mut self) -> bool {
+    /// Close the focused pane, and its workspace when it was the last one.
+    /// There is no implicit "worktree group" prompt (#419): since #62 a
+    /// workspace close closes only that workspace.
+    pub fn close_pane(&mut self) {
         let active = self.active;
-        if active.is_some_and(|ws_idx| {
-            self.close_focused_pane_would_close_workspace(ws_idx)
-                && self.workspace_close_would_close_worktree_group(ws_idx)
-        }) {
-            if let Some(ws_idx) = active {
-                if self.confirm_implicit_worktree_group_close(ws_idx) {
-                    return true;
-                }
-            }
-        }
-
         self.selection = None;
         self.selection_autoscroll = None;
         // Closing the owning pane is a blur the focus-change chokepoints never
@@ -3248,24 +3191,10 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(terminal_ids);
         }
-        false
     }
 
-    /// Close the active tab. Returns true when the close was deferred to confirmation.
-    pub fn close_tab(&mut self) -> bool {
-        if self.active.is_some_and(|ws_idx| {
-            self.workspaces
-                .get(ws_idx)
-                .is_some_and(|ws| ws.tabs.len() <= 1)
-                && self.workspace_close_would_close_worktree_group(ws_idx)
-        }) {
-            if let Some(ws_idx) = self.active {
-                if self.confirm_implicit_worktree_group_close(ws_idx) {
-                    return true;
-                }
-            }
-        }
-
+    /// Close the active tab, and its workspace when it was the last one.
+    pub fn close_tab(&mut self) {
         self.selection = None;
         self.selection_autoscroll = None;
         self.mark_session_dirty();
@@ -3277,7 +3206,7 @@ impl AppState {
             if let Some(active) = self.active {
                 self.close_workspace(active);
             }
-            return false;
+            return;
         }
         if let Some(ws_idx) = self.active {
             let terminal_ids = self
@@ -3286,7 +3215,7 @@ impl AppState {
                 .map(|ws| self.terminal_ids_for_tab(ws_idx, ws.active_tab))
                 .unwrap_or_default();
             let Some(ws) = self.workspaces.get_mut(ws_idx) else {
-                return false;
+                return;
             };
             let workspace_id = ws.id.clone();
             let closing_tab_id =
@@ -3302,7 +3231,6 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }
-        false
     }
 }
 
@@ -8113,21 +8041,21 @@ mod tests {
     }
 
     #[test]
-    fn close_pane_last_pane_in_parent_worktree_group_prompts() {
+    fn close_pane_last_pane_of_main_checkout_with_sibling_open_closes_only_it() {
+        // #419: no implicit "worktree group" prompt — since #62 the close
+        // takes only this workspace, so there is nothing to confirm.
         let mut state = app_with_workspaces(&["parent", "child"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
+        assert!(state.confirm_close);
         state.active = Some(0);
         state.selected = 1;
 
-        let deferred = state.close_pane();
+        state.close_pane();
 
-        assert!(deferred);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        // #419: the dialog names its target; the operator's cursor stays put.
-        assert_eq!(state.confirm_close_target_idx(), 0);
-        assert_eq!(state.selected, 1);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "child");
     }
 
     #[test]
@@ -8145,21 +8073,21 @@ mod tests {
     }
 
     #[test]
-    fn close_tab_last_tab_in_parent_worktree_group_prompts() {
+    fn close_tab_last_tab_of_main_checkout_with_sibling_open_closes_only_it() {
+        // #419: no implicit "worktree group" prompt — since #62 the close
+        // takes only this workspace, so there is nothing to confirm.
         let mut state = app_with_workspaces(&["parent", "child"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
+        assert!(state.confirm_close);
         state.active = Some(0);
         state.selected = 1;
 
-        let deferred = state.close_tab();
+        state.close_tab();
 
-        assert!(deferred);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        // #419: the dialog names its target; the operator's cursor stays put.
-        assert_eq!(state.confirm_close_target_idx(), 0);
-        assert_eq!(state.selected, 1);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "child");
     }
 
     #[test]
@@ -8187,9 +8115,8 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
 
-        let deferred = state.close_pane();
+        state.close_pane();
 
-        assert!(!deferred);
         assert_eq!(state.workspaces.len(), 2);
         assert_eq!(state.workspaces[0].display_name(), "child");
         assert_eq!(state.workspaces[1].display_name(), "notes");

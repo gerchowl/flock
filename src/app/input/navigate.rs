@@ -968,9 +968,8 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::CloseTab => {
-            if !state.close_tab() {
-                leave_navigate_mode(state);
-            }
+            state.close_tab();
+            leave_navigate_mode(state);
         }
         NavigateAction::RenamePane => {
             if let Some(pane_id) = state
@@ -994,9 +993,8 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::ClosePane => {
-            if !state.close_pane() {
-                leave_navigate_mode(state);
-            }
+            state.close_pane();
+            leave_navigate_mode(state);
         }
         NavigateAction::EditScrollback => {}
         // Handled at the App level (PTY spawn needs event_tx/runtimes),
@@ -2310,7 +2308,8 @@ last_pane = "prefix+tab"
     }
 
     #[test]
-    fn prefix_close_pane_last_parent_group_pane_opens_confirmation() {
+    fn prefix_close_pane_last_parent_group_pane_closes_only_that_workspace() {
+        // #419: no implicit "worktree group" prompt; the sibling survives.
         let mut state = state_with_workspaces(&["main", "issue"]);
         mark_worktree_space_member(&mut state, 0, "repo-key");
         mark_worktree_space_member(&mut state, 1, "repo-key");
@@ -2320,9 +2319,9 @@ last_pane = "prefix+tab"
 
         execute_navigate_action(&mut state, NavigateAction::ClosePane);
 
-        assert_eq!(state.confirm_close_target_idx(), 0);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "issue");
     }
 
     #[tokio::test]

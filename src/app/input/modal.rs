@@ -821,13 +821,12 @@ pub(super) fn apply_context_menu_action(
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
-            if !state.close_tab() {
-                state.mode = if state.active.is_some() {
-                    Mode::Terminal
-                } else {
-                    Mode::Navigate
-                };
-            }
+            state.close_tab();
+            state.mode = if state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
         }
         (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
             open_rename_pane(state, pane_id);
@@ -859,13 +858,12 @@ pub(super) fn apply_context_menu_action(
             state.mode = Mode::Terminal;
         }
         (ContextMenuKind::Pane { .. }, Some("Close pane")) => {
-            if !state.close_pane() {
-                state.mode = if state.active.is_some() {
-                    Mode::Terminal
-                } else {
-                    Mode::Navigate
-                };
-            }
+            state.close_pane();
+            state.mode = if state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
         }
         // Per-server spaces filter (#46): transient view state, never
         // persisted — so no mark_session_dirty here.
@@ -1407,7 +1405,8 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
+    fn context_menu_close_pane_last_parent_group_pane_closes_only_that_workspace() {
+        // #419: no implicit "worktree group" prompt; the sibling survives.
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);
         state.selected = 1;
@@ -1444,9 +1443,9 @@ mod tests {
 
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
 
-        assert_eq!(state.confirm_close_target_idx(), 0);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "issue");
     }
 
     #[test]

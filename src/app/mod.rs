@@ -4385,7 +4385,7 @@ sidebar_pane_gap = 99
     }
 
     #[test]
-    fn pane_close_request_requires_confirmation_before_closing_parent_worktree_group() {
+    fn pane_close_request_on_main_checkout_with_sibling_open_closes_only_that_workspace() {
         let mut app = test_app();
         let mut parent = Workspace::test_new("api-pane-close-parent");
         parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
@@ -4407,6 +4407,7 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 1;
+        assert!(app.state.confirm_close);
 
         let target_pane = app.state.workspaces[0].tabs[0].root_pane;
         let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
@@ -4419,13 +4420,15 @@ sidebar_pane_gap = 99
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
-        assert_eq!(response["error"]["code"], "confirmation_required");
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        // #419: an agent's request names the dialog's target, not the
-        // operator's cursor.
-        assert_eq!(app.state.confirm_close_target_idx(), 0);
-        assert_eq!(app.state.selected, 1);
-        assert_eq!(app.state.workspaces.len(), 2);
+        // #419: no "would close a worktree group" refusal — since #62 the
+        // close takes only the main checkout, and the sibling keeps the space.
+        assert_eq!(response["result"]["type"], "ok");
+        assert_ne!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].display_name(),
+            "api-pane-close-child"
+        );
     }
 
     #[test]
