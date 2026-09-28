@@ -27,6 +27,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0015](0015-operator-initiated-cross-repo-issue-filing.md) | The operator may file an issue from flock, over the API, into any repo their own token can reach | Proposed |
 | [0016](0016-operator-notification-log.md) | Outcomes are filed as durable events; unread is a projection, not a second store | Proposed |
 | [0017](0017-mcp-resource-surface.md) | Handed-over files are MCP resources with a durable identity; tools stay for parameterised calls | Proposed |
+| [0018](0018-message-delivery-response.md) | A message says how much it needs, a recipient can say "not now" and must say so, and an idle agent is reachable | Accepted |
 
 ## Conventions
 
