@@ -24,7 +24,7 @@ mod lineage;
 mod mcp;
 mod msg;
 mod notification;
-mod pane;
+pub(crate) mod pane;
 mod peers;
 mod preflight;
 mod ready;

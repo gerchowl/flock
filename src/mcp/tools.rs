@@ -124,8 +124,8 @@ pub(super) fn table() -> &'static [Tool] {
                           hard flock knocks: `fyi` never wakes the recipient — \
                           it is read whenever the inbox next is; \
                           `needs_reply` nudges it to read at its next turn \
-                          boundary (and, once idle wake is enabled, wakes \
-                          it if idle); `blocking` means \
+                          boundary, or wakes it if it is already idle; \
+                          `blocking` means \
                           you cannot proceed without an answer — it does \
                           everything `needs_reply` does, also puts the \
                           recipient in the operator's attention list, and \

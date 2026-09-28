@@ -550,6 +550,27 @@ impl MailboxRegistry {
         by_sender
     }
 
+    /// Panes holding at least one message worth waking an agent for
+    /// (ADR-0018 §1). The idle wake's per-tick question, answered from memory
+    /// and without allocating.
+    pub(crate) fn wakeable_panes(&self) -> impl Iterator<Item = &str> {
+        self.queues
+            .iter()
+            .filter(|(_, queue)| queue.iter().any(|message| self.message_wakes(message)))
+            .map(|(pane, _)| pane.as_str())
+    }
+
+    /// Correlation ids of one pane's queued messages that may wake it.
+    pub(crate) fn wakeable_ids(&self, pane: &str) -> Vec<String> {
+        self.queues.get(pane).map_or_else(Vec::new, |queue| {
+            queue
+                .iter()
+                .filter(|message| self.message_wakes(message))
+                .map(|message| message.correlation_id.clone())
+                .collect()
+        })
+    }
+
     pub(crate) fn queued_infos(
         &self,
         pane: Option<&str>,

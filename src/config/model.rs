@@ -1097,6 +1097,23 @@ pub struct MsgConfig {
     /// `0` refuses `blocking` outright (`msg_blocking_disabled`); senders can
     /// still say `needs_reply`.
     pub blocking_per_hour: usize,
+    /// Wake an idle agent that has mail by typing a fixed sentence into its
+    /// pane (ADR-0018 §2). Default: true. The kill switch: false leaves agents
+    /// to find mail at their next turn boundary, as before.
+    pub idle_wake: bool,
+    /// How long an agent must have been continuously `Idle` before flock
+    /// types into it. Default: 2000 ms. A state that just flipped is the one
+    /// most likely to flip back.
+    pub idle_wake_settle_ms: u64,
+    /// How long a pane must have had no operator input before flock types
+    /// into it. Default: 15000 ms. Flock does not type over a human, and a
+    /// human pausing mid-sentence is still typing.
+    pub idle_wake_operator_quiet_ms: u64,
+    /// How recent the screen observation behind an `Idle` must be for it to
+    /// count. Default: 2500 ms — several of the detector's re-publishes of a
+    /// stable idle prompt, so a live idle pane always qualifies and a pane
+    /// the detector has stopped reporting does not.
+    pub idle_wake_fresh_ms: u64,
 }
 
 impl Default for MsgConfig {
@@ -1105,6 +1122,10 @@ impl Default for MsgConfig {
             enabled: true,
             allow_from: vec!["*".to_string()],
             blocking_per_hour: 6,
+            idle_wake: true,
+            idle_wake_settle_ms: 2_000,
+            idle_wake_operator_quiet_ms: 15_000,
+            idle_wake_fresh_ms: 2_500,
         }
     }
 }
