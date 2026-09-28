@@ -424,24 +424,26 @@ fn plan_stop(
 /// reaches the recipient only through `flock_msg_read`, so nothing another
 /// agent wrote can arrive dressed as the operator's instruction — the wake
 /// channel carries no attacker-controlled text.
+///
+/// Mail and the recap self-heal are never fused. The recap asks a turn that is
+/// ENDING to summarise itself and stop; a turn with mail waiting is not ending,
+/// and telling it both made an agent read a `needs_reply` review, write its
+/// plan into the recap line and stop without doing the work — the message
+/// acknowledged and dropped (#408). So mail pending means read AND act, with
+/// no word of stopping; the recap is asked for at the next boundary, when the
+/// inbox is empty and the turn really is over.
 fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
-    let recap = "End your turn with a single sentinel line: `※ recap: \
-                 <current state>. Next: <one concrete step>.` Then stop.";
     let reason = match (pending_messages, want_recap) {
         (0, false) => return None,
-        (0, true) => recap.to_string(),
-        (n, false) => format!(
-            "You have {n} unread message{} from another agent. Read {} with the \
-             `flock_msg_read` tool before you stop.",
+        (0, true) => "End your turn with a single sentinel line: `※ recap: \
+                      <current state>. Next: <one concrete step>.` Then stop."
+            .to_string(),
+        (n, _) => format!(
+            "You have {n} unread message{} from other agents. Read {} with the \
+             `flock_msg_read` tool and act on any that need a reply before you end \
+             your turn.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "it" } else { "them" }
-        ),
-        (n, true) => format!(
-            "You have {n} unread message{} from another agent — read {} with the \
-             `flock_msg_read` tool. Then {}",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "it" } else { "them" },
-            recap
         ),
     };
     Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
@@ -1211,9 +1213,12 @@ mod tests {
     }
 
     #[test]
-    fn stop_combines_the_mail_wake_with_the_recap_nudge() {
-        // Both are true at once: no sentinel AND mail waiting. One block, both
-        // instructions — never two turns' worth of blocking.
+    fn a_mail_wake_says_act_and_never_stop_even_when_the_recap_is_missing() {
+        // #408, observed live: fused with the recap self-heal, the wake said
+        // "read it … Then … Then stop", and the agent did exactly that — read a
+        // `needs_reply` review, put its plan in the recap line and stopped
+        // without doing the work. A turn with mail waiting is not ending, so
+        // the wake asks for action and the recap waits for the next boundary.
         let path = transcript_with(&[r#"{"type":"assistant","content":"No sentinel here."}"#]);
         let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
         let out = plan(Agent::Claude, Action::Stop, &input, "Stop", "p_1", 1, None);
@@ -1221,7 +1226,18 @@ mod tests {
         assert!(nudge.contains("1 unread message"), "{nudge}");
         assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
-        assert!(nudge.contains("※ recap:"), "recap still required: {nudge}");
+        assert!(nudge.contains("act on"), "{nudge}");
+        assert!(
+            !nudge.contains("recap"),
+            "the recap waits for an empty inbox: {nudge}"
+        );
+        for (pending, want_recap) in [(1, false), (1, true), (3, false), (3, true)] {
+            let nudge = mail_nudge(pending, want_recap).expect("mail wakes");
+            assert!(
+                !nudge.to_lowercase().contains("stop"),
+                "a mail wake must never tell the agent to stop: {nudge}"
+            );
+        }
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
