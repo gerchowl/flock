@@ -2523,9 +2523,7 @@ mod tests {
             origin_summary: None,
             received_at: std::time::Instant::now(),
         });
-        // Tall enough that the whole band (home sorts after anvil and self)
-        // gets its rows.
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 60));
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
 
         // The home row's card, wherever it sorts (#422). Its origin's
         // workspaces are never in the spaces list, so "only this server" would

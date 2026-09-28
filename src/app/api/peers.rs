@@ -1527,9 +1527,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_hub_self_row_naming_another_machine_is_not_heard() {
-        // The relay binding fixes who the hub is. A `hub_self` about some other
-        // machine is not the hub speaking for itself, so it must not replace
-        // the carried origin.
+        // The relay binding fixes who the hub is, so a `hub_self` about some
+        // other machine is not taken as the hub's own row. This is bookkeeping,
+        // not the trust boundary: the same reading sent in `fleet` does reach
+        // the origin slot, and that is safe because nothing in it can change
+        // where a click dials (the home target is forced, see
+        // `absorb_origin_rows`).
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
             origin: "mba22".into(),

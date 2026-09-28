@@ -420,7 +420,12 @@ impl FleetSnapshotState {
     ) -> Vec<crate::api::schema::RelayedFleetPeer> {
         let origin_key = normalized_host_key(&self.origin);
         let (about_origin, rest): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| {
-            normalized_host_key(row.host.as_deref().unwrap_or(&row.name)) == origin_key
+            let identity = row
+                .host
+                .as_deref()
+                .filter(|host| !host.is_empty())
+                .unwrap_or(&row.name);
+            normalized_host_key(identity) == origin_key
         });
         for row in about_origin {
             let Some(entry) = relayed_entry_from_wire(row) else {

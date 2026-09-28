@@ -1820,6 +1820,43 @@ fn server_slot_rect(servers_area: Rect, slot: u16) -> Option<Rect> {
         .then(|| Rect::new(servers_area.x, y, servers_area.width, SERVER_ROW_LINES))
 }
 
+/// The visible band rows that fit `rows_area`, in band order.
+///
+/// Home and self used to be rows 0 and 1, so the height cap could only ever cut
+/// peers. Now they sort in place (#422), so when the band overflows, peers are
+/// dropped from the end to make room for them. The way home must never hide,
+/// and nor must the row saying where you are.
+fn fitted_band_slots(
+    app: &AppState,
+    rows_area: Rect,
+) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
+    let slots = visible_server_band_slots(app);
+    let capacity = usize::from(rows_area.height.saturating_sub(1) / SERVER_ROW_LINES);
+    if slots.len() <= capacity {
+        return slots;
+    }
+    let is_anchor = |slot: &Option<_>| {
+        matches!(
+            slot,
+            None | Some(crate::app::state::PeerSwitchRequest::Home)
+        )
+    };
+    let mut peer_room =
+        capacity.saturating_sub(slots.iter().filter(|slot| is_anchor(slot)).count());
+    slots
+        .into_iter()
+        .filter(|slot| {
+            if is_anchor(slot) {
+                return true;
+            }
+            let keep = peer_room > 0;
+            peer_room = peer_room.saturating_sub(1);
+            keep
+        })
+        .take(capacity)
+        .collect()
+}
+
 /// Compute hit areas for the `servers` section: the header rect (hosts the
 /// all/current scope toggle) and one two-line rect per visible switchable
 /// row (home, snapshot, config peer — see [`server_band_slots`] for the
@@ -1839,7 +1876,7 @@ pub(crate) fn compute_server_section_areas(
     let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
     let rows_area = server_band_rows_area(servers_area);
     let mut cards = Vec::new();
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         // The self row (None) gets no card.
         let Some(target) = target else {
             continue;
@@ -1871,7 +1908,7 @@ pub(crate) fn server_band_slot_at(
         return None;
     }
     let rows_area = server_band_rows_area(servers_area);
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
             break;
         };
@@ -1950,7 +1987,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
     // the name fields a band-global pad width (the longest name sets where
     // the count columns start), then paint.
     let mut prepared = Vec::new();
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
             break;
         };
@@ -4091,6 +4128,26 @@ mod tests {
         assert!(row.tally.is_none());
         assert!(health.starts_with("snapshot"), "{health}");
         assert!(health.contains("old"), "{health}");
+    }
+
+    #[test]
+    fn a_short_band_drops_peers_never_home_or_self() {
+        // Review of #422: home and self sort in place now, so the height cap
+        // must not cut them the way it cuts peers.
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot("zz-home", vec!["anvil", "beta", "ksb"]));
+        // Room for three rows under the header: 1 + 3 * 2 lines.
+        let rows_area = Rect::new(0, 0, 30, 1 + 3 * SERVER_ROW_LINES);
+        let fitted = fitted_band_slots(&app, rows_area);
+        assert_eq!(fitted.len(), 3, "{fitted:?}");
+        assert!(fitted.contains(&None), "self keeps its row: {fitted:?}");
+        assert!(
+            fitted.contains(&Some(PeerSwitchRequest::Home)),
+            "home keeps its row: {fitted:?}"
+        );
+        // Still in band order: the kept peer, wherever self sorts, home last.
+        assert_eq!(fitted.last(), Some(&Some(PeerSwitchRequest::Home)));
     }
 
     #[test]
