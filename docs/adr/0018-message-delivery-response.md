@@ -51,7 +51,7 @@ from it, and no sender text ever reaches the wake.
 
 `blocking` is sender-declared and therefore sender-abusable, so it carries a
 cost: its own per-sender rate limit, tighter than the general one, declared in
-config (`[messages] blocking_per_hour`) rather than compiled in.
+config (`[msg] blocking_per_hour`) rather than compiled in.
 
 An intent a receiving server does not recognise — version skew across the relay
 — is treated as `needs_reply`: skew fails toward the recipient hearing about
@@ -83,7 +83,7 @@ before the keystroke:
   marker clears when the agent reads its inbox or leaves `Idle`, so a wake is
   never re-typed on every tick.
 
-The settle and quiet windows are config (`[messages]`), and the feature has a
+The settle and quiet windows are config (`[msg]`, alongside the existing `enabled` and `allow_from`), and the feature has a
 kill switch (`idle_wake`, default on).
 
 ### 3. A mute must answer
