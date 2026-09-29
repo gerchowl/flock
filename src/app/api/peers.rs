@@ -140,16 +140,74 @@ impl App {
                 "peers.hub_fleet arrived with no relay bound",
             );
         };
-        crate::peers::merge_hub_pushed_fleet(
-            &mut self.state.relayed_fleet_cache,
-            params.fleet,
-            &hub,
-        );
+        let mut fleet = params.fleet;
+        // #424: the hub's own row, heard only under the name bound to this
+        // relay. A row about some other machine is not the hub speaking for
+        // itself.
+        //
+        // What the binding attests is the relay PROCESS. The hub's NAME is
+        // the one that process declared in its first frame (`record_hub`),
+        // so a relay could call itself anything. That stays within the
+        // same-user boundary the relay already runs in: only a process this
+        // user started can bind, and the home row it could then repaint
+        // still switches via the home target, never an ssh dial.
+        let hub_key = hub.to_ascii_lowercase();
+        let hub_self = params
+            .hub_self
+            .map(|row| *row)
+            .filter(|row| crate::peers::wire_row_identity(row) == hub_key);
+        match self.state.fleet_snapshot.as_mut() {
+            Some(snapshot) => {
+                // The home row is the one the operator trusts, so exactly one
+                // voice may repaint it: the bound hub, about itself, and only
+                // when that hub IS the client's home. A `fleet` row claiming
+                // to be home is another machine's say-so (any spoke the hub
+                // polls can report any host), so it is dropped rather than
+                // absorbed, and never stored as a second home row either.
+                fleet = snapshot.without_origin_claims(fleet);
+                if let Some(row) = hub_self {
+                    if snapshot.origin.eq_ignore_ascii_case(&hub) {
+                        snapshot.absorb_hub_self(row);
+                    } else {
+                        fleet.push(row);
+                    }
+                }
+            }
+            None => fleet.extend(hub_self),
+        }
+        crate::peers::merge_hub_pushed_fleet(&mut self.state.relayed_fleet_cache, fleet, &hub);
         self.state.evict_expired_relayed_entries();
         self.render_dirty
             .store(true, std::sync::atomic::Ordering::Release);
         self.render_notify.notify_one();
         super::responses::encode_success(id, crate::api::schema::ResponseResult::Ok {})
+    }
+
+    /// This server's own row for the `peers.hub_fleet` push (#424): the same
+    /// summary a hub stamps as a snapshot's origin at switch time, sent again
+    /// on every poll so a client that left this hub keeps a live view of it.
+    pub(crate) fn hub_self_row(&self) -> RelayedFleetPeer {
+        let us = short_host_name();
+        RelayedFleetPeer {
+            name: us.clone(),
+            // Never dialled by the spoke (hub-pushed rows are display-only),
+            // and a spoke that already has a route to us keeps its own.
+            ssh_target: us.clone(),
+            host: Some(us.clone()),
+            version: Some(crate::build_info::version()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            system: self.state.system_stats.as_ref().map(system_summary),
+            latency_ms: None,
+            workspaces: self.self_workspace_summaries(),
+            // We ARE the origin of our own reading, taken right now.
+            age_secs: Some(0),
+            error: None,
+            origin: us,
+            origin_last_ok_secs: Some(0),
+            proxy_jump: None,
+            icon: configured_node_icon(),
+            dial: None,
+        }
     }
 
     pub(super) fn own_relayed_fleet(&self) -> Vec<RelayedFleetPeer> {
@@ -518,8 +576,11 @@ impl App {
             PeerSwitchRequest::RelayedPeer { host_key, ws_idx } => {
                 let relayed = self.state.relayed_fleet_cache.get(&host_key)?;
                 // #410: a row a hub pushed down is display-only — never dialled.
+                // #424: but when the client CARRIED a route to the same machine,
+                // the live row is only the better reading of a server it can
+                // already reach — dial the carried route, never the pushed one.
                 if relayed.hub_pushed {
-                    return None;
+                    return self.switch_via_carried_route(&host_key, &relayed.peer, ws_idx);
                 }
                 let entry = &relayed.peer;
                 let ssh_target = entry.ssh_target.clone();
@@ -564,6 +625,49 @@ impl App {
                 })
             }
         }
+    }
+
+    /// Switch to the machine a hub-pushed row describes, over the route the
+    /// client's own carried snapshot holds for that machine (#424).
+    ///
+    /// Before the hub pushed its view down, such a machine rendered as its
+    /// carried snapshot row, frozen but clickable. The pushed row now wins the
+    /// dedup because it is live, and it is display-only, so without this the
+    /// click that used to work silently did nothing. Everything that decides
+    /// where ssh goes (target, ProxyJump) comes from the carried row. The
+    /// pushed row supplies only the space to focus, by id, so a space opened
+    /// there after the switch is reachable too. `None` when nothing carried a
+    /// route: the row stays display-only.
+    ///
+    /// The match is the exact host the relay cache keys the row under, never
+    /// the domain-stripped sort key: `anvil.other` is not `anvil`, and a click
+    /// on one must not dial the other's route.
+    fn switch_via_carried_route(
+        &self,
+        host_key: &str,
+        pushed: &crate::peers::PeerSummaryState,
+        ws_idx: Option<usize>,
+    ) -> Option<PreparedServerSwitch> {
+        let carried = self
+            .state
+            .fleet_snapshot
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|entry| crate::app::state::row_host_key(entry) == host_key)?;
+        let ssh_target = carried.ssh_target.clone();
+        let proxy_jump = carried.proxy_jump.clone();
+        let target = ws_idx.and_then(|ws_idx| pushed.workspaces.get(ws_idx));
+        let label = switch_label(carried.display_name(), target);
+        let focus_workspace = focus_target(target);
+        let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
+        Some(PreparedServerSwitch {
+            ssh_target,
+            label,
+            fleet,
+            focus_workspace,
+            proxy_jump,
+        })
     }
 
     /// The fleet snapshot the next attach leg carries.
@@ -1134,6 +1238,7 @@ mod tests {
                         // A row about this server itself is never stored.
                         hub_row(&crate::app::short_host_name(), "self", 1),
                     ],
+                    hub_self: None,
                 },
             ),
         });
@@ -1145,6 +1250,7 @@ mod tests {
                 crate::api::schema::PeersHubFleetParams {
                     hub: "impostor".into(),
                     fleet: vec![hub_row("ksb", "lars@ksb", 1)],
+                    hub_self: None,
                 },
             ),
         });
@@ -1325,5 +1431,469 @@ mod tests {
             "an entry whose origin is self must never enter the cache: {:?}",
             app.state.relayed_fleet_cache
         );
+    }
+
+    /// A workspace with a resolved git identity, the way the git-space cache
+    /// holds it once a checkout has been probed.
+    fn git_workspace(name: &str, project_key: &str) -> crate::workspace::Workspace {
+        let mut ws = crate::workspace::Workspace::test_new(name);
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: format!("/repos/{name}/.git"),
+            checkout_key: format!("/repos/{name}"),
+            label: name.to_string(),
+            repo_root: std::path::PathBuf::from(format!("/repos/{name}")),
+            is_linked_worktree: false,
+            project_key: project_key.to_string(),
+        });
+        ws
+    }
+
+    /// Bind this test process as the relay, as `peers.relay_attach` would.
+    fn bind_relay(app: &mut App) {
+        let relay = std::process::id();
+        let started = crate::platform::process_start_time(relay).expect("own start time");
+        app.uplink
+            .attach_relay(relay, started, crate::platform::process_start_time)
+            .expect("bound");
+        app.current_api_peer_pid = Some(relay);
+    }
+
+    fn push_down(spoke: &mut App, params: crate::api::schema::PeersHubFleetParams) {
+        let response = spoke.handle_api_request(crate::api::schema::Request {
+            id: "down".into(),
+            method: crate::api::schema::Method::PeersHubFleet(params),
+        });
+        assert!(response.contains("\"result\""), "{response}");
+    }
+
+    /// Every space name the spoke's sidebar shows for the client's HOME.
+    fn home_space_names(spoke: &App) -> Vec<String> {
+        let origin = spoke
+            .state
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .expect("carried origin");
+        crate::ui::workspace_list_entries(&spoke.state)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Origin,
+                    ws_idx,
+                    ..
+                } => Some(origin.workspaces[ws_idx].workspace.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_switch_away_from_the_hub_keeps_the_view_of_it_live() {
+        // #424: the client switches A (the hub) → B (a spoke A polls). The
+        // snapshot B receives was stamped once, at switch time, and nothing
+        // refreshed it, so a space renamed or opened on A afterwards never
+        // showed on B. A's own row now rides the push it already makes down the
+        // relay it holds into B, on every poll.
+        let mut hub = test_app();
+        hub.state.workspaces = vec![
+            git_workspace("flock", "github.com/gerchowl/flock"),
+            git_workspace("notes", "github.com/gerchowl/notes"),
+        ];
+        hub.state.workspaces[0].custom_name = Some("flock".into());
+        hub.state.peer_summaries = vec![summary("spoke", "lars@spoke")];
+        let prepared = hub
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: None,
+            })
+            .expect("switch resolves");
+
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState::from_wire(
+            prepared.fleet.expect("the hub stamps a snapshot"),
+        ));
+        assert_eq!(home_space_names(&spoke), vec!["flock", "notes"]);
+
+        // On A, after the switch: rename a space, open a new solo one.
+        hub.state.workspaces[0].custom_name = Some("flock-renamed".into());
+        hub.state
+            .workspaces
+            .push(git_workspace("scratch", "github.com/gerchowl/scratch"));
+        // Without a push B still shows the switch-time copy: the freeze.
+        assert_eq!(home_space_names(&spoke), vec!["flock", "notes"]);
+
+        // One refresh window: A's next poll of B pushes down, exactly what
+        // `PeerPollDue` hands `push_hub_fleet`.
+        bind_relay(&mut spoke);
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: crate::app::short_host_name(),
+                fleet: hub.own_relayed_fleet(),
+                hub_self: Some(Box::new(hub.hub_self_row())),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+
+        assert_eq!(
+            home_space_names(&spoke),
+            vec!["flock-renamed", "notes", "scratch"],
+            "B shows A's rename and A's new space"
+        );
+        let origin = spoke
+            .state
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .unwrap();
+        // Still the way HOME: never an ssh dial to wherever the push said.
+        assert_eq!(origin.ssh_target, crate::protocol::HOME_SWITCH_TARGET);
+        assert!(origin.proxy_jump.is_none());
+        // And one row for the hub, not the home row plus a relayed copy of it.
+        assert!(spoke.state.relayed_fleet_cache.is_empty());
+    }
+
+    fn planted_space(name: &str) -> crate::api::schema::PeerWorkspaceSummary {
+        crate::api::schema::PeerWorkspaceSummary {
+            id: "ws_9".into(),
+            workspace: name.into(),
+            project_key: Some("github.com/x/y".into()),
+            project_label: None,
+            branch: None,
+            is_linked_worktree: false,
+            agent: None,
+            status: crate::api::schema::AgentStatus::Idle,
+            status_age_secs: None,
+            activity: None,
+            agents: Vec::new(),
+        }
+    }
+
+    fn carried_home() -> crate::peers::FleetSnapshotState {
+        crate::peers::FleetSnapshotState {
+            origin: "mba22".into(),
+            peers: Vec::new(),
+            origin_summary: Some(summary("mba22", crate::protocol::HOME_SWITCH_TARGET)),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    fn home_workspaces(spoke: &App) -> Vec<String> {
+        spoke
+            .state
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .expect("carried origin")
+            .workspaces
+            .iter()
+            .map(|ws| ws.workspace.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_the_home_hub_itself_can_repaint_the_home_row() {
+        // #425 review blocker: the home row is the one the operator trusts.
+        // Any spoke the hub polls can REPORT any host, so a row in `fleet`
+        // claiming to be home (fresh, age 0) must not replace it — and must
+        // not be stored as a second home row either. Nor may a `hub_self` from
+        // a hub that is not home, or one naming a machine other than the hub.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        let mut claim = hub_row("mba22", "mba22", 0);
+        claim.workspaces = vec![planted_space("planted-by-a-spoke")];
+        let mut forged_self = hub_row("mba22", "mba22", 0);
+        forged_self.workspaces = vec![planted_space("planted-by-anvil")];
+        bind_relay(&mut spoke);
+        // The bound hub is anvil, not home: its fleet row about mba22 and its
+        // `hub_self` naming mba22 are both claims about someone else.
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "anvil".into(),
+                fleet: vec![claim.clone()],
+                hub_self: Some(Box::new(forged_self)),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        assert!(
+            home_workspaces(&spoke).is_empty(),
+            "{:?}",
+            home_workspaces(&spoke)
+        );
+        assert!(
+            !spoke.state.relayed_fleet_cache.contains_key("mba22"),
+            "a claim to be home is dropped, not stored"
+        );
+
+        // Even when the bound hub IS home, a `fleet` row about home is some
+        // polled node's say-so. Only the hub's own `hub_self` counts.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        bind_relay(&mut spoke);
+        let mut genuine = hub_row("mba22", "mba22", 0);
+        genuine.workspaces = vec![planted_space("home-for-real")];
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: vec![claim],
+                hub_self: None,
+            },
+        );
+        assert!(
+            home_workspaces(&spoke).is_empty(),
+            "{:?}",
+            home_workspaces(&spoke)
+        );
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: Vec::new(),
+                hub_self: Some(Box::new(genuine)),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        assert_eq!(home_workspaces(&spoke), vec!["home-for-real"]);
+        assert!(spoke.state.relayed_fleet_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_is_not_home_shows_as_its_own_display_only_row() {
+        // A spoke used to see its hub's peers but never the hub. When the hub
+        // is not the client's home, its `hub_self` is its own row.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        bind_relay(&mut spoke);
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "anvil".into(),
+                fleet: Vec::new(),
+                hub_self: Some(Box::new(hub_row("anvil", "anvil", 0))),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        let entry = &spoke.state.relayed_fleet_cache["anvil"];
+        assert!(entry.hub_pushed);
+        assert!(home_workspaces(&spoke).is_empty());
+        // Display-only: nothing was carried for anvil, so a click dials nothing.
+        assert!(spoke
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "anvil".into(),
+                ws_idx: None,
+            })
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_host_with_control_bytes_is_not_a_second_home() {
+        // #425 review r2: identity is keyed on the raw host, so `mba22\x07`
+        // got past `without_origin_claims` and rendered as a second mba22.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        bind_relay(&mut spoke);
+        let mut disguised = hub_row("mba22", "mba22", 0);
+        disguised.host = Some("mba22\u{7}".into());
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "anvil".into(),
+                fleet: vec![disguised, hub_row("ksb", "ksb", 0)],
+                hub_self: None,
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        let keys: Vec<&String> = spoke.state.relayed_fleet_cache.keys().collect();
+        assert_eq!(keys, vec!["ksb"], "the disguised row is dropped: {keys:?}");
+        assert!(home_workspaces(&spoke).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pushed_names_lose_control_bytes_before_they_render() {
+        // #425 review: the hub_fleet receive path renders what it is handed.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        bind_relay(&mut spoke);
+        let mut row = hub_row("mba22", "mba22", 0);
+        row.workspaces = vec![planted_space("ok\u{1b}]52;c;cGF5bG9hZA==\u{7}name")];
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: Vec::new(),
+                hub_self: Some(Box::new(row)),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        let names = home_workspaces(&spoke);
+        assert_eq!(names.len(), 1);
+        assert!(
+            !names[0].chars().any(char::is_control),
+            "control bytes stripped: {:?}",
+            names[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_hub_pushed_row_still_switches_over_the_carried_route() {
+        // #424: the hub's push makes a carried machine's row live, and the live
+        // row wins the dedup. It is display-only, so before this the click that
+        // worked on the frozen row silently did nothing. The route comes from
+        // the carried row; the push supplies only which space to focus.
+        let mut spoke = test_app();
+        let mut carried = summary("anvil", "lars@anvil");
+        carried.proxy_jump = Some("mba22".into());
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".into(),
+            peers: vec![carried],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        let mut live = hub_row("anvil", "-oProxyCommand=evil", 0);
+        live.ssh_target = "anvil-elsewhere".into();
+        live.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+            id: "ws_42".into(),
+            workspace: "opened-after-the-switch".into(),
+            project_key: Some("github.com/gerchowl/flock".into()),
+            project_label: None,
+            branch: Some("main".into()),
+            is_linked_worktree: false,
+            agent: None,
+            status: crate::api::schema::AgentStatus::Idle,
+            status_age_secs: None,
+            activity: None,
+            agents: Vec::new(),
+        }];
+        bind_relay(&mut spoke);
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: vec![live],
+                hub_self: None,
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        assert!(spoke.state.relayed_fleet_cache["anvil"].hub_pushed);
+
+        let prepared = spoke
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "anvil".into(),
+                ws_idx: Some(0),
+            })
+            .expect("the carried route makes the live row clickable");
+        assert_eq!(prepared.ssh_target, "lars@anvil");
+        assert_eq!(prepared.proxy_jump.as_deref(), Some("mba22"));
+        assert_eq!(prepared.focus_workspace.as_deref(), Some("ws_42"));
+    }
+
+    #[tokio::test]
+    async fn a_pushed_row_never_borrows_the_route_of_a_merely_similar_host() {
+        // #425 review: `anvil.other` is not `anvil`. The domain-stripped sort
+        // key must never decide whose route a click dials.
+        let mut spoke = test_app();
+        let mut carried = summary("anvil", "lars@anvil");
+        carried.proxy_jump = Some("mba22".into());
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".into(),
+            peers: vec![carried],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        bind_relay(&mut spoke);
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: vec![hub_row("anvil.other", "anvil.other", 0)],
+                hub_self: None,
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        assert!(spoke
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "anvil.other".into(),
+                ws_idx: None,
+            })
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hub_pushed_row_about_home_never_renders_home_twice() {
+        // A row about the client's home stored before the client attached
+        // (a spoke hears its hub whether or not anyone is attached) must not
+        // stand beside the home row. The origin slot stands for that machine.
+        let mut spoke = test_app();
+        bind_relay(&mut spoke);
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "mba22".into(),
+                fleet: Vec::new(),
+                hub_self: Some(Box::new(hub_row("mba22", "mba22", 0))),
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        assert!(spoke.state.relayed_fleet_cache.contains_key("mba22"));
+
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".into(),
+            peers: Vec::new(),
+            origin_summary: Some(summary("mba22", crate::protocol::HOME_SWITCH_TARGET)),
+            received_at: std::time::Instant::now(),
+        });
+        let rows: Vec<_> = spoke
+            .state
+            .remote_peers()
+            .into_iter()
+            .map(|(peer_ref, _)| peer_ref)
+            .collect();
+        assert_eq!(rows, vec![crate::app::state::RemotePeerRef::Origin]);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures.
+    fn a_new_git_space_reports_its_project_before_the_git_cache_fills() {
+        // #424 investigation, candidate (b): a remote row with no project key
+        // is dropped from the spaces list, so a space whose summary was built
+        // before its git identity resolved would vanish on every other server.
+        // For a git checkout it cannot: the summary derives the identity live
+        // from the checkout while the cache is empty.
+        let dir = std::env::temp_dir().join(format!(
+            "flock-424-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:gerchowl/flock.git",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let mut ws = crate::workspace::Workspace::test_new("main");
+        ws.identity_cwd = dir.clone();
+        ws.cached_git_space = None;
+        let summary = super::workspace_peer_summary(&ws, &std::collections::HashMap::new());
+        assert_eq!(
+            summary.project_key.as_deref(),
+            Some("github.com/gerchowl/flock")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

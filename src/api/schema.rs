@@ -3264,6 +3264,15 @@ pub struct PeersHubFleetParams {
     pub hub: String,
     #[serde(default)]
     pub fleet: Vec<RelayedFleetPeer>,
+    /// The hub's OWN summary, first-hand (#424). `fleet` is the peers the hub
+    /// polls and never the hub itself, so a client that switched here FROM the
+    /// hub had nothing but the copy it carried at switch time, frozen: a space
+    /// renamed or opened on the hub afterwards never showed. The spoke uses it
+    /// to refresh the carried origin when the hub is that origin, and as the
+    /// hub's own display-only row otherwise. Additive with `#[serde(default)]`,
+    /// so a v(N-1) hub's push parses as `None` and a v(N-1) spoke ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_self: Option<Box<RelayedFleetPeer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

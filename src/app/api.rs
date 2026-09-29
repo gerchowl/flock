@@ -322,6 +322,9 @@ impl App {
                 crate::health::PEER_POLL_MAX_ROUND_SECS,
                 crate::health::PeerPollErrorKind::Timeout,
             );
+            // #424: this server's own row rides every push too, so a client
+            // that switched away from here keeps a live view of it.
+            let mut hub_self: Option<Box<crate::api::schema::RelayedFleetPeer>> = None;
             for peer in self.state.peers.clone() {
                 let effective = gossip.effective_poll_interval(&peer);
                 if !self
@@ -356,6 +359,13 @@ impl App {
                             && row.ssh_target != peer.ssh_target()
                     })
                     .collect();
+                // Built on the first peer actually due, once per round: most
+                // ticks dispatch nothing, and it is the same for every spoke.
+                let hub_self = Some(
+                    hub_self
+                        .get_or_insert_with(|| Box::new(self.hub_self_row()))
+                        .clone(),
+                );
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
                     // sends, so the fetch must not be able to unwind past it
@@ -373,7 +383,7 @@ impl App {
                     // Down-gossip rides the held relay only: it is worth one
                     // line on a connection already open, never a fresh ssh.
                     if fetch.result.is_ok() {
-                        crate::peer_stream::push_hub_fleet(&peer, down_fleet);
+                        crate::peer_stream::push_hub_fleet(&peer, down_fleet, hub_self);
                     }
                     let _ = event_tx.blocking_send(AppEvent::PeerSummaryFetched(fetch));
                 });

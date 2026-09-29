@@ -2782,7 +2782,22 @@ impl AppState {
         //
         // Ordered by host key: the cache is a HashMap, and iterating it
         // directly reshuffles these rows between renders.
-        let mut relayed: Vec<_> = self.relayed_fleet_cache.iter().collect();
+        //
+        // #424: a hub-pushed row about the client's HOME is left out while a
+        // snapshot is carried. The origin slot stands for that machine and
+        // absorbs such readings as they arrive, so this only skips one stored
+        // before the client attached, which would render home twice.
+        let origin_key = self
+            .fleet_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.origin.to_ascii_lowercase());
+        let mut relayed: Vec<_> = self
+            .relayed_fleet_cache
+            .iter()
+            .filter(|(host_key, entry)| {
+                !(entry.hub_pushed && origin_key.as_deref() == Some(host_key.as_str()))
+            })
+            .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         candidates.extend(relayed.into_iter().map(|(host_key, entry)| {
             (
@@ -2874,7 +2889,7 @@ const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 /// Machine-independent host key: the peer's reported host (fallback: config
 /// name or ssh_target), lowercased. Used across surfaces so a host cannot
 /// dedupe under different keys on the band vs. the spaces list.
-fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
+pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
     let fallback = if peer.peer.is_empty() {
         peer.ssh_target.as_str()
     } else {

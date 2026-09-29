@@ -1194,33 +1194,42 @@ const SERVERS_SECTION_MAX_ROWS: u16 = 8;
 /// first, compact health on the second.
 const SERVER_ROW_LINES: u16 = 2;
 
-/// The band's two-line rows in render order: the home/origin row pinned
-/// first when the attached client carried a fleet snapshot, then the local
-/// server (`None` — it never gets a switch hit-area), then every peer row
-/// (carried snapshot rows + the server's own configured peers) sorted by the
-/// peer's machine-independent identity. A locally attached client has no
-/// snapshot: just self + config peers.
+/// The band's two-line rows in render order: the home/origin row when the
+/// attached client carried a fleet snapshot, the local server (`None` — it
+/// never gets a switch hit-area), and every peer row (carried snapshot, relayed
+/// and the server's own configured peers), all in ONE order.
 ///
-/// The peer tail is sorted so the band reads the same order on every server
-/// (#51) — without it the order was viewer-relative (each server's `[[peers]]`
-/// order + the carried snapshot's arrival order), so switching servers
-/// reshuffled the list. This mirrors the spaces fleet-stable sort (#85). Home
-/// and self stay pinned above the sorted tail (they are viewer-relative by
-/// definition and serve as a "you are here" affordance).
+/// That order is the same from every server (#422). #51 sorted the peer tail,
+/// but home and self stayed pinned above it, so the attached server jumped to
+/// the top and left its sorted slot, and every server saw a rotated list.
+/// Every row now sorts by [`band_row_key`], self and home included, and "you
+/// are here" / "home" are marked in place: the current-row fill on self and
+/// the home glyph on home.
 fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
+    server_band_slots_as(app, &crate::app::short_host_name())
+}
+
+/// [`server_band_slots`] for a viewer whose own host is `self_host`, so a test
+/// can stand in for servers other than the one running it.
+fn server_band_slots_as(
+    app: &AppState,
+    self_host: &str,
+) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
     use crate::app::state::PeerSwitchRequest;
-    let mut slots = Vec::new();
-    if app.fleet_snapshot.is_some() {
-        slots.push(Some(PeerSwitchRequest::Home));
+    let mut slots: Vec<(String, Option<PeerSwitchRequest>)> = Vec::new();
+    if let Some(snapshot) = app.fleet_snapshot.as_ref() {
+        slots.push((
+            crate::peers::normalized_host_key(&snapshot.origin),
+            Some(PeerSwitchRequest::Home),
+        ));
     }
-    slots.push(None);
+    slots.push((crate::peers::normalized_host_key(self_host), None));
 
     // Gossip v3 (#101 part 4): the band and the spaces list share ONE deduped
     // remote-row list. Same key (lowercased reported host), same tier + freshness
     // tie-break — so a two-hub fleet CANNOT produce a duplicate row here that
     // the spaces list also shows, and both surfaces agree on which entry won.
-    let mut peers: Vec<Option<PeerSwitchRequest>> = Vec::new();
-    for (peer_ref, _peer) in app.remote_peers() {
+    for (peer_ref, peer) in app.remote_peers() {
         // Origin rows fold into the spaces list, never a band slot — the Home
         // row above already stands for the origin server here.
         if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
@@ -1229,45 +1238,28 @@ fn server_band_slots(app: &AppState) -> Vec<Option<crate::app::state::PeerSwitch
         // A BAND row is a server, not a space: switch there and let it keep
         // its own focus. (It used to pin workspace 0, which quietly retargeted
         // the peer's first space every time you clicked its server row.)
-        peers.push(Some(peer_ref.server_switch_request()));
+        slots.push((band_row_key(peer), Some(peer_ref.server_switch_request())));
     }
-    // Stable order across peers so band layout does not shuffle: sort by the
-    // shared host key (lowercased reported host).
-    peers.sort_by_cached_key(|slot| server_slot_sort_key(app, slot));
-    slots.extend(peers);
-    slots
+    // Stable, so two rows that normalise to one key keep a fixed relative order.
+    slots.sort_by(|a, b| a.0.cmp(&b.0));
+    slots.into_iter().map(|(_, slot)| slot).collect()
 }
 
-/// Machine-independent sort key for a peer band row: the host the peer reports
-/// about itself, falling back to its config name, lowercased. Reported host is
-/// the same regardless of which server is doing the looking, so keying on it
-/// makes the band order identical across the fleet (#51). Non-peer slots
-/// (Home / self) never reach here — they are pinned above the sorted tail.
-fn server_slot_sort_key(
-    app: &AppState,
-    slot: &Option<crate::app::state::PeerSwitchRequest>,
-) -> String {
-    use crate::app::state::PeerSwitchRequest;
-    let summary = match slot {
-        Some(PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => app
-            .fleet_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.peers.get(*entry_idx)),
-        Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => app.peer_summaries.get(*peer_idx),
-        Some(PeerSwitchRequest::RelayedPeer { host_key, .. }) => app
-            .relayed_fleet_cache
-            .get(host_key)
-            .map(|entry| &entry.peer),
-        _ => None,
-    };
-    summary
-        .map(|peer| {
-            peer.host
-                .clone()
-                .unwrap_or_else(|| peer.peer.clone())
-                .to_ascii_lowercase()
-        })
-        .unwrap_or_default()
+/// Machine-independent sort key for a peer band row (#51, #422): the host the
+/// peer reports about itself, normalised by [`crate::peers::normalized_host_key`].
+///
+/// A peer that has not reported yet sorts by its ssh target under the same
+/// normalisation — never its config name, a local label that differs from one
+/// viewer to the next. The target is what gossip carries for that machine, and
+/// it is usually its host name already, so the row does not jump when the
+/// first report lands.
+fn band_row_key(peer: &crate::peers::PeerSummaryState) -> String {
+    let identity = peer
+        .host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(&peer.ssh_target);
+    crate::peers::normalized_host_key(identity)
 }
 
 /// The band rows actually rendered, honoring the servers scope toggle:
@@ -1828,6 +1820,43 @@ fn server_slot_rect(servers_area: Rect, slot: u16) -> Option<Rect> {
         .then(|| Rect::new(servers_area.x, y, servers_area.width, SERVER_ROW_LINES))
 }
 
+/// The visible band rows that fit `rows_area`, in band order.
+///
+/// Home and self used to be rows 0 and 1, so the height cap could only ever cut
+/// peers. Now they sort in place (#422), so when the band overflows, peers are
+/// dropped from the end to make room for them. The way home must never hide,
+/// and nor must the row saying where you are.
+fn fitted_band_slots(
+    app: &AppState,
+    rows_area: Rect,
+) -> Vec<Option<crate::app::state::PeerSwitchRequest>> {
+    let slots = visible_server_band_slots(app);
+    let capacity = usize::from(rows_area.height.saturating_sub(1) / SERVER_ROW_LINES);
+    if slots.len() <= capacity {
+        return slots;
+    }
+    let is_anchor = |slot: &Option<_>| {
+        matches!(
+            slot,
+            None | Some(crate::app::state::PeerSwitchRequest::Home)
+        )
+    };
+    let mut peer_room =
+        capacity.saturating_sub(slots.iter().filter(|slot| is_anchor(slot)).count());
+    slots
+        .into_iter()
+        .filter(|slot| {
+            if is_anchor(slot) {
+                return true;
+            }
+            let keep = peer_room > 0;
+            peer_room = peer_room.saturating_sub(1);
+            keep
+        })
+        .take(capacity)
+        .collect()
+}
+
 /// Compute hit areas for the `servers` section: the header rect (hosts the
 /// all/current scope toggle) and one two-line rect per visible switchable
 /// row (home, snapshot, config peer — see [`server_band_slots`] for the
@@ -1847,7 +1876,7 @@ pub(crate) fn compute_server_section_areas(
     let header_rect = Rect::new(servers_area.x, servers_area.y, servers_area.width, 1);
     let rows_area = server_band_rows_area(servers_area);
     let mut cards = Vec::new();
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         // The self row (None) gets no card.
         let Some(target) = target else {
             continue;
@@ -1879,7 +1908,7 @@ pub(crate) fn server_band_slot_at(
         return None;
     }
     let rows_area = server_band_rows_area(servers_area);
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
             break;
         };
@@ -1958,7 +1987,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
     // the name fields a band-global pad width (the longest name sets where
     // the count columns start), then paint.
     let mut prepared = Vec::new();
-    for (slot, target) in visible_server_band_slots(app).into_iter().enumerate() {
+    for (slot, target) in fitted_band_slots(app, rows_area).into_iter().enumerate() {
         let Some(rect) = server_slot_rect(rows_area, slot as u16) else {
             break;
         };
@@ -1973,7 +2002,13 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 let Some(snapshot) = app.fleet_snapshot.as_ref() else {
                     continue;
                 };
-                home_server_rows(snapshot, p, app.server_label)
+                home_server_rows(
+                    snapshot,
+                    p,
+                    app.server_label,
+                    now,
+                    stale_after_secs.as_secs(),
+                )
             }
             Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
                 let Some(peer) = app
@@ -2008,7 +2043,11 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 if let Some(via) = entry.via.as_deref() {
                     build.title_rest.insert(
                         0,
-                        Span::styled(format!("via {via} "), Style::default().fg(p.overlay0)),
+                        Span::styled(
+                            // The hub's name is self-declared by its relay.
+                            format!("via {} ", crate::control_bytes::strip(via)),
+                            Style::default().fg(p.overlay0),
+                        ),
                     );
                 }
                 build
@@ -2233,8 +2272,9 @@ fn server_name_spans(
 fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
     use super::status::{band_battery_style, battery_icon, format_net_io, push_band_metric};
     let p = &app.palette;
-    // No self marker (user: redundant) — the current-row highlight fill and
-    // band position already say "this is where you are".
+    // No self marker (user: redundant) — the current-row highlight fill says
+    // "this is where you are". Position does not: the band is one fleet-wide
+    // order (#422).
     let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
     // #164: our OWN self-declared icon, resolved locally (matches what we
     // gossip so the self row and peers' view of us agree).
@@ -2287,18 +2327,38 @@ fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
     }
 }
 
-/// The pinned origin row of a carried fleet snapshot: `← mba22 home` over a
-/// dim flush-left snapshot-age line. It carries no counts; its name field
-/// still pads to the band width so the count columns stay aligned.
-/// Selecting it re-attaches the client locally.
+/// The origin row of a carried fleet snapshot: the home glyph, then the
+/// origin's own health over a dim flush-left age line. Selecting it re-attaches
+/// the client locally.
+///
+/// The age is the ORIGIN's reading plus how long it has sat here (#424), not
+/// the time since this client attached: the hub refreshes that reading over its
+/// relay, and a snapshot that stopped being refreshed must say so. Past
+/// `[gossip] stale_after` the row takes the muted stale tint, counts greyed
+/// with it, rather than calling a frozen view current.
 fn home_server_rows(
     snapshot: &crate::peers::FleetSnapshotState,
     p: &crate::app::state::Palette,
     mode: crate::config::ServerLabelConfig,
+    now: std::time::Instant,
+    stale_after_secs: u64,
 ) -> ServerRowBuild {
-    // The way-home row renders like any server row (user: "I know my home")
-    // — its pinned slot-0 position IS the label; no arrow, no suffix.
-    let name_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
+    let age_secs = snapshot
+        .origin_summary
+        .as_ref()
+        .and_then(|origin| origin.carried_age_secs_at(now))
+        .unwrap_or_else(|| {
+            now.saturating_duration_since(snapshot.received_at)
+                .as_secs()
+        });
+    let stale = age_secs > stale_after_secs;
+    let name_style = if stale {
+        Style::default()
+            .fg(p.overlay0)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    };
     // #164: the origin's self-declared icon, carried in its summary.
     let name = server_name_spans(
         snapshot
@@ -2309,10 +2369,23 @@ fn home_server_rows(
         mode,
         name_style,
     );
+    // #422: the band is one fleet-wide order, so position no longer says which
+    // row is home. The glyph does, in place, leading the rest of the title the
+    // way `via <hub>` does on a relayed row.
+    let title_rest = vec![Span::styled(
+        HOME_ROW_GLYPH.to_string(),
+        Style::default().fg(p.overlay0),
+    )];
+    let age_span = |sep: &str| {
+        Span::styled(
+            format!("{sep}snapshot {} old", format_age(age_secs)),
+            Style::default().fg(p.overlay0),
+        )
+    };
     // The carried origin summary (#66) makes the home row live like a peer
     // row: the hub's own machine health below, its workspace tally in the
-    // count columns. Falls back to the bare snapshot-age line when no origin
-    // summary rode along (pre-#66 hub, or a CLI-stamped origin-only leg).
+    // count columns. Falls back to the bare age line when no origin summary
+    // rode along (pre-#66 hub, or a CLI-stamped origin-only leg).
     let (health, tally) = match snapshot.origin_summary.as_ref() {
         Some(origin) => {
             let mut spans = origin
@@ -2331,34 +2404,22 @@ fn home_server_rows(
                 })
                 .unwrap_or_default();
             let sep = if spans.is_empty() { "" } else { "  " };
-            spans.push(Span::styled(
-                format!(
-                    "{sep}snapshot {} old",
-                    format_age(snapshot.received_at.elapsed().as_secs())
-                ),
-                Style::default().fg(p.overlay0),
-            ));
+            spans.push(age_span(sep));
             (Line::from(spans), Some(peer_tally(origin)))
         }
-        None => (
-            Line::from(vec![Span::styled(
-                format!(
-                    "snapshot {} old",
-                    format_age(snapshot.received_at.elapsed().as_secs())
-                ),
-                Style::default().fg(p.overlay0),
-            )]),
-            None,
-        ),
+        None => (Line::from(vec![age_span("")]), None),
     };
     ServerRowBuild {
         name,
-        title_rest: Vec::new(),
+        title_rest,
         health,
         tally,
-        ghosted: false,
+        ghosted: stale,
     }
 }
+
+/// Marks the home row in place (#422): nf-md-home.
+const HOME_ROW_GLYPH: &str = "\u{f02dc}";
 
 /// A carried fleet-snapshot row: the regular peer row plus an explicit
 /// staleness-age chip. These rows are render-only — the server never polls
@@ -3414,15 +3475,65 @@ mod tests {
         }
     }
 
-    /// Resolved host order of the band's peer rows (Home / self pins resolve to
-    /// an empty key and drop out), i.e. exactly what a viewer sees down the
-    /// servers band below the pins.
-    fn peer_host_sequence(app: &AppState) -> Vec<String> {
-        server_band_slots(app)
+    /// The host every band row stands for, top to bottom, as the viewer whose
+    /// own host is `self_host` renders it: the WHOLE band, home and self
+    /// included, i.e. exactly the sequence an operator reads down the band.
+    fn band_host_sequence(app: &AppState, self_host: &str) -> Vec<String> {
+        use crate::app::state::PeerSwitchRequest;
+        server_band_slots_as(app, self_host)
             .iter()
-            .map(|slot| server_slot_sort_key(app, slot))
-            .filter(|key| !key.is_empty())
+            .map(|slot| match slot {
+                None => crate::peers::normalized_host_key(self_host),
+                Some(PeerSwitchRequest::Home) => crate::peers::normalized_host_key(
+                    &app.fleet_snapshot
+                        .as_ref()
+                        .expect("home needs a snapshot")
+                        .origin,
+                ),
+                Some(PeerSwitchRequest::ConfigPeer { peer_idx, .. }) => {
+                    band_row_key(&app.peer_summaries[*peer_idx])
+                }
+                Some(PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
+                    band_row_key(&app.fleet_snapshot.as_ref().unwrap().peers[*entry_idx])
+                }
+                Some(PeerSwitchRequest::RelayedPeer { host_key, .. }) => {
+                    band_row_key(&app.relayed_fleet_cache[host_key].peer)
+                }
+                Some(other) => panic!("not a band row: {other:?}"),
+            })
             .collect()
+    }
+
+    /// The band row a slot renders at (#422: self and home sort in place, so a
+    /// test cannot assume they lead the band).
+    fn band_row(app: &AppState, slot: Option<crate::app::state::PeerSwitchRequest>) -> u16 {
+        visible_server_band_slots(app)
+            .iter()
+            .position(|candidate| *candidate == slot)
+            .expect("slot is in the band") as u16
+    }
+
+    /// Band rows' hit-areas follow the band order, self skipped: each card sits
+    /// two lines per row below the header, at its own row's position.
+    fn assert_cards_follow_band(app: &AppState, area: Rect) {
+        let (header, cards) = compute_server_section_areas(app, area);
+        let slots = visible_server_band_slots(app);
+        let expected: Vec<(crate::app::state::PeerSwitchRequest, u16)> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(row, slot)| {
+                slot.clone()
+                    .map(|target| (target, header.y + 1 + row as u16 * SERVER_ROW_LINES))
+            })
+            .collect();
+        let got: Vec<(crate::app::state::PeerSwitchRequest, u16)> = cards
+            .iter()
+            .map(|card| (card.target.clone(), card.rect.y))
+            .collect();
+        assert_eq!(got, expected);
+        assert!(cards
+            .iter()
+            .all(|card| card.rect.height == SERVER_ROW_LINES));
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -3451,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_server_section_areas_lays_out_self_slot_then_two_line_peer_rows() {
+    fn compute_server_section_areas_gives_every_row_but_self_a_two_line_card() {
         let mut app = crate::app::state::AppState::test_new();
         app.peer_summaries = vec![
             peer_with_workspaces("anvil", vec![]),
@@ -3462,32 +3573,10 @@ mod tests {
         let area = Rect::new(0, 0, 30, 34);
         let (header, cards) = compute_server_section_areas(&app, area);
         assert_ne!(header, Rect::default());
+        // The local server's row has NO hit-area, so clicking it can never
+        // request a SwitchServer. Wherever it sorts, the peers keep theirs.
         assert_eq!(cards.len(), 2);
-        // Slot 0 (the two lines under the header) belongs to the local
-        // server and has NO hit-area, so clicking it can never request a
-        // SwitchServer; the first peer card starts below it.
-        assert_eq!(
-            cards[0].target,
-            crate::app::state::PeerSwitchRequest::ConfigPeer {
-                peer_idx: 0,
-                ws_idx: None,
-            }
-        );
-        assert_eq!(cards[0].rect.y, header.y + 1 + SERVER_ROW_LINES);
-        assert!(cards
-            .iter()
-            .all(|card| card.rect.y > header.y + SERVER_ROW_LINES));
-        // Each peer row spans two lines and stacks below the previous one.
-        assert_eq!(cards[0].rect.height, SERVER_ROW_LINES);
-        assert_eq!(
-            cards[1].target,
-            crate::app::state::PeerSwitchRequest::ConfigPeer {
-                peer_idx: 1,
-                ws_idx: None,
-            }
-        );
-        assert_eq!(cards[1].rect.y, cards[0].rect.y + SERVER_ROW_LINES);
-        assert_eq!(cards[1].rect.height, SERVER_ROW_LINES);
+        assert_cards_follow_band(&app, area);
 
         // Scope current without a carried snapshot: only the self row stays,
         // which has no hit-area — the header (with its toggle) remains.
@@ -3510,52 +3599,41 @@ mod tests {
     }
 
     #[test]
-    fn server_band_pins_home_self_then_sorts_peers() {
+    fn server_band_sorts_home_and_self_in_place_with_the_peers() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        // Names already alphabetical (anvil < ksb < ownpeer), so the sorted
-        // peer tail keeps snapshot-then-config order here; the interleaving
-        // case is covered by `server_band_sorts_peers_fleet_stably`.
         app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
 
+        // #422: home (mba22) and self (lab) are not pinned above the peers —
+        // they take their place in the one host order.
         assert_eq!(
-            server_band_slots(&app),
+            server_band_slots_as(&app, "lab"),
             vec![
-                Some(PeerSwitchRequest::Home),
-                None, // self — no switch hit-area
                 Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 0,
                     ws_idx: None
-                }),
+                }), // anvil
                 Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 1,
                     ws_idx: None
-                }),
+                }), // ksb
+                None,                          // lab, self — no switch hit-area
+                Some(PeerSwitchRequest::Home), // mba22
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 0,
                     ws_idx: None,
-                }),
+                }), // ownpeer
             ]
         );
 
         // Header + five two-line rows + the trailing divider.
         assert_eq!(servers_section_height(&app), 1 + 5 * SERVER_ROW_LINES + 1);
-
-        // The hit-areas skip the self slot: home sits directly under the
-        // header, the first snapshot row two lines below the self row.
-        let (header, cards) = compute_server_section_areas(&app, Rect::new(0, 0, 30, 80));
+        // Every row but self keeps a card, at its own row.
+        let area = Rect::new(0, 0, 30, 80);
+        let (_, cards) = compute_server_section_areas(&app, area);
         assert_eq!(cards.len(), 4);
-        assert_eq!(cards[0].target, PeerSwitchRequest::Home);
-        assert_eq!(cards[0].rect.y, header.y + 1);
-        assert_eq!(
-            cards[1].target,
-            PeerSwitchRequest::SnapshotPeer {
-                entry_idx: 0,
-                ws_idx: None
-            }
-        );
-        assert_eq!(cards[1].rect.y, header.y + 1 + 2 * SERVER_ROW_LINES);
+        assert_cards_follow_band(&app, area);
     }
 
     #[test]
@@ -3573,10 +3651,11 @@ mod tests {
         ];
 
         assert_eq!(
-            server_band_slots(&app),
+            server_band_slots_as(&app, "mba22")
+                .into_iter()
+                .filter(|slot| !matches!(slot, None | Some(PeerSwitchRequest::Home)))
+                .collect::<Vec<_>>(),
             vec![
-                Some(PeerSwitchRequest::Home),
-                None, // self
                 Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 1,
                     ws_idx: None
@@ -3605,9 +3684,12 @@ mod tests {
         // every other server also sees) sorts it first.
         app.peer_summaries = vec![
             peer_named_with_host("z-anvil", "anvil"),
-            peer_with_workspaces("beta", vec![]), // host=None → falls back to name
+            peer_with_workspaces("beta", vec![]), // host=None → its ssh target
         ];
-        assert_eq!(peer_host_sequence(&app), vec!["anvil", "beta"]);
+        assert_eq!(
+            band_host_sequence(&app, "lab"),
+            vec!["anvil", "beta", "lab"]
+        );
     }
 
     #[test]
@@ -3739,26 +3821,92 @@ mod tests {
 
     #[test]
     fn server_band_order_converges_across_viewers() {
-        // Two viewers of the SAME three machines (anvil/ksb/sage) that each
-        // learned them in a different order AND via a different source split
-        // (snapshot vs config). The band must present them in one identical
-        // host order regardless — that is the fleet-stability contract (#51).
-        let mut a = crate::app::state::AppState::test_new();
-        a.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("anvil", "anvil"), ("sage", "sage")],
-        ));
-        a.peer_summaries = vec![peer_named_with_host("ksb", "ksb")];
+        // #422: one fleet — mba22 (the operator's home), anvil, ksb, sage, and
+        // vm-dev, which nobody has heard from yet — seen from four servers the
+        // client is attached to in turn. Each learned the fleet in a different
+        // order, through a different mix of sources (carried snapshot, its own
+        // config, a hub's relay), under different local names, and with hosts
+        // in different spellings. Every one must render the SAME whole band,
+        // self and home included, not just the same peer tail (#51).
+        let relayed = |name: &str, host: Option<&str>, target: &str| {
+            let mut entry =
+                crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                    name: name.to_string(),
+                    ssh_target: target.to_string(),
+                    host: host.map(str::to_string),
+                    version: None,
+                    protocol: None,
+                    system: None,
+                    latency_ms: None,
+                    workspaces: Vec::new(),
+                    age_secs: Some(1),
+                    error: None,
+                    origin: "mba22".to_string(),
+                    origin_last_ok_secs: Some(1),
+                    proxy_jump: Some("mba22".to_string()),
+                    icon: None,
+                    dial: None,
+                })
+                .expect("valid row");
+            entry.via = Some("mba22".to_string());
+            entry
+        };
+        // The pending peer: config name is a local label, the ssh target is
+        // what gossip carries for it.
+        let pending = |label: &str| {
+            let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+                name: label.into(),
+                ssh: "lars@vm-dev".into(),
+                ..Default::default()
+            });
+            peer.last_ok = None;
+            peer
+        };
 
-        let mut b = crate::app::state::AppState::test_new();
-        b.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("sage", "sage"), ("ksb", "ksb")],
-        ));
-        b.peer_summaries = vec![peer_named_with_host("anvil", "anvil")];
+        // Home itself, locally attached: every other machine is its config.
+        let mut home = crate::app::state::AppState::test_new();
+        home.peer_summaries = vec![
+            peer_named_with_host("zz-sage", "sage"),
+            peer_named_with_host("anvil", "anvil.tail1234.ts.net"),
+            peer_named_with_host("k", "KSB"),
+            pending("devbox"),
+        ];
 
-        assert_eq!(peer_host_sequence(&a), vec!["anvil", "ksb", "sage"]);
-        assert_eq!(peer_host_sequence(&a), peer_host_sequence(&b));
+        // sage, a spoke that polls nobody: a carried snapshot plus what the
+        // hub pushed down.
+        let mut sage = crate::app::state::AppState::test_new();
+        sage.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("ksb", "ksb"), ("anvil", "anvil")],
+        ));
+        sage.relayed_fleet_cache
+            .insert("vm-dev".into(), relayed("vm", None, "vm-dev"));
+
+        // anvil, a second hub: its own config plus a relayed row.
+        let mut anvil = crate::app::state::AppState::test_new();
+        anvil.fleet_snapshot = Some(carried_snapshot_with_hosts("MBA22.local", &[]));
+        anvil.peer_summaries = vec![pending("the-vm"), peer_named_with_host("s", "sage")];
+        anvil
+            .relayed_fleet_cache
+            .insert("ksb".into(), relayed("ksb", Some("ksb"), "ksb"));
+
+        // ksb: everything came in the carried snapshot, in arrival order.
+        let mut ksb = crate::app::state::AppState::test_new();
+        ksb.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "mba22",
+            &[("vm", "sage"), ("anvil", "Anvil")],
+        ));
+        ksb.fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .peers
+            .push(pending("x"));
+
+        let expected = vec!["anvil", "ksb", "mba22", "sage", "vm-dev"];
+        assert_eq!(band_host_sequence(&home, "mba22"), expected, "from home");
+        assert_eq!(band_host_sequence(&sage, "sage"), expected, "from sage");
+        assert_eq!(band_host_sequence(&anvil, "anvil"), expected, "from anvil");
+        assert_eq!(band_host_sequence(&ksb, "ksb"), expected, "from ksb");
     }
 
     #[test]
@@ -3768,10 +3916,19 @@ mod tests {
         assert!(server_band_slots(&app).iter().all(Option::is_none));
         assert_eq!(servers_section_height(&app), 0);
 
-        // Config peers alone keep the pre-federation order: self first.
+        // Config peers alone: self sorts among them like any other server.
         app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
-        let slots = server_band_slots(&app);
-        assert_eq!(slots[0], None);
+        let slots = server_band_slots_as(&app, "zeta");
+        assert_eq!(
+            slots,
+            vec![
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: None
+                }),
+                None,
+            ]
+        );
         assert!(!slots.contains(&Some(crate::app::state::PeerSwitchRequest::Home)));
     }
 
@@ -3792,19 +3949,21 @@ mod tests {
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
         app.set_servers_panel_scope(PanelScope::Current);
 
-        // The way home must never hide: scope current keeps home + self.
-        assert_eq!(
-            visible_server_band_slots(&app),
-            vec![Some(PeerSwitchRequest::Home), None]
-        );
+        // The way home must never hide: scope current keeps home + self, in
+        // the band's one order.
+        let visible = visible_server_band_slots(&app);
+        assert_eq!(visible.len(), 2);
+        assert!(visible.contains(&Some(PeerSwitchRequest::Home)));
+        assert!(visible.contains(&None));
         assert_eq!(servers_section_height(&app), 1 + 2 * SERVER_ROW_LINES + 1);
 
-        // Home stays clickable directly under the header; snapshot/config
-        // peers lose their hit-areas with their rows.
-        let (header, cards) = compute_server_section_areas(&app, Rect::new(0, 0, 30, 80));
+        // Home stays clickable; snapshot/config peers lose their hit-areas
+        // with their rows.
+        let area = Rect::new(0, 0, 30, 80);
+        let (_, cards) = compute_server_section_areas(&app, area);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].target, PeerSwitchRequest::Home);
-        assert_eq!(cards[0].rect.y, header.y + 1);
+        assert_cards_follow_band(&app, area);
     }
 
     #[test]
@@ -3959,6 +4118,8 @@ mod tests {
             &snapshot,
             &app.palette,
             crate::config::ServerLabelConfig::Both,
+            std::time::Instant::now(),
+            crate::peers::PEER_STALE_AFTER_SECS,
         );
         let name = spans_text(&row.name);
         let health = line_text(&row.health);
@@ -3971,6 +4132,66 @@ mod tests {
         assert!(row.tally.is_none());
         assert!(health.starts_with("snapshot"), "{health}");
         assert!(health.contains("old"), "{health}");
+    }
+
+    #[test]
+    fn a_short_band_drops_peers_never_home_or_self() {
+        // Review of #422: home and self sort in place now, so the height cap
+        // must not cut them the way it cuts peers.
+        use crate::app::state::PeerSwitchRequest;
+        let mut app = crate::app::state::AppState::test_new();
+        app.fleet_snapshot = Some(carried_snapshot("zz-home", vec!["anvil", "beta", "ksb"]));
+        // Room for three rows under the header: 1 + 3 * 2 lines.
+        let rows_area = Rect::new(0, 0, 30, 1 + 3 * SERVER_ROW_LINES);
+        let fitted = fitted_band_slots(&app, rows_area);
+        assert_eq!(fitted.len(), 3, "{fitted:?}");
+        assert!(fitted.contains(&None), "self keeps its row: {fitted:?}");
+        assert!(
+            fitted.contains(&Some(PeerSwitchRequest::Home)),
+            "home keeps its row: {fitted:?}"
+        );
+        // Still in band order: the kept peer, wherever self sorts, home last.
+        assert_eq!(fitted.last(), Some(&Some(PeerSwitchRequest::Home)));
+    }
+
+    #[test]
+    fn home_row_ages_with_the_origin_reading_and_tints_once_stale() {
+        // #424: the home row's age is the ORIGIN's reading plus its dwell
+        // here, not the time since the client attached, and past
+        // `[gossip] stale_after` it stops presenting itself as current.
+        let app = crate::app::state::AppState::test_new();
+        let now = std::time::Instant::now();
+        let mut snapshot = carried_snapshot("mba22", vec![]);
+        let mut origin = peer_named_with_host("mba22", "mba22");
+        origin.origin_last_ok_secs = Some(5);
+        origin.ingested_at = Some(now);
+        snapshot.origin_summary = Some(origin);
+        let fresh = home_server_rows(
+            &snapshot,
+            &app.palette,
+            crate::config::ServerLabelConfig::Both,
+            now,
+            60,
+        );
+        assert!(line_text(&fresh.health).contains("snapshot 5s old"));
+        assert!(!fresh.ghosted);
+        // Home is marked in place, not by position (#422).
+        assert!(spans_text(&fresh.title_rest).contains(HOME_ROW_GLYPH));
+
+        let later = now + std::time::Duration::from_secs(90);
+        let stale = home_server_rows(
+            &snapshot,
+            &app.palette,
+            crate::config::ServerLabelConfig::Both,
+            later,
+            60,
+        );
+        assert!(
+            line_text(&stale.health).contains("1m"),
+            "{}",
+            line_text(&stale.health)
+        );
+        assert!(stale.ghosted, "a view older than stale_after is tinted");
     }
 
     #[test]
@@ -5704,11 +5925,11 @@ mod tests {
         let area = Rect::new(0, 0, 30, 40);
 
         let (header, cards) = compute_server_section_areas(&app, area);
-        // The self row spans the two lines under the header.
-        assert_eq!(
-            server_band_slot_at(&app, area, header.x + 2, header.y + 1),
-            Some(None)
-        );
+        // The self row spans two lines at its place in the band.
+        let self_y = header.y + 1 + band_row(&app, None) * SERVER_ROW_LINES;
+        for y in [self_y, self_y + 1] {
+            assert_eq!(server_band_slot_at(&app, area, header.x + 2, y), Some(None));
+        }
         // The peer row resolves to its switch target.
         assert_eq!(
             server_band_slot_at(&app, area, cards[0].rect.x + 2, cards[0].rect.y),
@@ -6005,8 +6226,18 @@ mod tests {
             expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
-        let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
-        let peer_rect = server_slot_rect(rows_area, 1).expect("peer slot");
+        let self_rect = server_slot_rect(rows_area, band_row(&app, None)).expect("self slot");
+        let peer_rect = server_slot_rect(
+            rows_area,
+            band_row(
+                &app,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: None,
+                }),
+            ),
+        )
+        .expect("peer slot");
 
         // Default mark = name first, then the counts `<name> 1 0 1 0`: fixed
         // blocked/done/working/idle columns, zeros muted, single-digit width. The
@@ -6074,8 +6305,28 @@ mod tests {
             expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
-        let long_rect = server_slot_rect(rows_area, 1).expect("long-name peer slot");
-        let short_rect = server_slot_rect(rows_area, 2).expect("short-name peer slot");
+        let long_rect = server_slot_rect(
+            rows_area,
+            band_row(
+                &app,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: None,
+                }),
+            ),
+        )
+        .expect("long-name peer slot");
+        let short_rect = server_slot_rect(
+            rows_area,
+            band_row(
+                &app,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 1,
+                    ws_idx: None,
+                }),
+            ),
+        )
+        .expect("short-name peer slot");
         // Behind the blank 2-cell #164 icon slot on every row.
         assert!(buffer_row_text(&buffer, long_rect, long_rect.y)
             .trim_start()
@@ -6131,8 +6382,18 @@ mod tests {
             expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
         let rows_area = server_band_rows_area(servers_area);
-        let self_rect = server_slot_rect(rows_area, 0).expect("self slot");
-        let peer_rect = server_slot_rect(rows_area, 1).expect("peer slot");
+        let self_rect = server_slot_rect(rows_area, band_row(&app, None)).expect("self slot");
+        let peer_rect = server_slot_rect(
+            rows_area,
+            band_row(
+                &app,
+                Some(crate::app::state::PeerSwitchRequest::ConfigPeer {
+                    peer_idx: 0,
+                    ws_idx: None,
+                }),
+            ),
+        )
+        .expect("peer slot");
 
         // Counts sit after the padded name field on every row.
         let host = crate::app::short_host_name();

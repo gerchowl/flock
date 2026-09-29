@@ -544,6 +544,84 @@ impl FleetSnapshotState {
     }
 }
 
+impl FleetSnapshotState {
+    /// Drop pushed rows that claim to be this snapshot's ORIGIN (#424 review).
+    ///
+    /// The home row is refreshed only from the bound hub's own `hub_self`, see
+    /// [`Self::absorb_hub_self`]. Anything else naming the home machine is a
+    /// claim by whichever node the hub polled, keyed on a host it chose, so it
+    /// is neither absorbed into the home row nor stored as a second one.
+    pub fn without_origin_claims(
+        &self,
+        rows: Vec<crate::api::schema::RelayedFleetPeer>,
+    ) -> Vec<crate::api::schema::RelayedFleetPeer> {
+        let origin_key = self.origin.to_ascii_lowercase();
+        rows.into_iter()
+            .filter(|row| wire_row_identity(row) != origin_key)
+            .collect()
+    }
+
+    /// Refresh the carried origin from the hub's own row (#424). The caller has
+    /// already checked that the row names the hub bound to the relay AND that
+    /// this hub is the snapshot's origin.
+    ///
+    /// The origin summary is the only view a spoke has of the server the
+    /// client came from, and it was stamped once, at switch time. A fresher
+    /// reading replaces it in place, so renames and new spaces there show up
+    /// here, while the row keeps what makes it the home row: it switches via
+    /// the reserved home target, never an ssh dial, whatever the reading says.
+    pub fn absorb_hub_self(&mut self, row: crate::api::schema::RelayedFleetPeer) {
+        let Some(entry) = relayed_entry_from_wire(row) else {
+            return;
+        };
+        let mut reading = entry.peer;
+        let fresher = match (
+            self.origin_summary
+                .as_ref()
+                .and_then(PeerSummaryState::carried_age_secs),
+            reading.carried_age_secs(),
+        ) {
+            (Some(current), Some(new)) => new <= current,
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if !fresher {
+            return;
+        }
+        reading.ssh_target = crate::protocol::HOME_SWITCH_TARGET.to_string();
+        reading.proxy_jump = None;
+        self.origin_summary = Some(reading);
+    }
+}
+
+/// The identity a relayed row is stored under: its reported host, else its ssh
+/// target, lowercased. Exactly the relay cache key, so a row cannot match one
+/// machine here and be stored as another there. Unlike [`normalized_host_key`]
+/// nothing is stripped, because identity must not fold `a.lan` into `a.tailnet`.
+pub fn wire_row_identity(row: &crate::api::schema::RelayedFleetPeer) -> String {
+    row.host
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(&row.ssh_target)
+        .to_ascii_lowercase()
+}
+
+/// A host identity every viewer derives the same way (#422): lowercased, any
+/// `user@` prefix dropped, and cut at the first dot so `sage`, `sage.local` and
+/// a tailnet `sage.tail1234.ts.net` are one machine. An IP address is kept
+/// whole — cutting it would fold unrelated hosts together.
+pub fn normalized_host_key(raw: &str) -> String {
+    let host = raw.rsplit_once('@').map_or(raw, |(_, host)| host).trim();
+    let lower = host.to_ascii_lowercase();
+    if lower.parse::<std::net::IpAddr>().is_ok() {
+        return lower;
+    }
+    match lower.split_once('.') {
+        Some((short, _)) if !short.is_empty() => short.to_string(),
+        _ => lower,
+    }
+}
+
 /// Carried-snapshot peer cap (env-var transport between attach legs — see
 /// `to_wire`). Far above any realistic personal fleet.
 pub const FLEET_SNAPSHOT_MAX_PEERS: usize = 16;
@@ -617,18 +695,34 @@ pub fn relayed_entry_from_wire(
             return None;
         }
     }
+    // Everything below renders in the sidebar, so it is cleaned the way every
+    // other receive boundary cleans it: the host-declared system summary is
+    // clamped, and free-form names lose any control bytes a peer planted.
+    let strip = |text: String| crate::control_bytes::strip(&text);
     Some(RelayedEntry {
         peer: PeerSummaryState {
             dial: Default::default(),
             stream_error: None,
-            peer: entry.name,
+            peer: strip(entry.name),
             ssh_target: entry.ssh_target,
-            host: entry.host,
-            version: entry.version,
+            host: entry.host.map(strip),
+            version: entry.version.map(strip),
             protocol: entry.protocol,
-            system: entry.system,
+            system: entry
+                .system
+                .map(crate::api::schema::PeerSystemSummary::sanitized),
             latency_ms: entry.latency_ms,
-            workspaces: entry.workspaces,
+            workspaces: entry
+                .workspaces
+                .into_iter()
+                .map(|mut ws| {
+                    ws.workspace = strip(ws.workspace);
+                    ws.project_label = ws.project_label.map(strip);
+                    ws.branch = ws.branch.map(strip);
+                    ws.agent = ws.agent.map(strip);
+                    ws
+                })
+                .collect(),
             last_ok: entry
                 .age_secs
                 .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
@@ -691,12 +785,14 @@ fn merge_relayed_rows(
         if entry.origin.eq_ignore_ascii_case(&self_host) {
             continue;
         }
-        let host_key = entry
-            .host
-            .as_deref()
-            .filter(|host| !host.is_empty())
-            .unwrap_or(&entry.ssh_target)
-            .to_ascii_lowercase();
+        let host_key = wire_row_identity(&entry);
+        // Identity is keyed before the row's names are cleaned, so a host
+        // carrying control bytes (`mba22\x07`) would slip past every exact
+        // comparison and then render as a second `mba22`. No real host has
+        // one: drop the row.
+        if host_key.chars().any(char::is_control) {
+            continue;
+        }
         if host_key == self_host_lower {
             // Never store an entry about ourselves as a relayed row — the self
             // row lives on the origin_summary path.
@@ -2904,5 +3000,16 @@ Last login: banner noise
             tracker.should_poll_now("sage", t0 + Duration::from_secs(9), Duration::from_secs(2)),
             "peer dropped from config, then re-added, starts fresh"
         );
+    }
+
+    #[test]
+    fn normalized_host_key_is_one_spelling_per_machine() {
+        // #422: every viewer must derive the same key for the same machine.
+        for raw in ["sage", "SAGE", "sage.local", "lars@sage.tail1234.ts.net"] {
+            assert_eq!(normalized_host_key(raw), "sage", "{raw}");
+        }
+        // An address is kept whole: cutting it would fold unrelated hosts.
+        assert_eq!(normalized_host_key("100.64.0.7"), "100.64.0.7");
+        assert_eq!(normalized_host_key("lars@::1"), "::1");
     }
 }
