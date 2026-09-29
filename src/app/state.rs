@@ -2419,6 +2419,11 @@ pub struct AppState {
     /// every member, not just the selected workspace. Set when opening the
     /// confirm for "Close group"; cleared on accept/cancel.
     pub confirm_close_whole_space: bool,
+    /// The workspace the open confirm-close dialog names, by id (#419). The
+    /// dialog and its accept read this rather than the operator's `selected`,
+    /// so opening the confirm never has to move the sidebar cursor. `None`
+    /// falls back to `selected`.
+    pub confirm_close_target: Option<String>,
     pub prompt_new_tab_name: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -3367,6 +3372,7 @@ impl AppState {
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             confirm_close_whole_space: false,
+            confirm_close_target: None,
             prompt_new_tab_name: true,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,

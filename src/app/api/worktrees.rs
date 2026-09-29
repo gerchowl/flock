@@ -756,8 +756,7 @@ impl App {
             })
         };
         if still_same_linked_worktree {
-            self.state.selected = ws_idx;
-            self.state.close_selected_workspace();
+            self.state.close_workspace(ws_idx);
             self.shutdown_detached_terminal_runtimes();
             // WorkspaceClosed is queued by close_workspace_indices.
         }
