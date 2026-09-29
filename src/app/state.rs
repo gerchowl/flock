@@ -2785,15 +2785,12 @@ impl AppState {
         let origin_key = self
             .fleet_snapshot
             .as_ref()
-            .map(|snapshot| crate::peers::normalized_host_key(&snapshot.origin));
+            .map(|snapshot| snapshot.origin.to_ascii_lowercase());
         let mut relayed: Vec<_> = self
             .relayed_fleet_cache
             .iter()
-            .filter(|(_, entry)| {
-                !(entry.hub_pushed
-                    && origin_key.as_deref().is_some_and(|origin| {
-                        crate::peers::normalized_host_key(&row_host_key(&entry.peer)) == origin
-                    }))
+            .filter(|(host_key, entry)| {
+                !(entry.hub_pushed && origin_key.as_deref() == Some(host_key.as_str()))
             })
             .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
@@ -2887,7 +2884,7 @@ const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 /// Machine-independent host key: the peer's reported host (fallback: config
 /// name or ssh_target), lowercased. Used across surfaces so a host cannot
 /// dedupe under different keys on the band vs. the spaces list.
-fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
+pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
     let fallback = if peer.peer.is_empty() {
         peer.ssh_target.as_str()
     } else {

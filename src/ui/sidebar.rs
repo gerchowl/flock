@@ -3841,6 +3841,7 @@ mod tests {
                     origin_last_ok_secs: Some(1),
                     proxy_jump: Some("mba22".to_string()),
                     icon: None,
+                    dial: None,
                 })
                 .expect("valid row");
             entry.via = Some("mba22".to_string());
