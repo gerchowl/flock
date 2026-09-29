@@ -33,6 +33,12 @@ pub const PEER_POLL_INITIAL_DELAY_SECS: u64 = 3;
 /// A peer whose last successful poll is older than this renders as stale.
 pub const PEER_STALE_AFTER_SECS: u64 = 60;
 
+/// Default `[gossip] dial_failure_summary_secs`: how often an UNCHANGED peer
+/// poll outage is restated at WARN (#418). Ten minutes turns a five-day outage
+/// on a 15s poll into ~720 lines per peer rather than ~29,000, while a WARN
+/// tail read at any moment still shows the outage within minutes of history.
+pub const PEER_DIAL_FAILURE_SUMMARY_SECS: u64 = 600;
+
 /// A peer whose latency exceeds this renders as "slow" (yellow dot).
 pub const PEER_SLOW_LATENCY_MS: u64 = 150;
 
@@ -212,6 +218,102 @@ pub struct PeerSummaryState {
     /// server's icon renders identically fleet-wide. Set from the peer's own
     /// `peers.summary`, carried through relay + snapshot. `None` = no icon.
     pub icon: Option<String>,
+    /// How this peer's polls have been failing, if they have (#418). Local
+    /// polls only; a carried or relayed row has no dial of ours to judge.
+    pub dial: PeerDialHealth,
+    /// Why this peer has no held relay stream, when establishing one failed
+    /// (#418). Set even while polls succeed over the one-shot fallback.
+    pub stream_error: Option<String>,
+}
+
+/// Consecutive poll failures a reason must survive before it is shown on the
+/// peer's row and in `flk peers` (#418): past ONE poll. A single failed dial
+/// is a blip — a laptop changing networks — and labelling it would teach the
+/// operator to ignore the label; two in a row is a state.
+pub const DIAL_FAILURE_PERSISTS_AFTER: u32 = 2;
+
+/// A peer's run of failed polls, and the bookkeeping that keeps its log
+/// honest without flooding it (#418).
+///
+/// mba22 failed every poll to every peer for five days and wrote the same
+/// bare WARN 2,229 times a day, which is the same as writing nothing. This
+/// logs the EDGES — the first failure, a change of reason, the recovery — and
+/// one summary per `[gossip] dial_failure_summary_secs` while an unchanged
+/// outage lasts, so the WARN tail still says the fleet is down on day five.
+#[derive(Debug, Clone, Default)]
+pub struct PeerDialHealth {
+    pub consecutive_failures: u32,
+    pub failing_since: Option<Instant>,
+    pub reason: Option<SshFailureReason>,
+    last_warned_at: Option<Instant>,
+}
+
+/// What one poll outcome should log. Decided by [`PeerDialHealth`] so the
+/// rate limit is a pure function of the history and `now`, testable without
+/// a clock or a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialLog {
+    /// A new failure: the first after success, or a different reason.
+    Failed,
+    /// The same failure again; `summary` when the periodic reminder is due.
+    StillFailing { summary: bool },
+    /// Success after a run of failures.
+    Recovered { failures: u32, failing_secs: u64 },
+    /// Success after success.
+    Quiet,
+}
+
+impl PeerDialHealth {
+    pub fn record_failure(
+        &mut self,
+        reason: SshFailureReason,
+        now: Instant,
+        summary_every: std::time::Duration,
+    ) -> DialLog {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let first = self.failing_since.is_none();
+        if first {
+            self.failing_since = Some(now);
+        }
+        let changed = self.reason != Some(reason);
+        self.reason = Some(reason);
+        if first || changed {
+            self.last_warned_at = Some(now);
+            return DialLog::Failed;
+        }
+        let due = self
+            .last_warned_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= summary_every);
+        if due {
+            self.last_warned_at = Some(now);
+        }
+        DialLog::StillFailing { summary: due }
+    }
+
+    pub fn record_success(&mut self, now: Instant) -> DialLog {
+        let previous = std::mem::take(self);
+        match previous.failing_since {
+            Some(since) => DialLog::Recovered {
+                failures: previous.consecutive_failures,
+                failing_secs: now.saturating_duration_since(since).as_secs(),
+            },
+            None => DialLog::Quiet,
+        }
+    }
+
+    /// Seconds the current run of failures has lasted, as of `now`.
+    pub fn failing_secs(&self, now: Instant) -> u64 {
+        self.failing_since
+            .map(|since| now.saturating_duration_since(since).as_secs())
+            .unwrap_or(0)
+    }
+
+    /// The failure reason, once it has persisted past one poll — the gate on
+    /// showing it to the operator.
+    pub fn persistent_reason(&self) -> Option<SshFailureReason> {
+        self.reason
+            .filter(|_| self.consecutive_failures >= DIAL_FAILURE_PERSISTS_AFTER)
+    }
 }
 
 impl PeerSummaryState {
@@ -231,7 +333,46 @@ impl PeerSummaryState {
             ingested_at: None,
             proxy_jump: None,
             icon: None,
+            dial: PeerDialHealth::default(),
+            stream_error: None,
         }
+    }
+
+    /// The dial report `flk peers` carries for this peer (#418): the reason
+    /// once it has persisted past one poll, and why no stream is held. `None`
+    /// when there is nothing to report.
+    pub fn dial_report(&self, now: Instant) -> Option<crate::api::schema::PeerDialReport> {
+        let reason = self.dial.persistent_reason();
+        if reason.is_none() && self.stream_error.is_none() {
+            return None;
+        }
+        Some(crate::api::schema::PeerDialReport {
+            reason: reason.map(|reason| reason.as_str().to_string()),
+            consecutive_failures: self.dial.consecutive_failures,
+            failing_secs: self
+                .dial
+                .failing_since
+                .is_some()
+                .then(|| self.dial.failing_secs(now)),
+            stream_reason: self
+                .stream_error
+                .as_deref()
+                .map(|detail| SshFailureReason::classify(detail).as_str().to_string()),
+        })
+    }
+
+    /// The failure reason to SHOW on this peer's row, if any (#418).
+    ///
+    /// A locally polled peer shows it only once it has persisted past one
+    /// poll. A carried or relayed row has no local dial history, so it keeps
+    /// the #410 behaviour of reading the reason from the error it arrived with.
+    pub fn shown_failure_reason(&self) -> Option<SshFailureReason> {
+        let reason = if self.dial.consecutive_failures > 0 {
+            self.dial.persistent_reason()
+        } else {
+            self.error.as_deref().map(SshFailureReason::classify)
+        };
+        reason.filter(|reason| *reason != SshFailureReason::Other)
     }
 
     pub fn is_stale(&self) -> bool {
@@ -478,6 +619,8 @@ pub fn relayed_entry_from_wire(
     }
     Some(RelayedEntry {
         peer: PeerSummaryState {
+            dial: Default::default(),
+            stream_error: None,
             peer: entry.name,
             ssh_target: entry.ssh_target,
             host: entry.host,
@@ -629,6 +772,8 @@ pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol
 /// receiver's dwell no longer cliffs a snapshot entry at `stale_after`.
 pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
     PeerSummaryState {
+        dial: Default::default(),
+        stream_error: None,
         peer: peer.name,
         ssh_target: peer.ssh_target,
         host: peer.host,
@@ -675,6 +820,11 @@ pub struct PeerSummaryPayload {
 pub struct PeerSummaryFetch {
     pub peer: String,
     pub result: Result<PeerSummaryPayload, String>,
+    /// Why this peer has no held relay stream, when it has none because
+    /// establishing one failed (#418). Independent of `result`: a peer whose
+    /// stream cannot be held still answers the one-shot fallback, and that is
+    /// exactly the degradation that used to be silent.
+    pub stream_error: Option<String>,
 }
 
 /// Run a peer fetch so that a panic becomes a failed poll instead of a lost
@@ -697,6 +847,7 @@ where
         PeerSummaryFetch {
             peer: peer_name.to_string(),
             result: Err("peer summary fetch panicked".to_string()),
+            stream_error: None,
         }
     })
 }
@@ -712,6 +863,7 @@ pub fn fetch_peer_summary(peer: &PeerConfig) -> PeerSummaryFetch {
     PeerSummaryFetch {
         peer: peer.name.clone(),
         result,
+        stream_error: crate::peer_stream::establish_failure(peer),
     }
 }
 
@@ -814,7 +966,8 @@ fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
             Err(err) => crate::logging::peer_stream_fallback(&peer.name, &err),
         }
     }
-    run_peer_ssh(peer, &peer.summary_command)
+    run_peer_ssh_with(peer, &peer.summary_command, DialCadence::Poll)
+        .map_err(|failure| failure.detail)
 }
 
 /// Fetch the tail of a peer's session logs over SSH for the cross-host log view
@@ -1002,6 +1155,10 @@ impl PeerMessageFailure {
 pub enum SshFailureReason {
     ConnectRefused,
     AuthRefused,
+    /// Auth failed because the ssh-agent socket this server dials with
+    /// refuses connections (#418). Distinct from `AuthRefused` because the
+    /// fix is on THIS machine — the far side never saw a usable key.
+    AgentUnreachable,
     HostKey,
     Timeout,
     /// The `ProxyJump` host answered and the hop BEYOND it did not. Observed
@@ -1022,6 +1179,12 @@ impl SshFailureReason {
             || lowered.contains("channel 0: open failed")
         {
             Self::JumpHopRefused
+        } else if lowered.contains("ssh agent unreachable")
+            || lowered.contains("error connecting to agent")
+            || lowered.contains("communication with agent failed")
+            || lowered.contains("agent refused operation")
+        {
+            Self::AgentUnreachable
         } else if lowered.contains("permission denied")
             || lowered.contains("authentication")
             || lowered.contains("too many authentication failures")
@@ -1053,6 +1216,7 @@ impl SshFailureReason {
         match self {
             Self::ConnectRefused => "connect_refused",
             Self::AuthRefused => "auth_refused",
+            Self::AgentUnreachable => "agent_unreachable",
             Self::HostKey => "host_key",
             Self::Timeout => "timeout",
             Self::JumpHopRefused => "jump_hop_refused",
@@ -1067,6 +1231,7 @@ impl SshFailureReason {
         match self {
             Self::ConnectRefused => "connection refused",
             Self::AuthRefused => "auth refused",
+            Self::AgentUnreachable => "ssh agent unreachable",
             Self::HostKey => "host key rejected",
             Self::Timeout => "timed out",
             Self::JumpHopRefused => "jump host reached, next hop refused",
@@ -1173,6 +1338,90 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
     run_peer_ssh_status(peer, remote_command).map_err(|failure| failure.detail)
 }
 
+/// The ssh options on every dial flock makes to a peer, one-shot or held.
+///
+/// `BatchMode` refuses to prompt, `ConnectTimeout` bounds the dial, and the
+/// ServerAlive pair lets ssh itself notice a dead link and exit — which is how
+/// a held stream learns it died (see `peer_stream`).
+///
+/// `ControlMaster=no` + `ControlPath=none` (#418) make each dial its own
+/// connection, whatever the operator's ssh config says. With a global
+/// `ControlMaster auto`, flock's dials silently rode any mux an interactive
+/// session had left behind: that is what hid mba22's dead agent for five days
+/// (dials "worked" exactly while some shell's mux was alive), and a STALE mux
+/// hangs a dial instead of failing it, which ADR-0009's transport notes
+/// already rejected ControlMaster for. flock's fast path is its own held
+/// stream; the one-shot fallback is the rare path and can afford an honest
+/// handshake.
+///
+/// Scope: these reach only the ssh flock starts. A `ProxyJump` in the
+/// operator's ssh config runs its own child ssh for the jump hop, which reads
+/// the config afresh and does NOT inherit `ControlMaster=no` — that hop can
+/// still ride a mux.
+pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 12] = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+];
+
+/// Hand a peer dial the agent socket that is live NOW, not the one the server
+/// inherited at launch (#418). Returns what was resolved, so a failure can be
+/// attributed to a dead agent rather than to the far side.
+pub(crate) fn apply_dial_agent(
+    command: &mut crate::process::TracedCommand,
+) -> crate::platform::ssh_agent::AgentSocket {
+    let agent = crate::platform::ssh_agent::agent_for_dial();
+    if let Some(path) = agent.path() {
+        command.env("SSH_AUTH_SOCK", path);
+    }
+    agent
+}
+
+/// Rewrite an auth failure as the agent failure it really is.
+///
+/// ssh cannot tell us: an agent it fails to reach is a debug-level message,
+/// so a passphrase-protected key under `BatchMode` just reads as
+/// `Permission denied (publickey)` — "the peer refused my key", which sends
+/// the operator to the wrong machine. flock knows the socket refused, so it
+/// says so, and the classifier then reads `agent_unreachable`.
+pub(crate) fn attribute_dial_failure(
+    detail: String,
+    agent: &crate::platform::ssh_agent::AgentSocket,
+) -> String {
+    match agent {
+        crate::platform::ssh_agent::AgentSocket::Dead(path)
+            if SshFailureReason::classify(&detail) == SshFailureReason::AuthRefused =>
+        {
+            // The path is NOT in this text: `error` is relayed to other hosts,
+            // and this machine's socket path is none of their business. It is
+            // logged locally, once, as `ssh.agent.unreachable`.
+            let _ = path;
+            format!("ssh agent unreachable (SSH_AUTH_SOCK refuses connections): {detail}")
+        }
+        _ => detail,
+    }
+}
+
+/// How often a dial runs, which decides how its failures are logged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DialCadence {
+    /// A user- or message-driven dial: every failure is its own event.
+    OneShot,
+    /// The summary poll, every few seconds for as long as the server runs:
+    /// `process.exec` reports it per peer on the edge only (#318, #418), and
+    /// the peer-level `peer.dial.*` events carry the ongoing story.
+    Poll,
+}
+
 /// A failed peer command, with the remote exit status kept.
 ///
 /// `run_peer_ssh` flattens this to its message, which is all its callers ever
@@ -1187,24 +1436,35 @@ struct PeerSshFailure {
 }
 
 fn run_peer_ssh_status(peer: &PeerConfig, remote_command: &str) -> Result<String, PeerSshFailure> {
-    let output = crate::process::TracedCommand::new("ssh", "peers")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            peer.ssh_target(),
-            remote_command,
-        ])
-        .stdin(std::process::Stdio::null())
+    run_peer_ssh_with(peer, remote_command, DialCadence::OneShot)
+}
+
+fn run_peer_ssh_with(
+    peer: &PeerConfig,
+    remote_command: &str,
+    cadence: DialCadence,
+) -> Result<String, PeerSshFailure> {
+    let mut command = crate::process::TracedCommand::new("ssh", "peers");
+    command
+        .args(PEER_DIAL_SSH_OPTIONS)
+        .args([peer.ssh_target(), remote_command])
+        .stdin(std::process::Stdio::null());
+    if cadence == DialCadence::Poll {
+        command.periodic().edge_scope(peer.name.clone());
+    }
+    let agent = apply_dial_agent(&mut command);
+    let output = command
         .output_traced_with_timeout(PEER_SSH_TIMEOUT)
         .map_err(|err| PeerSshFailure {
             exit_code: None,
-            detail: format!("ssh spawn failed: {err}"),
+            // A dial that hung past the deadline was killed, not refused to
+            // start: saying "spawn failed" would send the operator after the
+            // local ssh binary instead of the link (#418).
+            detail: if err.kind() == std::io::ErrorKind::TimedOut {
+                format!("ssh {err}")
+            } else {
+                format!("ssh spawn failed: {err}")
+            },
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1217,7 +1477,7 @@ fn run_peer_ssh_status(peer: &PeerConfig, remote_command: &str) -> Result<String
         };
         return Err(PeerSshFailure {
             exit_code: output.status.code(),
-            detail,
+            detail: attribute_dial_failure(detail, &agent),
         });
     }
     String::from_utf8(output.stdout).map_err(|_| PeerSshFailure {
@@ -1319,6 +1579,7 @@ mod tests {
         proxy_jump: Option<&str>,
     ) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            dial: None,
             name: "spoke2.invalid".into(),
             ssh_target: ssh_target.into(),
             host: Some("spoke2.invalid".into()),
@@ -1547,6 +1808,175 @@ mod tests {
         ));
     }
 
+    /// #418 with a REAL ssh: a dial that fails comes back classified from
+    /// ssh's own words, and those words reach the `process.exec` record as
+    /// its stderr tail. `.invalid` is reserved (RFC 2606) and never resolves,
+    /// so this asserts about ssh and flock, not about any fleet host.
+    #[test]
+    fn a_real_failed_dial_is_classified_and_its_stderr_reaches_the_log() {
+        let peer = PeerConfig {
+            name: "flk418".into(),
+            ssh: "nobody@flk-418-no-such-host.invalid".into(),
+            ..Default::default()
+        };
+        let mut outcome = None;
+        let logs = crate::logging::capture_logs(|| {
+            outcome = Some(run_peer_ssh_status(&peer, "true"));
+        });
+        let failure = match outcome {
+            Some(Err(failure)) => failure,
+            Some(Ok(_)) => panic!("a dial to an .invalid host succeeded"),
+            None => panic!("the dial never ran"),
+        };
+        if failure.detail.starts_with("ssh spawn failed") {
+            // No ssh client on this runner: nothing real to observe.
+            return;
+        }
+        assert_eq!(
+            SshFailureReason::classify(&failure.detail),
+            SshFailureReason::UnknownHost,
+            "{}",
+            failure.detail
+        );
+        assert_eq!(failure.exit_code, Some(255), "ssh's own failure status");
+        assert!(logs.contains("stderr_tail="), "{logs}");
+        assert!(
+            logs.to_ascii_lowercase()
+                .contains("could not resolve hostname"),
+            "ssh's reason is in the log, not only its exit status: {logs}"
+        );
+        // flock's own dials never ride, or leave behind, a shared mux.
+        assert!(logs.contains("ControlMaster=no") && logs.contains("ControlPath=none"));
+    }
+
+    /// ssh cannot say its agent is gone — that is a debug-level message — so
+    /// a passphrase key under BatchMode reads "Permission denied". flock knows
+    /// the socket refused and says so; only for an AUTH failure, though: a
+    /// refused TCP connection is not the agent's fault.
+    #[test]
+    fn an_auth_failure_through_a_dead_agent_reads_agent_unreachable() {
+        use crate::platform::ssh_agent::AgentSocket;
+        let socket = std::env::temp_dir().join("flk418-dead-agent.sock");
+        let dead = AgentSocket::Dead(socket.clone());
+        let auth = "lars@sage: Permission denied (publickey).".to_string();
+
+        let blamed = attribute_dial_failure(auth.clone(), &dead);
+        assert_eq!(
+            SshFailureReason::classify(&blamed),
+            SshFailureReason::AgentUnreachable,
+            "{blamed}"
+        );
+        assert!(
+            blamed.contains("Permission denied"),
+            "ssh's words kept: {blamed}"
+        );
+        assert!(
+            !blamed.contains(&socket.display().to_string()),
+            "the local socket path must not ride the relayed error: {blamed}"
+        );
+
+        let refused = "ssh: connect to host sage port 22: Connection refused".to_string();
+        assert_eq!(
+            SshFailureReason::classify(&attribute_dial_failure(refused, &dead)),
+            SshFailureReason::ConnectRefused
+        );
+        assert_eq!(
+            SshFailureReason::classify(&attribute_dial_failure(auth, &AgentSocket::Live(socket))),
+            SshFailureReason::AuthRefused,
+            "a live agent's auth failure is the far side's refusal"
+        );
+        // ssh-add's and a verbose ssh's own words for the same state.
+        assert_eq!(
+            SshFailureReason::classify("Error connecting to agent: Connection refused"),
+            SshFailureReason::AgentUnreachable
+        );
+    }
+
+    /// #418 rate limit: one WARN at onset, silence while unchanged, one
+    /// summary per window, an edge on a change of reason, INFO on recovery.
+    #[test]
+    fn a_persistent_failure_warns_on_edges_and_summarises_per_window() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let every = Duration::from_secs(600);
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut health = PeerDialHealth::default();
+
+        assert_eq!(
+            health.record_failure(SshFailureReason::AuthRefused, t0, every),
+            DialLog::Failed
+        );
+        assert_eq!(health.persistent_reason(), None, "one failure is a blip");
+        assert_eq!(
+            health.record_failure(SshFailureReason::AuthRefused, at(15), every),
+            DialLog::StillFailing { summary: false }
+        );
+        assert_eq!(
+            health.persistent_reason(),
+            Some(SshFailureReason::AuthRefused),
+            "past one poll, it is a state"
+        );
+        for k in 2..40 {
+            assert_eq!(
+                health.record_failure(SshFailureReason::AuthRefused, at(15 * k), every),
+                DialLog::StillFailing { summary: false },
+                "poll {k} is inside the window"
+            );
+        }
+        assert_eq!(
+            health.record_failure(SshFailureReason::AuthRefused, at(600), every),
+            DialLog::StillFailing { summary: true }
+        );
+        assert_eq!(
+            health.record_failure(SshFailureReason::AuthRefused, at(615), every),
+            DialLog::StillFailing { summary: false }
+        );
+        assert_eq!(
+            health.record_failure(SshFailureReason::AgentUnreachable, at(630), every),
+            DialLog::Failed,
+            "a different kind of broken is news"
+        );
+        let failures = health.consecutive_failures;
+        assert_eq!(
+            health.record_success(at(645)),
+            DialLog::Recovered {
+                failures,
+                failing_secs: 645
+            }
+        );
+        assert_eq!(health.record_success(at(660)), DialLog::Quiet);
+        assert_eq!(health.persistent_reason(), None);
+    }
+
+    /// The budget the rate limit buys, in the mba22 numbers: five days of a
+    /// 15s poll failing the same way.
+    #[test]
+    fn a_five_day_outage_is_hundreds_of_warns_not_tens_of_thousands() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let every = Duration::from_secs(PEER_DIAL_FAILURE_SUMMARY_SECS);
+        let mut health = PeerDialHealth::default();
+        let polls = 5 * 24 * 3600 / 15;
+        let warns = (0..polls)
+            .map(|k| {
+                health.record_failure(
+                    SshFailureReason::AgentUnreachable,
+                    t0 + Duration::from_secs(15 * k),
+                    every,
+                )
+            })
+            .filter(|log| {
+                matches!(
+                    log,
+                    DialLog::Failed | DialLog::StillFailing { summary: true }
+                )
+            })
+            .count();
+        assert_eq!(polls, 28_800);
+        assert!(warns <= 721, "{warns} WARNs for one unchanged outage");
+        assert!(warns >= 700, "the outage must still be restated: {warns}");
+    }
+
     #[test]
     fn an_ssh_failure_names_which_kind_of_broken() {
         // #410 P1: "unreachable" hides the fix. Each of these has a different
@@ -1678,6 +2108,8 @@ mod tests {
     #[test]
     fn to_wire_dedups_origin_and_caps_peer_count() {
         let mk = |name: &str| PeerSummaryState {
+            dial: Default::default(),
+            stream_error: None,
             peer: name.to_string(),
             ssh_target: name.to_string(),
             host: None,
@@ -1725,6 +2157,8 @@ mod tests {
 
     fn summary_state(name: &str, ssh_target: &str, age_secs: Option<u64>) -> PeerSummaryState {
         PeerSummaryState {
+            dial: Default::default(),
+            stream_error: None,
             peer: name.to_string(),
             ssh_target: ssh_target.to_string(),
             host: Some(format!("{name}-host")),
@@ -2340,6 +2774,7 @@ Last login: banner noise
 
         // v(N) struct → JSON → v(N) struct: value preserved.
         let full = RelayedFleetPeer {
+            dial: None,
             name: "sage".into(),
             ssh_target: "lars@sage".into(),
             host: None,

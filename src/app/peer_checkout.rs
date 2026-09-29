@@ -362,6 +362,8 @@ mod tests {
 
     fn peer_with_workspace(project_key: Option<&str>, branch: Option<&str>) -> PeerSummaryState {
         PeerSummaryState {
+            dial: Default::default(),
+            stream_error: None,
             peer: "anvil".into(),
             ssh_target: "lars@anvil".into(),
             host: Some("anvil".into()),

@@ -719,6 +719,10 @@ pub struct GossipConfig {
     pub stale_after_secs: u64,
     /// Latency (ms) above which a peer renders "slow" (yellow dot).
     pub slow_threshold_ms: u64,
+    /// While a peer's polls keep failing the SAME way, how often that is
+    /// restated at WARN (#418). The first failure, a change of reason, and
+    /// the recovery are always logged; this bounds only the repeats.
+    pub dial_failure_summary_secs: u64,
 }
 
 impl Default for GossipConfig {
@@ -733,6 +737,7 @@ impl Default for GossipConfig {
             initial_delay_secs: crate::peers::PEER_POLL_INITIAL_DELAY_SECS,
             stale_after_secs: crate::peers::PEER_STALE_AFTER_SECS,
             slow_threshold_ms: crate::peers::PEER_SLOW_LATENCY_MS,
+            dial_failure_summary_secs: crate::peers::PEER_DIAL_FAILURE_SUMMARY_SECS,
         }
     }
 }
@@ -761,6 +766,16 @@ impl GossipConfig {
     /// zero threshold would flag every peer as slow, defeating the signal.
     pub fn slow_threshold_ms(&self) -> u64 {
         self.slow_threshold_ms.max(1)
+    }
+
+    /// Effective repeat-WARN interval for an unchanged peer poll outage,
+    /// clamped to `>= poll_interval()`: anything shorter would restate the
+    /// outage on every poll, which is the flood this setting exists to stop.
+    pub fn dial_failure_summary(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.dial_failure_summary_secs
+                .max(self.poll_interval_secs.max(1)),
+        )
     }
 
     /// Resolve the effective poll interval for one peer: the per-peer override
