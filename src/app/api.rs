@@ -323,9 +323,8 @@ impl App {
                 crate::health::PeerPollErrorKind::Timeout,
             );
             // #424: this server's own row rides every push too, so a client
-            // that switched away from here keeps a live view of it. Built once
-            // per round: it is the same for every spoke.
-            let hub_self = (!self.state.peers.is_empty()).then(|| Box::new(self.hub_self_row()));
+            // that switched away from here keeps a live view of it.
+            let mut hub_self: Option<Box<crate::api::schema::RelayedFleetPeer>> = None;
             for peer in self.state.peers.clone() {
                 let effective = gossip.effective_poll_interval(&peer);
                 if !self
@@ -360,7 +359,13 @@ impl App {
                             && row.ssh_target != peer.ssh_target()
                     })
                     .collect();
-                let hub_self = hub_self.clone();
+                // Built on the first peer actually due, once per round: most
+                // ticks dispatch nothing, and it is the same for every spoke.
+                let hub_self = Some(
+                    hub_self
+                        .get_or_insert_with(|| Box::new(self.hub_self_row()))
+                        .clone(),
+                );
                 std::thread::spawn(move || {
                     // The in-flight guard is released only by the event this
                     // sends, so the fetch must not be able to unwind past it

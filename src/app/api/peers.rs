@@ -144,6 +144,13 @@ impl App {
         // #424: the hub's own row, heard only under the name bound to this
         // relay. A row about some other machine is not the hub speaking for
         // itself.
+        //
+        // What the binding attests is the relay PROCESS. The hub's NAME is
+        // the one that process declared in its first frame (`record_hub`),
+        // so a relay could call itself anything. That stays within the
+        // same-user boundary the relay already runs in: only a process this
+        // user started can bind, and the home row it could then repaint
+        // still switches via the home target, never an ssh dial.
         let hub_key = hub.to_ascii_lowercase();
         let hub_self = params
             .hub_self
@@ -1670,6 +1677,36 @@ mod tests {
         spoke.current_api_peer_pid = None;
         let entry = &spoke.state.relayed_fleet_cache["anvil"];
         assert!(entry.hub_pushed);
+        assert!(home_workspaces(&spoke).is_empty());
+        // Display-only: nothing was carried for anvil, so a click dials nothing.
+        assert!(spoke
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "anvil".into(),
+                ws_idx: None,
+            })
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_host_with_control_bytes_is_not_a_second_home() {
+        // #425 review r2: identity is keyed on the raw host, so `mba22\x07`
+        // got past `without_origin_claims` and rendered as a second mba22.
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(carried_home());
+        bind_relay(&mut spoke);
+        let mut disguised = hub_row("mba22", "mba22", 0);
+        disguised.host = Some("mba22\u{7}".into());
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "anvil".into(),
+                fleet: vec![disguised, hub_row("ksb", "ksb", 0)],
+                hub_self: None,
+            },
+        );
+        spoke.current_api_peer_pid = None;
+        let keys: Vec<&String> = spoke.state.relayed_fleet_cache.keys().collect();
+        assert_eq!(keys, vec!["ksb"], "the disguised row is dropped: {keys:?}");
         assert!(home_workspaces(&spoke).is_empty());
     }
 

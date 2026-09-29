@@ -2043,7 +2043,11 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 if let Some(via) = entry.via.as_deref() {
                     build.title_rest.insert(
                         0,
-                        Span::styled(format!("via {via} "), Style::default().fg(p.overlay0)),
+                        Span::styled(
+                            // The hub's name is self-declared by its relay.
+                            format!("via {} ", crate::control_bytes::strip(via)),
+                            Style::default().fg(p.overlay0),
+                        ),
                     );
                 }
                 build

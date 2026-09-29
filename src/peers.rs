@@ -786,6 +786,13 @@ fn merge_relayed_rows(
             continue;
         }
         let host_key = wire_row_identity(&entry);
+        // Identity is keyed before the row's names are cleaned, so a host
+        // carrying control bytes (`mba22\x07`) would slip past every exact
+        // comparison and then render as a second `mba22`. No real host has
+        // one: drop the row.
+        if host_key.chars().any(char::is_control) {
+            continue;
+        }
         if host_key == self_host_lower {
             // Never store an entry about ourselves as a relayed row — the self
             // row lives on the origin_summary path.
