@@ -1923,8 +1923,7 @@ impl App {
                                 .git_space()
                                 .is_some_and(|space| space.repo_root == result.path));
                     if still_same_linked_worktree {
-                        self.state.selected = ws_idx;
-                        self.state.close_selected_workspace();
+                        self.state.close_workspace(ws_idx);
                     }
                 }
                 self.sweep_orphaned_checkout_processes(&result.standing);

@@ -187,8 +187,7 @@ impl App {
         // may have used a positional `1` form, but the event should always
         // carry the public id.
         let workspace_id = self.public_workspace_id(index);
-        self.state.selected = index;
-        self.state.close_selected_workspace();
+        self.state.close_workspace(index);
         self.shutdown_detached_terminal_runtimes();
         // WorkspaceClosed is queued by close_workspace_indices — the one place
         // every close funnels through — and published by the drain below.

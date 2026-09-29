@@ -1291,6 +1291,28 @@ impl Workspace {
         }
     }
 
+    /// Workspaces `w0..wN`, each a linked worktree in the repo space its
+    /// `keys` entry names (empty = none) — the #419 close-focus fixture.
+    /// Linked, so closing one never touches the whole-space affordance.
+    pub(crate) fn test_in_spaces(keys: &[&str]) -> Vec<Self> {
+        keys.iter()
+            .enumerate()
+            .map(|(idx, key)| {
+                let mut ws = Self::test_new(&format!("w{idx}"));
+                if !key.is_empty() {
+                    ws.worktree_space = Some(WorktreeSpaceMembership {
+                        key: (*key).into(),
+                        label: (*key).into(),
+                        repo_root: format!("/repo/{key}").into(),
+                        checkout_path: format!("/repo/{key}-{idx}").into(),
+                        is_linked_worktree: true,
+                    });
+                }
+                ws
+            })
+            .collect()
+    }
+
     pub(crate) fn insert_test_runtime(&mut self, pane_id: PaneId, runtime: TerminalRuntime) {
         self.test_runtimes.insert(pane_id, runtime);
     }
