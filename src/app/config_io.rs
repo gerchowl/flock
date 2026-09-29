@@ -124,6 +124,12 @@ impl App {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
     }
 
+    /// Drop any transient action notice now, before its deadline.
+    pub(crate) fn clear_action_notice(&mut self) {
+        self.state.action_notice = None;
+        self.action_notice_deadline = None;
+    }
+
     pub(super) fn update_config_file<F>(&mut self, error_context: &str, update: F) -> bool
     where
         F: FnOnce(&str) -> String,

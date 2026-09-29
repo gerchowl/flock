@@ -628,6 +628,9 @@ impl App {
             include_resize_poll.then_some(self.next_resize_poll),
             self.config_diagnostic_deadline,
             self.toast_deadline,
+            // #434: an action notice expires on time, not on the next
+            // unrelated wake.
+            self.action_notice_deadline,
             self.copy_feedback_deadline,
             self.next_animation_tick,
             include_git_refresh

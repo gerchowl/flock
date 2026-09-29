@@ -576,22 +576,7 @@ impl HeadlessServer {
             }
 
             if let Some(request) = self.app.state.request_peer_switch.take() {
-                let was_home = request == crate::app::state::PeerSwitchRequest::Home;
-                match self.app.prepare_switch_server(request) {
-                    Some(prepared) => {
-                        self.app
-                            .show_action_notice(format!("switching to {}…", prepared.label));
-                        self.send_to_foreground_client(ServerMessage::SwitchServer {
-                            ssh_target: prepared.ssh_target,
-                            fleet: prepared.fleet,
-                            focus_workspace: prepared.focus_workspace,
-                            proxy_jump: prepared.proxy_jump,
-                        });
-                    }
-                    // switch_home with no carried origin: already home.
-                    None if was_home => self.app.show_action_notice("already home"),
-                    None => {}
-                }
+                self.dispatch_peer_switch(request);
                 needs_render = true;
             }
 
@@ -2420,8 +2405,19 @@ impl HeadlessServer {
                     self.app.window_title_publisher.invalidate();
                     true
                 } else {
-                    // Pausing: no frame work to do; just stop targeting it.
-                    false
+                    // Pausing: stop targeting it. A transient notice still
+                    // armed here was meant for the moment the operator left,
+                    // not for their return (#434). Another client still
+                    // painting this server keeps it.
+                    let still_watched = self
+                        .clients
+                        .values()
+                        .any(|c| c.is_full_app_client() && c.frame_subscription);
+                    if still_watched || self.app.state.action_notice.is_none() {
+                        return false;
+                    }
+                    self.app.clear_action_notice();
+                    true
                 }
             }
             ServerEvent::ClientFocusWorkspace {
@@ -3308,6 +3304,30 @@ impl HeadlessServer {
         }
         crate::render_prof::duration_since("full_render.total", full_started);
         crate::logging::render_virtual_frame(cols, rows, self.foreground_client_id);
+    }
+
+    /// Resolve a sidebar or switch_home request and hand the foreground
+    /// client its SwitchServer.
+    fn dispatch_peer_switch(&mut self, request: crate::app::state::PeerSwitchRequest) {
+        let was_home = request == crate::app::state::PeerSwitchRequest::Home;
+        match self.app.prepare_switch_server(request) {
+            Some(prepared) => {
+                // The client's own popup says "switching to X…" for the flip
+                // (#434). A notice raised here would stay armed on the server
+                // being left and greet the next return inside its window,
+                // naming the previous switch. Clear whatever is showing instead.
+                self.app.clear_action_notice();
+                self.send_to_foreground_client(ServerMessage::SwitchServer {
+                    ssh_target: prepared.ssh_target,
+                    fleet: prepared.fleet,
+                    focus_workspace: prepared.focus_workspace,
+                    proxy_jump: prepared.proxy_jump,
+                });
+            }
+            // switch_home with no carried origin: already home.
+            None if was_home => self.app.show_action_notice("already home"),
+            None => {}
+        }
     }
 
     /// Handle scheduled tasks for the headless server.
@@ -7692,6 +7712,43 @@ next_tab = ""
             false,
         );
         assert_eq!(published_titles(&control_rx).len(), 1);
+    }
+
+    #[test]
+    fn leaving_a_server_does_not_leave_its_notice_for_the_return() {
+        // #434: a notice armed on the server being left must not greet the
+        // operator when they come back inside its window.
+        let (mut server, _control_rx, _render_rx) = window_title_test_server();
+        server.app.show_action_notice("switching to sage…");
+
+        server.handle_server_event(ServerEvent::ClientSetFrameSubscription {
+            client_id: 1,
+            enabled: false,
+        });
+        server.handle_server_event(ServerEvent::ClientSetFrameSubscription {
+            client_id: 1,
+            enabled: true,
+        });
+
+        assert!(server.app.state.action_notice.is_none());
+        assert!(server.app.action_notice_deadline.is_none());
+    }
+
+    #[test]
+    fn dispatching_a_switch_clears_the_leaving_servers_notice() {
+        let (mut server, _control_rx, _render_rx) = window_title_test_server();
+        server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: Vec::new(),
+            origin_summary: None,
+            received_at: Instant::now(),
+        });
+        server.app.show_action_notice("copied worktree path");
+
+        server.dispatch_peer_switch(crate::app::state::PeerSwitchRequest::Home);
+
+        assert!(server.app.state.action_notice.is_none());
+        assert!(server.app.action_notice_deadline.is_none());
     }
 
     #[test]

@@ -2359,7 +2359,7 @@ pub struct AppState {
     /// Arrival `Instant` of the sample currently held in [`Self::system_stats`],
     /// stamped by the [`crate::events::AppEvent::SystemStatsUpdated`] handler.
     ///
-    /// Used by [`Self::system_stats_fresh_at`] to hide the last snapshot once
+    /// Used by [`Self::system_stats_fresh_at`] to tell a stale snapshot once
     /// the sampler thread stops delivering — otherwise a dead poller leaves
     /// the status line rendering old CPU / memory / battery values as if they
     /// were current, which is the failure mode `src/peers.rs:196` calls
@@ -2935,9 +2935,9 @@ impl AppState {
     /// The last system-stats snapshot, but only while it is still current.
     ///
     /// Returns `None` when the sample was never delivered, or when it is
-    /// older than three sample intervals. The status line uses this to
-    /// render a neutral placeholder instead of the frozen numbers once the
-    /// sampler thread stops answering — the same doctrine `src/peers.rs:196`
+    /// older than three sample intervals. The status line and self row use
+    /// this (via [`Self::system_stats_reading_at`]) to dim the frozen numbers
+    /// once the sampler thread stops answering — the same doctrine `src/peers.rs:196`
     /// states for peers: "a node that stopped answering must stop looking
     /// alive… an unbounded confident lie is strictly worse than showing it
     /// as gone".
@@ -2960,6 +2960,20 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    /// The last-known system-stats snapshot and whether it is still fresh
+    /// (#435). `None` only when no sample has ever arrived; a stale reading
+    /// comes back with `false` so the self row and status line keep the last
+    /// values, dimmed, the way ghost peer rows do. One slow sample must not
+    /// blank the machine's own metrics.
+    pub(crate) fn system_stats_reading_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<(&crate::system_stats::SystemStats, bool)> {
+        self.system_stats_at?;
+        let stats = self.system_stats.as_ref()?;
+        Some((stats, self.system_stats_fresh_at(now).is_some()))
     }
 
     /// Blank rows between sidebar list entries, clamped to the supported

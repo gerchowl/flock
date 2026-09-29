@@ -4478,6 +4478,23 @@ sidebar_pane_gap = 99
     }
 
     #[test]
+    fn next_loop_deadline_wakes_for_an_expiring_action_notice() {
+        // #434: the notice must expire on its own deadline, not ride on the
+        // headless accept-poll cap.
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_resize_poll = now + Duration::from_secs(60);
+        app.next_auto_update_check = None;
+        app.show_action_notice("copied");
+        let notice_deadline = app.action_notice_deadline.expect("notice armed");
+
+        let deadline = app
+            .next_headless_loop_deadline_with_git_refresh(now, false, false)
+            .expect("loop has a deadline");
+        assert!(deadline <= notice_deadline);
+    }
+
+    #[test]
     fn headless_next_loop_deadline_ignores_resize_poll() {
         let mut app = test_app();
         let now = Instant::now();
