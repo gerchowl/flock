@@ -173,6 +173,21 @@ impl Scrubber {
     }
 }
 
+/// Mask credentials only — tokens and `label: value` secrets — leaving hosts,
+/// paths and addresses alone.
+///
+/// For text that stays in THIS machine's session log, where the ssh target
+/// and argv already sit in the same record: a failed command's stderr tail
+/// (#418). The identity rules of [`Scrubber::scrub`] exist for a report that
+/// leaves the machine, and applied here they would erase the very host and
+/// path an operator needs to read ("connect to host <host>: refused").
+pub(crate) fn mask_credentials(value: &str) -> String {
+    let masked = secret_token_re().replace_all(value, "<redacted-token>");
+    labeled_secret_re()
+        .replace_all(&masked, "$1=<redacted>")
+        .into_owned()
+}
+
 fn secret_token_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

@@ -80,3 +80,7 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }
+
+pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
+    &[]
+}

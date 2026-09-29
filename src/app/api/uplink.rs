@@ -1193,6 +1193,7 @@ mod tests {
         }];
         let mut relayed =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                dial: None,
                 name: "ksb".into(),
                 ssh_target: "ksb".into(),
                 host: Some("ksb".into()),

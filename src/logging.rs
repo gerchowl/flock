@@ -910,7 +910,8 @@ static PERIODIC_LAST_STATUS: std::sync::OnceLock<Mutex<HashMap<String, String>>>
     std::sync::OnceLock::new();
 
 /// Distinct periodic commands tracked for edge detection. Real call sites
-/// number under a dozen; the cap only ever bites on a caller passing a
+/// number under a dozen, plus one per configured peer for the scoped peer
+/// poll (#418); the cap only ever bites on a caller passing a
 /// varying program path, which then simply reports every run as an edge
 /// (loud, not silent — the safe direction to fail).
 const PERIODIC_TRACKED_MAX: usize = 64;
@@ -959,6 +960,17 @@ fn periodic_edge(subsystem: &str, program: &str, status: &str) -> PeriodicEdge {
     }
 }
 
+/// How a completed run is reported, beyond its identity and outcome.
+pub(crate) struct ExecReport<'a> {
+    /// The call site's declared cadence; picks the level (#318).
+    pub(crate) cadence: crate::process::ExecCadence,
+    /// Per-target edge key for a periodic command (#418), see
+    /// `TracedCommand::edge_scope`.
+    pub(crate) edge_scope: Option<&'a str>,
+    /// Bounded, credential-masked tail of a FAILED run's stderr (#418).
+    pub(crate) stderr_tail: Option<&'a str>,
+}
+
 /// A child process finished. `status` is `None` if the wrapper never got a
 /// `Wait`ed status (currently unused: `output`/`status` always yield one).
 ///
@@ -976,9 +988,17 @@ pub(crate) fn process_exec_completed(
     args: &str,
     status: Option<std::process::ExitStatus>,
     duration_ms: u64,
-    cadence: crate::process::ExecCadence,
+    report: ExecReport<'_>,
 ) {
     let event = "process.exec";
+    let ExecReport {
+        cadence,
+        edge_scope,
+        stderr_tail,
+    } = report;
+    // Empty rather than absent: a failure whose tool printed nothing says so
+    // by the empty field, which is itself the diagnosis for a silent exit.
+    let stderr_tail = stderr_tail.unwrap_or("");
     let code = status.and_then(|s| s.code());
     let status_str = code
         .map(|c| c.to_string())
@@ -987,7 +1007,11 @@ pub(crate) fn process_exec_completed(
     // One lookup, before the branches: the edge must be RECORDED on every
     // periodic run, including the quiet ones, or the next run re-reports the
     // same status as fresh and the fire hose comes straight back.
-    let edge = periodic.then(|| periodic_edge(subsystem, program, &status_str));
+    let edge_program = match edge_scope {
+        Some(scope) => format!("{program}/{scope}"),
+        None => program.to_string(),
+    };
+    let edge = periodic.then(|| periodic_edge(subsystem, &edge_program, &status_str));
     let recovered = edge == Some(PeriodicEdge::Changed);
     let new_failure = matches!(
         edge,
@@ -1038,6 +1062,7 @@ pub(crate) fn process_exec_completed(
             args,
             status = status_str,
             duration_ms,
+            stderr_tail,
             "process exec exited non-zero"
         ),
         // Still failing the same way it was last tick. The WARN above already
@@ -1051,6 +1076,7 @@ pub(crate) fn process_exec_completed(
             args,
             status = status_str,
             duration_ms,
+            stderr_tail,
             "process exec still failing"
         ),
     }
@@ -3350,6 +3376,180 @@ pub(crate) fn peer_stream_closed(peer: &str, err: &str, backoff_secs: u64) {
         err,
         backoff_secs,
         "peer connection dropped, backing off before reconnect"
+    );
+}
+
+/// A peer's held relay stream could not be established (#418).
+///
+/// `changed` is the edge: WARN when the reason is new, DEBUG while the same
+/// reason repeats each backoff. Before this the relay's stderr went to
+/// /dev/null and the fallback logged at DEBUG, so a hub holding NO streams
+/// looked exactly like a healthy one that happened to be slower.
+pub(crate) fn peer_stream_unavailable(
+    peer: &str,
+    reason: &str,
+    detail: &str,
+    stderr_tail: &str,
+    backoff_secs: u64,
+    changed: bool,
+) {
+    if changed {
+        tracing::warn!(
+            target: "flock::peers",
+            event = "peer.stream.unavailable",
+            subsystem = "peers",
+            outcome = "error",
+            peer,
+            reason,
+            detail,
+            stderr_tail,
+            backoff_secs,
+            "peer relay stream could not be established; polling one-shot"
+        );
+    } else {
+        tracing::debug!(
+            target: "flock::peers",
+            event = "peer.stream.unavailable",
+            subsystem = "peers",
+            outcome = "error",
+            peer,
+            reason,
+            detail,
+            stderr_tail,
+            backoff_secs,
+            "peer relay stream still unavailable"
+        );
+    }
+}
+
+/// A held relay stream answered its first request. `down_secs` is how long
+/// establishing one had been failing, when it had (#418): the recovery edge
+/// of `peer.stream.unavailable`. One line per connection, so INFO.
+pub(crate) fn peer_stream_established(peer: &str, down_secs: Option<u64>) {
+    match down_secs {
+        Some(down_secs) => tracing::info!(
+            target: "flock::peers",
+            event = "peer.stream.established",
+            subsystem = "peers",
+            outcome = "recovered",
+            peer,
+            down_secs,
+            "peer relay stream established after failing"
+        ),
+        None => tracing::info!(
+            target: "flock::peers",
+            event = "peer.stream.established",
+            subsystem = "peers",
+            outcome = "ok",
+            peer,
+            "peer relay stream established"
+        ),
+    }
+}
+
+/// A peer poll failed, and this failure is news: the first after success, or
+/// a different kind of broken than the last (#418). Carries the classified
+/// `reason` and ssh's own words, which the 2,229-a-day bare
+/// "process exec exited non-zero" lines on mba22 carried neither of.
+pub(crate) fn peer_dial_failed(peer: &str, reason: &str, detail: &str, consecutive: u32) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.dial.failed",
+        subsystem = "peers",
+        outcome = "error",
+        peer,
+        reason,
+        detail,
+        consecutive,
+        "peer poll failed"
+    );
+}
+
+/// A peer poll failed the same way it failed last time. `summary` is the
+/// periodic reminder, once per `[gossip] dial_failure_summary_secs`, so an
+/// outage that never changes shape still shows up in a WARN tail; every other
+/// repeat is DEBUG (#418, log-budgets.toml).
+pub(crate) fn peer_dial_still_failing(
+    peer: &str,
+    reason: &str,
+    detail: &str,
+    consecutive: u32,
+    failing_secs: u64,
+    summary: bool,
+) {
+    if summary {
+        tracing::warn!(
+            target: "flock::peers",
+            event = "peer.dial.still_failing",
+            subsystem = "peers",
+            outcome = "error",
+            peer,
+            reason,
+            detail,
+            consecutive,
+            failing_secs,
+            "peer poll still failing"
+        );
+    } else {
+        tracing::debug!(
+            target: "flock::peers",
+            event = "peer.dial.still_failing",
+            subsystem = "peers",
+            outcome = "error",
+            peer,
+            reason,
+            detail,
+            consecutive,
+            failing_secs,
+            "peer poll still failing"
+        );
+    }
+}
+
+/// A peer poll succeeded after `failures` consecutive failures over
+/// `failing_secs`: the closing edge of `peer.dial.failed`.
+pub(crate) fn peer_dial_recovered(peer: &str, failures: u32, failing_secs: u64) {
+    tracing::info!(
+        target: "flock::peers",
+        event = "peer.dial.recovered",
+        subsystem = "peers",
+        outcome = "recovered",
+        peer,
+        failures,
+        failing_secs,
+        "peer poll recovered"
+    );
+}
+
+/// The inherited ssh-agent socket was dead and a live one was found in this
+/// user's launchd session directories (#418). Once per relogin.
+pub(crate) fn ssh_agent_resocketed(from: Option<&std::path::Path>, to: &std::path::Path) {
+    let from = from
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    tracing::info!(
+        target: "flock::peers",
+        event = "ssh.agent.resocketed",
+        subsystem = "peers",
+        outcome = "recovered",
+        from = %from,
+        to = %to.display(),
+        "ssh agent socket re-resolved for peer dials"
+    );
+}
+
+/// The ssh-agent socket peer dials use refuses connections and no live
+/// replacement was found (#418). Once per dead path: every dial keeps using
+/// it, and every auth failure it causes is classified `agent_unreachable`.
+pub(crate) fn ssh_agent_unreachable(path: &std::path::Path, rescanned: bool) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "ssh.agent.unreachable",
+        subsystem = "peers",
+        outcome = "error",
+        path = %path.display(),
+        rescanned,
+        "ssh agent socket refuses connections; peer dials needing it will fail auth"
     );
 }
 
