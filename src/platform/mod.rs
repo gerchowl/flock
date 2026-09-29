@@ -81,6 +81,8 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+pub(crate) mod ssh_agent;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

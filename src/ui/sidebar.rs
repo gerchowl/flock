@@ -2482,12 +2482,11 @@ fn peer_server_rows(
         // #410 P1: say HOW the dial failed when ssh said so — "auth refused"
         // and "jump host reached, next hop refused" have different fixes, and
         // a bare broken link hides which one this is.
-        if let Some(reason) = peer
-            .error
-            .as_deref()
-            .map(crate::peers::SshFailureReason::classify)
-            .filter(|reason| *reason != crate::peers::SshFailureReason::Other)
-        {
+        //
+        // #418: once it has persisted past one poll — a single failed dial is
+        // a blip, and "ssh agent unreachable" is the label that tells the
+        // operator the fix is on THIS machine, not the peer.
+        if let Some(reason) = peer.shown_failure_reason() {
             title_rest.push(Span::styled(
                 format!(" {}", reason.describe()),
                 Style::default()
@@ -2672,7 +2671,7 @@ fn server_health_spans(
     spans
 }
 
-fn format_age(secs: u64) -> String {
+pub(crate) fn format_age(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {

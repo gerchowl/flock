@@ -201,6 +201,9 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
+                    // #418: how this server's dials to the peer are failing,
+                    // which is what `flk peers` shows.
+                    dial: peer.dial_report(std::time::Instant::now()),
                     name: peer.peer.clone(),
                     ssh_target: peer.ssh_target.clone(),
                     host: peer.host.clone(),
@@ -933,6 +936,8 @@ mod tests {
 
     fn summary(name: &str, ssh_target: &str) -> crate::peers::PeerSummaryState {
         crate::peers::PeerSummaryState {
+            dial: Default::default(),
+            stream_error: None,
             peer: name.to_string(),
             ssh_target: ssh_target.to_string(),
             host: Some(name.to_string()),
@@ -1126,6 +1131,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                dial: None,
                 name: "spoke2.invalid".into(),
                 ssh_target: "lars@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
@@ -1170,6 +1176,7 @@ mod tests {
 
     fn hub_row(name: &str, ssh_target: &str, age: u64) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            dial: None,
             name: name.into(),
             ssh_target: ssh_target.into(),
             host: Some(name.into()),
@@ -1320,6 +1327,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                dial: None,
                 name: "spoke2.invalid".into(),
                 ssh_target: "lars@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
@@ -1368,6 +1376,7 @@ mod tests {
         app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
                     host: "anvil".into(),
                     version: None,
@@ -1376,6 +1385,7 @@ mod tests {
                     latency_ms: 5,
                     workspaces: Vec::new(),
                     relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
+                        dial: None,
                         name: "loop-back".into(),
                         ssh_target: "lars@loop".into(),
                         host: Some("loop-back".into()),

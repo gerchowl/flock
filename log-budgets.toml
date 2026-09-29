@@ -57,6 +57,18 @@ mode = "gate"
 #   [event."client.tick"]
 #   max_pct = 5.0
 
+# `peer.dial.*` (#418) is deliberately NOT declared either, for the same
+# reason: the capture has no peers, so it never dials one. The defect it
+# guards is the one mba22 hit — every poll to every peer failing, one WARN per
+# poll, 2,229 a day. The fix is structural (WARN on the onset, a change of
+# reason, and one `peer.dial.still_failing` summary per
+# `[gossip] dial_failure_summary_secs`; DEBUG otherwise), pinned by
+# peers::tests::a_five_day_outage_is_hundreds_of_warns_not_tens_of_thousands.
+# For a live hub log with peers configured, add:
+#
+#   [event."peer.dial.still_failing"]
+#   max_pct = 5.0
+
 # --- SILENCE: the switch has to be observable -------------------------------
 # A completed slot switch emitted NOTHING at INFO. That is why a measured 5.05s
 # connect→handshake stall was undiagnosable from a default-level tail (#43,

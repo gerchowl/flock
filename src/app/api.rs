@@ -403,6 +403,7 @@ impl App {
                     .peer_poll_health
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
+            let summary_every = self.state.config.gossip.dial_failure_summary();
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -412,6 +413,10 @@ impl App {
                 // Peer was removed from config while the fetch was in flight.
                 return;
             };
+            // #418: a stream that cannot be held is a degradation even while
+            // the one-shot fallback keeps the row fresh, so it rides the row
+            // independently of this poll's outcome.
+            summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(payload) => {
                     // Gossip v3 (#101): merge the polled peer's relayed_fleet
@@ -447,6 +452,13 @@ impl App {
                     summary.workspaces = payload.workspaces;
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
+                    if let crate::peers::DialLog::Recovered {
+                        failures,
+                        failing_secs,
+                    } = summary.dial.record_success(now)
+                    {
+                        crate::logging::peer_dial_recovered(&summary.peer, failures, failing_secs);
+                    }
                     // Per-poll trace so a "peer row looks stale" report is
                     // diagnosable live (FLOCK_LOG=flock=debug + `flk peers
                     // logs`): shows exactly what each poll applied (#4, #67).
@@ -461,11 +473,41 @@ impl App {
                 // #410 P1: lead with WHICH kind of broken, so the servers band
                 // and `flk peers summary` can say "auth refused" rather than
                 // only that the peer is down.
+                //
+                // #418: and say it in the log without saying it every poll —
+                // the edges, plus one summary per window while it lasts.
                 Err(error) => {
-                    summary.error = Some(match crate::peers::SshFailureReason::classify(&error) {
-                        crate::peers::SshFailureReason::Other => error,
-                        reason => format!("{}: {error}", reason.describe()),
-                    })
+                    let reason = crate::peers::SshFailureReason::classify(&error);
+                    let log = summary.dial.record_failure(reason, now, summary_every);
+                    let consecutive = summary.dial.consecutive_failures;
+                    match log {
+                        crate::peers::DialLog::Failed => crate::logging::peer_dial_failed(
+                            &summary.peer,
+                            reason.as_str(),
+                            &error,
+                            consecutive,
+                        ),
+                        crate::peers::DialLog::StillFailing { summary: restate } => {
+                            crate::logging::peer_dial_still_failing(
+                                &summary.peer,
+                                reason.as_str(),
+                                &error,
+                                consecutive,
+                                summary.dial.failing_secs(now),
+                                restate,
+                            )
+                        }
+                        crate::peers::DialLog::Recovered { .. } | crate::peers::DialLog::Quiet => {}
+                    }
+                    summary.error = Some(
+                        if reason == crate::peers::SshFailureReason::Other
+                            || error.starts_with(reason.describe())
+                        {
+                            error
+                        } else {
+                            format!("{}: {error}", reason.describe())
+                        },
+                    )
                 }
             }
             // Drop relay rows nothing has refreshed for long enough that they
@@ -1647,6 +1689,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
                     host: "anvil-host".into(),
                     version: Some("0.6.8".into()),
@@ -1695,6 +1738,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Err("ssh: connect timed out".into()),
             },
         ));
@@ -1710,10 +1754,120 @@ mod tests {
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "ghost".into(),
+                stream_error: None,
                 result: Err("nope".into()),
             },
         ));
         assert_eq!(app.state.peer_summaries.len(), 1);
+    }
+
+    /// #418 end to end through the main loop: a dead-agent dial failure is
+    /// logged once at WARN, stays quiet while unchanged, reaches the peer's
+    /// row and `flk peers` only once it has persisted past one poll, and its
+    /// recovery closes the story at INFO. The no-relay-stream reason rides
+    /// the row independently, even while polls succeed.
+    #[tokio::test]
+    async fn a_persisting_dial_failure_is_classified_rate_limited_and_reported() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.peers = vec![crate::config::PeerConfig {
+            name: "sage".into(),
+            ..Default::default()
+        }];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let dead_agent = "ssh agent unreachable (SSH_AUTH_SOCK refuses connections): \
+                          Permission denied (publickey)."
+            .to_string();
+        let fail = |app: &mut App| {
+            crate::logging::capture_logs(|| {
+                app.handle_internal_event(AppEvent::PeerSummaryFetched(
+                    crate::peers::PeerSummaryFetch {
+                        peer: "sage".into(),
+                        result: Err(dead_agent.clone()),
+                        stream_error: Some(dead_agent.clone()),
+                    },
+                ));
+            })
+        };
+
+        let first = fail(&mut app);
+        assert!(
+            first.contains("peer.dial.failed")
+                && first.contains("WARN")
+                && first.contains("reason=\"agent_unreachable\""),
+            "the first failure is the line worth waking up for: {first}"
+        );
+        let summary = &app.state.peer_summaries[0];
+        assert_eq!(
+            summary.shown_failure_reason(),
+            None,
+            "one failure is a blip"
+        );
+        assert!(
+            app.own_relayed_fleet()[0]
+                .dial
+                .as_ref()
+                .and_then(|dial| dial.reason.as_ref())
+                .is_none(),
+            "flk peers must not claim a reason after one poll"
+        );
+
+        let second = fail(&mut app);
+        assert!(
+            !second.contains("WARN"),
+            "the same failure again must not repeat at WARN: {second}"
+        );
+        let summary = &app.state.peer_summaries[0];
+        assert_eq!(
+            summary.shown_failure_reason(),
+            Some(crate::peers::SshFailureReason::AgentUnreachable)
+        );
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.starts_with("ssh agent unreachable: ssh agent")),
+            "the reason is not stated twice: {:?}",
+            summary.error
+        );
+        let row = app.own_relayed_fleet().remove(0);
+        let dial = row.dial.expect("a persisted failure is reported");
+        assert_eq!(dial.reason.as_deref(), Some("agent_unreachable"));
+        assert_eq!(dial.consecutive_failures, 2);
+        assert_eq!(
+            dial.stream_reason.as_deref(),
+            Some("agent_unreachable"),
+            "no relay stream is said out loud, as a token"
+        );
+        let wire = serde_json::to_string(&dial).expect("serialize");
+        assert!(
+            !wire.contains("Permission denied"),
+            "ssh's free text must not leave the machine: {wire}"
+        );
+
+        let recovered = crate::logging::capture_logs(|| {
+            app.handle_internal_event(AppEvent::PeerSummaryFetched(
+                crate::peers::PeerSummaryFetch {
+                    peer: "sage".into(),
+                    result: Ok(crate::peers::PeerSummaryPayload {
+                        host: "sage".into(),
+                        version: None,
+                        protocol: None,
+                        system: None,
+                        latency_ms: 20,
+                        workspaces: Vec::new(),
+                        relayed_fleet: Vec::new(),
+                        icon: None,
+                    }),
+                    stream_error: None,
+                },
+            ));
+        });
+        assert!(
+            recovered.contains("peer.dial.recovered") && recovered.contains("failures=2"),
+            "{recovered}"
+        );
+        assert!(app.own_relayed_fleet()[0].dial.is_none());
     }
 
     #[tokio::test]
@@ -1757,6 +1911,7 @@ mod tests {
                      ws: Vec<crate::api::schema::PeerWorkspaceSummary>| {
             AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
                     host: "anvil-host".into(),
                     version: None,
@@ -2606,6 +2761,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
                     host: "anvil-host".into(),
                     version: Some("0.6.8".into()),
@@ -2635,6 +2791,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
                 peer: "anvil".into(),
+                stream_error: None,
                 result: Err(leaky.clone()),
             },
         ));

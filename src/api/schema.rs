@@ -3321,6 +3321,47 @@ pub struct RelayedFleetPeer {
     /// `#[serde(default)]` so a v(N-1) hub's relay entries parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// How the ORIGIN's dials to this peer are failing (#418), when they are:
+    /// the classified reason once it has persisted past one poll, and why no
+    /// relay stream is held. Additive with `#[serde(default)]`, so a v(N-1)
+    /// hub's rows parse as `None` and an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<PeerDialReport>,
+}
+
+/// The dial half of a peer's health, as the polling server sees it (#418).
+///
+/// Every field is a classification or a count, never free text: this crosses
+/// machines (see `stream_reason`).
+///
+/// Separate from `error` (the last poll's own words) because an operator's
+/// question is different: not "what did the last poll say" but "which kind of
+/// broken has this edge been, for how long" — and whether the push path is
+/// down even while the one-shot fallback keeps the row looking fresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDialReport {
+    /// Stable classification token (`auth_refused`, `agent_unreachable`,
+    /// `host_key`, `connect_refused`, `timeout`, …), present once the same
+    /// failure has persisted past one poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Polls failed in a row.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Seconds since the current run of failures began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_secs: Option<u64>,
+    /// Classification token for why establishing a held relay stream last
+    /// failed, when no stream is held for that reason. Independent of
+    /// `reason`: polls can succeed over the one-shot fallback while this is
+    /// set.
+    ///
+    /// A token, never ssh's words: this block is served by `peers.summary`
+    /// and pushed to every spoke, and stderr carries host names, local paths
+    /// and whatever the far side's shell printed (#300). The full text stays
+    /// in this machine's session log (`peer.stream.unavailable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

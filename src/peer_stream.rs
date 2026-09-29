@@ -54,6 +54,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How long a failed stream waits for ssh's stderr to drain before it is
+/// explained. ssh writes its error and exits, and the stdout EOF that reports
+/// the failure can overtake the stderr reader by a scheduler tick; this only
+/// bounds that race, so a relay that is wedged rather than gone never waits.
+const STDERR_SETTLE: Duration = Duration::from_secs(1);
+
 /// One held `ssh <peer> flk peers relay`.
 ///
 /// Requests are strictly sequential, matching the relay's own shape, so
@@ -75,6 +81,22 @@ struct PeerStream {
     /// the fetch that would have refreshed the fields that moved while it sat
     /// here (#4). See `MAX_PUSH_AGE`.
     latest_push: Arc<Mutex<Option<(std::time::Instant, String)>>>,
+    /// The last few lines ssh wrote to stderr (#418). Before this the relay's
+    /// stderr went to /dev/null, so a stream that could never be established
+    /// fell back to one-shot polling with no word about why.
+    stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+    /// Disconnects when ssh's stderr reaches EOF — ssh has exited.
+    stderr_done: Receiver<()>,
+    /// The agent socket this connection was dialled with, so an auth failure
+    /// can be attributed to a dead agent (#418).
+    agent: crate::platform::ssh_agent::AgentSocket,
+}
+
+/// Why a stream could not be established, as last observed.
+struct StreamFailure {
+    reason: crate::peers::SshFailureReason,
+    detail: String,
+    since: std::time::Instant,
 }
 
 /// Whether a relay line is an unsolicited push rather than a response.
@@ -182,27 +204,48 @@ fn route_relay_lines<R: BufRead>(
 
 impl PeerStream {
     fn spawn(peer: &PeerConfig) -> Result<Self, String> {
-        let mut child = crate::process::TracedCommand::new("ssh", "peers")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=5",
-                // Same probe cadence as the one-shot path: ssh detects a dead
-                // or half-open link itself and exits, which is how death
-                // reaches us. Nothing here polls for it.
-                "-o",
-                "ServerAliveInterval=5",
-                "-o",
-                "ServerAliveCountMax=2",
-                peer.ssh_target(),
-                &peer.relay_command,
-            ])
+        let mut command = crate::process::TracedCommand::new("ssh", "peers");
+        // Same options as the one-shot path, ServerAlive included: ssh
+        // detects a dead or half-open link itself and exits, which is how
+        // death reaches us. Nothing here polls for it.
+        command
+            .args(crate::peers::PEER_DIAL_SSH_OPTIONS)
+            .args([peer.ssh_target(), peer.relay_command.as_str()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
+            // A peer that cannot hold a stream is re-dialled every backoff for
+            // as long as the outage lasts. The spawn is routine; what it came
+            // to is reported by `peer.stream.*`, on the edge.
+            .periodic();
+        let agent = crate::peers::apply_dial_agent(&mut command);
+        let mut child = command
             .spawn_traced()
             .map_err(|err| format!("ssh spawn failed: {err}"))?;
+
+        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let (stderr_done_tx, stderr_done) = std::sync::mpsc::channel::<()>();
+        if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&stderr_tail);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let Ok(mut tail) = tail.lock() else {
+                        break;
+                    };
+                    // Bounded twice: lines kept, and each line's length, so a
+                    // chatty or hostile far side cannot grow this.
+                    let line: String = line
+                        .chars()
+                        .take(crate::process::MAX_STDERR_LOG_CHARS)
+                        .collect();
+                    tail.push_back(line);
+                    while tail.len() > crate::process::STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                }
+                drop(stderr_done_tx);
+            });
+        }
 
         let stdin = child.stdin.take().ok_or("ssh stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("ssh stdout unavailable")?;
@@ -246,7 +289,36 @@ impl PeerStream {
             lines,
             next_id: 0,
             latest_push,
+            stderr_tail,
+            stderr_done,
+            agent,
         })
+    }
+
+    /// Explain a failed request from what ssh said on the way out.
+    ///
+    /// Returns the one-line detail (ssh's last stderr line, attributed to a
+    /// dead agent where that is the cause) and the bounded tail for the log.
+    /// A connection that went away waits briefly for stderr to drain; a
+    /// wedged one does not, since ssh is still running and has said nothing.
+    fn explain(&self, err: &str) -> (String, Option<String>) {
+        if !err.starts_with(WEDGED) {
+            let _ = self.stderr_done.recv_timeout(STDERR_SETTLE);
+        }
+        let lines: Vec<String> = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default();
+        let tail = crate::process::shape_stderr_tail(lines.join("\n").as_bytes());
+        let detail = match lines.iter().rev().find(|line| !line.trim().is_empty()) {
+            Some(last) => crate::peers::attribute_dial_failure(
+                crate::report::redact::mask_credentials(last.trim()),
+                &self.agent,
+            ),
+            None => err.to_string(),
+        };
+        (detail, tail)
     }
 
     /// Send one API request, return its response line.
@@ -261,7 +333,7 @@ impl PeerStream {
             match self.lines.try_recv() {
                 Ok(_) => continue,
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err("connection closed".into()),
+                Err(TryRecvError::Disconnected) => return Err(CONNECTION_CLOSED.into()),
             }
         }
 
@@ -279,13 +351,20 @@ impl PeerStream {
         match self.lines.recv_timeout(REQUEST_TIMEOUT) {
             Ok(line) => Ok(line),
             Err(RecvTimeoutError::Timeout) => Err(format!(
-                "no response in {}s — peer relay wedged",
+                "{WEDGED} in {}s — peer relay wedged",
                 REQUEST_TIMEOUT.as_secs()
             )),
-            Err(RecvTimeoutError::Disconnected) => Err("connection closed".into()),
+            Err(RecvTimeoutError::Disconnected) => Err(CONNECTION_CLOSED.into()),
         }
     }
 }
+
+/// The error a request reports when ssh has gone away under it.
+const CONNECTION_CLOSED: &str = "connection closed";
+
+/// How a request's error starts when the connection is up but the relay never
+/// answered — the one failure where ssh has nothing on stderr to wait for.
+const WEDGED: &str = "no response";
 
 /// Where relay readers hand the frames their spokes push up: this hub's
 /// main loop (#410). Set by the poll dispatch, which already owns the sender.
@@ -385,6 +464,10 @@ struct Slot {
     /// The ssh destination this connection was opened against, so a config
     /// reload can tell "this peer moved" from "some unrelated key changed".
     target: String,
+    /// Why the last attempt to ESTABLISH a stream failed, until one succeeds
+    /// (#418). A stream that was up and later died is not recorded here: that
+    /// is an ordinary reconnect, not a peer that cannot hold a stream at all.
+    failure: Option<StreamFailure>,
 }
 
 type Registry = Mutex<HashMap<String, Arc<Mutex<Slot>>>>;
@@ -479,11 +562,18 @@ fn request_over(
         slot.stream = None;
     }
 
-    if slot.stream.is_none() {
+    let fresh = slot.stream.is_none();
+    if fresh {
         if !spawn {
             return Err("no held connection".into());
         }
-        slot.stream = Some(PeerStream::spawn(peer)?);
+        match PeerStream::spawn(peer) {
+            Ok(stream) => slot.stream = Some(stream),
+            Err(err) => {
+                record_establish_failure(&mut slot, &peer.name, &err, None, Duration::ZERO);
+                return Err(err);
+            }
+        }
         slot.target = peer.ssh_target().to_string();
     }
 
@@ -491,8 +581,18 @@ fn request_over(
         return Err("no connection".into());
     };
     match stream.request(method, params) {
-        Ok(response) => Ok(response),
+        Ok(response) => {
+            if fresh {
+                let down_secs = slot
+                    .failure
+                    .take()
+                    .map(|failure| failure.since.elapsed().as_secs());
+                crate::logging::peer_stream_established(&peer.name, down_secs);
+            }
+            Ok(response)
+        }
         Err(err) => {
+            let (detail, tail) = stream.explain(&err);
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
             slot.stream = None;
@@ -507,10 +607,70 @@ fn request_over(
             if spawn {
                 slot.retry_after = Some(std::time::Instant::now() + backoff);
             }
-            crate::logging::peer_stream_closed(&peer.name, &err, backoff.as_secs());
-            Err(err)
+            if fresh {
+                record_establish_failure(&mut slot, &peer.name, &detail, tail.as_deref(), backoff);
+            } else {
+                crate::logging::peer_stream_closed(&peer.name, &detail, backoff.as_secs());
+            }
+            Err(detail)
         }
     }
+}
+
+/// Record, and report on the edge, that a stream could not be established.
+///
+/// WARN when the reason is new — the first failure, or a different kind of
+/// broken than last time — and DEBUG while it is the same, because a peer
+/// whose stream is down is re-dialled every backoff for as long as the outage
+/// lasts and one line per attempt is the fire hose #318 removed. The ongoing
+/// state is not lost by going quiet: it is on the peer's row and in
+/// `flk peers`, via [`establish_failure`].
+fn record_establish_failure(
+    slot: &mut Slot,
+    peer: &str,
+    detail: &str,
+    stderr_tail: Option<&str>,
+    backoff: Duration,
+) {
+    let reason = crate::peers::SshFailureReason::classify(detail);
+    let changed = slot.failure.as_ref().map(|failure| failure.reason) != Some(reason);
+    match slot.failure.as_mut() {
+        Some(failure) if !changed => failure.detail = detail.to_string(),
+        _ => {
+            slot.failure = Some(StreamFailure {
+                reason,
+                detail: detail.to_string(),
+                since: std::time::Instant::now(),
+            })
+        }
+    }
+    crate::logging::peer_stream_unavailable(
+        peer,
+        reason.as_str(),
+        detail,
+        stderr_tail.unwrap_or(""),
+        backoff.as_secs(),
+        changed,
+    );
+}
+
+/// Why `peer` has no held stream, if the last attempt to establish one failed
+/// and none has succeeded since (#418). `None` for a peer holding a stream,
+/// one never tried, and one that only ever used the one-shot path.
+pub fn establish_failure(peer: &PeerConfig) -> Option<String> {
+    let slot = {
+        let registry = registry().lock().ok()?;
+        Arc::clone(registry.get(&peer.name)?)
+    };
+    // A blocking lock, not `try_lock`: this runs on the poll's own worker
+    // thread, never the main loop, and a request in flight (an uplink answer,
+    // say) would otherwise read as "no failure" and blank the peer's row for
+    // a poll. Poison is recovered like `request_over` does.
+    let slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.failure.as_ref().map(|failure| failure.detail.clone())
 }
 
 /// How old a pushed summary may be and still answer a poll (#4).
@@ -603,6 +763,59 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// #418 with a real ssh: a relay stream that cannot be established says
+    /// why — ssh's own words, classified — instead of falling back in
+    /// silence, and the reason stays readable for the peer's row until a
+    /// stream is held. Before this the relay's stderr went to /dev/null and
+    /// the error was a bare "connection closed".
+    #[test]
+    fn a_stream_that_cannot_be_established_says_why() {
+        let target = PeerConfig {
+            name: "flk418-stream".into(),
+            ssh: "nobody@flk-418-no-such-host.invalid".into(),
+            ..Default::default()
+        };
+        let mut outcome = None;
+        let logs = crate::logging::capture_logs(|| {
+            outcome = Some(request(&target, "peers.summary", serde_json::json!({})));
+        });
+        let err = outcome
+            .expect("ran")
+            .expect_err("an .invalid host holds no stream");
+        if err.starts_with("ssh spawn failed") {
+            // No ssh client on this runner: nothing real to observe.
+            return;
+        }
+        assert_eq!(
+            crate::peers::SshFailureReason::classify(&err),
+            crate::peers::SshFailureReason::UnknownHost,
+            "{err}"
+        );
+        assert!(
+            logs.contains("peer.stream.unavailable")
+                && logs.contains("WARN")
+                && logs.contains("reason=\"unknown_host\""),
+            "{logs}"
+        );
+        assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
+    }
+
+    /// The same establish failure on every backoff is one WARN, not one per
+    /// attempt; a different reason is news again.
+    #[test]
+    fn a_repeated_establish_failure_warns_once_per_reason() {
+        let mut slot = Slot::default();
+        let attempt = |slot: &mut Slot, detail: &str| {
+            crate::logging::capture_logs(|| {
+                record_establish_failure(slot, "p", detail, None, RECONNECT_BACKOFF);
+            })
+        };
+        let refused = "ssh: connect to host p port 22: Connection refused";
+        assert!(attempt(&mut slot, refused).contains("WARN"));
+        assert!(!attempt(&mut slot, refused).contains("WARN"));
+        assert!(attempt(&mut slot, "Permission denied (publickey).").contains("WARN"));
     }
 
     /// A response must never be mistaken for a push just because the peer's
