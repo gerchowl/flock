@@ -2177,6 +2177,10 @@ impl HeadlessServer {
                 // why, instead of stranding at a shell.
                 if !direct_attach_requested {
                     if let Some(notice) = notice.filter(|n| !n.is_empty()) {
+                        // A failed switch or a lost connection also goes on
+                        // that host's row and into the notification log
+                        // (#420): the top-right notice is gone in seconds.
+                        self.app.note_fleet_failure_notice(&notice);
                         self.app.show_action_notice(notice);
                     }
                 }
@@ -3327,6 +3331,9 @@ impl HeadlessServer {
                 if !leaving.is_some_and(|id| self.another_app_client_paints(id)) {
                     self.app.clear_action_notice();
                 }
+                // Trying the host again retires its last failure (#420); a
+                // new one comes back with the fallback notice if it fails.
+                self.app.state.switch_failures.remove(&prepared.ssh_target);
                 self.send_to_foreground_client(ServerMessage::SwitchServer {
                     ssh_target: prepared.ssh_target,
                     fleet: prepared.fleet,
@@ -4367,6 +4374,44 @@ mod tests {
             Some("switch to sage failed: connection refused"),
             "the launcher's failed-switch notice must render top-right"
         );
+    }
+
+    /// #420: a switch that fails for good lands its classified reason on that
+    /// host's servers-band row and in the operator notification log, not only
+    /// in the top-right notice that is gone in seconds.
+    #[test]
+    fn a_failed_switch_notice_marks_the_row_and_files_a_notification() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            fleet: None,
+            host_theme: None,
+            notice: Some("switch to lars@sage failed: auth refused".to_string()),
+            writer,
+        }));
+
+        assert_eq!(
+            server.app.state.switch_failures.get("lars@sage"),
+            Some(&crate::peers::SshFailureReason::AuthRefused),
+            "the reason goes on that host's row"
+        );
+        let filed: Vec<_> = server.app.state.notifications.newest_first().collect();
+        assert_eq!(filed.len(), 1, "one notification filed");
+        assert_eq!(filed[0].title, "switch to lars@sage failed: auth refused");
+        assert_eq!(
+            filed[0].source,
+            crate::api::schema::NotificationSource::Fleet
+        );
+        assert!(!filed[0].seen);
     }
 
     /// A direct terminal attach is not an app leg — it must never raise the

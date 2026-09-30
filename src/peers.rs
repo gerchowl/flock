@@ -1350,6 +1350,23 @@ impl SshFailureReason {
         .find(|reason| reason.as_str() == token)
     }
 
+    /// The reason whose [`Self::describe`] is exactly `text`, if any. Reads a
+    /// classified reason back out of a notice (#420).
+    pub fn from_description(text: &str) -> Option<Self> {
+        [
+            Self::ConnectRefused,
+            Self::AuthRefused,
+            Self::AgentUnreachable,
+            Self::HostKey,
+            Self::Timeout,
+            Self::JumpHopRefused,
+            Self::UnknownHost,
+            Self::NoFlk,
+        ]
+        .into_iter()
+        .find(|reason| reason.describe() == text.trim())
+    }
+
     /// Short human phrase, for messages and the servers band.
     pub fn describe(self) -> &'static str {
         match self {
@@ -1362,6 +1379,85 @@ impl SshFailureReason {
             Self::UnknownHost => "unknown host",
             Self::NoFlk => "no flk on the far side",
             Self::Other => "ssh failed",
+        }
+    }
+}
+
+/// The words an operator sees for a failure `detail` (#420): the classified
+/// reason when ssh's text says which kind of broken it is, otherwise the first
+/// line of flock's own error. Raw ssh stderr is for the log, not the screen.
+pub fn failure_text(detail: &str) -> String {
+    match SshFailureReason::classify(detail) {
+        SshFailureReason::Other => {
+            let first = detail.lines().next().unwrap_or(detail).trim();
+            if first.is_empty() {
+                "connection failed".to_string()
+            } else {
+                first.to_string()
+            }
+        }
+        reason => reason.describe().to_string(),
+    }
+}
+
+/// A fleet transport failure the launcher hands the leg it falls back to, as
+/// the attach `notice` (#63, #420). One format, written by the launcher and
+/// read back by the server, so the server can put the reason on that host's
+/// row and file it in the operator's notification log (ADR-0016) — the notice
+/// itself stays plain text, so an older server still shows it as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetFailureNotice {
+    /// A switch to `target` never established.
+    SwitchFailed { target: String, reason: String },
+    /// An established leg to `target` dropped and gave up reconnecting.
+    ConnectionLost { target: String },
+}
+
+const SWITCH_FAILED_PREFIX: &str = "switch to ";
+const SWITCH_FAILED_INFIX: &str = " failed: ";
+const CONNECTION_LOST_PREFIX: &str = "lost connection to ";
+
+impl FleetFailureNotice {
+    pub fn parse(notice: &str) -> Option<Self> {
+        if let Some(target) = notice.strip_prefix(CONNECTION_LOST_PREFIX) {
+            let target = target.trim();
+            return (!target.is_empty()).then(|| Self::ConnectionLost {
+                target: target.to_string(),
+            });
+        }
+        let rest = notice.strip_prefix(SWITCH_FAILED_PREFIX)?;
+        let (target, reason) = rest.split_once(SWITCH_FAILED_INFIX)?;
+        (!target.is_empty()).then(|| Self::SwitchFailed {
+            target: target.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    pub fn target(&self) -> &str {
+        match self {
+            Self::SwitchFailed { target, .. } | Self::ConnectionLost { target } => target,
+        }
+    }
+
+    /// The classified reason, when the notice names one.
+    pub fn reason(&self) -> Option<SshFailureReason> {
+        match self {
+            Self::SwitchFailed { reason, .. } => SshFailureReason::from_description(reason),
+            Self::ConnectionLost { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FleetFailureNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SwitchFailed { target, reason } => {
+                write!(
+                    f,
+                    "{SWITCH_FAILED_PREFIX}{target}{SWITCH_FAILED_INFIX}{reason}"
+                )
+            }
+            Self::ConnectionLost { target } => write!(f, "{CONNECTION_LOST_PREFIX}{target}"),
         }
     }
 }
@@ -1719,6 +1815,47 @@ mod tests {
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
         }
+    }
+
+    #[test]
+    fn a_fleet_failure_notice_reads_back_what_the_launcher_wrote() {
+        let failed = FleetFailureNotice::SwitchFailed {
+            target: "lars@sage".to_string(),
+            reason: SshFailureReason::HostKey.describe().to_string(),
+        };
+        let text = failed.to_string();
+        assert_eq!(text, "switch to lars@sage failed: host key rejected");
+        let parsed = FleetFailureNotice::parse(&text).expect("parses");
+        assert_eq!(parsed, failed);
+        assert_eq!(parsed.reason(), Some(SshFailureReason::HostKey));
+
+        let lost = FleetFailureNotice::ConnectionLost {
+            target: "sage".to_string(),
+        };
+        assert_eq!(FleetFailureNotice::parse(&lost.to_string()), Some(lost));
+        // A reason that is flock's own words still files, with no row reason.
+        let own =
+            FleetFailureNotice::parse("switch to sage failed: matching remote flock not installed")
+                .expect("parses");
+        assert_eq!(own.reason(), None);
+        assert_eq!(FleetFailureNotice::parse("already home"), None);
+    }
+
+    #[test]
+    fn failure_text_says_the_kind_of_broken_not_ssh_stderr() {
+        assert_eq!(
+            failure_text("ssh: connect to host sage port 22: Connection refused"),
+            "connection refused"
+        );
+        assert_eq!(
+            failure_text("lars@sage: Permission denied (publickey)."),
+            "auth refused"
+        );
+        assert_eq!(
+            failure_text("matching remote flock 0.6.8 is not installed\nrun it interactively"),
+            "matching remote flock 0.6.8 is not installed"
+        );
+        assert_eq!(failure_text("  "), "connection failed");
     }
 
     #[test]

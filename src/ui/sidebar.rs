@@ -2023,7 +2023,14 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 let Some(peer) = app.peer_summaries.get(peer_idx) else {
                     continue;
                 };
-                peer_server_rows(peer, p, app.server_label)
+                let mut build = peer_server_rows(peer, p, app.server_label);
+                push_switch_failure(
+                    &mut build,
+                    app.switch_failures.get(&peer.ssh_target).copied(),
+                    peer.shown_failure_reason(),
+                    p,
+                );
+                build
             }
             Some(crate::app::state::PeerSwitchRequest::RelayedPeer { ref host_key, .. }) => {
                 // A two-hop peer, known to us only because one of our peers
@@ -2036,6 +2043,12 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                     continue;
                 };
                 let mut build = peer_server_rows(&entry.peer, p, app.server_label);
+                push_switch_failure(
+                    &mut build,
+                    app.switch_failures.get(&entry.peer.ssh_target).copied(),
+                    entry.peer.shown_failure_reason(),
+                    p,
+                );
                 // Leading, not trailing: the band is narrow, and the latency
                 // after it is the relayer's measurement, not ours — the less
                 // important of the two to lose to truncation.
@@ -2581,6 +2594,28 @@ fn peer_server_rows(
         tally: Some(peer_tally(peer)),
         ghosted: false,
     }
+}
+
+/// Say on a host's row why the last switch to it failed (#420), unless the
+/// row already names that same reason from its polls.
+fn push_switch_failure(
+    build: &mut ServerRowBuild,
+    switch_failure: Option<crate::peers::SshFailureReason>,
+    already_shown: Option<crate::peers::SshFailureReason>,
+    p: &crate::app::state::Palette,
+) {
+    let Some(reason) = switch_failure.filter(|reason| Some(*reason) != already_shown) else {
+        return;
+    };
+    // Leading: the band is narrow, and the latency after it is the less
+    // important of the two to lose to truncation.
+    build.title_rest.insert(
+        0,
+        Span::styled(
+            format!("\u{f0026} {} ", reason.describe()), // nf-md-alert
+            Style::default().fg(p.red),
+        ),
+    );
 }
 
 /// A server row's metric line in the band's fixed-width glyph language:

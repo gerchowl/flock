@@ -1248,6 +1248,11 @@ pub struct RemoteConfig {
     /// How often a redial rechecks for the server within
     /// `reattach_grace_ms`. Default: 100 ms.
     pub reattach_poll_ms: u64,
+    /// How long a failed bridge connection waits, after its ssh exits, for the
+    /// rest of ssh's stderr (#420): the classified reason is read from it. A
+    /// ProxyJump helper can hold the pipe open far longer, so this is a bound,
+    /// not a join. Default: 200 ms.
+    pub bridge_stderr_settle_ms: u64,
 }
 
 impl Default for RemoteConfig {
@@ -1260,6 +1265,7 @@ impl Default for RemoteConfig {
             reconnect_deadline_secs: 120,
             reattach_grace_ms: 1_500,
             reattach_poll_ms: 100,
+            bridge_stderr_settle_ms: 200,
         }
     }
 }

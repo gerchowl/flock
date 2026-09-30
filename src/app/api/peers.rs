@@ -528,6 +528,36 @@ pub(crate) struct PreparedServerSwitch {
 }
 
 impl App {
+    /// Record a fleet failure the launcher handed back in the attach notice
+    /// (#420): a switch that never established, or a remote session that gave
+    /// up reconnecting. The reason goes on that host's servers-band row, and
+    /// the notice into the operator's notification log (ADR-0016), where it
+    /// outlives the few seconds the top-right notice is up. Notices of any
+    /// other shape are left to the action notice alone.
+    pub(crate) fn note_fleet_failure_notice(&mut self, notice: &str) {
+        let Some(failure) = crate::peers::FleetFailureNotice::parse(notice) else {
+            return;
+        };
+        if let Some(reason) = failure.reason() {
+            self.state
+                .switch_failures
+                .insert(failure.target().to_string(), reason);
+        }
+        self.state
+            .file_notification(crate::app::notifications::NotificationEntry {
+                id: crate::app::notifications::mint_notification_id(),
+                title: notice.to_string(),
+                body: None,
+                kind: crate::api::schema::NotificationRecordKind::Notice,
+                source: crate::api::schema::NotificationSource::Fleet,
+                workspace_id: None,
+                pane_id: None,
+                origin_host: crate::app::short_host_name(),
+                filed_at_ms: crate::app::notifications::now_ms(),
+                seen: false,
+            });
+    }
+
     /// Resolve a server-switch request from the sidebar or the switch_home
     /// keybind into the SwitchServer payload. Returns None when the request
     /// no longer resolves (rows changed) — or for Home without an origin.

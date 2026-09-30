@@ -380,6 +380,9 @@ pub enum NotificationSource {
     AgentState,
     /// An explicit `notification.show` request.
     Api,
+    /// A fleet transport failure: a server switch that never established, or
+    /// a remote session that lost its connection and gave up (#420).
+    Fleet,
 }
 
 /// `notification.list` (#372 / ADR-0016). Reads the operator's filed
