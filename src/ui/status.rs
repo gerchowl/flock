@@ -508,16 +508,24 @@ pub(super) fn mem_percent(used: u64, total: u64) -> f32 {
     }
 }
 
+/// The dim italic a reading takes once it is no longer live: a ghost peer's
+/// last system block, or this machine's sample past its freshness window.
+pub(super) fn stale_reading_style(p: &crate::app::state::Palette) -> Style {
+    Style::default()
+        .fg(p.overlay0)
+        .add_modifier(Modifier::ITALIC)
+}
+
 /// One-line machine HUD: cpu · mem · disk · battery · net · gpu. Metrics the
 /// sampler could not read are omitted. Utilization colors shift at 60/85%.
 ///
 /// Once the sampler thread stops delivering (dies, wedges), the last snapshot
 /// on AppState would otherwise be rendered indefinitely as if it were now —
 /// the `src/peers.rs:196` "unbounded confident lie" failure mode, on the
-/// most-glanced surface in the app. [`AppState::system_stats_fresh_at`]
-/// hides the snapshot once it is older than three sample intervals; here we
-/// render a dim `–` placeholder in its place so the line stops asserting
-/// values it no longer has.
+/// most-glanced surface in the app. Past three sample intervals
+/// ([`AppState::system_stats_reading_at`]) the line keeps the last values but
+/// restyles them in the ghost tint the self row and peer rows use (#435), so
+/// one slow sample never blanks it and a frozen reading never passes for live.
 pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, area: Rect) {
     if area.height == 0 || area.width < 10 {
         return;
@@ -531,17 +539,12 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
     // every pane (#262/#265); freshness gets a single `Instant::now()` and
     // that same `now` gates every metric below.
     let now = std::time::Instant::now();
-    let Some(stats) = app.system_stats_fresh_at(now) else {
-        // Two failure modes render the same fallback text but distinct
-        // messages: never-sampled is the sampler still warming up; stale is
-        // the sampler no longer answering. Both refuse to render numbers,
-        // which is the whole point.
-        let message = if app.system_stats_at.is_none() {
-            " gathering system stats\u{2026}"
-        } else {
-            " \u{2013}"
-        };
-        frame.render_widget(Paragraph::new(Span::styled(message, dim)), area);
+    let Some((stats, fresh)) = app.system_stats_reading_at(now) else {
+        // Never sampled: the sampler is still warming up.
+        frame.render_widget(
+            Paragraph::new(Span::styled(" gathering system stats\u{2026}", dim)),
+            area,
+        );
         return;
     };
 
@@ -612,6 +615,11 @@ pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, 
 
     if spans.is_empty() {
         return;
+    }
+    if !fresh {
+        for span in &mut spans {
+            span.style = stale_reading_style(p);
+        }
     }
     spans.insert(0, Span::styled(" ".to_string(), dim));
     frame.render_widget(
@@ -698,9 +706,28 @@ mod tests {
             .to_string()
     }
 
+    fn status_cells(
+        app: &crate::app::AppState,
+        width: u16,
+    ) -> Vec<(String, ratatui::style::Color, Modifier)> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let area = Rect::new(0, 0, width, 1);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("test terminal");
+        terminal
+            .draw(|frame| render_status_line(app, frame, area))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .map(|x| {
+                let cell = &buffer[(x, 0)];
+                (cell.symbol().to_string(), cell.fg, cell.modifier)
+            })
+            .collect()
+    }
+
     /// A fresh sample renders its numbers: the sampler is alive, so the
     /// user sees the machine's real CPU/memory reading. Pairs with
-    /// [`status_line_replaces_values_with_dash_once_sample_is_stale`] — the
+    /// [`status_line_dims_last_values_once_sample_is_stale`] — the
     /// two together prove the freshness gate is what changes the output,
     /// not some ambient breakage.
     #[test]
@@ -725,12 +752,12 @@ mod tests {
         assert!(rendered.contains("mba22"), "{rendered}");
     }
 
-    /// The behaviour this whole change exists to protect: once the sampler
-    /// thread stops delivering, the last snapshot is not rendered as if it
-    /// were current. The status line drops the numbers and shows a neutral
-    /// placeholder — the `src/peers.rs:196` doctrine applied here.
+    /// Once the sampler stops delivering, the last snapshot is not rendered
+    /// as if it were current, and one slow sample does not blank the line
+    /// either (#435): the values stay, all in the ghost tint the self row
+    /// uses — the `src/peers.rs:196` doctrine applied here.
     #[test]
-    fn status_line_replaces_values_with_dash_once_sample_is_stale() {
+    fn status_line_dims_last_values_once_sample_is_stale() {
         use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
         const G: u64 = 1024 * 1024 * 1024;
         let mut app = crate::app::state::AppState::test_new();
@@ -741,23 +768,23 @@ mod tests {
             mem_total: Some(16 * G),
             ..Default::default()
         });
-        // Past the 3× SAMPLE_INTERVAL freshness ceiling: the sampler is
-        // presumed dead. Backdated an extra second so the check clears the
-        // boundary regardless of wall-clock drift in this test.
+        // Past the 3× SAMPLE_INTERVAL freshness ceiling. Backdated an extra
+        // second so the check clears the boundary regardless of drift.
         app.system_stats_at = Some(
             std::time::Instant::now() - 3 * SAMPLE_INTERVAL - std::time::Duration::from_secs(1),
         );
 
         let rendered = render_status_to_string(&app, 80);
-        assert!(
-            rendered.contains('\u{2013}'),
-            "expected en-dash placeholder, got {rendered:?}"
-        );
-        // No metric value from the stale snapshot may bleed through — that
-        // would be the exact "unbounded confident lie" this guards against.
-        assert!(!rendered.contains("42%"), "{rendered:?}");
-        assert!(!rendered.contains("13G/16G"), "{rendered:?}");
-        assert!(!rendered.contains("mba22"), "{rendered:?}");
+        assert!(rendered.contains("42%"), "{rendered:?}");
+        assert!(rendered.contains("13G/16G"), "{rendered:?}");
+        assert!(rendered.contains("mba22"), "{rendered:?}");
+        let stale = stale_reading_style(&app.palette);
+        for (x, (symbol, fg, modifier)) in status_cells(&app, 80).into_iter().enumerate() {
+            if !symbol.trim().is_empty() {
+                assert_eq!(Some(fg), stale.fg, "cell {x} {symbol:?} kept a live color");
+                assert!(modifier.contains(Modifier::ITALIC), "cell {x} {symbol:?}");
+            }
+        }
     }
 
     /// The "gathering…" fallback still fires before any sample lands, so

@@ -1923,10 +1923,9 @@ pub(crate) fn server_band_slot_at(
 fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
     // One clock read per frame for the whole band. `self_server_rows`
-    // reads through `AppState::system_stats_fresh_at(now)` so a dead
-    // sampler thread stops leaving the self row rendering a frozen
-    // CPU/mem/battery reading next to PEER rows whose staleness IS
-    // handled — the `src/peers.rs:196` doctrine, applied here.
+    // reads through `AppState::system_stats_reading_at(now)` so a dead
+    // sampler thread leaves the self row's last reading dimmed, the way
+    // PEER rows show theirs — the `src/peers.rs:196` doctrine, applied here.
     let now = std::time::Instant::now();
     // #96: the header down-count is the ONE sidebar consumer that has
     // AppState reach and therefore the live [gossip] thresholds. The shared
@@ -2287,12 +2286,12 @@ fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
 
     let mut title_rest: Vec<Span<'static>> = Vec::new();
     let mut health: Vec<Span<'static>> = Vec::new();
-    // Freshness gate shared with the status line (`AppState::system_stats_fresh_at`).
-    // Past 3× SAMPLE_INTERVAL the snapshot is treated as gone: title_rest
-    // and health stay empty, so the self row falls back to the hostname
-    // alone. That reads as "no reading" next to the peer rows in the same
-    // band, rather than a confident-looking frozen number.
-    if let Some(stats) = app.system_stats_fresh_at(now) {
+    // Freshness gate shared with the status line
+    // (`AppState::system_stats_reading_at`). Past 3× SAMPLE_INTERVAL the last
+    // reading stays, restyled in the ghost-row tint peer rows use (#435): one
+    // slow sample must not blank the row, and a dimmed number does not pass
+    // for a live one. Only a machine never sampled shows the hostname alone.
+    if let Some((stats, fresh)) = app.system_stats_reading_at(now) {
         if let Some(percent) = stats.battery_percent {
             title_rest.push(Span::styled(
                 battery_icon(percent, stats.battery_charging).to_string(),
@@ -2317,6 +2316,11 @@ fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
             stats.thermal.as_ref(),
             p,
         );
+        if !fresh {
+            for span in title_rest.iter_mut().chain(health.iter_mut()) {
+                span.style = super::status::stale_reading_style(p);
+            }
+        }
     }
     ServerRowBuild {
         name,
@@ -2513,9 +2517,7 @@ fn peer_server_rows(
             // dim restyle deliberately flattens any thermal tint too (#291).
             // A stale reading from a node we cannot reach is not a live alarm.
             for span in &mut health {
-                span.style = Style::default()
-                    .fg(p.overlay0)
-                    .add_modifier(Modifier::ITALIC);
+                span.style = super::status::stale_reading_style(p);
             }
         }
         return ServerRowBuild {
@@ -4292,16 +4294,11 @@ mod tests {
         assert!(!health.contains("\u{f08ae}"), "{health}");
     }
 
-    /// The behaviour this change exists to protect on the servers band:
-    /// once the sampler thread stops delivering, the self row does not keep
-    /// rendering its last CPU / memory / battery / net glyphs. It falls back
-    /// to the hostname alone — matching how a peer that stopped answering
-    /// reads in the same band. Frozen self row next to freshness-aware peer
-    /// rows was the specific misleading surface the sidebar-only path let
-    /// through, so this test asserts the numbers are GONE, not that they
-    /// merely differ.
+    /// #435: one slow sample must not blank the servers band's own row. Past
+    /// the freshness window the last reading stays, restyled in the ghost
+    /// tint peer rows use, so it neither vanishes nor passes for live.
     #[test]
-    fn self_server_row_hides_health_once_sample_is_stale() {
+    fn self_server_row_dims_last_reading_once_sample_is_stale() {
         use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
         const G: u64 = 1024 * 1024 * 1024;
         let mut app = crate::app::state::AppState::test_new();
@@ -4323,19 +4320,27 @@ mod tests {
         let row = self_server_rows(&app, std::time::Instant::now());
         let rest = spans_text(&row.title_rest);
         let health = line_text(&row.health);
-        // No battery glyph, no net glyph — those are the frozen-looking
-        // indicators next to peer rows that make the self row read as
-        // authoritative when it is not.
-        assert!(row.title_rest.is_empty(), "{rest}");
-        // No cpu/mem/gpu number, no health glyphs at all.
-        assert!(health.is_empty(), "{health}");
-        assert!(!health.contains("42%"), "{health}");
-        assert!(!health.contains("13G/16G"), "{health}");
+        assert!(rest.contains('\u{f0079}'), "{rest}");
+        assert!(health.contains("42%"), "{health}");
+        assert!(health.contains("13G/16G"), "{health}");
+        let stale = super::super::status::stale_reading_style(&app.palette);
+        for span in row.title_rest.iter().chain(row.health.spans.iter()) {
+            assert_eq!(span.style, stale, "{:?} kept a live style", span.content);
+        }
     }
 
-    /// Pairs with `self_server_row_hides_health_once_sample_is_stale`: proves
-    /// the gate returns the values once a fresh stamp is present, so the
-    /// difference between the two tests is exactly the age of the sample.
+    /// Only a machine never sampled shows the hostname alone.
+    #[test]
+    fn self_server_row_is_bare_before_the_first_sample() {
+        let app = crate::app::state::AppState::test_new();
+        let row = self_server_rows(&app, std::time::Instant::now());
+        assert!(row.title_rest.is_empty(), "{}", spans_text(&row.title_rest));
+        assert!(row.health.spans.is_empty(), "{}", line_text(&row.health));
+    }
+
+    /// Pairs with `self_server_row_dims_last_reading_once_sample_is_stale`:
+    /// a fresh stamp keeps the live styles, so the difference between the
+    /// two tests is exactly the age of the sample.
     #[test]
     fn self_server_row_shows_health_when_sample_is_fresh() {
         use crate::system_stats::{SystemStats, SAMPLE_INTERVAL};
