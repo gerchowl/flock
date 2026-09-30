@@ -4384,6 +4384,137 @@ sidebar_pane_gap = 99
         assert_eq!(focus_names(&app), ("w0".to_string(), "w2".to_string()));
     }
 
+    /// The last shell in `ws_idx` exits (#429).
+    fn shell_exit(app: &mut App, ws_idx: usize) {
+        let pane_id = app.state.workspaces[ws_idx].tabs[0].root_pane;
+        app.state.handle_app_event(AppEvent::PaneDied { pane_id });
+        app.drain_pending_ui_events();
+    }
+
+    /// Move `from`'s only pane into `to`'s first tab, focus left alone (#429).
+    fn pane_move_request(app: &mut App, from: usize, to: usize) -> serde_json::Value {
+        let pane = app.state.workspaces[from].tabs[0].root_pane;
+        let pane_id = app.pane_info(from, pane).unwrap().pane_id;
+        let tab_id = app.public_tab_id(to, 0).unwrap();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_move_429".into(),
+            method: crate::api::schema::Method::PaneMove(crate::api::schema::PaneMoveParams {
+                pane_id,
+                destination: crate::api::schema::PaneMoveDestination::Tab {
+                    tab_id,
+                    target_pane_id: None,
+                    split: crate::api::schema::SplitDirection::Right,
+                    ratio: None,
+                },
+                focus: false,
+            }),
+        });
+        serde_json::from_str(&response).unwrap()
+    }
+
+    fn workspace_closed_count(app: &App, workspace_id: &str) -> usize {
+        app.event_hub
+            .events_after(0)
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    &event.data,
+                    crate::api::schema::EventData::WorkspaceClosed { workspace_id: id }
+                        if id == workspace_id
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn shell_exit_emptying_a_lower_background_workspace_leaves_the_operator_in_place() {
+        // #429: `w0`'s last shell exits. It is a LOWER index than both the
+        // operator's active `w3` and their sidebar cursor on `w2`.
+        let mut app = app_with_spaces_419(&["", "", "", ""]);
+        app.state.active = Some(3);
+        app.state.selected = 2;
+        let closed_id = app.state.workspaces[0].id.clone();
+
+        shell_exit(&mut app, 0);
+
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(focus_names(&app), ("w3".to_string(), "w2".to_string()));
+        assert_eq!(workspace_closed_count(&app, &closed_id), 1);
+    }
+
+    #[test]
+    fn pane_move_emptying_a_lower_background_workspace_leaves_the_operator_in_place() {
+        // #429: `w0`'s only pane moves into `w1`, emptying `w0`.
+        let mut app = app_with_spaces_419(&["", "", "", ""]);
+        app.state.active = Some(3);
+        app.state.selected = 2;
+        let closed_id = app.state.workspaces[0].id.clone();
+        let moved_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let moved_terminal = app.state.terminal_id_for_pane(0, moved_pane).unwrap();
+
+        let response = pane_move_request(&mut app, 0, 1);
+
+        assert_eq!(response["result"]["type"], "pane_move");
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(app.state.workspaces[0].display_name(), "w1");
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 2);
+        assert_eq!(focus_names(&app), ("w3".to_string(), "w2".to_string()));
+        assert_eq!(workspace_closed_count(&app, &closed_id), 1);
+        // The source's teardown must not take the moved pane's PTY with it.
+        assert!(app.state.terminals.contains_key(&moved_terminal));
+        assert!(!app
+            .state
+            .terminal_runtime_shutdowns
+            .contains(&moved_terminal));
+    }
+
+    #[test]
+    fn shell_exit_emptying_the_active_space_lands_on_the_419_successor() {
+        // Display order is w0 w3 (space X), then w1 w2 (space Y). With no
+        // focus history, the operator's own `w3` emptying goes to its
+        // same-space sibling `w0`, not `w2`, its `Vec` neighbour.
+        let mut app = app_with_spaces_419(&["X", "Y", "Y", "X"]);
+        app.state.active = Some(3);
+        app.state.selected = 3;
+        let closed_id = app.state.workspaces[3].id.clone();
+
+        shell_exit(&mut app, 3);
+
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(focus_names(&app), ("w0".to_string(), "w0".to_string()));
+        assert_eq!(workspace_closed_count(&app, &closed_id), 1);
+    }
+
+    #[test]
+    fn shell_exit_taking_the_confirm_dialogs_target_drops_the_dialog() {
+        let mut app = app_with_spaces_419(&["", "", ""]);
+        app.state.active = Some(0);
+        app.state.selected = 2;
+        app.state.confirm_close_target = Some(app.state.workspaces[1].id.clone());
+        app.state.mode = Mode::ConfirmClose;
+
+        shell_exit(&mut app, 1);
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.state.confirm_close_target, None);
+        assert_eq!(focus_names(&app), ("w0".to_string(), "w2".to_string()));
+    }
+
+    #[test]
+    fn pane_move_taking_the_confirm_dialogs_target_drops_the_dialog() {
+        let mut app = app_with_spaces_419(&["", "", ""]);
+        app.state.active = Some(0);
+        app.state.selected = 2;
+        app.state.confirm_close_target = Some(app.state.workspaces[1].id.clone());
+        app.state.mode = Mode::ConfirmClose;
+
+        pane_move_request(&mut app, 1, 0);
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.state.confirm_close_target, None);
+        assert_eq!(focus_names(&app), ("w0".to_string(), "w2".to_string()));
+    }
+
     #[test]
     fn keyboard_and_socket_close_of_the_active_space_land_on_the_same_workspace() {
         // #419: one focus rule for every door. `w3` is active and the
