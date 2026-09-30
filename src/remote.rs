@@ -1787,12 +1787,13 @@ impl Drop for SshStdioBridge {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
         let _ = std::fs::remove_file(&self.local_socket);
-        // Unblock the accept thread if it is parked in `child.wait()` on a live
-        // tunnel: SIGKILL the ssh child so the wait returns now instead of after
-        // the ssh keepalive timeout. `should_stop` is already set, so the accept
-        // loop exits rather than dialing again (#176).
+        // Unblock every connection thread parked in `child.wait()` on a live
+        // tunnel: SIGKILL each ssh child so the waits return now instead of
+        // after the ssh keepalive timeout. `should_stop` is already set, so the
+        // accept loop exits rather than dialing again, then joins those
+        // threads (#176).
         //
-        // Teardown is thus bounded by (kill → child reap → one BRIDGE_ACCEPT_POLL
+        // Teardown is thus bounded by (kill → children reaped → one BRIDGE_ACCEPT_POLL
         // tick), not the ssh keepalive — but it is not instantaneous.
         //
         // The pid is published while the child is alive and cleared under the
@@ -2208,8 +2209,12 @@ fn bridge_connection(
         let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
+    // Never joined: a ProxyJump/ProxyCommand helper inherits this pipe and can
+    // outlive a SIGKILLed ssh by a full TCP timeout on a dead network. Waiting
+    // for EOF here would stall teardown for exactly that long, undoing #176's
+    // bounded kill. The thread ends on its own when the last writer exits.
     let stderr_target = target.to_string();
-    let stderr_log = child_stderr.map(|stderr| {
+    if let Some(stderr) = child_stderr {
         thread::spawn(move || {
             use std::io::BufRead;
             for line in io::BufReader::new(stderr).lines() {
@@ -2218,8 +2223,8 @@ fn bridge_connection(
                     crate::logging::remote_bridge_ssh_stderr(&stderr_target, line.trim_end());
                 }
             }
-        })
-    });
+        });
+    }
 
     let status = child.wait()?;
     if let Ok(mut pids) = active_child_pids.lock() {
@@ -2227,9 +2232,6 @@ fn bridge_connection(
     }
     let _ = upload.join();
     let _ = download.join();
-    if let Some(stderr_log) = stderr_log {
-        let _ = stderr_log.join();
-    }
 
     // Read AFTER the wait, never before: `Drop` sets `should_stop` and only
     // then SIGKILLs the child, so by the time this wait returns because of our
