@@ -853,11 +853,17 @@ mod tests {
             r#"
 [session]
 resume_agents_on_restore = true
+stop_transcript_wait_ms = 250
 "#,
         )
         .unwrap();
 
         assert!(loaded.config.session.resume_agents_on_restore);
+        assert_eq!(loaded.config.session.stop_transcript_wait_ms, 250);
+        assert_eq!(
+            loaded.config.session.stop_transcript_poll_ms, 50,
+            "an unset key keeps its default"
+        );
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
     }

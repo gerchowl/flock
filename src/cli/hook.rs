@@ -39,6 +39,13 @@ use crate::api::schema::{
 /// immediately with ENOENT/ECONNREFUSED, so it stays fire-and-forget.
 const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The line an agent ends its turn with; the Stop hook lifts it verbatim.
+const RECAP_SENTINEL: &str = "※ recap:";
+
+/// Floor on the Stop hook's transcript re-read interval: `[session]
+/// stop_transcript_poll_ms = 0` must not turn the wait into a busy spin.
+const MIN_TRANSCRIPT_POLL: Duration = Duration::from_millis(1);
+
 /// Harness-internal markers that arrive through the same prompt/reply pipe as
 /// real content. Dropped at the source so they never reach flock's history.
 const SYSTEM_REMINDER_PREFIXES: [&str; 8] = [
@@ -196,6 +203,23 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     } else {
         0
     };
+    // #415: an older harness hands the hook no `last_assistant_message`, so
+    // `plan_stop` has only the transcript — and the turn's final reply may not
+    // have landed there yet. Give it a bounded window here, at the IO edge,
+    // so the plan below reads what the turn actually ended with. The config
+    // is loaded only on that path: a current harness never pays for it.
+    if matches!((agent, action), (Agent::Claude, Action::Stop))
+        && harness_final_text(&input).is_none()
+    {
+        if let Some(path) = str_field(&input, "transcript_path") {
+            let session = crate::config::Config::load().config.session;
+            await_settled_transcript(
+                &path,
+                Duration::from_millis(session.stop_transcript_wait_ms),
+                Duration::from_millis(session.stop_transcript_poll_ms),
+            );
+        }
+    }
     // The account profile the session is running under (g-fleet's claude-auth):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
@@ -369,9 +393,26 @@ fn plan_stop(
     // string agent_id marks a subagent. `str_field` already rejects empty
     // strings, so an `agent_id: ""` is (correctly) not treated as a subagent.
     let is_subagent = str_field(input, "agent_id").is_some();
-    let last_assistant = str_field(input, "transcript_path")
-        .and_then(|path| last_assistant_text(&path))
-        .unwrap_or_default();
+    // The text the turn ended with. `None` means it could not be known: the
+    // transcript has not caught up with the turn yet (#415).
+    let Some(last_assistant) = final_text(input) else {
+        // Unknown is not "no sentinel". Asking for a recap here re-nudged
+        // turns that had ended with one, on nearly every turn of every
+        // session, so the recap is left alone — mail still wakes.
+        return HookOutcome {
+            stdout: mail_nudge(pending_messages, false),
+            ..HookOutcome::default()
+        };
+    };
+    // Inside a continuation a Stop hook already forced, never force another:
+    // at most one recap nudge per turn, whatever the reply looked like.
+    // The flag is also set when another plugin's Stop hook forced the
+    // continuation, and skipping flock's nudge then is intended: that turn
+    // was not the agent's own ending either.
+    let stop_hook_active = input
+        .get("stop_hook_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     let mut outcome = HookOutcome::default();
 
@@ -388,11 +429,7 @@ fn plan_stop(
     }
 
     // Lift the `※ recap:` sentinel line verbatim if present.
-    if let Some(recap) = last_assistant
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('※'))
-    {
+    if let Some(recap) = last_assistant.lines().find_map(recap_line) {
         outcome
             .reports
             .push(Method::PaneReportRecap(PaneReportRecapParams {
@@ -408,9 +445,9 @@ fn plan_stop(
     }
 
     // No sentinel: nudge for one more turn (self-heal, never user-facing).
-    // Skip when we saw no assistant text or this is a subagent, so we don't
-    // loop on nothing.
-    if !last_assistant.is_empty() && !is_subagent {
+    // Skip when we saw no assistant text, this is a subagent, or this turn is
+    // already the nudge's continuation, so we don't loop on nothing.
+    if !last_assistant.is_empty() && !is_subagent && !stop_hook_active {
         outcome.stdout = mail_nudge(pending_messages, true);
     } else {
         outcome.stdout = mail_nudge(pending_messages, false);
@@ -518,45 +555,156 @@ fn read_stdin_json() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
 }
 
-/// Walk a Claude JSONL transcript backwards for the last assistant message's
-/// text. Transcript shapes vary by version: role is on the top-level object or
-/// the nested `message` object; content is a string or a list of `text` blocks.
-fn last_assistant_text(path: &str) -> Option<String> {
+/// The final reply as the harness itself reports it on the Stop input.
+///
+/// Claude Code sends `last_assistant_message` on current versions, and it is
+/// the only source that cannot lag: the harness appends the reply to the
+/// transcript only AFTER the Stop hook returns, so a transcript read during
+/// the hook sees the message before it (#415, measured on 2.1.281). A present
+/// field is authoritative even when empty.
+fn harness_final_text(input: &serde_json::Value) -> Option<String> {
+    input
+        .get("last_assistant_message")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| text.trim().to_string())
+}
+
+/// The text the turn ended with: the harness's own field, else the transcript
+/// when it has caught up with the turn. `None` means it cannot be known.
+///
+/// A missing or unreadable transcript is `Some("")` — nothing to report and
+/// nothing to nudge about, exactly as before — and not `None`, which is kept
+/// for the one case that used to lie: a transcript that exists but lags.
+fn final_text(input: &serde_json::Value) -> Option<String> {
+    if let Some(text) = harness_final_text(input) {
+        return Some(text);
+    }
+    let Some(tail) = str_field(input, "transcript_path").and_then(|path| read_transcript(&path))
+    else {
+        return Some(String::new());
+    };
+    tail.settled
+        .then(|| tail.last_assistant.unwrap_or_default())
+}
+
+/// Re-read the transcript until the turn's final reply has landed, or the
+/// budget is spent. Returns whether it settled. The waiting half of
+/// [`final_text`]'s fallback, kept at the IO edge so `plan` never sleeps.
+///
+/// Both knobs come from config, so neither may hurt the turn: the budget is
+/// capped at the harness's own hook timeout (waiting past it only gets the
+/// hook killed, and an absurd value must not overflow `Instant`), and the
+/// poll is floored so `0` cannot busy-spin whole-file reads.
+fn await_settled_transcript(path: &str, budget: Duration, poll: Duration) -> bool {
+    let budget = budget.min(Duration::from_secs(crate::integration::CLAUDE_HOOK_TIMEOUT));
+    let poll = poll.max(MIN_TRANSCRIPT_POLL);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match read_transcript(path) {
+            None => return false,
+            Some(tail) if tail.settled => return true,
+            Some(_) => {}
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll.min(deadline - now));
+    }
+}
+
+/// The recap sentinel within one line of the reply, if the line is one.
+///
+/// Agents dress the line in markdown — bold, a list item, a quote — so the
+/// leading `**`, `- ` and `> ` are peeled (and a closing `**` with them)
+/// before matching `※ recap:` itself; any other `※` line is not a recap.
+fn recap_line(line: &str) -> Option<&str> {
+    let mut line = line.trim();
+    while let Some(rest) = ["**", "- ", "> "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+    {
+        line = rest.trim_start();
+    }
+    if !line.starts_with(RECAP_SENTINEL) {
+        return None;
+    }
+    let line = line.trim_end();
+    Some(line.strip_suffix("**").map_or(line, str::trim_end))
+}
+
+/// What a transcript read found.
+struct TranscriptTail {
+    /// Text of the newest assistant entry that has any.
+    last_assistant: Option<String>,
+    /// Whether the newest conversational entry is an assistant entry with
+    /// text. A turn always ends on an assistant reply, so a `user` entry last
+    /// — a prompt, a tool result, a Stop hook's feedback — means the reply has
+    /// not landed and `last_assistant` is the PREVIOUS message. Claude writes
+    /// each content block as its own entry, so a textless assistant entry last
+    /// (a thinking block) may be a reply whose text is still to come.
+    settled: bool,
+}
+
+fn read_transcript(path: &str) -> Option<TranscriptTail> {
     let content = std::fs::read_to_string(path).ok()?;
+    let mut settled = None;
     for line in content.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some((role, text)) = transcript_entry(line) else {
             continue;
         };
-        let message = obj.get("message").filter(|m| m.is_object());
-        let role = message
-            .and_then(|m| str_field(m, "role"))
-            .or_else(|| str_field(&obj, "role"))
-            .or_else(|| str_field(&obj, "type"));
-        if role.as_deref() != Some("assistant") {
-            continue;
-        }
-        let content = message.unwrap_or(&obj).get("content");
-        let text = match content {
-            Some(serde_json::Value::String(s)) => s.trim().to_string(),
-            Some(serde_json::Value::Array(blocks)) => blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_string(),
-            _ => String::new(),
-        };
-        if !text.is_empty() {
-            return Some(text);
+        let is_assistant = role == "assistant";
+        settled.get_or_insert(is_assistant && !text.is_empty());
+        if is_assistant && !text.is_empty() {
+            return Some(TranscriptTail {
+                last_assistant: Some(text),
+                settled: settled.unwrap_or(true),
+            });
         }
     }
-    None
+    Some(TranscriptTail {
+        last_assistant: None,
+        settled: settled.unwrap_or(true),
+    })
+}
+
+/// Walk a Claude JSONL transcript backwards for the last assistant message's
+/// text, whether or not the transcript has caught up with the turn.
+#[cfg(test)]
+fn last_assistant_text(path: &str) -> Option<String> {
+    read_transcript(path)?.last_assistant
+}
+
+/// One transcript line as `(role, text)`, for the conversational entries only
+/// (`user` / `assistant`). Transcript shapes vary by version: role is on the
+/// top-level object or the nested `message` object; content is a string or a
+/// list of `text` blocks.
+fn transcript_entry(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let obj = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let message = obj.get("message").filter(|m| m.is_object());
+    let role = message
+        .and_then(|m| str_field(m, "role"))
+        .or_else(|| str_field(&obj, "role"))
+        .or_else(|| str_field(&obj, "type"))
+        .filter(|role| role == "assistant" || role == "user")?;
+    let content = message.unwrap_or(&obj).get("content");
+    let text = match content {
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    };
+    Some((role, text))
 }
 
 /// Monotonic report sequence. Seeded from wall-clock nanos (so the server sees
@@ -1256,6 +1404,303 @@ mod tests {
         let nudge = out.stdout.expect("expected a nudge");
         assert!(nudge.contains("\"decision\":\"block\""));
         assert!(nudge.contains("※ recap:"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    // --- #415: the recap is judged on what the turn really ended with ------
+
+    /// A tool-using turn as Claude 2.1.x writes it: one entry per content
+    /// block, tool results as `user` entries.
+    const EARLIER_REPLY: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Checking the tests first."}]}}"#;
+    const TOOL_USE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+    const THINKING: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":""}]}}"#;
+    const FINAL_WITH_RECAP: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"All green.\n\n※ recap: tests pass. Next: open the PR."}]}}"#;
+    const FINAL_REPLY_RECAP: &str = "All green.\n\n※ recap: tests pass. Next: open the PR.";
+
+    fn stop(input: &serde_json::Value, pending_messages: usize) -> HookOutcome {
+        plan(
+            Agent::Claude,
+            Action::Stop,
+            input,
+            "Stop",
+            "p_1",
+            pending_messages,
+            None,
+        )
+    }
+
+    fn recap_of(out: &HookOutcome) -> Option<&str> {
+        out.reports.iter().find_map(|method| match method {
+            Method::PaneReportRecap(recap) => Some(recap.recap.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_transcript_ending_on_the_sentinel_is_never_nudged() {
+        // (a) The final entry has landed and carries the recap.
+        let path = transcript_with(&[
+            EARLIER_REPLY,
+            TOOL_USE,
+            TOOL_RESULT,
+            THINKING,
+            FINAL_WITH_RECAP,
+        ]);
+        let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap(), "stop_hook_active": false});
+        let out = stop(&input, 0);
+        assert_eq!(
+            recap_of(&out),
+            Some("※ recap: tests pass. Next: open the PR.")
+        );
+        assert!(out.stdout.is_none(), "sentinel present ⇒ no nudge");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_harness_field_wins_over_a_transcript_one_message_behind() {
+        // (b) #415 as observed: the reply is not in the transcript yet, so the
+        // newest text there is the message BEFORE it, which has no sentinel.
+        // The hook input's own `last_assistant_message` has the real reply.
+        let path = transcript_with(&[EARLIER_REPLY, TOOL_USE, TOOL_RESULT]);
+        let input = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "stop_hook_active": false,
+            "last_assistant_message": FINAL_REPLY_RECAP,
+        });
+        let out = stop(&input, 0);
+        assert_eq!(
+            recap_of(&out),
+            Some("※ recap: tests pass. Next: open the PR.")
+        );
+        assert!(
+            out.stdout.is_none(),
+            "a turn that ended with the sentinel must never be re-nudged"
+        );
+        let Method::PaneReportReply(reply) = &out.reports[0] else {
+            panic!("the reply is reported first")
+        };
+        assert_eq!(
+            reply.reply, FINAL_REPLY_RECAP,
+            "the reply, not the one before it"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_lagging_transcript_without_the_field_is_unknown_not_missing() {
+        // An older harness sends no field. A transcript whose newest entry is
+        // a tool result — or a thinking block whose text is still to come —
+        // shows the previous message, so the hook cannot tell whether the turn
+        // ended with a recap and must not ask for one. Mail still wakes.
+        for tail in [
+            &[EARLIER_REPLY, TOOL_USE, TOOL_RESULT][..],
+            &[EARLIER_REPLY, TOOL_USE, TOOL_RESULT, THINKING][..],
+        ] {
+            let path = transcript_with(tail);
+            let input =
+                json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
+            let out = stop(&input, 0);
+            assert!(out.reports.is_empty(), "nothing stale is reported");
+            assert!(out.stdout.is_none(), "unknown is not a missing sentinel");
+
+            let woken = stop(&input, 1).stdout.expect("mail still wakes");
+            assert!(woken.contains("flock_msg_read"), "{woken}");
+            assert!(!woken.contains("recap"), "{woken}");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn a_turn_without_the_sentinel_is_nudged_exactly_once() {
+        // (c) Genuinely no sentinel: one nudge. The continuation that nudge
+        // forces arrives with `stop_hook_active: true`, and whatever it wrote,
+        // it is not nudged again.
+        let path = transcript_with(&[EARLIER_REPLY]);
+        let first = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "stop_hook_active": false,
+            "last_assistant_message": "Done, no recap line.",
+        });
+        let nudge = stop(&first, 0).stdout.expect("no sentinel ⇒ one nudge");
+        assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
+        assert!(nudge.contains("※ recap:"), "{nudge}");
+
+        let again = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "stop_hook_active": true,
+            "last_assistant_message": "Still no recap line.",
+        });
+        assert!(
+            stop(&again, 0).stdout.is_none(),
+            "at most one nudge per turn"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn inside_a_hook_continuation_the_recap_is_never_asked_for() {
+        // (d) stop_hook_active: no recap nudge from the transcript path
+        // either — but a mail wake is not a recap nudge, and still fires.
+        let path = transcript_with(&[r#"{"type":"assistant","content":"No sentinel here."}"#]);
+        let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap(), "stop_hook_active": true});
+        let out = stop(&input, 0);
+        assert_eq!(
+            out.reports.iter().map(method_name).collect::<Vec<_>>(),
+            ["report_reply"]
+        );
+        assert!(out.stdout.is_none(), "stop_hook_active ⇒ no recap nudge");
+
+        let woken = stop(&input, 2).stdout.expect("mail still wakes");
+        assert!(woken.contains("2 unread messages"), "{woken}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_wait_sees_a_final_entry_written_after_a_delay() {
+        // An older harness that DOES flush while the hook runs: the wait at
+        // the IO edge picks the reply up, and the plan then reads it.
+        let path = transcript_with(&[EARLIER_REPLY, TOOL_USE, TOOL_RESULT]);
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                let mut body = std::fs::read_to_string(&path).unwrap();
+                body.push('\n');
+                body.push_str(FINAL_WITH_RECAP);
+                std::fs::write(&path, body).unwrap();
+            })
+        };
+        let settled = await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+        );
+        writer.join().unwrap();
+        assert!(settled, "the delayed reply lands inside the budget");
+
+        let input = json!({"hook_event_name": "Stop", "transcript_path": path.to_str().unwrap()});
+        let out = stop(&input, 0);
+        assert_eq!(
+            recap_of(&out),
+            Some("※ recap: tests pass. Next: open the PR.")
+        );
+        assert!(out.stdout.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_wait_gives_up_when_its_budget_is_spent() {
+        // Claude 2.1.x appends the reply only after the hook returns, so the
+        // wait must end on its own; `0` reads once and returns.
+        let path = transcript_with(&[EARLIER_REPLY, TOOL_USE, TOOL_RESULT]);
+        let started = std::time::Instant::now();
+        assert!(!await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        assert!(!await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(10),
+        ));
+        assert!(
+            !await_settled_transcript(
+                "/no/such/path",
+                Duration::from_secs(10),
+                Duration::from_millis(10)
+            ),
+            "a missing transcript never waits"
+        );
+        // Config cannot hurt the turn: a zero poll is floored rather than
+        // spinning, and a budget past `Instant`'s range is capped, not a
+        // panic.
+        let started = std::time::Instant::now();
+        assert!(!await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                // Lands the reply so the capped wait ends; what is under test
+                // is that `u64::MAX` ms reaches the loop without panicking.
+                std::thread::sleep(Duration::from_millis(50));
+                let mut body = std::fs::read_to_string(&path).unwrap();
+                body.push('\n');
+                body.push_str(FINAL_WITH_RECAP);
+                std::fs::write(&path, body).unwrap();
+            }
+        });
+        assert!(await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_millis(u64::MAX),
+            Duration::from_millis(10),
+        ));
+        writer.join().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_recap_dressed_in_markdown_is_still_the_recap() {
+        for (line, expected) in [
+            (
+                "※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "**※ recap: done. Next: ship.**",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "- ※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "> ※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "  > **※ recap: done. Next: ship.**  ",
+                Some("※ recap: done. Next: ship."),
+            ),
+            ("※ note: not a recap", None),
+            ("the ※ recap: line goes last", None),
+            ("", None),
+        ] {
+            assert_eq!(recap_line(line), expected, "{line:?}");
+        }
+
+        // End to end: a bolded recap is lifted and the turn is not nudged,
+        // while a line that merely starts with ※ is no recap at all.
+        let path = transcript_with(&[EARLIER_REPLY]);
+        let bold = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "Done.\n\n**※ recap: done. Next: ship.**",
+        });
+        let out = stop(&bold, 0);
+        assert_eq!(recap_of(&out), Some("※ recap: done. Next: ship."));
+        assert!(out.stdout.is_none(), "a bolded recap is a recap");
+
+        let other = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "Done.\n※ note: nothing to recap",
+        });
+        let out = stop(&other, 0);
+        assert_eq!(recap_of(&out), None);
+        assert!(
+            out.stdout.is_some(),
+            "a ※ line that is not the recap still nudges"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
