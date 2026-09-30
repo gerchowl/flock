@@ -825,9 +825,11 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>, intentional_
     } else {
         // Includes UNFLAGGED signal-death: an ssh child killed by something
         // other than us (OOM killer, an operator's `kill`, a crash) is a real
-        // event and must stay loud. This is a demotion of one known-benign
-        // case, not a blanket suppression of the status.
-        tracing::warn!(
+        // event. It is DEBUG here because `remote.bridge.failed` follows with
+        // its stderr, its reason and its attempt number, and that event is
+        // the one that goes loud once the failure persists (#420). Two WARNs
+        // for one failure is how a log teaches people to skim.
+        tracing::debug!(
             event = "remote.bridge.exited",
             subsystem = "remote",
             outcome = "error",
@@ -872,15 +874,57 @@ pub(crate) fn remote_bridge_listener_failed(target: &str, stage: &'static str, e
 
 /// One line the bridge's ssh wrote to stderr. ssh's own complaints ("Broken
 /// pipe", "Connection closed by …") used to reach the terminal directly, over
-/// the TUI, in raw mode (#436). They belong in the log.
+/// the TUI, in raw mode (#436, #420). They belong in the log.
 pub(crate) fn remote_bridge_ssh_stderr(target: &str, line: &str) {
-    tracing::warn!(
+    // DEBUG: the failure's own event carries the tail at the level it earns.
+    tracing::debug!(
         event = "remote.bridge.ssh_stderr",
         subsystem = "remote",
         outcome = "stderr",
         target,
         line,
         "ssh bridge stderr"
+    );
+}
+
+/// A switch's dial failed for good (#420): the popup says the classified
+/// reason, and this keeps ssh's own words.
+pub(crate) fn client_switch_dial_failed(target: &str, err: &str) {
+    let reason = crate::peers::SshFailureReason::classify(err).as_str();
+    let err = crate::report::redact::mask_credentials(err);
+    tracing::warn!(
+        event = "client.switch.dial_failed",
+        subsystem = "client",
+        outcome = "error",
+        target,
+        reason,
+        err = err.as_str(),
+        "server switch dial failed"
+    );
+}
+
+/// The launcher fell back to the previous leg because the next one failed or
+/// lost its connection for good (#420). The notice it hands back is the text.
+pub(crate) fn leg_fell_back(notice: &str) {
+    tracing::warn!(
+        event = "remote.leg.fell_back",
+        subsystem = "remote",
+        outcome = "fell_back",
+        notice,
+        "attach leg failed; falling back to the previous server"
+    );
+}
+
+/// A launcher preflight line on a switch, where the screen is not the
+/// launcher's to write on (#420).
+pub(crate) fn remote_launcher_notice(target: &str, message: &str) {
+    tracing::info!(
+        event = "remote.launcher.notice",
+        subsystem = "remote",
+        outcome = "notice",
+        target,
+        message,
+        "remote launcher notice"
     );
 }
 
@@ -936,8 +980,20 @@ pub(crate) fn remote_client_reconnect_gave_up(
 /// `ConnectionAborted` this reports is the DOWNSTREAM effect of the teardown
 /// SIGKILL, so an ordinary switch home used to emit this WARN too — the second
 /// half of the pair in #319.
-pub(crate) fn remote_bridge_failed(target: &str, err: &str, intentional_teardown: bool) {
-    if intentional_teardown {
+///
+/// A failure the redial recovers from is churn (#420): DEBUG, with its
+/// attempt number, so the log can still count them. Only the failure that
+/// makes the run persistent is a WARN, and it carries ssh's stderr tail and
+/// the classified reason — the "why" the old bare WARN never had.
+pub(crate) fn remote_bridge_failed(
+    target: &str,
+    err: &str,
+    failure: &crate::remote::BridgeFailureLog<'_>,
+) {
+    let reason = failure.reason.unwrap_or_default();
+    let stderr_tail = failure.stderr_tail.unwrap_or_default();
+    let attempt = failure.attempt;
+    if failure.intentional_teardown {
         tracing::debug!(
             event = "remote.bridge.failed",
             subsystem = "remote",
@@ -946,13 +1002,28 @@ pub(crate) fn remote_bridge_failed(target: &str, err: &str, intentional_teardown
             err,
             "ssh bridge connection ended by teardown"
         );
-    } else {
+    } else if failure.persistent {
         tracing::warn!(
             event = "remote.bridge.failed",
             subsystem = "remote",
             outcome = "error",
             target,
             err,
+            attempt,
+            reason,
+            stderr_tail,
+            "ssh bridge connection keeps failing"
+        );
+    } else {
+        tracing::debug!(
+            event = "remote.bridge.failed",
+            subsystem = "remote",
+            outcome = "transient",
+            target,
+            err,
+            attempt,
+            reason,
+            stderr_tail,
             "ssh bridge connection failed"
         );
     }
@@ -4489,18 +4560,21 @@ mod tests {
     }
 
     #[test]
-    fn remote_bridge_exited_is_warn_on_nonzero_debug_on_zero() {
+    fn remote_bridge_exited_is_debug_and_labels_the_outcome() {
+        // #420: the exit is always DEBUG; `remote.bridge.failed` carries the
+        // failure's level, once, with its reason.
         let ok = capture_logs(|| remote_bridge_exited("host1", Some(0), false));
         assert!(ok.contains("DEBUG"), "clean exit is debug noise: {ok}");
         assert!(ok.contains("event=\"remote.bridge.exited\""), "{ok}");
 
         let bad = capture_logs(|| remote_bridge_exited("host1", Some(3), false));
-        assert!(bad.contains("WARN"), "failed exit must be WARN: {bad}");
+        assert!(!bad.contains("WARN"), "{bad}");
+        assert!(bad.contains("outcome=\"error\""), "{bad}");
         assert!(bad.contains("status=\"3\""), "{bad}");
 
         let signal = capture_logs(|| remote_bridge_exited("host1", None, false));
         assert!(signal.contains("status=\"signal\""), "{signal}");
-        assert!(signal.contains("WARN"), "{signal}");
+        assert!(signal.contains("outcome=\"error\""), "{signal}");
     }
 
     /// #319: 94% of the WARNs in a measured client log were flock reporting
@@ -4525,7 +4599,7 @@ mod tests {
         // blanket suppression this fix exists to avoid.
         let raced = capture_logs(|| remote_bridge_exited("host1", Some(255), true));
         assert!(
-            raced.contains("WARN"),
+            raced.contains("outcome=\"error\""),
             "a real ssh exit status is never torn_down: {raced}"
         );
         assert!(raced.contains("status=\"255\""), "{raced}");
@@ -4533,20 +4607,67 @@ mod tests {
         // Signal-death with NO teardown flag: something else killed our ssh.
         let unflagged = capture_logs(|| remote_bridge_exited("host1", None, false));
         assert!(
-            unflagged.contains("WARN"),
-            "unflagged signal-death stays loud: {unflagged}"
+            unflagged.contains("outcome=\"error\""),
+            "unflagged signal-death is still an error, not a teardown: {unflagged}"
         );
     }
 
     #[test]
-    fn bridge_failed_follows_the_same_teardown_split() {
-        let torn = capture_logs(|| remote_bridge_failed("host1", "connection aborted", true));
+    fn bridge_failed_is_loud_only_where_the_failure_persists() {
+        use crate::remote::BridgeFailureLog;
+        let torn = capture_logs(|| {
+            remote_bridge_failed(
+                "host1",
+                "connection aborted",
+                &BridgeFailureLog {
+                    intentional_teardown: true,
+                    attempt: 0,
+                    persistent: false,
+                    reason: None,
+                    stderr_tail: None,
+                },
+            )
+        });
         assert!(torn.contains("DEBUG"), "{torn}");
         assert!(torn.contains("outcome=\"torn_down\""), "{torn}");
 
-        let real = capture_logs(|| remote_bridge_failed("host1", "connection refused", false));
-        assert!(real.contains("WARN"), "{real}");
-        assert!(real.contains("outcome=\"error\""), "{real}");
+        // #420: the first failure of a run is churn the redial usually fixes.
+        let transient = capture_logs(|| {
+            remote_bridge_failed(
+                "host1",
+                "ssh bridge exited with exit status: 255",
+                &BridgeFailureLog {
+                    intentional_teardown: false,
+                    attempt: 1,
+                    persistent: false,
+                    reason: Some("connect_refused"),
+                    stderr_tail: Some("ssh: connect to host host1 port 22: Connection refused"),
+                },
+            )
+        });
+        assert!(!transient.contains("WARN"), "{transient}");
+        assert!(transient.contains("outcome=\"transient\""), "{transient}");
+        assert!(transient.contains("attempt=1"), "{transient}");
+
+        let persistent = capture_logs(|| {
+            remote_bridge_failed(
+                "host1",
+                "ssh bridge exited with exit status: 255",
+                &BridgeFailureLog {
+                    intentional_teardown: false,
+                    attempt: 2,
+                    persistent: true,
+                    reason: Some("connect_refused"),
+                    stderr_tail: Some("ssh: connect to host host1 port 22: Connection refused"),
+                },
+            )
+        });
+        assert!(persistent.contains("WARN"), "{persistent}");
+        assert!(
+            persistent.contains("reason=\"connect_refused\""),
+            "{persistent}"
+        );
+        assert!(persistent.contains("stderr_tail="), "{persistent}");
     }
 
     #[test]

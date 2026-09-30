@@ -229,6 +229,7 @@ fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
                 notice,
                 previous: prev,
             } => {
+                logging::leg_fell_back(&notice);
                 std::env::set_var(client::SWITCH_NOTICE_ENV_VAR, notice);
                 previous = prev;
                 leg = to;
@@ -327,7 +328,7 @@ fn decide_next_leg(
         None => match (result, previous) {
             (Err(err), Some((fallback, target_label))) => LegStep::FallBack {
                 notice: fallback_notice(&target_label, &err),
-                to: fallback,
+                to: behind_held_frame(fallback),
                 previous: None,
             },
             (result, _) => LegStep::Finish {
@@ -337,6 +338,19 @@ fn decide_next_leg(
                 result,
             },
         },
+    }
+}
+
+/// A leg re-run as a fallback runs behind the failed leg's held frame, so it
+/// must not prompt or print as the CLI launch that first ran it did (#420,
+/// #115): it becomes a federation-switch leg.
+fn behind_held_frame(leg: AttachLeg) -> AttachLeg {
+    match leg {
+        AttachLeg::Remote(mut launch) => {
+            launch.context = remote::LaunchContext::FederationSwitch;
+            AttachLeg::Remote(launch)
+        }
+        local => local,
     }
 }
 
@@ -358,10 +372,11 @@ fn fallback_notice(target_label: &str, err: &io::Error) -> String {
         .and_then(|inner| inner.downcast_ref::<remote::ReconnectGaveUp>());
     match gave_up {
         Some(gave_up) => gave_up.to_string(),
-        None => format!(
-            "switch to {target_label} failed: {}",
-            switch_failure_reason(err)
-        ),
+        None => peers::FleetFailureNotice::SwitchFailed {
+            target: target_label.to_string(),
+            reason: switch_failure_reason(err),
+        }
+        .to_string(),
     }
 }
 
@@ -378,14 +393,17 @@ fn report_attach_chain_error(err: &io::Error) {
 }
 
 /// A concise, single-line reason from a failed leg launch for the notice.
+///
+/// Classified, never raw ssh text (#420): the notice lands on the operator's
+/// screen, and "auth refused" says what to fix where ssh's stderr does not.
 fn switch_failure_reason(err: &io::Error) -> String {
-    let text = err.to_string();
-    let line = text.lines().next().unwrap_or(&text).trim();
-    if line.is_empty() {
-        "connection failed".to_string()
-    } else {
-        line.to_string()
+    if let Some(failed) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<remote::BridgeDialFailed>())
+    {
+        return failed.reason.describe().to_string();
     }
+    peers::failure_text(&err.to_string())
 }
 
 fn main() -> io::Result<()> {
@@ -950,6 +968,53 @@ mod tests {
                 assert_eq!(notice, "lost connection to lars@sage");
             }
             _ => panic!("expected FallBack"),
+        }
+    }
+
+    /// #420: the fallback notice names the classified reason — never ssh's
+    /// raw stderr, never "remote client exited with exit status: 1".
+    #[test]
+    fn a_failed_switch_notice_carries_the_classified_reason() {
+        let from_bridge = io::Error::new(
+            io::ErrorKind::Interrupted,
+            remote::BridgeDialFailed {
+                reason: peers::SshFailureReason::AuthRefused,
+            },
+        );
+        assert_eq!(
+            fallback_notice("lars@sage", &from_bridge),
+            "switch to lars@sage failed: auth refused"
+        );
+        let raw_ssh = io::Error::other(
+            "remote platform probe failed: ssh: connect to host sage port 22: Connection refused",
+        );
+        assert_eq!(
+            fallback_notice("lars@sage", &raw_ssh),
+            "switch to lars@sage failed: connection refused"
+        );
+    }
+
+    /// #447 review: the leg a failed switch falls back to runs behind the
+    /// failed leg's held frame. A `flk --remote` leg re-run there must not
+    /// keep the CLI context that lets it prompt and print.
+    #[test]
+    fn a_fallback_remote_leg_runs_as_a_federation_switch() {
+        let err = io::Error::other("connection refused");
+        // The chain started as `flk --remote lars@sage`: a CLI launch.
+        let AttachLeg::Remote(mut cli_launch) = remote_leg("lars@sage") else {
+            unreachable!("remote_leg builds a remote leg")
+        };
+        cli_launch.context = remote::LaunchContext::Cli;
+        let previous = Some((AttachLeg::Remote(cli_launch), "lars@anvil".to_string()));
+        match decide_next_leg(&remote_leg("lars@anvil"), None, Err(err), previous, true) {
+            LegStep::FallBack {
+                to: AttachLeg::Remote(launch),
+                ..
+            } => {
+                assert_eq!(launch.target, "lars@sage");
+                assert_eq!(launch.context, remote::LaunchContext::FederationSwitch);
+            }
+            _ => panic!("expected a FallBack to the remote leg"),
         }
     }
 

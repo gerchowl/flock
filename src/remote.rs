@@ -287,7 +287,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     progress.set_stage(crate::switch_progress::Stage::Connecting);
-    let _bridge = crate::logging::timed_switch_stage(&active_ssh_target, "bridge_listen", || {
+    let bridge = crate::logging::timed_switch_stage(&active_ssh_target, "bridge_listen", || {
         SshStdioBridge::start(
             remote.target,
             prepared_remote.remote_flock,
@@ -320,15 +320,47 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // over a live frame. Dropping the guard joins that thread first.
     drop(progress);
 
-    run_client_process(
+    let result = run_client_process(
         &local_socket,
         &reattach_command,
         remote.keybindings,
         &fleet,
         &active_ssh_target,
         &local_socket,
-    )
+    );
+    // A client that died because its bridge could not get through exits with
+    // a bare status; the reason is on the bridge's side of the socket (#420).
+    // Hand the classified reason to the leg loop, so the fallback notice says
+    // "auth refused", not "remote client exited with exit status: 1".
+    match result {
+        Err(err) if !is_reconnect_give_up(&err) => {
+            match bridge.failing_reason_after_connections_end() {
+                Some(reason) => Err(io::Error::new(err.kind(), BridgeDialFailed { reason })),
+                None => Err(err),
+            }
+        }
+        other => other,
+    }
 }
+
+fn is_reconnect_give_up(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<ReconnectGaveUp>())
+}
+
+/// A leg whose bridge never got through, with the classified reason (#420).
+#[derive(Debug)]
+pub(crate) struct BridgeDialFailed {
+    pub(crate) reason: crate::peers::SshFailureReason,
+}
+
+impl std::fmt::Display for BridgeDialFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason.describe())
+    }
+}
+
+impl std::error::Error for BridgeDialFailed {}
 
 pub(crate) fn run_remote_client_bridge(reattach: bool) -> io::Result<()> {
     // A redial after a transport drop (#436) must reach the SAME server. If
@@ -915,10 +947,6 @@ enum RemoteServerRestartReason {
     VersionMismatch,
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "remote-server readiness runs from the launcher shell before the TUI attaches — handoff failures and the fallback notice belong on the user's terminal, not in a not-yet-wired tracing sink"
-)]
 fn ensure_remote_server_ready(
     target: &str,
     remote_flock: &RemoteFlock,
@@ -944,24 +972,50 @@ fn ensure_remote_server_ready(
     };
 
     if live_handoff_enabled && live_handoff {
-        match live_handoff_remote_server(target, remote_flock) {
+        match live_handoff_remote_server(target, remote_flock, context) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                eprintln!("remote live handoff failed: {err}");
-                eprintln!("falling back to remote server restart.");
+                launcher_notice(
+                    context,
+                    target,
+                    &format!(
+                        "remote live handoff failed: {err}\nfalling back to remote server restart."
+                    ),
+                );
             }
         }
     }
 
     if stop_after_install_approved {
-        stop_remote_server(target, remote_flock)?;
+        stop_remote_server(target, remote_flock, context)?;
         return Ok(());
     }
 
     if confirm_remote_server_stop(target, version.as_deref(), protocol, reason, context)? {
-        stop_remote_server(target, remote_flock)?;
+        stop_remote_server(target, remote_flock, context)?;
     }
     Ok(())
+}
+
+/// A progress line from the launcher's preflight (#420). From `flk --remote`
+/// the launcher owns the terminal and the operator is watching it, so the line
+/// goes to stderr. On a federation switch a held frame owns the screen, and a
+/// line written there lands over it at whatever the cursor was; there it goes
+/// to the log.
+#[expect(
+    clippy::print_stderr,
+    reason = "the CLI launch path owns the terminal before any TUI attaches; the switch path is routed to tracing instead"
+)]
+fn launcher_notice(context: LaunchContext, target: &str, message: &str) {
+    // Keyed on the held frame as well as the context: a leg the chain falls
+    // back to re-runs with the context it was first launched with, and a
+    // `flk --remote` leg re-run behind a held frame must not print over it.
+    let terminal_held = std::env::var_os(crate::client::HELD_TERMINAL_ENV_VAR).is_some();
+    if context.allows_install_prompt() && !terminal_held {
+        eprintln!("{message}");
+    } else {
+        crate::logging::remote_launcher_notice(target, message);
+    }
 }
 
 fn remote_server_restart_reason(
@@ -1239,11 +1293,11 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "surfaces the live-handoff success notice on the launcher's stderr so the user sees the reconnect happen"
-)]
-fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
+fn live_handoff_remote_server(
+    target: &str,
+    remote_flock: &RemoteFlock,
+    context: LaunchContext,
+) -> io::Result<()> {
     let command = format!(
         "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
         remote_flock.shell_path,
@@ -1256,15 +1310,21 @@ fn live_handoff_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::R
         return Err(command_failed("remote server live handoff failed", &output));
     }
 
-    eprintln!("handed off the remote flk server on {target}; reconnecting to the prepared server.");
+    launcher_notice(
+        context,
+        target,
+        &format!(
+            "handed off the remote flk server on {target}; reconnecting to the prepared server."
+        ),
+    );
     Ok(())
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "surfaces the remote-server stop confirmation on the launcher's stderr so the user knows the restart window has opened"
-)]
-fn stop_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()> {
+fn stop_remote_server(
+    target: &str,
+    remote_flock: &RemoteFlock,
+    context: LaunchContext,
+) -> io::Result<()> {
     let command = format!("{} server stop", remote_flock.shell_path);
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
@@ -1272,7 +1332,13 @@ fn stop_remote_server(target: &str, remote_flock: &RemoteFlock) -> io::Result<()
     }
 
     wait_for_remote_server_shutdown(target, remote_flock)?;
-    eprintln!("stopped the remote flk server on {target}; it will restart when the remote client bridge attaches.");
+    launcher_notice(
+        context,
+        target,
+        &format!(
+            "stopped the remote flk server on {target}; it will restart when the remote client bridge attaches."
+        ),
+    );
     Ok(())
 }
 
@@ -1543,8 +1609,10 @@ mv "$tmp" "$dest"
         .arg(target)
         .arg(format!("/bin/sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        // Captured, not inherited (#420): what ssh says belongs in the error
+        // and the log, not written into the terminal mid-prompt.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
@@ -1557,14 +1625,18 @@ mv "$tmp" "$dest"
             "ssh install stdin missing",
         ))
     };
-    let status = child.wait()?;
+    let output = child.wait_with_output()?;
+    let status = output.status;
     copy_result?;
 
     if status.success() {
         crate::logging::remote_install_completed(target, &remote_flock.shell_path);
         Ok(())
     } else {
-        let err = format!("remote install exited with {status}");
+        let err = match crate::process::shape_stderr_tail(&output.stderr) {
+            Some(tail) => format!("remote install exited with {status}: {tail}"),
+            None => format!("remote install exited with {status}"),
+        };
         crate::logging::remote_install_failed(target, &remote_flock.shell_path, &err);
         Err(io::Error::other(err))
     }
@@ -1703,10 +1775,63 @@ pub(crate) struct SshStdioBridge {
     /// of seconds) — bounding a flaky-peer teardown so writer threads don't
     /// pile up under a reconnect storm (#176).
     active_child_pids: ActiveChildPids,
+    /// The run of failed connections and its last classified reason (#420),
+    /// shared with the connection threads.
+    health: Arc<std::sync::Mutex<BridgeHealth>>,
+    /// Connection threads still running; see [`Self::failing_reason_after_connections_end`].
+    connections_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bound on waiting for a failed connection's bookkeeping.
+    stderr_settle: Duration,
     /// Gossip v3 (#101 part 3): retained for the observability event so a
     /// snapshot-derived leg's ProxyJump identity is visible in flock.log.
     #[allow(dead_code)]
     proxy_jump: Option<String>,
+}
+
+/// A bridge's run of failed ssh connections (#420).
+///
+/// A connection that fails and is then redialed successfully is churn, not an
+/// error: mba22 logged `remote.bridge.failed` for 24 of 25 bridges while the
+/// switches themselves worked, and a WARN nobody should act on teaches the
+/// operator to ignore WARN. So a failure is DEBUG, with its attempt number,
+/// until the run reaches [`crate::peers::DIAL_FAILURE_PERSISTS_AFTER`] in a
+/// row — the same bar #418 set for peer polls — and that edge is the WARN.
+#[derive(Debug, Default)]
+struct BridgeHealth {
+    consecutive_failures: u32,
+    last_reason: Option<crate::peers::SshFailureReason>,
+}
+
+impl BridgeHealth {
+    /// Record a failed connection; returns its attempt number in the current
+    /// run and whether this is the one that makes the run persistent. A tunnel
+    /// that worked before it died starts a fresh run: it is a drop, not a
+    /// dial that never got through.
+    fn record_failure(
+        &mut self,
+        established: bool,
+        reason: crate::peers::SshFailureReason,
+    ) -> (u32, bool) {
+        if established {
+            self.consecutive_failures = 0;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_reason = Some(reason);
+        (
+            self.consecutive_failures,
+            self.consecutive_failures == crate::peers::DIAL_FAILURE_PERSISTS_AFTER,
+        )
+    }
+
+    fn record_success(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The classified reason the latest connection failed with, while the
+    /// run of failures is still open.
+    fn failing_reason(&self) -> Option<crate::peers::SshFailureReason> {
+        self.last_reason.filter(|_| self.consecutive_failures > 0)
+    }
 }
 
 /// Live ssh children of one bridge, by connection id.
@@ -1720,9 +1845,42 @@ struct BridgeDial {
     session_name: String,
     keepalive_ssh_config: Option<PathBuf>,
     proxy_jump: Option<String>,
+    /// How long a failed connection waits for the rest of ssh's stderr.
+    stderr_settle: Duration,
+    health: Arc<std::sync::Mutex<BridgeHealth>>,
+    connections_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SshStdioBridge {
+    /// [`Self::failing_reason`] once every connection thread has finished,
+    /// waiting at most the stderr settle bound plus one accept tick.
+    pub(crate) fn failing_reason_after_connections_end(
+        &self,
+    ) -> Option<crate::peers::SshFailureReason> {
+        let deadline = Instant::now() + self.stderr_settle + BRIDGE_ACCEPT_POLL;
+        while self.connections_in_flight.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            thread::sleep(
+                BRIDGE_ACCEPT_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        self.failing_reason()
+    }
+
+    /// Why the bridge's latest connection failed, when it did (#420). The
+    /// launcher reads this when its client leg dies before attaching, so the
+    /// fallback notice names the classified reason, not "client exited 1".
+    ///
+    /// The client sees the dead tunnel's EOF before the connection thread has
+    /// read ssh's stderr and recorded the failure, so a launcher that asked at
+    /// once would find nothing, then drop the bridge and have the failure
+    /// logged as a teardown. [`Self::failing_reason_after_connections_end`] waits it out.
+    pub(crate) fn failing_reason(&self) -> Option<crate::peers::SshFailureReason> {
+        self.health
+            .lock()
+            .map(|health| health.failing_reason())
+            .unwrap_or(None)
+    }
+
     fn start(
         target: String,
         remote_flock: RemoteFlock,
@@ -1761,12 +1919,23 @@ impl SshStdioBridge {
         let active_child_pids: ActiveChildPids = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let thread_stop = Arc::clone(&should_stop);
         let thread_child_pids = Arc::clone(&active_child_pids);
+        let health = Arc::new(std::sync::Mutex::new(BridgeHealth::default()));
+        let connections_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stderr_settle = Duration::from_millis(
+            crate::config::Config::load()
+                .config
+                .remote
+                .bridge_stderr_settle_ms,
+        );
         let dial = Arc::new(BridgeDial {
             target,
             remote_flock,
             session_name,
             keepalive_ssh_config: keepalive_ssh_config.clone(),
             proxy_jump: proxy_jump.clone(),
+            stderr_settle,
+            health: Arc::clone(&health),
+            connections_in_flight: Arc::clone(&connections_in_flight),
         });
         let thread = thread::spawn(move || {
             bridge_accept_loop(&listener, &dial, &thread_child_pids, &thread_stop);
@@ -1778,8 +1947,20 @@ impl SshStdioBridge {
             should_stop,
             thread: Some(thread),
             active_child_pids,
+            health,
+            connections_in_flight,
+            stderr_settle,
             proxy_jump,
         })
+    }
+}
+
+/// Counts a connection thread as running until it is dropped.
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1821,15 +2002,17 @@ fn bridge_accept_loop(
                 let dial = Arc::clone(dial);
                 let pids = Arc::clone(active_child_pids);
                 let stop = Arc::clone(should_stop);
+                dial.connections_in_flight.fetch_add(1, Ordering::AcqRel);
                 connections.push(thread::spawn(move || {
+                    let _in_flight = InFlight(&dial.connections_in_flight);
+                    // An ssh that ran and failed is logged inside, with its
+                    // stderr and reason. What arrives here never got an ssh
+                    // started at all.
                     if let Err(err) = bridge_connection(stream, &dial, connection, &pids, &stop) {
-                        // The `ConnectionAborted` a teardown produces is our
-                        // own SIGKILL coming back around (#319), not a failure.
-                        let intentional = stop.load(Ordering::Acquire);
-                        crate::logging::remote_bridge_failed(
+                        crate::logging::remote_bridge_listener_failed(
                             &dial.target,
+                            "spawn",
                             &err.to_string(),
-                            intentional,
                         );
                     }
                 }));
@@ -2425,24 +2608,49 @@ fn bridge_connection(
     let upload = thread::spawn(move || {
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
     });
+    // The first bytes back through the tunnel close the bridge's run of
+    // failures (#420): the dial got through, whatever happens to it later.
+    // Waiting for a clean exit instead let a drop's reason outlive a working
+    // redial and relabel a later, unrelated failure as that old one.
+    let through_health = Arc::clone(&dial.health);
     let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
+        let delivered = copy_flush_marking_first(&mut child_stdout, &mut child_to_stream, || {
+            if let Ok(mut health) = through_health.lock() {
+                health.record_success();
+            }
+        })
+        .unwrap_or(0);
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
+        delivered
     });
-    // Never joined: a ProxyJump/ProxyCommand helper inherits this pipe and can
-    // outlive a SIGKILLed ssh by a full TCP timeout on a dead network. Waiting
-    // for EOF here would stall teardown for exactly that long, undoing #176's
-    // bounded kill. The thread ends on its own when the last writer exits.
-    let stderr_target = target.to_string();
+    // ssh's last stderr lines, for the failure's tail and reason (#420). Never
+    // joined: a ProxyJump/ProxyCommand helper inherits this pipe and can
+    // outlive a SIGKILLed ssh by a full TCP timeout on a dead network, and
+    // waiting for its EOF would stall teardown for that long, undoing #176's
+    // bounded kill. The thread says when it saw EOF; the wait for that is
+    // bounded by `stderr_settle`.
+    let stderr_lines = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let (stderr_done_tx, stderr_done) = std::sync::mpsc::channel::<()>();
     if let Some(stderr) = child_stderr {
+        let stderr_target = target.to_string();
+        let lines = Arc::clone(&stderr_lines);
         thread::spawn(move || {
             use std::io::BufRead;
             for line in io::BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                if !line.trim().is_empty() {
-                    crate::logging::remote_bridge_ssh_stderr(&stderr_target, line.trim_end());
+                let line = line.trim_end();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                crate::logging::remote_bridge_ssh_stderr(&stderr_target, line);
+                if let Ok(mut lines) = lines.lock() {
+                    if lines.len() == crate::process::STDERR_TAIL_LINES {
+                        lines.pop_front();
+                    }
+                    lines.push_back(line.to_string());
                 }
             }
+            let _ = stderr_done_tx.send(());
         });
     }
 
@@ -2451,7 +2659,7 @@ fn bridge_connection(
         pids.remove(&connection);
     }
     let _ = upload.join();
-    let _ = download.join();
+    let delivered = download.join().unwrap_or(0);
 
     // Read AFTER the wait, never before: `Drop` sets `should_stop` and only
     // then SIGKILLs the child, so by the time this wait returns because of our
@@ -2460,13 +2668,89 @@ fn bridge_connection(
     let intentional_teardown = should_stop.load(Ordering::Acquire);
     crate::logging::remote_bridge_exited(target, status.code(), intentional_teardown);
     if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
-        ))
+        if let Ok(mut health) = dial.health.lock() {
+            health.record_success();
+        }
+        return Ok(());
     }
+    if intentional_teardown {
+        crate::logging::remote_bridge_failed(
+            target,
+            &format!("ssh bridge exited with {status}"),
+            &BridgeFailureLog::torn_down(),
+        );
+        return Ok(());
+    }
+
+    let _ = stderr_done.recv_timeout(dial.stderr_settle);
+    let stderr_tail = stderr_lines
+        .lock()
+        .ok()
+        .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+        .and_then(|text| crate::process::shape_stderr_tail(text.as_bytes()));
+    let reason = crate::peers::SshFailureReason::classify(stderr_tail.as_deref().unwrap_or(""));
+    let (attempt, persistent) = dial
+        .health
+        .lock()
+        .map(|mut health| health.record_failure(delivered > 0, reason))
+        .unwrap_or((1, false));
+    crate::logging::remote_bridge_failed(
+        target,
+        &format!("ssh bridge exited with {status}"),
+        &BridgeFailureLog {
+            intentional_teardown: false,
+            attempt,
+            persistent,
+            reason: Some(reason.as_str()),
+            stderr_tail: stderr_tail.as_deref(),
+        },
+    );
+    Ok(())
+}
+
+/// What one failed bridge connection logs (#420).
+pub(crate) struct BridgeFailureLog<'a> {
+    pub(crate) intentional_teardown: bool,
+    /// This failure's number in the bridge's current run of failures.
+    pub(crate) attempt: u32,
+    /// Whether this failure is the one that makes the run persistent: the
+    /// only one logged at WARN.
+    pub(crate) persistent: bool,
+    pub(crate) reason: Option<&'a str>,
+    pub(crate) stderr_tail: Option<&'a str>,
+}
+
+impl BridgeFailureLog<'_> {
+    fn torn_down() -> Self {
+        Self {
+            intentional_teardown: true,
+            attempt: 0,
+            persistent: false,
+            reason: None,
+            stderr_tail: None,
+        }
+    }
+}
+
+/// [`copy_flush`], calling `on_first` once the first bytes have been written.
+fn copy_flush_marking_first<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    on_first: impl FnOnce(),
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 16 * 1024];
+    let first = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(0),
+            Ok(bytes_read) => break bytes_read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    writer.write_all(&buffer[..first])?;
+    writer.flush()?;
+    on_first();
+    Ok(first as u64 + copy_flush(reader, writer)?)
 }
 
 fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
@@ -2542,7 +2826,10 @@ pub(crate) struct ReconnectGaveUp {
 
 impl std::fmt::Display for ReconnectGaveUp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "lost connection to {}", self.target)
+        crate::peers::FleetFailureNotice::ConnectionLost {
+            target: self.target.clone(),
+        }
+        .fmt(f)
     }
 }
 
@@ -3253,6 +3540,183 @@ mod tests {
             }
             _ => panic!("expected a Welcome"),
         }
+    }
+
+    /// A stub `ssh` that fails its first `failures` dials with ssh's own
+    /// "Connection refused" on stderr and exit 255, then echoes.
+    fn install_flaky_ssh(name: &str, failures: u32) -> PathBuf {
+        let counter = std::env::temp_dir()
+            .join(format!("flock-{name}-{}", std::process::id()))
+            .join("dials");
+        let script = format!(
+            "#!/bin/sh\n\
+             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo \"$n\" > '{counter}'\n\
+             if [ \"$n\" -le {failures} ]; then\n\
+               echo 'ssh: connect to host flaky port 22: Connection refused' >&2\n\
+               exit 255\n\
+             fi\n\
+             exec cat\n",
+            counter = counter.display()
+        );
+        install_stub_ssh(name, &script)
+    }
+
+    /// Dial the bridge once: true when bytes make it through and back.
+    fn round_trip(socket: &Path) -> bool {
+        use std::io::{Read, Write};
+        let Ok(mut stream) = UnixStream::connect(socket) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        if stream.write_all(b"ping").is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).is_ok() && &buf == b"ping"
+    }
+
+    /// #420 acceptance: a switch whose first bridge attempt fails and whose
+    /// retry succeeds logs no WARN, and ssh's complaint reaches the log (as
+    /// the failure's tail and reason), not the terminal.
+    #[test]
+    fn a_first_attempt_failure_the_retry_fixes_is_not_a_warning() {
+        let target = "flaky-once";
+        let stub_dir = install_flaky_ssh("flaky-once", 1);
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-bridge-flaky1-{}.sock", std::process::id()));
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let mut first = true;
+        let mut retry = false;
+        let mut cleared = false;
+        let mut stale_while_live = None;
+        let out = crate::logging::capture_logs_across_threads(|| {
+            // SAFETY: nextest runs each test in its own process.
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
+            }
+            let bridge = SshStdioBridge::start(
+                target.to_string(),
+                test_remote_flock(),
+                socket.clone(),
+                "default".to_string(),
+                false,
+                None,
+            )
+            .expect("start bridge listener");
+            first = round_trip(&socket);
+            // #447 review: the run closes when the redial's tunnel first
+            // delivers, not when it ends. A reason left over from the failure
+            // would otherwise relabel any later, unrelated client failure.
+            let mut live = UnixStream::connect(&socket).expect("redial");
+            let _ = live.set_read_timeout(Some(Duration::from_secs(5)));
+            {
+                use std::io::{Read, Write};
+                live.write_all(b"ping").expect("write through the tunnel");
+                let mut buf = [0u8; 4];
+                retry = live.read_exact(&mut buf).is_ok() && &buf == b"ping";
+            }
+            stale_while_live = bridge.failing_reason();
+            drop(live);
+            // The retry's tunnel ends cleanly once the client hangs up, and
+            // that closes the run of failures.
+            cleared = wait_until(Duration::from_secs(5), || bridge.failing_reason().is_none());
+            drop(bridge);
+        });
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert!(
+            !first,
+            "the first attempt must fail for this test to mean anything"
+        );
+        assert!(retry, "the retry must get through");
+        assert!(cleared, "a working tunnel after the failure closes the run");
+        assert_eq!(
+            stale_while_live, None,
+            "a live redial must not leave the old failure's reason behind"
+        );
+        let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();
+        let warns: Vec<&&str> = ours.iter().filter(|l| l.contains("WARN")).collect();
+        assert!(
+            warns.is_empty(),
+            "a recovered failure is not a WARN: {warns:#?}"
+        );
+        let failed = ours
+            .iter()
+            .find(|l| l.contains("remote.bridge.failed"))
+            .expect("the failure is still logged");
+        assert!(failed.contains("DEBUG"), "{failed}");
+        assert!(failed.contains("attempt=1"), "{failed}");
+        assert!(failed.contains("reason=\"connect_refused\""), "{failed}");
+        assert!(
+            failed.contains("Connection refused"),
+            "stderr tail: {failed}"
+        );
+    }
+
+    /// #420: a failure that persists goes loud exactly once, with ssh's tail
+    /// and the classified reason, and the bridge reports that reason for the
+    /// launcher's fallback notice.
+    #[test]
+    fn a_persisting_bridge_failure_warns_once_with_its_reason() {
+        let target = "flaky-always";
+        let stub_dir = install_flaky_ssh("flaky-always", 99);
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-bridge-flaky9-{}.sock", std::process::id()));
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let mut reason = None;
+        let out = crate::logging::capture_logs_across_threads(|| {
+            // SAFETY: nextest runs each test in its own process.
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
+            }
+            let bridge = SshStdioBridge::start(
+                target.to_string(),
+                test_remote_flock(),
+                socket.clone(),
+                "default".to_string(),
+                false,
+                None,
+            )
+            .expect("start bridge listener");
+            for _ in 0..3 {
+                assert!(!round_trip(&socket));
+            }
+            assert!(wait_until(Duration::from_secs(5), || {
+                bridge.failing_reason().is_some() && live_bridge_children(&bridge) == 0
+            }));
+            reason = bridge.failing_reason();
+            drop(bridge);
+        });
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert_eq!(reason, Some(crate::peers::SshFailureReason::ConnectRefused));
+        let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();
+        let warns: Vec<&&str> = ours
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains("remote.bridge.failed"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "one WARN at the edge, not one per dial: {ours:#?}"
+        );
+        assert!(warns[0].contains("attempt=2"), "{}", warns[0]);
+        assert!(
+            warns[0].contains("reason=\"connect_refused\""),
+            "{}",
+            warns[0]
+        );
+        assert!(warns[0].contains("stderr_tail="), "{}", warns[0]);
     }
 
     /// Does the bridge currently hold a live ssh child pid? Used to prove the

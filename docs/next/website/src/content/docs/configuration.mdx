@@ -115,11 +115,14 @@ reconnect_backoff_max_ms = 5000      # the wait doubles per redial, up to this
 reconnect_deadline_secs = 120        # give up this long after the drop
 reattach_grace_ms = 1500             # on the remote: wait this long for its server before calling it gone
 reattach_poll_ms = 100               # ... rechecking this often
+bridge_stderr_settle_ms = 200        # wait this long for ssh's last stderr on a failed connection
 ```
 
 When enabled, `flk --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Flock's generated config.
 
 When the connection to a remote server drops — the laptop slept, the network changed — Flock keeps your last screen up under a `reconnecting to <host>…` bar and redials. Once the server answers it re-attaches to the same session. Press Esc to stop waiting; Flock also stops at `reconnect_deadline_secs`. Either way you land back on the server you switched from, told that the connection was lost, or at your shell if there is none. Quitting, detaching and switching never reconnect. If the remote server itself exited meanwhile, Flock says the session state is lost instead of attaching you to a new, empty server. Clients with `[slots] enabled` do not redial; they fall back to home as before. Set `reconnect = false` to end the session on the first drop instead.
+
+When a switch to a server fails for good, the servers band shows why on that server's row (for example `auth refused`), and the failure is kept in the notification log. ssh's own messages go to the session log (`flock-client.log`), never over your screen.
 
 ## Keybindings
 
