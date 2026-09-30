@@ -703,7 +703,7 @@ The body is pushed only for a sender this server attested (an agent in one of it
 
 The inbox stays the source of truth. A push is not a read, so the message stays unread until the agent calls `flock_msg_read` or answers it with `flock_msg_reply`. The stop-hook nudge and the idle wake keep running underneath for any session that did not load the channel, since flock cannot tell which sessions did. The idle wake then fires `channel_push_idle_wake_grace_ms` later than it would otherwise.
 
-Turning `channel_push` off with a config reload stops pushes at once, because each push first asks the server whether the flag is still on. Turning it on reaches only Claude sessions started afterwards, because a session fixes its capabilities when it starts. A pushing `flk mcp serve` logs to `flock-mcp.log`, next to the other flock logs.
+Turning `channel_push` off with a config reload stops pushes at once, because each push first asks the server whether the flag is still on. Turning it on reaches only Claude sessions started afterwards, because a session fixes its capabilities when it starts. A pushing `flk mcp serve` logs to its own `flock-mcp-<pid>.log`, next to the other flock logs. Files left by finished sessions are removed when the next one starts.
 
 ## Environment variables
 

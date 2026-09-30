@@ -58,6 +58,47 @@ pub(crate) fn help_log_paths_summary() -> String {
     )
 }
 
+/// Log to this process's own `flock-mcp-<pid>.log` (#438).
+///
+/// A pushing `flk mcp serve` runs once per agent session, so a shared file
+/// would have one rotating writer per session on one path, and those race
+/// (see `SESSION_LOG_FILES`). A file per pid has exactly one writer. Files
+/// whose process is gone are pruned at startup, so they cannot pile up across
+/// sessions. Not in `SESSION_LOG_FILES`, whose names are fixed.
+pub(crate) fn init_mcp_file_logging() {
+    let dir = crate::session::data_dir();
+    prune_dead_mcp_logs(&dir, |pid| {
+        crate::platform::process_start_time(pid).is_some()
+    });
+    init_file_logging(&format!("flock-mcp-{}.log", std::process::id()));
+}
+
+/// The pid in `flock-mcp-<pid>.log` or a rotation of it (`….log.N`).
+fn mcp_log_pid(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix("flock-mcp-")?;
+    let (pid, tail) = rest.split_once(".log")?;
+    let rotation_ok = tail.is_empty()
+        || tail
+            .strip_prefix('.')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    rotation_ok.then(|| pid.parse().ok()).flatten()
+}
+
+fn prune_dead_mcp_logs(dir: &std::path::Path, alive: impl Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(mcp_log_pid) else {
+            continue;
+        };
+        if pid != std::process::id() && !alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// The session's log files, in role order. The fixed set `peers logs` is
 /// allowed to read — never an arbitrary path (#67).
 const SESSION_LOG_FILES: [&str; 4] = [
@@ -4561,6 +4602,34 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("flock.log")
+    }
+
+    #[test]
+    fn mcp_logs_of_dead_sessions_are_pruned_and_live_ones_kept() {
+        assert_eq!(mcp_log_pid("flock-mcp-42.log"), Some(42));
+        assert_eq!(mcp_log_pid("flock-mcp-42.log.2"), Some(42));
+        assert_eq!(mcp_log_pid("flock-mcp-42.logx"), None);
+        assert_eq!(mcp_log_pid("flock-server.log"), None);
+
+        let dir = std::env::temp_dir().join(format!("flock-mcp-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "flock-mcp-1.log",
+            "flock-mcp-1.log.1",
+            "flock-mcp-2.log",
+            "flock.log",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        prune_dead_mcp_logs(&dir, |pid| pid == 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["flock-mcp-2.log", "flock.log"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

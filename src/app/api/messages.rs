@@ -110,10 +110,36 @@ fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) ->
     }
 }
 
-/// Whether an encoded API response is an error envelope.
-fn response_is_error(response: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(response)
-        .map_or(true, |value| value.get("error").is_some())
+/// What became of a `msg.reply`, read off its response (#438).
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyOutcome {
+    /// Queued here, or relayed over a peer's ssh: the reply went out.
+    Sent,
+    /// Handed up to the hub, which has not answered yet. The response is a
+    /// stand-in, and the caller hears the real outcome later.
+    HandedUp {
+        reply_correlation_id: String,
+    },
+    Failed,
+}
+
+impl ReplyOutcome {
+    fn of(response: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(response) else {
+            return Self::Failed;
+        };
+        if value.get("error").is_some() {
+            return Self::Failed;
+        }
+        let result = &value["result"];
+        match (result["state"].as_str(), result["correlation_id"].as_str()) {
+            (Some("handed_up"), Some(reply)) => Self::HandedUp {
+                reply_correlation_id: reply.to_string(),
+            },
+            (Some("handed_up"), None) => Self::Failed,
+            _ => Self::Sent,
+        }
+    }
 }
 
 /// The one budget every unattested `blocking` sender shares.
@@ -342,11 +368,20 @@ impl App {
         let response = self.route_msg_reply(id, params);
         // #438: under channel push an agent can answer mail it was shown but
         // never pulled. The reply is the only acknowledgement a push gets, so
-        // a reply that actually went out — queued here, relayed, or handed up
-        // — settles the original. One that failed settles nothing: the
-        // message stays unread, and the wakes will knock for it again.
-        if self.state.config.msg.channel_push && !response_is_error(&response) {
-            self.settle_replied_original(&correlation_id);
+        // a reply that went out settles the original: at once when it was
+        // queued here or relayed over a peer's ssh, and only on the hub's
+        // answer when it was handed up. A reply that failed settles nothing,
+        // so the message stays unread and the wakes knock for it again.
+        if self.state.config.msg.channel_push {
+            match ReplyOutcome::of(&response) {
+                ReplyOutcome::Sent => self.settle_replied_original(&correlation_id),
+                ReplyOutcome::HandedUp {
+                    reply_correlation_id,
+                } => {
+                    self.settle_when_hub_delivers(&reply_correlation_id, &correlation_id);
+                }
+                ReplyOutcome::Failed => {}
+            }
         }
         response
     }
@@ -1438,13 +1473,43 @@ impl App {
     /// is resolved from process ancestry, so knowing a correlation id is not
     /// enough to settle somebody else's mail.
     fn settle_replied_original(&mut self, correlation_id: &str) {
-        let Some(pane) = self
-            .parse_pane_id_or_peer("", self.current_api_peer_pid)
-            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id))
-        else {
+        if let Some(pane) = self.replier_pane() {
+            self.settle_original_in(&pane, correlation_id);
+        }
+    }
+
+    /// A reply handed up to the hub is only provisionally sent: mark its
+    /// parked send so the hub's answer settles the original, and nothing
+    /// before it (#446 review). The replier's pane is resolved NOW, while
+    /// the caller's ancestry is at hand.
+    fn settle_when_hub_delivers(&mut self, reply_correlation_id: &str, original: &str) {
+        let Some(pane) = self.replier_pane() else {
             return;
         };
-        let Some(message) = self.mailboxes.take_queued(&pane, correlation_id) else {
+        if self
+            .mailboxes
+            .queued_message(original)
+            .is_none_or(|message| message.to_pane != pane)
+        {
+            return;
+        }
+        if let Some(send) = self.uplink.parked_send_mut(reply_correlation_id) {
+            send.settles_on_delivery = Some(crate::app::uplink::SettleOnDelivery {
+                pane,
+                correlation_id: original.to_string(),
+            });
+        }
+    }
+
+    /// The caller's own pane, from process ancestry.
+    fn replier_pane(&mut self) -> Option<String> {
+        self.parse_pane_id_or_peer("", self.current_api_peer_pid)
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id))
+    }
+
+    /// Settle `correlation_id` out of `pane`'s inbox as answered.
+    pub(super) fn settle_original_in(&mut self, pane: &str, correlation_id: &str) {
+        let Some(message) = self.mailboxes.take_queued(pane, correlation_id) else {
             return;
         };
         self.mailboxes.record_delivered(&message);
@@ -1459,7 +1524,7 @@ impl App {
             },
         });
         self.sync_blocking_mail();
-        self.idle_wake_on_read(&pane);
+        self.idle_wake_on_read(pane);
     }
 
     /// The fleet-global id of the agent making the current API call, from

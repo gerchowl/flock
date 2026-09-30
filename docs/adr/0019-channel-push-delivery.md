@@ -101,7 +101,11 @@ silently for a session that did not register the channel (finding 4). So
 nothing about a push marks a message delivered. `flock_msg_read` does, and so
 does `flock_msg_reply` naming a still-queued message in the replier's **own**
 inbox (the replier is resolved from process ancestry). The reply is the only
-acknowledgement a pushed body gets.
+acknowledgement a pushed body gets, so it counts only once it has actually
+gone out. A reply queued locally or relayed over a peer's ssh settles the
+original at once. A reply handed up to the hub settles it only when the hub
+answers that it delivered the reply. A refusal, a timeout or any failed reply
+leaves the original unread, and the wakes keep knocking for it.
 
 The Stop-hook nudge and the idle wake keep running unchanged underneath.
 Because the server cannot detect registration (finding 4), there is no
@@ -170,7 +174,7 @@ push, so delivery costs a notify rather than a poll tick. The 100 ms tick
 remains only as the bound for noticing a hung-up client. Nothing is spawned
 per message. The feed re-attaches `channel_push_reconnect_secs` (at least one second)
 after the socket goes away, and it survived a live handoff (last table row).
-A pushing `flk mcp serve` writes its own `flock-mcp.log`, so a feed that keeps
+A pushing `flk mcp serve` writes its own `flock-mcp-<pid>.log`, so a feed that keeps
 failing is visible. With the flag off it still logs nothing.
 
 ## Consequences

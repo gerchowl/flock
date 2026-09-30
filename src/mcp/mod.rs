@@ -19,7 +19,7 @@
 //! on stdin means the client hung up and we exit 0 cleanly. It logs nothing —
 //! except with channel push on (#438), when a long-lived feed thread runs
 //! and its failures would otherwise be invisible, so the process then writes
-//! `flock-mcp.log` the way the relay writes its own file.
+//! its own `flock-mcp-<pid>.log`, the way the relay writes its own file.
 
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +48,7 @@ pub(crate) fn serve_over_stdio() -> std::io::Result<i32> {
     let out: SharedOut = Arc::new(Mutex::new(std::io::stdout()));
     let channel = ChannelOptions::from_config(&crate::config::Config::load().config.msg);
     if channel.push {
-        crate::logging::init_file_logging("flock-mcp.log");
+        crate::logging::init_mcp_file_logging();
     }
     let feed_out = out.clone();
     let feed_opts = channel.clone();
