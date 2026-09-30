@@ -328,8 +328,11 @@ pub(crate) fn run_remote_client_bridge(reattach: bool) -> io::Result<()> {
     // it is gone — crashed, stopped — refuse in the protocol's own terms
     // rather than start a new, empty one: the client ends its reconnect and
     // tells the operator the session state is lost.
-    if reattach && !crate::server::autodetect::is_server_listening() {
-        return refuse_reattach(io::stdin().lock(), io::stdout().lock());
+    if reattach {
+        let (grace, poll) = crate::config::Config::load().config.remote.reattach_grace();
+        if !server_listening_within(grace, poll, crate::server::autodetect::is_server_listening) {
+            return refuse_reattach(io::stdin().lock(), io::stdout().lock());
+        }
     }
     ensure_remote_server_running()?;
 
@@ -355,6 +358,30 @@ pub(crate) fn run_remote_client_bridge(reattach: bool) -> io::Result<()> {
     });
 
     copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
+/// Whether `is_listening` turns true within `grace`, checked every `poll`.
+///
+/// One check is not enough: a live handoff (`just apply` on this host)
+/// removes and rebinds the server socket, and a reattach that lands in that
+/// gap would otherwise be told a live session is lost. Bounded, so a server
+/// that really is gone is reported within `grace`.
+fn server_listening_within(
+    grace: Duration,
+    poll: Duration,
+    mut is_listening: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if is_listening() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(poll.min(deadline - now));
+    }
 }
 
 /// Answer a client's Hello with a Welcome that carries
@@ -2886,6 +2913,48 @@ mod tests {
         );
     }
 
+    /// Review of #442: a live handoff unbinds and rebinds the server socket.
+    /// A reattach landing in that gap must wait for the rebind, not report
+    /// the session as lost.
+    #[test]
+    fn a_reattach_waits_out_a_handoff_rebind_gap() {
+        let socket =
+            PathBuf::from("/tmp").join(format!("flock-reattach-gap-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let rebind = socket.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            std::os::unix::net::UnixListener::bind(&rebind).expect("rebind")
+        });
+        let started = Instant::now();
+        let found =
+            server_listening_within(Duration::from_secs(3), Duration::from_millis(50), || {
+                UnixStream::connect(&socket).is_ok()
+            });
+        let listener = server.join().expect("rebind thread");
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
+        assert!(found, "the server came back inside the grace window");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_reattach_to_a_server_that_stays_gone_gives_up_at_the_grace_bound() {
+        let started = Instant::now();
+        let mut checks = 0u32;
+        let found = server_listening_within(
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            || {
+                checks += 1;
+                false
+            },
+        );
+        assert!(!found);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(checks <= 6, "one check per poll step, got {checks}");
+    }
+
     #[test]
     fn a_redial_asks_the_remote_to_reattach_rather_than_start_a_server() {
         let mut argv = bridge_dial_argv(
@@ -2907,7 +2976,7 @@ mod tests {
     /// carrying the reason, which the client's handshake turns into a
     /// refusal — never a fresh, empty server reported as "reconnected".
     #[test]
-    fn a_reattach_to_a_vanished_server_is_refused_in_protocol_terms() {
+    fn a_reattach_to_a_vanished_server_answers_the_first_frame_with_a_refusal() {
         let hello = crate::protocol::ClientMessage::Input { data: vec![b'x'] };
         let mut input = Vec::new();
         crate::protocol::write_message(&mut input, &hello).expect("encode hello");

@@ -1616,10 +1616,13 @@ where
             // server is gone (`--reattach`), or now speaks another protocol —
             // ends the outage like a give-up, so it falls back and says why.
             if let Some(ended) = outage.take() {
-                let reason = err
-                    .source_client_error()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "reconnect failed".to_string());
+                // A refusal's own sentence, not "server rejected handshake
+                // (version N): …", which reads like a protocol problem.
+                let reason = match err.source_client_error() {
+                    Some(ClientError::HandshakeRejected { error, .. }) => error.clone(),
+                    Some(other) => other.to_string(),
+                    None => "reconnect failed".to_string(),
+                };
                 crate::logging::remote_client_reconnect_gave_up(
                     &ended.target,
                     &reason,
@@ -6350,9 +6353,9 @@ mod tests {
         assert_eq!(attempts, 2);
         match result {
             Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp { reason, .. })) => {
-                assert!(
-                    reason.contains("upgrade"),
-                    "the refusal is the reason: {reason}"
+                assert_eq!(
+                    reason, "upgrade",
+                    "the refusal's own sentence is the reason"
                 );
             }
             _ => panic!("a refused redial must end the outage as a give-up"),

@@ -113,6 +113,8 @@ reconnect = true
 reconnect_backoff_initial_ms = 500   # wait before the first redial
 reconnect_backoff_max_ms = 5000      # the wait doubles per redial, up to this
 reconnect_deadline_secs = 120        # give up this long after the drop
+reattach_grace_ms = 1500             # on the remote: wait this long for its server before calling it gone
+reattach_poll_ms = 100               # ... rechecking this often
 ```
 
 When enabled, `flk --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Flock's generated config.

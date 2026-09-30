@@ -1231,6 +1231,15 @@ pub struct RemoteConfig {
     /// Give up this long after the drop and fall back like a failed switch.
     /// Default: 120 s.
     pub reconnect_deadline_secs: u64,
+    /// On the REMOTE host: how long a redial waits for a server to be
+    /// listening before it concludes the server is gone. A live handoff
+    /// (`just apply` on a deployed host) unbinds and rebinds the socket, and a
+    /// redial landing in that gap must not be told the session is lost.
+    /// Default: 1500 ms.
+    pub reattach_grace_ms: u64,
+    /// How often a redial rechecks for the server within
+    /// `reattach_grace_ms`. Default: 100 ms.
+    pub reattach_poll_ms: u64,
 }
 
 impl Default for RemoteConfig {
@@ -1241,6 +1250,8 @@ impl Default for RemoteConfig {
             reconnect_backoff_initial_ms: 500,
             reconnect_backoff_max_ms: 5_000,
             reconnect_deadline_secs: 120,
+            reattach_grace_ms: 1_500,
+            reattach_poll_ms: 100,
         }
     }
 }
@@ -1262,6 +1273,17 @@ impl RemoteConfig {
             max,
             deadline: Duration::from_secs(self.reconnect_deadline_secs),
         })
+    }
+}
+
+impl RemoteConfig {
+    /// The reattach grace window and its poll step. The step is at least a
+    /// millisecond, so a zero cannot turn the recheck into a spin.
+    pub fn reattach_grace(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.reattach_grace_ms),
+            Duration::from_millis(self.reattach_poll_ms.max(1)),
+        )
     }
 }
 
