@@ -230,7 +230,8 @@ impl App {
                     latency_ms: peer.latency_ms,
                     workspaces: peer.workspaces.clone(),
                     age_secs,
-                    error: peer.error.clone(),
+                    // #428: the token only; ssh's words stay in our log.
+                    error: peer.error.as_deref().map(crate::peers::wire_error),
                     origin: origin.clone(),
                     // Gossip v3 (#101 part 2): we ARE the origin for our own
                     // polled peers, so the origin's assertion is our
@@ -588,7 +589,7 @@ impl App {
                 let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
                 let label = switch_label(&name, target);
                 let focus_workspace = focus_target(target);
-                let proxy_jump = entry.proxy_jump.clone();
+                let proxy_jump = Some(self.relayed_route(relayed, &short_host_name())?);
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
                     ssh_target,
@@ -686,8 +687,9 @@ impl App {
     fn outgoing_fleet_snapshot(&self, exclude_ssh_target: &str) -> crate::protocol::FleetSnapshot {
         let us = short_host_name();
         // Gossip v3 (#101 part 3): stamp our own reachable identity on every
-        // peer we contribute — the client's next-leg bridge uses it as
+        // peer we polled ourselves. The client's next-leg bridge uses it as
         // `-o ProxyJump=<us>` to reach peers only routable through this hub.
+        // A relayed row needs the relayer too, see `relayed_route` (#441).
         let stamp_proxy_jump = |mut peer: crate::protocol::FleetPeer| {
             peer.proxy_jump.get_or_insert_with(|| us.clone());
             peer
@@ -712,12 +714,13 @@ impl App {
             .filter(|(_, entry)| !entry.hub_pushed)
             .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
-        ours.extend(
-            relayed
-                .into_iter()
-                .map(|(_, entry)| relayed_peer_to_wire(entry))
-                .map(stamp_proxy_jump),
-        );
+        // A row with no route (its relayer left our `[[peers]]`) is display
+        // only here, so it is not carried to where it would be dialled.
+        ours.extend(relayed.into_iter().filter_map(|(_, entry)| {
+            let mut peer = relayed_peer_to_wire(entry);
+            peer.proxy_jump = Some(self.relayed_route(entry, &us)?);
+            Some(peer)
+        }));
 
         match self.state.fleet_snapshot.as_ref() {
             Some(carried) => {
@@ -743,6 +746,36 @@ impl App {
                 origin_summary: Some(Box::new(self.origin_self_summary())),
             },
         }
+    }
+
+    /// The `ProxyJump` chain that reaches a relayed row, written from the
+    /// client's side of this server (#441): through us, then through the
+    /// relayer that polls the row.
+    ///
+    /// A relayed row's `ssh_target` is the RELAYER's name for that machine
+    /// (anvil's `ws00860001` for ksb), which resolves nowhere else. Stamping
+    /// it with this server alone sent `ssh -J mba22 ws00860001`, a name mba22
+    /// cannot resolve. The relayer hop is how THIS server reaches the relayer:
+    /// its own `[[peers]]` target, nothing the row says about itself.
+    ///
+    /// `None` when the relayer is no longer one of our `[[peers]]` (the cache
+    /// outlives a config edit until eviction). The row is then display-only:
+    /// a relayer the operator removed does not get to pick a jump host.
+    ///
+    /// The client cuts whichever leading hops are its own machine at dial
+    /// time, so the chain stays correct whether the client runs here, on the
+    /// relayer, or anywhere else. Only a first-hand relayed row reaches here:
+    /// a hub-pushed row is never dialled.
+    fn relayed_route(&self, entry: &crate::peers::RelayedEntry, us: &str) -> Option<String> {
+        let via = entry.via.as_deref()?;
+        let relayer = self
+            .state
+            .peer_summaries
+            .iter()
+            .find(|peer| peer.peer == via)
+            .map(|peer| peer.ssh_target.as_str())
+            .filter(|hop| !hop.is_empty())?;
+        Some(format!("{us},{relayer}"))
     }
 
     /// This server as a PEER entry for a pass-through snapshot — unlike
@@ -1165,6 +1198,11 @@ mod tests {
                 proxy_jump: Some("anvil".into()),
                 icon: None,
             })
+            .map(|mut entry| {
+                // Relayed by the anvil we poll, as a real poll merge records.
+                entry.via = Some("anvil".into());
+                entry
+            })
             .expect("fixture destination is a valid ssh target"),
         );
 
@@ -1189,6 +1227,190 @@ mod tests {
         assert!(
             !targets.contains(&"lars@anvil"),
             "hop target excluded: {targets:?}"
+        );
+    }
+
+    /// A row `anvil` relays about `ksb`, with the target only anvil resolves.
+    fn relayed_by_anvil(name: &str, ssh_target: &str) -> crate::api::schema::RelayedFleetPeer {
+        crate::api::schema::RelayedFleetPeer {
+            dial: None,
+            name: name.into(),
+            ssh_target: ssh_target.into(),
+            host: Some(name.into()),
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: Some(3),
+            error: None,
+            origin: "anvil.invalid".into(),
+            origin_last_ok_secs: Some(3),
+            proxy_jump: Some("anvil.invalid".into()),
+            icon: None,
+        }
+    }
+
+    fn snapshot_jump<'a>(fleet: &'a crate::protocol::FleetSnapshot, name: &str) -> Option<&'a str> {
+        fleet
+            .peers
+            .iter()
+            .find(|peer| peer.name == name)
+            .unwrap_or_else(|| panic!("{name} rides the snapshot: {:?}", fleet.peers))
+            .proxy_jump
+            .as_deref()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_row_routes_via_its_relayer_and_a_polled_one_via_the_hub() {
+        // #441: the hub stamped EVERY row with itself, so ksb (which only
+        // anvil can resolve as `ws00860001`) became `ssh -J mba22 ws00860001`.
+        let us = crate::app::short_host_name();
+        let mut app = test_app();
+        app.state.peer_summaries = vec![
+            summary("anvil.invalid", "lars@anvil.tailnet"),
+            summary("spoke1.invalid", "lars@spoke1.invalid"),
+        ];
+        crate::peers::merge_relayed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![relayed_by_anvil("ksb.invalid", "ws00860001")],
+            "anvil.invalid",
+        );
+
+        let prepared = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 1,
+                ws_idx: None,
+            })
+            .expect("switch to spoke1");
+        let fleet = prepared.fleet.expect("a snapshot rides the leg");
+        let chain = format!("{us},lars@anvil.tailnet");
+        assert_eq!(snapshot_jump(&fleet, "anvil.invalid"), Some(us.as_str()));
+        assert_eq!(snapshot_jump(&fleet, "ksb.invalid"), Some(chain.as_str()));
+
+        // The hub's own click on the relayed row takes the same route.
+        let direct = app
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "ksb.invalid".into(),
+                ws_idx: None,
+            })
+            .expect("a relayed row is dialable");
+        assert_eq!(direct.ssh_target, "ws00860001");
+        assert_eq!(direct.proxy_jump.as_deref(), Some(chain.as_str()));
+
+        // Dialled from the hub itself: the polled peer goes direct, the
+        // relayed one via the relayer only. From anywhere else, both hops.
+        let from_hub = |jump: Option<&str>| {
+            jump.and_then(|j| crate::remote::relative_proxy_jump(j, &[us.as_str()]))
+        };
+        assert_eq!(from_hub(snapshot_jump(&fleet, "anvil.invalid")), None);
+        assert_eq!(
+            from_hub(snapshot_jump(&fleet, "ksb.invalid")).as_deref(),
+            Some("lars@anvil.tailnet")
+        );
+        assert_eq!(
+            crate::remote::relative_proxy_jump(&chain, &["laptop.invalid"]).as_deref(),
+            Some(chain.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_row_whose_relayer_left_config_is_display_only() {
+        // The relay cache outlives a `[[peers]]` edit until eviction. A relayer
+        // the operator removed must not keep choosing a jump host: the row is
+        // neither dialled nor carried to a server that would dial it.
+        let mut app = test_app();
+        app.state.peer_summaries = vec![summary("spoke1.invalid", "lars@spoke1.invalid")];
+        crate::peers::merge_relayed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![relayed_by_anvil("ksb.invalid", "ws00860001")],
+            "anvil.invalid",
+        );
+        assert!(app
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "ksb.invalid".into(),
+                ws_idx: None,
+            })
+            .is_none());
+        let fleet = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: None,
+            })
+            .and_then(|prepared| prepared.fleet)
+            .expect("a snapshot rides the leg");
+        assert!(
+            fleet.peers.iter().all(|peer| peer.name != "ksb.invalid"),
+            "{:?}",
+            fleet.peers
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hub_pushed_row_still_cannot_be_dialled_or_carried() {
+        // #410/#425: the route change must not widen what a push can make a
+        // client dial. A pushed row with no carried route stays display-only,
+        // and never rides an outgoing snapshot where it WOULD be dialled.
+        let mut app = test_app();
+        app.state.peer_summaries = vec![summary("spoke1.invalid", "lars@spoke1.invalid")];
+        crate::peers::merge_hub_pushed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![hub_row("ksb.invalid", "ws00860001", 0)],
+            "mba22",
+        );
+        assert!(app.state.relayed_fleet_cache["ksb.invalid"].hub_pushed);
+        assert!(app
+            .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
+                host_key: "ksb.invalid".into(),
+                ws_idx: None,
+            })
+            .is_none());
+        let fleet = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 0,
+                ws_idx: None,
+            })
+            .and_then(|prepared| prepared.fleet)
+            .expect("a snapshot rides the leg");
+        assert!(
+            fleet.peers.iter().all(|peer| peer.name != "ksb.invalid"),
+            "{:?}",
+            fleet.peers
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_error_leaves_as_a_token_not_ssh_text() {
+        // #428: `error` crossed to every poller and spoke as ssh's stderr
+        // line, host names and ports included. Only the token leaves now.
+        let mut app = test_app();
+        let mut failing = summary("spoke1.invalid", "lars@spoke1.invalid");
+        failing.error =
+            Some("ssh: connect to host sage.internal port 22: Connection refused".into());
+        app.state.peer_summaries = vec![failing, summary("anvil", "lars@anvil")];
+
+        let row = app.own_relayed_fleet().remove(0);
+        assert_eq!(row.error.as_deref(), Some("connect_refused"));
+
+        let fleet = app
+            .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
+                peer_idx: 1,
+                ws_idx: None,
+            })
+            .and_then(|prepared| prepared.fleet)
+            .expect("a snapshot rides the leg");
+        let carried = fleet
+            .peers
+            .iter()
+            .find(|peer| peer.name == "spoke1.invalid")
+            .unwrap();
+        assert_eq!(carried.error.as_deref(), Some("connect_refused"));
+
+        // And the receiver still reads the reason out of it.
+        let received = crate::peers::peer_from_wire(carried.clone());
+        assert_eq!(
+            received.shown_failure_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
         );
     }
 

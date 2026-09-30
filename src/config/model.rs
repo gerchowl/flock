@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -842,6 +843,14 @@ pub struct PeerConfig {
     /// Short host badge shown on remote rows (e.g. "anvil"). Required.
     pub name: String,
     /// SSH destination used for polling and attach. Defaults to `name`.
+    ///
+    /// A client that switches here from another machine dials this value as
+    /// a LATER `ProxyJump` hop (`-J <hub>,<ssh>`) when this peer relays rows
+    /// the client reaches through it (#441). ssh reads that hop's name from
+    /// the CLIENT's ssh config and has the hub resolve the result in DNS, so a
+    /// `Host` alias defined only in the hub's `~/.ssh/config` does not resolve
+    /// there. Prefer a name that resolves everywhere (a tailnet name) or
+    /// define the same alias on the clients.
     pub ssh: String,
     /// Command run on the peer to fetch its summary. The default wraps the
     /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
@@ -1248,13 +1257,94 @@ pub struct RemoteConfig {
     /// Add a keepalive fallback under the user's ssh config for the `--remote`
     /// bridge. Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Redial in place when a remote leg's transport drops (#436) — the Mac
+    /// slept, the Wi-Fi changed, the bridge ssh died — instead of ending the
+    /// session. The last frame stays up under a "reconnecting" bar until the
+    /// server answers again, the deadline passes, or the operator presses Esc.
+    /// Default: true.
+    pub reconnect: bool,
+    /// Wait before the first redial after a drop. Each later redial waits
+    /// twice as long, up to `reconnect_backoff_max_ms`. Default: 500 ms.
+    pub reconnect_backoff_initial_ms: u64,
+    /// Longest wait between two redials. Default: 5000 ms.
+    pub reconnect_backoff_max_ms: u64,
+    /// Give up this long after the drop and fall back like a failed switch.
+    /// Default: 120 s.
+    pub reconnect_deadline_secs: u64,
+    /// On the REMOTE host: how long a redial waits for a server to be
+    /// listening before it concludes the server is gone. A live handoff
+    /// (`just apply` on a deployed host) unbinds and rebinds the socket, and a
+    /// redial landing in that gap must not be told the session is lost.
+    /// Default: 1500 ms.
+    pub reattach_grace_ms: u64,
+    /// How often a redial rechecks for the server within
+    /// `reattach_grace_ms`. Default: 100 ms.
+    pub reattach_poll_ms: u64,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            reconnect: true,
+            reconnect_backoff_initial_ms: 500,
+            reconnect_backoff_max_ms: 5_000,
+            reconnect_deadline_secs: 120,
+            reattach_grace_ms: 1_500,
+            reattach_poll_ms: 100,
         }
+    }
+}
+
+impl RemoteConfig {
+    /// The redial schedule for a dropped remote leg, or `None` when reconnect
+    /// is off. Small values are clamped so a typo cannot turn the backoff into
+    /// an ssh spawn storm (#294): every step waits at least
+    /// [`RECONNECT_BACKOFF_FLOOR`], and the cap is never below the first step.
+    pub fn reconnect_policy(&self) -> Option<ReconnectPolicy> {
+        if !self.reconnect {
+            return None;
+        }
+        let initial =
+            Duration::from_millis(self.reconnect_backoff_initial_ms).max(RECONNECT_BACKOFF_FLOOR);
+        let max = Duration::from_millis(self.reconnect_backoff_max_ms).max(initial);
+        Some(ReconnectPolicy {
+            initial,
+            max,
+            deadline: Duration::from_secs(self.reconnect_deadline_secs),
+        })
+    }
+}
+
+impl RemoteConfig {
+    /// The reattach grace window and its poll step. The step is at least a
+    /// millisecond, so a zero cannot turn the recheck into a spin.
+    pub fn reattach_grace(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.reattach_grace_ms),
+            Duration::from_millis(self.reattach_poll_ms.max(1)),
+        )
+    }
+}
+
+/// The shortest wait between two redials of a dropped remote leg, whatever the
+/// config says. Each redial spawns an ssh, so this caps that rate.
+pub const RECONNECT_BACKOFF_FLOOR: Duration = Duration::from_millis(100);
+
+/// When a dropped remote leg redials, and when it stops trying (#436).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    pub initial: Duration,
+    pub max: Duration,
+    pub deadline: Duration,
+}
+
+impl ReconnectPolicy {
+    /// The wait before redial number `attempt` (0-based): `initial`, doubled
+    /// per attempt, capped at `max`.
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
     }
 }
 
@@ -1576,6 +1666,41 @@ impl Default for AdvancedConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reconnect_backoff_doubles_to_its_cap() {
+        let policy = RemoteConfig::default()
+            .reconnect_policy()
+            .expect("reconnect is on by default");
+        assert_eq!(policy.backoff(0), Duration::from_millis(500));
+        assert_eq!(policy.backoff(1), Duration::from_millis(1_000));
+        assert_eq!(policy.backoff(3), Duration::from_millis(4_000));
+        assert_eq!(policy.backoff(4), Duration::from_millis(5_000));
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(policy.deadline, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn reconnect_policy_clamps_zeros_and_honours_the_kill_switch() {
+        let zeros = RemoteConfig {
+            reconnect_backoff_initial_ms: 0,
+            reconnect_backoff_max_ms: 0,
+            ..RemoteConfig::default()
+        };
+        let policy = zeros.reconnect_policy().expect("still on");
+        assert_eq!(
+            policy.backoff(0),
+            RECONNECT_BACKOFF_FLOOR,
+            "never a spawn storm"
+        );
+        assert!(policy.max >= policy.initial);
+
+        let off = RemoteConfig {
+            reconnect: false,
+            ..RemoteConfig::default()
+        };
+        assert!(off.reconnect_policy().is_none());
+    }
 
     #[test]
     fn msg_policy_is_open_by_default_and_narrows_by_host() {

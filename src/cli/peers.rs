@@ -159,20 +159,26 @@ fn print_logs_json(records: &[crate::logging::LogLine]) {
 
 fn print_logs_human(records: &[crate::logging::LogLine], show_host: bool) {
     for record in records {
-        let host = if show_host {
-            format!("{} ", record.host.as_deref().unwrap_or("?"))
-        } else {
-            String::new()
-        };
-        println!(
-            "{ts}  {level:<5}  {host}{target}: {message}",
-            ts = record.ts,
-            level = record.level,
-            host = host,
-            target = record.target,
-            message = record.message,
-        );
+        println!("{}", log_line_human(record, show_host));
     }
+}
+
+/// One `flk peers logs` line. Host, target and message can come from another
+/// machine's log, so each passes [`printable`] before it reaches the terminal
+/// (#428), the same boundary `flk peers status` holds.
+fn log_line_human(record: &crate::logging::LogLine, show_host: bool) -> String {
+    let host = if show_host {
+        format!("{} ", printable(record.host.as_deref().unwrap_or("?")))
+    } else {
+        String::new()
+    };
+    format!(
+        "{ts}  {level:<5}  {host}{target}: {message}",
+        ts = printable(&record.ts),
+        level = printable(&record.level),
+        target = printable(&record.target),
+        message = printable(&record.message),
+    )
 }
 
 /// This server's federated summary (workspaces + agent statuses). Peer
@@ -234,11 +240,28 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
         println!("no peers configured");
         return Ok(0);
     }
-    let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
-    for row in &rows {
-        println!("{:width$}  {}", printable(&row.name), peer_status_line(row));
+    for line in status_table(&rows) {
+        println!("{line}");
     }
     Ok(0)
+}
+
+/// The `flk peers status` table, one line per peer, the name column padded to
+/// the widest name AS PRINTED (#428): measuring the raw name counted the
+/// control bytes `printable` strips, so a planted escape pushed every other
+/// row's status column out.
+fn status_table(rows: &[crate::api::schema::RelayedFleetPeer]) -> Vec<String> {
+    let names: Vec<String> = rows.iter().map(|row| printable(&row.name)).collect();
+    let width = names
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    names
+        .iter()
+        .zip(rows)
+        .map(|(name, row)| format!("{name:width$}  {}", peer_status_line(row)))
+        .collect()
 }
 
 /// Text from another host made safe for this terminal: control sequences
@@ -266,7 +289,9 @@ fn peer_status_line(row: &crate::api::schema::RelayedFleetPeer) -> String {
                 }
                 down.push(')');
             }
-            if let Some(error) = error {
+            // A current peer sends the reason token as `error` too (#428):
+            // say it once.
+            if let Some(error) = error.as_deref().filter(|error| *error != reason) {
                 down.push_str(&format!(": {}", printable(error)));
             }
             down
@@ -867,6 +892,72 @@ mod tests {
         assert!(line.contains("down  auth_refused (3 polls, 45s)"), "{line}");
         assert!(line.contains("Permission denied more"), "{line}");
         assert!(line.contains("[no relay stream: auth_refused]"), "{line}");
+    }
+
+    fn status_row(name: &str, error: Option<&str>) -> crate::api::schema::RelayedFleetPeer {
+        crate::api::schema::RelayedFleetPeer {
+            dial: None,
+            name: name.into(),
+            ssh_target: "sage".into(),
+            host: None,
+            version: None,
+            protocol: None,
+            system: None,
+            latency_ms: None,
+            workspaces: Vec::new(),
+            age_secs: None,
+            error: error.map(Into::into),
+            origin: "hub".into(),
+            origin_last_ok_secs: None,
+            proxy_jump: None,
+            icon: None,
+        }
+    }
+
+    /// #428: the name column is as wide as the widest name AS PRINTED. A
+    /// planted escape is stripped from the name, and must not widen the
+    /// column for every other row either.
+    #[test]
+    fn the_status_column_lines_up_after_names_are_stripped() {
+        let rows = vec![
+            status_row("sage\u{1b}[31m\u{1b}[0m", None),
+            status_row("anvil", None),
+        ];
+        let lines = super::status_table(&rows);
+        assert_eq!(lines, vec!["sage   ok", "anvil  ok"]);
+    }
+
+    /// #428: a current peer sends the reason token as `error`, so the status
+    /// line states it once rather than `down  timeout (…): timeout`.
+    #[test]
+    fn a_token_error_is_not_repeated_after_the_reason() {
+        let mut row = status_row("sage", Some("timeout"));
+        row.dial = Some(crate::api::schema::PeerDialReport {
+            reason: Some("timeout".into()),
+            consecutive_failures: 2,
+            failing_secs: None,
+            stream_reason: None,
+        });
+        assert_eq!(super::peer_status_line(&row), "down  timeout (2 polls)");
+    }
+
+    /// #428: `flk peers logs` prints host, target and message from another
+    /// machine's log. None of them may hand the operator's terminal an
+    /// escape sequence.
+    #[test]
+    fn peers_logs_strips_control_sequences_from_remote_fields() {
+        let record = crate::logging::LogLine {
+            ts: "2026-09-30T00:07:00Z".into(),
+            level: "WARN".into(),
+            target: "flock::\u{1b}]52;c;cHduZWQ=\u{7}peers".into(),
+            message: "\u{1b}[2Jdial failed\r\nagain".into(),
+            source: None,
+            host: Some("ksb\u{1b}[31m".into()),
+        };
+        let line = super::log_line_human(&record, true);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("ksb flock::"), "{line}");
+        assert!(line.contains("dial failed again"), "{line}");
     }
 
     /// #4, the whole bug in one assertion. A burst that ENDS inside the

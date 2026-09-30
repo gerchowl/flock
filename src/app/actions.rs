@@ -2834,8 +2834,17 @@ impl AppState {
         if close_indices.is_empty() {
             return;
         }
-        self.selection = None;
-        self.selection_autoscroll = None;
+        // A text selection survives only a close of some other workspace.
+        let selection_survives = self.selection.as_ref().is_some_and(|selection| {
+            self.workspaces.iter().enumerate().any(|(idx, ws)| {
+                !close_indices.contains(&idx)
+                    && ws.find_tab_index_for_pane(selection.pane_id).is_some()
+            })
+        });
+        if !selection_survives {
+            self.selection = None;
+            self.selection_autoscroll = None;
+        }
         self.mark_session_dirty();
 
         let mut terminal_ids = Vec::new();
@@ -3932,8 +3941,8 @@ impl AppState {
                 // thread: this is the one place the loop applies the update,
                 // and stamping here keeps `system_stats` and `system_stats_at`
                 // moving together without threading a clock through the
-                // sampler. The status line reads both via
-                // `AppState::system_stats_fresh_at` and shows a placeholder
+                // sampler. The status line and self row read both via
+                // `AppState::system_stats_reading_at` and dim the last values
                 // once the pair falls behind — the `src/peers.rs:196`
                 // doctrine applied to the sampler.
                 self.system_stats = Some(stats);
@@ -4810,7 +4819,6 @@ impl AppState {
         }
 
         let pane_terminal_id = self.terminal_id_for_pane(ws_idx, pane_id);
-        let workspace_terminal_ids = self.terminal_ids_for_workspace(ws_idx);
         self.pane_id_aliases.retain(|_, alias| *alias != pane_id);
         let should_close_workspace = {
             let ws = &mut self.workspaces[ws_idx];
@@ -4819,23 +4827,13 @@ impl AppState {
         self.mark_session_dirty();
 
         if should_close_workspace {
-            self.workspaces.remove(ws_idx);
-            self.remove_unattached_terminal_ids(workspace_terminal_ids);
-            if self.workspaces.is_empty() {
-                self.set_active_workspace(None);
-                self.selected = 0;
-                if self.mode == Mode::Terminal {
-                    self.mode = Mode::Navigate;
-                }
-            } else {
-                if let Some(active) = self.active {
-                    if active >= self.workspaces.len() {
-                        self.set_active_workspace(Some(self.workspaces.len() - 1));
-                    }
-                }
-                if self.selected >= self.workspaces.len() {
-                    self.selected = self.workspaces.len() - 1;
-                }
+            // The last shell exiting is one more door to the one close tail
+            // (#429): focus stays put by id and WorkspaceClosed is announced.
+            // `remove_pane` leaves the last pane in place when it asks for the
+            // close, so the tail's own teardown reaps its terminal too.
+            self.close_workspace_indices(vec![ws_idx]);
+            if self.workspaces.is_empty() && self.mode == Mode::Terminal {
+                self.mode = Mode::Navigate;
             }
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);

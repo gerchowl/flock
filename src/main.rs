@@ -163,6 +163,10 @@ enum AttachLeg {
 /// bailing here.
 fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
     let switch_file = std::env::temp_dir().join(format!("flock-switch-{}", std::process::id()));
+    // The shell's own terminal settings, taken before any leg goes raw, so a
+    // chain that ends on an error can hand back a cooked terminal before
+    // anything prints (#436).
+    client::capture_terminal_for_crash_restore();
     // Inherited by the (possibly nested) client process of every leg.
     std::env::set_var(client::SWITCH_FILE_ENV_VAR, &switch_file);
 
@@ -185,6 +189,13 @@ fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
             std::env::set_var(client::HELD_TERMINAL_ENV_VAR, "1");
         } else {
             std::env::remove_var(client::HELD_TERMINAL_ENV_VAR);
+        }
+        // A leg with somewhere to fall back to may exit holding its frame
+        // when it gives up reconnecting (#436): the fallback leg repaints it.
+        if previous.is_some() {
+            std::env::set_var(client::LEG_FALLBACK_ENV_VAR, "1");
+        } else {
+            std::env::remove_var(client::LEG_FALLBACK_ENV_VAR);
         }
         let result = match &leg {
             AttachLeg::Local => server::autodetect::auto_detect_launch(),
@@ -232,6 +243,10 @@ fn run_attach_legs(first: AttachLeg) -> io::Result<()> {
                 // stranded in a frozen alt-screen with raw mode on.
                 if restore_terminal {
                     client::force_restore_host_terminal();
+                } else if result.is_err() {
+                    // The error is printed next, and a leg chained in behind
+                    // a held frame may have left the terminal raw (#436).
+                    client::restore_cooked_termios();
                 }
                 return result;
             }
@@ -311,10 +326,7 @@ fn decide_next_leg(
         // shell. A clean exit, or a failure with nowhere to fall back, ends.
         None => match (result, previous) {
             (Err(err), Some((fallback, target_label))) => LegStep::FallBack {
-                notice: format!(
-                    "switch to {target_label} failed: {}",
-                    switch_failure_reason(&err)
-                ),
+                notice: fallback_notice(&target_label, &err),
                 to: fallback,
                 previous: None,
             },
@@ -334,6 +346,34 @@ fn switch_failure_label(leg: &AttachLeg) -> String {
     match leg {
         AttachLeg::Local => "home".to_string(),
         AttachLeg::Remote(launch) => launch.target.clone(),
+    }
+}
+
+/// The top-right notice for a leg that fell back (#63): a switch that failed,
+/// or an established leg that lost its transport and gave up redialing
+/// (#436), which is no failed switch and should not read like one.
+fn fallback_notice(target_label: &str, err: &io::Error) -> String {
+    let gave_up = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<remote::ReconnectGaveUp>());
+    match gave_up {
+        Some(gave_up) => gave_up.to_string(),
+        None => format!(
+            "switch to {target_label} failed: {}",
+            switch_failure_reason(err)
+        ),
+    }
+}
+
+/// Print the error a leg chain ended on. The terminal is already restored.
+/// A leg that gave up reconnecting (#436) printed its own reason on the way
+/// out, so saying it again would only add a line.
+fn report_attach_chain_error(err: &io::Error) {
+    let gave_up = err
+        .get_ref()
+        .is_some_and(|inner| inner.is::<remote::ReconnectGaveUp>());
+    if !gave_up {
+        eprintln!("flk: {err}");
     }
 }
 
@@ -387,7 +427,9 @@ fn main() -> io::Result<()> {
 
     // Subcommands and flags (no TUI, no logging needed)
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
-        return remote::run_remote_client_bridge();
+        return remote::run_remote_client_bridge(
+            args.iter().any(|arg| arg == remote::REATTACH_FLAG),
+        );
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
@@ -600,7 +642,11 @@ fn main() -> io::Result<()> {
     }
 
     if let Some(remote_launch) = remote_launch {
-        return run_attach_legs(AttachLeg::Remote(remote_launch));
+        if let Err(err) = run_attach_legs(AttachLeg::Remote(remote_launch)) {
+            report_attach_chain_error(&err);
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     let loaded_config = config::Config::load();
@@ -612,7 +658,7 @@ fn main() -> io::Result<()> {
     // Check if a server is running, spawn one if needed, then attach as client.
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
-            eprintln!("flk: {err}");
+            report_attach_chain_error(&err);
             std::process::exit(1);
         }
         return Ok(());
@@ -881,6 +927,27 @@ mod tests {
             LegStep::FallBack { to, notice, .. } => {
                 assert_eq!(to, AttachLeg::Local);
                 assert_eq!(notice, "switch to lars@sage failed: connection refused");
+            }
+            _ => panic!("expected FallBack"),
+        }
+    }
+
+    #[test]
+    fn a_leg_that_gave_up_reconnecting_falls_back_saying_the_connection_was_lost() {
+        // #436: an established leg lost its transport and gave up redialing.
+        // It falls back like a failed switch, but the notice names what
+        // happened rather than blaming a switch.
+        let err = io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            remote::ReconnectGaveUp {
+                target: "lars@sage".to_string(),
+            },
+        );
+        let previous = Some((AttachLeg::Local, "lars@sage".to_string()));
+        match decide_next_leg(&remote_leg("lars@sage"), None, Err(err), previous, true) {
+            LegStep::FallBack { to, notice, .. } => {
+                assert_eq!(to, AttachLeg::Local);
+                assert_eq!(notice, "lost connection to lars@sage");
             }
             _ => panic!("expected FallBack"),
         }

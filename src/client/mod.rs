@@ -296,13 +296,27 @@ static SWITCH_HANDOFF_PENDING: AtomicBool = AtomicBool::new(false);
 /// re-armed. While true, an abnormal exit must reclaim the terminal.
 static INHERITED_TERMINAL_HOLD: AtomicBool = AtomicBool::new(false);
 
-/// Whether the host terminal is currently held with nothing live to reclaim
-/// it: either this leg set the switch-handoff hold, or it inherited one from a
-/// previous leg. Used by [`HeldRestoreGuard`] to decide whether an abnormal
-/// exit must force a restore.
-fn host_terminal_is_held() -> bool {
+/// Set while a remote leg whose transport dropped keeps its last frame up and
+/// redials (#436). Like [`SWITCH_HANDOFF_PENDING`] it makes the terminal
+/// teardown keep the alternate screen and raw mode, so the operator keeps
+/// looking at their session under a "reconnecting" bar instead of a shell
+/// prompt. Cleared the moment the redial re-attaches, or by any full restore.
+static RECONNECT_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// Whether a switch holds the terminal for the NEXT leg to repaint: this leg's
+/// own pending handoff, or one it inherited and has not repainted yet.
+fn switch_holds_terminal() -> bool {
     SWITCH_HANDOFF_PENDING.load(Ordering::Acquire)
         || INHERITED_TERMINAL_HOLD.load(Ordering::Acquire)
+}
+
+/// Whether the host terminal is currently held with nothing live to reclaim
+/// it: this leg set the switch-handoff hold, inherited one from a previous
+/// leg, or is holding its last frame while it reconnects (#436). Used by
+/// [`HeldRestoreGuard`] to decide whether an abnormal exit must force a
+/// restore.
+fn host_terminal_is_held() -> bool {
+    switch_holds_terminal() || RECONNECT_HOLD.load(Ordering::Acquire)
 }
 
 /// True once this leg has written a host window title (#361), i.e. flock owns
@@ -416,15 +430,25 @@ fn mark_terminal_owned(owned: bool) {
 /// Whether a crash must reset the terminal: we own it AND it is not in a
 /// deliberate seamless-switch hold (where the next leg repaints it).
 fn crash_restore_armed() -> bool {
-    TERMINAL_OWNED.load(Ordering::Acquire) && !host_terminal_is_held()
+    // A reconnect hold is not a handoff: no next leg would repaint after a
+    // crash, so a crash while reconnecting must still reset the terminal.
+    TERMINAL_OWNED.load(Ordering::Acquire) && !switch_holds_terminal()
 }
 
 /// Capture the cooked termios once, before any raw mode, so the crash handler
-/// can restore it. Best-effort: a failure just means the handler emits the
-/// escape resets without the `tcsetattr`.
-fn capture_terminal_for_crash_restore() {
+/// and [`force_restore_host_terminal`] can restore it. Best-effort: a failure
+/// just means the restore emits the escape resets without the `tcsetattr`.
+///
+/// The launcher calls this before its first leg, while the terminal is still
+/// the shell's. A leg that inherited a held terminal (#69) skips it: what it
+/// would capture is the previous leg's raw mode, and "restoring" that is how
+/// a failed chain printed its last errors as a staircase (#436).
+pub fn capture_terminal_for_crash_restore() {
     if !ORIG_TERMIOS.load(Ordering::Acquire).is_null() {
         return; // already captured (first leg, cooked)
+    }
+    if INHERITED_TERMINAL_HOLD.load(Ordering::Acquire) {
+        return;
     }
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: tcgetattr fills `termios` for stdin; we read it only on success.
@@ -442,6 +466,21 @@ fn capture_terminal_for_crash_restore() {
         {
             // SAFETY: ptr came from Box::into_raw and was not published.
             drop(unsafe { Box::from_raw(ptr) });
+        }
+    }
+}
+
+/// Put back the termios captured by [`capture_terminal_for_crash_restore`], if
+/// any. crossterm's `disable_raw_mode` only undoes a raw mode THIS process
+/// enabled, and restores whatever it saw then — a raw terminal, in a leg
+/// chained in behind a held frame. Output after that has no carriage return
+/// on newline, so each line starts where the last one ended (#436).
+pub fn restore_cooked_termios() {
+    let termios = ORIG_TERMIOS.load(Ordering::Acquire);
+    if !termios.is_null() {
+        // SAFETY: ORIG_TERMIOS is a valid, never-freed pointer once published.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
         }
     }
 }
@@ -543,6 +582,9 @@ pub enum ClientError {
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
     Protocol(protocol::FramingError),
+    /// A remote leg's transport dropped and redialing stopped (#436): the
+    /// deadline passed or the operator pressed Esc.
+    ReconnectGaveUp { target: String, reason: String },
 }
 
 impl std::fmt::Display for ClientError {
@@ -591,6 +633,9 @@ impl std::fmt::Display for ClientError {
             }
             ClientError::Protocol(err) => {
                 write!(f, "protocol error: {err}")
+            }
+            ClientError::ReconnectGaveUp { target, reason } => {
+                write!(f, "lost connection to {target}: {reason}")
             }
         }
     }
@@ -739,7 +784,8 @@ fn restore_terminal_state(reset_modify_other_keys: bool) {
     // alt-screen and drop raw mode; skip it. The next leg's `ratatui::init()`
     // re-enters both and paints over the frozen frame. A real exit (detach,
     // error, quit) clears the flag and restores fully as before.
-    if SWITCH_HANDOFF_PENDING.load(Ordering::Acquire) {
+    // A dropped remote leg holds the same way while it redials (#436).
+    if SWITCH_HANDOFF_PENDING.load(Ordering::Acquire) || RECONNECT_HOLD.load(Ordering::Acquire) {
         let _ = io::stdout().flush();
         return;
     }
@@ -811,8 +857,10 @@ impl Drop for HeldRestoreGuard {
 pub fn force_restore_host_terminal() {
     SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
     INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+    RECONNECT_HOLD.store(false, Ordering::Release);
     mark_terminal_owned(false);
     let _ = crossterm::terminal::disable_raw_mode();
+    restore_cooked_termios();
     // Reset xterm modifyOtherKeys unconditionally: a held leg may have enabled
     // it (tmux/host-specific) and exited without resetting. Harmless on hosts
     // that never set it.
@@ -1074,23 +1122,28 @@ fn capture_host_terminal_theme() -> (Option<crate::terminal_theme::TerminalTheme
 }
 
 fn read_host_theme_replies() -> (Option<crate::terminal_theme::TerminalTheme>, Vec<u8>) {
-    use std::io::Read;
-
     if write_host_terminal_theme_query(io::stdout()).is_err() {
         return (None, Vec::new());
     }
+    // Never block in `read` (#352). `poll` saying "readable" is not a promise
+    // that a later `read` finds anything: another reader of the same tty can
+    // take the bytes in between, and a blocking read then waits for the
+    // operator's next keystroke with the handshake not yet sent. With
+    // VMIN=0/VTIME=0 an empty read returns 0 at once and the deadline below
+    // still bounds the wait. `disable_raw_mode` puts the saved termios back.
+    let _ = set_nonblocking_tty_reads(libc::STDIN_FILENO);
 
     let mut buf = Vec::new();
     let mut theme = crate::terminal_theme::TerminalTheme::default();
     let deadline = Instant::now() + HOST_THEME_CAPTURE_TIMEOUT;
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
     while Instant::now() < deadline {
-        match input::stdin_read_ready(&reader, HOST_THEME_CAPTURE_POLL_MS) {
+        match input::poll_read_ready(libc::STDIN_FILENO, HOST_THEME_CAPTURE_POLL_MS) {
             Some(true) => {
                 let mut scratch = [0u8; 1024];
-                match reader.read(&mut scratch) {
-                    Ok(0) => break,
+                match input::read_fd(libc::STDIN_FILENO, &mut scratch) {
+                    // Nothing there after all (someone else read it) or a
+                    // hung-up tty: keep waiting out the deadline.
+                    Ok(0) => {}
                     Ok(n) => {
                         buf.extend_from_slice(&scratch[..n]);
                         theme = theme_from_capture_buffer(&buf);
@@ -1113,6 +1166,26 @@ fn read_host_theme_replies() -> (Option<crate::terminal_theme::TerminalTheme>, V
         crate::logging::client_host_theme_captured(&format!("{:?}", theme));
     }
     ((!theme.is_empty()).then_some(theme), buf)
+}
+
+/// Make `read` on the tty `fd` return at once when nothing is buffered
+/// (VMIN=0, VTIME=0). Only for the theme capture's raw-mode window: the
+/// caller's `disable_raw_mode` restores the termios crossterm saved.
+fn set_nonblocking_tty_reads(fd: libc::c_int) -> io::Result<()> {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr fills `termios`; it is read only on success.
+    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr succeeded, so `termios` is initialised.
+    let mut termios = unsafe { termios.assume_init() };
+    termios.c_cc[libc::VMIN] = 0;
+    termios.c_cc[libc::VTIME] = 0;
+    // SAFETY: `termios` is a valid, fully initialised struct.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn theme_from_capture_buffer(buf: &[u8]) -> crate::terminal_theme::TerminalTheme {
@@ -1166,6 +1239,13 @@ impl AttachAttemptError {
                 reason: Some(reason),
             }) => reason == protocol::LIVE_HANDOFF_ATTACH_NOTICE,
             _ => false,
+        }
+    }
+
+    fn source_client_error(&self) -> Option<&ClientError> {
+        match self {
+            AttachAttemptError::Handshake(err) | AttachAttemptError::Session(err) => Some(err),
+            AttachAttemptError::TerminalSetup(_) => None,
         }
     }
 
@@ -1258,14 +1338,7 @@ impl HandoffRetry {
         let text = self.status_text();
 
         if host_terminal_is_held() {
-            // Bottom row, reverse-video bar, cursor parked then restored so the
-            // overlay never disturbs the frozen frame underneath.
-            let mut out = io::stdout();
-            let _ = write!(
-                out,
-                "\x1b7\x1b[9999;1H\x1b[K\x1b[7m {frame} {text} \x1b[0m\x1b8"
-            );
-            let _ = out.flush();
+            paint_held_status_bar(&format!("{frame} {text}"));
             self.painted_held = true;
             self.status_line_shown = true;
             return;
@@ -1286,16 +1359,305 @@ impl HandoffRetry {
     fn clear_status_line(&mut self) {
         use std::io::IsTerminal;
         if self.painted_held {
-            // Erase the bottom-row overlay we painted on the held screen.
-            let mut out = io::stdout();
-            let _ = write!(out, "\x1b7\x1b[9999;1H\x1b[K\x1b8");
-            let _ = out.flush();
+            clear_held_status_bar();
             self.painted_held = false;
         } else if self.status_line_shown && io::stderr().is_terminal() {
             let _ = write!(io::stderr(), "\r\x1b[K");
             let _ = io::stderr().flush();
         }
         self.status_line_shown = false;
+    }
+}
+
+/// Overlay `text` as a reverse-video bar on the bottom row of a HELD screen (a
+/// frozen frame, #63/#69/#436), with the cursor saved and restored around it
+/// so the frame underneath is not disturbed.
+fn paint_held_status_bar(text: &str) {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b7\x1b[9999;1H\x1b[K\x1b[7m {text} \x1b[0m\x1b8");
+    let _ = out.flush();
+}
+
+/// Erase the bar [`paint_held_status_bar`] drew.
+fn clear_held_status_bar() {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b7\x1b[9999;1H\x1b[K\x1b8");
+    let _ = out.flush();
+}
+
+// ---------------------------------------------------------------------------
+// In-place reconnect of a dropped remote leg (#436)
+// ---------------------------------------------------------------------------
+
+/// Env var the launcher sets on a leg it has a previous leg to fall back to
+/// (#63). A remote leg that gives up reconnecting then exits holding its frame
+/// for that fallback to repaint, exactly like a failed switch; without one it
+/// restores the terminal and says why.
+pub const LEG_FALLBACK_ENV_VAR: &str = "FLOCK_LEG_FALLBACK";
+
+/// Exit status of a client that gave up reconnecting (#436), so the launcher
+/// can tell "the transport is gone" from any other failure. EX_TEMPFAIL.
+pub const RECONNECT_GAVE_UP_EXIT_CODE: i32 = 75;
+
+/// The ssh target this client leg would redial, and how: set only for a remote
+/// leg (the launcher tags its client with the target) with `[remote]
+/// reconnect` on. A local attach has no transport to lose.
+///
+/// Never under `[slots] enabled`. A slots client flips its active connection
+/// in process, so the connection that drops is not necessarily the leg's
+/// bridge: after a flip to home, a lost home connection would be "recovered"
+/// by redialing the ORIGINAL remote and silently landing the operator there.
+/// Slots already has its own answer to a dying peer — demote it to home — so
+/// the redial is reserved for the launcher-leg client, where the only
+/// connection is the leg's own bridge.
+fn remote_reconnect_plan(
+    config: &crate::config::Config,
+    active_ssh_target: Option<String>,
+) -> Option<(String, crate::config::ReconnectPolicy)> {
+    if config.slots.enabled {
+        return None;
+    }
+    let target = active_ssh_target.filter(|t| !t.is_empty())?;
+    Some((target, config.remote.reconnect_policy()?))
+}
+
+/// Bytes that give up a reconnect: a bare Esc, or ctrl-c (raw mode delivers it
+/// as a byte, not a signal).
+fn is_reconnect_give_up_key(chunk: &[u8]) -> bool {
+    is_bare_esc_chunk(chunk) || chunk == [0x03]
+}
+
+/// What the reconnect loop does after one wait.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectStep {
+    /// Dial the bridge again.
+    Redial,
+    /// Stop trying, for this reason.
+    GiveUp(String),
+}
+
+/// One outage of a remote leg: from the transport drop to re-attach or give-up.
+struct Reconnect {
+    target: String,
+    policy: crate::config::ReconnectPolicy,
+    lost_at: Instant,
+    redials: u32,
+}
+
+impl Reconnect {
+    fn begin(target: String, policy: crate::config::ReconnectPolicy, err: &str) -> Self {
+        crate::logging::remote_client_transport_lost(&target, err);
+        Self {
+            target,
+            policy,
+            lost_at: Instant::now(),
+            redials: 0,
+        }
+    }
+
+    fn gap_ms(&self) -> u64 {
+        self.lost_at.elapsed().as_millis() as u64
+    }
+
+    fn status_text(&self) -> String {
+        format!(
+            "reconnecting to {}… ({}) · Esc to give up",
+            self.target,
+            self.redials + 1
+        )
+    }
+
+    /// Wait out one backoff step, then say whether to redial. One redial per
+    /// step and nothing between them: no polling, no spawn per tick (#294).
+    /// The wait ends early only on a give-up key or a quit signal.
+    fn next_step(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+        should_quit: &AtomicBool,
+    ) -> ReconnectStep {
+        let elapsed = self.lost_at.elapsed();
+        if elapsed >= self.policy.deadline {
+            return ReconnectStep::GiveUp(format!(
+                "no answer after {}s",
+                self.policy.deadline.as_secs()
+            ));
+        }
+        let delay = self
+            .policy
+            .backoff(self.redials)
+            .min(self.policy.deadline - elapsed);
+        if host_terminal_is_held() {
+            paint_held_status_bar(&self.status_text());
+        }
+        let cancelled = rt.block_on(wait_for_redial(stdin_rx, delay));
+        if cancelled {
+            return ReconnectStep::GiveUp("gave up".to_string());
+        }
+        if should_quit.load(Ordering::Acquire) {
+            return ReconnectStep::GiveUp("interrupted".to_string());
+        }
+        self.redials += 1;
+        ReconnectStep::Redial
+    }
+}
+
+/// Sleep `delay`, discarding typed input, unless a give-up key arrives first
+/// (returns true). Keys typed into a dead session are dropped: there is no
+/// server to deliver them to, and replaying them after the re-attach would
+/// land in whatever the operator is looking at by then.
+async fn wait_for_redial(
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    delay: Duration,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            chunk = stdin_rx.recv(), if stdin_open => match chunk {
+                Some(chunk) if is_reconnect_give_up_key(&chunk) => return true,
+                Some(_) => {}
+                None => stdin_open = false,
+            },
+        }
+    }
+}
+
+impl AttachAttemptError {
+    /// An established remote session whose transport dropped: the socket hit
+    /// EOF or a write failed. Not a panic's teardown, and never an exit the
+    /// operator asked for — quit, detach and switch arrive as `ServerShutdown`
+    /// or a clean return, so they can never start a reconnect.
+    fn is_transport_loss(&self) -> bool {
+        matches!(
+            self,
+            AttachAttemptError::Session(ClientError::ConnectionLost(_))
+        ) && !client_should_stop_for_panic()
+    }
+
+    /// While reconnecting: a redial that failed to connect or handshake, or a
+    /// session that dropped again. A server that answered and REFUSED (a
+    /// protocol mismatch, a shutdown) ends the reconnect: retrying cannot help.
+    fn is_redial_failure(&self) -> bool {
+        match self {
+            AttachAttemptError::Handshake(
+                ClientError::ConnectionFailed(_)
+                | ClientError::ConnectionLost(_)
+                | ClientError::Protocol(_),
+            ) => true,
+            AttachAttemptError::Session(_) => self.is_transport_loss(),
+            _ => false,
+        }
+    }
+}
+
+/// Shared by the attach loop and each attempt. An attempt calls
+/// [`Self::mark_attached`] the moment it has a live session again: that ends
+/// an outage (#436), and it has to be logged then, not when the re-attached
+/// session eventually ends.
+#[derive(Default)]
+struct AttachSignal {
+    outage: std::cell::RefCell<Option<Reconnect>>,
+}
+
+impl AttachSignal {
+    /// Record a live session. Returns true when it ends an outage.
+    fn mark_attached(&self) -> bool {
+        let Some(ended) = self.outage.borrow_mut().take() else {
+            return false;
+        };
+        crate::logging::remote_client_reconnected(&ended.target, ended.gap_ms(), ended.redials);
+        true
+    }
+}
+
+/// Attach, and keep attaching while the failure is one worth retrying: a live
+/// handoff in progress (#38), or, for a remote leg, a dropped transport
+/// (#436). Each redial is one `attempt`, which reports a live session through
+/// `signal`.
+fn attach_until_done<A>(
+    mut attempt: A,
+    signal: &AttachSignal,
+    reconnect_plan: Option<&(String, crate::config::ReconnectPolicy)>,
+    handoff_retry: &mut HandoffRetry,
+    rt: &tokio::runtime::Runtime,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    should_quit: &AtomicBool,
+) -> Result<(), AttachAttemptError>
+where
+    A: FnMut(&mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Result<(), AttachAttemptError>,
+{
+    loop {
+        let attempt_started = Instant::now();
+        let result = attempt(stdin_rx);
+        let err = match result {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        if should_quit.load(Ordering::Acquire) {
+            return Err(err);
+        }
+        if handoff_retry.should_retry(&err, attempt_started.elapsed()) {
+            handoff_retry.pause_before_retry();
+            continue;
+        }
+        let Some((target, policy)) = reconnect_plan else {
+            return Err(err);
+        };
+        let mut outage = signal.outage.borrow_mut();
+        let redial = match &*outage {
+            None => err.is_transport_loss(),
+            Some(_) => err.is_redial_failure(),
+        };
+        if !redial {
+            // A redial that reached the far end and was refused — the remote
+            // server is gone (`--reattach`), or now speaks another protocol —
+            // ends the outage like a give-up, so it falls back and says why.
+            if let Some(ended) = outage.take() {
+                // A refusal's own sentence, not "server rejected handshake
+                // (version N): …", which reads like a protocol problem.
+                let reason = match err.source_client_error() {
+                    Some(ClientError::HandshakeRejected { error, .. }) => error.clone(),
+                    Some(other) => other.to_string(),
+                    None => "reconnect failed".to_string(),
+                };
+                crate::logging::remote_client_reconnect_gave_up(
+                    &ended.target,
+                    &reason,
+                    ended.gap_ms(),
+                    ended.redials,
+                );
+                return Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp {
+                    target: ended.target,
+                    reason,
+                }));
+            }
+            return Err(err);
+        }
+        let current = outage.get_or_insert_with(|| {
+            let cause = err
+                .source_client_error()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            Reconnect::begin(target.clone(), *policy, &cause)
+        });
+        match current.next_step(rt, stdin_rx, should_quit) {
+            ReconnectStep::Redial => continue,
+            ReconnectStep::GiveUp(reason) => {
+                crate::logging::remote_client_reconnect_gave_up(
+                    &current.target,
+                    &reason,
+                    current.gap_ms(),
+                    current.redials,
+                );
+                return Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp {
+                    target: current.target.clone(),
+                    reason,
+                }));
+            }
+        }
     }
 }
 
@@ -1318,6 +1680,8 @@ fn run_attach_attempt(
     mouse_scroll_lines: usize,
     redraw_on_focus_gained: bool,
     attach_t0: Instant,
+    hold_on_transport_loss: bool,
+    signal: &AttachSignal,
 ) -> Result<(), AttachAttemptError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
@@ -1378,6 +1742,14 @@ fn run_attach_attempt(
         setup_terminal(false)
     }
     .map_err(AttachAttemptError::TerminalSetup)?;
+    // Live again. A reconnect hold (#436) ends here: this session owns the
+    // terminal, and its first frame repaints everything, the bar included.
+    RECONNECT_HOLD.store(false, Ordering::Release);
+    if signal.mark_attached() {
+        // Keys typed while the redial was connecting were aimed at a frozen
+        // frame, not at whatever the re-attached session now shows. Drop them.
+        while stdin_rx.try_recv().is_ok() {}
+    }
 
     let attach_escape = direct_attach.then(AttachEscapeState::default);
     let initial_input = pending_stdin.take();
@@ -1398,7 +1770,16 @@ fn run_attach_attempt(
         attach_t0,
     ));
 
-    // Restore the terminal before the caller prints anything.
+    // A remote leg whose transport dropped keeps its last frame up while it
+    // redials (#436): decide before the guard's restore runs. Everything else
+    // restores the terminal before the caller prints anything.
+    if hold_on_transport_loss
+        && matches!(result, Err(ClientError::ConnectionLost(_)))
+        && !should_quit.load(Ordering::Acquire)
+        && !client_should_stop_for_panic()
+    {
+        RECONNECT_HOLD.store(true, Ordering::Release);
+    }
     drop(_guard);
 
     result.map_err(AttachAttemptError::Session)
@@ -1495,6 +1876,11 @@ fn run_client_with_mode(
     let held_restore = HeldRestoreGuard::new();
 
     let loaded_config = crate::config::Config::load();
+    // Whether, and how, this leg redials a dropped transport (#436).
+    let reconnect_plan = remote_reconnect_plan(
+        &loaded_config.config,
+        std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR).ok(),
+    );
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let sound_config = loaded_config.config.ui.sound;
@@ -1534,13 +1920,10 @@ fn run_client_with_mode(
 
     // Spawn the stdin reader thread once, after the theme capture released
     // stdin. It outlives individual attach attempts so a handoff retry never
-    // leaves typed bytes stranded in a session-scoped reader.
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    // leaves typed bytes stranded in a session-scoped reader, and it stops
+    // when this leg returns, so it cannot steal the next leg's input (#352).
     let should_quit = Arc::new(AtomicBool::new(false));
-    let stdin_quit = should_quit.clone();
-    std::thread::spawn(move || {
-        input::stdin_reader_loop(stdin_tx, &stdin_quit);
-    });
+    let mut stdin_reader = input::StdinReader::spawn_stdin(should_quit.clone())?;
 
     // Install flock's terminal-restoring panic hook. It is re-asserted after
     // every `ratatui::try_init` (see setup_terminal_with_capabilities) because
@@ -1567,37 +1950,38 @@ fn run_client_with_mode(
 
     // Attach, retrying while the server refuses with the live-handoff notice
     // (#38): ~200ms pauses for up to ~30s behind a single status line, then
-    // the original error.
+    // the original error. A remote leg also redials in place when its
+    // transport drops (#436).
+    let attach_signal = AttachSignal::default();
     let mut handoff_retry = HandoffRetry::default();
-    let result = loop {
-        let attempt_started = Instant::now();
-        match run_attach_attempt(
-            &socket_path,
-            requested_encoding,
-            attach_request.as_ref(),
-            direct_attach,
-            kitty_graphics_enabled,
-            host_theme,
-            &mut pending_stdin,
-            &mut stdin_rx,
-            &rt,
-            &should_quit,
-            &sound_config,
-            mouse_scroll_lines,
-            redraw_on_focus_gained,
-            attach_t0,
-        ) {
-            Ok(()) => break Ok(()),
-            Err(err) => {
-                if should_quit.load(Ordering::Acquire)
-                    || !handoff_retry.should_retry(&err, attempt_started.elapsed())
-                {
-                    break Err(err);
-                }
-                handoff_retry.pause_before_retry();
-            }
-        }
-    };
+    let result = attach_until_done(
+        |stdin_rx| {
+            run_attach_attempt(
+                &socket_path,
+                requested_encoding,
+                attach_request.as_ref(),
+                direct_attach,
+                kitty_graphics_enabled,
+                host_theme,
+                &mut pending_stdin,
+                stdin_rx,
+                &rt,
+                &should_quit,
+                &sound_config,
+                mouse_scroll_lines,
+                redraw_on_focus_gained,
+                attach_t0,
+                reconnect_plan.is_some(),
+                &attach_signal,
+            )
+        },
+        &attach_signal,
+        reconnect_plan.as_ref(),
+        &mut handoff_retry,
+        &rt,
+        &mut stdin_reader.rx,
+        &should_quit,
+    );
     handoff_retry.clear_status_line();
 
     if let Err(attempt_err) = result {
@@ -1628,6 +2012,18 @@ fn run_client_with_mode(
             &err,
             ClientError::ServerShutdown { reason: Some(reason) } if reason == "switching"
         );
+        let gave_up_reconnecting = matches!(&err, ClientError::ReconnectGaveUp { .. });
+        if gave_up_reconnecting && std::env::var_os(LEG_FALLBACK_ENV_VAR).is_some() {
+            // A dropped leg that gave up falls back like a failed switch
+            // (#63, #436): keep the frame held for the leg the launcher
+            // re-attaches, say nothing here (the launcher's notice does), and
+            // exit with the status that tells the launcher why.
+            held_restore.into_handoff();
+            drop(stdin_reader);
+            rt.shutdown_timeout(Duration::from_millis(100));
+            crate::logging::shutdown("client");
+            std::process::exit(RECONNECT_GAVE_UP_EXIT_CODE);
+        }
         if switching {
             held_restore.into_handoff();
         } else if host_terminal_is_held() {
@@ -1653,6 +2049,7 @@ fn run_client_with_mode(
         if !is_clean_exit(&err) {
             let _ = writeln!(io::stderr(), "flock: {err}");
         }
+        drop(stdin_reader);
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -1665,7 +2062,11 @@ fn run_client_with_mode(
             return Ok(());
         }
 
-        std::process::exit(1);
+        std::process::exit(if gave_up_reconnecting {
+            RECONNECT_GAVE_UP_EXIT_CODE
+        } else {
+            1
+        });
     }
 
     // Clean leg exit: the terminal is already fully restored. Disarm so the
@@ -5589,5 +5990,391 @@ mod tests {
             matches!(result, Err(ClientError::ConnectionLost(_))),
             "home dying has no fallback and must be fatal"
         );
+    }
+
+    // --- #436: in-place reconnect of a dropped remote leg -------------------
+
+    fn reconnect_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    fn fast_policy(deadline: Duration) -> crate::config::ReconnectPolicy {
+        crate::config::ReconnectPolicy {
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(80),
+            deadline,
+        }
+    }
+
+    fn transport_loss() -> AttachAttemptError {
+        AttachAttemptError::Session(ClientError::ConnectionLost(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed connection",
+        )))
+    }
+
+    /// One attach attempt against a fake bridge socket: connect (a refused or
+    /// missing socket is a failed dial), count as attached, then read. EOF is
+    /// the transport dropping; one byte is a session that ended cleanly.
+    fn attach_over_socket(
+        socket: &Path,
+        attached: &AttachSignal,
+    ) -> Result<(), AttachAttemptError> {
+        use std::io::Read;
+        let mut stream = UnixStream::connect(socket)
+            .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
+        let _ = attached.mark_attached();
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(transport_loss()),
+            Err(err) => Err(AttachAttemptError::Session(ClientError::ConnectionLost(
+                err,
+            ))),
+        }
+    }
+
+    /// The acceptance test of #436, against a fake bridge socket: the first
+    /// session's transport drops, the socket then refuses dials for a while,
+    /// and then accepts again. The leg must ride that out and come back on
+    /// its own, never surfacing the drop as an error.
+    #[test]
+    fn a_dropped_remote_leg_redials_the_bridge_until_it_answers_again() {
+        use std::os::unix::net::UnixListener;
+
+        // Under /tmp, not temp_dir(): a nix-develop TMPDIR overflows sun_path.
+        let socket = std::path::PathBuf::from("/tmp")
+            .join(format!("flock-reconnect-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind fake bridge");
+        let bridge_socket = socket.clone();
+        let fake_bridge = std::thread::spawn(move || {
+            // The live session, then the drop: accept and hang up at once.
+            let (first, _) = listener.accept().expect("first accept");
+            drop(first);
+            // The transport is gone: dials fail for a while.
+            drop(listener);
+            let _ = std::fs::remove_file(&bridge_socket);
+            std::thread::sleep(Duration::from_millis(150));
+            // Back: a fresh listener answers the redial.
+            let listener = UnixListener::bind(&bridge_socket).expect("rebind fake bridge");
+            let (mut second, _) = listener.accept().expect("redial accept");
+            second.write_all(b"k").expect("answer the redial");
+            let _ = std::fs::remove_file(&bridge_socket);
+        });
+
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let plan = (
+            "fake-bridge".to_string(),
+            fast_policy(Duration::from_secs(10)),
+        );
+        let attached = AttachSignal::default();
+        let quit = AtomicBool::new(false);
+        let mut attempts = 0u32;
+        let mut result = None;
+        let out = crate::logging::capture_logs(|| {
+            result = Some(attach_until_done(
+                |_stdin| {
+                    attempts += 1;
+                    attach_over_socket(&socket, &attached)
+                },
+                &attached,
+                Some(&plan),
+                &mut HandoffRetry::default(),
+                &rt,
+                &mut stdin_rx,
+                &quit,
+            ));
+        });
+        fake_bridge.join().expect("fake bridge thread");
+
+        assert!(
+            matches!(result, Some(Ok(()))),
+            "the leg must come back, not exit"
+        );
+        assert!(
+            attempts >= 3,
+            "the drop, at least one refused redial, then the redial that lands: {attempts}"
+        );
+        assert!(out.contains("remote.client.transport_lost"), "{out}");
+        assert!(out.contains("remote.client.reconnected"), "{out}");
+        assert!(!out.contains("remote.client.reconnect_gave_up"), "{out}");
+    }
+
+    /// Quit, detach and switch are exits the operator asked for: they must
+    /// never start a reconnect, even on a remote leg with reconnect on.
+    #[test]
+    fn an_explicit_exit_never_reconnects() {
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let plan = ("sage".to_string(), fast_policy(Duration::from_secs(10)));
+        let attached = AttachSignal::default();
+        let quit = AtomicBool::new(false);
+        for reason in ["detached", "switching", "server quit"] {
+            let mut attempts = 0u32;
+            let result = attach_until_done(
+                |_stdin| {
+                    attempts += 1;
+                    let _ = attached.mark_attached();
+                    Err(AttachAttemptError::Session(ClientError::ServerShutdown {
+                        reason: Some(reason.to_string()),
+                    }))
+                },
+                &attached,
+                Some(&plan),
+                &mut HandoffRetry::default(),
+                &rt,
+                &mut stdin_rx,
+                &quit,
+            );
+            assert_eq!(attempts, 1, "{reason} must not redial");
+            assert!(matches!(
+                result,
+                Err(AttachAttemptError::Session(
+                    ClientError::ServerShutdown { .. }
+                ))
+            ));
+        }
+
+        // A signal (ctrl-c outside raw mode, SIGTERM, SIGHUP) is a quit too.
+        quit.store(true, Ordering::Release);
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                Err(transport_loss())
+            },
+            &attached,
+            Some(&plan),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &quit,
+        );
+        assert_eq!(attempts, 1);
+        assert!(result.is_err());
+    }
+
+    /// A local leg has no transport to lose: without a plan a drop is final.
+    #[test]
+    fn a_leg_without_a_reconnect_plan_does_not_redial() {
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let attached = AttachSignal::default();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                Err(transport_loss())
+            },
+            &attached,
+            None,
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            result,
+            Err(AttachAttemptError::Session(ClientError::ConnectionLost(_)))
+        ));
+    }
+
+    /// Review of #442: under `[slots] enabled` the leg can flip to home in
+    /// process, and a lost HOME connection must not be "recovered" by
+    /// redialing the leg's original remote bridge. Slots clients get no plan,
+    /// so that loss stays what slots makes it, and nothing redials.
+    #[test]
+    fn a_slots_client_that_flipped_home_never_redials_the_original_remote() {
+        let mut config = crate::config::Config::default();
+        assert!(
+            remote_reconnect_plan(&config, Some("sage".to_string())).is_some(),
+            "a launcher-leg remote client reconnects"
+        );
+        assert!(
+            remote_reconnect_plan(&config, None).is_none(),
+            "a local leg has no transport to redial"
+        );
+        config.slots.enabled = true;
+        let plan = remote_reconnect_plan(&config, Some("sage".to_string()));
+        assert!(
+            plan.is_none(),
+            "a slots client never redials the leg bridge"
+        );
+
+        // Flipped to home, then home dies: one attempt, the loss surfaces.
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let attached = AttachSignal::default();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                Err(transport_loss())
+            },
+            &attached,
+            plan.as_ref(),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(attempts, 1, "no redial to the original remote");
+        assert!(matches!(
+            result,
+            Err(AttachAttemptError::Session(ClientError::ConnectionLost(_)))
+        ));
+    }
+
+    /// Esc gives up at once — no waiting out a long backoff step.
+    #[test]
+    fn esc_gives_up_a_reconnect_without_waiting_out_the_backoff() {
+        let rt = reconnect_test_runtime();
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let policy = crate::config::ReconnectPolicy {
+            initial: Duration::from_secs(30),
+            max: Duration::from_secs(30),
+            deadline: Duration::from_secs(300),
+        };
+        let plan = ("sage".to_string(), policy);
+        let attached = AttachSignal::default();
+        stdin_tx.try_send(b"typed".to_vec()).expect("queue input");
+        stdin_tx.try_send(vec![0x1b]).expect("queue Esc");
+        let started = Instant::now();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                Err(transport_loss())
+            },
+            &attached,
+            Some(&plan),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(attempts, 1, "Esc during the first wait: no redial");
+        match result {
+            Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp { target, .. })) => {
+                assert_eq!(target, "sage");
+            }
+            other => panic!(
+                "expected ReconnectGaveUp, got {:?}",
+                other
+                    .err()
+                    .map(|e| e.source_client_error().map(ToString::to_string))
+            ),
+        }
+    }
+
+    /// The deadline ends an outage that never recovers, and the redials up to
+    /// it follow the backoff: one dial per step, not a spin (#294).
+    #[test]
+    fn a_reconnect_gives_up_at_the_deadline_after_one_redial_per_backoff_step() {
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let deadline = Duration::from_millis(500);
+        let plan = ("sage".to_string(), fast_policy(deadline));
+        let attached = AttachSignal::default();
+        let started = Instant::now();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(transport_loss())
+                } else {
+                    Err(AttachAttemptError::Handshake(
+                        ClientError::ConnectionFailed(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "refused",
+                        )),
+                    ))
+                }
+            },
+            &attached,
+            Some(&plan),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert!(started.elapsed() >= deadline);
+        assert!(matches!(
+            result,
+            Err(AttachAttemptError::Session(
+                ClientError::ReconnectGaveUp { .. }
+            ))
+        ));
+        // 20 + 40 + 80 + 80 + … ms reaches 500 ms after 8 steps.
+        assert!(
+            (3..=10).contains(&attempts),
+            "one redial per backoff step, got {attempts}"
+        );
+    }
+
+    /// A redial that reaches a server that REFUSES us ends the reconnect: a
+    /// protocol mismatch will not heal by dialing again.
+    #[test]
+    fn a_refused_redial_ends_the_reconnect() {
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let plan = ("sage".to_string(), fast_policy(Duration::from_secs(10)));
+        let attached = AttachSignal::default();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(transport_loss())
+                } else {
+                    Err(AttachAttemptError::Handshake(
+                        ClientError::HandshakeRejected {
+                            version: PROTOCOL_VERSION + 1,
+                            error: "upgrade".to_string(),
+                        },
+                    ))
+                }
+            },
+            &attached,
+            Some(&plan),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(attempts, 2);
+        match result {
+            Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp { reason, .. })) => {
+                assert_eq!(
+                    reason, "upgrade",
+                    "the refusal's own sentence is the reason"
+                );
+            }
+            _ => panic!("a refused redial must end the outage as a give-up"),
+        }
+    }
+
+    #[test]
+    fn a_reconnect_hold_keeps_the_frame_but_not_a_crash() {
+        let _guard = hold_test_lock();
+        SWITCH_HANDOFF_PENDING.store(false, Ordering::Release);
+        INHERITED_TERMINAL_HOLD.store(false, Ordering::Release);
+        RECONNECT_HOLD.store(true, Ordering::Release);
+        mark_terminal_owned(true);
+        assert!(host_terminal_is_held(), "an abnormal exit must reclaim it");
+        assert!(
+            crash_restore_armed(),
+            "no next leg repaints after a crash while reconnecting"
+        );
+        RECONNECT_HOLD.store(false, Ordering::Release);
+        mark_terminal_owned(false);
     }
 }
