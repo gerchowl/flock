@@ -771,6 +771,98 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>, intentional_
     }
 }
 
+/// The bridge accepted a connection on its local socket (#352).
+///
+/// The first half of the pair that locates a stalled remote connect: the
+/// client logs `client.connect` before it dials, the bridge logs this the
+/// moment `accept()` returns, and `process.spawn ssh` follows. A gap before
+/// this line is the client's; a gap after it is the bridge's.
+pub(crate) fn remote_bridge_accepted(target: &str, connection: u64) {
+    tracing::info!(
+        event = "remote.bridge.accepted",
+        subsystem = "remote",
+        outcome = "accepted",
+        target,
+        connection,
+        "ssh bridge accepted a client connection"
+    );
+}
+
+/// The bridge could not use an accepted connection, or its listener died.
+/// Once an `eprintln!` from the accept thread (#436): that wrote over the
+/// live TUI in raw mode, one of the staircase lines.
+pub(crate) fn remote_bridge_listener_failed(target: &str, stage: &'static str, err: &str) {
+    tracing::warn!(
+        event = "remote.bridge.listener_failed",
+        subsystem = "remote",
+        outcome = "error",
+        target,
+        stage,
+        err,
+        "ssh bridge listener failed"
+    );
+}
+
+/// One line the bridge's ssh wrote to stderr. ssh's own complaints ("Broken
+/// pipe", "Connection closed by …") used to reach the terminal directly, over
+/// the TUI, in raw mode (#436). They belong in the log.
+pub(crate) fn remote_bridge_ssh_stderr(target: &str, line: &str) {
+    tracing::warn!(
+        event = "remote.bridge.ssh_stderr",
+        subsystem = "remote",
+        outcome = "stderr",
+        target,
+        line,
+        "ssh bridge stderr"
+    );
+}
+
+/// A remote leg lost its transport and starts redialing in place (#436).
+pub(crate) fn remote_client_transport_lost(target: &str, err: &str) {
+    tracing::warn!(
+        event = "remote.client.transport_lost",
+        subsystem = "remote",
+        outcome = "lost",
+        target,
+        err,
+        "remote transport lost; reconnecting"
+    );
+}
+
+/// A dropped remote leg is attached again. `gap_ms` is the time since the
+/// drop, so sleep-and-wake drops are countable and their length visible.
+pub(crate) fn remote_client_reconnected(target: &str, gap_ms: u64, redials: u32) {
+    tracing::info!(
+        event = "remote.client.reconnected",
+        subsystem = "remote",
+        outcome = "reconnected",
+        target,
+        gap_ms,
+        redials,
+        "remote transport reconnected"
+    );
+}
+
+/// A dropped remote leg stopped redialing: deadline passed or the operator
+/// pressed Esc.
+pub(crate) fn remote_client_reconnect_gave_up(
+    target: &str,
+    reason: &str,
+    gap_ms: u64,
+    redials: u32,
+) {
+    tracing::warn!(
+        event = "remote.client.reconnect_gave_up",
+        subsystem = "remote",
+        outcome = "gave_up",
+        target,
+        reason,
+        gap_ms,
+        redials,
+        "remote reconnect gave up"
+    );
+}
+
 /// The bridge's accept loop got an error back from one connection.
 ///
 /// Same split as [`remote_bridge_exited`], for the same reason: the
@@ -4037,6 +4129,24 @@ struct RotatingFileGuard {
     state: Arc<Mutex<RotatingFileState>>,
 }
 
+/// Stamp one formatted JSON record with the writing process's pid (#352).
+///
+/// Two processes share `flock-client.log`: the launcher (which was the first
+/// client leg, and still owns the bridge) and the client leg it spawned. With
+/// no pid on a line, "who logged this" was a guess, and in #352 it was the
+/// guess that mattered. The json layer writes each record in one call, so a
+/// buffer that opens a JSON object is exactly one record's start.
+fn stamp_pid(buf: &[u8], pid: u32) -> std::borrow::Cow<'_, [u8]> {
+    match buf.strip_prefix(b"{") {
+        Some(rest) if !rest.starts_with(b"\"pid\"") => {
+            let mut stamped = format!("{{\"pid\":{pid},").into_bytes();
+            stamped.extend_from_slice(rest);
+            std::borrow::Cow::Owned(stamped)
+        }
+        _ => std::borrow::Cow::Borrowed(buf),
+    }
+}
+
 impl Write for RotatingFileGuard {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let Ok(mut state) = self.state.lock() else {
@@ -4045,15 +4155,18 @@ impl Write for RotatingFileGuard {
         if state.disabled {
             return Ok(buf.len());
         }
-        if state.rotate_if_needed(buf.len() as u64).is_err() {
+        let record = stamp_pid(buf, std::process::id());
+        if state.rotate_if_needed(record.len() as u64).is_err() {
             state.disabled = true;
             return Ok(buf.len());
         }
         if let Some(file) = state.file.as_mut() {
-            match file.write(buf) {
-                Ok(written) => {
-                    state.current_size = state.current_size.saturating_add(written as u64);
-                    Ok(written)
+            // All or nothing: a stamped record is longer than `buf`, so a
+            // partial count could not be mapped back onto the caller's bytes.
+            match file.write_all(&record) {
+                Ok(()) => {
+                    state.current_size = state.current_size.saturating_add(record.len() as u64);
+                    Ok(buf.len())
                 }
                 Err(_) => {
                     state.disabled = true;
@@ -5005,6 +5118,53 @@ mod tests {
         assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
         assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
+    }
+
+    #[test]
+    fn every_json_record_carries_the_writing_pid() {
+        let stamped = stamp_pid(br#"{"timestamp":"t","level":"INFO"}"#, 4242);
+        assert_eq!(
+            &*stamped,
+            br#"{"pid":4242,"timestamp":"t","level":"INFO"}"#.as_slice()
+        );
+        // Already stamped, or not a record start: untouched.
+        assert_eq!(
+            &*stamp_pid(br#"{"pid":1}"#, 4242),
+            br#"{"pid":1}"#.as_slice()
+        );
+        assert_eq!(&*stamp_pid(b"plain", 4242), b"plain".as_slice());
+    }
+
+    #[test]
+    fn the_rotating_writer_stamps_the_pid_on_disk() {
+        let dir = std::env::temp_dir().join(format!("flock-log-pid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let writer =
+            RotatingFileMakeWriter::new(dir.clone(), "pid.log", 1024 * 1024, 1).expect("writer");
+        let record = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00.000000Z","level":"INFO","#,
+            r#""target":"t","message":"m"}"#,
+            "\n"
+        )
+        .as_bytes();
+        let written = writer.make_writer().write(record).expect("write");
+        assert_eq!(written, record.len(), "the caller's byte count, not ours");
+        let on_disk = fs::read_to_string(dir.join("pid.log")).expect("read log");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            on_disk.starts_with(&format!("{{\"pid\":{},", std::process::id())),
+            "{on_disk}"
+        );
+        let parsed = parse_log_lines(&on_disk, None);
+        assert_eq!(parsed.len(), 1, "a stamped record still parses: {on_disk}");
+    }
+
+    #[test]
+    fn remote_bridge_accepted_is_info_with_target() {
+        let out = capture_logs(|| remote_bridge_accepted("acc-target", 3));
+        assert!(out.contains("event=\"remote.bridge.accepted\""), "{out}");
+        assert!(out.contains("target=\"acc-target\""), "{out}");
+        assert!(out.contains("INFO"), "{out}");
     }
 
     #[test]
