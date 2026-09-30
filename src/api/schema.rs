@@ -2117,6 +2117,13 @@ pub enum ResponseResult {
         /// the way `msg.read` resolves it, without a second verb.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
+        /// The server's LIVE `[msg] channel_push` (#438). A pushing
+        /// `flk mcp serve` asks this before every push, so turning the flag
+        /// off at runtime stops pushes on the same reload that stops the
+        /// idle wake's grace — the two can never disagree about whether the
+        /// other is running.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        channel_push: bool,
         /// Messages a wake may name. Forced to zero whenever a wake is
         /// suppressed, so a caller that reads only this field cannot wake
         /// through a suppression by ignoring the reason. The true queue depth

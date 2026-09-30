@@ -140,11 +140,27 @@ inbox are pushed nothing, and ADR-0018 §1's reply rule applies unchanged. An
   any other key silently. A value that is not id-shaped is dropped rather than
   escaped, so a sender-minted correlation id cannot smuggle prose into an
   attribute.
+  On a doorbell for a relayed message, `from_agent` and `from_host` are the
+  relay's **claim**, not an attestation. The ingress check guarantees they are
+  id-shaped, which keeps the risk low, but a reader must not take them as
+  proof of who sent the message. Only a pushed body implies an attested
+  sender.
 - **No permission relay.** flock does not declare
   `claude/channel/permission`. Doing so would let whoever can reach the
   channel approve tool calls.
 
-### 4. The feed is event-driven
+### 4. The server's live flag governs, not the session's snapshot
+
+`flk mcp serve` reads `channel_push` once, at startup, because it must
+declare the capability in its `initialize` answer. Claude Code fixes the
+capability for the session. The server, meanwhile, reads the flag live for
+the idle wake's grace. So that the two cannot drift apart, every `msg.wake`
+answer carries the server's current `channel_push`, and the session pushes
+only while it is true. Turning the flag off with a config reload therefore
+stops every push immediately, on the same reload that removes the grace.
+Turning it on reaches only sessions started afterwards.
+
+### 5. The feed is event-driven
 
 `flk mcp serve` opens one `events.subscribe` with a new `msg.queued { pane }`
 subscription for its own pane, resolved the way `msg.read` resolves it (the
@@ -152,8 +168,10 @@ subscription for its own pane, resolved the way `msg.read` resolves it (the
 hub-driven subscriptions sleeps on a condvar the event hub notifies on every
 push, so delivery costs a notify rather than a poll tick. The 100 ms tick
 remains only as the bound for noticing a hung-up client. Nothing is spawned
-per message. The feed re-attaches `channel_push_reconnect_secs` after the
-socket goes away, and it survived a live handoff (last table row).
+per message. The feed re-attaches `channel_push_reconnect_secs` (at least one second)
+after the socket goes away, and it survived a live handoff (last table row).
+A pushing `flk mcp serve` writes its own `flock-mcp.log`, so a feed that keeps
+failing is visible. With the flag off it still logs nothing.
 
 ## Consequences
 

@@ -1,4 +1,4 @@
-//! Channel push (#438, ADR-0018 amendment, Proposed): agent mail delivered
+//! Channel push (#438, ADR-0019, Proposed): agent mail delivered
 //! into a Claude Code session as a `notifications/claude/channel` event.
 //!
 //! Off unless `[msg] channel_push = true`. When on, `flk mcp serve` declares
@@ -68,7 +68,9 @@ impl ChannelOptions {
         Self {
             push: msg.channel_push,
             body_max_bytes: msg.channel_push_body_max_bytes,
-            reconnect: Duration::from_secs(msg.channel_push_reconnect_secs),
+            // At least a second: 0 would re-attach in a hot loop against a
+            // server that is down, logging a WARN on every pass.
+            reconnect: Duration::from_secs(msg.channel_push_reconnect_secs.max(1)),
         }
     }
 
@@ -136,6 +138,7 @@ impl Arrival {
 /// mints a correlation id carrying prose must not get that prose into the
 /// session as an attribute.
 fn meta_value(raw: &str) -> Option<String> {
+    // guardrails-ok(no-hardcoded): format bound on an id-shaped attribute, not a tunable — every real id is far shorter
     const MAX_META_CHARS: usize = 128;
     let ok = !raw.is_empty()
         && raw.chars().count() <= MAX_META_CHARS
@@ -155,10 +158,16 @@ fn put(meta: &mut Map<String, Value>, key: &str, raw: Option<&str>) {
 /// the SAME question the Stop-hook nudge and the idle wake ask (`msg.wake`),
 /// so a mute, a paused fleet, an `fyi`-only inbox and the reply rule all hold
 /// for the push exactly as they hold for the other two.
+///
+/// The answer also carries the server's live `channel_push`. This process
+/// read the flag once, at startup, to declare the capability; the server may
+/// have reloaded since. Pushing only while the server says the flag is on
+/// keeps the push and the idle wake's grace switched together (#446 review).
 pub(super) fn wake_allows(wake: &Value) -> Option<usize> {
+    let live = wake.get("channel_push").and_then(Value::as_bool) == Some(true);
     let count = wake.get("count").and_then(Value::as_u64)? as usize;
     let suppressed = wake.get("suppressed").is_some_and(|s| !s.is_null());
-    (count > 0 && !suppressed).then_some(count)
+    (live && count > 0 && !suppressed).then_some(count)
 }
 
 /// Build the channel notification for one arrival, given the wake count.
@@ -362,6 +371,18 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_reconnect_interval_cannot_spin() {
+        let msg = MsgConfig {
+            channel_push_reconnect_secs: 0,
+            ..MsgConfig::default()
+        };
+        assert_eq!(
+            ChannelOptions::from_config(&msg).reconnect,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
     fn meta_values_that_are_not_id_shaped_are_dropped_not_escaped() {
         let mut a = arrival(Some("ws_1:p1"), "hi");
         a.correlation_id = "x\" onclick=\"y".into();
@@ -371,16 +392,25 @@ mod tests {
 
     #[test]
     fn the_push_asks_the_wake_question() {
-        assert_eq!(wake_allows(&json!({"count": 2})), Some(2));
+        let live = |mut wake: Value| {
+            wake["channel_push"] = json!(true);
+            wake_allows(&wake)
+        };
+        assert_eq!(live(json!({"count": 2})), Some(2));
+        assert_eq!(live(json!({"count": 0, "suppressed": "fyi_only"})), None);
+        assert_eq!(live(json!({"count": 0, "suppressed": "muted"})), None);
+        assert_eq!(live(json!({"count": 0})), None);
+    }
+
+    #[test]
+    fn a_flag_turned_off_at_runtime_stops_the_push() {
+        // The server reloaded with channel_push = false: its idle wake no
+        // longer waits out a grace, so a push now would race it again.
+        assert_eq!(wake_allows(&json!({"count": 2})), None);
         assert_eq!(
-            wake_allows(&json!({"count": 0, "suppressed": "fyi_only"})),
+            wake_allows(&json!({"count": 2, "channel_push": false})),
             None
         );
-        assert_eq!(
-            wake_allows(&json!({"count": 0, "suppressed": "muted"})),
-            None
-        );
-        assert_eq!(wake_allows(&json!({"count": 0})), None);
     }
 
     #[test]

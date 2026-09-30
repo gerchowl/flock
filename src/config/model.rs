@@ -1181,7 +1181,7 @@ pub struct MsgConfig {
     /// the detector has stopped reporting does not.
     pub idle_wake_fresh_ms: u64,
     /// Push arriving mail into a Claude Code session as a channel event
-    /// (#438, ADR-0018 amendment, Proposed). Default: false.
+    /// (#438, ADR-0019, Proposed). Default: false.
     ///
     /// When true, `flk mcp serve` declares the `claude/channel` capability and
     /// emits `notifications/claude/channel` when mail lands in its own pane's

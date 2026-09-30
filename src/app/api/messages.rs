@@ -110,6 +110,12 @@ fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) ->
     }
 }
 
+/// Whether an encoded API response is an error envelope.
+fn response_is_error(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .map_or(true, |value| value.get("error").is_some())
+}
+
 /// The one budget every unattested `blocking` sender shares.
 const UNATTESTED_BLOCKING_BUCKET: &str = "unattested";
 
@@ -332,16 +338,23 @@ impl App {
     }
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
+        let correlation_id = params.correlation_id.clone();
+        let response = self.route_msg_reply(id, params);
+        // #438: under channel push an agent can answer mail it was shown but
+        // never pulled. The reply is the only acknowledgement a push gets, so
+        // a reply that actually went out — queued here, relayed, or handed up
+        // — settles the original. One that failed settles nothing: the
+        // message stays unread, and the wakes will knock for it again.
+        if self.state.config.msg.channel_push && !response_is_error(&response) {
+            self.settle_replied_original(&correlation_id);
+        }
+        response
+    }
+
+    fn route_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
-        }
-        // #438: under channel push an agent can answer mail it was shown but
-        // never pulled. The reply is the only acknowledgement a push gets, so
-        // it settles the original first — and from then on the message
-        // routes from delivery history like any read one.
-        if self.state.config.msg.channel_push {
-            self.settle_replied_original(&params.correlation_id);
         }
         // The original sender's pane is the reply target; delivered messages
         // keep it in history, still-queued ones in the queue itself.
@@ -677,6 +690,7 @@ impl App {
                 id,
                 ResponseResult::MsgWake {
                     pane: Some(pane.clone()),
+                    channel_push: self.state.config.msg.channel_push,
                     count: 0,
                     suppressed: Some(suppression.reason.into()),
                     muted_until_ms: suppression.muted_until_ms,
@@ -695,6 +709,7 @@ impl App {
             id,
             ResponseResult::MsgWake {
                 pane: Some(pane),
+                channel_push: self.state.config.msg.channel_push,
                 count,
                 suppressed,
                 muted_until_ms: None,
@@ -2743,6 +2758,52 @@ mod tests {
                 assert!(!settled);
             }
         }
+    }
+
+    /// A reply that did not go out settles nothing (#446 review): the
+    /// original was never answered, so it must stay unread for the wakes.
+    #[tokio::test]
+    async fn under_channel_push_a_failed_reply_leaves_the_original_queued() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        app.state.config.msg.channel_push = true;
+        let answerer = pane_target(&app, 1);
+        // No sender at all: `msg.reply` has nowhere to route and refuses
+        // with `no_reply_address` — after the original was looked up.
+        app.mailboxes
+            .enqueue(crate::app::mailboxes::PendingMessage {
+                correlation_id: "c-anon".into(),
+                body: "who sent this?".into(),
+                from_pane: None,
+                from_agent: None,
+                from_host: None,
+                from_repo: None,
+                to_pane: answerer.clone(),
+                to_repo: None,
+                in_reply_to: None,
+                enqueued_at_ms: 1,
+                delivery_attempts: 0,
+                intent: MsgIntent::NeedsReply,
+            });
+        let answerer_pane = app.state.workspaces[1].focused_pane_id().unwrap();
+        app.test_pane_child_pids
+            .insert(answerer_pane, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.reply",
+            "params": { "correlation_id": "c-anon", "body": "hello?" },
+        })));
+        app.current_api_peer_pid = None;
+        assert!(response.contains("no_reply_address"), "{response}");
+        assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");
+        assert!(
+            !hub.events_after(0).into_iter().any(|(_, e)| matches!(
+                &e.data,
+                EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
+            )),
+            "no durable settle for a reply that never went out"
+        );
     }
 
     /// The settle is scoped to the replier's own inbox: knowing another

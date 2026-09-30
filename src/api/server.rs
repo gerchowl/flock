@@ -1005,14 +1005,26 @@ mod tests {
             handle_connection(server, &api_tx, &event_hub, &server_running, None)
         });
 
-        let ack: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(ack["result"]["type"], "subscription_started");
+        // ONE reader for the whole stream: a burst lands in a single read, and
+        // a reader per line would swallow the second event into a buffer it
+        // then drops — which hung this test. The timeout turns any future
+        // miss into a failure instead of a hang.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(next()["result"]["type"], "subscription_started");
 
         hub.push(queued_for("ws_1:p2", "c-other"));
         hub.push(queued_for("ws_1:p1", "c-1"));
         hub.push(queued_for("ws_1:p1", "c-2"));
-        let first: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        let second: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        let first = next();
+        let second = next();
         assert_eq!(first["data"]["correlation_id"], "c-1");
         assert_eq!(second["data"]["correlation_id"], "c-2");
         assert_eq!(first["data"]["body"], "hello");
