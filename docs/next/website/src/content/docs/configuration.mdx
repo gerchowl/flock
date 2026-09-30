@@ -109,9 +109,15 @@ Remote attach manages its SSH bridge with a temporary keepalive fallback by defa
 ```toml
 [remote]
 manage_ssh_config = true
+reconnect = true
+reconnect_backoff_initial_ms = 500   # wait before the first redial
+reconnect_backoff_max_ms = 5000      # the wait doubles per redial, up to this
+reconnect_deadline_secs = 120        # give up this long after the drop
 ```
 
 When enabled, `flk --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Flock's generated config.
+
+When the connection to a remote server drops — the laptop slept, the network changed — Flock keeps your last screen up under a `reconnecting to <host>…` bar and redials. Once the server answers it re-attaches to the same session. Press Esc to stop waiting; Flock also stops at `reconnect_deadline_secs`. Either way you land back on the server you switched from, told that the connection was lost, or at your shell if there is none. Quitting, detaching and switching never reconnect. Set `reconnect = false` to end the session on the first drop instead.
 
 ## Keybindings
 

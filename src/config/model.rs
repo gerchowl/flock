@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -1201,13 +1202,67 @@ pub struct RemoteConfig {
     /// Add a keepalive fallback under the user's ssh config for the `--remote`
     /// bridge. Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Redial in place when a remote leg's transport drops (#436) — the Mac
+    /// slept, the Wi-Fi changed, the bridge ssh died — instead of ending the
+    /// session. The last frame stays up under a "reconnecting" bar until the
+    /// server answers again, the deadline passes, or the operator presses Esc.
+    /// Default: true.
+    pub reconnect: bool,
+    /// Wait before the first redial after a drop. Each later redial waits
+    /// twice as long, up to `reconnect_backoff_max_ms`. Default: 500 ms.
+    pub reconnect_backoff_initial_ms: u64,
+    /// Longest wait between two redials. Default: 5000 ms.
+    pub reconnect_backoff_max_ms: u64,
+    /// Give up this long after the drop and fall back like a failed switch.
+    /// Default: 120 s.
+    pub reconnect_deadline_secs: u64,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            reconnect: true,
+            reconnect_backoff_initial_ms: 500,
+            reconnect_backoff_max_ms: 5_000,
+            reconnect_deadline_secs: 120,
         }
+    }
+}
+
+impl RemoteConfig {
+    /// The redial schedule for a dropped remote leg, or `None` when reconnect
+    /// is off. Zero values are clamped so a typo cannot turn the backoff into
+    /// a spin (#294): every step waits at least a millisecond, and the cap is
+    /// never below the first step.
+    pub fn reconnect_policy(&self) -> Option<ReconnectPolicy> {
+        if !self.reconnect {
+            return None;
+        }
+        let initial = Duration::from_millis(self.reconnect_backoff_initial_ms.max(1));
+        let max = Duration::from_millis(self.reconnect_backoff_max_ms).max(initial);
+        Some(ReconnectPolicy {
+            initial,
+            max,
+            deadline: Duration::from_secs(self.reconnect_deadline_secs),
+        })
+    }
+}
+
+/// When a dropped remote leg redials, and when it stops trying (#436).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    pub initial: Duration,
+    pub max: Duration,
+    pub deadline: Duration,
+}
+
+impl ReconnectPolicy {
+    /// The wait before redial number `attempt` (0-based): `initial`, doubled
+    /// per attempt, capped at `max`.
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
     }
 }
 
@@ -1529,6 +1584,40 @@ impl Default for AdvancedConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reconnect_backoff_doubles_to_its_cap() {
+        let policy = RemoteConfig::default()
+            .reconnect_policy()
+            .expect("reconnect is on by default");
+        assert_eq!(policy.backoff(0), Duration::from_millis(500));
+        assert_eq!(policy.backoff(1), Duration::from_millis(1_000));
+        assert_eq!(policy.backoff(3), Duration::from_millis(4_000));
+        assert_eq!(policy.backoff(4), Duration::from_millis(5_000));
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(policy.deadline, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn reconnect_policy_clamps_zeros_and_honours_the_kill_switch() {
+        let zeros = RemoteConfig {
+            reconnect_backoff_initial_ms: 0,
+            reconnect_backoff_max_ms: 0,
+            ..RemoteConfig::default()
+        };
+        let policy = zeros.reconnect_policy().expect("still on");
+        assert!(
+            policy.backoff(0) >= Duration::from_millis(1),
+            "never a spin"
+        );
+        assert!(policy.max >= policy.initial);
+
+        let off = RemoteConfig {
+            reconnect: false,
+            ..RemoteConfig::default()
+        };
+        assert!(off.reconnect_policy().is_none());
+    }
 
     #[test]
     fn msg_policy_is_open_by_default_and_narrows_by_host() {
