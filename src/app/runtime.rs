@@ -207,6 +207,16 @@ impl App {
             changed = true;
         }
 
+        // #434: the loop now wakes for this deadline, so it must be retired
+        // here too, or a past deadline spins the monolithic loop.
+        if self
+            .action_notice_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.clear_action_notice();
+            changed = true;
+        }
+
         if self
             .next_animation_tick
             .is_some_and(|deadline| now >= deadline)

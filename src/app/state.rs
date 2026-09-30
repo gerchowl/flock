@@ -2359,8 +2359,8 @@ pub struct AppState {
     /// Arrival `Instant` of the sample currently held in [`Self::system_stats`],
     /// stamped by the [`crate::events::AppEvent::SystemStatsUpdated`] handler.
     ///
-    /// Used by [`Self::system_stats_fresh_at`] to tell a stale snapshot once
-    /// the sampler thread stops delivering — otherwise a dead poller leaves
+    /// Used by [`Self::system_stats_fresh_at`] to tell when the snapshot has
+    /// gone stale because the sampler thread stopped delivering — otherwise a dead poller leaves
     /// the status line rendering old CPU / memory / battery values as if they
     /// were current, which is the failure mode `src/peers.rs:196` calls
     /// "an unbounded confident lie". Kept as a sibling `Option` (not packed

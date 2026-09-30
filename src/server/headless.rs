@@ -2409,11 +2409,9 @@ impl HeadlessServer {
                     // armed here was meant for the moment the operator left,
                     // not for their return (#434). Another client still
                     // painting this server keeps it.
-                    let still_watched = self
-                        .clients
-                        .values()
-                        .any(|c| c.is_full_app_client() && c.frame_subscription);
-                    if still_watched || self.app.state.action_notice.is_none() {
+                    if self.another_app_client_paints(client_id)
+                        || self.app.state.action_notice.is_none()
+                    {
                         return false;
                     }
                     self.app.clear_action_notice();
@@ -3306,6 +3304,14 @@ impl HeadlessServer {
         crate::logging::render_virtual_frame(cols, rows, self.foreground_client_id);
     }
 
+    /// Whether a full app client other than `client_id` is still painting
+    /// this server, and so still reading its transient notice.
+    fn another_app_client_paints(&self, client_id: u64) -> bool {
+        self.clients
+            .iter()
+            .any(|(id, c)| *id != client_id && c.is_full_app_client() && c.frame_subscription)
+    }
+
     /// Resolve a sidebar or switch_home request and hand the foreground
     /// client its SwitchServer.
     fn dispatch_peer_switch(&mut self, request: crate::app::state::PeerSwitchRequest) {
@@ -3315,8 +3321,12 @@ impl HeadlessServer {
                 // The client's own popup says "switching to X…" for the flip
                 // (#434). A notice raised here would stay armed on the server
                 // being left and greet the next return inside its window,
-                // naming the previous switch. Clear whatever is showing instead.
-                self.app.clear_action_notice();
+                // naming the previous switch. Clear whatever is showing
+                // instead, unless another client still paints this server.
+                let leaving = self.foreground_client_id;
+                if !leaving.is_some_and(|id| self.another_app_client_paints(id)) {
+                    self.app.clear_action_notice();
+                }
                 self.send_to_foreground_client(ServerMessage::SwitchServer {
                     ssh_target: prepared.ssh_target,
                     fleet: prepared.fleet,
@@ -7749,6 +7759,40 @@ next_tab = ""
 
         assert!(server.app.state.action_notice.is_none());
         assert!(server.app.action_notice_deadline.is_none());
+    }
+
+    #[test]
+    fn a_switch_keeps_the_notice_for_a_client_still_painting() {
+        // #434 review: a second attached client still reading this server
+        // keeps its notice when the foreground one switches away.
+        let (mut server, _control_rx, _render_rx) = window_title_test_server();
+        let (writer, _control_b, _render_b) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "mba22".to_string(),
+            peers: Vec::new(),
+            origin_summary: None,
+            received_at: Instant::now(),
+        });
+        server.app.show_action_notice("copied worktree path");
+
+        server.dispatch_peer_switch(crate::app::state::PeerSwitchRequest::Home);
+
+        assert_eq!(
+            server.app.state.action_notice.as_deref(),
+            Some("copied worktree path")
+        );
     }
 
     #[test]
