@@ -4819,7 +4819,6 @@ impl AppState {
         }
 
         let pane_terminal_id = self.terminal_id_for_pane(ws_idx, pane_id);
-        let workspace_terminal_ids = self.terminal_ids_for_workspace(ws_idx);
         self.pane_id_aliases.retain(|_, alias| *alias != pane_id);
         let should_close_workspace = {
             let ws = &mut self.workspaces[ws_idx];
@@ -4830,10 +4829,9 @@ impl AppState {
         if should_close_workspace {
             // The last shell exiting is one more door to the one close tail
             // (#429): focus stays put by id and WorkspaceClosed is announced.
-            // The dead pane is already out of the tabs, so its terminal is
-            // handed over separately.
+            // `remove_pane` leaves the last pane in place when it asks for the
+            // close, so the tail's own teardown reaps its terminal too.
             self.close_workspace_indices(vec![ws_idx]);
-            self.remove_unattached_terminal_ids(workspace_terminal_ids);
             if self.workspaces.is_empty() && self.mode == Mode::Terminal {
                 self.mode = Mode::Navigate;
             }

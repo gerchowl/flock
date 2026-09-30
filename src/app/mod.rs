@@ -4449,6 +4449,8 @@ sidebar_pane_gap = 99
         app.state.active = Some(3);
         app.state.selected = 2;
         let closed_id = app.state.workspaces[0].id.clone();
+        let moved_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let moved_terminal = app.state.terminal_id_for_pane(0, moved_pane).unwrap();
 
         let response = pane_move_request(&mut app, 0, 1);
 
@@ -4457,6 +4459,29 @@ sidebar_pane_gap = 99
         assert_eq!(app.state.workspaces[0].display_name(), "w1");
         assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 2);
         assert_eq!(focus_names(&app), ("w3".to_string(), "w2".to_string()));
+        assert_eq!(workspace_closed_count(&app, &closed_id), 1);
+        // The source's teardown must not take the moved pane's PTY with it.
+        assert!(app.state.terminals.contains_key(&moved_terminal));
+        assert!(!app
+            .state
+            .terminal_runtime_shutdowns
+            .contains(&moved_terminal));
+    }
+
+    #[test]
+    fn shell_exit_emptying_the_active_space_lands_on_the_419_successor() {
+        // Display order is w0 w3 (space X), then w1 w2 (space Y). With no
+        // focus history, the operator's own `w3` emptying goes to its
+        // same-space sibling `w0`, not `w2`, its `Vec` neighbour.
+        let mut app = app_with_spaces_419(&["X", "Y", "Y", "X"]);
+        app.state.active = Some(3);
+        app.state.selected = 3;
+        let closed_id = app.state.workspaces[3].id.clone();
+
+        shell_exit(&mut app, 3);
+
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(focus_names(&app), ("w0".to_string(), "w0".to_string()));
         assert_eq!(workspace_closed_count(&app, &closed_id), 1);
     }
 
