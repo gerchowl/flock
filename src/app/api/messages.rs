@@ -336,6 +336,13 @@ impl App {
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
         }
+        // #438: under channel push an agent can answer mail it was shown but
+        // never pulled. The reply is the only acknowledgement a push gets, so
+        // it settles the original first — and from then on the message
+        // routes from delivery history like any read one.
+        if self.state.config.msg.channel_push {
+            self.settle_replied_original(&params.correlation_id);
+        }
         // The original sender's pane is the reply target; delivered messages
         // keep it in history, still-queued ones in the queue itself.
         let original = self
@@ -669,6 +676,7 @@ impl App {
             return encode_success(
                 id,
                 ResponseResult::MsgWake {
+                    pane: Some(pane.clone()),
                     count: 0,
                     suppressed: Some(suppression.reason.into()),
                     muted_until_ms: suppression.muted_until_ms,
@@ -686,6 +694,7 @@ impl App {
         encode_success(
             id,
             ResponseResult::MsgWake {
+                pane: Some(pane),
                 count,
                 suppressed,
                 muted_until_ms: None,
@@ -1407,6 +1416,35 @@ impl App {
     /// attention cycle and the agents panel read it.
     pub(crate) fn sync_blocking_mail(&mut self) {
         self.state.blocking_mail = self.mailboxes.blocking_mail();
+    }
+
+    /// Mark a still-queued message delivered because its recipient replied
+    /// to it (#438). Only the recipient's own inbox is searched: the replier
+    /// is resolved from process ancestry, so knowing a correlation id is not
+    /// enough to settle somebody else's mail.
+    fn settle_replied_original(&mut self, correlation_id: &str) {
+        let Some(pane) = self
+            .parse_pane_id_or_peer("", self.current_api_peer_pid)
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id))
+        else {
+            return;
+        };
+        let Some(message) = self.mailboxes.take_queued(&pane, correlation_id) else {
+            return;
+        };
+        self.mailboxes.record_delivered(&message);
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageDelivered,
+            data: EventData::MessageDelivered {
+                correlation_id: message.correlation_id.clone(),
+                delivered: true,
+                outcome: "replied".into(),
+                delivery_attempts: message.delivery_attempts + 1,
+                latency_ms: now_ms().saturating_sub(message.enqueued_at_ms),
+            },
+        });
+        self.sync_blocking_mail();
+        self.idle_wake_on_read(&pane);
     }
 
     /// The fleet-global id of the agent making the current API call, from
@@ -2647,6 +2685,120 @@ mod tests {
         let messages = read_inbox(&mut app, &answerer);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].intent, MsgIntent::NeedsReply);
+    }
+
+    /// #438: a message pushed into a session can be answered without ever
+    /// being pulled. With `channel_push` on, that reply is the push's only
+    /// acknowledgement, so it settles the original — and only in the
+    /// replier's OWN inbox. Off, nothing changes: the original stays queued.
+    #[tokio::test]
+    async fn under_channel_push_a_reply_settles_the_pushed_original() {
+        for channel_push in [false, true] {
+            let hub = crate::api::EventHub::default();
+            let mut app = test_app_with_hub(hub.clone());
+            app.state.config.msg.channel_push = channel_push;
+            let asker = pane_target(&app, 0);
+            let answerer = pane_target(&app, 1);
+            app.mailboxes
+                .enqueue(crate::app::mailboxes::PendingMessage {
+                    correlation_id: "c-pushed".into(),
+                    body: "ready to merge?".into(),
+                    from_pane: Some(asker.clone()),
+                    from_agent: None,
+                    from_host: None,
+                    from_repo: None,
+                    to_pane: answerer.clone(),
+                    to_repo: None,
+                    in_reply_to: None,
+                    enqueued_at_ms: 1,
+                    delivery_attempts: 0,
+                    intent: MsgIntent::NeedsReply,
+                });
+            // The replier is the answerer's agent, by process ancestry.
+            let answerer_pane = app.state.workspaces[1].focused_pane_id().unwrap();
+            app.test_pane_child_pids
+                .insert(answerer_pane, std::process::id());
+            app.current_api_peer_pid = Some(std::process::id());
+            let response = app.handle_api_request(wire_request(serde_json::json!({
+                "id": "req",
+                "method": "msg.reply",
+                "params": { "correlation_id": "c-pushed", "body": "yes" },
+            })));
+            app.current_api_peer_pid = None;
+            assert!(!response.contains("\"error\""), "{response}");
+
+            let still_queued = app.mailboxes.queued_len(&answerer);
+            let settled = hub.events_after(0).into_iter().any(|(_, e)| {
+                matches!(
+                    &e.data,
+                    EventData::MessageDelivered { correlation_id, outcome, .. }
+                        if correlation_id == "c-pushed" && outcome == "replied"
+                )
+            });
+            if channel_push {
+                assert_eq!(still_queued, 0, "the reply acknowledged the push");
+                assert!(settled, "settled durably, so a restart agrees");
+            } else {
+                assert_eq!(still_queued, 1, "flag off: behaviour unchanged");
+                assert!(!settled);
+            }
+        }
+    }
+
+    /// The settle is scoped to the replier's own inbox: knowing another
+    /// pane's correlation id is not a way to clear that pane's mail.
+    #[tokio::test]
+    async fn a_reply_cannot_settle_someone_elses_mail() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.channel_push = true;
+        let asker = pane_target(&app, 0);
+        let answerer = pane_target(&app, 1);
+        app.mailboxes
+            .enqueue(crate::app::mailboxes::PendingMessage {
+                correlation_id: "c-theirs".into(),
+                body: "for the answerer only".into(),
+                from_pane: Some(asker.clone()),
+                from_agent: None,
+                from_host: None,
+                from_repo: None,
+                to_pane: answerer.clone(),
+                to_repo: None,
+                in_reply_to: None,
+                enqueued_at_ms: 1,
+                delivery_attempts: 0,
+                intent: MsgIntent::NeedsReply,
+            });
+        // The caller sits in the ASKER's pane, not the recipient's.
+        let asker_pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        app.test_pane_child_pids
+            .insert(asker_pane, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        let _ = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "msg.reply",
+            "params": { "correlation_id": "c-theirs", "body": "not mine to answer" },
+        })));
+        app.current_api_peer_pid = None;
+        assert_eq!(app.mailboxes.queued_len(&answerer), 1);
+    }
+
+    /// `msg.wake` names the inbox it counted (#438), so `flk mcp serve` can
+    /// learn its own pane the way `msg.read` resolves it.
+    #[tokio::test]
+    async fn msg_wake_names_the_pane_it_counted() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to = pane_target(&app, 1);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgWake(crate::api::schema::MsgWakeParams {
+                pane: Some(to.clone()),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgWake { pane, .. } = success.result else {
+            panic!("expected msg_wake: {response}");
+        };
+        assert_eq!(pane.as_deref(), Some(to.as_str()));
     }
 
     #[tokio::test]

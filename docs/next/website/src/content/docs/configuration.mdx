@@ -677,6 +677,24 @@ Flock types only when **all** of the following hold, and checks them again at th
 
 Which messages have already been announced is held in memory, so after a server restart any still-unread mail can earn one more wake. Set `idle_wake = false` to turn it off. Agents then find mail only at a turn boundary, as before. Each wake is logged as `msg.idle_wake.fired` at INFO, and each Enter that was held back as `msg.idle_wake.abandoned`. Suppressions are logged at DEBUG, once per change of reason.
 
+## Pushing mail into a Claude session (experimental)
+
+Off by default, and a research-preview feature of Claude Code (#438, ADR-0019, Proposed). With it on, `flk mcp serve` declares itself a Claude Code **channel**. When mail lands in its pane's inbox, it pushes the message into the session, and an idle agent starts a turn at once. A busy agent receives the message at its next tool boundary instead of at the end of its turn.
+
+```toml
+[msg]
+channel_push = false                  # the switch
+channel_push_body_max_bytes = 4096    # larger bodies arrive as a count-only doorbell
+channel_push_reconnect_secs = 5       # re-attach after a server restart or live handoff
+channel_push_idle_wake_grace_ms = 2000  # the idle wake waits this long for the push to land
+```
+
+The session has to load the channel. On a personal account that means starting Claude with `--dangerously-load-development-channels server:flock`, which shows a warning dialog on every launch. The dialog needs one Enter.
+
+The body is pushed only for a sender this server attested (an agent in one of its own panes) and only under the size cap. Every other message, including all mail relayed from another host, arrives as the same count-only sentence the idle wake types. `fyi` mail is never pushed, and a mute or a paused fleet holds the push exactly as it holds the other wakes.
+
+The inbox stays the source of truth. A push is not a read, so the message stays unread until the agent calls `flock_msg_read` or answers it with `flock_msg_reply`. The stop-hook nudge and the idle wake keep running underneath for any session that did not load the channel, since flock cannot tell which sessions did. The idle wake then fires `channel_push_idle_wake_grace_ms` later than it would otherwise.
+
 ## Environment variables
 
 | Variable | Purpose |

@@ -28,6 +28,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0016](0016-operator-notification-log.md) | Outcomes are filed as durable events; unread is a projection, not a second store | Proposed |
 | [0017](0017-mcp-resource-surface.md) | Handed-over files are MCP resources with a durable identity; tools stay for parameterised calls | Proposed |
 | [0018](0018-message-delivery-response.md) | A message says how much it needs, a recipient can say "not now" and must say so, and an idle agent is reachable | Accepted |
+| [0019](0019-channel-push-delivery.md) | Agent mail may also arrive as a Claude Code channel push, as a first knock over the pull that stays the source of truth | Proposed |
 
 ## Conventions
 

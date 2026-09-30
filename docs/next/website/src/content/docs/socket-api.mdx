@@ -369,6 +369,8 @@ The first response acknowledges the subscription. Later lines are pushed events.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 
+`{"type":"msg.queued","pane":"<public pane id>"}` streams each `message_queued` event for one inbox (#438). It starts at the moment of subscribing, because mail already waiting is `msg.list`'s to report. It wakes on the event itself rather than on a poll tick. `flk mcp serve` uses it for the experimental channel push, and learns its own pane from the `pane` field that `msg.wake` now returns.
+
 Use `events.wait` when you want one matching event and then a response.
 
 ## Reading panes

@@ -1557,6 +1557,15 @@ pub enum Subscription {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
+    /// Mail landing in ONE pane's inbox (#438): each `message_queued` event
+    /// whose `to_pane` is `pane`, from the moment the subscription starts.
+    ///
+    /// The feed `flk mcp serve` turns into a channel push. It starts at the
+    /// hub's current sequence rather than replaying the ring, because mail
+    /// already waiting is the inbox's to report — a replay would re-announce
+    /// messages the agent may have read long ago.
+    #[serde(rename = "msg.queued")]
+    MsgQueued { pane: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2103,6 +2112,11 @@ pub enum ResponseResult {
         messages: Vec<InboxMessage>,
     },
     MsgWake {
+        /// The inbox this count is for, as a public pane id (#438). Lets a
+        /// caller that asked about "my own pane" learn which one that is,
+        /// the way `msg.read` resolves it, without a second verb.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
         /// Messages a wake may name. Forced to zero whenever a wake is
         /// suppressed, so a caller that reads only this field cannot wake
         /// through a suppression by ignoring the reason. The true queue depth

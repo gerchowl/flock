@@ -460,6 +460,32 @@ pub(crate) fn idle_wake_abandoned(pane: &str, reason: &str) {
     );
 }
 
+/// `flk mcp serve` pushed one message into its session as a channel event
+/// (#438). `attested` says whether the body rode along or only a doorbell.
+pub(crate) fn mcp_channel_pushed(correlation_id: &str, attested: bool) {
+    tracing::debug!(
+        event = "mcp.channel.pushed",
+        subsystem = "msg",
+        outcome = "ok",
+        correlation_id,
+        attested,
+        "channel push emitted"
+    );
+}
+
+/// The channel push feed ended and will re-attach after
+/// `[msg] channel_push_reconnect_secs`. WARN: until it does, mail reaches
+/// this session only through the Stop-hook nudge and the idle wake.
+pub(crate) fn mcp_channel_feed_ended(reason: &str) {
+    tracing::warn!(
+        event = "mcp.channel.feed_ended",
+        subsystem = "msg",
+        outcome = "error",
+        reason,
+        "channel push feed ended"
+    );
+}
+
 pub(crate) fn pane_spawned(pane_id: u32, pid: u32) {
     tracing::info!(
         event = "pane.spawned",

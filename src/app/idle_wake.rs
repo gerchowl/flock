@@ -243,6 +243,28 @@ impl App {
             return Decision::Suppressed("already_announced");
         }
 
+        // #438: under channel push the push is the first knock. Hold off
+        // until it has had time to start a turn — if it did, the idle gate
+        // below finds the agent working and nothing is typed.
+        if config.channel_push {
+            let grace = config.channel_push_idle_wake_grace_ms;
+            let announced = self.idle_wake.panes.get(pane).map(|entry| &entry.announced);
+            let newest = wakeable_ids
+                .iter()
+                .filter(|id| announced.is_none_or(|announced| !announced.contains(*id)))
+                .filter_map(|id| self.mailboxes.queued_message(id))
+                .map(|message| message.enqueued_at_ms)
+                .max();
+            if let Some(enqueued_ms) = newest {
+                let waited = super::api::messages::now_ms().saturating_sub(enqueued_ms);
+                if waited < grace {
+                    self.idle_wake
+                        .note_deadline(now + Duration::from_millis(grace - waited));
+                    return Decision::Suppressed("channel_push_grace");
+                }
+            }
+        }
+
         // Every gate from here on is evaluated in the same call that types,
         // with nothing between the last check and the write.
         if let Some(suppression) = self.wake_suppression(pane, super::api::messages::now_ms()) {

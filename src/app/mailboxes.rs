@@ -385,6 +385,28 @@ impl MailboxRegistry {
         Some(message)
     }
 
+    /// Take one specific queued message out of `pane_id`'s inbox (#438).
+    ///
+    /// For the channel push, where an agent can answer a message it was shown
+    /// but never pulled: the reply is the only acknowledgement a push gets,
+    /// so it settles the message the way a read would. Scoped to the
+    /// recipient's own queue — a pane cannot settle someone else's mail by
+    /// knowing its correlation id.
+    pub(crate) fn take_queued(
+        &mut self,
+        pane_id: &str,
+        correlation_id: &str,
+    ) -> Option<PendingMessage> {
+        let queue = self.queues.get_mut(pane_id)?;
+        let index = queue
+            .iter()
+            .position(|message| message.correlation_id == correlation_id)?;
+        let message = queue.remove(index)?;
+        self.deferred.remove(&message.correlation_id);
+        self.escalated.remove(&message.correlation_id);
+        Some(message)
+    }
+
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
         let root = message
             .in_reply_to
