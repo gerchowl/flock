@@ -3941,8 +3941,8 @@ impl AppState {
                 // thread: this is the one place the loop applies the update,
                 // and stamping here keeps `system_stats` and `system_stats_at`
                 // moving together without threading a clock through the
-                // sampler. The status line reads both via
-                // `AppState::system_stats_fresh_at` and shows a placeholder
+                // sampler. The status line and self row read both via
+                // `AppState::system_stats_reading_at` and dim the last values
                 // once the pair falls behind — the `src/peers.rs:196`
                 // doctrine applied to the sampler.
                 self.system_stats = Some(stats);

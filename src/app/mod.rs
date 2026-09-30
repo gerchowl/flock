@@ -4609,6 +4609,47 @@ sidebar_pane_gap = 99
     }
 
     #[test]
+    fn next_loop_deadline_wakes_for_an_expiring_action_notice() {
+        // #434: the notice must expire on its own deadline, not ride on the
+        // headless accept-poll cap. Every other deadline is later or unset,
+        // so the notice is what wakes the loop.
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_resize_poll = now + Duration::from_secs(60);
+        app.next_auto_update_check = None;
+        app.show_action_notice("copied");
+
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            app.action_notice_deadline
+        );
+        assert_eq!(
+            app.next_loop_deadline(now, false),
+            app.action_notice_deadline
+        );
+    }
+
+    #[test]
+    fn monolithic_loop_retires_an_expired_action_notice() {
+        // #434 review: the monolithic loop wakes for the notice deadline, so
+        // it must also clear it, or a past deadline busy-loops `App::run`.
+        let mut app = test_app();
+        app.show_action_notice("copied");
+        let notice_deadline = app.action_notice_deadline.expect("notice armed");
+        let after = notice_deadline + Duration::from_millis(1);
+        app.next_resize_poll = after + Duration::from_secs(60);
+        app.next_auto_update_check = None;
+
+        app.handle_scheduled_tasks(after, false);
+
+        assert!(app.state.action_notice.is_none());
+        assert!(app.action_notice_deadline.is_none());
+        assert!(app
+            .next_loop_deadline(after, false)
+            .is_none_or(|deadline| deadline > after));
+    }
+
+    #[test]
     fn headless_next_loop_deadline_ignores_resize_poll() {
         let mut app = test_app();
         let now = Instant::now();
