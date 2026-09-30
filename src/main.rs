@@ -328,7 +328,7 @@ fn decide_next_leg(
         None => match (result, previous) {
             (Err(err), Some((fallback, target_label))) => LegStep::FallBack {
                 notice: fallback_notice(&target_label, &err),
-                to: fallback,
+                to: behind_held_frame(fallback),
                 previous: None,
             },
             (result, _) => LegStep::Finish {
@@ -338,6 +338,19 @@ fn decide_next_leg(
                 result,
             },
         },
+    }
+}
+
+/// A leg re-run as a fallback runs behind the failed leg's held frame, so it
+/// must not prompt or print as the CLI launch that first ran it did (#420,
+/// #115): it becomes a federation-switch leg.
+fn behind_held_frame(leg: AttachLeg) -> AttachLeg {
+    match leg {
+        AttachLeg::Remote(mut launch) => {
+            launch.context = remote::LaunchContext::FederationSwitch;
+            AttachLeg::Remote(launch)
+        }
+        local => local,
     }
 }
 
@@ -979,6 +992,30 @@ mod tests {
             fallback_notice("lars@sage", &raw_ssh),
             "switch to lars@sage failed: connection refused"
         );
+    }
+
+    /// #447 review: the leg a failed switch falls back to runs behind the
+    /// failed leg's held frame. A `flk --remote` leg re-run there must not
+    /// keep the CLI context that lets it prompt and print.
+    #[test]
+    fn a_fallback_remote_leg_runs_as_a_federation_switch() {
+        let err = io::Error::other("connection refused");
+        // The chain started as `flk --remote lars@sage`: a CLI launch.
+        let AttachLeg::Remote(mut cli_launch) = remote_leg("lars@sage") else {
+            unreachable!("remote_leg builds a remote leg")
+        };
+        cli_launch.context = remote::LaunchContext::Cli;
+        let previous = Some((AttachLeg::Remote(cli_launch), "lars@anvil".to_string()));
+        match decide_next_leg(&remote_leg("lars@anvil"), None, Err(err), previous, true) {
+            LegStep::FallBack {
+                to: AttachLeg::Remote(launch),
+                ..
+            } => {
+                assert_eq!(launch.target, "lars@sage");
+                assert_eq!(launch.context, remote::LaunchContext::FederationSwitch);
+            }
+            _ => panic!("expected a FallBack to the remote leg"),
+        }
     }
 
     #[test]

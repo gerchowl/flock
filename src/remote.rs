@@ -1007,7 +1007,11 @@ fn ensure_remote_server_ready(
     reason = "the CLI launch path owns the terminal before any TUI attaches; the switch path is routed to tracing instead"
 )]
 fn launcher_notice(context: LaunchContext, target: &str, message: &str) {
-    if context.allows_install_prompt() {
+    // Keyed on the held frame as well as the context: a leg the chain falls
+    // back to re-runs with the context it was first launched with, and a
+    // `flk --remote` leg re-run behind a held frame must not print over it.
+    let terminal_held = std::env::var_os(crate::client::HELD_TERMINAL_ENV_VAR).is_some();
+    if context.allows_install_prompt() && !terminal_held {
         eprintln!("{message}");
     } else {
         crate::logging::remote_launcher_notice(target, message);
@@ -1774,7 +1778,7 @@ pub(crate) struct SshStdioBridge {
     /// The run of failed connections and its last classified reason (#420),
     /// shared with the connection threads.
     health: Arc<std::sync::Mutex<BridgeHealth>>,
-    /// Connection threads still running; see [`Self::failing_reason_after`].
+    /// Connection threads still running; see [`Self::failing_reason_after_connections_end`].
     connections_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Bound on waiting for a failed connection's bookkeeping.
     stderr_settle: Duration,
@@ -1869,7 +1873,7 @@ impl SshStdioBridge {
     /// The client sees the dead tunnel's EOF before the connection thread has
     /// read ssh's stderr and recorded the failure, so a launcher that asked at
     /// once would find nothing, then drop the bridge and have the failure
-    /// logged as a teardown. [`Self::failing_reason_after`] waits it out.
+    /// logged as a teardown. [`Self::failing_reason_after_connections_end`] waits it out.
     pub(crate) fn failing_reason(&self) -> Option<crate::peers::SshFailureReason> {
         self.health
             .lock()
@@ -2604,8 +2608,18 @@ fn bridge_connection(
     let upload = thread::spawn(move || {
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
     });
+    // The first bytes back through the tunnel close the bridge's run of
+    // failures (#420): the dial got through, whatever happens to it later.
+    // Waiting for a clean exit instead let a drop's reason outlive a working
+    // redial and relabel a later, unrelated failure as that old one.
+    let through_health = Arc::clone(&dial.health);
     let download = thread::spawn(move || {
-        let delivered = copy_flush(&mut child_stdout, &mut child_to_stream).unwrap_or(0);
+        let delivered = copy_flush_marking_first(&mut child_stdout, &mut child_to_stream, || {
+            if let Ok(mut health) = through_health.lock() {
+                health.record_success();
+            }
+        })
+        .unwrap_or(0);
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
         delivered
     });
@@ -2716,6 +2730,27 @@ impl BridgeFailureLog<'_> {
             stderr_tail: None,
         }
     }
+}
+
+/// [`copy_flush`], calling `on_first` once the first bytes have been written.
+fn copy_flush_marking_first<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    on_first: impl FnOnce(),
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 16 * 1024];
+    let first = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(0),
+            Ok(bytes_read) => break bytes_read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    writer.write_all(&buffer[..first])?;
+    writer.flush()?;
+    on_first();
+    Ok(first as u64 + copy_flush(reader, writer)?)
 }
 
 fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
@@ -3555,6 +3590,7 @@ mod tests {
         let mut first = true;
         let mut retry = false;
         let mut cleared = false;
+        let mut stale_while_live = None;
         let out = crate::logging::capture_logs_across_threads(|| {
             // SAFETY: nextest runs each test in its own process.
             unsafe {
@@ -3570,7 +3606,19 @@ mod tests {
             )
             .expect("start bridge listener");
             first = round_trip(&socket);
-            retry = round_trip(&socket);
+            // #447 review: the run closes when the redial's tunnel first
+            // delivers, not when it ends. A reason left over from the failure
+            // would otherwise relabel any later, unrelated client failure.
+            let mut live = UnixStream::connect(&socket).expect("redial");
+            let _ = live.set_read_timeout(Some(Duration::from_secs(5)));
+            {
+                use std::io::{Read, Write};
+                live.write_all(b"ping").expect("write through the tunnel");
+                let mut buf = [0u8; 4];
+                retry = live.read_exact(&mut buf).is_ok() && &buf == b"ping";
+            }
+            stale_while_live = bridge.failing_reason();
+            drop(live);
             // The retry's tunnel ends cleanly once the client hangs up, and
             // that closes the run of failures.
             cleared = wait_until(Duration::from_secs(5), || bridge.failing_reason().is_none());
@@ -3588,6 +3636,10 @@ mod tests {
         );
         assert!(retry, "the retry must get through");
         assert!(cleared, "a working tunnel after the failure closes the run");
+        assert_eq!(
+            stale_while_live, None,
+            "a live redial must not leave the old failure's reason behind"
+        );
         let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();
         let warns: Vec<&&str> = ours.iter().filter(|l| l.contains("WARN")).collect();
         assert!(

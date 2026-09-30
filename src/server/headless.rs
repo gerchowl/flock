@@ -4414,6 +4414,22 @@ mod tests {
         assert!(!filed[0].seen);
     }
 
+    /// #447 review: the notice can carry the first line of flock's own error,
+    /// and that can carry remote output. The durable record is masked and
+    /// stripped of control bytes.
+    #[test]
+    fn a_fleet_failure_record_is_masked_and_stripped() {
+        let mut server = test_headless_server();
+        server.app.note_fleet_failure_notice(
+            "switch to sage failed: token ghp_abcdefghijklmnopqrstuvwxyz0123 \u{1b}[31mred",
+        );
+        let filed: Vec<_> = server.app.state.notifications.newest_first().collect();
+        assert_eq!(filed.len(), 1);
+        assert!(!filed[0].title.contains("ghp_"), "{}", filed[0].title);
+        assert!(!filed[0].title.contains('\u{1b}'), "{:?}", filed[0].title);
+        assert!(filed[0].title.starts_with("switch to sage failed:"));
+    }
+
     /// A direct terminal attach is not an app leg — it must never raise the
     /// switch-failure action notice (only the foreground app client does).
     #[test]

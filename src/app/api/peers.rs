@@ -538,6 +538,10 @@ impl App {
         let Some(failure) = crate::peers::FleetFailureNotice::parse(notice) else {
             return;
         };
+        // The reason can be the first line of flock's own error, which can
+        // carry remote output: mask credentials and strip control bytes
+        // before it becomes a durable record.
+        let title = crate::control_bytes::strip(&crate::report::redact::mask_credentials(notice));
         if let Some(reason) = failure.reason() {
             self.state
                 .switch_failures
@@ -546,7 +550,7 @@ impl App {
         self.state
             .file_notification(crate::app::notifications::NotificationEntry {
                 id: crate::app::notifications::mint_notification_id(),
-                title: notice.to_string(),
+                title,
                 body: None,
                 kind: crate::api::schema::NotificationRecordKind::Notice,
                 source: crate::api::schema::NotificationSource::Fleet,
