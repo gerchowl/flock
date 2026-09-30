@@ -771,12 +771,6 @@ pub(crate) fn remote_bridge_exited(target: &str, code: Option<i32>, intentional_
     }
 }
 
-/// The bridge's accept loop got an error back from one connection.
-///
-/// Same split as [`remote_bridge_exited`], for the same reason: the
-/// `ConnectionAborted` this reports is the DOWNSTREAM effect of the teardown
-/// SIGKILL, so an ordinary switch home used to emit this WARN too — the second
-/// half of the pair in #319.
 /// The bridge accepted a connection on its local socket (#352).
 ///
 /// The first half of the pair that locates a stalled remote connect: the
@@ -869,6 +863,12 @@ pub(crate) fn remote_client_reconnect_gave_up(
     );
 }
 
+/// The bridge's accept loop got an error back from one connection.
+///
+/// Same split as [`remote_bridge_exited`], for the same reason: the
+/// `ConnectionAborted` this reports is the DOWNSTREAM effect of the teardown
+/// SIGKILL, so an ordinary switch home used to emit this WARN too — the second
+/// half of the pair in #319.
 pub(crate) fn remote_bridge_failed(target: &str, err: &str, intentional_teardown: bool) {
     if intentional_teardown {
         tracing::debug!(

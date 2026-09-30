@@ -1402,13 +1402,23 @@ pub const RECONNECT_GAVE_UP_EXIT_CODE: i32 = 75;
 /// The ssh target this client leg would redial, and how: set only for a remote
 /// leg (the launcher tags its client with the target) with `[remote]
 /// reconnect` on. A local attach has no transport to lose.
+///
+/// Never under `[slots] enabled`. A slots client flips its active connection
+/// in process, so the connection that drops is not necessarily the leg's
+/// bridge: after a flip to home, a lost home connection would be "recovered"
+/// by redialing the ORIGINAL remote and silently landing the operator there.
+/// Slots already has its own answer to a dying peer — demote it to home — so
+/// the redial is reserved for the launcher-leg client, where the only
+/// connection is the leg's own bridge.
 fn remote_reconnect_plan(
-    config: &crate::config::RemoteConfig,
+    config: &crate::config::Config,
+    active_ssh_target: Option<String>,
 ) -> Option<(String, crate::config::ReconnectPolicy)> {
-    let target = std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR)
-        .ok()
-        .filter(|t| !t.is_empty())?;
-    Some((target, config.reconnect_policy()?))
+    if config.slots.enabled {
+        return None;
+    }
+    let target = active_ssh_target.filter(|t| !t.is_empty())?;
+    Some((target, config.remote.reconnect_policy()?))
 }
 
 /// Bytes that give up a reconnect: a bare Esc, or ctrl-c (raw mode delivers it
@@ -1553,10 +1563,13 @@ struct AttachSignal {
 }
 
 impl AttachSignal {
-    fn mark_attached(&self) {
-        if let Some(ended) = self.outage.borrow_mut().take() {
-            crate::logging::remote_client_reconnected(&ended.target, ended.gap_ms(), ended.redials);
-        }
+    /// Record a live session. Returns true when it ends an outage.
+    fn mark_attached(&self) -> bool {
+        let Some(ended) = self.outage.borrow_mut().take() else {
+            return false;
+        };
+        crate::logging::remote_client_reconnected(&ended.target, ended.gap_ms(), ended.redials);
+        true
     }
 }
 
@@ -1599,6 +1612,25 @@ where
             Some(_) => err.is_redial_failure(),
         };
         if !redial {
+            // A redial that reached the far end and was refused — the remote
+            // server is gone (`--reattach`), or now speaks another protocol —
+            // ends the outage like a give-up, so it falls back and says why.
+            if let Some(ended) = outage.take() {
+                let reason = err
+                    .source_client_error()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "reconnect failed".to_string());
+                crate::logging::remote_client_reconnect_gave_up(
+                    &ended.target,
+                    &reason,
+                    ended.gap_ms(),
+                    ended.redials,
+                );
+                return Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp {
+                    target: ended.target,
+                    reason,
+                }));
+            }
             return Err(err);
         }
         let current = outage.get_or_insert_with(|| {
@@ -1710,7 +1742,11 @@ fn run_attach_attempt(
     // Live again. A reconnect hold (#436) ends here: this session owns the
     // terminal, and its first frame repaints everything, the bar included.
     RECONNECT_HOLD.store(false, Ordering::Release);
-    signal.mark_attached();
+    if signal.mark_attached() {
+        // Keys typed while the redial was connecting were aimed at a frozen
+        // frame, not at whatever the re-attached session now shows. Drop them.
+        while stdin_rx.try_recv().is_ok() {}
+    }
 
     let attach_escape = direct_attach.then(AttachEscapeState::default);
     let initial_input = pending_stdin.take();
@@ -1837,6 +1873,11 @@ fn run_client_with_mode(
     let held_restore = HeldRestoreGuard::new();
 
     let loaded_config = crate::config::Config::load();
+    // Whether, and how, this leg redials a dropped transport (#436).
+    let reconnect_plan = remote_reconnect_plan(
+        &loaded_config.config,
+        std::env::var(crate::remote::ACTIVE_SSH_TARGET_ENV_VAR).ok(),
+    );
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let sound_config = loaded_config.config.ui.sound;
@@ -1908,7 +1949,6 @@ fn run_client_with_mode(
     // (#38): ~200ms pauses for up to ~30s behind a single status line, then
     // the original error. A remote leg also redials in place when its
     // transport drops (#436).
-    let reconnect_plan = remote_reconnect_plan(&loaded_config.config.remote);
     let attach_signal = AttachSignal::default();
     let mut handoff_retry = HandoffRetry::default();
     let result = attach_until_done(
@@ -5983,7 +6023,7 @@ mod tests {
         use std::io::Read;
         let mut stream = UnixStream::connect(socket)
             .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
-        attached.mark_attached();
+        let _ = attached.mark_attached();
         let mut byte = [0u8; 1];
         match stream.read(&mut byte) {
             Ok(1) => Ok(()),
@@ -6076,7 +6116,7 @@ mod tests {
             let result = attach_until_done(
                 |_stdin| {
                     attempts += 1;
-                    attached.mark_attached();
+                    let _ = attached.mark_attached();
                     Err(AttachAttemptError::Session(ClientError::ServerShutdown {
                         reason: Some(reason.to_string()),
                     }))
@@ -6136,6 +6176,52 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(attempts, 1);
+        assert!(matches!(
+            result,
+            Err(AttachAttemptError::Session(ClientError::ConnectionLost(_)))
+        ));
+    }
+
+    /// Review of #442: under `[slots] enabled` the leg can flip to home in
+    /// process, and a lost HOME connection must not be "recovered" by
+    /// redialing the leg's original remote bridge. Slots clients get no plan,
+    /// so that loss stays what slots makes it, and nothing redials.
+    #[test]
+    fn a_slots_client_that_flipped_home_never_redials_the_original_remote() {
+        let mut config = crate::config::Config::default();
+        assert!(
+            remote_reconnect_plan(&config, Some("sage".to_string())).is_some(),
+            "a launcher-leg remote client reconnects"
+        );
+        assert!(
+            remote_reconnect_plan(&config, None).is_none(),
+            "a local leg has no transport to redial"
+        );
+        config.slots.enabled = true;
+        let plan = remote_reconnect_plan(&config, Some("sage".to_string()));
+        assert!(
+            plan.is_none(),
+            "a slots client never redials the leg bridge"
+        );
+
+        // Flipped to home, then home dies: one attempt, the loss surfaces.
+        let rt = reconnect_test_runtime();
+        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let attached = AttachSignal::default();
+        let mut attempts = 0u32;
+        let result = attach_until_done(
+            |_stdin| {
+                attempts += 1;
+                Err(transport_loss())
+            },
+            &attached,
+            plan.as_ref(),
+            &mut HandoffRetry::default(),
+            &rt,
+            &mut stdin_rx,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(attempts, 1, "no redial to the original remote");
         assert!(matches!(
             result,
             Err(AttachAttemptError::Session(ClientError::ConnectionLost(_)))
@@ -6262,12 +6348,15 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(attempts, 2);
-        assert!(matches!(
-            result,
-            Err(AttachAttemptError::Handshake(
-                ClientError::HandshakeRejected { .. }
-            ))
-        ));
+        match result {
+            Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp { reason, .. })) => {
+                assert!(
+                    reason.contains("upgrade"),
+                    "the refusal is the reason: {reason}"
+                );
+            }
+            _ => panic!("a refused redial must end the outage as a give-up"),
+        }
     }
 
     #[test]

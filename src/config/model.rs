@@ -1247,14 +1247,15 @@ impl Default for RemoteConfig {
 
 impl RemoteConfig {
     /// The redial schedule for a dropped remote leg, or `None` when reconnect
-    /// is off. Zero values are clamped so a typo cannot turn the backoff into
-    /// a spin (#294): every step waits at least a millisecond, and the cap is
-    /// never below the first step.
+    /// is off. Small values are clamped so a typo cannot turn the backoff into
+    /// an ssh spawn storm (#294): every step waits at least
+    /// [`RECONNECT_BACKOFF_FLOOR`], and the cap is never below the first step.
     pub fn reconnect_policy(&self) -> Option<ReconnectPolicy> {
         if !self.reconnect {
             return None;
         }
-        let initial = Duration::from_millis(self.reconnect_backoff_initial_ms.max(1));
+        let initial =
+            Duration::from_millis(self.reconnect_backoff_initial_ms).max(RECONNECT_BACKOFF_FLOOR);
         let max = Duration::from_millis(self.reconnect_backoff_max_ms).max(initial);
         Some(ReconnectPolicy {
             initial,
@@ -1263,6 +1264,10 @@ impl RemoteConfig {
         })
     }
 }
+
+/// The shortest wait between two redials of a dropped remote leg, whatever the
+/// config says. Each redial spawns an ssh, so this caps that rate.
+pub const RECONNECT_BACKOFF_FLOOR: Duration = Duration::from_millis(100);
 
 /// When a dropped remote leg redials, and when it stops trying (#436).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1621,9 +1626,10 @@ mod tests {
             ..RemoteConfig::default()
         };
         let policy = zeros.reconnect_policy().expect("still on");
-        assert!(
-            policy.backoff(0) >= Duration::from_millis(1),
-            "never a spin"
+        assert_eq!(
+            policy.backoff(0),
+            RECONNECT_BACKOFF_FLOOR,
+            "never a spawn storm"
         );
         assert!(policy.max >= policy.initial);
 

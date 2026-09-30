@@ -323,7 +323,14 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )
 }
 
-pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
+pub(crate) fn run_remote_client_bridge(reattach: bool) -> io::Result<()> {
+    // A redial after a transport drop (#436) must reach the SAME server. If
+    // it is gone — crashed, stopped — refuse in the protocol's own terms
+    // rather than start a new, empty one: the client ends its reconnect and
+    // tells the operator the session state is lost.
+    if reattach && !crate::server::autodetect::is_server_listening() {
+        return refuse_reattach(io::stdin().lock(), io::stdout().lock());
+    }
     ensure_remote_server_running()?;
 
     let socket_path = crate::server::socket_paths::client_socket_path();
@@ -348,6 +355,22 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     });
 
     copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
+/// Answer a client's Hello with a Welcome that carries
+/// [`REMOTE_SERVER_GONE`], so its handshake fails with that reason.
+fn refuse_reattach(mut input: impl io::Read, mut output: impl io::Write) -> io::Result<()> {
+    // Read the Hello first so the client never sees its write refused.
+    let _: Result<crate::protocol::ClientMessage, _> =
+        crate::protocol::read_message(&mut input, crate::protocol::MAX_FRAME_SIZE);
+    let welcome = crate::protocol::ServerMessage::Welcome {
+        version: crate::protocol::PROTOCOL_VERSION,
+        encoding: crate::protocol::RenderEncoding::TerminalAnsi,
+        error: Some(REMOTE_SERVER_GONE.to_string()),
+    };
+    crate::protocol::write_message(&mut output, &welcome)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    output.flush()
 }
 
 fn ensure_remote_server_running() -> io::Result<()> {
@@ -1572,6 +1595,16 @@ fn remote_bridge_command(remote_flock: &RemoteFlock, session_name: &str) -> Stri
     command
 }
 
+/// Flag the bridge adds to the remote command on every connection after its
+/// first: a redial of a leg that was already attached (#436).
+pub(crate) const REATTACH_FLAG: &str = "--reattach";
+
+/// The refusal a reattach gets when the remote server it was attached to is
+/// gone. Starting a fresh server there would hand the operator an empty
+/// session and call it "reconnected".
+pub(crate) const REMOTE_SERVER_GONE: &str =
+    "the remote flk server exited while you were away; its session state is lost";
+
 fn reattach_command(
     program: &str,
     target: &str,
@@ -2148,6 +2181,17 @@ fn bridge_dial_argv(
     Ok(argv)
 }
 
+/// Turn a bridge dial into a REATTACH dial (#436): every connection after a
+/// bridge's first is a client redialing a session it already had, and the
+/// remote end must then refuse rather than start a fresh server. The remote
+/// command is the last argument.
+fn mark_reattach(argv: &mut [String]) {
+    if let Some(remote_command) = argv.last_mut() {
+        remote_command.push(' ');
+        remote_command.push_str(REATTACH_FLAG);
+    }
+}
+
 fn bridge_connection(
     stream: UnixStream,
     dial: &BridgeDial,
@@ -2157,13 +2201,16 @@ fn bridge_connection(
 ) -> io::Result<()> {
     let target = dial.target.as_str();
     let mut command = TracedCommand::new("ssh", "remote");
-    let argv = bridge_dial_argv(
+    let mut argv = bridge_dial_argv(
         target,
         &dial.remote_flock,
         &dial.session_name,
         dial.keepalive_ssh_config.as_deref(),
         dial.proxy_jump.as_deref(),
     )?;
+    if connection > 1 {
+        mark_reattach(&mut argv);
+    }
     for arg in &argv {
         command.arg(arg);
     }
@@ -2837,6 +2884,44 @@ mod tests {
                     && l.contains("closed by remote host")),
             "ssh's stderr must land in the log: {ours:#?}"
         );
+    }
+
+    #[test]
+    fn a_redial_asks_the_remote_to_reattach_rather_than_start_a_server() {
+        let mut argv = bridge_dial_argv(
+            "lars@sage",
+            &test_remote_flock(),
+            crate::session::DEFAULT_SESSION_NAME,
+            None,
+            None,
+        )
+        .expect("argv");
+        mark_reattach(&mut argv);
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("exec \"$HOME/.local/bin/flk\" remote-client-bridge --reattach")
+        );
+    }
+
+    /// A reattach to a server that is gone answers the Hello with a Welcome
+    /// carrying the reason, which the client's handshake turns into a
+    /// refusal — never a fresh, empty server reported as "reconnected".
+    #[test]
+    fn a_reattach_to_a_vanished_server_is_refused_in_protocol_terms() {
+        let hello = crate::protocol::ClientMessage::Input { data: vec![b'x'] };
+        let mut input = Vec::new();
+        crate::protocol::write_message(&mut input, &hello).expect("encode hello");
+        let mut output = Vec::new();
+        refuse_reattach(input.as_slice(), &mut output).expect("refuse");
+        let welcome: crate::protocol::ServerMessage =
+            crate::protocol::read_message(&mut output.as_slice(), crate::protocol::MAX_FRAME_SIZE)
+                .expect("decode welcome");
+        match welcome {
+            crate::protocol::ServerMessage::Welcome { error, .. } => {
+                assert_eq!(error.as_deref(), Some(REMOTE_SERVER_GONE));
+            }
+            _ => panic!("expected a Welcome"),
+        }
     }
 
     /// Does the bridge currently hold a live ssh child pid? Used to prove the
