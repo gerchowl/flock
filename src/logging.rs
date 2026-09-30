@@ -933,6 +933,20 @@ pub(crate) fn remote_probe_failed(target: &str, stage: &'static str, err: &str) 
     );
 }
 
+/// A switch leg dialled through a `ProxyJump` chain failed in a way a later
+/// hop explains (#441 review): its name did not resolve where it was dialled.
+pub(crate) fn remote_jump_route_failed(target: &str, proxy_jump: &str, reason: &str) {
+    tracing::warn!(
+        event = "remote.jump.failed",
+        subsystem = "remote",
+        outcome = "error",
+        target,
+        proxy_jump,
+        reason,
+        "remote dial through a jump chain failed; a later hop may be an ssh alias this machine does not define"
+    );
+}
+
 pub(crate) fn remote_install_started(target: &str, source_description: &str, dest: &str) {
     tracing::info!(
         event = "remote.install.start",

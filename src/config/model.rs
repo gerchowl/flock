@@ -843,6 +843,14 @@ pub struct PeerConfig {
     /// Short host badge shown on remote rows (e.g. "anvil"). Required.
     pub name: String,
     /// SSH destination used for polling and attach. Defaults to `name`.
+    ///
+    /// A client that switches here from another machine dials this value as
+    /// a LATER `ProxyJump` hop (`-J <hub>,<ssh>`) when this peer relays rows
+    /// the client reaches through it (#441). ssh reads that hop's name from
+    /// the CLIENT's ssh config and has the hub resolve the result in DNS, so a
+    /// `Host` alias defined only in the hub's `~/.ssh/config` does not resolve
+    /// there. Prefer a name that resolves everywhere (a tailnet name) or
+    /// define the same alias on the clients.
     pub ssh: String,
     /// Command run on the peer to fetch its summary. The default wraps the
     /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
