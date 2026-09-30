@@ -267,30 +267,6 @@ impl App {
             }
         }
 
-        let mut closed_workspace_id = None;
-        if source_workspace_empty && cross_workspace {
-            self.state.workspaces.remove(source_ws_idx);
-            closed_workspace_id = Some(previous_workspace_id.clone());
-            if self.state.workspaces.is_empty() {
-                self.state.active = None;
-                self.state.selected = 0;
-            } else {
-                if let Some(active) = self.state.active {
-                    if active == source_ws_idx {
-                        self.state.active =
-                            Some(source_ws_idx.min(self.state.workspaces.len() - 1));
-                    } else if active > source_ws_idx {
-                        self.state.active = Some(active - 1);
-                    }
-                }
-                if self.state.selected == source_ws_idx {
-                    self.state.selected = source_ws_idx.min(self.state.workspaces.len() - 1);
-                } else if self.state.selected > source_ws_idx {
-                    self.state.selected -= 1;
-                }
-            }
-        }
-
         let mut created_workspace_flag = false;
         let mut created_tab_flag = false;
         let (target_ws_idx, target_tab_idx, moved_pane_id) = match resolved {
@@ -380,6 +356,28 @@ impl App {
             }
         };
 
+        // Only once the pane has landed does the emptied source close, through
+        // the one close tail every other door uses (#429): focus stays put by
+        // id, a confirm dialog naming the source is dropped, and
+        // WorkspaceClosed is announced there. Closing it earlier would leave a
+        // failed move nothing to recover into.
+        let mut closed_workspace_id = None;
+        let mut target_ws_idx = target_ws_idx;
+        if source_workspace_empty && cross_workspace {
+            if let Some(source_ws_idx) = self
+                .state
+                .workspaces
+                .iter()
+                .position(|ws| ws.id == previous_workspace_id)
+            {
+                self.state.close_workspace(source_ws_idx);
+                closed_workspace_id = Some(previous_workspace_id.clone());
+                if target_ws_idx > source_ws_idx {
+                    target_ws_idx -= 1;
+                }
+            }
+        }
+
         if focus || self.state.active.is_none() {
             self.state
                 .switch_workspace_tab(target_ws_idx, target_tab_idx);
@@ -427,14 +425,6 @@ impl App {
                 data: EventData::TabClosed {
                     tab_id: closed_tab_id.clone(),
                     workspace_id: previous_workspace_id.clone(),
-                },
-            });
-        }
-        if let Some(closed_workspace_id) = &closed_workspace_id {
-            self.emit_event(EventEnvelope {
-                event: EventKind::WorkspaceClosed,
-                data: EventData::WorkspaceClosed {
-                    workspace_id: closed_workspace_id.clone(),
                 },
             });
         }
