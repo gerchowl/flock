@@ -2930,9 +2930,16 @@ async fn run_client_loop(
                             .mark_dial_failed(&slots::SlotTarget::from_key(&key), Instant::now());
                     }
                     if let Some(p) = pending_switch.as_mut() {
+                        // The popup names the classified reason, not ssh's
+                        // raw stderr (#420); the full error is in the log.
+                        crate::logging::client_switch_dial_failed(&p.target_display, &err);
                         p.outcome_beat = Some((
                             Instant::now() + POPUP_FAILURE_BEAT,
-                            format!("switch to {} failed: {err}", p.target_display),
+                            crate::peers::FleetFailureNotice::SwitchFailed {
+                                target: p.target_display.clone(),
+                                reason: crate::peers::failure_text(&err),
+                            }
+                            .to_string(),
                         ));
                         paint_switch_popup(p, state.reported_size, Instant::now());
                     }

@@ -2225,6 +2225,13 @@ pub struct AppState {
     /// server's own `peers.summary` only relays its OWN polled peers,
     /// bounding hop count to one.
     pub relayed_fleet_cache: std::collections::HashMap<String, crate::peers::RelayedEntry>,
+    /// Why the last switch to a host failed, keyed by its ssh target (#420).
+    /// Written when the launcher falls back here with a failed-switch notice,
+    /// shown on that host's servers-band row, and cleared when the operator
+    /// tries that host again. A switch can fail while polls to the same host
+    /// succeed — the bridge needs `flk` and an exec where a poll does not — so
+    /// this is not the poll's dial health.
+    pub switch_failures: std::collections::HashMap<String, crate::peers::SshFailureReason>,
     /// Fleet snapshot carried by the attached client's handshake
     /// (hub-and-spoke down-gossip): origin/home label + render-only peer
     /// rows. None when the client attached locally — no home row then.
@@ -3275,6 +3282,7 @@ impl AppState {
             peers: Vec::new(),
             peer_summaries: Vec::new(),
             relayed_fleet_cache: std::collections::HashMap::new(),
+            switch_failures: std::collections::HashMap::new(),
             fleet_snapshot: None,
             request_peer_switch: None,
             request_peer_checkout: None,
