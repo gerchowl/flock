@@ -824,6 +824,14 @@ fn merge_relayed_rows(
     }
 }
 
+/// A dial error as it leaves this machine (#428): the classified token, never
+/// ssh's stderr line. That line names hosts, ports and paths on this side, and
+/// every spoke and next server would otherwise receive it verbatim. The words
+/// stay in this host's own log, where the dial failure is recorded.
+pub fn wire_error(detail: &str) -> String {
+    SshFailureReason::classify(detail).as_str().to_string()
+}
+
 /// Wire shape of one cached peer summary (`Instant` freshness → age in
 /// seconds at capture time).
 pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
@@ -845,7 +853,7 @@ pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol
         age_secs: peer
             .last_ok
             .map(|at| now.saturating_duration_since(at).as_secs()),
-        error: peer.error.clone(),
+        error: peer.error.as_deref().map(wire_error),
         // Gossip v3 (#101 part 2): forward the frozen origin assertion when
         // the source was a snapshot / relay entry that already carried it.
         // Otherwise the local-poll last_ok IS the origin and doubles as the
@@ -1269,6 +1277,10 @@ pub enum SshFailureReason {
 
 impl SshFailureReason {
     pub fn classify(detail: &str) -> Self {
+        // A row from another host carries the token, not the words (#428).
+        if let Some(reason) = Self::from_token(detail.trim()) {
+            return reason;
+        }
         let lowered = detail.to_ascii_lowercase();
         if lowered.contains("unknown port 65535")
             || lowered.contains("stdio forwarding failed")
@@ -1320,6 +1332,22 @@ impl SshFailureReason {
             Self::NoFlk => "no_flk",
             Self::Other => "other",
         }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        [
+            Self::ConnectRefused,
+            Self::AuthRefused,
+            Self::AgentUnreachable,
+            Self::HostKey,
+            Self::Timeout,
+            Self::JumpHopRefused,
+            Self::UnknownHost,
+            Self::NoFlk,
+            Self::Other,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == token)
     }
 
     /// Short human phrase, for messages and the servers band.
@@ -2071,6 +2099,31 @@ mod tests {
         assert_eq!(polls, 28_800);
         assert!(warns <= 721, "{warns} WARNs for one unchanged outage");
         assert!(warns >= 700, "the outage must still be restated: {warns}");
+    }
+
+    #[test]
+    fn a_reason_token_from_another_host_classifies_back_to_itself() {
+        // #428: a peer now sends the token as `error`, and the receiver still
+        // has to read the reason out of it.
+        use super::SshFailureReason as R;
+        for reason in [
+            R::ConnectRefused,
+            R::AuthRefused,
+            R::AgentUnreachable,
+            R::HostKey,
+            R::Timeout,
+            R::JumpHopRefused,
+            R::UnknownHost,
+            R::NoFlk,
+            R::Other,
+        ] {
+            assert_eq!(R::classify(reason.as_str()), reason);
+            assert_eq!(super::wire_error(reason.as_str()), reason.as_str());
+        }
+        assert_eq!(
+            super::wire_error("ssh: Could not resolve hostname ws00860001: nodename nor servname"),
+            "unknown_host"
+        );
     }
 
     #[test]

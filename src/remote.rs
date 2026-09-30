@@ -259,6 +259,11 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // guard is dropped before `run_client_process` so the painter thread is
     // joined before the client can touch the terminal.
     let progress = crate::switch_progress::SwitchProgress::start(&active_ssh_target);
+    // #441: the carried chain is written from the hub's side; cut the hops that
+    // are this machine, then route every ssh call of the leg through the rest,
+    // the probes included, not only the bridge.
+    let proxy_jump = client_relative_proxy_jump(remote.proxy_jump.as_deref());
+    let control_route = route_control_plane(&remote.target, proxy_jump.as_deref());
     let prepared_remote =
         crate::logging::timed_switch_stage(&active_ssh_target, "remote_prepare", || {
             prepare_remote_flock(&remote.target, remote.live_handoff, remote.context)
@@ -274,6 +279,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             remote.context,
         )
     })?;
+    drop(control_route);
 
     let manage_ssh_config = crate::config::Config::load()
         .config
@@ -287,7 +293,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             local_socket.clone(),
             session_name,
             manage_ssh_config,
-            remote.proxy_jump.clone(),
+            proxy_jump,
         )
     })?;
 
@@ -1481,6 +1487,7 @@ mv "$tmp" "$dest"
     );
 
     let mut child = TracedCommand::new("ssh", "remote")
+        .args(control_plane_jump_args(target)?)
         .arg("-T")
         .arg(target)
         .arg(format!("/bin/sh -eu -c {}", shell_quote(&script)))
@@ -1531,6 +1538,7 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
     // Feed POSIX bootstrap scripts to /bin/sh so the user's login shell only
     // has to parse a simple executable invocation.
     let mut child = TracedCommand::new("ssh", "remote")
+        .args(control_plane_jump_args(target)?)
         .arg("-T")
         .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
@@ -1555,6 +1563,7 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
 
 fn ssh_user_shell_output(target: &str, command: &str) -> io::Result<Output> {
     TracedCommand::new("ssh", "remote")
+        .args(control_plane_jump_args(target)?)
         .arg("-T")
         .args(SSH_NONINTERACTIVE_OPTS)
         .arg(target)
@@ -1907,8 +1916,12 @@ pub(crate) fn start_switch_bridge_noninteractive(
     // The ssh round trip. On a stalled switch this is the leg that is almost
     // always responsible, and it is invisible from the client side because it
     // hides inside what the client calls `bridge_start` (#43, #282).
+    let proxy_jump = client_relative_proxy_jump(proxy_jump);
     let probe_started = Instant::now();
-    let remote_flock = probe_switch_remote_flock(target);
+    let remote_flock = {
+        let _route = route_control_plane(target, proxy_jump.as_deref());
+        probe_switch_remote_flock(target)
+    };
     crate::logging::remote_switch_stage(
         target,
         "remote_probe",
@@ -1931,7 +1944,7 @@ pub(crate) fn start_switch_bridge_noninteractive(
         local_socket.clone(),
         session_name,
         manage_ssh_config,
-        proxy_jump.map(str::to_string),
+        proxy_jump,
     );
     crate::logging::remote_switch_stage(
         target,
@@ -2052,6 +2065,100 @@ pub(crate) fn is_valid_ssh_destination(value: &str) -> bool {
 /// as `None` or an empty string and never reach this.
 pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
     !chain.is_empty() && chain.split(',').all(is_valid_ssh_destination)
+}
+
+/// A carried `ProxyJump` chain as seen from THIS machine (#441).
+///
+/// A snapshot row's chain is written by the server that built the snapshot,
+/// hub first: `mba22` for a peer the hub polls, `mba22,anvil` for one only
+/// the relayer `anvil` can reach. When the launcher runs on one of those hops,
+/// every hop up to and including it is a loop back to where the dial already
+/// is, so it is cut: the hub's own client reaches its polled peers directly
+/// and a relayed peer via the relayer alone. `None` when nothing is left.
+pub(crate) fn client_relative_proxy_jump(chain: Option<&str>) -> Option<String> {
+    relative_proxy_jump(chain?, &crate::app::short_host_name())
+}
+
+pub(crate) fn relative_proxy_jump(chain: &str, self_host: &str) -> Option<String> {
+    let me = jump_hop_host_key(self_host);
+    let hops: Vec<&str> = chain.split(',').filter(|hop| !hop.is_empty()).collect();
+    let start = hops
+        .iter()
+        .rposition(|hop| jump_hop_host_key(hop) == me)
+        .map_or(0, |at| at + 1);
+    let rest = hops[start..].join(",");
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The machine a `[user@]host[:port]` hop names, keyed the way every viewer
+/// keys a host (#422), so `lars@mba22.tail1234.ts.net:22` is `mba22`.
+fn jump_hop_host_key(hop: &str) -> String {
+    let host = hop.rsplit_once('@').map_or(hop, |(_, host)| host);
+    let host = match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    };
+    crate::peers::normalized_host_key(host)
+}
+
+std::thread_local! {
+    /// The `ProxyJump` the control-plane ssh calls of the leg being prepared
+    /// on this thread must ride, keyed by the target it belongs to.
+    static CONTROL_PLANE_ROUTE: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Route the probe, install and server-status ssh calls for `target` through
+/// `proxy_jump` until the guard drops (#441).
+///
+/// Only the bridge used to carry a snapshot row's jump. Every ssh round trip
+/// before it (platform probe, binary discovery, server status) dialled the
+/// bare target, so a row whose target resolves only behind its jump host (a
+/// relayer's `ws00860001`) failed the probe with "Could not resolve hostname"
+/// before the bridge ever ran. Scoped to the preparing thread and to the one
+/// target, so no other dial picks it up.
+fn route_control_plane(target: &str, proxy_jump: Option<&str>) -> ControlPlaneRoute {
+    let route = proxy_jump
+        .filter(|jump| !jump.is_empty())
+        .map(|jump| (target.to_string(), jump.to_string()));
+    CONTROL_PLANE_ROUTE.with(|slot| *slot.borrow_mut() = route);
+    ControlPlaneRoute
+}
+
+struct ControlPlaneRoute;
+
+impl Drop for ControlPlaneRoute {
+    fn drop(&mut self) {
+        CONTROL_PLANE_ROUTE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// `-o ProxyJump=<chain>` for a control-plane ssh call to `target`, when the
+/// leg being prepared routes it through one. A chain that fails validation is
+/// an error, never a silent direct dial.
+fn control_plane_jump_args(target: &str) -> io::Result<Vec<String>> {
+    let jump = CONTROL_PLANE_ROUTE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(routed, _)| routed == target)
+            .map(|(_, jump)| jump.clone())
+    });
+    let Some(jump) = jump else {
+        return Ok(Vec::new());
+    };
+    if !is_valid_ssh_proxy_jump(&jump) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to dial through an invalid ssh proxy jump: {jump:?}"),
+        ));
+    }
+    Ok(vec!["-o".to_string(), format!("ProxyJump={jump}")])
 }
 
 /// Assemble the argv (minus the `ssh` program itself) the bridge dial will
@@ -2330,6 +2437,62 @@ mod tests {
             "should flag unknown protocol: {blurb}"
         );
         assert!(blurb.contains(&CURRENT_PROTOCOL.to_string()));
+    }
+
+    /// #441: a chain is written from the hub's side. The hops that are the
+    /// dialling machine itself are cut, along with every hop before them.
+    #[test]
+    fn a_jump_through_the_dialling_machine_is_cut() {
+        // The client on the hub dials a hub-polled peer directly.
+        assert_eq!(relative_proxy_jump("mba22", "mba22"), None);
+        // And a relayed peer via the relayer alone.
+        assert_eq!(
+            relative_proxy_jump("mba22,lars@anvil", "mba22").as_deref(),
+            Some("lars@anvil")
+        );
+        // On the relayer, the target resolves locally: no jump at all.
+        assert_eq!(relative_proxy_jump("mba22,lars@anvil", "anvil"), None);
+        // Anywhere else the two-hop chain is kept whole.
+        assert_eq!(
+            relative_proxy_jump("mba22,lars@anvil", "ksb").as_deref(),
+            Some("mba22,lars@anvil")
+        );
+        // A hop names the machine however ssh spells it.
+        assert_eq!(
+            relative_proxy_jump("lars@MBA22.tail1234.ts.net:22,anvil", "mba22").as_deref(),
+            Some("anvil")
+        );
+        // A different machine sharing a prefix is not us.
+        assert_eq!(
+            relative_proxy_jump("mba22,anvil", "mba").as_deref(),
+            Some("mba22,anvil")
+        );
+    }
+
+    /// #441: the probe ssh rides the leg's jump. It used to dial the bare
+    /// target, so a relayer's `ws00860001` failed with "Could not resolve
+    /// hostname" before the bridge, which did carry the jump, ever ran.
+    #[test]
+    fn control_plane_ssh_rides_the_legs_jump_only_while_it_is_prepared() {
+        assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+        {
+            let _route = route_control_plane("ws00860001", Some("mba22,anvil"));
+            assert_eq!(
+                control_plane_jump_args("ws00860001").unwrap(),
+                vec!["-o".to_string(), "ProxyJump=mba22,anvil".to_string()]
+            );
+            // Another target on the same thread is not routed.
+            assert!(control_plane_jump_args("sage").unwrap().is_empty());
+        }
+        assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+        {
+            let _route = route_control_plane("ws00860001", Some("-oProxyCommand=evil"));
+            assert!(control_plane_jump_args("ws00860001").is_err());
+        }
+        {
+            let _route = route_control_plane("ws00860001", None);
+            assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+        }
     }
 
     #[test]
