@@ -483,6 +483,18 @@ Session references are stored in the local Flock session snapshot. They are not 
 
 For how native agent session restore differs from pane screen history and live handoff, see [Session state and restore](/docs/session-state/).
 
+### Claude Stop hook recap check
+
+Flock's Claude Stop hook asks an agent for a `※ recap:` line when its turn ended without one. It judges this from the reply that Claude Code passes to the hook. An older Claude Code does not pass the reply, and there the hook reads the transcript instead. That transcript can lag one message behind the turn, so the hook waits a bounded time for the reply to land:
+
+```toml
+[session]
+stop_transcript_wait_ms = 1000
+stop_transcript_poll_ms = 50
+```
+
+If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. The wait is capped at Claude's 10-second hook timeout, and a poll interval below 1 ms is treated as 1 ms. Current Claude Code never uses these keys.
+
 ## IME cursor tracking
 
 When the focused pane hides its cursor and paints its own — common in AI-agent TUIs like Claude Code, pi, and codex — macOS native input methods stop tracking the candidate window position because the outer terminal stops reporting the cursor.

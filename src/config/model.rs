@@ -320,12 +320,27 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Flock session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// How long Claude's Stop hook waits for the turn's final reply to land in
+    /// the transcript, in milliseconds (#415). Default: 1000.
+    ///
+    /// Only consulted when the harness does not hand the hook the reply
+    /// itself (`last_assistant_message`, present on current Claude Code). A
+    /// transcript read before the reply is flushed shows the PREVIOUS message,
+    /// which has no recap line — so the hook waits this long for the reply to
+    /// appear, and if it never does, it does not ask for a recap it cannot
+    /// check. `0` reads once and never waits.
+    pub stop_transcript_wait_ms: u64,
+    /// How often that wait re-reads the transcript, in milliseconds.
+    /// Default: 50.
+    pub stop_transcript_poll_ms: u64,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            stop_transcript_wait_ms: 1_000,
+            stop_transcript_poll_ms: 50,
         }
     }
 }
