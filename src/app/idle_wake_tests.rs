@@ -669,3 +669,60 @@ async fn a_message_relayed_from_another_host_wakes_the_same_way() {
     tick_past_gap(&mut app);
     assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
 }
+
+/// #438: under channel push the push knocks first. The idle wake holds off
+/// for the grace window, so a push that started a turn leaves nothing to
+/// type — and a session that never registered the channel is still woken,
+/// once the window has passed.
+#[tokio::test]
+async fn under_channel_push_the_idle_wake_waits_out_the_grace_then_still_falls_back() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    app.state.config.msg.channel_push = true;
+    app.state.config.msg.channel_push_idle_wake_grace_ms = 60_000;
+    claude_idle_for(&mut app, settled());
+
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    tick_past_gap(&mut app);
+    assert!(drain(&mut pty).is_empty(), "nothing typed inside the grace");
+
+    // No push landed (the session never registered the channel): once the
+    // grace has passed, the ordinary wake types the constant.
+    app.mailboxes.test_age_all(61_000);
+    claude_idle_for(&mut app, settled());
+    app.tick_idle_wakes(Instant::now());
+    assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
+}
+
+#[tokio::test]
+async fn under_channel_push_a_turn_the_push_started_is_never_typed_over() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    app.state.config.msg.channel_push = true;
+    app.state.config.msg.channel_push_idle_wake_grace_ms = 60_000;
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+
+    // The push landed and Claude started working before the grace ran out.
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Claude),
+        AgentState::Working,
+        false,
+        true,
+        false,
+        false,
+        Instant::now(),
+    );
+    app.mailboxes.test_age_all(61_000);
+    tick_past_gap(&mut app);
+    assert!(
+        drain(&mut pty).is_empty(),
+        "a working agent is not typed into"
+    );
+}

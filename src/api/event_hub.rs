@@ -16,6 +16,11 @@ struct PersistedEvent {
 #[derive(Clone, Default)]
 pub struct EventHub {
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    /// The newest sequence pushed, behind its own lock so a waiter can sleep
+    /// on it (#438). Kept apart from `inner` because a condvar pairs with ONE
+    /// mutex, and `inner` is held across disk writes — a waiter must never
+    /// queue behind an fsync just to learn that nothing new arrived.
+    arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 }
 
 #[derive(Default)]
@@ -299,6 +304,33 @@ impl EventHub {
         if overflow > 0 {
             state.events.drain(0..overflow);
         }
+        drop(state);
+        let (latest, condvar) = &*self.arrived;
+        if let Ok(mut latest) = latest.lock() {
+            *latest = sequence;
+            condvar.notify_all();
+        }
+    }
+
+    /// Block until an event newer than `sequence` has been pushed, or
+    /// `timeout` passes. Returns whether one arrived.
+    ///
+    /// The event-driven half of a stream subscription (#438): a waiter wakes
+    /// on the push itself rather than on its next sleep tick, so delivery
+    /// latency is the notify, not the tick. The timeout stays so the caller
+    /// can still notice a hung-up client or a stopping server.
+    pub fn wait_after(&self, sequence: u64, timeout: std::time::Duration) -> bool {
+        let (latest, condvar) = &*self.arrived;
+        let Ok(guard) = latest.lock() else {
+            return false;
+        };
+        if *guard > sequence {
+            return true;
+        }
+        match condvar.wait_timeout_while(guard, timeout, |latest| *latest <= sequence) {
+            Ok((guard, _)) => *guard > sequence,
+            Err(_) => false,
+        }
     }
 
     pub fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
@@ -395,6 +427,26 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    /// #438: a waiter wakes on the push itself, and a wait that finds the
+    /// hub already past its cursor returns without sleeping at all.
+    #[test]
+    fn wait_after_wakes_on_push_and_times_out_without_one() {
+        let hub = EventHub::default();
+        let cursor = hub.current_sequence();
+        assert!(!hub.wait_after(cursor, std::time::Duration::from_millis(10)));
+
+        let pusher = hub.clone();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            pusher.push(workspace_event("w"));
+        });
+        assert!(hub.wait_after(cursor, std::time::Duration::from_secs(10)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        handle.join().unwrap();
+        assert!(hub.wait_after(cursor, std::time::Duration::ZERO));
     }
 
     #[test]

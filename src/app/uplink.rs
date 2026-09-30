@@ -56,6 +56,10 @@ pub(crate) struct ParkedSend {
     /// Set when this send is a mute's automatic deferral (ADR-0018 §3): the
     /// record the hub's answer settles, since there is no caller to answer.
     pub(crate) deferral: Option<Box<crate::events::MsgDeferralRelay>>,
+    /// Set when this send is a reply to channel-pushed mail (#438): the
+    /// original it answers, settled only once the hub says the reply was
+    /// delivered. A refusal or a timeout leaves the original unread.
+    pub(crate) settles_on_delivery: Option<SettleOnDelivery>,
     deadline: Instant,
     /// `None` until the transport attaches it, and forever when the request
     /// did not come through a transport that can park (a direct in-process
@@ -78,6 +82,7 @@ impl ParkedSend {
             to_agent,
             intent: crate::api::schema::MsgIntent::Fyi,
             deferral: None,
+            settles_on_delivery: None,
             deadline,
             respond_to: None,
         }
@@ -89,6 +94,14 @@ impl ParkedSend {
             let _ = respond_to.send(response);
         }
     }
+}
+
+/// A queued original a handed-up reply answers (#438): which inbox holds it,
+/// and its correlation id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettleOnDelivery {
+    pub(crate) pane: String,
+    pub(crate) correlation_id: String,
 }
 
 /// A relay's take, parked until there is a frame for it.
@@ -337,6 +350,14 @@ impl Uplink {
                 Ok(())
             }
         }
+    }
+
+    /// The parked send carrying `correlation_id`, while it still waits on the
+    /// hub.
+    pub(crate) fn parked_send_mut(&mut self, correlation_id: &str) -> Option<&mut ParkedSend> {
+        self.sends
+            .values_mut()
+            .find(|send| send.correlation_id == correlation_id)
     }
 
     /// The hub answered: resolve the send waiting on `uplink_id`. `None` when

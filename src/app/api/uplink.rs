@@ -421,6 +421,13 @@ impl App {
             return encode_success(id, ResponseResult::MsgUplinkResultAck { matched: false });
         };
         let response = self.uplinked_outcome(&send, &params);
+        // #438: a reply to pushed mail settles its original only now, on the
+        // hub's word that the reply went out.
+        if let Some(settle) = send.settles_on_delivery.take() {
+            if params.response.get("error").is_none() {
+                self.settle_original_in(&settle.pane, &settle.correlation_id);
+            }
+        }
         if let Some(relay) = send.deferral.take() {
             let outcome = match params.response.get("error") {
                 Some(error) => Err(error.to_string()),
@@ -1001,6 +1008,109 @@ mod tests {
 
         assert_eq!(mute_count(&mut app, &pane), 1, "released, so retried");
         assert_eq!(app.uplink.outbound_len(), 1);
+    }
+
+    // ---- #438: a reply to pushed mail, handed up, settles on the hub's word
+
+    /// A spoke agent's pane holding a pushed `needs_reply` from an agent on
+    /// another spoke. Answering it can only go up the hub. Returns the pane.
+    fn spoke_agent_with_pushed_question(app: &mut crate::app::App, cid: &str) -> String {
+        app.state.config.msg.channel_push = true;
+        attest_caller(app);
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("workspace has a pane");
+        let pane = app.public_pane_id(0, pane_id).expect("public id");
+        let queued = value(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgSend(MsgSendParams {
+                from_agent: Some("agent_far_1".into()),
+                from_host: Some("far".into()),
+                to: MessageTarget::Pane { pane: pane.clone() },
+                correlation_id: Some(cid.into()),
+                ..send_to("unused")
+            }),
+        }));
+        assert_eq!(queued["result"]["state"], "queued", "{queued}");
+        pane
+    }
+
+    /// The agent answers from its own pane, as `flock_msg_reply` would.
+    fn reply_as_agent(app: &mut crate::app::App, cid: &str) -> std::sync::mpsc::Receiver<String> {
+        app.current_api_peer_pid = Some(std::process::id());
+        let rx = via_transport(
+            app,
+            Method::MsgReply(crate::api::schema::MsgReplyParams {
+                correlation_id: cid.into(),
+                body: "answer".into(),
+                intent: MsgIntent::Fyi,
+                reply_correlation_id: None,
+            }),
+        );
+        app.current_api_peer_pid = None;
+        rx
+    }
+
+    fn replied_settles(app: &crate::app::App, cid: &str) -> usize {
+        app.event_hub
+            .events_after(0)
+            .into_iter()
+            .filter(|(_, envelope)| {
+                matches!(
+                    &envelope.data,
+                    crate::api::schema::EventData::MessageDelivered { correlation_id, outcome, .. }
+                        if correlation_id == cid && outcome == "replied"
+                )
+            })
+            .count()
+    }
+
+    /// #446 review: `handed_up` is a stand-in, not an outcome. A reply the
+    /// hub then REFUSES went nowhere, so the pushed original stays unread
+    /// and the wakes keep knocking for it.
+    #[tokio::test]
+    async fn a_handed_up_reply_the_hub_refuses_leaves_the_original_unread() {
+        let mut app = test_app();
+        let _take = attach_relay(&mut app);
+        let pane = spoke_agent_with_pushed_question(&mut app, "c-pushed-refused");
+
+        let _answer = reply_as_agent(&mut app, "c-pushed-refused");
+        assert_eq!(app.uplink.outbound_len(), 1, "the reply went up the hub");
+        assert_eq!(
+            app.mailboxes.queued_len(&pane),
+            1,
+            "nothing settles on the stand-in"
+        );
+
+        hub_answers(
+            &mut app,
+            serde_json::json!({
+                "id": "uplink-forward",
+                "error": {"code": "peer_unreachable", "message": "hub cannot reach far"},
+            }),
+        );
+        assert_eq!(app.mailboxes.queued_len(&pane), 1, "still unread");
+        assert_eq!(replied_settles(&app, "c-pushed-refused"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handed_up_reply_the_hub_delivers_settles_the_original() {
+        let mut app = test_app();
+        let _take = attach_relay(&mut app);
+        let pane = spoke_agent_with_pushed_question(&mut app, "c-pushed-ok");
+
+        let _answer = reply_as_agent(&mut app, "c-pushed-ok");
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+        hub_answers(
+            &mut app,
+            serde_json::json!({
+                "id": "uplink-forward",
+                "result": {"type": "msg_queued", "correlation_id": "r-1",
+                           "state": "relayed", "to_host": "far"},
+            }),
+        );
+        assert_eq!(app.mailboxes.queued_len(&pane), 0, "settled on delivery");
+        assert_eq!(replied_settles(&app, "c-pushed-ok"), 1);
     }
 
     #[tokio::test]

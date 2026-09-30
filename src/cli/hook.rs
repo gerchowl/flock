@@ -825,6 +825,8 @@ mod tests {
         };
 
         let woken = encode(crate::api::schema::ResponseResult::MsgWake {
+            pane: None,
+            channel_push: false,
             count: 3,
             suppressed: None,
             muted_until_ms: None,
@@ -834,6 +836,8 @@ mod tests {
         // A suppressed wake reports zero in the count itself, so a hook that
         // reads only the count cannot nudge through a pause or a mute.
         let suppressed = encode(crate::api::schema::ResponseResult::MsgWake {
+            pane: None,
+            channel_push: false,
             count: 0,
             suppressed: Some("fleet_paused".into()),
             muted_until_ms: None,

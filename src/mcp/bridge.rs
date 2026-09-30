@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{Method, Request};
 
+use super::channel::{self, ChannelOptions};
 use super::framing::McpError;
 use super::{resources, tools};
 
@@ -40,9 +41,10 @@ pub(super) fn route<F: FlockCall>(
     method: &str,
     params: Value,
     flock: &F,
+    channel: &ChannelOptions,
 ) -> Result<Value, McpError> {
     match method {
-        "initialize" => Ok(initialize_result()),
+        "initialize" => Ok(initialize_result(channel)),
         // Notifications the MCP spec mandates a client sends after
         // `initialize`. We accept them silently (and their result is
         // discarded by the loop anyway — never sent on the wire).
@@ -66,22 +68,32 @@ pub(super) fn route<F: FlockCall>(
     }
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(channel: &ChannelOptions) -> Value {
     // The `2024-11-05` protocol version is what the Anthropic MCP spec
     // documents for the capability set we advertise. Bumping this is a wire
     // change — update the golden test alongside.
-    json!({
+    //
+    // `resources` advertises the handed-over-file surface (#286). No
+    // `subscribe`/`listChanged` sub-capability: flock does not push
+    // resource notifications, and claiming otherwise would make a client
+    // wait for an update that never comes.
+    let mut result = json!({
         "protocolVersion": "2024-11-05",
-        // `resources` advertises the handed-over-file surface (#286). No
-        // `subscribe`/`listChanged` sub-capability: flock does not push
-        // resource notifications, and claiming otherwise would make a client
-        // wait for an update that never comes.
         "capabilities": { "tools": {}, "resources": {} },
         "serverInfo": {
             "name": "flock",
             "version": env!("CARGO_PKG_VERSION"),
         },
-    })
+    });
+    // #438: the channel capability is declared ONLY with `[msg]
+    // channel_push` on. Its presence is what makes Claude Code register a
+    // listener, and a server that declares it without pushing would leave a
+    // listener waiting on nothing.
+    if channel.push {
+        result["capabilities"]["experimental"] = json!({ channel::CAPABILITY: {} });
+        result["instructions"] = json!(channel::INSTRUCTIONS);
+    }
+    result
 }
 
 fn tools_list_result() -> Value {
@@ -190,7 +202,7 @@ mod tests {
     #[test]
     fn initialize_returns_server_info() {
         let flock = MockApi::ok(json!({}));
-        let result = route("initialize", json!({}), &flock).unwrap();
+        let result = route("initialize", json!({}), &flock, &ChannelOptions::off()).unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["capabilities"]["tools"], json!({}));
         assert_eq!(result["capabilities"]["resources"], json!({}));
@@ -200,9 +212,45 @@ mod tests {
     }
 
     #[test]
+    fn the_channel_capability_is_declared_only_with_the_flag_on() {
+        let flock = MockApi::ok(json!({}));
+        let off = route("initialize", json!({}), &flock, &ChannelOptions::off()).unwrap();
+        assert!(off["capabilities"].get("experimental").is_none());
+        assert!(off.get("instructions").is_none());
+
+        let on_opts = ChannelOptions {
+            push: true,
+            ..ChannelOptions::off()
+        };
+        let on = route("initialize", json!({}), &flock, &on_opts).unwrap();
+        assert_eq!(
+            on["capabilities"]["experimental"]["claude/channel"],
+            json!({})
+        );
+        assert!(on["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("flock_msg_read"));
+        // Nothing else about the handshake moves with the flag.
+        assert_eq!(on["capabilities"]["tools"], json!({}));
+        assert_eq!(on["protocolVersion"], off["protocolVersion"]);
+        // Permission relay is a separate opt-in flock does not make: it would
+        // let whoever reaches the channel approve tool calls.
+        assert!(on["capabilities"]["experimental"]
+            .get("claude/channel/permission")
+            .is_none());
+    }
+
+    #[test]
     fn notifications_initialized_produces_no_flock_call() {
         let flock = MockApi::ok(json!({}));
-        route("notifications/initialized", json!({}), &flock).unwrap();
+        route(
+            "notifications/initialized",
+            json!({}),
+            &flock,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
         assert!(flock.calls.borrow().is_empty());
     }
 
@@ -211,14 +259,14 @@ mod tests {
         let flock = MockApi::ok(json!({}));
         // `prompts/list` is a real MCP method flock does not implement —
         // `resources/list` stopped being one in #286.
-        let err = route("prompts/list", json!({}), &flock).unwrap_err();
+        let err = route("prompts/list", json!({}), &flock, &ChannelOptions::off()).unwrap_err();
         assert_eq!(err.code, -32601);
     }
 
     #[test]
     fn tools_list_matches_the_table() {
         let flock = MockApi::ok(json!({}));
-        let result = route("tools/list", json!({}), &flock).unwrap();
+        let result = route("tools/list", json!({}), &flock, &ChannelOptions::off()).unwrap();
         let names: Vec<&str> = result["tools"]
             .as_array()
             .unwrap()
@@ -242,6 +290,7 @@ mod tests {
             "tools/call",
             json!({ "name": "flock_agent_list", "arguments": {} }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -259,6 +308,7 @@ mod tests {
             "tools/call",
             json!({ "name": "flock_pane_close", "arguments": { "pane_id": "p1" } }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap_err();
         assert_eq!(err.code, -32000);
@@ -284,6 +334,7 @@ mod tests {
             "tools/call",
             json!({ "name": "flock_agent_fork", "arguments": { "target": "codex" } }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap_err();
         assert_eq!(err.code, -32000);
@@ -314,7 +365,7 @@ mod tests {
                 "total": 1
             }
         }));
-        let result = route("resources/list", json!({}), &flock).unwrap();
+        let result = route("resources/list", json!({}), &flock, &ChannelOptions::off()).unwrap();
         assert_eq!(result["resources"][0]["uri"], "flock://handoff/file:abc:0");
         assert_eq!(result["resources"][0]["name"], "spec.pdf");
         assert!(matches!(flock.calls.borrow()[0], Method::HandoffList(_)));
@@ -341,6 +392,7 @@ mod tests {
             "resources/read",
             json!({ "uri": "flock://handoff/file:abc:0" }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap();
         assert_eq!(result["contents"][0]["text"], "# hello");
@@ -362,6 +414,7 @@ mod tests {
             "resources/read",
             json!({ "uri": "flock://handoff/x" }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap_err();
         assert_eq!(err.code, -32000);
@@ -378,6 +431,7 @@ mod tests {
             "resources/read",
             json!({ "uri": "file:///etc/passwd" }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap_err();
         assert_eq!(err.code, -32602);
@@ -391,6 +445,7 @@ mod tests {
             "tools/call",
             json!({ "name": "flock_agent_get", "arguments": {} }),
             &flock,
+            &ChannelOptions::off(),
         )
         .unwrap_err();
         assert_eq!(err.code, -32602);

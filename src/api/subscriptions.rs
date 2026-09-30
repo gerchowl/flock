@@ -93,8 +93,17 @@ pub(super) struct ActiveEventSubscription {
     last_sequence: u64,
 }
 
+/// A pane's inbox feed (#438). Hub-driven like [`ActiveEventSubscription`],
+/// filtered to one kind AND one recipient, and started at the hub's current
+/// sequence so it reports only mail that arrives after it attached.
+pub(super) struct ActiveMsgQueuedSubscription {
+    pane: String,
+    last_sequence: u64,
+}
+
 pub(super) enum ActiveSubscription {
     Event(ActiveEventSubscription),
+    MsgQueued(ActiveMsgQueuedSubscription),
     OutputMatched(ActiveOutputMatchedSubscription),
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
 }
@@ -167,6 +176,10 @@ impl ActiveSubscription {
             Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneAgentDetected,
                 last_sequence: 0,
+            })),
+            Subscription::MsgQueued { pane } => Ok(Self::MsgQueued(ActiveMsgQueuedSubscription {
+                pane,
+                last_sequence: event_hub.current_sequence(),
             })),
             Subscription::PaneOutputMatched {
                 pane_id,
@@ -255,6 +268,7 @@ impl ActiveSubscription {
     ) -> Option<serde_json::Value> {
         match self {
             Self::Event(subscription) => subscription.poll(event_hub),
+            Self::MsgQueued(subscription) => subscription.poll(event_hub),
             Self::OutputMatched(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
             }
@@ -270,6 +284,36 @@ impl ActiveEventSubscription {
         for (sequence, event) in event_hub.events_after(self.last_sequence) {
             self.last_sequence = sequence;
             if event.event == self.event_kind {
+                return serde_json::to_value(event).ok();
+            }
+        }
+        None
+    }
+}
+
+impl ActiveSubscription {
+    /// The hub sequence this subscription has consumed up to, when it is
+    /// driven by the hub alone. `None` for a subscription that must re-read
+    /// pane state on a timer, which the stream loop cannot sleep through.
+    pub(super) fn hub_cursor(&self) -> Option<u64> {
+        match self {
+            Self::MsgQueued(subscription) => Some(subscription.last_sequence),
+            Self::Event(_) | Self::OutputMatched(_) | Self::AgentStatusChanged(_) => None,
+        }
+    }
+}
+
+impl ActiveMsgQueuedSubscription {
+    fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
+        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+            self.last_sequence = sequence;
+            if event.event != crate::api::schema::EventKind::MessageQueued {
+                continue;
+            }
+            let crate::api::schema::EventData::MessageQueued { to_pane, .. } = &event.data else {
+                continue;
+            };
+            if *to_pane == self.pane {
                 return serde_json::to_value(event).ok();
             }
         }

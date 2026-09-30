@@ -11,43 +11,64 @@
 //!   - [`tools`]   — the closed tool table (names, schemas, method builders)
 //!   - [`resources`] — the resource surface: handed-over files (#286)
 //!   - [`bridge`]  — pure dispatcher from parsed method → MCP result
+//!   - [`channel`] — the opt-in channel push of arriving mail (#438)
 //!   - this file  — the blocking read/write loop
 //!
 //! The loop mirrors [`crate::cli::hook`]'s posture: a blocking `BufReader` on
-//! stdin, no tokio, no logging. Newline-delimited JSON is the whole framing
-//! protocol; EOF on stdin means the client hung up and we exit 0 cleanly.
+//! stdin, no tokio. Newline-delimited JSON is the whole framing protocol; EOF
+//! on stdin means the client hung up and we exit 0 cleanly. It logs nothing —
+//! except with channel push on (#438), when a long-lived feed thread runs
+//! and its failures would otherwise be invisible, so the process then writes
+//! its own `flock-mcp-<pid>.log`, the way the relay writes its own file.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 mod bridge;
+mod channel;
 mod framing;
 mod resources;
 mod tools;
 
 use bridge::{FlockCall, LocalApi};
+use channel::{ChannelOptions, SharedOut};
 use framing::{error_response, parse_message, success_response};
 
 /// Run the MCP stdio server on this process's stdin/stdout. Returns when
 /// stdin reaches EOF or an IO error interrupts the loop.
 pub(crate) fn serve_over_stdio() -> std::io::Result<i32> {
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
-    let writer = stdout.lock();
-    serve_loop(reader, writer, &LocalApi)
+    // Shared, not locked for the process lifetime: with channel push on, a
+    // second thread writes notifications between responses.
+    let out: SharedOut = Arc::new(Mutex::new(std::io::stdout()));
+    let channel = ChannelOptions::from_config(&crate::config::Config::load().config.msg);
+    if channel.push {
+        crate::logging::init_mcp_file_logging();
+    }
+    let feed_out = out.clone();
+    let feed_opts = channel.clone();
+    serve_loop(reader, &out, &LocalApi, &channel, move || {
+        channel::spawn_push_feed(feed_out, feed_opts);
+    })
 }
 
 /// The serve loop, parameterised over its IO and the flock transport so
-/// tests can drive it end-to-end without stdio or a socket.
-fn serve_loop<R: BufRead, W: Write, F: FlockCall>(
+/// tests can drive it end-to-end without stdio or a socket. `start_feed`
+/// runs at most once, when the client finishes initializing and channel push
+/// is on.
+fn serve_loop<R: BufRead, F: FlockCall>(
     mut reader: R,
-    mut writer: W,
+    out: &SharedOut,
     flock: &F,
+    channel: &ChannelOptions,
+    start_feed: impl FnOnce(),
 ) -> std::io::Result<i32> {
+    let mut start_feed = Some(start_feed);
     let mut line = String::new();
     loop {
         line.clear();
@@ -63,24 +84,28 @@ fn serve_loop<R: BufRead, W: Write, F: FlockCall>(
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(&line, flock) {
-            write_json_line(&mut writer, &response)?;
+        if let Some(response) = handle_line(&line, flock, channel) {
+            channel::emit(out, &response)?;
+        }
+        // A push before the client has initialized has no listener to reach,
+        // so the feed attaches on `notifications/initialized`, once.
+        if channel.push && is_initialized_notification(&line) {
+            if let Some(start) = start_feed.take() {
+                start();
+            }
         }
     }
 }
 
-fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<()> {
-    let mut buf = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    buf.push(b'\n');
-    writer.write_all(&buf)?;
-    writer.flush()
+fn is_initialized_notification(line: &str) -> bool {
+    parse_message(line).is_ok_and(|m| m.id.is_none() && m.method == "notifications/initialized")
 }
 
 /// Process one line from stdin. Returns `None` when the caller must NOT emit
 /// a response (notifications, per JSON-RPC 2.0). Malformed input returns a
 /// parse-error response with id `null` — the spec's fallback when we can't
 /// recover an id from the client's payload.
-fn handle_line<F: FlockCall>(line: &str, flock: &F) -> Option<Value> {
+fn handle_line<F: FlockCall>(line: &str, flock: &F, channel: &ChannelOptions) -> Option<Value> {
     let parsed = match parse_message(line) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -93,7 +118,7 @@ fn handle_line<F: FlockCall>(line: &str, flock: &F) -> Option<Value> {
     };
 
     let is_notification = parsed.id.is_none();
-    let outcome = bridge::route(&parsed.method, parsed.params, flock);
+    let outcome = bridge::route(&parsed.method, parsed.params, flock, channel);
 
     if is_notification {
         // Per spec: no response for notifications, even on error. The bridge
@@ -146,15 +171,25 @@ mod tests {
     }
 
     fn drive(input: &str, response: Value) -> Vec<Value> {
+        drive_with(input, response, &ChannelOptions::off(), || {})
+    }
+
+    fn drive_with(
+        input: &str,
+        response: Value,
+        channel: &ChannelOptions,
+        start_feed: impl FnOnce(),
+    ) -> Vec<Value> {
         let flock = MockApi {
             response,
             calls: RefCell::new(Vec::new()),
         };
-        let mut output: Vec<u8> = Vec::new();
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let out: SharedOut = sink.clone();
         let reader = std::io::BufReader::new(input.as_bytes());
-        serve_loop(reader, &mut output, &flock).unwrap();
+        serve_loop(reader, &out, &flock, channel, start_feed).unwrap();
         // Split newline-framed JSON back into values.
-        let text = String::from_utf8(output).unwrap();
+        let text = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
         text.lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
@@ -217,6 +252,39 @@ mod tests {
         // No input at all — the loop returns Ok(0) and emits nothing.
         let out = drive("", json!({}));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_push_feed_starts_once_on_initialized_and_only_with_the_flag() {
+        let handshake = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+        );
+        let on = ChannelOptions {
+            push: true,
+            ..ChannelOptions::off()
+        };
+        let started = std::cell::Cell::new(0);
+        let out = drive_with(handshake, json!({}), &on, || started.set(started.get() + 1));
+        assert_eq!(started.get(), 1, "one feed per session");
+        assert_eq!(
+            out[0]["result"]["capabilities"]["experimental"]["claude/channel"],
+            json!({})
+        );
+
+        let started = std::cell::Cell::new(0);
+        drive_with(handshake, json!({}), &ChannelOptions::off(), || {
+            started.set(1)
+        });
+        assert_eq!(
+            started.get(),
+            0,
+            "flag off: no feed, no socket subscription"
+        );
     }
 
     #[test]

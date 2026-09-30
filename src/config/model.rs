@@ -1180,6 +1180,34 @@ pub struct MsgConfig {
     /// stable idle prompt, so a live idle pane always qualifies and a pane
     /// the detector has stopped reporting does not.
     pub idle_wake_fresh_ms: u64,
+    /// Push arriving mail into a Claude Code session as a channel event
+    /// (#438, ADR-0019, Proposed). Default: false.
+    ///
+    /// When true, `flk mcp serve` declares the `claude/channel` capability and
+    /// emits `notifications/claude/channel` when mail lands in its own pane's
+    /// inbox. The inbox stays the source of truth: a push is never an ack, so
+    /// the Stop-hook nudge and the idle wake keep running underneath as the
+    /// fallback for a session that did not load the channel.
+    pub channel_push: bool,
+    /// Largest body a channel push carries verbatim, in bytes. Default: 4096.
+    /// A longer body, or any body from a sender this server did not attest,
+    /// is pushed as a count-only doorbell instead.
+    pub channel_push_body_max_bytes: usize,
+    /// How long `flk mcp serve` waits before re-attaching its inbox feed
+    /// after the flock socket went away (a restart, a live handoff), in
+    /// seconds. Default: 5. The inbox keeps the mail meanwhile, and the
+    /// Stop-hook nudge and idle wake still reach the agent.
+    pub channel_push_reconnect_secs: u64,
+    /// With `channel_push` on, how long the idle wake holds off after a
+    /// message arrives before it may type, in ms. Default: 2000.
+    ///
+    /// The push and the idle wake both fire on enqueue. A registered channel
+    /// starts the agent's turn within a few hundred ms, and the idle wake then
+    /// finds it no longer idle and types nothing; without the grace the two
+    /// race, and the #438 probe caught the wake typing its sentence and then
+    /// withholding the Enter — leaving the sentence in the prompt. A session
+    /// that never registered the channel still gets the wake, this much later.
+    pub channel_push_idle_wake_grace_ms: u64,
 }
 
 impl Default for MsgConfig {
@@ -1196,6 +1224,10 @@ impl Default for MsgConfig {
             idle_wake_settle_ms: 2_000,
             idle_wake_operator_quiet_ms: 15_000,
             idle_wake_fresh_ms: 2_500,
+            channel_push: false,
+            channel_push_body_max_bytes: 4_096,
+            channel_push_reconnect_secs: 5,
+            channel_push_idle_wake_grace_ms: 2_000,
         }
     }
 }

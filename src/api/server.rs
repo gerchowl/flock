@@ -523,8 +523,10 @@ fn stream_subscriptions(
             return Ok(());
         }
 
+        let mut wrote = false;
         for subscription in &mut subscriptions {
             if let Some(event) = subscription.poll(api_tx, event_hub) {
+                wrote = true;
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -533,7 +535,25 @@ fn stream_subscriptions(
                 }
             }
         }
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        // A stream made only of hub-driven subscriptions sleeps ON the hub
+        // (#438): the push that queues a message wakes it, so delivery costs
+        // a notify rather than up to a whole tick. The tick stays as the
+        // bound on noticing a hung-up client or a stopping server. Any
+        // subscription that re-reads pane state keeps the plain tick, and so
+        // keeps its old pacing exactly.
+        let cursor: Option<u64> = subscriptions
+            .iter()
+            .map(ActiveSubscription::hub_cursor)
+            .collect::<Option<Vec<u64>>>()
+            .and_then(|cursors| cursors.into_iter().min());
+        match cursor {
+            // Drain a burst before sleeping: one poll yields one event.
+            Some(_) if wrote => {}
+            Some(cursor) => {
+                event_hub.wait_after(cursor, CONNECTION_POLL_INTERVAL);
+            }
+            None => std::thread::sleep(CONNECTION_POLL_INTERVAL),
+        }
     }
 }
 
@@ -939,6 +959,78 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    fn queued_for(to_pane: &str, correlation_id: &str) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::MessageQueued,
+            data: crate::api::schema::EventData::MessageQueued {
+                correlation_id: correlation_id.into(),
+                from_pane: Some("ws_1:p9".into()),
+                from_agent: None,
+                from_host: None,
+                from_repo: None,
+                to_pane: to_pane.into(),
+                to_repo: None,
+                cross_repo: false,
+                in_reply_to: None,
+                enqueued_at_ms: 1,
+                intent: crate::api::schema::MsgIntent::NeedsReply,
+                body: "hello".into(),
+            },
+        }
+    }
+
+    /// #438: the inbox feed reports only its own pane's mail, only mail that
+    /// arrived after it attached, and a burst in full.
+    #[test]
+    fn a_msg_queued_subscription_streams_only_its_panes_new_mail() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(
+                br#"{"id":"sub_msg","method":"events.subscribe","params":{"subscriptions":[{"type":"msg.queued","pane":"ws_1:p1"}]}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        // Mail that was already there is the inbox's to report, not the feed's.
+        event_hub.push(queued_for("ws_1:p1", "c-before"));
+        let hub = event_hub.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        // ONE reader for the whole stream: a burst lands in a single read, and
+        // a reader per line would swallow the second event into a buffer it
+        // then drops — which hung this test. The timeout turns any future
+        // miss into a failure instead of a hang.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(next()["result"]["type"], "subscription_started");
+
+        hub.push(queued_for("ws_1:p2", "c-other"));
+        hub.push(queued_for("ws_1:p1", "c-1"));
+        hub.push(queued_for("ws_1:p1", "c-2"));
+        let first = next();
+        let second = next();
+        assert_eq!(first["data"]["correlation_id"], "c-1");
+        assert_eq!(second["data"]["correlation_id"], "c-2");
+        assert_eq!(first["data"]["body"], "hello");
+
+        running.store(false, Ordering::Relaxed);
+        assert!(server_thread.join().unwrap().is_ok());
     }
 
     #[test]
