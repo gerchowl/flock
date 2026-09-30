@@ -2127,6 +2127,21 @@ mod tests {
     }
 
     #[test]
+    fn an_old_peers_free_text_error_is_passed_on_as_a_token() {
+        // #428 review: a v(N-1) peer still relays ssh's words as `error`. This
+        // hub reads the reason out of them, and passes on only the token.
+        let mut row = wire_peer("ws00860001", Some("anvil"));
+        row.error = Some("ksb.invalid: Permission denied (publickey).".into());
+        let entry = super::relayed_entry_from_wire(row).expect("valid row");
+        assert_eq!(
+            entry.peer.shown_failure_reason(),
+            Some(super::SshFailureReason::AuthRefused)
+        );
+        let onward = super::peer_to_wire(&entry.peer);
+        assert_eq!(onward.error.as_deref(), Some("auth_refused"));
+    }
+
+    #[test]
     fn an_ssh_failure_names_which_kind_of_broken() {
         // #410 P1: "unreachable" hides the fix. Each of these has a different
         // one, and the #406 case — a ProxyJump whose SECOND hop was refused —

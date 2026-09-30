@@ -267,7 +267,8 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let prepared_remote =
         crate::logging::timed_switch_stage(&active_ssh_target, "remote_prepare", || {
             prepare_remote_flock(&remote.target, remote.live_handoff, remote.context)
-        })?;
+        })
+        .map_err(|err| explain_jump_failure(err, &remote.target, proxy_jump.as_deref()))?;
     progress.set_stage(crate::switch_progress::Stage::StartingServer);
     crate::logging::timed_switch_stage(&active_ssh_target, "remote_server_ready", || {
         ensure_remote_server_ready(
@@ -1927,7 +1928,8 @@ pub(crate) fn start_switch_bridge_noninteractive(
         "remote_probe",
         probe_started.elapsed().as_millis() as u64,
     );
-    let remote_flock = remote_flock?;
+    let remote_flock =
+        remote_flock.map_err(|err| explain_jump_failure(err, target, proxy_jump.as_deref()))?;
 
     let manage_ssh_config = crate::config::Config::load()
         .config
@@ -2076,23 +2078,31 @@ pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
 /// is, so it is cut: the hub's own client reaches its polled peers directly
 /// and a relayed peer via the relayer alone. `None` when nothing is left.
 pub(crate) fn client_relative_proxy_jump(chain: Option<&str>) -> Option<String> {
-    relative_proxy_jump(chain?, &crate::app::short_host_name())
+    let short = crate::app::short_host_name();
+    let full = sysinfo::System::host_name().unwrap_or_default();
+    relative_proxy_jump(chain?, &[short.as_str(), full.as_str()])
 }
 
-pub(crate) fn relative_proxy_jump(chain: &str, self_host: &str) -> Option<String> {
-    let me = jump_hop_host_key(self_host);
+/// Cut `chain` after the last hop naming one of `self_names`. Matched EXACTLY
+/// (case, `user@` and `:port` aside): on `anvil`, a hop `anvil.other` is some
+/// other machine and is kept (the #425 lesson, never the domain-stripped key).
+pub(crate) fn relative_proxy_jump(chain: &str, self_names: &[&str]) -> Option<String> {
+    let me: Vec<String> = self_names
+        .iter()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     let hops: Vec<&str> = chain.split(',').filter(|hop| !hop.is_empty()).collect();
     let start = hops
         .iter()
-        .rposition(|hop| jump_hop_host_key(hop) == me)
+        .rposition(|hop| me.contains(&jump_hop_host(hop)))
         .map_or(0, |at| at + 1);
     let rest = hops[start..].join(",");
     (!rest.is_empty()).then_some(rest)
 }
 
-/// The machine a `[user@]host[:port]` hop names, keyed the way every viewer
-/// keys a host (#422), so `lars@mba22.tail1234.ts.net:22` is `mba22`.
-fn jump_hop_host_key(hop: &str) -> String {
+/// The host a `[user@]host[:port]` hop names, lowercased and otherwise whole.
+fn jump_hop_host(hop: &str) -> String {
     let host = hop.rsplit_once('@').map_or(hop, |(_, host)| host);
     let host = match host.rsplit_once(':') {
         Some((name, port))
@@ -2104,7 +2114,36 @@ fn jump_hop_host_key(hop: &str) -> String {
         }
         _ => host,
     };
-    crate::peers::normalized_host_key(host)
+    host.to_ascii_lowercase()
+}
+
+/// Say why a leg dialled through a jump chain failed, when a later hop is the
+/// likely cause (#441 review).
+///
+/// With `-J`, ssh reads each hop's name from THIS machine's ssh config, then
+/// asks the hop before it to connect to the resulting host, which that hop
+/// resolves in DNS. A `[[peers]]` target that is a `Host` alias only the hub's
+/// `~/.ssh/config` knows (`ksb-meatgrind`) is therefore unresolvable as a
+/// later hop, and ssh's own words for it name no alias at all.
+fn explain_jump_failure(err: io::Error, target: &str, proxy_jump: Option<&str>) -> io::Error {
+    let Some(jump) = proxy_jump.filter(|jump| !jump.is_empty()) else {
+        return err;
+    };
+    let reason = crate::peers::SshFailureReason::classify(&err.to_string());
+    if !matches!(
+        reason,
+        crate::peers::SshFailureReason::JumpHopRefused
+            | crate::peers::SshFailureReason::UnknownHost
+    ) {
+        return err;
+    }
+    crate::logging::remote_jump_route_failed(target, jump, reason.as_str());
+    io::Error::new(
+        err.kind(),
+        format!(
+            "{err} (via ProxyJump {jump}: every hop name must resolve from this machine's ssh config or DNS; a Host alias only another machine defines will not)"
+        ),
+    )
 }
 
 std::thread_local! {
@@ -2444,28 +2483,88 @@ mod tests {
     #[test]
     fn a_jump_through_the_dialling_machine_is_cut() {
         // The client on the hub dials a hub-polled peer directly.
-        assert_eq!(relative_proxy_jump("mba22", "mba22"), None);
+        assert_eq!(relative_proxy_jump("mba22", &["mba22"]), None);
         // And a relayed peer via the relayer alone.
         assert_eq!(
-            relative_proxy_jump("mba22,lars@anvil", "mba22").as_deref(),
+            relative_proxy_jump("mba22,lars@anvil", &["mba22"]).as_deref(),
             Some("lars@anvil")
         );
         // On the relayer, the target resolves locally: no jump at all.
-        assert_eq!(relative_proxy_jump("mba22,lars@anvil", "anvil"), None);
+        assert_eq!(relative_proxy_jump("mba22,lars@anvil", &["anvil"]), None);
+        // Mid-chain: everything up to and including us goes.
+        assert_eq!(
+            relative_proxy_jump("mba22,anvil,ksb", &["anvil"]).as_deref(),
+            Some("ksb")
+        );
         // Anywhere else the two-hop chain is kept whole.
         assert_eq!(
-            relative_proxy_jump("mba22,lars@anvil", "ksb").as_deref(),
+            relative_proxy_jump("mba22,lars@anvil", &["ksb"]).as_deref(),
             Some("mba22,lars@anvil")
         );
-        // A hop names the machine however ssh spells it.
+        // `user@`, `:port` and case do not hide us.
         assert_eq!(
-            relative_proxy_jump("lars@MBA22.tail1234.ts.net:22,anvil", "mba22").as_deref(),
+            relative_proxy_jump("lars@MBA22:22,anvil", &["mba22"]).as_deref(),
             Some("anvil")
         );
-        // A different machine sharing a prefix is not us.
+        // The full host name counts as us too.
         assert_eq!(
-            relative_proxy_jump("mba22,anvil", "mba").as_deref(),
+            relative_proxy_jump(
+                "mba22.tail1234.ts.net,anvil",
+                &["mba22", "mba22.tail1234.ts.net"]
+            )
+            .as_deref(),
+            Some("anvil")
+        );
+        // But a domain is never stripped: `anvil.other` is another machine.
+        assert_eq!(
+            relative_proxy_jump("mba22,anvil.other", &["anvil"]).as_deref(),
+            Some("mba22,anvil.other")
+        );
+        // Nor is a prefix us.
+        assert_eq!(
+            relative_proxy_jump("mba22,anvil", &["mba"]).as_deref(),
             Some("mba22,anvil")
+        );
+    }
+
+    /// #441 review: the route is released on every way out of the preparing
+    /// scope, an early `?` return included, so a failed leg cannot leave its
+    /// jump on the next dial this thread makes.
+    #[test]
+    fn a_route_is_released_when_its_leg_fails() {
+        fn failing_leg() -> io::Result<()> {
+            let _route = route_control_plane("ws00860001", Some("mba22,anvil"));
+            assert!(!control_plane_jump_args("ws00860001").unwrap().is_empty());
+            Err(io::Error::other("remote switch probe failed"))?;
+            unreachable!("the leg failed above")
+        }
+        assert!(failing_leg().is_err());
+        assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+    }
+
+    /// #441 review: a later hop that does not resolve says why, and a failure
+    /// with no jump involved is left exactly as ssh said it.
+    #[test]
+    fn a_jump_hop_failure_names_the_alias_trap() {
+        let resolve = || io::Error::other("stdio forwarding failed");
+        let explained = explain_jump_failure(resolve(), "ws00860001", Some("mba22,ksb-meatgrind"));
+        let text = explained.to_string();
+        assert!(text.starts_with("stdio forwarding failed"), "{text}");
+        assert!(text.contains("mba22,ksb-meatgrind"), "{text}");
+        assert!(text.contains("Host alias"), "{text}");
+        assert!(
+            !text.contains('\n'),
+            "one line for the switch notice: {text}"
+        );
+
+        assert_eq!(
+            explain_jump_failure(resolve(), "ws00860001", None).to_string(),
+            "stdio forwarding failed"
+        );
+        let refused = io::Error::other("Permission denied (publickey)");
+        assert_eq!(
+            explain_jump_failure(refused, "ws00860001", Some("mba22")).to_string(),
+            "Permission denied (publickey)"
         );
     }
 
