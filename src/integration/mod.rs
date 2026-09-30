@@ -40,7 +40,9 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
     // `※ recap:` sentinel is missing (self-healing nudge). See the shim asset.
     ("Stop", "stop", None),
 ];
-const CLAUDE_HOOK_TIMEOUT: u64 = 10;
+/// Seconds Claude gives each installed hook before killing it. Also the
+/// ceiling on how long `flk hook claude stop` may wait for its transcript.
+pub(crate) const CLAUDE_HOOK_TIMEOUT: u64 = 10;
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
 const CODEX_INTEGRATION_VERSION: u32 = 6;

@@ -493,7 +493,7 @@ stop_transcript_wait_ms = 1000
 stop_transcript_poll_ms = 50
 ```
 
-If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. Current Claude Code never uses these keys.
+If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. The wait is capped at Claude's 10-second hook timeout, and a poll interval below 1 ms is treated as 1 ms. Current Claude Code never uses these keys.
 
 ## IME cursor tracking
 

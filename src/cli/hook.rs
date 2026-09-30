@@ -39,6 +39,13 @@ use crate::api::schema::{
 /// immediately with ENOENT/ECONNREFUSED, so it stays fire-and-forget.
 const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The line an agent ends its turn with; the Stop hook lifts it verbatim.
+const RECAP_SENTINEL: &str = "※ recap:";
+
+/// Floor on the Stop hook's transcript re-read interval: `[session]
+/// stop_transcript_poll_ms = 0` must not turn the wait into a busy spin.
+const MIN_TRANSCRIPT_POLL: Duration = Duration::from_millis(1);
+
 /// Harness-internal markers that arrive through the same prompt/reply pipe as
 /// real content. Dropped at the source so they never reach flock's history.
 const SYSTEM_REMINDER_PREFIXES: [&str; 8] = [
@@ -399,6 +406,9 @@ fn plan_stop(
     };
     // Inside a continuation a Stop hook already forced, never force another:
     // at most one recap nudge per turn, whatever the reply looked like.
+    // The flag is also set when another plugin's Stop hook forced the
+    // continuation, and skipping flock's nudge then is intended: that turn
+    // was not the agent's own ending either.
     let stop_hook_active = input
         .get("stop_hook_active")
         .and_then(serde_json::Value::as_bool)
@@ -419,11 +429,7 @@ fn plan_stop(
     }
 
     // Lift the `※ recap:` sentinel line verbatim if present.
-    if let Some(recap) = last_assistant
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('※'))
-    {
+    if let Some(recap) = last_assistant.lines().find_map(recap_line) {
         outcome
             .reports
             .push(Method::PaneReportRecap(PaneReportRecapParams {
@@ -584,7 +590,14 @@ fn final_text(input: &serde_json::Value) -> Option<String> {
 /// Re-read the transcript until the turn's final reply has landed, or the
 /// budget is spent. Returns whether it settled. The waiting half of
 /// [`final_text`]'s fallback, kept at the IO edge so `plan` never sleeps.
+///
+/// Both knobs come from config, so neither may hurt the turn: the budget is
+/// capped at the harness's own hook timeout (waiting past it only gets the
+/// hook killed, and an absurd value must not overflow `Instant`), and the
+/// poll is floored so `0` cannot busy-spin whole-file reads.
 fn await_settled_transcript(path: &str, budget: Duration, poll: Duration) -> bool {
+    let budget = budget.min(Duration::from_secs(crate::integration::CLAUDE_HOOK_TIMEOUT));
+    let poll = poll.max(MIN_TRANSCRIPT_POLL);
     let deadline = std::time::Instant::now() + budget;
     loop {
         match read_transcript(path) {
@@ -598,6 +611,26 @@ fn await_settled_transcript(path: &str, budget: Duration, poll: Duration) -> boo
         }
         std::thread::sleep(poll.min(deadline - now));
     }
+}
+
+/// The recap sentinel within one line of the reply, if the line is one.
+///
+/// Agents dress the line in markdown — bold, a list item, a quote — so the
+/// leading `**`, `- ` and `> ` are peeled (and a closing `**` with them)
+/// before matching `※ recap:` itself; any other `※` line is not a recap.
+fn recap_line(line: &str) -> Option<&str> {
+    let mut line = line.trim();
+    while let Some(rest) = ["**", "- ", "> "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+    {
+        line = rest.trim_start();
+    }
+    if !line.starts_with(RECAP_SENTINEL) {
+        return None;
+    }
+    let line = line.trim_end();
+    Some(line.strip_suffix("**").map_or(line, str::trim_end))
 }
 
 /// What a transcript read found.
@@ -1583,6 +1616,90 @@ mod tests {
                 Duration::from_millis(10)
             ),
             "a missing transcript never waits"
+        );
+        // Config cannot hurt the turn: a zero poll is floored rather than
+        // spinning, and a budget past `Instant`'s range is capped, not a
+        // panic.
+        let started = std::time::Instant::now();
+        assert!(!await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                // Lands the reply so the capped wait ends; what is under test
+                // is that `u64::MAX` ms reaches the loop without panicking.
+                std::thread::sleep(Duration::from_millis(50));
+                let mut body = std::fs::read_to_string(&path).unwrap();
+                body.push('\n');
+                body.push_str(FINAL_WITH_RECAP);
+                std::fs::write(&path, body).unwrap();
+            }
+        });
+        assert!(await_settled_transcript(
+            path.to_str().unwrap(),
+            Duration::from_millis(u64::MAX),
+            Duration::from_millis(10),
+        ));
+        writer.join().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_recap_dressed_in_markdown_is_still_the_recap() {
+        for (line, expected) in [
+            (
+                "※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "**※ recap: done. Next: ship.**",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "- ※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "> ※ recap: done. Next: ship.",
+                Some("※ recap: done. Next: ship."),
+            ),
+            (
+                "  > **※ recap: done. Next: ship.**  ",
+                Some("※ recap: done. Next: ship."),
+            ),
+            ("※ note: not a recap", None),
+            ("the ※ recap: line goes last", None),
+            ("", None),
+        ] {
+            assert_eq!(recap_line(line), expected, "{line:?}");
+        }
+
+        // End to end: a bolded recap is lifted and the turn is not nudged,
+        // while a line that merely starts with ※ is no recap at all.
+        let path = transcript_with(&[EARLIER_REPLY]);
+        let bold = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "Done.\n\n**※ recap: done. Next: ship.**",
+        });
+        let out = stop(&bold, 0);
+        assert_eq!(recap_of(&out), Some("※ recap: done. Next: ship."));
+        assert!(out.stdout.is_none(), "a bolded recap is a recap");
+
+        let other = json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "Done.\n※ note: nothing to recap",
+        });
+        let out = stop(&other, 0);
+        assert_eq!(recap_of(&out), None);
+        assert!(
+            out.stdout.is_some(),
+            "a ※ line that is not the recap still nudges"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
