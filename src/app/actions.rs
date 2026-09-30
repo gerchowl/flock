@@ -2834,8 +2834,17 @@ impl AppState {
         if close_indices.is_empty() {
             return;
         }
-        self.selection = None;
-        self.selection_autoscroll = None;
+        // A text selection survives only a close of some other workspace.
+        let selection_survives = self.selection.as_ref().is_some_and(|selection| {
+            self.workspaces.iter().enumerate().any(|(idx, ws)| {
+                !close_indices.contains(&idx)
+                    && ws.find_tab_index_for_pane(selection.pane_id).is_some()
+            })
+        });
+        if !selection_survives {
+            self.selection = None;
+            self.selection_autoscroll = None;
+        }
         self.mark_session_dirty();
 
         let mut terminal_ids = Vec::new();
@@ -4819,23 +4828,14 @@ impl AppState {
         self.mark_session_dirty();
 
         if should_close_workspace {
-            self.workspaces.remove(ws_idx);
+            // The last shell exiting is one more door to the one close tail
+            // (#429): focus stays put by id and WorkspaceClosed is announced.
+            // The dead pane is already out of the tabs, so its terminal is
+            // handed over separately.
+            self.close_workspace_indices(vec![ws_idx]);
             self.remove_unattached_terminal_ids(workspace_terminal_ids);
-            if self.workspaces.is_empty() {
-                self.set_active_workspace(None);
-                self.selected = 0;
-                if self.mode == Mode::Terminal {
-                    self.mode = Mode::Navigate;
-                }
-            } else {
-                if let Some(active) = self.active {
-                    if active >= self.workspaces.len() {
-                        self.set_active_workspace(Some(self.workspaces.len() - 1));
-                    }
-                }
-                if self.selected >= self.workspaces.len() {
-                    self.selected = self.workspaces.len() - 1;
-                }
+            if self.workspaces.is_empty() && self.mode == Mode::Terminal {
+                self.mode = Mode::Navigate;
             }
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);
