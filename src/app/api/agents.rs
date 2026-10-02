@@ -51,7 +51,14 @@ impl App {
     }
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
-        let (agent, argv) = match self.start_agent(params) {
+        // WHO is asking, resolved once and by the same classifier the spawn
+        // ceiling uses (#398). Placement asks one question of it — whether the
+        // active workspace may stand in for a placement this caller did not
+        // name — and a second walk of the peer's ancestry would be a second
+        // answer to the same question, which is the drift #124 / #197 /
+        // #199-#210 are.
+        let caller = self.spawn_caller();
+        let (agent, argv) = match self.start_agent(params, &caller) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
