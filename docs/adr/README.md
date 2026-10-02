@@ -29,6 +29,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0017](0017-mcp-resource-surface.md) | Handed-over files are MCP resources with a durable identity; tools stay for parameterised calls | Proposed |
 | [0018](0018-message-delivery-response.md) | A message says how much it needs, a recipient can say "not now" and must say so, and an idle agent is reachable | Accepted |
 | [0019](0019-channel-push-delivery.md) | Agent mail may also arrive as a Claude Code channel push, as a first knock over the pull that stays the source of truth | Proposed |
+| [0020](0020-agent-kind-is-a-type.md) | The spawn agent kind is a type, not an allowlist; it gains opencode, and a caller may never name a profile | Accepted |
 
 ## Conventions
 

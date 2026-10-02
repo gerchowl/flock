@@ -17,6 +17,7 @@ mod agent;
 mod checks;
 mod digest;
 mod fleet;
+mod help;
 mod hook;
 mod integration;
 mod issue;
@@ -36,6 +37,7 @@ mod tab;
 mod workspace;
 mod worktree;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
     Handled(i32),
     NotCli,
@@ -45,6 +47,23 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
+
+    // #455: `--help` / `-h` is answered here, above every verb parser, so it
+    // cannot be read as one of a verb's arguments (`flk agent fork --help`
+    // used to resolve `--help` as an agent) and a help request can never reach
+    // the parser that would allocate (`flk worktree create --help` used to
+    // answer "unknown option", and `flk worktree create` without it allocated
+    // a git worktree and a branch). Group-level help is left to the groups,
+    // which print their full command lists.
+    //
+    // stdout, like `flk --help`: this is a request that was honoured, so it is
+    // the command's output and `flk worktree create --help > usage.txt` has to
+    // write something. Usage printed alongside a FAILED parse still goes to
+    // stderr, which is where every error path below already puts it.
+    if let Some(usage) = help::help_usage(args) {
+        println!("usage: {usage}");
+        return Ok(CommandOutcome::Handled(0));
+    }
 
     let exit_code = match command {
         "server" => {
