@@ -1604,31 +1604,15 @@ fn worktree_membership(
 mod tests {
     use super::*;
     use crate::api::schema::{ErrorResponse, Request, SuccessResponse};
+    // Git fixtures and the App event helper live in `crate::test_support`: the
+    // classifier tests, the TUI kill dialog and this module all need the same
+    // submodule shape, and three copies of one fixture is how a fix to one seam
+    // quietly stops covering the others (#402).
+    use crate::test_support::{
+        create_committed_repo, create_submodule_worktree, run_git, run_git_over_file_protocol,
+        unique_temp_path, wait_for_event,
+    };
     use crate::{config::Config, workspace::Workspace};
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn run_git(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
 
     /// Attach a workspace to an existing linked checkout and return its public
     /// id — the shape every `worktree.kill` caller starts from.
@@ -1663,18 +1647,6 @@ mod tests {
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false)
-    }
-
-    fn create_committed_repo(name: &str) -> PathBuf {
-        let repo = unique_temp_path(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Flock Test"]);
-        std::fs::write(repo.join("README.md"), "test\n").unwrap();
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-        repo
     }
 
     fn test_app() -> App {
@@ -3201,29 +3173,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(repo);
     }
 
-    /// git blocks the file transport for submodules by default, so a fixture
-    /// cloning one from a sibling temp dir has to opt back in.
-    fn run_git_over_file_protocol(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
-
     /// #351: a clean checkout that merely holds a submodule is refused by git
     /// too, and the socket has to say so in a way a caller can act on —
     /// `worktree_remove_failed` reads as "give up", not "retry with force".
@@ -3297,6 +3246,172 @@ mod tests {
         assert!(forced);
         assert!(!checkout.exists());
         assert_eq!(app.state.workspaces.len(), 1);
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(sub);
+    }
+
+    // ---------------------------------------------------------------
+    // #402: ONE decision, THREE seams. #351 routed the TUI kill dialog and
+    // this socket through `classify_worktree_remove_error` and left the
+    // fleet-wide sweep (#81) predicting `force` from a `dirty` probe — which
+    // cannot see a submodule at all, so a clean submodule worktree refused
+    // and the sweep dead-ended. This test lives HERE, and asserts the seams
+    // against each other, rather than beside any one of them.
+    //
+    // Three separate per-seam tests would not have caught it: #351's two were
+    // both green while the third drifted. The defect is the disagreement, so
+    // the test has to hold all three in one frame — which means all three
+    // have to run against ONE real repo state, in an order that leaves the
+    // checkout standing until the last of them needs it gone.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn every_worktree_remove_seam_agrees_on_one_submodule_worktree() {
+        let branch = "worktree/seam-agreement";
+        let (sub, repo, checkout) = create_submodule_worktree("api-seam-agreement", branch);
+
+        // The state all three seams are about, read off real git. If this ever
+        // stops holding, the test below is no longer testing the submodule
+        // refusal and would quietly pass for the wrong reason.
+        assert_eq!(
+            crate::worktree::checkout_is_dirty(&checkout),
+            Some(false),
+            "the fixture must be clean, or nothing here exercises the submodule refusal"
+        );
+
+        let mut app = app_with_parent(&repo);
+        let child_id = push_worktree_workspace(&mut app, &repo, &checkout);
+
+        // ---- seam 1: the socket API -------------------------------------
+        // Asks for the cheapest removal it can and must be told, in its own
+        // vocabulary, that this one needs force. Its answer is a CODE, because
+        // a script can retry with it.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: child_id.clone(),
+                force: false,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code, "submodule_worktree_requires_force",
+            "the socket lost the submodule/dirty distinction: {response}"
+        );
+        assert!(
+            checkout.exists(),
+            "a refused remove must not delete anything"
+        );
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "a refused remove must not close the workspace"
+        );
+
+        // ---- seam 2: the TUI kill dialog --------------------------------
+        // Same repo state, same refusal. A human is present here, so the seam's
+        // job is to turn the refusal into the second confirmation rather than
+        // spend the force itself — which is why its answer is a DIALOG, not a
+        // deletion.
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
+            workspace_id: child_id.clone(),
+            repo_root: repo.clone(),
+            path: checkout.clone(),
+            error: None,
+            removing: false,
+            force_confirmation: None,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
+            force: false,
+            probe: None,
+            delete_branch: true,
+            branch: Some(branch.to_string()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+            branch_protected: false,
+            gate_timed_out: false,
+        });
+        app.state.mode = crate::app::state::Mode::ConfirmRemoveWorktree;
+        app.start_worktree_remove();
+        match wait_for_event(&mut app, |event| {
+            matches!(event, crate::events::AppEvent::WorktreeRemoveFinished(_))
+        }) {
+            crate::events::AppEvent::WorktreeRemoveFinished(result) => {
+                assert!(result.result.is_err(), "git refused, as seam 1 saw");
+                app.handle_worktree_remove_finished(result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(
+            remove.force_confirmation,
+            Some(crate::worktree::WorktreeRemoveRefusal::Submodules),
+            "the dialog must name the same refusal the socket coded"
+        );
+        assert_eq!(
+            remove.error, None,
+            "the dialog must not read a force-clearable refusal as a dead end"
+        );
+        assert_eq!(remove.primary_label(), "force remove");
+        assert!(checkout.exists());
+
+        // ---- seam 3: the fleet sweep ------------------------------------
+        // Same repo state again, and nobody to ask. This is the seam that
+        // drifted, and the one that has to ACT rather than report: a clean
+        // submodule worktree is not a dead end, it is a removal git will drop
+        // for `--force` and loses no uncommitted work to grant.
+        app.state.worktree_remove = None;
+        app.state.worktree_kill_all = Some(crate::app::state::WorktreeKillAllState {
+            rows: vec![crate::app::state::WorktreeKillRow {
+                workspace_id: child_id.clone(),
+                label: branch.into(),
+                repo_root: repo.clone(),
+                checkout: checkout.clone(),
+                managed: true,
+                branch: Some(branch.to_string()),
+                // What the sweep's probe would have said about this checkout.
+                dirty: false,
+                working_agent: false,
+                merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+                protected: false,
+                tier: crate::worktree::KillTier::CheckoutOnly,
+                status: crate::app::state::WorktreeKillRowStatus::Pending,
+            }],
+            executing: false,
+            force_dirty: false,
+        });
+        app.start_kill_all_worktrees();
+        let sweep = match wait_for_event(&mut app, |event| {
+            matches!(event, crate::events::AppEvent::WorktreeKillAllFinished(_))
+        }) {
+            crate::events::AppEvent::WorktreeKillAllFinished(result) => result,
+            other => panic!("unexpected event: {other:?}"),
+        };
+
+        assert_eq!(sweep.outcomes.len(), 1, "one row, one outcome");
+        assert_eq!(
+            sweep.outcomes[0].1,
+            Ok(()),
+            "the sweep disagreed with the other two seams: it could not remove what \
+             they were both told only needs force"
+        );
+        assert!(!checkout.exists());
+
+        // The sweep's own finalisation, so "no dead end" is asserted where the
+        // operator reads it rather than only in the worker's return value.
+        app.handle_worktree_kill_all_finished(sweep);
+        let notice = app.state.action_notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("0 error(s)"),
+            "the sweep reported a failure the other two seams recovered from: {notice}"
+        );
+
+        // All three agreed on the removal, and force bought the checkout only:
+        // no merge evidence, so the branch survives (#351's pitfall 1).
+        assert!(
+            branch_exists(&repo, branch),
+            "the sweep force-recovered the checkout and deleted an unmerged branch"
+        );
 
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(sub);
