@@ -11,7 +11,11 @@
 //! rules live in `crate::report`; a second entry point reuses them rather than
 //! reimplementing them.
 //!
-//! Nothing is transmitted without an explicit `--open`. The default prints.
+//! Nothing here transmits anything. `--print` shows the report, `--open` opens
+//! GitHub's form for a human to submit, and `--body-only` (#427) writes the
+//! body to stdout and leaves the filing to whoever typed the command. ADR-0010
+//! decision 6 ("the binary never submits") is why there is no `--submit` among
+//! them; see the note above [`run_body_only`].
 
 use std::collections::BTreeMap;
 
@@ -104,6 +108,7 @@ struct Options {
     file: Option<String>,
     repo: Option<String>,
     open: bool,
+    body_only: bool,
     records: Option<usize>,
     no_diagnostics: bool,
     all_levels: bool,
@@ -119,6 +124,15 @@ fn run_report(kind: ReportKind, args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     };
+
+    // Checked here rather than by letting one flag win, because these two ask
+    // for opposite things and the loser's effect — a browser opening behind a
+    // body that was piped somewhere — is not what either of them meant.
+    if options.body_only && options.open {
+        eprintln!("--body-only writes the body to stdout and --open launches a browser; pick one");
+        eprintln!("run 'flk report help' for usage");
+        return Ok(2);
+    }
 
     let repo = match url::resolve(options.repo.as_deref()) {
         Ok(repo) => repo,
@@ -173,6 +187,10 @@ fn run_report(kind: ReportKind, args: &[String]) -> std::io::Result<i32> {
         diagnostics,
     });
 
+    if options.body_only {
+        return run_body_only(&composed);
+    }
+
     println!("{}", composed.preview);
 
     for advisory in &composed.advisories {
@@ -193,6 +211,56 @@ fn run_report(kind: ReportKind, args: &[String]) -> std::io::Result<i32> {
     }
 
     open_for_review(&composed)
+}
+
+/// The headless route: the body on stdout, and everything a person needs to
+/// decide about it on stderr.
+///
+/// **Why there is no `--submit` here.** #427 asked for one, and ADR-0010
+/// decision 6 is the reason it is not in this file: "The binary never submits …
+/// Shipping a write-capable token in a public binary is refused outright." The
+/// same ADR lists `gh issue create` as "Retained as a possible opt-in for users
+/// with write permission, **deferred** out of the first release" — deferral is
+/// not permission. ADR-0015 amends that decision, but only as narrowly as its
+/// own §3 ("A repo that defines a template is not posted through") and §5
+/// ("The mutation is excluded from the MCP surface … whether an agent should
+/// ever file is left open and is the operator's call") describe, and flock's own
+/// `.github/ISSUE_TEMPLATE/bug.yml` is exactly the templated case §3 routes
+/// back to a browser. So the write path that does exist — `flk issue drop`,
+/// `--file-it`, operator's own token — stays the only one, and an agent in a
+/// pane gets to compose, redact and hand over a body rather than an issue.
+///
+/// This function therefore transmits nothing: it writes text. The invariant
+/// that matters is the split, because it is what a pipe would otherwise
+/// destroy — the composed block is previewed before anything can be sent
+/// (ADR-0010 decision 5), and a body on stdout with the preview on stdout too
+/// would make the preview unreachable to anything reading the pipe.
+fn run_body_only(composed: &crate::report::compose::Composed) -> std::io::Result<i32> {
+    eprint!("{}", composed.preview);
+    eprintln!();
+
+    for advisory in &composed.advisories {
+        eprintln!("note: {}", advisory.message());
+    }
+    if composed.diagnostics_block.is_some() {
+        eprintln!(
+            "note: the redacted log tail is in the body above — pass --no-diagnostics to leave it out"
+        );
+    }
+
+    eprintln!("destination: {}", composed.destination);
+    eprintln!("nothing has been sent. review the preview above, then file it yourself:");
+    eprintln!(
+        "  gh issue create --repo {} --title '<one line>' --body-file -",
+        composed.destination
+    );
+    eprintln!("  (that reads the body from stdin, which is what was just written to stdout.)");
+    eprintln!("  gh posts a raw body and bypasses the issue form, so nothing validates it");
+    eprintln!("  and the reproducibility confirmation is not one gh can set — re-run with");
+    eprintln!("  --open if you want GitHub's own form to run the checks.");
+
+    print!("{}", composed.body);
+    Ok(0)
 }
 
 fn open_for_review(composed: &crate::report::compose::Composed) -> std::io::Result<i32> {
@@ -244,8 +312,16 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 options.open = true;
                 index += 1;
             }
+            "--body-only" => {
+                options.body_only = true;
+                index += 1;
+            }
             "--print" => {
+                // The default route, spelled as a way back to it: it clears
+                // both ways of leaving the machine, exactly as it always
+                // cleared `--open`.
                 options.open = false;
+                options.body_only = false;
                 index += 1;
             }
             "--no-diagnostics" => {
@@ -367,6 +443,9 @@ fn print_report_help() {
     eprintln!("  flk report template bug > bug.md    write the form to edit");
     eprintln!("  flk report bug --file bug.md        compose and preview it");
     eprintln!("  flk report bug --file bug.md --open review it on GitHub and submit");
+    eprintln!(
+        "  flk report bug --file bug.md --body-only > body.md   body on stdout, nothing sent"
+    );
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --file <path>      read a filled-in form");
@@ -375,6 +454,8 @@ fn print_report_help() {
     eprintln!("  --repro <text>");
     eprintln!("  --impact <text>");
     eprintln!("  --open             open GitHub's form, prefilled, for you to submit");
+    eprintln!("  --body-only        write just the body to stdout, so it pipes into");
+    eprintln!("                     `gh issue create --body-file -`. Preview on stderr.");
     eprintln!("  --print            preview only, send nothing (default)");
     eprintln!("  --last <n>         attach n log records (default {DEFAULT_RECORDS})");
     eprintln!("  --all-levels       attach INFO records too, not just WARN/ERROR");
@@ -383,7 +464,11 @@ fn print_report_help() {
     eprintln!();
     eprintln!("Logs are redacted before they are shown: paths, hostnames, tokens and");
     eprintln!("usernames are stripped. The preview is exactly what leaves your machine,");
-    eprintln!("and diagnostics go to your clipboard, never into the link.");
+    eprintln!("and diagnostics never enter the link — --open copies them to your");
+    eprintln!("clipboard, --body-only carries them inline in the body.");
+    eprintln!();
+    eprintln!("flk never files the report itself: the three routes above all end with you.");
+    eprintln!("`flk issue drop --file-it` is the one write path, and it is yours to confirm.");
 }
 
 #[cfg(test)]
@@ -475,6 +560,21 @@ mod tests {
         assert!(parse_options(&["--nope".to_string()]).is_err());
         assert!(parse_options(&["--file".to_string()]).is_err());
         assert!(parse_options(&["--last".to_string(), "x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn body_only_is_its_own_mode_and_print_is_the_way_back() {
+        let options = parse_options(&["--body-only".to_string()]).expect("parse");
+        assert!(options.body_only);
+        assert!(!options.open, "--body-only must not imply --open");
+
+        // `--print` already existed as the way to undo `--open`; it now undoes
+        // the other route too, so `flk report bug --body-only --print` means
+        // what a reader expects rather than depending on argument order.
+        let back =
+            parse_options(&["--body-only".to_string(), "--print".to_string()]).expect("parse");
+        assert!(!back.body_only);
+        assert!(!back.open);
     }
 
     #[test]
