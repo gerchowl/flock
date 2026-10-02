@@ -249,6 +249,10 @@ If no native session reference is stored, the field is omitted.
 
 `agent.read` reads a **pane**: terminal output, wrapped at the width it was drawn at. `agent.history` reads the **conversation** — the agent's own session transcript, unwrapped, one entry per turn. Claude only, since that is the transcript format Flock parses.
 
+For a TUI agent the distinction is the whole point. A pane read is a screen scrape, so against an agent TUI it returns the chrome that TUI draws rather than the conversation, and it changes shape as the TUI repaints. Poll `agent.history` to learn what an agent said.
+
+`pane.read` with `source: "recent"` returns the bottom `lines` rows of the screen, reaching further up when those rows are blank — a pane whose visible content sits above an empty region reads as that content rather than as an empty string. `source: "visible"` is the user-visible viewport and follows the operator's scroll position, so it is not a stable thing for a script to read or to derive status from.
+
 ```json
 {"id":"req_9","method":"agent.history","params":{"target":"claude","detail":"collapsed","limit":10}}
 ```
