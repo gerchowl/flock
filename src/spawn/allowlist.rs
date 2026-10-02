@@ -365,6 +365,67 @@ mod tests {
         assert_eq!(allowlist.keys(), BASELINE);
     }
 
+    /// ADR-0020 §1 claims the environment half needs no code at all, because
+    /// the agent is resolved from argv[0] and `opencode` is already a name
+    /// `identify_agent` knows. That claim is only worth something if it is
+    /// asserted, so this drives it the way a spawn does — kind in, argv out,
+    /// agent resolved, declaration consulted — rather than naming `opencode`
+    /// directly and proving nothing about the seam between the two enums.
+    #[test]
+    fn a_spawn_naming_opencode_resolves_to_the_opencode_agent() {
+        let kind = AgentKind::parse("opencode").expect("a caller may name opencode");
+        let argv = kind.argv(&probe_prompt());
+        assert_eq!(argv[0], "opencode", "the child's argv[0] is the seam");
+
+        // Resolution, not a guess: the label is read off the resolved agent,
+        // so it cannot say "opencode" if the lookup returned None — that
+        // renders as "unknown", the baseline-only path #452 hit.
+        let allowlist = for_argv(&argv, &SpawnEnvConfig::default());
+        assert_eq!(
+            super::super::env::agent_for_argv(&argv),
+            Some(Agent::OpenCode),
+            "a spawn argv[0] of opencode must resolve to the opencode agent"
+        );
+        assert_eq!(allowlist.agent(), "opencode");
+
+        // And the declaration reaches it, which is the observable half of
+        // "the env machinery is already agent-generic": [spawn.env.opencode]
+        // is consulted with no change here.
+        let declared = SpawnEnvConfig::empty().with_agent(Agent::OpenCode, &["FLEET_OPENCODE_DIR"]);
+        assert!(contains(&for_argv(&argv, &declared), "FLEET_OPENCODE_DIR"));
+    }
+
+    /// The converse, so the test above cannot pass for the wrong reason: an
+    /// opencode declaration must not leak into a claude child, or the
+    /// resolution above would be proving nothing about which agent was
+    /// matched.
+    #[test]
+    fn an_opencode_declaration_does_not_reach_a_claude_child() {
+        let declared = SpawnEnvConfig::empty().with_agent(Agent::OpenCode, &["FLEET_OPENCODE_DIR"]);
+        let allowlist = for_argv(&claude_argv(), &declared);
+        assert_eq!(allowlist.agent(), "claude");
+        assert!(!contains(&allowlist, "FLEET_OPENCODE_DIR"));
+    }
+
+    /// ADR-0020 §2: opencode ships with no compiled credential keys, so it
+    /// gets the baseline plus its declaration and nothing more. Asserted so
+    /// adding one later is a decision someone sees rather than a drive-by
+    /// edit that inherits Claude's keys.
+    #[test]
+    fn opencode_gets_the_baseline_and_no_compiled_credentials() {
+        let allowlist = for_argv(
+            &AgentKind::OpenCode.argv(&probe_prompt()),
+            &SpawnEnvConfig::empty(),
+        );
+        assert_eq!(allowlist.keys(), BASELINE);
+        for claude_only in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+            assert!(
+                !contains(&allowlist, claude_only),
+                "{claude_only} is Claude's and opencode must not inherit it by table"
+            );
+        }
+    }
+
     /// Exact keys, never prefixes: `AWS_*`-style matching is how a credential
     /// ends up allowed by a rule written for a config variable next to it.
     /// Config is validated for this too, so the property holds for a declared
