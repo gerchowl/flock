@@ -61,13 +61,31 @@ fn create_committed_repo(path: &Path) {
 }
 
 struct SpawnedFlock {
-    master: Option<Box<dyn MasterPty + Send>>,
+    /// The PTY master, held open for as long as the server lives.
+    ///
+    /// Deliberately kept on *every* platform, and deliberately never read.
+    /// Dropping the master closes its fd (`portable_pty::FileDescriptor` is
+    /// RAII), and closing the last master of a PTY hangs up the slave — the
+    /// kernel SIGHUPs the foreground process group. So on Linux this field is
+    /// not dead weight to be cfg'd away: it is the thing *stopping* the SIGHUP
+    /// that `wait_for_stopped_server`'s Linux branch is written to avoid. Only
+    /// the Darwin arm may drop it, and only there it is what unblocks the hang.
+    ///
+    /// The leading underscore is load-bearing, not laziness: `dead_code` cannot
+    /// tell a keep-alive from an oversight, and clippy runs with `-D warnings`.
+    /// An `#[allow(dead_code)]` here would be worse — it would hide a genuinely
+    /// unused field later, which is the mistake `cfg` was used to avoid.
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
 impl SpawnedFlock {
+    /// Hang up the PTY, which on Darwin is the only way a session leader's
+    /// `exit()` can complete. Darwin-only, hence the `cfg`: on Linux this would
+    /// SIGHUP a shutdown that may not have finished.
+    #[cfg(target_os = "macos")]
     fn close_master(&mut self) {
-        self.master = None;
+        self._master = None;
     }
 
     /// Reap a server that has already been told to stop.
@@ -332,7 +350,7 @@ fn spawn_flock_with_config(
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
-        master: Some(pair.master),
+        _master: Some(pair.master),
         child,
     }
 }
