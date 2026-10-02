@@ -166,8 +166,16 @@ workspace is now something you ask for:
 
 ```bash
 flk agent start reviewer --active --split right -- pi   # beside the focused space, on purpose
-flk agent start reviewer --here -- claude                # same flag, said from inside a pane
+flk agent start reviewer --here -- pi                   # beside the space YOUR pane is in
 ```
+
+`--active` and `--here` are two different questions, not two spellings of one.
+`--active` is the workspace you are **looking at** — what the server remembers
+about its own focus, which is why it needs asking for. `--here` is the workspace
+**your own pane** is in, which the server reads from your process's ancestry. For
+a person at the TUI the two coincide; for a script run from a pane of a space
+nobody is watching they are not, and `--here` is the honest answer. `--here` is
+refused, naming `--active`, when the server cannot place your process in a pane.
 
 A start that names **no** place — no `--workspace`, no `--tab`, no `--cwd`, no
 `--active` — is refused with `agent_placement_required` unless the caller is
@@ -175,8 +183,21 @@ running inside a pane of that Flock session. The refusal names the flags that
 would have worked. `--active` is the one to reach for if what you meant really
 was "wherever I'm looking"; `--workspace`/`--tab`/`--cwd` are better if you know.
 
-Flock decides this from the calling process's ancestry, not from anything the
-caller says about itself, and it can therefore tell an operator sitting in a
+Two placements at once is refused (`--active` or `--here` together with
+`--workspace`/`--tab`, or with each other). A placement *plus* `--cwd` is not:
+`--cwd` says where the process starts and only implies a space, so the placement
+you named wins, as it always has.
+
+Two things that narrowing does **not** mean. A `--cwd` naming a real directory
+still gets a space of its own, even when no space matches it — that is how you
+start an agent in a checkout Flock has not got open — *unless* you also passed
+`--split`, which still refuses there because there is no space to split yet. And
+under `tab_mode = "workspace"`, where a tab is never drawn, `--active`/`--here`
+without `--split` place the agent in a **sibling space** grouped with the named
+one rather than in a tab of it.
+
+Flock decides all of this from the calling process's ancestry, not from anything
+the caller says about itself, and it can therefore tell an operator sitting in a
 pane from a dispatch arriving over `ssh` — but not a human from a script, which
 is why a start from a terminal window *outside* the session is treated as
 headless and needs `--active` too.

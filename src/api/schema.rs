@@ -768,6 +768,16 @@ pub struct AgentStartParams {
     /// rather than a guess.
     #[serde(default, skip_serializing_if = "is_false")]
     pub active: bool,
+    /// #398: name the space this caller's OWN pane is in, on purpose.
+    ///
+    /// A different question from `active`, and deliberately so. `active` is a
+    /// recollection — whichever workspace a human last focused — which is why
+    /// it needs asking for. `here` is a locality: the workspace the calling
+    /// process's ancestry attests it is sitting in, so a script run from a pane
+    /// gets the space it is actually in rather than the one being looked at.
+    /// Refused rather than guessed when ancestry places the caller nowhere.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub here: bool,
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,

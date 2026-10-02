@@ -42,7 +42,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
 
 pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
 
@@ -61,9 +61,14 @@ struct AgentStartFlags {
     cwd: Option<String>,
     workspace_id: Option<String>,
     tab_id: Option<String>,
-    /// #398: ask for the active workspace by name. See
-    /// `AGENT_START_USAGE`'s flag and `spawn_caller::may_default_to_active`.
+    /// #398: ask for the workspace you are LOOKING AT — a recollection the
+    /// server reads from `state.active`.
     active: bool,
+    /// #398: ask for the workspace your own PANE is in — a locality the server
+    /// reads from the caller's process ancestry. Two different questions, so
+    /// two different flags; `parse_agent_start_flags` keeps them apart rather
+    /// than aliasing one for the other.
+    here: bool,
     split: Option<SplitDirection>,
     focus: bool,
     wait_ready: bool,
@@ -103,12 +108,20 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.tab_id = Some(super::normalize_tab_id(&value_for("--tab")?));
                 index += 2;
             }
-            // #398. `--here` is the same request read from inside a pane, and
-            // both spellings are accepted because the flag answers a question
-            // ("the one I am in") that operators and scripts phrase
-            // differently. There is one meaning behind them, not two.
-            "--active" | "--here" => {
+            // #398. Not an alias pair: `--active` is "the workspace you are
+            // looking at", which the server remembers, and `--here` is "the
+            // workspace your own pane is in", which the server attests from
+            // the caller's process ancestry. The second was originally spelled
+            // as an alias of the first and promised a locality the code did
+            // not implement; for a caller in a pane of a background space those
+            // are different workspaces, which is the #398 defect with the
+            // exemption bolted on.
+            "--active" => {
                 flags.active = true;
+                index += 1;
+            }
+            "--here" => {
+                flags.here = true;
                 index += 1;
             }
             "--split" => {
@@ -175,6 +188,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         workspace_id,
         tab_id,
         active,
+        here,
         split,
         focus,
         wait_ready,
@@ -190,6 +204,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             tab_id,
             split,
             active,
+            here,
             focus,
             argv: args[separator + 1..].to_vec(),
         }),
@@ -694,9 +709,16 @@ fn print_agent_help() {
     eprintln!(
         "    a cwd matching nothing gets a space of its own, and --workspace/--tab still win"
     );
-    eprintln!("  --active (--here) names the active workspace as the placement, from any caller:");
     eprintln!(
-        "    a start with no placement at all is refused unless the caller is running inside a"
+        "  --active names the workspace you are LOOKING AT as the placement; --here names the"
+    );
+    eprintln!(
+        "    workspace your own PANE is in, read from your process ancestry rather than from"
+    );
+    eprintln!("    what was last focused — so a script run from a background space gets its own");
+    eprintln!("    space, not the one somebody is looking at;");
+    eprintln!(
+        "  a start with no placement at all is refused unless the caller is running inside a"
     );
     eprintln!("    pane of this session, because \"the workspace you are looking at\" is only an");
     eprintln!(
@@ -727,27 +749,45 @@ mod tests {
         parse_agent_start_flags(&args, separator)
     }
 
-    /// #398: the flag has to actually reach the request. The server-side gate
-    /// is only reachable by a caller that asked for the active workspace, and a
-    /// parser that dropped `--active` would leave every headless dispatcher
-    /// with a refusal and no way out of it.
+    /// #398: the flags have to actually reach the request, and they have to
+    /// arrive as TWO fields. The server-side gate is only escapable by a caller
+    /// that asked for a placement, so a parser that dropped either would leave a
+    /// headless dispatcher with a refusal and no way out of it — and a parser
+    /// that mapped `--here` onto `active` would answer "the space my pane is
+    /// in" with "the space somebody last looked at", which is the bug the two
+    /// questions exist to keep apart.
     #[test]
-    fn active_and_here_both_name_the_active_workspace() {
-        for spelling in ["--active", "--here"] {
-            let parsed = flags(&[spelling]).expect("a flag this build documents");
-            assert!(
-                parsed.active,
-                "{spelling} must ask for the active workspace"
-            );
-        }
+    fn active_and_here_are_separate_requests_not_one_flag_twice() {
+        let parsed = flags(&["--active"]).expect("a flag this build documents");
+        assert!(
+            parsed.active,
+            "--active asks for the workspace being looked at"
+        );
+        assert!(!parsed.here, "and nothing else");
+
+        let parsed = flags(&["--here"]).expect("a flag this build documents");
+        assert!(parsed.here, "--here asks for the caller's own space");
+        assert!(
+            !parsed.active,
+            "--here must not be answered by the remembered workspace"
+        );
+
+        let parsed = flags(&["--active", "--here"]).expect("parses");
+        assert!(
+            parsed.active && parsed.here,
+            "both may be sent; the server refuses the combination, since only it knows whether \
+             they name different spaces"
+        );
     }
 
     /// Absent means "not asked for", which the server reads as a refusal rather
     /// than a guess. A parser defaulting it the other way would reopen the bug.
     #[test]
     fn a_start_without_the_flag_does_not_ask_for_the_active_workspace() {
-        assert!(!flags(&["--cwd", "/tmp"]).expect("parses").active);
-        assert!(!flags(&["--split", "right"]).expect("parses").active);
+        let parsed = flags(&["--cwd", "/tmp"]).expect("parses");
+        assert!(!parsed.active && !parsed.here);
+        let parsed = flags(&["--split", "right"]).expect("parses");
+        assert!(!parsed.active && !parsed.here);
     }
 
     /// `--no-focus` is the CLI's DEFAULT, which is why #398 could not use it as
@@ -756,11 +796,12 @@ mod tests {
     #[test]
     fn focus_and_the_active_workspace_are_independent_flags() {
         let parsed = flags(&["--active", "--no-focus"]).expect("parses");
-        assert!(parsed.active);
+        assert!(parsed.active && !parsed.here);
         assert!(!parsed.focus);
 
-        let parsed = flags(&["--active", "--focus"]).expect("parses");
-        assert!(parsed.active && parsed.focus);
+        let parsed = flags(&["--here", "--focus"]).expect("parses");
+        assert!(parsed.here && !parsed.active);
+        assert!(parsed.focus);
     }
 
     /// The `--` terminator ends the flags, so a value that looks like one is
@@ -770,7 +811,7 @@ mod tests {
         let parsed = flags(&["--cwd", "--active", "--split", "right"]).expect("parses");
         assert_eq!(parsed.cwd.as_deref(), Some("--active"));
         assert!(
-            !parsed.active,
+            !parsed.active && !parsed.here,
             "the flag loop must stop at the value it just consumed"
         );
         assert_eq!(
@@ -795,7 +836,7 @@ mod tests {
     /// caller is told about a flag that does nothing.
     #[test]
     fn the_usage_line_documents_the_flag_the_parser_accepts() {
-        assert!(AGENT_START_USAGE.contains("[--active]"));
+        assert!(AGENT_START_USAGE.contains("[--active|--here]"));
         assert!(AGENT_START_USAGE.contains("[--split"));
     }
 }

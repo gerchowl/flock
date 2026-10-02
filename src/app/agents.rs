@@ -436,16 +436,58 @@ impl App {
             .map_err(AgentStartError::ProfileUnresolved)?;
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
 
-        // #398: two placements, both named, and no rule that says which wins.
+        // #398: two PLACEMENTS named at once is refused rather than resolved.
         // Silently preferring one is how a caller ends up reasoning about a
         // workspace it never asked for — the shape #365 is about. Checked
         // before any arm consumes either flag.
-        if params.active && (params.workspace_id.is_some() || params.tab_id.is_some()) {
+        //
+        // `--cwd` is deliberately not in this set, and the reason is that it is
+        // not a peer: `--workspace`/`--tab`/`--active`/`--here` each name where
+        // the PANE goes, while `--cwd` names where the PROCESS starts and only
+        // ever *implies* a space (#390). A placement therefore outranks a cwd
+        // here exactly as it does in the two arms above it, which is #365's
+        // "naming a placement explicitly always wins over the `--cwd` default"
+        // rather than a second, different precedence rule.
+        if (params.active || params.here)
+            && (params.workspace_id.is_some() || params.tab_id.is_some())
+        {
+            let named = if params.here { "--here" } else { "--active" };
+            return Err(AgentStartError::PlacementConflict(format!(
+                "{named} names a workspace; it cannot be combined with --workspace or --tab"
+            )));
+        }
+        if params.active && params.here {
             return Err(AgentStartError::PlacementConflict(
-                "--active names the active workspace; it cannot be combined with --workspace \
-                 or --tab"
+                "--active is the workspace you are looking at and --here is the one your pane is \
+                 in; they are different questions, so pass one"
                     .into(),
             ));
+        }
+
+        // The one arm that places by an OPT-IN rather than by a default, which
+        // is also the only place a placement is resolved from the caller's
+        // attested ancestry instead of from what a human last touched.
+        let named_workspace = if params.here {
+            // #398: "here" is a locality, so it is answered by the pane
+            // ancestry attests this caller to be in — never by `state.active`,
+            // which is the recollection `--active` is for. A caller flock
+            // cannot place has no here, and is told so.
+            Some(
+                caller
+                    .own_workspace()
+                    .ok_or(AgentStartError::NoCallerPane)?,
+            )
+        } else if params.active {
+            self.state
+                .active
+                .filter(|idx| *idx < self.state.workspaces.len())
+        } else {
+            None
+        };
+        if params.active && named_workspace.is_none() {
+            // `--active` on a server with nothing focused. Not a refusal to
+            // guess: the caller named a placement and there was none.
+            return Err(AgentStartError::NoActiveWorkspace);
         }
 
         let (ws_idx, tab_idx, pane_id) = if let Some(tab_id) = params.tab_id {
@@ -493,18 +535,11 @@ impl App {
                 &argv,
                 focus,
             )?
-        } else if params.active {
-            // #398: the active workspace, asked for by name. This is what an
-            // untargeted `--split` used to fall back to silently, and it stays
-            // reachable from any caller — including one flock cannot place,
-            // which is the whole point of an opt-in.
-            let Some(ws_idx) = self
-                .state
-                .active
-                .filter(|idx| *idx < self.state.workspaces.len())
-            else {
-                return Err(AgentStartError::NoActiveWorkspace);
-            };
+        } else if let Some(ws_idx) = named_workspace {
+            // #398: the placement was asked for by name, so it is reached from
+            // any caller — including one flock cannot place, which is the whole
+            // point of an opt-in. This is what an untargeted `--split` used to
+            // fall back to silently.
             let tab_idx = self.state.workspaces[ws_idx].active_tab;
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
@@ -514,7 +549,12 @@ impl App {
                 }
                 // Without `--split` this is a placement, not a pane gesture, so
                 // it takes the shape `--workspace` does for #364: the agent is
-                // the only pane of a tab nobody else is in.
+                // the only pane of a tab nobody else is in. Under
+                // `tab_mode = "workspace"` a tab is never drawn, so
+                // `spawn_agent_in_workspace` mints a SIBLING space carrying the
+                // named one's worktree membership instead — inherited #390
+                // behaviour, and the reason the docs say "the named workspace"
+                // rather than "a tab in it".
                 None => {
                     let workspace_id = self.public_workspace_id(ws_idx);
                     self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
@@ -561,6 +601,17 @@ impl App {
                 let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
                 self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
             } else {
+                // A split needs an existing space to split. An unmatched cwd
+                // is placement ENOUGH on the untargeted arm below — flock
+                // mints a space at it (#364) — but there is nothing here to
+                // split, so `--split` keeps refusing where the other arm
+                // accepts. That is the one place the "a real directory is
+                // placement" rule does not reach, and it is a difference of
+                // KIND, not of policy: one arm creates a space and the other
+                // subdivides one. `--active`, `--workspace`, `--tab` and a
+                // `--cwd` naming an OPEN checkout all name a space, so all four
+                // still work here; pinned by
+                // `only_a_flag_naming_a_real_space_fixes_a_headless_split_refusal`.
                 return Err(AgentStartError::PlacementRequired);
             }
         } else {
@@ -678,6 +729,17 @@ impl App {
                 code: "agent_no_active_workspace".into(),
                 message: "--active was passed and no workspace is focused; name a placement \
                           with --workspace or --tab"
+                    .into(),
+            },
+            AgentStartError::NoCallerPane => crate::api::schema::ErrorBody {
+                code: "agent_here_unavailable".into(),
+                // Names the alternatives, because "there is no here" is not an
+                // answer a caller can act on — it is the refusal that would
+                // otherwise have been a guess.
+                message: "--here means the workspace this caller's own pane is in, and this \
+                          caller's process ancestry does not land in a pane of this session. \
+                          Use --active for the workspace you are looking at, or name one with \
+                          --workspace ID or --tab ID."
                     .into(),
             },
             AgentStartError::SpawnFailed(message) => crate::api::schema::ErrorBody {
@@ -1029,6 +1091,11 @@ pub(super) enum AgentStartError {
     /// `--active` on a server with nothing focused. Not a refusal to guess:
     /// the caller named a placement and there was none.
     NoActiveWorkspace,
+    /// #398: `--here` from a caller whose process ancestry lands in no pane of
+    /// this session. Refused rather than answered with `state.active`, because
+    /// "the space I am in" answered by "the space somebody last looked at" is
+    /// the bug the flag was added to name.
+    NoCallerPane,
     SpawnFailed(String),
     /// #178: the child exec'd and was already gone when flock looked. A
     /// successful spawn is not a started agent.
@@ -1181,6 +1248,7 @@ mod tests {
                 tab_id: None,
                 split: None,
                 active: false,
+                here: false,
                 focus: false,
                 // #178/#374: a start whose child is already gone is a failed
                 // start, so these need a pane that is still there afterwards.
@@ -1199,6 +1267,7 @@ mod tests {
                 tab_id: None,
                 split: None,
                 active: false,
+                here: false,
                 focus: false,
                 argv: vec![program.to_string()],
             }),

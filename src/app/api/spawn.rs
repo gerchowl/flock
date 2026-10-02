@@ -84,6 +84,33 @@ impl SpawnCaller {
     pub(in crate::app) fn may_default_to_active(&self) -> bool {
         matches!(self, SpawnCaller::Operator { pane: Some(_) })
     }
+
+    /// The workspace this caller's OWN pane is in — the "here" `--here` means,
+    /// and the only placement default that is a locality rather than a
+    /// recollection.
+    ///
+    /// The distinction from [`Self::may_default_to_active`] is the whole reason
+    /// this accessor exists. `state.active` is whichever workspace a human last
+    /// focused, which for a caller sitting in a pane of some *other* space is
+    /// somewhere else entirely: a resume script run from a pane in the
+    /// background would be answered with the space the operator is looking at,
+    /// which is #398's defect with the exemption bolted on. Ancestry knows
+    /// which workspace the caller is actually in, so `--here` asks the
+    /// attested question rather than the remembered one.
+    ///
+    /// Both classes can have a pane, and both get a real answer here: an agent
+    /// asking to place something beside itself is naming an address, not
+    /// asking for a default. What neither gets is `may_default_to_active` —
+    /// having a "here" is not a claim to be a keystroke.
+    pub(in crate::app) fn own_workspace(&self) -> Option<usize> {
+        match self {
+            SpawnCaller::Agent { ws_idx, .. } => Some(*ws_idx),
+            SpawnCaller::Operator {
+                pane: Some((ws_idx, _)),
+            } => Some(*ws_idx),
+            SpawnCaller::Operator { pane: None } => None,
+        }
+    }
 }
 
 /// The lineage a child admitted by the funnel must be stamped with.
