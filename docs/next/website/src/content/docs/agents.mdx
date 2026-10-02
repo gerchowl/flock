@@ -105,7 +105,7 @@ Targets accept terminal IDs, unique agent names, detected or reported agent labe
 Integrations can report a visual status label without changing semantic state.
 
 ```bash
-flk pane report-agent 1-1 \
+flk pane report-agent \
   --source custom:indexer \
   --agent docs-bot \
   --state working \
@@ -113,6 +113,8 @@ flk pane report-agent 1-1 \
 ```
 
 `state` controls waits, notifications, and rollups. `custom-status` is only display text.
+
+Run from inside the pane's agent and you can leave the pane id out entirely: `report-agent` defaults to the calling pane, the same as `report-recap` and `report-reply`. Name it explicitly as `flk pane report-agent <pane_id> …` or with `--pane <pane_id>` when the reporter runs somewhere else.
 
 ## Start agents from the CLI
 

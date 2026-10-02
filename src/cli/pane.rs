@@ -579,10 +579,12 @@ struct ReportAgentArgs {
 /// that swallow turned every state transition into a discard.
 ///
 /// The pane id is therefore optional and resolves exactly the way
-/// `report-recap`/`report-reply` resolve it: `--pane`, else the legacy bare
+/// `report-recap`/`report-reply` resolve it: `--pane`, else the legacy leading
 /// positional, else the calling pane ($FLOCK_PANE_ID, healed server-side by
-/// socket-peer process ancestry). A bare word is only ever read as the pane id
-/// when it is not an option, so a flag can no longer be consumed as one.
+/// socket-peer process ancestry). A flag can no longer be consumed as the pane
+/// id, and a bare word that arrives after the first token is refused by name
+/// rather than adopted — so this verb is no laxer than its siblings about a
+/// caller's stray word.
 fn parse_report_agent_args(args: &[String]) -> Result<ReportAgentArgs, String> {
     let mut pane_id: Option<String> = None;
     let mut source = None;
@@ -597,27 +599,34 @@ fn parse_report_agent_args(args: &[String]) -> Result<ReportAgentArgs, String> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        // Every value-taking arm below reads `args[index + 1]`, so a flag's
-        // value is never mistaken for the positional pane id.
-        if !arg.starts_with('-') {
-            if pane_id.is_some() {
-                return Err(format!(
-                    "unexpected argument: {arg} (the pane id was already given)"
-                ));
-            }
+        // The pane id is positional and comes FIRST, so only the first token
+        // may be one. Every value-taking arm below reads `args[index + 1]`,
+        // which is why a flag's value never reaches this test — but a bare
+        // word arriving AFTER the first token is not a pane id the caller
+        // meant: it is an unquoted multi-word value (`--message waiting`).
+        // Reading it as the pane would report to a pane nobody named, which
+        // is the shape of trap #454 moved rather than closed, and it would
+        // make this verb laxer than report-recap/report-reply, which have no
+        // positional at all and refuse such a word by name.
+        if index == 0 && !arg.starts_with('-') {
             pane_id = Some(super::normalize_pane_id(arg));
             index += 1;
             continue;
         }
         match arg {
             "--pane" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("missing value for --pane".to_string());
-                };
+                // No flock pane id can begin with `-` (the server accepts only
+                // `p_<n>`, `p_<ws>_<n>`, `<ws>:p<n>` and legacy `<ws>-<n>`), so
+                // a flag here is a missing value, not an exotic pane id. Naming
+                // that is the difference between a diagnosis and a puzzle.
+                match args.get(index + 1) {
+                    Some(value) if !value.starts_with('-') => {}
+                    _ => return Err("missing value for --pane".to_string()),
+                }
                 if pane_id.is_some() {
                     return Err("the pane id was already given".to_string());
                 }
-                pane_id = Some(super::normalize_pane_id(value));
+                pane_id = Some(super::normalize_pane_id(&args[index + 1]));
                 index += 2;
             }
             "--source" => {
@@ -710,9 +719,15 @@ fn parse_report_agent_args(args: &[String]) -> Result<ReportAgentArgs, String> {
 ///
 /// The pane id is optional (#454) and defaults to the calling pane, the same
 /// resolution `report-recap` and `report-reply` use — so the reporting verbs
-/// agree on how a pane is supplied. When no pane can be resolved at all, the
-/// server answers `pane_not_found` and [`super::send_ok_request`] turns that
-/// into a non-zero exit, which no caller can mistake for a delivered report.
+/// agree on how a pane is supplied. A parse failure exits 2 with the reason on
+/// stderr, and when no pane resolves at all the server answers
+/// `pane_not_found`, which [`super::send_ok_request`] turns into exit 1.
+///
+/// That narrows #454's trap; it does not make the failure unswallowable. A
+/// reporter that omits the pane, has no `$FLOCK_PANE_ID`, and whose ancestry
+/// the server cannot attribute still gets `pane_not_found` → exit 1, which a
+/// `|| true` eats — the same as `report-recap` has always behaved. What is
+/// fixed is the parser: a flag can no longer be consumed as the pane id.
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let parsed = match parse_report_agent_args(args) {
         Ok(parsed) => parsed,
@@ -1468,18 +1483,112 @@ mod tests {
     /// not mean.
     #[test]
     fn naming_the_pane_twice_is_refused() {
+        let err = parse_report_agent_args(&argv(&[
+            "p_1", "--pane", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+        ]))
+        .expect_err("two panes are ambiguous");
+        assert!(
+            err.contains("pane"),
+            "the refusal must say the pane is the problem: {err}"
+        );
+
+        // A second BARE word is not a second pane the parser can diagnose — it
+        // reaches the unknown-option arm, which is exactly how `report-recap`
+        // and `report-reply` treat a stray word. The verb stays strict, and the
+        // message is the sibling one.
+        let err = parse_report_agent_args(&argv(&[
+            "p_1", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+        ]))
+        .expect_err("a second bare word is not a pane");
+        assert!(
+            err.contains("unknown option"),
+            "a stray word is refused by name, as the sibling verbs do: {err}"
+        );
+    }
+
+    /// #454 follow-up: the fix must not have MOVED the trap rather than closed
+    /// it. Accepting the positional only at index 0 is what keeps this true —
+    /// with the guard at every position, `--message waiting` set the pane id to
+    /// `waiting` and exited 0, where the old parser said `unknown option:
+    /// waiting` and exited 2.
+    #[test]
+    fn a_stray_bare_word_after_a_flag_is_refused_not_eaten_as_the_pane() {
+        // A flag's OWN value belongs to that flag wherever it sits: `--message
+        // waiting` is a message, never a pane. What must be refused is a bare
+        // word no flag claimed — which is exactly what an unquoted multi-word
+        // value leaves behind (`--message waiting for the build`).
+        assert_eq!(
+            parse_report_agent_args(&argv(&[
+                "--source",
+                "ax",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+                "--message",
+                "waiting",
+            ])),
+            Ok(ReportAgentArgs {
+                message: Some("waiting".into()),
+                ..working("ax")
+            })
+        );
+
         for args in [
+            // `--message waiting for the build` with the value unquoted.
             argv(&[
-                "p_1", "--pane", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+                "--source",
+                "ax",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+                "--message",
+                "waiting",
+                "for",
+                "the",
+                "build",
             ]),
+            // No flag at all claims the trailing word.
             argv(&[
-                "p_1", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+                "--source", "ax", "--agent", "zzz", "--state", "working", "waiting",
+            ]),
+            // Nor when the pane was named with `--pane`…
+            argv(&[
+                "--pane", "p_1", "--source", "ax", "--agent", "a", "--state", "idle", "stray",
+            ]),
+            // …or with the leading positional.
+            argv(&[
+                "w1:p3", "--source", "ax", "--agent", "a", "--state", "idle", "stray",
             ]),
         ] {
-            let err = parse_report_agent_args(&args).expect_err("two panes are ambiguous");
+            let err = parse_report_agent_args(&args).expect_err("a stray word must be refused");
             assert!(
-                err.contains("pane"),
-                "the refusal must say the pane is the problem: {err}"
+                err.contains("unknown option"),
+                "a stray word is refused by name, as the sibling verbs do: {err}"
+            );
+            assert!(
+                err.starts_with("unknown option"),
+                "and the word it refused leads the message: {err}"
+            );
+        }
+    }
+
+    /// `--pane` with no value, or with a flag where the value belongs. No flock
+    /// pane id can begin with `-`, so a flag there is a missing value — and
+    /// saying "unexpected argument: x" points at the wrong word entirely.
+    #[test]
+    fn a_pane_flag_without_a_value_says_so() {
+        for args in [
+            argv(&["--pane"]),
+            argv(&[
+                "--pane", "--source", "ax", "--agent", "a", "--state", "idle",
+            ]),
+        ] {
+            let err = parse_report_agent_args(&args).expect_err("--pane needs a pane id");
+            assert!(
+                err.contains("missing value for --pane"),
+                "the refusal must name the option that has no value: {err}"
             );
         }
     }
