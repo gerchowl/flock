@@ -19,7 +19,7 @@ url: https://github.com/gerchowl/herdr/issues/80
 3. **Visibility = a selection set, not "only"**: per-server show/hide toggles (context menu / click on band rows; multi-hide supported); "only X" = select-one shortcut, "all" = full set; replaces #51's single Option<ServerFilter>. The selection lives in the VIEWER PROFILE (#79) — it follows the user across servers and is per-client.
 
 ## Acceptance
-- ctrl+shift+a reaches a blocked agent on sage from mba22 (e2e with a remote blocked summary), respecting visibility.
+- ctrl+shift+a reaches a blocked agent on atlas from hopper (e2e with a remote blocked summary), respecting visibility.
 - Hiding N servers removes their rows + agents + queue entries everywhere at once; counts/joins on the band remain (the band always shows the fleet — visibility filters the SPACES/AGENTS lists, not the servers band).
 - Selection persists in the viewer profile (#79) once that lands; interim: session snapshot.
 

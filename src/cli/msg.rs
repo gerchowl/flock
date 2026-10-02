@@ -552,7 +552,7 @@ mod tests {
         // message. Silently, with a success at the sending end.
         let err = parse_send_args(&argv(&[
             "--agent",
-            "agent_sage_1",
+            "agent_atlas_1",
             "--intent-typo",
             "needs_reply",
             "the message",
@@ -577,7 +577,7 @@ mod tests {
         // already uses for every body it sends.
         let parsed = parse_send_args(&argv(&[
             "--agent",
-            "agent_sage_1",
+            "agent_atlas_1",
             "--",
             "--intent",
             "is what I typed",
@@ -599,7 +599,7 @@ mod tests {
         // down. Each option is fed with a value; the arms that take none
         // ignore the extra word as body text, which is what makes this cheap.
         for option in SEND_OPTIONS {
-            let args = argv(&["--agent", "agent_sage_1", option, "fyi", "body"]);
+            let args = argv(&["--agent", "agent_atlas_1", option, "fyi", "body"]);
             assert!(
                 parse_send_args(&args).is_ok(),
                 "{option} is advertised but refused"
@@ -619,7 +619,7 @@ mod tests {
         // Only a `--`-prefixed word is refused. A lone `-`, a `-5` or a diff
         // line is body text, exactly as before — narrowing the escape hatch
         // any further would break bodies that work today.
-        let parsed = parse_send_args(&argv(&["--agent", "agent_sage_1", "-5", "degrees"]))
+        let parsed = parse_send_args(&argv(&["--agent", "agent_atlas_1", "-5", "degrees"]))
             .expect("a single dash is body text");
         assert_eq!(parsed.positional, vec!["-5", "degrees"]);
         assert!(!looks_like_option("-"));
@@ -649,11 +649,11 @@ mod tests {
         // breaking cross-host messaging outright.
         let parsed = parse_send_args(&argv(&[
             "--agent",
-            "agent_sage_1",
+            "agent_atlas_1",
             "--from-agent",
-            "agent_mba22_2",
+            "agent_hopper_2",
             "--from-host",
-            "mba22",
+            "hopper",
             "--correlation-id",
             "c-1",
             "--reply-to",
@@ -665,8 +665,8 @@ mod tests {
             "re-derive both parameters",
         ]))
         .expect("the relay's own command line must survive its own refusal rule");
-        assert_eq!(parsed.agent.as_deref(), Some("agent_sage_1"));
-        assert_eq!(parsed.from_host.as_deref(), Some("mba22"));
+        assert_eq!(parsed.agent.as_deref(), Some("agent_atlas_1"));
+        assert_eq!(parsed.from_host.as_deref(), Some("hopper"));
         assert_eq!(parsed.in_reply_to.as_deref(), Some("c-0"));
         assert_eq!(parsed.intent, MsgIntent::NeedsReply);
         assert_eq!(parsed.positional, vec!["re-derive both parameters"]);

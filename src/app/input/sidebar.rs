@@ -1020,7 +1020,7 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         });
         peer.last_ok = Some(std::time::Instant::now());

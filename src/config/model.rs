@@ -462,7 +462,7 @@ pub struct Config {
     /// its OWN identity.
     pub name: String,
     /// Self-declared fleet ICON for THIS node (#164): a named flat Nerd Font
-    /// glyph (`icon = "laptop"`) shown as a prefix in every viewer's servers
+    /// glyph (`icon = "hopper"`) shown as a prefix in every viewer's servers
     /// band — gossiped with the node's identity so it renders identically
     /// fleet-wide (unlike the viewer-relative `[[peers]].name`). The name maps
     /// to a glyph via a static registry on the RENDERING side, so only an ASCII
@@ -840,7 +840,7 @@ impl GossipConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PeerConfig {
-    /// Short host badge shown on remote rows (e.g. "anvil"). Required.
+    /// Short host badge shown on remote rows (e.g. "kiln"). Required.
     pub name: String,
     /// SSH destination used for polling and attach. Defaults to `name`.
     ///
@@ -1125,7 +1125,7 @@ pub struct MsgConfig {
     /// Open by default because a flock fleet is already one trust domain —
     /// SSH keys plus a host CA — so a mandatory allowlist would be friction
     /// against no threat model. Narrow it when that stops being true:
-    /// `allow_from = ["mba22"]`.
+    /// `allow_from = ["hopper"]`.
     pub allow_from: Vec<String>,
     /// Longest `reason` a mute may carry, in characters (ADR-0018 §3).
     /// Longer is truncated, not refused: the reason is quoted to every
@@ -1712,7 +1712,7 @@ mod tests {
     fn msg_policy_is_open_by_default_and_narrows_by_host() {
         let open = super::MsgConfig::default();
         assert!(
-            open.accepts_from(Some("anvil")),
+            open.accepts_from(Some("kiln")),
             "default is the whole fleet"
         );
         assert!(
@@ -1722,15 +1722,15 @@ mod tests {
 
         let narrowed = super::MsgConfig {
             enabled: true,
-            allow_from: vec!["mba22".into()],
+            allow_from: vec!["hopper".into()],
             ..super::MsgConfig::default()
         };
-        assert!(narrowed.accepts_from(Some("mba22")));
+        assert!(narrowed.accepts_from(Some("hopper")));
         assert!(
-            narrowed.accepts_from(Some("MBA22")),
+            narrowed.accepts_from(Some("HOPPER")),
             "host match is case-insensitive"
         );
-        assert!(!narrowed.accepts_from(Some("anvil")));
+        assert!(!narrowed.accepts_from(Some("kiln")));
         assert!(
             narrowed.accepts_from(None),
             "narrowing inbound hosts must not break local sends"
@@ -1741,7 +1741,7 @@ mod tests {
             allow_from: vec!["*".into()],
             ..super::MsgConfig::default()
         };
-        assert!(!closed.accepts_from(Some("mba22")));
+        assert!(!closed.accepts_from(Some("hopper")));
         assert!(
             !closed.accepts_from(None),
             "disabled means disabled, including locally"
@@ -1754,8 +1754,8 @@ mod tests {
         let default_config = Config::default();
         assert!(default_config.name.is_empty());
 
-        let config: Config = toml::from_str(r#"name = "mba22""#).unwrap();
-        assert_eq!(config.name, "mba22");
+        let config: Config = toml::from_str(r#"name = "hopper""#).unwrap();
+        assert_eq!(config.name, "hopper");
     }
 
     #[test]
@@ -2566,7 +2566,7 @@ stale_after_secs = 5
         // ~2s. Resolution: per-peer override, else global default.
         let gossip = GossipConfig::default();
         let default_peer = PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         };
         assert_eq!(

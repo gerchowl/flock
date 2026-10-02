@@ -2079,10 +2079,10 @@ mod tests {
         app.peer_checkout = Some(crate::app::state::PeerCheckoutState {
             generation: 1,
             peer: crate::config::PeerConfig {
-                name: "anvil".into(),
+                name: "kiln".into(),
                 ..Default::default()
             },
-            host: "anvil".into(),
+            host: "kiln".into(),
             remote_workspace_id: "ws_3".into(),
             branch: "feature-x".into(),
             source_repo_root: "/repo".into(),
@@ -2102,7 +2102,7 @@ mod tests {
 
         let (title, summary, warnings, status) = super::cross_checkout_overlay_lines(&app);
         assert!(title.contains("feature-x"));
-        assert!(summary.contains("anvil") && summary.contains("feature-x"));
+        assert!(summary.contains("kiln") && summary.contains("feature-x"));
         assert_eq!(warnings.len(), 2, "dirty + unpushed both warn");
         assert!(
             status.is_none(),

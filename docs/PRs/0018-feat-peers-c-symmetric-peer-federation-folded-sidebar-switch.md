@@ -38,8 +38,8 @@ Reframes the tree from `server → project → worktree → agent` to **`project
  spaces
  ▾ herdr                       ← folds by origin URL
      herdr            cc · idle    (local)
-     anvil:fix/pty    ● blocked    (peer row — click to jump)
- dotfiles · sage:vm-dev  ● working  (remote-only project, trailing)
+     kiln:fix/pty    ● blocked    (peer row — click to jump)
+ dotfiles · atlas:bastion  ● working  (remote-only project, trailing)
 ```
 
 Cross-machine attention falls out for free: `focus_attention` ranks blocked-oldest across the merged set, so `ctrl+shift+a` from one machine lands you on another's blocked agent — switch included.

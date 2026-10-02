@@ -12,7 +12,7 @@ url: https://github.com/gerchowl/herdr/issues/131
 
 # port herdr-web bridge into herdr as a first-class option (g-fleet keeps only the tailscale-serve exposure)
 
-The web bridge currently lives in **g-fleet** (`pkgs/herdr-web/`: a 367-line axum + portable-pty + tokio WS server, plus `static/index.html` and vendored xterm). It was built there for #109-MVP speed (sage-only, Darwin-only launchd, vendored) — but it's a small, self-contained app that is *entirely coupled to herdr's own `HERDR_RENDER_ENCODING=terminal-ansi` output*. It belongs in the product, not in personal dotfiles.
+The web bridge currently lives in **g-fleet** (`pkgs/herdr-web/`: a 367-line axum + portable-pty + tokio WS server, plus `static/index.html` and vendored xterm). It was built there for #109-MVP speed (atlas-only, Darwin-only launchd, vendored) — but it's a small, self-contained app that is *entirely coupled to herdr's own `HERDR_RENDER_ENCODING=terminal-ansi` output*. It belongs in the product, not in personal dotfiles.
 
 ## Architecture (unchanged)
 ```
@@ -42,7 +42,7 @@ Parent: #109. Subsumes the home for #128 / #129 / #130.
 
 # Spike addendum (2026-06-14): hosting topology, bridge transport, gossip freshness
 
-This expands #131 from "move the bridge into herdr" into the architectural decision behind it: **the web bridge should be a fleet *client* attached to a headless herdr node that gossips independently of any interactive machine** — so a phone can see the whole fleet via an always-on host (e.g. sage) even when the MacBook is off. Parent #109.
+This expands #131 from "move the bridge into herdr" into the architectural decision behind it: **the web bridge should be a fleet *client* attached to a headless herdr node that gossips independently of any interactive machine** — so a phone can see the whole fleet via an always-on host (e.g. atlas) even when the MacBook is off. Parent #109.
 
 ## Hosting topology — the headless node is the fleet member, the web bridge is just a client
 
@@ -50,7 +50,7 @@ Verified against the code:
 
 - A **headless `herdr server`** (`src/server/headless.rs:3272`) participates *fully* in fleet gossip with **no TUI and no client attached**. The peer-poll loop lives in `App` (`src/app/mod.rs:304`), which lives in the headless server — **not** in the interface client. Clients never gossip.
 - The **interface client** (`src/client/`) is a thin paint-only client; with `HERDR_RENDER_ENCODING=terminal-ansi` the server pre-diffs and ships raw ANSI and the client is a stdout passthrough (`src/client/mod.rs:1697`). That byte stream is exactly what xterm.js consumes.
-- ⇒ **sage runs a headless server that gossips with the fleet regardless of the laptop. The web bridge is *another client* attaching to sage's local server. The phone sees the whole fleet** (sidebar peer rows, reachability, agent-attention rollup) because *sage's server* is the poller — the laptop being off is irrelevant to what the phone sees.
+- ⇒ **atlas runs a headless server that gossips with the fleet regardless of the hopper. The web bridge is *another client* attaching to atlas's local server. The phone sees the whole fleet** (sidebar peer rows, reachability, agent-attention rollup) because *atlas's server* is the poller — the hopper being off is irrelevant to what the phone sees.
 
 The MVP almost does this but spawns a fresh default `herdr` per WS connection (each attaches/auto-spawns a server) rather than deliberately attaching to a **persistent, always-on headless server**. Decision below.
 
@@ -58,17 +58,17 @@ The MVP almost does this but spawns a fresh default `herdr` per WS connection (e
 
 | State the phone is viewing | Path | Latency |
 |---|---|---|
-| The **attached server's own** sessions/panes/agents (sage) | direct render-frame stream, pushed every render (`src/server/render_stream.rs`) | **instant** |
+| The **attached server's own** sessions/panes/agents (atlas) | direct render-frame stream, pushed every render (`src/server/render_stream.rs`) | **instant** |
 | **Other fleet members'** state (MacBook reachability, peer sidebar dots, cross-host agent rollup) | **15s pull-poll**: `peer-summary-tick` → `ssh <peer> herdr peers summary --json` (`src/app/mod.rs:309`, `src/app/api.rs:162`, `src/peers.rs:201`) | **up to ~15s** + staleness (`PEER_STALE_AFTER_SECS = 60`) |
 
-**There is no push / broadcast / notify-on-change between servers.** A local change on one host is *not* immediately gossiped; peers learn it on their next 15s poll. The only non-poll propagation is `FleetSnapshot`, a one-shot ride-along stamped only on a client server-switch (`src/app/api/peers.rs:154`) — not continuous. The phone attaching to sage does not change this: sage is the poller, so cross-fleet rows on the phone are 15s-cadence regardless.
+**There is no push / broadcast / notify-on-change between servers.** A local change on one host is *not* immediately gossiped; peers learn it on their next 15s poll. The only non-poll propagation is `FleetSnapshot`, a one-shot ride-along stamped only on a client server-switch (`src/app/api/peers.rs:154`) — not continuous. The phone attaching to atlas does not change this: atlas is the poller, so cross-fleet rows on the phone are 15s-cadence regardless.
 
 **Decision to make:** for the phone-glance case, is 15s-stale cross-fleet state acceptable (likely yes — it's a glance), or does this case warrant a faster poll / push-on-change gossip? The latter is a **fleet-wide** change larger than the web bridge and should be split into its own issue if pursued.
 
 ## Spike decisions (to be settled by the review panel + owner)
 
 1. **Bridge transport.** (a) Spawn `herdr client` subprocess in a PTY (MVP — reuses everything, opaque byte pump) vs (b) speak the `herdr-client.sock` bincode protocol natively in the bridge (`src/protocol/wire.rs` `ClientMessage`/`ServerMessage`; mirrors `remote::run_client_process`). (b) drops the PTY + subprocess, enables structured input (mouse #130, key bar #129) and a real "connected" signal (#128), but reimplements the client handshake/encoding loop.
-2. **Server attach model.** Persistent shared headless server (sessions survive WS disconnect; one server gossips; multiple clients incl. the TUI view the same live session) vs ephemeral per-WS server (MVP). Recommend **persistent**, matching the always-on-sage intent.
+2. **Server attach model.** Persistent shared headless server (sessions survive WS disconnect; one server gossips; multiple clients incl. the TUI view the same live session) vs ephemeral per-WS server (MVP). Recommend **persistent**, matching the always-on-atlas intent.
 3. **Packaging.** `herdr web --bind 127.0.0.1:PORT` subcommand behind a cargo feature (axum/tower/portable-pty gated; lean default build) vs baking a listener into `herdr server`. Embed assets (rust-embed/include_dir), drop `--static-dir`.
 4. **Auth boundary.** v1 = bind 127.0.0.1 + `tailscale serve` (tailnet identity). Decide whether to map the tailscale identity header → herdr user, and whether multi-client write access needs any guard (a web client can drive kill/worktree/branch actions).
 

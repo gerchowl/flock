@@ -18,9 +18,9 @@ Replace the exit-and-relaunch leg model with **connection slots inside one clien
 
 ```
 client (one process, owns the tty forever)
- ├─ slot[active]: sage   — frames painted, input forwarded
- ├─ slot[warm]:   mba22  — connection held, frames PAUSED (home: always warm)
- └─ slot[cold]:   anvil  — no connection; lazy dial on first switch
+ ├─ slot[active]: atlas   — frames painted, input forwarded
+ ├─ slot[warm]:   hopper  — connection held, frames PAUSED (home: always warm)
+ └─ slot[cold]:   kiln  — no connection; lazy dial on first switch
 ```
 
 - **Switch** = pre-dial target in the background (current view keeps painting) → on Welcome+first frame, flip the active pointer + full-redraw (exists as redraw-on-attach). Instant when warm.

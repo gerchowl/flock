@@ -104,22 +104,22 @@ mod tests {
 
     #[test]
     fn ids_are_unique_within_and_across_hosts() {
-        let a = AgentId::alloc("sage");
-        let b = AgentId::alloc("sage");
+        let a = AgentId::alloc("atlas");
+        let b = AgentId::alloc("atlas");
         assert_ne!(a, b, "two agents on one host must differ");
 
-        let elsewhere = AgentId::alloc("anvil-dev");
+        let elsewhere = AgentId::alloc("kiln-dev");
         assert_ne!(a, elsewhere);
-        assert!(a.to_string().contains("sage"));
-        assert!(elsewhere.to_string().contains("anvil-dev"));
+        assert!(a.to_string().contains("atlas"));
+        assert!(elsewhere.to_string().contains("kiln-dev"));
     }
 
     #[test]
     fn a_minted_id_is_well_formed_and_prose_is_not() {
         assert!(AgentId::is_well_formed(
-            &AgentId::alloc("vm-dev").to_string()
+            &AgentId::alloc("bastion").to_string()
         ));
-        assert!(AgentId::is_well_formed("agent_sage_65af8253dde56aa62"));
+        assert!(AgentId::is_well_formed("agent_atlas_65af8253dde56aa62"));
         for claim in [
             "",
             "agent_",
@@ -137,7 +137,7 @@ mod tests {
         // The whole point: an id read back from a snapshot is the SAME id, so
         // an agent keeps its name across a restart. Minting on restore would
         // silently re-address every agent and orphan in-flight message threads.
-        let minted = AgentId::alloc("sage");
+        let minted = AgentId::alloc("atlas");
         let restored = AgentId::from_persisted(minted.to_string());
         assert_eq!(minted, restored);
     }

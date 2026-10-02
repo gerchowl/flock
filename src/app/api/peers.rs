@@ -675,7 +675,7 @@ impl App {
     /// route: the row stays display-only.
     ///
     /// The match is the exact host the relay cache keys the row under, never
-    /// the domain-stripped sort key: `anvil.other` is not `anvil`, and a click
+    /// the domain-stripped sort key: `kiln.other` is not `kiln`, and a click
     /// on one must not dial the other's route.
     fn switch_via_carried_route(
         &self,
@@ -787,8 +787,8 @@ impl App {
     /// relayer that polls the row.
     ///
     /// A relayed row's `ssh_target` is the RELAYER's name for that machine
-    /// (anvil's `ws00860001` for ksb), which resolves nowhere else. Stamping
-    /// it with this server alone sent `ssh -J mba22 ws00860001`, a name mba22
+    /// (kiln's `ws00860001` for node-b), which resolves nowhere else. Stamping
+    /// it with this server alone sent `ssh -J hopper ws00860001`, a name hopper
     /// cannot resolve. The relayer hop is how THIS server reaches the relayer:
     /// its own `[[peers]]` target, nothing the row says about itself.
     ///
@@ -1044,8 +1044,11 @@ mod tests {
 
     fn carried_snapshot() -> crate::peers::FleetSnapshotState {
         crate::peers::FleetSnapshotState {
-            origin: "mba22".to_string(),
-            peers: vec![summary("anvil", "lars@anvil"), summary("ksb", "lars@ksb")],
+            origin: "hopper".to_string(),
+            peers: vec![
+                summary("kiln", "operator@kiln"),
+                summary("node-b", "operator@node-b"),
+            ],
             origin_summary: None,
             received_at: std::time::Instant::now(),
         }
@@ -1074,7 +1077,7 @@ mod tests {
             .prepare_switch_server(PeerSwitchRequest::Home)
             .expect("home resolves when an origin was carried");
         assert_eq!(prepared.ssh_target, crate::protocol::HOME_SWITCH_TARGET);
-        assert!(prepared.label.contains("mba22"));
+        assert!(prepared.label.contains("hopper"));
         // Going home carries nothing: the local server needs no snapshot.
         assert!(prepared.fleet.is_none());
     }
@@ -1096,22 +1099,22 @@ mod tests {
                 ws_idx: None,
             })
             .expect("snapshot row resolves");
-        assert_eq!(prepared.ssh_target, "lars@anvil");
+        assert_eq!(prepared.ssh_target, "operator@kiln");
         let fleet = prepared.fleet.expect("nested leap carries the snapshot");
         // Pass-through, not re-stamp: the ORIGINAL origin survives, and the
         // hop target drops out (it becomes the self row over there).
-        assert_eq!(fleet.origin, "mba22");
+        assert_eq!(fleet.origin, "hopper");
         let targets: Vec<&str> = fleet
             .peers
             .iter()
             .map(|peer| peer.ssh_target.as_str())
             .collect();
         assert!(
-            targets.contains(&"lars@ksb"),
+            targets.contains(&"operator@node-b"),
             "carried peers survive: {targets:?}"
         );
         assert!(
-            !targets.contains(&"lars@anvil"),
+            !targets.contains(&"operator@kiln"),
             "hop target excluded: {targets:?}"
         );
         // #80: the leg also carries THIS server, so the next hop can see the
@@ -1131,8 +1134,8 @@ mod tests {
     async fn config_peer_switch_from_hub_stamps_own_origin_and_peers() {
         let mut app = test_app();
         app.state.peer_summaries = vec![
-            summary("anvil", "lars@anvil"),
-            summary("spoke2.invalid", "lars@spoke2.invalid"),
+            summary("kiln", "operator@kiln"),
+            summary("spoke2.invalid", "operator@spoke2.invalid"),
         ];
 
         let prepared = app
@@ -1141,12 +1144,12 @@ mod tests {
                 ws_idx: Some(0),
             })
             .expect("config peer resolves");
-        assert_eq!(prepared.ssh_target, "lars@spoke2.invalid");
+        assert_eq!(prepared.ssh_target, "operator@spoke2.invalid");
         let fleet = prepared.fleet.expect("hub leap stamps a fresh snapshot");
         assert_eq!(fleet.origin, crate::app::short_host_name());
         // The hop target is excluded from its own snapshot.
         assert_eq!(fleet.peers.len(), 1);
-        assert_eq!(fleet.peers[0].ssh_target, "lars@anvil");
+        assert_eq!(fleet.peers[0].ssh_target, "operator@kiln");
         // The hub stamps its OWN summary so a spoke sees the way-home spaces
         // (#66): home-targeted, never an ssh dial.
         let origin = fleet.origin_summary.expect("hub stamps its own summary");
@@ -1160,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn origin_workspace_switch_lands_home_with_focus_target() {
         let mut app = test_app();
-        let mut origin = summary("mba22", crate::protocol::HOME_SWITCH_TARGET);
+        let mut origin = summary("hopper", crate::protocol::HOME_SWITCH_TARGET);
         origin.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
             id: "ws_7".to_string(),
             workspace: "keyboard-shorcuts".to_string(),
@@ -1203,22 +1206,22 @@ mod tests {
 
     #[tokio::test]
     async fn outgoing_fleet_snapshot_from_hub_merges_relayed_cache_into_wire() {
-        // Gossip v3 (#101) part 1 (RED): hub polls anvil, anvil relays twohop
-        // (twohop lives one hop past anvil). The fixture host is deliberately
+        // Gossip v3 (#101) part 1 (RED): hub polls kiln, kiln relays twohop
+        // (twohop lives one hop past kiln). The fixture host is deliberately
         // not a real machine name: an entry about the host RUNNING the test is
         // dropped as "that's us", so a peer named after the developer's box
-        // failed here for reasons that had nothing to do with the relay. anvil's spoke1 attaches to hub —
-        // hub's outgoing_fleet_snapshot must include sage in its `peers`
+        // failed here for reasons that had nothing to do with the relay. kiln's spoke1 attaches to hub —
+        // hub's outgoing_fleet_snapshot must include atlas in its `peers`
         // vector so the FULL fleet is visible on spoke1. Without the relay
-        // merge this test fails (only anvil appears).
+        // merge this test fails (only kiln appears).
         let mut app = test_app();
-        app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
+        app.state.peer_summaries = vec![summary("kiln", "operator@kiln")];
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 dial: None,
                 name: "spoke2.invalid".into(),
-                ssh_target: "lars@spoke2.invalid".into(),
+                ssh_target: "operator@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
                 version: Some("0.9.0".into()),
                 protocol: None,
@@ -1227,14 +1230,14 @@ mod tests {
                 workspaces: Vec::new(),
                 age_secs: Some(4),
                 error: None,
-                origin: "anvil".into(),
+                origin: "kiln".into(),
                 origin_last_ok_secs: Some(4),
-                proxy_jump: Some("anvil".into()),
+                proxy_jump: Some("kiln".into()),
                 icon: None,
             })
             .map(|mut entry| {
-                // Relayed by the anvil we poll, as a real poll merge records.
-                entry.via = Some("anvil".into());
+                // Relayed by the kiln we poll, as a real poll merge records.
+                entry.via = Some("kiln".into());
                 entry
             })
             .expect("fixture destination is a valid ssh target"),
@@ -1245,26 +1248,26 @@ mod tests {
                 peer_idx: 0,
                 ws_idx: Some(0),
             })
-            .expect("hub stamps a snapshot on switch to anvil");
+            .expect("hub stamps a snapshot on switch to kiln");
         let fleet = prepared.fleet.expect("hub leap carries a snapshot");
-        // anvil is the hop target — dropped. sage rides through as a
-        // relayed row, so a spoke1 attaching to anvil sees the fleet.
+        // kiln is the hop target — dropped. atlas rides through as a
+        // relayed row, so a spoke1 attaching to kiln sees the fleet.
         let targets: Vec<&str> = fleet
             .peers
             .iter()
             .map(|peer| peer.ssh_target.as_str())
             .collect();
         assert!(
-            targets.contains(&"lars@spoke2.invalid"),
+            targets.contains(&"operator@spoke2.invalid"),
             "relayed peer must ride the wire: {targets:?}"
         );
         assert!(
-            !targets.contains(&"lars@anvil"),
+            !targets.contains(&"operator@kiln"),
             "hop target excluded: {targets:?}"
         );
     }
 
-    /// A row `anvil` relays about `ksb`, with the target only anvil resolves.
+    /// A row `kiln` relays about `node-b`, with the target only kiln resolves.
     fn relayed_by_anvil(name: &str, ssh_target: &str) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
             dial: None,
@@ -1278,9 +1281,9 @@ mod tests {
             workspaces: Vec::new(),
             age_secs: Some(3),
             error: None,
-            origin: "anvil.invalid".into(),
+            origin: "kiln.invalid".into(),
             origin_last_ok_secs: Some(3),
-            proxy_jump: Some("anvil.invalid".into()),
+            proxy_jump: Some("kiln.invalid".into()),
             icon: None,
         }
     }
@@ -1297,18 +1300,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_relayed_row_routes_via_its_relayer_and_a_polled_one_via_the_hub() {
-        // #441: the hub stamped EVERY row with itself, so ksb (which only
-        // anvil can resolve as `ws00860001`) became `ssh -J mba22 ws00860001`.
+        // #441: the hub stamped EVERY row with itself, so node-b (which only
+        // kiln can resolve as `ws00860001`) became `ssh -J hopper ws00860001`.
         let us = crate::app::short_host_name();
         let mut app = test_app();
         app.state.peer_summaries = vec![
-            summary("anvil.invalid", "lars@anvil.tailnet"),
-            summary("spoke1.invalid", "lars@spoke1.invalid"),
+            summary("kiln.invalid", "operator@kiln.tailnet"),
+            summary("spoke1.invalid", "operator@spoke1.invalid"),
         ];
         crate::peers::merge_relayed_fleet(
             &mut app.state.relayed_fleet_cache,
-            vec![relayed_by_anvil("ksb.invalid", "ws00860001")],
-            "anvil.invalid",
+            vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
+            "kiln.invalid",
         );
 
         let prepared = app
@@ -1318,14 +1321,17 @@ mod tests {
             })
             .expect("switch to spoke1");
         let fleet = prepared.fleet.expect("a snapshot rides the leg");
-        let chain = format!("{us},lars@anvil.tailnet");
-        assert_eq!(snapshot_jump(&fleet, "anvil.invalid"), Some(us.as_str()));
-        assert_eq!(snapshot_jump(&fleet, "ksb.invalid"), Some(chain.as_str()));
+        let chain = format!("{us},operator@kiln.tailnet");
+        assert_eq!(snapshot_jump(&fleet, "kiln.invalid"), Some(us.as_str()));
+        assert_eq!(
+            snapshot_jump(&fleet, "node-b.invalid"),
+            Some(chain.as_str())
+        );
 
         // The hub's own click on the relayed row takes the same route.
         let direct = app
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "ksb.invalid".into(),
+                host_key: "node-b.invalid".into(),
                 ws_idx: None,
             })
             .expect("a relayed row is dialable");
@@ -1337,13 +1343,13 @@ mod tests {
         let from_hub = |jump: Option<&str>| {
             jump.and_then(|j| crate::remote::relative_proxy_jump(j, &[us.as_str()]))
         };
-        assert_eq!(from_hub(snapshot_jump(&fleet, "anvil.invalid")), None);
+        assert_eq!(from_hub(snapshot_jump(&fleet, "kiln.invalid")), None);
         assert_eq!(
-            from_hub(snapshot_jump(&fleet, "ksb.invalid")).as_deref(),
-            Some("lars@anvil.tailnet")
+            from_hub(snapshot_jump(&fleet, "node-b.invalid")).as_deref(),
+            Some("operator@kiln.tailnet")
         );
         assert_eq!(
-            crate::remote::relative_proxy_jump(&chain, &["laptop.invalid"]).as_deref(),
+            crate::remote::relative_proxy_jump(&chain, &["hopper.invalid"]).as_deref(),
             Some(chain.as_str())
         );
     }
@@ -1354,15 +1360,15 @@ mod tests {
         // the operator removed must not keep choosing a jump host: the row is
         // neither dialled nor carried to a server that would dial it.
         let mut app = test_app();
-        app.state.peer_summaries = vec![summary("spoke1.invalid", "lars@spoke1.invalid")];
+        app.state.peer_summaries = vec![summary("spoke1.invalid", "operator@spoke1.invalid")];
         crate::peers::merge_relayed_fleet(
             &mut app.state.relayed_fleet_cache,
-            vec![relayed_by_anvil("ksb.invalid", "ws00860001")],
-            "anvil.invalid",
+            vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
+            "kiln.invalid",
         );
         assert!(app
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "ksb.invalid".into(),
+                host_key: "node-b.invalid".into(),
                 ws_idx: None,
             })
             .is_none());
@@ -1374,7 +1380,7 @@ mod tests {
             .and_then(|prepared| prepared.fleet)
             .expect("a snapshot rides the leg");
         assert!(
-            fleet.peers.iter().all(|peer| peer.name != "ksb.invalid"),
+            fleet.peers.iter().all(|peer| peer.name != "node-b.invalid"),
             "{:?}",
             fleet.peers
         );
@@ -1386,16 +1392,16 @@ mod tests {
         // client dial. A pushed row with no carried route stays display-only,
         // and never rides an outgoing snapshot where it WOULD be dialled.
         let mut app = test_app();
-        app.state.peer_summaries = vec![summary("spoke1.invalid", "lars@spoke1.invalid")];
+        app.state.peer_summaries = vec![summary("spoke1.invalid", "operator@spoke1.invalid")];
         crate::peers::merge_hub_pushed_fleet(
             &mut app.state.relayed_fleet_cache,
-            vec![hub_row("ksb.invalid", "ws00860001", 0)],
-            "mba22",
+            vec![hub_row("node-b.invalid", "ws00860001", 0)],
+            "hopper",
         );
-        assert!(app.state.relayed_fleet_cache["ksb.invalid"].hub_pushed);
+        assert!(app.state.relayed_fleet_cache["node-b.invalid"].hub_pushed);
         assert!(app
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "ksb.invalid".into(),
+                host_key: "node-b.invalid".into(),
                 ws_idx: None,
             })
             .is_none());
@@ -1407,7 +1413,7 @@ mod tests {
             .and_then(|prepared| prepared.fleet)
             .expect("a snapshot rides the leg");
         assert!(
-            fleet.peers.iter().all(|peer| peer.name != "ksb.invalid"),
+            fleet.peers.iter().all(|peer| peer.name != "node-b.invalid"),
             "{:?}",
             fleet.peers
         );
@@ -1418,10 +1424,10 @@ mod tests {
         // #428: `error` crossed to every poller and spoke as ssh's stderr
         // line, host names and ports included. Only the token leaves now.
         let mut app = test_app();
-        let mut failing = summary("spoke1.invalid", "lars@spoke1.invalid");
+        let mut failing = summary("spoke1.invalid", "operator@spoke1.invalid");
         failing.error =
-            Some("ssh: connect to host sage.internal port 22: Connection refused".into());
-        app.state.peer_summaries = vec![failing, summary("anvil", "lars@anvil")];
+            Some("ssh: connect to host atlas.internal port 22: Connection refused".into());
+        app.state.peer_summaries = vec![failing, summary("kiln", "operator@kiln")];
 
         let row = app.own_relayed_fleet().remove(0);
         assert_eq!(row.error.as_deref(), Some("connect_refused"));
@@ -1488,7 +1494,7 @@ mod tests {
                 crate::api::schema::PeersHubFleetParams {
                     hub: "hub".into(),
                     fleet: vec![
-                        hub_row("ksb", "lars@ksb", 2),
+                        hub_row("node-b", "operator@node-b", 2),
                         // #392: a row this host will not dial is dropped.
                         hub_row("evil", "-oProxyCommand=touch /tmp/x", 1),
                         // A row about this server itself is never stored.
@@ -1505,7 +1511,7 @@ mod tests {
             method: crate::api::schema::Method::PeersHubFleet(
                 crate::api::schema::PeersHubFleetParams {
                     hub: "impostor".into(),
-                    fleet: vec![hub_row("ksb", "lars@ksb", 1)],
+                    fleet: vec![hub_row("node-b", "operator@node-b", 1)],
                     hub_self: None,
                 },
             ),
@@ -1513,8 +1519,12 @@ mod tests {
         app.current_api_peer_pid = None;
 
         let keys: Vec<&String> = app.state.relayed_fleet_cache.keys().collect();
-        assert_eq!(keys, vec!["ksb"], "only the valid, foreign row: {keys:?}");
-        let entry = app.state.relayed_fleet_cache["ksb"].clone();
+        assert_eq!(
+            keys,
+            vec!["node-b"],
+            "only the valid, foreign row: {keys:?}"
+        );
+        let entry = app.state.relayed_fleet_cache["node-b"].clone();
         assert_eq!(entry.via.as_deref(), Some("hub"), "routed via the hub");
         assert!(entry.hub_pushed, "display-only");
         assert_eq!(
@@ -1525,7 +1535,7 @@ mod tests {
         // Display-only: clicking it dials nothing, whatever its ssh target says.
         assert!(
             app.prepare_switch_server(crate::app::state::PeerSwitchRequest::RelayedPeer {
-                host_key: "ksb".into(),
+                host_key: "node-b".into(),
                 ws_idx: None,
             })
             .is_none(),
@@ -1533,12 +1543,12 @@ mod tests {
         );
         // Nor carried on: the snapshot the next attach leg takes — which that
         // server dials on a click and warms with no click — leaves it out.
-        let snapshot = app.outgoing_fleet_snapshot("lars@elsewhere");
+        let snapshot = app.outgoing_fleet_snapshot("operator@elsewhere");
         assert!(
             snapshot
                 .peers
                 .iter()
-                .all(|peer| peer.ssh_target != "lars@ksb" && peer.name != "ksb"),
+                .all(|peer| peer.ssh_target != "operator@node-b" && peer.name != "node-b"),
             "a hub-pushed row never crosses a leap: {:?}",
             snapshot
                 .peers
@@ -1555,7 +1565,7 @@ mod tests {
             .collect();
         let warmed = crate::client::slots::warm_all_targets(&[], &carried, 8);
         assert!(
-            !format!("{warmed:?}").contains("lars@ksb"),
+            !format!("{warmed:?}").contains("operator@node-b"),
             "never warm-dialled downstream: {warmed:?}"
         );
 
@@ -1573,7 +1583,7 @@ mod tests {
         let ttl = stale_after * crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE;
         app.state.relayed_fleet_cache.insert(
             "old".into(),
-            crate::peers::relayed_entry_from_wire(hub_row("old", "lars@old", ttl + 5))
+            crate::peers::relayed_entry_from_wire(hub_row("old", "operator@old", ttl + 5))
                 .expect("valid"),
         );
         app.expire_uplink();
@@ -1596,14 +1606,14 @@ mod tests {
         // relay. Result: an entry travels exactly one hop, breaking the
         // ping-pong you'd get if two hubs both re-relayed each other's rows.
         let mut app = test_app();
-        app.state.peer_summaries = vec![summary("anvil", "lars@anvil")];
-        // Simulate anvil having relayed sage to us on a prior poll.
+        app.state.peer_summaries = vec![summary("kiln", "operator@kiln")];
+        // Simulate kiln having relayed atlas to us on a prior poll.
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 dial: None,
                 name: "spoke2.invalid".into(),
-                ssh_target: "lars@spoke2.invalid".into(),
+                ssh_target: "operator@spoke2.invalid".into(),
                 host: Some("spoke2.invalid".into()),
                 version: None,
                 protocol: None,
@@ -1612,21 +1622,21 @@ mod tests {
                 workspaces: Vec::new(),
                 age_secs: Some(3),
                 error: None,
-                origin: "anvil".into(),
+                origin: "kiln".into(),
                 origin_last_ok_secs: Some(3),
-                proxy_jump: Some("anvil".into()),
+                proxy_jump: Some("kiln".into()),
                 icon: None,
             })
             .expect("fixture destination is a valid ssh target"),
         );
 
         let entries = app.own_relayed_fleet();
-        // Only anvil (our own polled peer) — sage was received via relay and
+        // Only kiln (our own polled peer) — atlas was received via relay and
         // must NOT ride our outgoing summary.
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["anvil"],
+            vec!["kiln"],
             "relayed cache must not re-relay: {names:?}"
         );
         assert_eq!(entries[0].origin, crate::app::short_host_name());
@@ -1641,7 +1651,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -1649,10 +1659,10 @@ mod tests {
 
         app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
-                    host: "anvil".into(),
+                    host: "kiln".into(),
                     version: None,
                     protocol: None,
                     system: None,
@@ -1661,7 +1671,7 @@ mod tests {
                     relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
                         dial: None,
                         name: "loop-back".into(),
-                        ssh_target: "lars@loop".into(),
+                        ssh_target: "operator@loop".into(),
                         host: Some("loop-back".into()),
                         version: None,
                         protocol: None,
@@ -1670,7 +1680,7 @@ mod tests {
                         workspaces: Vec::new(),
                         age_secs: Some(1),
                         error: None,
-                        // This is us: an anvil that received our relay and
+                        // This is us: a kiln that received our relay and
                         // echoed us as its own origin. Must be dropped.
                         origin: self_host.clone(),
                         origin_last_ok_secs: Some(1),
@@ -1756,7 +1766,7 @@ mod tests {
             git_workspace("notes", "github.com/gerchowl/notes"),
         ];
         hub.state.workspaces[0].custom_name = Some("flock".into());
-        hub.state.peer_summaries = vec![summary("spoke", "lars@spoke")];
+        hub.state.peer_summaries = vec![summary("spoke", "operator@spoke")];
         let prepared = hub
             .prepare_switch_server(PeerSwitchRequest::ConfigPeer {
                 peer_idx: 0,
@@ -1827,9 +1837,9 @@ mod tests {
 
     fn carried_home() -> crate::peers::FleetSnapshotState {
         crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers: Vec::new(),
-            origin_summary: Some(summary("mba22", crate::protocol::HOME_SWITCH_TARGET)),
+            origin_summary: Some(summary("hopper", crate::protocol::HOME_SWITCH_TARGET)),
             received_at: std::time::Instant::now(),
         }
     }
@@ -1856,17 +1866,17 @@ mod tests {
         // a hub that is not home, or one naming a machine other than the hub.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
-        let mut claim = hub_row("mba22", "mba22", 0);
+        let mut claim = hub_row("hopper", "hopper", 0);
         claim.workspaces = vec![planted_space("planted-by-a-spoke")];
-        let mut forged_self = hub_row("mba22", "mba22", 0);
-        forged_self.workspaces = vec![planted_space("planted-by-anvil")];
+        let mut forged_self = hub_row("hopper", "hopper", 0);
+        forged_self.workspaces = vec![planted_space("planted-by-kiln")];
         bind_relay(&mut spoke);
-        // The bound hub is anvil, not home: its fleet row about mba22 and its
-        // `hub_self` naming mba22 are both claims about someone else.
+        // The bound hub is kiln, not home: its fleet row about hopper and its
+        // `hub_self` naming hopper are both claims about someone else.
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "anvil".into(),
+                hub: "kiln".into(),
                 fleet: vec![claim.clone()],
                 hub_self: Some(Box::new(forged_self)),
             },
@@ -1878,7 +1888,7 @@ mod tests {
             home_workspaces(&spoke)
         );
         assert!(
-            !spoke.state.relayed_fleet_cache.contains_key("mba22"),
+            !spoke.state.relayed_fleet_cache.contains_key("hopper"),
             "a claim to be home is dropped, not stored"
         );
 
@@ -1887,12 +1897,12 @@ mod tests {
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
         bind_relay(&mut spoke);
-        let mut genuine = hub_row("mba22", "mba22", 0);
+        let mut genuine = hub_row("hopper", "hopper", 0);
         genuine.workspaces = vec![planted_space("home-for-real")];
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
+                hub: "hopper".into(),
                 fleet: vec![claim],
                 hub_self: None,
             },
@@ -1905,7 +1915,7 @@ mod tests {
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
+                hub: "hopper".into(),
                 fleet: Vec::new(),
                 hub_self: Some(Box::new(genuine)),
             },
@@ -1925,19 +1935,19 @@ mod tests {
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "anvil".into(),
+                hub: "kiln".into(),
                 fleet: Vec::new(),
-                hub_self: Some(Box::new(hub_row("anvil", "anvil", 0))),
+                hub_self: Some(Box::new(hub_row("kiln", "kiln", 0))),
             },
         );
         spoke.current_api_peer_pid = None;
-        let entry = &spoke.state.relayed_fleet_cache["anvil"];
+        let entry = &spoke.state.relayed_fleet_cache["kiln"];
         assert!(entry.hub_pushed);
         assert!(home_workspaces(&spoke).is_empty());
-        // Display-only: nothing was carried for anvil, so a click dials nothing.
+        // Display-only: nothing was carried for kiln, so a click dials nothing.
         assert!(spoke
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "anvil".into(),
+                host_key: "kiln".into(),
                 ws_idx: None,
             })
             .is_none());
@@ -1945,24 +1955,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_with_control_bytes_is_not_a_second_home() {
-        // #425 review r2: identity is keyed on the raw host, so `mba22\x07`
-        // got past `without_origin_claims` and rendered as a second mba22.
+        // #425 review r2: identity is keyed on the raw host, so `hopper\x07`
+        // got past `without_origin_claims` and rendered as a second hopper.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
         bind_relay(&mut spoke);
-        let mut disguised = hub_row("mba22", "mba22", 0);
-        disguised.host = Some("mba22\u{7}".into());
+        let mut disguised = hub_row("hopper", "hopper", 0);
+        disguised.host = Some("hopper\u{7}".into());
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "anvil".into(),
-                fleet: vec![disguised, hub_row("ksb", "ksb", 0)],
+                hub: "kiln".into(),
+                fleet: vec![disguised, hub_row("node-b", "node-b", 0)],
                 hub_self: None,
             },
         );
         spoke.current_api_peer_pid = None;
         let keys: Vec<&String> = spoke.state.relayed_fleet_cache.keys().collect();
-        assert_eq!(keys, vec!["ksb"], "the disguised row is dropped: {keys:?}");
+        assert_eq!(
+            keys,
+            vec!["node-b"],
+            "the disguised row is dropped: {keys:?}"
+        );
         assert!(home_workspaces(&spoke).is_empty());
     }
 
@@ -1972,12 +1986,12 @@ mod tests {
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
         bind_relay(&mut spoke);
-        let mut row = hub_row("mba22", "mba22", 0);
+        let mut row = hub_row("hopper", "hopper", 0);
         row.workspaces = vec![planted_space("ok\u{1b}]52;c;cGF5bG9hZA==\u{7}name")];
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
+                hub: "hopper".into(),
                 fleet: Vec::new(),
                 hub_self: Some(Box::new(row)),
             },
@@ -1999,16 +2013,16 @@ mod tests {
         // worked on the frozen row silently did nothing. The route comes from
         // the carried row; the push supplies only which space to focus.
         let mut spoke = test_app();
-        let mut carried = summary("anvil", "lars@anvil");
-        carried.proxy_jump = Some("mba22".into());
+        let mut carried = summary("kiln", "operator@kiln");
+        carried.proxy_jump = Some("hopper".into());
         spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers: vec![carried],
             origin_summary: None,
             received_at: std::time::Instant::now(),
         });
-        let mut live = hub_row("anvil", "-oProxyCommand=evil", 0);
-        live.ssh_target = "anvil-elsewhere".into();
+        let mut live = hub_row("kiln", "-oProxyCommand=evil", 0);
+        live.ssh_target = "kiln-elsewhere".into();
         live.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
             id: "ws_42".into(),
             workspace: "opened-after-the-switch".into(),
@@ -2026,34 +2040,34 @@ mod tests {
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
+                hub: "hopper".into(),
                 fleet: vec![live],
                 hub_self: None,
             },
         );
         spoke.current_api_peer_pid = None;
-        assert!(spoke.state.relayed_fleet_cache["anvil"].hub_pushed);
+        assert!(spoke.state.relayed_fleet_cache["kiln"].hub_pushed);
 
         let prepared = spoke
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "anvil".into(),
+                host_key: "kiln".into(),
                 ws_idx: Some(0),
             })
             .expect("the carried route makes the live row clickable");
-        assert_eq!(prepared.ssh_target, "lars@anvil");
-        assert_eq!(prepared.proxy_jump.as_deref(), Some("mba22"));
+        assert_eq!(prepared.ssh_target, "operator@kiln");
+        assert_eq!(prepared.proxy_jump.as_deref(), Some("hopper"));
         assert_eq!(prepared.focus_workspace.as_deref(), Some("ws_42"));
     }
 
     #[tokio::test]
     async fn a_pushed_row_never_borrows_the_route_of_a_merely_similar_host() {
-        // #425 review: `anvil.other` is not `anvil`. The domain-stripped sort
+        // #425 review: `kiln.other` is not `kiln`. The domain-stripped sort
         // key must never decide whose route a click dials.
         let mut spoke = test_app();
-        let mut carried = summary("anvil", "lars@anvil");
-        carried.proxy_jump = Some("mba22".into());
+        let mut carried = summary("kiln", "operator@kiln");
+        carried.proxy_jump = Some("hopper".into());
         spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers: vec![carried],
             origin_summary: None,
             received_at: std::time::Instant::now(),
@@ -2062,15 +2076,15 @@ mod tests {
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
-                fleet: vec![hub_row("anvil.other", "anvil.other", 0)],
+                hub: "hopper".into(),
+                fleet: vec![hub_row("kiln.other", "kiln.other", 0)],
                 hub_self: None,
             },
         );
         spoke.current_api_peer_pid = None;
         assert!(spoke
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
-                host_key: "anvil.other".into(),
+                host_key: "kiln.other".into(),
                 ws_idx: None,
             })
             .is_none());
@@ -2086,18 +2100,18 @@ mod tests {
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
-                hub: "mba22".into(),
+                hub: "hopper".into(),
                 fleet: Vec::new(),
-                hub_self: Some(Box::new(hub_row("mba22", "mba22", 0))),
+                hub_self: Some(Box::new(hub_row("hopper", "hopper", 0))),
             },
         );
         spoke.current_api_peer_pid = None;
-        assert!(spoke.state.relayed_fleet_cache.contains_key("mba22"));
+        assert!(spoke.state.relayed_fleet_cache.contains_key("hopper"));
 
         spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers: Vec::new(),
-            origin_summary: Some(summary("mba22", crate::protocol::HOME_SWITCH_TARGET)),
+            origin_summary: Some(summary("hopper", crate::protocol::HOME_SWITCH_TARGET)),
             received_at: std::time::Instant::now(),
         });
         let rows: Vec<_> = spoke

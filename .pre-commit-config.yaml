@@ -44,7 +44,7 @@ repos:
         language: system
         pass_filenames: true
       # Tests that read the process cwd, the machine's hostname, or a hardcoded
-      # FHS path assert about the developer's laptop rather than about flock —
+      # FHS path assert about the developer's hopper rather than about flock —
       # they pass for whoever wrote them and fail confusingly everywhere else,
       # long after the change that exposed them (#268). Scope is test code only:
       # `tests/` plus `#[cfg(test)]` regions. Per-line `guardrails-ok(hermetic)`

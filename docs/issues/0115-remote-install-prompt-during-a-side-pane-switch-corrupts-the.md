@@ -14,10 +14,10 @@ url: https://github.com/gerchowl/herdr/issues/115
 
 ## Bug (live, dangerous): remote-install prompt during a side-pane switch corrupts/kills the terminal
 
-Switching to a stale/mismatched remote (anvil-dev: PATH herdr is base 0.6.8, not the fork) from the side pane triggers herdr's remote-bootstrap install prompt ("want to install? y/n"). That interactive prompt, in the switch/bridge context, KILLS the terminal tab and leaves it unusable afterward (raw mode / alt-screen not restored -- the #69/#72 restore class, here on the remote-bootstrap path).
+Switching to a stale/mismatched remote (kiln-dev: PATH herdr is base 0.6.8, not the fork) from the side pane triggers herdr's remote-bootstrap install prompt ("want to install? y/n"). That interactive prompt, in the switch/bridge context, KILLS the terminal tab and leaves it unusable afterward (raw mode / alt-screen not restored -- the #69/#72 restore class, here on the remote-bootstrap path).
 
 Two faults:
-1. **A SWITCH should never block on an interactive install prompt.** prepare_remote_herdr / ensure_remote_server_ready prompts when the remote binary mismatches. In the federation side-pane switch path this is hostile: the switch should FAIL GRACEFULLY with the top-right notice (#67 failure path) -- e.g. "anvil-dev: herdr mismatch (base 0.6.8 vs fork). Run `just apply anvil`." -- not prompt, not block, not corrupt.
+1. **A SWITCH should never block on an interactive install prompt.** prepare_remote_herdr / ensure_remote_server_ready prompts when the remote binary mismatches. In the federation side-pane switch path this is hostile: the switch should FAIL GRACEFULLY with the top-right notice (#67 failure path) -- e.g. "kiln-dev: herdr mismatch (base 0.6.8 vs fork). Run `just apply kiln`." -- not prompt, not block, not corrupt.
 2. **Even if it prompts, the terminal MUST be restored on every exit** (the #72 HeldRestoreGuard discipline). The tab being "unusable afterwards" means an exit path skipped restore.
 
 ## Fix

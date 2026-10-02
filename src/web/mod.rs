@@ -9,7 +9,7 @@
 //! `FLOCK_RENDER_ENCODING=terminal-ansi`; flock's server pre-diffs to ANSI and
 //! the client is a stdout passthrough, so xterm.js writes the byte stream
 //! straight to its buffer — no JS painting, no rerender. On an always-on host
-//! (e.g. sage) the client attaches to the persistent `flk server` daemon, so
+//! (e.g. atlas) the client attaches to the persistent `flk server` daemon, so
 //! the phone shares that node's live session AND its fleet gossip view.
 //!
 //! Security boundary (v1): this binds loopback only and is fronted by
@@ -567,7 +567,7 @@ fn origin_allowed(
         return true;
     };
     // Hostnames are case-insensitive (DNS); compare accordingly so e.g.
-    // `https://Sage.tailnet.ts.net` matches Host `sage.tailnet.ts.net`.
+    // `https://Studio.tailnet.ts.net` matches Host `atlas.tailnet.ts.net`.
     let origin_lower = origin.to_ascii_lowercase();
     let origin_authority = origin_lower
         .split_once("://")
@@ -882,8 +882,8 @@ mod tests {
     #[test]
     fn same_origin_is_allowed() {
         assert!(origin_allowed(
-            Some("https://sage.tailnet.ts.net"),
-            Some("sage.tailnet.ts.net"),
+            Some("https://atlas.tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
             &[],
             false
         ));
@@ -892,8 +892,8 @@ mod tests {
     #[test]
     fn same_origin_is_case_insensitive() {
         assert!(origin_allowed(
-            Some("https://Sage.Tailnet.ts.net"),
-            Some("sage.tailnet.ts.net"),
+            Some("https://Studio.Tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
             &[],
             false
         ));
@@ -904,7 +904,7 @@ mod tests {
         // Sandboxed/opaque-origin pages send `Origin: null`; not same-origin.
         assert!(!origin_allowed(
             Some("null"),
-            Some("sage.tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
             &[],
             false
         ));
@@ -914,7 +914,7 @@ mod tests {
     fn cross_origin_is_rejected() {
         assert!(!origin_allowed(
             Some("https://evil.example.com"),
-            Some("sage.tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
             &[],
             false
         ));
@@ -935,7 +935,7 @@ mod tests {
     fn allow_any_bypasses_check() {
         assert!(origin_allowed(
             Some("https://evil.example.com"),
-            Some("sage.tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
             &[],
             true
         ));
@@ -949,13 +949,13 @@ mod tests {
 
     #[test]
     fn identity_allowed_when_listed_case_insensitive() {
-        let allowed = vec!["lars@example.com".to_string()];
-        assert!(identity_allowed(Some("Lars@Example.com"), &allowed));
+        let allowed = vec!["operator@example.com".to_string()];
+        assert!(identity_allowed(Some("Operator@Example.com"), &allowed));
     }
 
     #[test]
     fn identity_rejected_when_not_listed_or_absent() {
-        let allowed = vec!["lars@example.com".to_string()];
+        let allowed = vec!["operator@example.com".to_string()];
         assert!(!identity_allowed(Some("eve@example.com"), &allowed));
         // Absent identity but a list is configured → can't verify → reject.
         assert!(!identity_allowed(None, &allowed));
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn funnel_active_detects_true_value() {
-        let v = serde_json::json!({ "AllowFunnel": { "sage.tailnet.ts.net:443": true } });
+        let v = serde_json::json!({ "AllowFunnel": { "atlas.tailnet.ts.net:443": true } });
         assert!(funnel_active(&v));
     }
 
@@ -1064,7 +1064,7 @@ mod tests {
         config.web.max_sessions = 4;
         config.web.idle_timeout_secs = 45;
         config.web.allowed_origins = vec!["https://phone.example".to_string()];
-        config.web.allowed_users = vec!["lars@example.com".to_string()];
+        config.web.allowed_users = vec!["operator@example.com".to_string()];
 
         let cfg = ok(parse_args_with_config(&[], &config));
 
@@ -1073,7 +1073,7 @@ mod tests {
         assert_eq!(cfg.max_sessions, 4);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(45)));
         assert_eq!(cfg.allowed_origins, vec!["https://phone.example"]);
-        assert_eq!(cfg.allowed_users, vec!["lars@example.com"]);
+        assert_eq!(cfg.allowed_users, vec!["operator@example.com"]);
     }
 
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
             "--bind",
             "127.0.0.1:5555",
             "--session",
-            "laptop",
+            "hopper",
             "--max-sessions",
             "9",
             "--idle-timeout",
@@ -1107,7 +1107,7 @@ mod tests {
         let cfg = ok(parse_args_with_config(&args, &config));
 
         assert_eq!(cfg.bind, "127.0.0.1:5555".parse::<SocketAddr>().unwrap());
-        assert_eq!(cfg.session.as_deref(), Some("laptop"));
+        assert_eq!(cfg.session.as_deref(), Some("hopper"));
         assert_eq!(cfg.max_sessions, 9);
         assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(10)));
         assert_eq!(

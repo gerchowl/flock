@@ -364,9 +364,9 @@ mod tests {
         PeerSummaryState {
             dial: Default::default(),
             stream_error: None,
-            peer: "anvil".into(),
-            ssh_target: "lars@anvil".into(),
-            host: Some("anvil".into()),
+            peer: "kiln".into(),
+            ssh_target: "operator@kiln".into(),
+            host: Some("kiln".into()),
             version: None,
             protocol: None,
             system: None,
@@ -397,10 +397,10 @@ mod tests {
         PeerCheckoutState {
             generation: 1,
             peer: crate::config::PeerConfig {
-                name: "anvil".into(),
+                name: "kiln".into(),
                 ..Default::default()
             },
-            host: "anvil".into(),
+            host: "kiln".into(),
             remote_workspace_id: "ws_3".into(),
             branch: "feature-x".into(),
             source_repo_root: "/repo".into(),
@@ -418,7 +418,7 @@ mod tests {
     async fn begin_peer_checkout_without_local_checkout_notices_and_does_not_spawn() {
         let mut app = test_app();
         app.state.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         app.state.peer_summaries = vec![peer_with_workspace(
@@ -441,7 +441,7 @@ mod tests {
     async fn begin_peer_checkout_without_branch_notices() {
         let mut app = test_app();
         app.state.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         app.state.peer_summaries = vec![peer_with_workspace(Some("github.com/x/proj"), None)];

@@ -15,4 +15,4 @@ url: https://github.com/gerchowl/herdr/pull/101
 
 # fix(sidebar): rows heading remote folds are leaders, not solos
 
-The dompt screenshot bug: solo-form was picked by LOCAL grouping alone, so a lone local checkout with remote children kept its `· mba22:…` suffix while heading them. Law 1 (leader vs solo = does anything indent under it) now counts remote folds. Regression test included. 2176/0 · federation 7/7 · clippy clean.
+The dompt screenshot bug: solo-form was picked by LOCAL grouping alone, so a lone local checkout with remote children kept its `· hopper:…` suffix while heading them. Law 1 (leader vs solo = does anything indent under it) now counts remote folds. Regression test included. 2176/0 · federation 7/7 · clippy clean.

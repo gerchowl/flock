@@ -31,8 +31,8 @@ pub(crate) struct AgentLocation {
     /// told us about this agent. `None` when local.
     ///
     /// Separate from `host` on purpose. `host` is what the machine calls
-    /// itself (`vm-dev`); the route is what THIS server knows it as
-    /// (`anvil`). They routinely differ — a live cross-host send failed with
+    /// itself (`bastion`); the route is what THIS server knows it as
+    /// (`kiln`). They routinely differ — a live cross-host send failed with
     /// "not in this server's [[peers]]" because the relay looked up a peer
     /// named after the reported hostname. Resolution knows which peer the
     /// answer came from, so it should hand that back rather than make the
@@ -289,30 +289,30 @@ mod tests {
         // The whole point of the directory: an identity minted on another
         // machine is findable here, with the host needed to reach it.
         let mut app = test_app();
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "anvil-dev", "agent_anvil-dev_1")];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "kiln-dev", "agent_kiln-dev_1")];
 
         let found = app
-            .locate_agent("agent_anvil-dev_1")
+            .locate_agent("agent_kiln-dev_1")
             .expect("remote agent resolves");
         assert!(!found.local);
-        assert_eq!(found.host, "anvil-dev");
+        assert_eq!(found.host, "kiln-dev");
         assert_eq!(found.pane_id, "w1:p1");
     }
 
     #[test]
     fn a_remote_location_carries_the_route_not_just_the_hostname() {
-        // Found live: a peer configured as `anvil` reports its hostname as
-        // `vm-dev`, so a relay that looked up `[[peers]]` by the REPORTED host
+        // Found live: a peer configured as `kiln` reports its hostname as
+        // `bastion`, so a relay that looked up `[[peers]]` by the REPORTED host
         // found nothing and refused a message it could actually deliver. The
         // directory knows which peer entry answered — it has to hand that back.
         let mut app = test_app();
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
 
-        let found = app.locate_agent("agent_vm-dev_1").expect("resolves");
-        assert_eq!(found.host, "vm-dev", "where the agent is");
+        let found = app.locate_agent("agent_bastion_1").expect("resolves");
+        assert_eq!(found.host, "bastion", "where the agent is");
         assert_eq!(
             found.route.as_deref(),
-            Some("anvil"),
+            Some("kiln"),
             "how THIS server reaches it — the [[peers]] name, not the hostname"
         );
     }
@@ -358,7 +358,7 @@ mod tests {
             .clone();
         let agent_id = app.state.terminals[&terminal_id].agent_id.to_string();
 
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "anvil-dev", &agent_id)];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "kiln-dev", &agent_id)];
 
         let found = app.locate_agent(&agent_id).expect("resolves");
         assert!(
@@ -391,7 +391,7 @@ mod tests {
         // answer, so every field addressing needs has to be on the row.
         let mut app = test_app();
         let local_id = name_local_agent(&mut app, "here");
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
 
         let fleet = app.collect_fleet_agents();
         assert_eq!(fleet.len(), 2, "one local, one remote: {fleet:?}");
@@ -404,15 +404,15 @@ mod tests {
         assert!(local.route.is_none());
 
         let remote = &fleet[1];
-        assert_eq!(remote.agent_id, "agent_vm-dev_1");
+        assert_eq!(remote.agent_id, "agent_bastion_1");
         assert!(
             !remote.local,
             "a peer's agent is not addressable by pane id"
         );
-        assert_eq!(remote.host, "vm-dev", "where it is");
+        assert_eq!(remote.host, "bastion", "where it is");
         assert_eq!(
             remote.route.as_deref(),
-            Some("anvil"),
+            Some("kiln"),
             "how we reach it — the [[peers]] name, which routinely differs"
         );
         assert_eq!(remote.pane_id, "w1:p1", "a routing detail on THAT host");
@@ -426,7 +426,7 @@ mod tests {
         // delivery then routes elsewhere is worse than no listing at all.
         let mut app = test_app();
         let local_id = name_local_agent(&mut app, "here");
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "anvil-dev", &local_id)];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "kiln-dev", &local_id)];
 
         let fleet = app.collect_fleet_agents();
         let rows: Vec<&crate::api::schema::FleetAgentInfo> = fleet

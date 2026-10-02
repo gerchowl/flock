@@ -1070,7 +1070,7 @@ fn server_filter_label(app: &AppState) -> Option<String> {
 /// Display label for a remote row: the member grammar `<host>:<branch>` on a
 /// matched/indented row, or the PROJECT IDENTITY alone on a remote-only group
 /// leader (#78) — leaders NEVER read `<server>:<branch>` (that grammar would
-/// erase the project name, and two repos that both head as `sage:main` are then
+/// erase the project name, and two repos that both head as `atlas:main` are then
 /// indistinguishable). `owner/repo` per #27 when the project key resolves, the
 /// peer's display label when it doesn't, the workspace name as a last resort.
 pub(crate) fn remote_entry_label(
@@ -1123,9 +1123,9 @@ pub(crate) fn remote_entry_label(
 /// suffixes ` · same repo?` when a LOCAL project group exists whose
 /// display identity matches this remote's host + basename but whose
 /// full project key does NOT — i.e. the two projects APPEAR to be the
-/// same repo (same forge, same repo name) but their normalized keys
+/// same repo (same kiln, same repo name) but their normalized keys
 /// diverged (GitHub rename, `insteadOf` misconfig, case-sensitive
-/// self-hosted forge with mixed-case checkout). The chip surfaces the
+/// self-hosted kiln with mixed-case checkout). The chip surfaces the
 /// mismatch honestly instead of the sidebar silently splitting them
 /// into two sections. Returns `Some(local_project_key)` when the chip
 /// should render, `None` otherwise.
@@ -2265,7 +2265,7 @@ fn render_server_rows(frame: &mut Frame, rect: Rect, [title, health]: [Line<'sta
     );
 }
 
-/// The local server's row: `mba22 ✦` (the name field), then — after the
+/// The local server's row: `hopper ✦` (the name field), then — after the
 /// count columns — the battery as a COLORED GLYPH ONLY (the level lives in
 /// the color; the status line keeps the percent) and net throughput (#41 —
 /// peers don't carry those), over the shared flush-left fixed-width metric
@@ -2492,7 +2492,7 @@ fn snapshot_server_rows(
     build
 }
 
-/// One peer's two `servers` lines: `anvil` (the name field), then — after
+/// One peer's two `servers` lines: `kiln` (the name field), then — after
 /// the count columns — ` 34ms`, over the band's flush-left fixed-width
 /// metric line. A down peer renders as the GHOST of the same row.
 fn peer_server_rows(
@@ -2963,7 +2963,7 @@ fn render_workspace_list(
         }
         // A section LEADER (`group_key` is set: the selectable main checkout that
         // heads a multi-member project section) renders the PROJECT IDENTITY, not
-        // `<server>:<branch>` (#78) — two repos that both head as `mba22:main` are
+        // `<server>:<branch>` (#78) — two repos that both head as `hopper:main` are
         // otherwise indistinguishable. A SOLO local row — an unindented project
         // section with no sibling members — carries the combined
         // `project · <server>:<branch>` form (#92), mirroring solo remotes (#81)
@@ -3625,8 +3625,8 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         assert_eq!(servers_section_height(&app), 0);
         app.peer_summaries = vec![
-            peer_with_workspaces("anvil", vec![]),
-            peer_with_workspaces("sage", vec![]),
+            peer_with_workspaces("kiln", vec![]),
+            peer_with_workspaces("atlas", vec![]),
         ];
         // Header + two lines each for the self row and both peers + the
         // trailing divider before the spaces list.
@@ -3641,8 +3641,8 @@ mod tests {
     fn compute_server_section_areas_gives_every_row_but_self_a_two_line_card() {
         let mut app = crate::app::state::AppState::test_new();
         app.peer_summaries = vec![
-            peer_with_workspaces("anvil", vec![]),
-            peer_with_workspaces("sage", vec![]),
+            peer_with_workspaces("kiln", vec![]),
+            peer_with_workspaces("atlas", vec![]),
         ];
         // Tall enough that the half-section cap fits the full band: header +
         // three two-line rows + the trailing divider (8 rows).
@@ -3678,24 +3678,24 @@ mod tests {
     fn server_band_sorts_home_and_self_in_place_with_the_peers() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
+        app.fleet_snapshot = Some(carried_snapshot("hopper", vec!["kiln", "node-b"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
 
-        // #422: home (mba22) and self (lab) are not pinned above the peers —
+        // #422: home (hopper) and self (bastion) are not pinned above the peers —
         // they take their place in the one host order.
         assert_eq!(
-            server_band_slots_as(&app, "lab"),
+            server_band_slots_as(&app, "bastion"),
             vec![
+                None,                          // bastion, self — no switch hit-area
+                Some(PeerSwitchRequest::Home), // hopper
                 Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 0,
                     ws_idx: None
-                }), // anvil
+                }), // kiln
                 Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 1,
                     ws_idx: None
-                }), // ksb
-                None,                          // lab, self — no switch hit-area
-                Some(PeerSwitchRequest::Home), // mba22
+                }), // node-b
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 0,
                     ws_idx: None,
@@ -3716,34 +3716,34 @@ mod tests {
     fn server_band_sorts_peers_fleet_stably() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        // Unsorted across BOTH sources: snapshot arrives [ksb, anvil], config
+        // Unsorted across BOTH sources: snapshot arrives [node-b, kiln], config
         // is written [zeta, beta]. The band must interleave and emit them in
-        // one host-sorted order — anvil, beta, ksb, zeta — regardless of which
+        // one host-sorted order — beta, kiln, node-b, zeta — regardless of which
         // source each came from, so every server shows the same sequence (#51).
-        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["ksb", "anvil"]));
+        app.fleet_snapshot = Some(carried_snapshot("hopper", vec!["node-b", "kiln"]));
         app.peer_summaries = vec![
             peer_with_workspaces("zeta", vec![]),
             peer_with_workspaces("beta", vec![]),
         ];
 
         assert_eq!(
-            server_band_slots_as(&app, "mba22")
+            server_band_slots_as(&app, "hopper")
                 .into_iter()
                 .filter(|slot| !matches!(slot, None | Some(PeerSwitchRequest::Home)))
                 .collect::<Vec<_>>(),
             vec![
-                Some(PeerSwitchRequest::SnapshotPeer {
-                    entry_idx: 1,
-                    ws_idx: None
-                }), // anvil
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 1, // beta
                     ws_idx: None,
                 }),
                 Some(PeerSwitchRequest::SnapshotPeer {
+                    entry_idx: 1,
+                    ws_idx: None
+                }), // kiln
+                Some(PeerSwitchRequest::SnapshotPeer {
                     entry_idx: 0,
                     ws_idx: None
-                }), // ksb
+                }), // node-b
                 Some(PeerSwitchRequest::ConfigPeer {
                     peer_idx: 0, // zeta
                     ws_idx: None,
@@ -3755,16 +3755,16 @@ mod tests {
     #[test]
     fn server_band_sort_keys_on_reported_host_not_config_name() {
         let mut app = crate::app::state::AppState::test_new();
-        // Config calls it "z-anvil" but the box reports host "anvil". Keying on
+        // Config calls it "z-atlas" but the box reports host "atlas". Keying on
         // the config name would sort it last; keying on the reported host (what
         // every other server also sees) sorts it first.
         app.peer_summaries = vec![
-            peer_named_with_host("z-anvil", "anvil"),
+            peer_named_with_host("z-atlas", "atlas"),
             peer_with_workspaces("beta", vec![]), // host=None → its ssh target
         ];
         assert_eq!(
-            band_host_sequence(&app, "lab"),
-            vec!["anvil", "beta", "lab"]
+            band_host_sequence(&app, "bastion"),
+            vec!["atlas", "bastion", "beta"]
         );
     }
 
@@ -3772,13 +3772,13 @@ mod tests {
     fn server_band_dedups_same_host_keeping_config_peer() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        // `anvil` advertised BOTH as a carried snapshot row and a local config
+        // `kiln` advertised BOTH as a carried snapshot row and a local config
         // peer (the multi-hub double-count in #40). It must appear once.
         app.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("anvil-snap", "anvil")],
+            "hopper",
+            &[("kiln-snap", "kiln")],
         ));
-        app.peer_summaries = vec![peer_named_with_host("anvil-cfg", "anvil")];
+        app.peer_summaries = vec![peer_named_with_host("kiln-cfg", "kiln")];
 
         let peer_slots: Vec<PeerSwitchRequest> = server_band_slots(&app)
             .into_iter()
@@ -3810,10 +3810,10 @@ mod tests {
         // host, and the LOCALLY-POLLED config peer must win the tie.
         let mut app = crate::app::state::AppState::test_new();
         app.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("anvil-from-snap", "anvil")],
+            "hopper",
+            &[("kiln-from-snap", "kiln")],
         ));
-        app.peer_summaries = vec![peer_named_with_host("anvil-cfg", "anvil")];
+        app.peer_summaries = vec![peer_named_with_host("kiln-cfg", "kiln")];
 
         // Servers band: one non-Home/non-Self entry, and it MUST be the
         // config peer (rank 0 beats the snapshot rank 2).
@@ -3841,7 +3841,7 @@ mod tests {
             "locally polled config peer must win the dedup: {band_peers:?}"
         );
 
-        // Spaces list source of truth: single row about `anvil`, and it is
+        // Spaces list source of truth: single row about `kiln`, and it is
         // the config peer ref (not the snapshot one). Both surfaces agree.
         let remote_rows: Vec<crate::app::state::RemotePeerRef> = app
             .remote_peers()
@@ -3869,12 +3869,12 @@ mod tests {
         // fleet_snapshot) break on frozen origin freshness. The SMALLER
         // origin_last_ok_secs (fresher origin assertion) wins.
         let mut app = crate::app::state::AppState::test_new();
-        let mut stale = peer_named_with_host("anvil", "anvil");
+        let mut stale = peer_named_with_host("kiln", "kiln");
         stale.origin_last_ok_secs = Some(45);
-        let mut fresh = peer_named_with_host("anvil", "anvil");
+        let mut fresh = peer_named_with_host("kiln", "kiln");
         fresh.origin_last_ok_secs = Some(3);
         let snapshot = crate::peers::FleetSnapshotState {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: vec![stale, fresh],
             origin_summary: None,
             received_at: std::time::Instant::now(),
@@ -3897,8 +3897,8 @@ mod tests {
 
     #[test]
     fn server_band_order_converges_across_viewers() {
-        // #422: one fleet — mba22 (the operator's home), anvil, ksb, sage, and
-        // vm-dev, which nobody has heard from yet — seen from four servers the
+        // #422: one fleet — hopper (the operator's home), kiln, node-b, atlas, and
+        // bastion, which nobody has heard from yet — seen from four servers the
         // client is attached to in turn. Each learned the fleet in a different
         // order, through a different mix of sources (carried snapshot, its own
         // config, a hub's relay), under different local names, and with hosts
@@ -3917,14 +3917,14 @@ mod tests {
                     workspaces: Vec::new(),
                     age_secs: Some(1),
                     error: None,
-                    origin: "mba22".to_string(),
+                    origin: "hopper".to_string(),
                     origin_last_ok_secs: Some(1),
-                    proxy_jump: Some("mba22".to_string()),
+                    proxy_jump: Some("hopper".to_string()),
                     icon: None,
                     dial: None,
                 })
                 .expect("valid row");
-            entry.via = Some("mba22".to_string());
+            entry.via = Some("hopper".to_string());
             entry
         };
         // The pending peer: config name is a local label, the ssh target is
@@ -3932,7 +3932,7 @@ mod tests {
         let pending = |label: &str| {
             let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
                 name: label.into(),
-                ssh: "lars@vm-dev".into(),
+                ssh: "operator@bastion".into(),
                 ..Default::default()
             });
             peer.last_ok = None;
@@ -3942,47 +3942,52 @@ mod tests {
         // Home itself, locally attached: every other machine is its config.
         let mut home = crate::app::state::AppState::test_new();
         home.peer_summaries = vec![
-            peer_named_with_host("zz-sage", "sage"),
-            peer_named_with_host("anvil", "anvil.tail1234.ts.net"),
-            peer_named_with_host("k", "KSB"),
+            peer_named_with_host("zz-atlas", "atlas"),
+            peer_named_with_host("kiln", "kiln.tail1234.ts.net"),
+            peer_named_with_host("k", "NODE-B"),
             pending("devbox"),
         ];
 
-        // sage, a spoke that polls nobody: a carried snapshot plus what the
+        // atlas, a spoke that polls nobody: a carried snapshot plus what the
         // hub pushed down.
-        let mut sage = crate::app::state::AppState::test_new();
-        sage.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("ksb", "ksb"), ("anvil", "anvil")],
+        let mut atlas = crate::app::state::AppState::test_new();
+        atlas.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "hopper",
+            &[("node-b", "node-b"), ("kiln", "kiln")],
         ));
-        sage.relayed_fleet_cache
-            .insert("vm-dev".into(), relayed("vm", None, "vm-dev"));
-
-        // anvil, a second hub: its own config plus a relayed row.
-        let mut anvil = crate::app::state::AppState::test_new();
-        anvil.fleet_snapshot = Some(carried_snapshot_with_hosts("MBA22.local", &[]));
-        anvil.peer_summaries = vec![pending("the-vm"), peer_named_with_host("s", "sage")];
-        anvil
+        atlas
             .relayed_fleet_cache
-            .insert("ksb".into(), relayed("ksb", Some("ksb"), "ksb"));
+            .insert("bastion".into(), relayed("vm", None, "bastion"));
 
-        // ksb: everything came in the carried snapshot, in arrival order.
-        let mut ksb = crate::app::state::AppState::test_new();
-        ksb.fleet_snapshot = Some(carried_snapshot_with_hosts(
-            "mba22",
-            &[("vm", "sage"), ("anvil", "Anvil")],
+        // kiln, a second hub: its own config plus a relayed row.
+        let mut kiln = crate::app::state::AppState::test_new();
+        kiln.fleet_snapshot = Some(carried_snapshot_with_hosts("HOPPER.local", &[]));
+        kiln.peer_summaries = vec![pending("the-vm"), peer_named_with_host("s", "atlas")];
+        kiln.relayed_fleet_cache
+            .insert("node-b".into(), relayed("node-b", Some("node-b"), "node-b"));
+
+        // node-b: everything came in the carried snapshot, in arrival order.
+        let mut spoke = crate::app::state::AppState::test_new();
+        spoke.fleet_snapshot = Some(carried_snapshot_with_hosts(
+            "hopper",
+            &[("vm", "atlas"), ("kiln", "Kiln")],
         ));
-        ksb.fleet_snapshot
+        spoke
+            .fleet_snapshot
             .as_mut()
             .unwrap()
             .peers
             .push(pending("x"));
 
-        let expected = vec!["anvil", "ksb", "mba22", "sage", "vm-dev"];
-        assert_eq!(band_host_sequence(&home, "mba22"), expected, "from home");
-        assert_eq!(band_host_sequence(&sage, "sage"), expected, "from sage");
-        assert_eq!(band_host_sequence(&anvil, "anvil"), expected, "from anvil");
-        assert_eq!(band_host_sequence(&ksb, "ksb"), expected, "from ksb");
+        let expected = vec!["atlas", "bastion", "hopper", "kiln", "node-b"];
+        assert_eq!(band_host_sequence(&home, "hopper"), expected, "from home");
+        assert_eq!(band_host_sequence(&atlas, "atlas"), expected, "from atlas");
+        assert_eq!(band_host_sequence(&kiln, "kiln"), expected, "from kiln");
+        assert_eq!(
+            band_host_sequence(&spoke, "node-b"),
+            expected,
+            "from node-b"
+        );
     }
 
     #[test]
@@ -3993,7 +3998,7 @@ mod tests {
         assert_eq!(servers_section_height(&app), 0);
 
         // Config peers alone: self sorts among them like any other server.
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
         let slots = server_band_slots_as(&app, "zeta");
         assert_eq!(
             slots,
@@ -4012,7 +4017,7 @@ mod tests {
     fn snapshot_only_spoke_shows_band_with_home_row() {
         let mut app = crate::app::state::AppState::test_new();
         // The typical spoke: zero config peers, but a carried snapshot.
-        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil"]));
+        app.fleet_snapshot = Some(carried_snapshot("hopper", vec!["kiln"]));
         // Header + home + self + one snapshot row + the trailing divider.
         assert_eq!(servers_section_height(&app), 1 + 3 * SERVER_ROW_LINES + 1);
     }
@@ -4021,7 +4026,7 @@ mod tests {
     fn servers_current_scope_keeps_home_row_when_snapshot_present() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        app.fleet_snapshot = Some(carried_snapshot("mba22", vec!["anvil", "ksb"]));
+        app.fleet_snapshot = Some(carried_snapshot("hopper", vec!["kiln", "node-b"]));
         app.peer_summaries = vec![peer_with_workspaces("ownpeer", vec![])];
         app.set_servers_panel_scope(PanelScope::Current);
 
@@ -4063,7 +4068,7 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
 
         let area = Rect::new(0, 0, 30, 40);
         let mut terminal =
@@ -4189,7 +4194,7 @@ mod tests {
     #[test]
     fn home_server_rows_mark_origin_and_snapshot_age() {
         let app = crate::app::state::AppState::test_new();
-        let snapshot = carried_snapshot("mba22", vec![]);
+        let snapshot = carried_snapshot("hopper", vec![]);
         let row = home_server_rows(
             &snapshot,
             &app.palette,
@@ -4202,7 +4207,7 @@ mod tests {
         // Ornaments kicked: the home row is just the origin name — its
         // pinned slot-0 position is the label.
         // Behind the (blank) #164 icon slot; the origin name is the label.
-        assert!(name.contains("mba22"), "{name}");
+        assert!(name.contains("hopper"), "{name}");
         assert!(!name.contains('←') && !name.contains("home"), "{name}");
         // No counts on the home row; the age line is flush left.
         assert!(row.tally.is_none());
@@ -4216,7 +4221,7 @@ mod tests {
         // must not cut them the way it cuts peers.
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        app.fleet_snapshot = Some(carried_snapshot("zz-home", vec!["anvil", "beta", "ksb"]));
+        app.fleet_snapshot = Some(carried_snapshot("zz-home", vec!["kiln", "beta", "node-b"]));
         // Room for three rows under the header: 1 + 3 * 2 lines.
         let rows_area = Rect::new(0, 0, 30, 1 + 3 * SERVER_ROW_LINES);
         let fitted = fitted_band_slots(&app, rows_area);
@@ -4237,8 +4242,8 @@ mod tests {
         // `[gossip] stale_after` it stops presenting itself as current.
         let app = crate::app::state::AppState::test_new();
         let now = std::time::Instant::now();
-        let mut snapshot = carried_snapshot("mba22", vec![]);
-        let mut origin = peer_named_with_host("mba22", "mba22");
+        let mut snapshot = carried_snapshot("hopper", vec![]);
+        let mut origin = peer_named_with_host("hopper", "hopper");
         origin.origin_last_ok_secs = Some(5);
         origin.ingested_at = Some(now);
         snapshot.origin_summary = Some(origin);
@@ -4273,7 +4278,7 @@ mod tests {
     #[test]
     fn snapshot_server_rows_show_staleness_age() {
         let app = crate::app::state::AppState::test_new();
-        let mut peer = peer_with_workspaces("anvil", vec![]);
+        let mut peer = peer_with_workspaces("kiln", vec![]);
         peer.last_ok = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
         let row = snapshot_server_rows(&peer, &app.palette, crate::config::ServerLabelConfig::Both);
         // The staleness chip rides the title's trailing metrics, not the
@@ -4468,20 +4473,20 @@ mod tests {
 
     #[test]
     fn peer_server_rows_show_configured_name_over_reported_host() {
-        // The peer is configured `[[peers]] name = "anvil"` but reports a raw
+        // The peer is configured `[[peers]] name = "kiln"` but reports a raw
         // OS hostname; the row must show the configured name (#42).
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("anvil", vec![]);
-        peer.host = Some("mac-studio-12345.local".into());
+        let mut peer = peer_with_workspaces("kiln", vec![]);
+        peer.host = Some("mac-atlas-12345.local".into());
         peer.latency_ms = Some(10);
 
         let name =
             spans_text(&peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).name);
         // The leading 2-cell icon slot (#164) is blank (no icon set) → the host
         // follows two spaces.
-        assert_eq!(name, "  anvil");
+        assert_eq!(name, "  kiln");
         assert!(
-            !name.contains("mac-studio"),
+            !name.contains("mac-atlas"),
             "reported host must not win: {name}"
         );
     }
@@ -4491,11 +4496,11 @@ mod tests {
         // #164: a known icon → glyph + space; None or an unknown/garbage name →
         // two spaces. Always 2 display cells so hostnames stay column-aligned.
         let style = Style::default();
-        let known = server_icon_span(Some("laptop"), style);
+        let known = server_icon_span(Some("toad"), style);
         assert_eq!(known.content.chars().count(), 2, "glyph + trailing space");
         assert_eq!(
             known.content.chars().next(),
-            crate::server_icons::glyph("laptop").and_then(|g| g.chars().next())
+            crate::server_icons::glyph("toad").and_then(|g| g.chars().next())
         );
         assert_eq!(server_icon_span(None, style).content.as_ref(), "  ");
         assert_eq!(
@@ -4517,33 +4522,33 @@ mod tests {
         use crate::config::ServerLabelConfig;
         let style = Style::default();
         let text = |spans: &[Span<'_>]| spans_text(spans);
-        let glyph = crate::server_icons::glyph("laptop").unwrap();
+        let glyph = crate::server_icons::glyph("toad").unwrap();
 
         // `name` = bare hostname, no icon.
         assert_eq!(
             text(&server_name_spans(
-                Some("laptop"),
-                "mba22",
+                Some("toad"),
+                "hopper",
                 ServerLabelConfig::Name,
                 style
             )),
-            "mba22"
+            "hopper"
         );
         // `both` = the 2-cell icon slot + hostname.
         assert_eq!(
             text(&server_name_spans(
-                Some("laptop"),
-                "mba22",
+                Some("toad"),
+                "hopper",
                 ServerLabelConfig::Both,
                 style
             )),
-            format!("{glyph} mba22")
+            format!("{glyph} hopper")
         );
         // `icon` = glyph alone...
         assert_eq!(
             text(&server_name_spans(
-                Some("laptop"),
-                "mba22",
+                Some("toad"),
+                "hopper",
                 ServerLabelConfig::Icon,
                 style
             )),
@@ -4553,37 +4558,37 @@ mod tests {
         assert_eq!(
             text(&server_name_spans(
                 None,
-                "ksb",
+                "node-b",
                 ServerLabelConfig::Icon,
                 style
             )),
-            "ksb"
+            "node-b"
         );
         assert_eq!(
             text(&server_name_spans(
                 Some("bogus"),
-                "ksb",
+                "node-b",
                 ServerLabelConfig::Icon,
                 style
             )),
-            "ksb"
+            "node-b"
         );
     }
 
     #[test]
     fn peer_server_rows_render_the_gossiped_icon_glyph() {
-        // #164: a peer that gossiped `icon = "anvil"` renders the mapped glyph
+        // #164: a peer that gossiped `icon = "toad"` renders the mapped glyph
         // ahead of its name; both viewers resolve the SAME glyph from the name.
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("anvil", vec![]);
-        peer.host = Some("anvil".into());
+        let mut peer = peer_with_workspaces("kiln", vec![]);
+        peer.host = Some("kiln".into());
         peer.latency_ms = Some(10);
-        peer.icon = Some("anvil".into());
+        peer.icon = Some("toad".into());
 
         let name =
             spans_text(&peer_server_rows(&peer, &p, crate::config::ServerLabelConfig::Both).name);
-        let glyph = crate::server_icons::glyph("anvil").unwrap();
-        assert_eq!(name, format!("{glyph} anvil"));
+        let glyph = crate::server_icons::glyph("toad").unwrap();
+        assert_eq!(name, format!("{glyph} kiln"));
     }
 
     #[test]
@@ -4597,7 +4602,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         let mut peer = peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -4605,7 +4610,7 @@ mod tests {
                 Some("fix/pty"),
             )],
         );
-        peer.icon = Some("anvil".into());
+        peer.icon = Some("toad".into());
         app.peer_summaries = vec![peer];
         app.ensure_test_terminals();
         app.active = Some(0);
@@ -4613,12 +4618,12 @@ mod tests {
 
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        let glyph = crate::server_icons::glyph("toad").unwrap();
         let has_badge = (0..area.height).any(|y| {
             let row: String = (0..area.width)
                 .map(|x| buffer[(x, y)].symbol().to_string())
                 .collect();
-            row.contains(glyph) && row.contains("anvil")
+            row.contains(glyph) && row.contains("kiln")
         });
         assert!(
             has_badge,
@@ -4640,7 +4645,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         let mut peer = peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -4648,7 +4653,7 @@ mod tests {
                 Some("fix/pty"),
             )],
         );
-        peer.icon = Some("anvil".into());
+        peer.icon = Some("toad".into());
         app.peer_summaries = vec![peer];
         app.ensure_test_terminals();
         app.active = Some(0);
@@ -4656,7 +4661,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 40, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
-        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        let glyph = crate::server_icons::glyph("toad").unwrap();
         // The remote member is the row carrying its branch.
         let remote_row = (0..area.height)
             .map(|y| {
@@ -4677,7 +4682,7 @@ mod tests {
     fn peer_server_rows_split_identity_and_glyph_health() {
         let p = crate::app::state::AppState::test_new().palette;
         let mut peer = peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -4685,7 +4690,7 @@ mod tests {
                 Some("fix/pty"),
             )],
         );
-        peer.host = Some("anvil".into());
+        peer.host = Some("kiln".into());
         peer.latency_ms = Some(34);
         peer.system = Some(crate::api::schema::PeerSystemSummary {
             cpu_percent: Some(71),
@@ -4701,7 +4706,7 @@ mod tests {
         let health = line_text(&row.health);
         // Name first (behind the blank #164 icon slot); the latency rides the
         // trailing metrics after the count columns.
-        assert_eq!(name, "  anvil");
+        assert_eq!(name, "  kiln");
         assert!(rest.contains("34ms"), "{rest}");
         // The second line speaks the band's fixed-width glyph language
         // (cpu right-aligned width-3, no `·` separators, flush left); the
@@ -4711,14 +4716,14 @@ mod tests {
         assert!(!health.contains('\u{b7}'), "{health}");
         assert!(!health.contains('\u{2776}'), "{health}");
         assert_eq!(row.tally, Some(tally_states([StateClass::Working])));
-        assert!(!health.contains("anvil"), "{health}");
+        assert!(!health.contains("toad"), "{health}");
     }
 
     #[test]
     fn peer_server_rows_badges_protocol_skew() {
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("anvil", vec![]);
-        peer.host = Some("anvil".into());
+        let mut peer = peer_with_workspaces("kiln", vec![]);
+        peer.host = Some("kiln".into());
         peer.latency_ms = Some(10);
 
         // A reachable peer on a DIFFERENT wire protocol gets the alert badge
@@ -4759,8 +4764,8 @@ mod tests {
     fn peer_server_rows_keep_metric_columns_stable_at_full_utilization() {
         const G: u64 = 1024 * 1024 * 1024;
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("anvil", vec![]);
-        peer.host = Some("anvil".into());
+        let mut peer = peer_with_workspaces("kiln", vec![]);
+        peer.host = Some("kiln".into());
         peer.system = Some(crate::api::schema::PeerSystemSummary {
             cpu_percent: Some(100),
             mem_used: Some(92 * G),
@@ -4795,8 +4800,8 @@ mod tests {
         p: &crate::app::state::Palette,
     ) -> Line<'static> {
         const G: u64 = 1024 * 1024 * 1024;
-        let mut peer = peer_with_workspaces("anvil", vec![]);
-        peer.host = Some("anvil".into());
+        let mut peer = peer_with_workspaces("kiln", vec![]);
+        peer.host = Some("kiln".into());
         peer.system = Some(crate::api::schema::PeerSystemSummary {
             cpu_percent,
             mem_used: Some(13 * G),
@@ -4994,7 +4999,7 @@ mod tests {
         use crate::api::schema::{ThermalComponent, ThermalReport};
         const G: u64 = 1024 * 1024 * 1024;
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("ksb", vec![]);
+        let mut peer = peer_with_workspaces("node-b", vec![]);
         peer.last_ok = None;
         peer.error = Some("connect timed out".into());
         peer.system = Some(crate::api::schema::PeerSystemSummary {
@@ -5026,7 +5031,7 @@ mod tests {
     fn peer_server_rows_ghost_unreachable_peers() {
         use ratatui::style::Modifier;
         let p = crate::app::state::AppState::test_new().palette;
-        let mut peer = peer_with_workspaces("ksb", vec![]);
+        let mut peer = peer_with_workspaces("node-b", vec![]);
         peer.last_ok = None;
         peer.error = Some("connect timed out".into());
         peer.system = Some(crate::api::schema::PeerSystemSummary {
@@ -5045,7 +5050,7 @@ mod tests {
         let name_text = spans_text(&row.name);
         let rest_text = spans_text(&row.title_rest);
         // Behind the (blank) icon slot; the whole row incl. the slot dims.
-        assert!(name_text.contains("ksb"), "{name_text:?}");
+        assert!(name_text.contains("node-b"), "{name_text:?}");
         assert!(
             rest_text.contains('\u{f033a}'),
             "broken-link icon: {rest_text:?}"
@@ -5066,7 +5071,7 @@ mod tests {
         let name = row
             .name
             .iter()
-            .find(|span| span.content.contains("ksb"))
+            .find(|span| span.content.contains("node-b"))
             .expect("name span");
         assert!(name.style.add_modifier.contains(Modifier::CROSSED_OUT));
         let health_text = line_text(&row.health);
@@ -5115,7 +5120,7 @@ mod tests {
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5125,7 +5130,7 @@ mod tests {
         )];
 
         let entries = workspace_list_entries(&app);
-        // #153: local `flock` (1 checkout) + the matching `anvil` remote makes
+        // #153: local `flock` (1 checkout) + the matching `kiln` remote makes
         // two members sharing the project, so it AGGREGATES under a synthetic
         // header — the local node is an equal indented member, not a privileged
         // unindented leader. Local `other` has no remote, so it stays solo.
@@ -5160,7 +5165,7 @@ mod tests {
                 0,
                 true
             ),
-            "anvil:fix/pty"
+            "kiln:fix/pty"
         );
     }
 
@@ -5178,7 +5183,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5187,7 +5192,7 @@ mod tests {
             )],
         )];
         app.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "anvil".into(),
+            ssh_target: "kiln".into(),
         });
 
         let entries = workspace_list_entries(&app);
@@ -5216,7 +5221,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         let fresh = peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5236,7 +5241,7 @@ mod tests {
 
         // The peer goes stale: the section is a lone local checkout again.
         let mut stale = peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5330,7 +5335,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "other",
                 Some("github.com/gerchowl/other"),
@@ -5374,7 +5379,7 @@ mod tests {
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5424,7 +5429,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![
                 remote_summary(
                     "dotfiles",
@@ -5436,7 +5441,7 @@ mod tests {
                     "dotfiles-wt",
                     Some("github.com/gerchowl/dotfiles"),
                     Some("dotfiles"),
-                    Some("vm-dev"),
+                    Some("bastion"),
                 ),
             ],
         )];
@@ -5476,7 +5481,7 @@ mod tests {
         );
         assert_eq!(
             remote_entry_label(&app, &config_peer, 1, true),
-            "sage:vm-dev"
+            "atlas:bastion"
         );
     }
 
@@ -5487,7 +5492,7 @@ mod tests {
     /// `dotfiles` vs `g-fleet` — actually here basenames DIFFER, so
     /// chip is silent). Trigger when basenames MATCH: local
     /// `gerchowl/Flock` vs remote `gerchowl-forks/flock` on the SAME
-    /// forge — same basename, different owner path.
+    /// kiln — same basename, different owner path.
     #[test]
     fn same_repo_chip_fires_when_host_and_basename_match_but_keys_diverge() {
         let mut app = crate::app::state::AppState::test_new();
@@ -5499,7 +5504,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![remote_summary(
                 "flock",
                 // Same host + basename but different owner → keys
@@ -5521,7 +5526,7 @@ mod tests {
         // MATCHES the local's — they fold together and there's nothing
         // to explain.
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5549,9 +5554,9 @@ mod tests {
         );
 
         // Sanity: different basename → chip silent (the remote is just
-        // a different repo that happens to live on the same forge).
+        // a different repo that happens to live on the same kiln).
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![remote_summary(
                 "dotfiles",
                 Some("github.com/gerchowl/dotfiles"),
@@ -5574,7 +5579,7 @@ mod tests {
     fn solo_remote_project_keeps_project_and_member_grammar() {
         let mut app = crate::app::state::AppState::test_new();
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![remote_summary(
                 "dotfiles",
                 Some("github.com/gerchowl/dotfiles"),
@@ -5585,7 +5590,7 @@ mod tests {
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
             remote_entry_label(&app, &config_peer, 0, false),
-            "gerchowl/dotfiles · sage:main"
+            "gerchowl/dotfiles · atlas:main"
         );
     }
 
@@ -5618,7 +5623,7 @@ mod tests {
         child.worktree_space = Some(space(true));
         app.workspaces = vec![parent, child];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5662,9 +5667,9 @@ mod tests {
         // The spoke case: zero config peers, a carried snapshot whose peer
         // has a row matching the local project plus a remote-only project.
         app.fleet_snapshot = Some(snapshot_with_peers(
-            "mba22",
+            "hopper",
             vec![peer_with_workspaces(
-                "anvil",
+                "kiln",
                 vec![
                     remote_summary(
                         "flock",
@@ -5711,7 +5716,7 @@ mod tests {
         // Snapshot rows label like config-peer rows: carried host + branch.
         assert_eq!(
             remote_entry_label(&app, &RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
-            "anvil:fix/pty"
+            "kiln:fix/pty"
         );
 
         // No snapshot, no config peers: nothing remote folds in.
@@ -5729,10 +5734,10 @@ mod tests {
             "flock",
             "github.com/gerchowl/flock",
         )];
-        // The spoke standing on sage: the hub (mba22) carries its OWN
+        // The spoke standing on atlas: the hub (hopper) carries its OWN
         // workspaces as the origin summary (#66) — home-targeted, not ssh.
         let mut origin = peer_with_workspaces(
-            "mba22",
+            "hopper",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5740,9 +5745,9 @@ mod tests {
                 Some("keyboard-shorcuts"),
             )],
         );
-        origin.host = Some("mba22".into());
+        origin.host = Some("hopper".into());
         origin.ssh_target = crate::protocol::HOME_SWITCH_TARGET.into();
-        let mut snapshot = snapshot_with_peers("mba22", vec![]);
+        let mut snapshot = snapshot_with_peers("hopper", vec![]);
         snapshot.origin_summary = Some(origin);
         app.fleet_snapshot = Some(snapshot);
 
@@ -5767,10 +5772,10 @@ mod tests {
                 },
             ]
         );
-        // Labels by the origin host (#62 grammar): `mba22:<branch>`.
+        // Labels by the origin host (#62 grammar): `hopper:<branch>`.
         assert_eq!(
             remote_entry_label(&app, &RemotePeerRef::Origin, 0, true),
-            "mba22:keyboard-shorcuts"
+            "hopper:keyboard-shorcuts"
         );
         // Clicking it emits a home-bound switch with the workspace focus.
         assert_eq!(
@@ -5791,16 +5796,16 @@ mod tests {
                 Some("fix/pty"),
             )
         };
-        // Defensive hub-meets-snapshot case: "anvil" is both a live-polled
+        // Defensive hub-meets-snapshot case: "kiln" is both a live-polled
         // config peer and a carried snapshot entry (same ssh target). The
-        // polled entry wins; the snapshot-only "sage" still folds in after.
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![flock_row()])];
+        // polled entry wins; the snapshot-only "atlas" still folds in after.
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![flock_row()])];
         app.fleet_snapshot = Some(snapshot_with_peers(
-            "mba22",
+            "hopper",
             vec![
-                peer_with_workspaces("anvil", vec![flock_row()]),
+                peer_with_workspaces("kiln", vec![flock_row()]),
                 peer_with_workspaces(
-                    "sage",
+                    "atlas",
                     vec![remote_summary(
                         "dotfiles",
                         Some("github.com/gerchowl/dotfiles"),
@@ -5819,8 +5824,8 @@ mod tests {
             })
             .collect();
         // #102 merged stream: `gerchowl/dotfiles` sorts before
-        // `gerchowl/flock`, so sage's dotfiles row lands FIRST — but the
-        // dedup contract still holds: the duplicated anvil renders once,
+        // `gerchowl/flock`, so atlas's dotfiles row lands FIRST — but the
+        // dedup contract still holds: the duplicated kiln renders once,
         // from the polled config entry.
         assert_eq!(
             remote_peers,
@@ -5828,7 +5833,7 @@ mod tests {
                 RemotePeerRef::Snapshot { entry_idx: 1 },
                 RemotePeerRef::Config { peer_idx: 0 },
             ],
-            "the duplicated anvil renders once, from the polled config entry"
+            "the duplicated kiln renders once, from the polled config entry"
         );
     }
 
@@ -5840,7 +5845,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5849,9 +5854,9 @@ mod tests {
             )],
         )];
         app.fleet_snapshot = Some(snapshot_with_peers(
-            "mba22",
+            "hopper",
             vec![peer_with_workspaces(
-                "sage",
+                "atlas",
                 vec![remote_summary(
                     "dotfiles",
                     Some("github.com/gerchowl/dotfiles"),
@@ -5886,7 +5891,7 @@ mod tests {
             "github.com/gerchowl/flock",
         )];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5896,9 +5901,9 @@ mod tests {
         )];
         // Interleaved projects (a, b, a) regroup under their leaders.
         app.fleet_snapshot = Some(snapshot_with_peers(
-            "mba22",
+            "hopper",
             vec![peer_with_workspaces(
-                "sage",
+                "atlas",
                 vec![
                     remote_summary(
                         "dotfiles",
@@ -5916,36 +5921,36 @@ mod tests {
                         "dotfiles-wt",
                         Some("github.com/gerchowl/dotfiles"),
                         Some("dotfiles"),
-                        Some("vm-dev"),
+                        Some("bastion"),
                     ),
                 ],
             )],
         ));
 
         app.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "sage".into(),
+            ssh_target: "atlas".into(),
         });
-        let sage = RemotePeerRef::Snapshot { entry_idx: 0 };
+        let atlas = RemotePeerRef::Snapshot { entry_idx: 0 };
         assert_eq!(
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Remote {
-                    peer: sage.clone(),
+                    peer: atlas.clone(),
                     ws_idx: 0,
                     indented: false
                 },
                 WorkspaceListEntry::Remote {
-                    peer: sage.clone(),
+                    peer: atlas.clone(),
                     ws_idx: 2,
                     indented: true
                 },
                 WorkspaceListEntry::Remote {
-                    peer: sage,
+                    peer: atlas,
                     ws_idx: 1,
                     indented: false
                 },
             ],
-            "only sage's rows, projects regrouped with unindented leaders"
+            "only atlas's rows, projects regrouped with unindented leaders"
         );
 
         // A filter whose server no longer resolves narrows to nothing
@@ -5964,7 +5969,7 @@ mod tests {
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary(
                 "flock",
                 Some("github.com/gerchowl/flock"),
@@ -5977,7 +5982,7 @@ mod tests {
         // Peer filter: one remote entry — scroll clamps to it, and the hit
         // areas (same single source) carry only that remote card.
         app.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "anvil".into(),
+            ssh_target: "kiln".into(),
         });
         assert_eq!(workspace_list_entries(&app).len(), 1);
         assert_eq!(normalized_workspace_scroll(&app, area, 99), 0);
@@ -6000,7 +6005,7 @@ mod tests {
     fn server_band_slot_at_resolves_self_and_peer_rows() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
         let area = Rect::new(0, 0, 30, 40);
 
         let (header, cards) = compute_server_section_areas(&app, area);
@@ -6029,9 +6034,9 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
         app.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "anvil".into(),
+            ssh_target: "kiln".into(),
         });
 
         let area = Rect::new(0, 0, 30, 40);
@@ -6050,7 +6055,7 @@ mod tests {
             .map(|x| buffer[(x, list_area.y)].symbol().to_string())
             .collect();
         assert!(
-            header_text.starts_with(" spaces · only anvil"),
+            header_text.starts_with(" spaces · only kiln"),
             "{header_text:?}"
         );
     }
@@ -6181,7 +6186,7 @@ mod tests {
             "github.com/peer-fed-test/shared",
         )];
         let mut origin = peer_with_workspaces(
-            "mba22",
+            "hopper",
             vec![remote_summary(
                 "alpha",
                 Some("github.com/peer-fed-test/alpha"),
@@ -6189,13 +6194,13 @@ mod tests {
                 Some("main"),
             )],
         );
-        origin.host = Some("mba22".into());
+        origin.host = Some("hopper".into());
         origin.ssh_target = crate::protocol::HOME_SWITCH_TARGET.into();
-        let mut snapshot = snapshot_with_peers("mba22", vec![]);
+        let mut snapshot = snapshot_with_peers("hopper", vec![]);
         snapshot.origin_summary = Some(origin);
         app.fleet_snapshot = Some(snapshot);
         app.mode = Mode::Navigate;
-        // A width tight enough to truncate the `· mba22:main` tail right at the
+        // A width tight enough to truncate the `· hopper:main` tail right at the
         // separator must not panic.
         for width in 20..30 {
             let _ = render_sidebar_to_buffer(&mut app, Rect::new(0, 0, width, 45));
@@ -6295,7 +6300,7 @@ mod tests {
         blocked.status = AgentStatus::Blocked;
         let mut working = remote_summary("b", None, None, None);
         working.status = AgentStatus::Working;
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![blocked, working])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![blocked, working])];
 
         let area = Rect::new(0, 0, 30, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
@@ -6324,7 +6329,7 @@ mod tests {
         // columns sit at the same x on every row.
         let host = crate::app::short_host_name();
         // +2: every row's name leads with the fixed 2-cell #164 icon slot.
-        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
+        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("kiln".len());
         let counts_x = |rect: Rect| rect.x + name_width as u16 + 1;
         for rect in [self_rect, peer_rect] {
             let x = counts_x(rect);
@@ -6354,7 +6359,7 @@ mod tests {
         assert!(
             buffer_row_text(&buffer, peer_rect, peer_rect.y)
                 .trim_start()
-                .starts_with("anvil"),
+                .starts_with("kiln"),
             "{:?}",
             buffer_row_text(&buffer, peer_rect, peer_rect.y)
         );
@@ -6373,7 +6378,7 @@ mod tests {
         // Two peers with very different name widths: the count columns must
         // land at the same x on both rows (padded to the band-wide max).
         app.peer_summaries = vec![
-            peer_with_workspaces("anvil-dev", vec![]),
+            peer_with_workspaces("kiln-dev", vec![]),
             peer_with_workspaces("k", vec![]),
         ];
 
@@ -6409,7 +6414,7 @@ mod tests {
         // Behind the blank 2-cell #164 icon slot on every row.
         assert!(buffer_row_text(&buffer, long_rect, long_rect.y)
             .trim_start()
-            .starts_with("anvil-dev"));
+            .starts_with("kiln-dev"));
         assert!(buffer_row_text(&buffer, short_rect, short_rect.y)
             .trim_start()
             .starts_with("k "));
@@ -6430,7 +6435,7 @@ mod tests {
         let short_x = first_digit_x(short_rect);
         assert_eq!(long_x, short_x, "count columns align across name widths");
         assert!(
-            long_x > long_rect.x + "anvil-dev".len() as u16,
+            long_x > long_rect.x + "kiln-dev".len() as u16,
             "counts start after the longest name"
         );
     }
@@ -6451,7 +6456,7 @@ mod tests {
                 ws
             })
             .collect();
-        app.peer_summaries = vec![peer_with_workspaces("anvil", workspaces)];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", workspaces)];
 
         let area = Rect::new(0, 0, 30, 40);
         let buffer = render_sidebar_to_buffer(&mut app, area);
@@ -6477,7 +6482,7 @@ mod tests {
         // Counts sit after the padded name field on every row.
         let host = crate::app::short_host_name();
         // +2: the fixed 2-cell #164 icon slot leads every name field.
-        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("anvil".len());
+        let name_width = 2 + spans_display_width(&[Span::raw(host.clone())]).max("kiln".len());
         // Peer: ` 0 10  0` — the working column hits two digits.
         let peer_title: String = buffer_row_text(&buffer, peer_rect, peer_rect.y)
             .chars()
@@ -6505,7 +6510,7 @@ mod tests {
         app.ensure_test_terminals();
         app.active = Some(0);
         app.mode = crate::app::Mode::Terminal;
-        app.peer_summaries = vec![peer_with_workspaces("anvil", vec![])];
+        app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
         app.server_state_mark = crate::config::ServerStateMarkConfig::MedallionQuadrant;
 
         let area = Rect::new(0, 0, 30, 40);
@@ -6654,7 +6659,7 @@ mod tests {
 
     /// #78: the section LEADER renders the PROJECT IDENTITY (`owner/repo` when the
     /// project key resolves), NEVER `<server>:<branch>` — two repos that both head
-    /// as `mba22:main` are otherwise indistinguishable. Members keep the member
+    /// as `hopper:main` are otherwise indistinguishable. Members keep the member
     /// grammar.
     #[test]
     fn leader_renders_owner_repo_identity_never_server_branch() {
@@ -6705,7 +6710,7 @@ mod tests {
         app.mode = crate::app::Mode::Terminal;
         let mut remote = remote_summary("main", None, None, None);
         remote.project_key = Some("github.com/nerd-machines/dompt".into());
-        app.peer_summaries = vec![peer_with_workspaces("sage", vec![remote])];
+        app.peer_summaries = vec![peer_with_workspaces("atlas", vec![remote])];
 
         // Entry shape: header, local member (indented), remote member (indented).
         assert_eq!(
@@ -7716,7 +7721,7 @@ mod tests {
             app.server_filter = None;
             app.server_label = mode;
             let mut peer =
-                peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
+                peer_with_workspaces("kiln", vec![remote_summary("aaa", None, None, None)]);
             peer.icon = Some("toad".into());
             app.peer_summaries = vec![peer];
             let (_, first_row) = agents_band_rows(&app);
@@ -7725,19 +7730,19 @@ mod tests {
 
         // `name`: the pre-icon look, unchanged.
         let named = row_for(ServerLabelConfig::Name);
-        assert!(named.contains("anvil"), "name mode row: {named:?}");
+        assert!(named.contains("kiln"), "name mode row: {named:?}");
         assert!(!named.contains(glyph), "name mode row: {named:?}");
         // `both`: the glyph leads the hostname, space-joined like the rest of
         // the location.
         let both = row_for(ServerLabelConfig::Both);
         assert!(
-            both.contains(&format!("{glyph} anvil")),
+            both.contains(&format!("{glyph} kiln")),
             "both mode row: {both:?}"
         );
         // `icon`: the symbol stands in for the host entirely.
         let icon = row_for(ServerLabelConfig::Icon);
         assert!(icon.contains(glyph), "icon mode row: {icon:?}");
-        assert!(!icon.contains("anvil"), "icon mode row: {icon:?}");
+        assert!(!icon.contains("toad"), "icon mode row: {icon:?}");
     }
 
     #[test]
@@ -7761,12 +7766,12 @@ mod tests {
         app.server_filter = None;
         app.server_label = ServerLabelConfig::Icon;
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![remote_summary("aaa", None, None, None)],
         )];
 
         let (_, first_row) = agents_band_rows(&app);
-        assert!(first_row.contains("anvil"), "row: {first_row:?}");
+        assert!(first_row.contains("kiln"), "row: {first_row:?}");
     }
 
     #[test]
@@ -7797,8 +7802,8 @@ mod tests {
             app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
             app.server_filter = None;
 
-            let aaa = peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]);
-            let zzz = peer_with_workspaces("sage", vec![remote_summary("zzz", None, None, None)]);
+            let aaa = peer_with_workspaces("kiln", vec![remote_summary("aaa", None, None, None)]);
+            let zzz = peer_with_workspaces("atlas", vec![remote_summary("zzz", None, None, None)]);
             app.peer_summaries = if aaa_first {
                 vec![aaa, zzz]
             } else {
@@ -7842,8 +7847,8 @@ mod tests {
         app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
         app.server_filter = None;
         app.peer_summaries = vec![
-            peer_with_workspaces("anvil", vec![remote_summary("aaa", None, None, None)]),
-            peer_with_workspaces("sage", vec![remote_summary("zzz", None, None, None)]),
+            peer_with_workspaces("kiln", vec![remote_summary("aaa", None, None, None)]),
+            peer_with_workspaces("atlas", vec![remote_summary("zzz", None, None, None)]),
         ];
 
         let entries = agent_panel_entries(&app);
@@ -8266,7 +8271,7 @@ mod tests {
             workspace_with_project_key("other", "github.com/gerchowl/other"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
-            "anvil",
+            "kiln",
             vec![
                 remote_summary(
                     "flock",
@@ -8685,7 +8690,7 @@ mod tests {
 
     /// #102 — the merged alphanumeric stream: local, remote-only, and misc
     /// all interleave under the same display-shaped sort key. The screenshot
-    /// case from the issue: `gerchowl/g-fleet · sage:main` (remote-only)
+    /// case from the issue: `gerchowl/g-fleet · atlas:main` (remote-only)
     /// renders BETWEEN a local `flock` and a misc `notes`, not trailing
     /// after both.
     #[test]
@@ -8701,7 +8706,7 @@ mod tests {
             workspace_with_project_key("ribes", "github.com/gerchowl/ribes"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
-            "sage",
+            "atlas",
             vec![remote_summary(
                 "g-fleet",
                 Some("github.com/gerchowl/g-fleet"),

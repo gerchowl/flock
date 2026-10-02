@@ -816,7 +816,7 @@ mod tests {
         const G: u64 = 1024 * 1024 * 1024;
         let mut app = crate::app::state::AppState::test_new();
         app.system_stats = Some(SystemStats {
-            host: Some("mba22".into()),
+            host: Some("hopper".into()),
             cpu_percent: Some(42.0),
             mem_used: Some(13 * G),
             mem_total: Some(16 * G),
@@ -829,7 +829,7 @@ mod tests {
         let rendered = render_status_to_string(&app, 80);
         assert!(rendered.contains("42%"), "{rendered}");
         assert!(rendered.contains("13G/16G"), "{rendered}");
-        assert!(rendered.contains("mba22"), "{rendered}");
+        assert!(rendered.contains("hopper"), "{rendered}");
     }
 
     /// Once the sampler stops delivering, the last snapshot is not rendered
@@ -842,7 +842,7 @@ mod tests {
         const G: u64 = 1024 * 1024 * 1024;
         let mut app = crate::app::state::AppState::test_new();
         app.system_stats = Some(SystemStats {
-            host: Some("mba22".into()),
+            host: Some("hopper".into()),
             cpu_percent: Some(42.0),
             mem_used: Some(13 * G),
             mem_total: Some(16 * G),
@@ -857,7 +857,7 @@ mod tests {
         let rendered = render_status_to_string(&app, 80);
         assert!(rendered.contains("42%"), "{rendered:?}");
         assert!(rendered.contains("13G/16G"), "{rendered:?}");
-        assert!(rendered.contains("mba22"), "{rendered:?}");
+        assert!(rendered.contains("hopper"), "{rendered:?}");
         let stale = stale_reading_style(&app.palette);
         for (x, (symbol, fg, modifier)) in status_cells(&app, 80).into_iter().enumerate() {
             if !symbol.trim().is_empty() {

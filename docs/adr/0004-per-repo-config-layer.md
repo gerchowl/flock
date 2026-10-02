@@ -25,7 +25,7 @@ merge evidence). The fix is a **hardcoded, config-independent** guard: the
 default branch (`main`/`master`/`origin/HEAD`) is never auto-deletable. But the
 *natural extension* — "also never prune `develop` or `release/*` in this repo" —
 is a repo policy with nowhere to live. Putting it in the user-global config is
-wrong: a teammate who clones the repo would inherit none of it, and a laptop's
+wrong: a teammate who clones the repo would inherit none of it, and a hopper's
 `config.local.toml` is the wrong scope for a fact about the repository.
 
 Other configuration has the same shape: the worktree base directory/naming for

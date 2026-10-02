@@ -31,13 +31,13 @@ interval, per peer (~160 MB re-parsed per call). Replication also required
 origin-scoped cursors, per-origin dedupe, replica-log integrity, and would put
 every message body on every spoke's disk permanently.
 
-**Measurement decided the alternative.** Cold SSH handshake from `sage`,
+**Measurement decided the alternative.** Cold SSH handshake from `atlas`,
 `ControlMaster=no ControlPath=none`, exit status verified:
 
 | peer | handshake |
 | --- | --- |
-| anvil | 0.13s |
-| anvil-dev | 0.16s |
+| kiln | 0.13s |
+| kiln-dev | 0.16s |
 | ethz-heimdall (Tailscale-remote) | 0.97s |
 
 Five requests: **1.93s** spawning per call versus **0.38s** over one held
@@ -92,7 +92,7 @@ was not to build the distributed log at all.
 
 **SSH `ControlMaster`.** Amortizes handshakes for free, and is already in the
 operator's `~/.ssh/config`. Not a substitute: its sockets go stale across
-exactly what a roaming laptop does — sleep, wifi↔LTE, Tailscale DERP↔direct —
+exactly what a roaming hopper does — sleep, wifi↔LTE, Tailscale DERP↔direct —
 and then hang rather than reconnect. An app-managed connection with an
 explicit fallback handles that; borrowing ssh's multiplexing does not.
 

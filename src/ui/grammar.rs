@@ -1,7 +1,7 @@
 //! Single source of the spaces/agents label grammar (#62).
 //!
 //! Every concrete checkout — local or remote — renders as `<server>:<target>`
-//! (`mba22:main`, `sage:keyboard-shorcuts`). The server qualifier is always
+//! (`hopper:main`, `atlas:keyboard-shorcuts`). The server qualifier is always
 //! present, the local host included, so "where is this checkout" is always
 //! answered. The space row above carries the project identity itself
 //! (`owner/repo` per #27), not a checkout. Keeping the rendering here in one
@@ -12,7 +12,7 @@
 use crate::app::AppState;
 use crate::workspace::Workspace;
 
-/// The local server name, as it appears in member rows (`mba22:main`). Shared
+/// The local server name, as it appears in member rows (`hopper:main`). Shared
 /// with the servers band and status line so one machine reads the same name
 /// everywhere.
 pub(crate) fn local_server_name() -> String {
@@ -98,7 +98,7 @@ pub(crate) fn project_identity_label(project_key: &str) -> String {
 
 /// The label for a section-LEADER row (the selectable main checkout that heads
 /// a multi-member project section): the PROJECT IDENTITY, never `<server>:<branch>`
-/// (#78). Two different repos that both head as `mba22:main` are indistinguishable
+/// (#78). Two different repos that both head as `hopper:main` are indistinguishable
 /// under the member grammar — the leader must read the project, with its members
 /// carrying the `<server>:<target>` qualifier beneath. Resolves to `owner/repo`
 /// from the project key (#27), falling back to the workspace's display label when
@@ -219,7 +219,7 @@ pub(crate) fn server_field_label(
 
 /// The agents-panel single-row location string (#62), matching the spaces
 /// grammar: `<server> <tab> <proj> <target>` (e.g.
-/// `mba22 logs flock keyboard-shorcuts`). The tab segment appears only for a
+/// `hopper logs flock keyboard-shorcuts`). The tab segment appears only for a
 /// multi-tab workspace (#394) — one row per pane means every row of such a
 /// workspace would otherwise carry the same location text, leaving the alias
 /// as the only thing telling two agents apart.
@@ -322,10 +322,10 @@ mod tests {
 
     #[test]
     fn member_label_joins_server_and_target() {
-        assert_eq!(member_label("mba22", "main"), "mba22:main");
+        assert_eq!(member_label("hopper", "main"), "hopper:main");
         assert_eq!(
-            member_label("sage", "keyboard-shorcuts"),
-            "sage:keyboard-shorcuts"
+            member_label("atlas", "keyboard-shorcuts"),
+            "atlas:keyboard-shorcuts"
         );
     }
 
@@ -352,24 +352,24 @@ mod tests {
     #[test]
     fn agent_location_joins_server_proj_target_when_it_fits() {
         assert_eq!(
-            agent_location_label("mba22", None, Some("flock"), "keyboard-shorcuts", 80),
-            "mba22 flock keyboard-shorcuts"
+            agent_location_label("hopper", None, Some("flock"), "keyboard-shorcuts", 80),
+            "hopper flock keyboard-shorcuts"
         );
     }
 
     #[test]
     fn agent_location_omits_absent_project() {
         assert_eq!(
-            agent_location_label("sage", None, None, "main", 80),
-            "sage main"
+            agent_location_label("atlas", None, None, "main", 80),
+            "atlas main"
         );
     }
 
     #[test]
     fn agent_location_truncates_target_before_project() {
         // Server + project stay whole; the target shrinks (middle-truncated).
-        let out = agent_location_label("mba22", None, Some("flock"), "keyboard-shorcuts", 20);
-        assert!(out.starts_with("mba22 flock "), "got {out:?}");
+        let out = agent_location_label("hopper", None, Some("flock"), "keyboard-shorcuts", 20);
+        assert!(out.starts_with("hopper flock "), "got {out:?}");
         assert!(out.chars().count() <= 20, "got {out:?}");
         assert!(out.contains('…'), "got {out:?}");
     }
@@ -379,8 +379,8 @@ mod tests {
     #[test]
     fn agent_location_renders_the_tab_between_server_and_project() {
         assert_eq!(
-            agent_location_label("mba22", Some("logs"), Some("flock"), "main", 80),
-            "mba22 logs flock main"
+            agent_location_label("hopper", Some("logs"), Some("flock"), "main", 80),
+            "hopper logs flock main"
         );
     }
 
@@ -390,11 +390,11 @@ mod tests {
     /// which is the #62 order the tab segment does not disturb.
     #[test]
     fn agent_location_drops_the_tab_before_the_project() {
-        // 14 cols cannot hold `mba22 logs flock ` (17) plus a target, so the
+        // 14 cols cannot hold `hopper logs flock ` (17) plus a target, so the
         // tab goes and the pre-#394 shape returns, target truncated.
-        let out = agent_location_label("mba22", Some("logs"), Some("flock"), "shorcuts", 14);
+        let out = agent_location_label("hopper", Some("logs"), Some("flock"), "shorcuts", 14);
         assert!(!out.contains("logs"), "got {out:?}");
-        assert!(out.starts_with("mba22 flock "), "got {out:?}");
+        assert!(out.starts_with("hopper flock "), "got {out:?}");
         assert!(out.chars().count() <= 14, "got {out:?}");
         assert!(
             out.contains('…'),
@@ -409,20 +409,20 @@ mod tests {
     #[test]
     fn agent_location_without_a_tab_adds_no_segment() {
         assert_eq!(
-            agent_location_label("mba22", None, Some("flock"), "keyboard-shorcuts", 80),
-            "mba22 flock keyboard-shorcuts"
+            agent_location_label("hopper", None, Some("flock"), "keyboard-shorcuts", 80),
+            "hopper flock keyboard-shorcuts"
         );
         for width in [1, 5, 12, 20, 40, 80] {
             let out =
-                agent_location_label("mba22", None, Some("flock"), "keyboard-shorcuts", width);
+                agent_location_label("hopper", None, Some("flock"), "keyboard-shorcuts", width);
             assert!(out.chars().count() <= width, "{width}: {out:?}");
             assert!(!out.contains("  "), "{width}: {out:?}");
         }
         // And the tab segment is genuinely consumed: the same row with and
         // without a tab differs, at a width that fits both.
         assert_ne!(
-            agent_location_label("mba22", Some("logs"), Some("flock"), "main", 80),
-            agent_location_label("mba22", None, Some("flock"), "main", 80)
+            agent_location_label("hopper", Some("logs"), Some("flock"), "main", 80),
+            agent_location_label("hopper", None, Some("flock"), "main", 80)
         );
     }
 
@@ -433,14 +433,14 @@ mod tests {
     #[test]
     fn agent_location_drops_a_blank_tab_label_instead_of_rendering_it() {
         for blank in ["", " ", "   ", "\t", "\n"] {
-            let out = agent_location_label("mba22", Some(blank), Some("flock"), "main", 80);
-            assert_eq!(out, "mba22 flock main", "blank={blank:?}");
+            let out = agent_location_label("hopper", Some(blank), Some("flock"), "main", 80);
+            assert_eq!(out, "hopper flock main", "blank={blank:?}");
             assert!(!out.contains("  "), "blank={blank:?}: {out:?}");
         }
         // A label with content around the whitespace is trimmed, not dropped.
         assert_eq!(
-            agent_location_label("mba22", Some("  logs  "), Some("flock"), "main", 80),
-            "mba22 logs flock main"
+            agent_location_label("hopper", Some("  logs  "), Some("flock"), "main", 80),
+            "hopper logs flock main"
         );
     }
 
@@ -558,11 +558,11 @@ mod tests {
     #[test]
     fn solo_remote_label_combines_project_and_member() {
         // The remote twin of solo_local_label: `owner/repo · host:branch`.
-        let peer = peer_named("sage");
+        let peer = peer_named("atlas");
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
             solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
-            "gerchowl/flock \u{00b7} sage:main"
+            "gerchowl/flock \u{00b7} atlas:main"
         );
     }
 
@@ -570,36 +570,36 @@ mod tests {
     fn solo_remote_label_without_project_is_bare_member() {
         // No project identity reported: fall back to `host:target`, never a
         // dangling `· `.
-        let peer = peer_named("sage");
+        let peer = peer_named("atlas");
         let summary = remote_summary(None, Some("wip"));
         assert_eq!(
             solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
-            "sage:wip"
+            "atlas:wip"
         );
     }
 
     #[test]
     fn member_label_moded_icon_replaces_host_with_glyph() {
         use crate::config::ServerLabelConfig;
-        let glyph = crate::server_icons::glyph("anvil").unwrap();
+        let glyph = crate::server_icons::glyph("toad").unwrap();
         // `icon` mode: the server's glyph stands in for the host, `· branch`.
         assert_eq!(
-            member_label_moded(ServerLabelConfig::Icon, Some("anvil"), "anvil", "fix/pty"),
+            member_label_moded(ServerLabelConfig::Icon, Some("toad"), "kiln", "fix/pty"),
             format!("{glyph} \u{00b7} fix/pty")
         );
         // No usable icon → falls back to the uniform `host:branch`.
         assert_eq!(
-            member_label_moded(ServerLabelConfig::Icon, None, "ksb", "wip"),
-            "ksb:wip"
+            member_label_moded(ServerLabelConfig::Icon, None, "node-b", "wip"),
+            "node-b:wip"
         );
         // `both` / `name` are unchanged: always `host:branch`.
         assert_eq!(
-            member_label_moded(ServerLabelConfig::Both, Some("anvil"), "anvil", "fix/pty"),
-            "anvil:fix/pty"
+            member_label_moded(ServerLabelConfig::Both, Some("kiln"), "kiln", "fix/pty"),
+            "kiln:fix/pty"
         );
         assert_eq!(
-            member_label_moded(ServerLabelConfig::Name, Some("anvil"), "anvil", "fix/pty"),
-            "anvil:fix/pty"
+            member_label_moded(ServerLabelConfig::Name, Some("kiln"), "kiln", "fix/pty"),
+            "kiln:fix/pty"
         );
     }
 
@@ -609,18 +609,18 @@ mod tests {
         let glyph = crate::server_icons::glyph("toad").unwrap();
         // `name` keeps the bare hostname even when an icon is declared.
         assert_eq!(
-            server_field_label(ServerLabelConfig::Name, Some("toad"), "sage"),
-            "sage"
+            server_field_label(ServerLabelConfig::Name, Some("toad"), "atlas"),
+            "atlas"
         );
         // `both` = the glyph, then the hostname, space-joined like the rest of
         // the location string.
         assert_eq!(
-            server_field_label(ServerLabelConfig::Both, Some("toad"), "sage"),
-            format!("{glyph} sage")
+            server_field_label(ServerLabelConfig::Both, Some("toad"), "atlas"),
+            format!("{glyph} atlas")
         );
         // `icon` = the symbol standing in for the host.
         assert_eq!(
-            server_field_label(ServerLabelConfig::Icon, Some("toad"), "sage"),
+            server_field_label(ServerLabelConfig::Icon, Some("toad"), "atlas"),
             glyph
         );
     }
@@ -636,10 +636,10 @@ mod tests {
             // No icon at all, and a name the registry does not know (a
             // version-skewed or hostile peer) both fall back to the host —
             // the raw name never reaches the screen.
-            assert_eq!(server_field_label(mode, None, "ksb"), "ksb");
+            assert_eq!(server_field_label(mode, None, "node-b"), "node-b");
             assert_eq!(
-                server_field_label(mode, Some("no-such-icon-name"), "ksb"),
-                "ksb"
+                server_field_label(mode, Some("no-such-icon-name"), "node-b"),
+                "node-b"
             );
         }
     }
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn solo_remote_label_icon_mode_uses_glyph_member() {
         let glyph = crate::server_icons::glyph("toad").unwrap();
-        let mut peer = peer_named("sage");
+        let mut peer = peer_named("atlas");
         peer.icon = Some("toad".into());
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
@@ -659,8 +659,8 @@ mod tests {
     #[test]
     fn agent_location_drops_project_under_hard_pressure() {
         // Too tight for any project segment: drop it, keep server + target.
-        let out = agent_location_label("mba22", None, Some("flock"), "main", 9);
-        assert!(out.starts_with("mba22 "), "got {out:?}");
+        let out = agent_location_label("hopper", None, Some("flock"), "main", 9);
+        assert!(out.starts_with("hopper "), "got {out:?}");
         assert!(!out.contains("flock"), "got {out:?}");
         assert!(out.chars().count() <= 9, "got {out:?}");
     }
@@ -669,10 +669,10 @@ mod tests {
     /// the project, which every row of the workspace shares, outlives it.
     #[test]
     fn agent_location_drops_the_tab_before_the_project_under_hard_pressure() {
-        let out = agent_location_label("mba22", Some("logs"), Some("flock"), "main", 9);
+        let out = agent_location_label("hopper", Some("logs"), Some("flock"), "main", 9);
         assert!(!out.contains("logs"), "got {out:?}");
         assert!(!out.contains("flock"), "got {out:?}");
-        assert!(out.starts_with("mba22 "), "got {out:?}");
+        assert!(out.starts_with("hopper "), "got {out:?}");
         assert!(out.chars().count() <= 9, "got {out:?}");
     }
 }

@@ -872,8 +872,8 @@ mod tests {
                 failing_secs: Some(45),
                 stream_reason: Some("auth\u{1b}]52;c;cHduZWQ=\u{7}_refused".into()),
             }),
-            name: "sage".into(),
-            ssh_target: "sage".into(),
+            name: "atlas".into(),
+            ssh_target: "atlas".into(),
             host: None,
             version: None,
             protocol: None,
@@ -898,7 +898,7 @@ mod tests {
         crate::api::schema::RelayedFleetPeer {
             dial: None,
             name: name.into(),
-            ssh_target: "sage".into(),
+            ssh_target: "atlas".into(),
             host: None,
             version: None,
             protocol: None,
@@ -920,18 +920,18 @@ mod tests {
     #[test]
     fn the_status_column_lines_up_after_names_are_stripped() {
         let rows = vec![
-            status_row("sage\u{1b}[31m\u{1b}[0m", None),
-            status_row("anvil", None),
+            status_row("atlas\u{1b}[31m\u{1b}[0m", None),
+            status_row("kiln", None),
         ];
         let lines = super::status_table(&rows);
-        assert_eq!(lines, vec!["sage   ok", "anvil  ok"]);
+        assert_eq!(lines, vec!["atlas  ok", "kiln   ok"]);
     }
 
     /// #428: a current peer sends the reason token as `error`, so the status
     /// line states it once rather than `down  timeout (…): timeout`.
     #[test]
     fn a_token_error_is_not_repeated_after_the_reason() {
-        let mut row = status_row("sage", Some("timeout"));
+        let mut row = status_row("atlas", Some("timeout"));
         row.dial = Some(crate::api::schema::PeerDialReport {
             reason: Some("timeout".into()),
             consecutive_failures: 2,
@@ -952,11 +952,11 @@ mod tests {
             target: "flock::\u{1b}]52;c;cHduZWQ=\u{7}peers".into(),
             message: "\u{1b}[2Jdial failed\r\nagain".into(),
             source: None,
-            host: Some("ksb\u{1b}[31m".into()),
+            host: Some("node-b\u{1b}[31m".into()),
         };
         let line = super::log_line_human(&record, true);
         assert!(!line.chars().any(char::is_control), "{line:?}");
-        assert!(line.contains("ksb flock::"), "{line}");
+        assert!(line.contains("node-b flock::"), "{line}");
         assert!(line.contains("dial failed again"), "{line}");
     }
 
