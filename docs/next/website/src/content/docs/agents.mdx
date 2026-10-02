@@ -199,8 +199,18 @@ flk agent get "$name"    # resolves now, before the agent has printed anything
 
 If `agent get <name>` ever answers `agent_not_found` for a name a start just
 returned, that is a real failure and worth reporting — not a race to wait out.
-The one thing that will make a name stop resolving is the pane going away: a
-closed pane, or an agent that exited and took its pane with it.
+
+A name stops resolving in two situations, and only the first is obvious:
+
+- **The pane goes away** — closed, or taken with an agent that exited.
+- **The pane's agent runtime is rebuilt and the rebuild fails.** Flock clears
+  the agent identity when it cannot spawn the replacement shell for a resumed
+  agent, so `agent resume` on a pane whose shell will not start leaves the pane
+  in place with the name gone. The server log carries the spawn error; the pane
+  itself looks fine. A successful `agent resume` keeps the name.
+
+So if a name you just started stops resolving while its pane is still on
+screen, the pane is still there and the answer is in the log, not in a race.
 
 Use `flk pane ...` commands for ordinary terminals, servers, tests, shells, and low-level terminal input. For example, use `pane split` and `pane run` for `cargo test`, not `agent start`, unless that terminal is intentionally being treated as an agent target.
 
