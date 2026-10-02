@@ -70,6 +70,12 @@ pub struct Composed {
     pub diagnostics_block: Option<String>,
     /// Byte-for-byte what leaves the machine, for display before it does.
     pub preview: String,
+    /// The issue body on its own: the sections, nothing else. `--body-only`
+    /// writes this to stdout and nothing else, so it carries no `destination:`
+    /// header and no prefilled URL — and unlike the URL it is not length
+    /// capped, so the diagnostics ride inline rather than being pushed to the
+    /// clipboard (#427).
+    pub body: String,
     pub advisories: Vec<Advisory>,
 }
 
@@ -97,6 +103,7 @@ pub fn compose(inputs: &ReportInputs) -> Composed {
     Composed {
         destination: inputs.repo.clone(),
         preview: render_preview(inputs, &values, diagnostics_block.as_deref()),
+        body: render_body(&values, diagnostics_block.as_deref()),
         url: built,
         diagnostics_block,
         advisories: advisories(inputs),
@@ -150,7 +157,13 @@ fn render_preview(
     }
     match diagnostics_block {
         Some(block) => {
-            out.push_str("## diagnostics (clipboard, not in the URL)\n");
+            // Route-agnostic on purpose. "clipboard" was true only of `--open`,
+            // and `--body-only` (#427) reuses this preview verbatim on a route
+            // that puts the tail in the body and copies nothing anywhere — so a
+            // heading that names a destination this route does not use is a
+            // false statement in the one place the reporter is told what they
+            // are about to send. What holds on every route is the second half.
+            out.push_str("## diagnostics (never in the URL)\n");
             out.push_str(block);
         }
         None => out.push_str(
@@ -158,6 +171,34 @@ fn render_preview(
         ),
     }
     out
+}
+
+/// The body alone, with the diagnostics inline.
+///
+/// Two differences from the preview, both deliberate. The header lines are
+/// absent because this is what a person pastes into a field, and `destination:`
+/// inside an issue body is noise about the reporter's shell rather than
+/// anything about the bug. The diagnostics ride inline because the URL cap is a
+/// property of the *URL*, not of the body: `--open` has to push a log tail to
+/// the clipboard because everything else has to fit in a query string, and this
+/// route has no query string. A headless report is therefore strictly richer
+/// than a browser one, not a thinner copy of it.
+///
+/// With nothing collected the body says nothing about diagnostics at all —
+/// no heading, no placeholder. The preview says so on stderr, and an issue
+/// body reading "## diagnostics (none collected)" is worse than silence.
+fn render_body(values: &[(&str, String)], diagnostics_block: Option<&str>) -> String {
+    let mut out = String::new();
+    for (id, value) in values {
+        out.push_str(&format!("## {id}\n{}\n\n", value.trim_end()));
+    }
+    if let Some(block) = diagnostics_block {
+        out.push_str(block);
+    }
+    // Never empty in practice — `environment` is machine-filled and always
+    // pushed — so the trim cannot empty the body and there is no empty-body
+    // branch to defend.
+    format!("{}\n", out.trim_end())
 }
 
 #[cfg(test)]
@@ -287,5 +328,65 @@ mod tests {
     fn preview_shows_the_destination() {
         let composed = compose(&inputs("run `flk worktree create --branch x` in any repo"));
         assert!(composed.preview.contains("destination: gerchowl/flock"));
+    }
+
+    /// The body is what a pipe carries into `gh issue create --body-file -`,
+    /// so the preview's furniture has to be absent from it — including the
+    /// destination line, which would otherwise read as the first paragraph of
+    /// somebody's bug report.
+    #[test]
+    fn the_body_carries_no_preview_furniture() {
+        let composed = compose(&inputs("run `flk worktree create --branch x` in any repo"));
+        assert!(!composed.body.contains("destination:"), "{}", composed.body);
+        assert!(!composed.body.contains("kind:"), "{}", composed.body);
+        assert!(!composed.body.contains("github.com"), "{}", composed.body);
+        assert!(!composed.body.contains("issues/new"), "{}", composed.body);
+        assert!(composed.body.starts_with("## current-behavior\n"));
+        assert!(composed.body.ends_with('\n'));
+        // Every prose field is still there — the preview's job is display, not
+        // selection.
+        for id in [
+            "current-behavior",
+            "expected-behavior",
+            "reproduction",
+            "impact",
+            "environment",
+        ] {
+            assert!(
+                composed.body.contains(&format!("## {id}\n")),
+                "{id} missing"
+            );
+        }
+    }
+
+    /// The URL is capped; the body is not. So on this route the diagnostics
+    /// belong inline rather than on the clipboard, and a report composed
+    /// headlessly carries strictly more evidence than the browser route can.
+    #[test]
+    fn diagnostics_ride_inline_in_the_body() {
+        let mut inputs = inputs("run flk worktree create --branch x");
+        inputs.diagnostics = vec![DiagnosticRecord {
+            ts: "t".into(),
+            level: "ERROR".into(),
+            source: Some("flock-server.log".into()),
+            fields: vec![("program".into(), "zzdiagnosticzz".into())],
+        }];
+        let composed = compose(&inputs);
+        assert!(
+            composed.body.contains("program=zzdiagnosticzz"),
+            "{}",
+            composed.body
+        );
+        // And not under the preview's heading, which is a lie on this route:
+        // nothing goes to a clipboard when stdout is the destination.
+        assert!(!composed.body.contains("clipboard"), "{}", composed.body);
+    }
+
+    /// A body with no diagnostics says nothing about them, rather than
+    /// rendering a placeholder an issue would carry forever.
+    #[test]
+    fn a_body_without_diagnostics_has_no_diagnostics_heading() {
+        let composed = compose(&inputs("run flk worktree create --branch x"));
+        assert!(!composed.body.contains("diagnostics"), "{}", composed.body);
     }
 }

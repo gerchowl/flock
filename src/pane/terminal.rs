@@ -1430,9 +1430,37 @@ fn ghostty_detection_text(core: &GhosttyPaneCore) -> Result<String, crate::ghost
         .ok()
         .map(|rows| usize::from(rows).max(1))
         .unwrap_or(DEFAULT_DETECTION_ROWS);
+    // The whole screen, and `recent_window_start`'s floor is what keeps it
+    // there. It asks for exactly `terminal.rows()` lines, so its window starts
+    // at the floor already and the walk has nowhere to go — the detector
+    // cannot reach scrollback whether or not the walk exists. That is why this
+    // is an ordinary call and not a separate one: an earlier version of #456
+    // split the two behind an `extend_past_blank` flag, and the flag was
+    // unreachable as a behaviour, so no test could have caught losing it.
+    // The property that is real — the detector never sees scrollback, so the
+    // screen detectors are never handed rows that were never on screen — is
+    // enforced by the floor and pinned by
+    // `resize_recovery_does_not_replay_scrolled_history_over_blank_bottom`.
     ghostty_recent_text(core, lines)
 }
 
+/// The bottom `lines` rows of the page list, extended upward over blank rows
+/// until it holds content (#456).
+///
+/// Two properties, and the second is the one that matters most:
+///
+/// 1. A window that already has content is returned untouched, so no answer
+///    that was already right can move.
+/// 2. **The walk stops at the top of the SCREEN.** It never reaches into
+///    scrollback, and that floor is what protects `detection_text` as much as
+///    it protects a caller. Removing it fails
+///    `resize_recovery_does_not_replay_scrolled_history_over_blank_bottom` and
+///    `recent_reads_do_not_reach_into_scrollback_past_a_blank_screen`.
+///
+/// Returns a start row, not a length: the window may come back SHORTER than
+/// `lines`, which happens only when the whole screen is blank and there is
+/// nothing above it to find. The answer is `""` either way, so shortening is
+/// free; widening past the floor would not be.
 fn ghostty_recent_text(
     core: &GhosttyPaneCore,
     lines: usize,
@@ -1442,7 +1470,7 @@ fn ghostty_recent_text(
     if total_rows == 0 || cols == 0 {
         return Ok(String::new());
     }
-    let start = total_rows.saturating_sub(lines);
+    let start = recent_window_start(core, total_rows, lines)?;
     let mut rows = Vec::with_capacity(total_rows.saturating_sub(start));
     for y in start..total_rows {
         rows.push(ghostty_screen_row(core, cols, y as u32)?);
@@ -1460,7 +1488,7 @@ fn ghostty_recent_text_unwrapped(
     if total_rows == 0 || cols == 0 {
         return Ok(String::new());
     }
-    let start = total_rows.saturating_sub(lines) as u32;
+    let start = recent_window_start(core, total_rows, lines)? as u32;
     let end = total_rows.saturating_sub(1) as u32;
     core.terminal
         .read_text_screen((0, start), (cols.saturating_sub(1), end), false)
@@ -1476,10 +1504,111 @@ fn ghostty_recent_ansi(
     if total_rows == 0 || cols == 0 {
         return Ok(String::new());
     }
-    let start = total_rows.saturating_sub(lines) as u32;
+    let start = recent_window_start(core, total_rows, lines)? as u32;
     let end = total_rows.saturating_sub(1) as u32;
     core.terminal
         .read_ansi_screen((0, start), (cols.saturating_sub(1), end), false, unwrap)
+}
+
+/// The first row of the window every `recent*` read returns (#456).
+///
+/// That window is the bottom `lines` rows of the page list, and a window of
+/// nothing but blank rows answers `""` — which is a claim about the PANE, not
+/// about the window. A TUI that paints its top rows in a taller pane, or a
+/// pane that has just been cleared, is visibly full of text and reads as
+/// empty. `flk pane read` saying nothing there is the defect; a caller cannot
+/// tell it apart from a pane that has never printed.
+///
+/// So when the requested window holds no content, it walks upward until it
+/// does. A window that already has content is returned exactly as it was,
+/// which is the property that makes this safe: no answer that was already
+/// right can move, so no caller reading a pane with output near its bottom
+/// sees a difference.
+///
+/// **The walk stops at the top of the screen.** It never reaches into
+/// scrollback. A `recent*` read is a read of what is on the pane, and history
+/// above a blank screen is a different thing — the pane-terminal tests pin
+/// that for both this read and the detector's. A caller that wants history
+/// asks for a window wide enough to reach it, and `lines` well past the pane's
+/// height still does.
+///
+/// Blankness is probed with the PLAIN formatter, for the ANSI reads too, so
+/// that "is there text here" is asked the same way whichever read is being
+/// served. A styled-but-EMPTY row is blank under either formatter, which the
+/// fixture below relies on: rows 10-12 carry `\x1b[38;5;244m` and no glyphs, so
+/// a probe that counted styling as content would stop the walk there and read
+/// a pane with two lines on it as a pane full of them.
+///
+/// Deliberately not applied to `visible_text`. That is the user-visible
+/// viewport, the operator can scroll it, and AGENTS.md forbids it as a
+/// source of truth.
+fn recent_window_start(
+    core: &GhosttyPaneCore,
+    total_rows: usize,
+    lines: usize,
+) -> Result<usize, crate::ghostty::Error> {
+    let bottom = total_rows.saturating_sub(lines);
+    // A zero-line window asks for nothing, and `lines == usize::MAX` (what
+    // `snapshot_history` reads with) already covers every row. Arithmetic
+    // answers both correctly, so neither is probed.
+    if lines == 0 || bottom == 0 {
+        return Ok(bottom);
+    }
+    if !recent_rows_are_blank(core, bottom, total_rows)? {
+        return Ok(bottom);
+    }
+
+    let screen_rows = core
+        .terminal
+        .rows()
+        .map(|rows| usize::from(rows).max(1))
+        .unwrap_or(DEFAULT_DETECTION_ROWS);
+    let floor = total_rows.saturating_sub(screen_rows);
+
+    // Upward in `lines`-sized chunks, so finding the content costs a handful
+    // of reads rather than one per row of scrollback.
+    let mut end = bottom;
+    loop {
+        let start = end.saturating_sub(lines).max(floor);
+        if start < end && !recent_rows_are_blank(core, start, end)? {
+            let mut last = end;
+            while last > start + 1 && recent_row_is_blank(core, last - 1)? {
+                last -= 1;
+            }
+            // Clamped to the floor, because `last - lines` can land below it
+            // whenever the content found is nearer the top of the screen than
+            // `lines` rows — which is exactly the case the walk exists to
+            // serve, and the one that would otherwise read scrollback.
+            return Ok(last.saturating_sub(lines).max(floor));
+        }
+        if start == floor {
+            return Ok(floor);
+        }
+        end = start;
+    }
+}
+
+/// Are rows `start..end` of the page list all blank?
+fn recent_rows_are_blank(
+    core: &GhosttyPaneCore,
+    start: usize,
+    end: usize,
+) -> Result<bool, crate::ghostty::Error> {
+    if start >= end {
+        return Ok(true);
+    }
+    let cols = core.terminal.cols()?;
+    let text = core.terminal.read_text_screen(
+        (0, start as u32),
+        (cols.saturating_sub(1), end.saturating_sub(1) as u32),
+        false,
+    )?;
+    Ok(text.trim().is_empty())
+}
+
+/// Is row `y` of the page list blank?
+fn recent_row_is_blank(core: &GhosttyPaneCore, y: usize) -> Result<bool, crate::ghostty::Error> {
+    recent_rows_are_blank(core, y, y.saturating_add(1))
 }
 
 fn ghostty_restore_scroll_offset_from_bottom(
@@ -1951,6 +2080,142 @@ mod tests {
         } = &mut *core;
         render_state.update(terminal).unwrap();
         render_state.colors().unwrap().palette[usize::from(index)]
+    }
+
+    /// #456: a pane that has painted its top rows and left the bottom of the
+    /// screen blank — what an agent TUI looks like in a pane taller than the
+    /// frame it drew, and what a pane looks like the instant after a clear.
+    ///
+    /// Alt-screen bytes and an in-memory emulator, no PTY: the defect is in
+    /// how the read picks its window, not in what reaches the pane.
+    ///
+    /// Rows 10-12 are styled but EMPTY (`\x1b[38;5;244m` with no glyph after
+    /// it), between the content and the blank bottom. They are here so the
+    /// window walk has to pass over styling without treating it as text: a
+    /// probe that stopped there would read this two-line pane as a full one.
+    fn pane_painted_at_the_top(rows: u16) -> GhosttyPaneTerminal {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, rows, 0).unwrap();
+        terminal.write(b"\x1b[?1049h\x1b[2J\x1b[H");
+        terminal.write(b"\x1b[1;1HTOP-MARKER");
+        terminal.write(b"\x1b[5;1HSECOND");
+        terminal.write(b"\x1b[38;5;244m\x1b[10;1H\x1b[38;5;244m\x1b[11;1H\x1b[38;5;244m\x1b[12;1H");
+        GhosttyPaneTerminal::new(terminal, tx).unwrap()
+    }
+
+    /// The regression, in the shape it was reported: `flk pane read
+    /// --source recent --lines 30` answered `{"text":""}` for a pane that was
+    /// visibly running an agent. Every `recent*` read took the bottom `lines`
+    /// rows of the page list and reported a window of blanks as a pane with
+    /// nothing on it.
+    #[test]
+    fn recent_reads_extend_past_a_blank_window_instead_of_reporting_an_empty_pane() {
+        let pane = pane_painted_at_the_top(60);
+
+        // Narrow windows reach above the paint and used to answer "".
+        assert_eq!(pane.recent_text(5), "TOP-MARKER\n\n\n\nSECOND\n");
+        assert_eq!(pane.recent_text(30), "TOP-MARKER\n\n\n\nSECOND\n");
+        assert_eq!(pane.recent_unwrapped_text(30), "TOP-MARKER\n\n\n\nSECOND");
+
+        // A window that already reaches the paint is untouched, which is what
+        // keeps every caller that was being answered correctly unaffected.
+        assert_eq!(
+            pane.recent_text(60),
+            "TOP-MARKER\n\n\n\nSECOND\n",
+            "a window wide enough to hold the content must read the same as it always did"
+        );
+
+        // The ANSI reads take the same window.
+        assert!(
+            pane.recent_ansi(5).contains("TOP-MARKER"),
+            "recent_ansi lost the paint: {:?}",
+            pane.recent_ansi(5)
+        );
+        assert!(
+            pane.recent_unwrapped_ansi(5).contains("TOP-MARKER"),
+            "recent_unwrapped_ansi lost the paint: {:?}",
+            pane.recent_unwrapped_ansi(5)
+        );
+
+        // The styled-but-empty rows at 10-12 sit between the content and the
+        // blank bottom. The window is 5 rows, so it can only reach TOP-MARKER
+        // by walking past them: a blankness probe that counted `\x1b[38;5;244m`
+        // as content would stop there and return the styling instead.
+        assert!(
+            !pane.recent_ansi(5).contains("38;5;244"),
+            "styling with no glyph on it must not be read as content: {:?}",
+            pane.recent_ansi(5)
+        );
+    }
+
+    /// The other half: a pane with nothing on it anywhere still reads empty.
+    /// Widening the window must not turn "this pane has printed nothing" into
+    /// a page of blank lines, because `flk agent start --wait-ready`'s refusal
+    /// and #178's exit quote both ask that question on purpose.
+    #[test]
+    fn recent_reads_still_report_a_pane_that_has_printed_nothing_as_empty() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 40, 0).unwrap();
+        terminal.write(b"\x1b[?1049h\x1b[2J\x1b[H");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        for lines in [1, 5, 30, 40, 400] {
+            assert_eq!(pane.recent_text(lines), "", "lines={lines}");
+            assert_eq!(pane.recent_unwrapped_text(lines), "", "lines={lines}");
+        }
+    }
+
+    /// And the floor the extension stops at: history above a blank screen is
+    /// scrollback, not the pane. A `recent*` read must not replay it, and the
+    /// window only reaches history when the caller asks for a window wide
+    /// enough to include it.
+    #[test]
+    fn recent_reads_do_not_reach_into_scrollback_past_a_blank_screen() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        write_numbered_lines(&mut terminal, 20);
+        terminal.write(b"\x1b[2J\x1b[H");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        assert!(
+            pane.recent_text(3).trim().is_empty(),
+            "the bottom 3 rows are blank, and the window must stop at the top of the screen \
+             rather than replay the 20 lines above it: {:?}",
+            pane.recent_text(3)
+        );
+        // A caller that wants history asks for a window that reaches it.
+        assert!(
+            pane.recent_text(30).contains("000000"),
+            "a window wider than the pane covers the scrollback and should still see it"
+        );
+    }
+
+    /// The clamp, not just the chunk floor.
+    ///
+    /// When the walk finds its content NEAR THE TOP of the screen — nearer than
+    /// `lines` rows — `last - lines` lands above the floor, and reading from
+    /// there is reading scrollback. The screen is 50 rows with content only on
+    /// its first row and scrollback above that; a 40-line window must stop at
+    /// the top of the screen.
+    #[test]
+    fn recent_reads_clamp_the_window_to_the_screen_when_content_is_near_its_top() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 50, 10_000).unwrap();
+        write_numbered_lines(&mut terminal, 100);
+        terminal.write(b"\x1b[2J\x1b[H");
+        terminal.write(b"\x1b[1;1HSCREEN-TOP-MARKER");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let text = pane.recent_text(40);
+        assert_eq!(
+            text, "SCREEN-TOP-MARKER\n",
+            "the walk reaches the top of the screen and stops there. Unclamped it returns 40 \
+             rows of scrollback above the screen instead."
+        );
+        assert!(
+            !pane.detection_text().contains("000000"),
+            "and the detector's snapshot is a read of the screen, not of its history"
+        );
     }
 
     fn expected_osc_rgb_response(command: &str, color: crate::ghostty::RgbColor) -> Bytes {
