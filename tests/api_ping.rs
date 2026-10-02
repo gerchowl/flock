@@ -72,7 +72,6 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
-#[cfg(target_os = "linux")]
 fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -103,7 +102,6 @@ fn spawn_flock_with_path(
     )
 }
 
-#[cfg(target_os = "linux")]
 fn spawn_flock_with_shell(
     config_home: &Path,
     runtime_dir: &Path,
@@ -630,20 +628,20 @@ fn tab_methods_round_trip_over_socket() {
     cleanup_spawned_flock(child, base);
 }
 
-// Genuinely Linux-only, and not for a removable reason (#269): the assertion
-// below reads `/proc/<pid>/cwd` to prove the *process* moved directories while
-// the *pane*'s recorded cwd did not. `/proc` has no macOS equivalent reachable
-// from a test without a platform helper, so this stays gated rather than being
-// made portable on paper. (It would trip over `/tmp` being a symlink too, but
-// the `/proc` read is the real blocker.)
-#[cfg(target_os = "linux")]
+// This test used to be `#[cfg(target_os = "linux")]` because it proved the
+// foreground process's directory by reading `/proc/<pid>/cwd` (#269). That read
+// has been replaced by having the foreground shell report its own cwd with
+// `pwd`, which is the same observation without the Linux-only interface — so
+// the test now runs everywhere, and in particular it is the only coverage
+// `platform::macos::process_cwd` has. Do not reintroduce a `/proc` read here:
+// it is what cost this test its macOS run.
 #[test]
 fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let foreground = base.join("foreground-process");
     let marker = base.join("foreground-ready");
-    let pid_file = base.join("foreground.pid");
+    let cwd_marker = base.join("foreground-cwd");
     fs::create_dir_all(&foreground).unwrap();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -670,11 +668,14 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         .unwrap()
         .to_string();
 
+    // `pwd > {cwd_marker}` is how the foreground process states its own
+    // directory. `/proc/<pid>/cwd` said the same thing but only exists on Linux,
+    // which is the whole reason this test used to be gated off macOS.
     let command = format!(
-        "/bin/sh -c 'cd {} && printf %s $$ > {} && touch {} && sleep 30'",
+        "/bin/sh -c 'cd {} && touch {} && pwd > {} && sleep 30'",
         foreground.display(),
-        pid_file.display(),
-        marker.display()
+        marker.display(),
+        cwd_marker.display()
     );
     let send_text = send_request(
         &socket_path,
@@ -698,11 +699,15 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     );
     assert_eq!(send_enter["result"]["type"], "ok");
     wait_for_path(&marker, Duration::from_secs(5));
+    wait_for_path(&cwd_marker, Duration::from_secs(5));
 
-    let foreground_pid: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-    assert_eq!(
-        fs::read_link(format!("/proc/{foreground_pid}/cwd")).unwrap(),
-        foreground
+    // The foreground process is in `foreground`, by its own account. Compared
+    // with `assert_same_dir` because the shell reports the path as typed while
+    // the server reports it resolved, and on macOS `/tmp` is a symlink to
+    // `/private/tmp`.
+    assert_same_dir(
+        &serde_json::json!(fs::read_to_string(&cwd_marker).unwrap().trim()),
+        &foreground,
     );
 
     let pane = send_request(
@@ -712,24 +717,15 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
             pane_id
         ),
     );
-    assert_eq!(pane["result"]["pane"]["cwd"], base.display().to_string());
-    assert_eq!(
-        pane["result"]["pane"]["foreground_cwd"],
-        foreground.display().to_string()
-    );
+    assert_same_dir(&pane["result"]["pane"]["cwd"], &base);
+    assert_same_dir(&pane["result"]["pane"]["foreground_cwd"], &foreground);
 
     let panes = send_request(
         &socket_path,
         r#"{"id":"fg_panes","method":"pane.list","params":{}}"#,
     );
-    assert_eq!(
-        panes["result"]["panes"][0]["cwd"],
-        base.display().to_string()
-    );
-    assert_eq!(
-        panes["result"]["panes"][0]["foreground_cwd"],
-        foreground.display().to_string()
-    );
+    assert_same_dir(&panes["result"]["panes"][0]["cwd"], &base);
+    assert_same_dir(&panes["result"]["panes"][0]["foreground_cwd"], &foreground);
 
     let reported = send_request(
         &socket_path,
@@ -744,13 +740,10 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         &socket_path,
         r#"{"id":"fg_agents","method":"agent.list","params":{}}"#,
     );
-    assert_eq!(
-        agents["result"]["agents"][0]["cwd"],
-        base.display().to_string()
-    );
-    assert_eq!(
-        agents["result"]["agents"][0]["foreground_cwd"],
-        foreground.display().to_string()
+    assert_same_dir(&agents["result"]["agents"][0]["cwd"], &base);
+    assert_same_dir(
+        &agents["result"]["agents"][0]["foreground_cwd"],
+        &foreground,
     );
 
     cleanup_spawned_flock(child, base);

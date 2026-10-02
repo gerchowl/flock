@@ -30,6 +30,25 @@ class PlatformTestGap(unittest.TestCase):
         root = self._tree({"cli_wrapper.rs": body})
         self.assertEqual(gated_tests(root), {Path("tests/cli_wrapper.rs"): 3})
 
+    def test_file_level_gate_counts_every_test_for_both_spellings(self):
+        # The bug this pins: `GATE_FILE` used to match only `not(macos)` while
+        # the item-level pattern matched both spellings. A file gated wholesale
+        # with `target_os = "linux"` was therefore reported as withholding ONE
+        # gate rather than every test in it — so the exact-count pin could be
+        # satisfied while a whole file was compiled out. Whichever spelling is
+        # used, file scope must report the same number as item scope would.
+        body = """
+        #![cfg(target_os = "linux")]
+        #[test]
+        fn a() {}
+        #[tokio::test]
+        async fn b() {}
+        #[test]
+        fn c() {}
+        """
+        root = self._tree({"linux_only.rs": body})
+        self.assertEqual(gated_tests(root), {Path("tests/linux_only.rs"): 3})
+
     def test_item_level_gates_count_individually(self):
         body = """
         #[test]
@@ -99,17 +118,24 @@ class PlatformTestGap(unittest.TestCase):
         root = self._tree({"plain.rs": "#[test]\nfn a() {}\n"})
         self.assertEqual(gated_tests(root), {})
 
-    def test_reports_the_real_tree(self):
+def test_reports_the_real_tree(self):
         """The notice must describe this repository, not a fixture.
 
-        #269 closed the blanket macOS gates. What is left is ONE test that is
-        # Linux-only because it reads `/proc/<pid>/cwd`, which no test-side shim
-        can paper over. This is the test that notices if a gate comes back, and
-        it is deliberately an exact count rather than a "greater than zero" — a
-        ratchet that tolerates growth is not a ratchet.
+        The answer is `{}`, and that is the whole point of the ratchet: #269
+        triaged every gate in `tests/` and the last one went too, so a macOS
+        build now contains every test in the suite. Any gate at all fails this
+        assertion, which is the enforcement — a "greater than zero" pin would
+        have let the gap creep back one test at a time unnoticed.
+
+        The last gate to fall was
+        `pane_info_reports_foreground_cwd_without_changing_pane_cwd`, which had
+        been Linux-only for a `/proc/<pid>/cwd` read. Asking the foreground shell
+        for its own cwd with `pwd` proves the same thing through a portable
+        interface, and it means `platform::macos::process_cwd` is now covered
+        rather than sitting untested behind a gate.
         """
         root = Path(__file__).resolve().parent.parent
-        self.assertEqual(gated_tests(root), {Path("tests/api_ping.rs"): 1})
+        self.assertEqual(gated_tests(root), {})
 
 
 if __name__ == "__main__":

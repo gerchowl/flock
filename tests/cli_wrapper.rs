@@ -70,19 +70,45 @@ impl SpawnedFlock {
         self.master = None;
     }
 
-    /// Wait for the server to exit under its own steam, up to `grace`.
+    /// Reap a server that has already been told to stop.
     ///
-    /// Returns whether it exited. This exists so `close_master` is a fallback
-    /// rather than the first move — see the `server_stop` tests for why.
-    fn wait_until_exited(&mut self, grace: Duration) -> bool {
-        let deadline = Instant::now() + grace;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return true,
-                _ if Instant::now() >= deadline => return false,
-                _ => thread::sleep(Duration::from_millis(20)),
-            }
-        }
+    /// Two platforms, two genuinely different strategies, chosen by `cfg`. This
+    /// was previously a poll-then-close with a 2s budget, which read as a
+    /// guarantee ("on Linux the master is never closed") while actually being a
+    /// bet on the server exiting inside two seconds. It is a `cfg` now, so the
+    /// Linux branch closes nothing under any timing whatsoever.
+    ///
+    /// The returned status is authoritative and is what the callers assert on:
+    /// portable-pty's `Child` for `std::process::Child` delegates to std, which
+    /// caches a reaped status, so this is a single reap and a later `wait()`
+    /// would not fail with `ECHILD`. The callers read `process_id()` before
+    /// calling in any case.
+    #[cfg(not(target_os = "macos"))]
+    fn wait_for_stopped_server(&mut self) -> portable_pty::ExitStatus {
+        // The server exits on its own once `server stop` has been acknowledged,
+        // so the plain blocking wait is correct here and the PTY master is
+        // deliberately left alone: closing it would SIGHUP a shutdown that may
+        // not have finished, and the caller's `assert!(exit_status.success())`
+        // would fail. This branch cannot reach `close_master` at all.
+        self.child.wait().unwrap()
+    }
+
+    /// Reap a server that has already been told to stop.
+    ///
+    /// Darwin will not let a session leader finish `exit()` while the master end
+    /// of its controlling terminal is still open, and `flock` is a session
+    /// leader whose controlling terminal is this PTY. By this point the server
+    /// has already logged "flock exiting", so a blocking wait simply hangs — it
+    /// did, indefinitely, before this was split out. Dropping the master lets
+    /// the kernel complete the exit path.
+    #[cfg(target_os = "macos")]
+    fn wait_for_stopped_server(&mut self) -> portable_pty::ExitStatus {
+        // Safe to close first *here* precisely because the alternative is an
+        // indefinite hang: there is no "wait a bit and see" that could succeed.
+        // If the SIGHUP ever did beat the shutdown, the caller's status
+        // assertion catches it as a failure rather than a silent pass.
+        self.close_master();
+        self.child.wait().unwrap()
     }
 }
 
@@ -1595,23 +1621,11 @@ fn server_stop_command_shuts_down_running_server() {
         String::from_utf8_lossy(&stopped.stdout)
     );
 
-    // ORDERING IS LOAD-BEARING. Read this before tidying it.
-    //
-    // `flock` is a session leader whose controlling terminal is this PTY, and
-    // Darwin will not let a session leader finish `exit()` while the master end
-    // of its controlling terminal is still open. The server has already logged
-    // "flock exiting" here, so a plain blocking `wait()` hangs forever on a Mac
-    // (#269). Closing the master unblocks it — but closing it *first*, before
-    // the process is known to have exited, would SIGHUP a shutdown that may not
-    // have finished, and that is a regression on Linux, which does not need the
-    // help at all: there the server has already exited, `try_wait` reports it,
-    // and the master is never closed. So: poll first, drop the master only as a
-    // fallback, and leave the assertion below exactly as it was.
-    if !flock.wait_until_exited(Duration::from_secs(2)) {
-        flock.close_master();
-    }
+    // `wait_for_stopped_server` picks its strategy by `cfg`, because the two
+    // platforms genuinely need opposite things here; see its doc comment before
+    // changing it.
     let pid = flock.child.process_id();
-    let exit_status = flock.child.wait().unwrap();
+    let exit_status = flock.wait_for_stopped_server();
     unregister_spawned_flock_pid(pid);
     assert!(exit_status.success(), "server stop should exit cleanly");
 
@@ -1683,23 +1697,11 @@ fn server_stop_then_restart_restores_pane_history() {
         String::from_utf8_lossy(&stopped.stderr)
     );
 
-    // ORDERING IS LOAD-BEARING. Read this before tidying it.
-    //
-    // `flock` is a session leader whose controlling terminal is this PTY, and
-    // Darwin will not let a session leader finish `exit()` while the master end
-    // of its controlling terminal is still open. The server has already logged
-    // "flock exiting" here, so a plain blocking `wait()` hangs forever on a Mac
-    // (#269). Closing the master unblocks it — but closing it *first*, before
-    // the process is known to have exited, would SIGHUP a shutdown that may not
-    // have finished, and that is a regression on Linux, which does not need the
-    // help at all: there the server has already exited, `try_wait` reports it,
-    // and the master is never closed. So: poll first, drop the master only as a
-    // fallback, and leave the assertion below exactly as it was.
-    if !flock.wait_until_exited(Duration::from_secs(2)) {
-        flock.close_master();
-    }
+    // `wait_for_stopped_server` picks its strategy by `cfg`, because the two
+    // platforms genuinely need opposite things here; see its doc comment before
+    // changing it.
     let pid = flock.child.process_id();
-    let exit_status = flock.child.wait().unwrap();
+    let exit_status = flock.wait_for_stopped_server();
     unregister_spawned_flock_pid(pid);
     assert!(exit_status.success(), "server stop should exit cleanly");
     drop(flock);

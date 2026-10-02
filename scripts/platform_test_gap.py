@@ -40,10 +40,15 @@ from pathlib import Path
 # gap be under-reported.
 #
 # `#[cfg(target_os = "macos")]` is deliberately absent: those tests exist HERE.
-BLOCKING = re.compile(
-    r'#!?\[cfg\((?:not\(target_os\s*=\s*"macos"\)|target_os\s*=\s*"linux")\)\]'
-)
-GATE_FILE = re.compile(r'#!\[cfg\(not\(target_os\s*=\s*"macos"\)\)\]')
+#
+# The file-scope and item-scope patterns are built from ONE spelling list, because
+# they used to disagree — `GATE_FILE` matched only `not(macos)` while the item
+# pattern matched both. A file fully gated with `target_os = "linux"` was then
+# reported as withholding a single gate instead of every test in it, which means
+# the exact-count pin could be satisfied by a whole file being compiled out.
+SPELLINGS = r'(?:not\(target_os\s*=\s*"macos"\)|target_os\s*=\s*"linux")'
+GATE_FILE = re.compile(rf'#!\[cfg\({SPELLINGS}\)\]')
+BLOCKING = re.compile(rf'#!?\[cfg\({SPELLINGS}\)\]')
 TEST_ATTR = re.compile(r"#\[(?:tokio::)?test\]")
 
 # Attributes are matched only at the start of a line, and comments are stripped
