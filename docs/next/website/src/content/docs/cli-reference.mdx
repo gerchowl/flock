@@ -411,6 +411,33 @@ Text comes back in `text`, everything else base64 in `blob`. `resources/read` ta
 
 The paste still happens as well: flock cannot tell from outside a pane whether the agent in it has this MCP server wired up.
 
+## Reporting a bug
+
+```bash
+flk report template [bug] > bug.md
+flk report bug --file bug.md [--print|--open|--body-only] [--repo owner/name] [--last N] [--all-levels] [--no-diagnostics]
+flk report bug --current TEXT --expected TEXT --repro TEXT --impact TEXT
+```
+
+`flk report` composes a bug report from what you wrote plus what the binary already knows: version, update channel, build commit, OS and architecture, terminal, shell, client protocol, and the running server's version and protocol compatibility. Logs come from the same directory with the server dead — which is exactly when you file one — filtered to WARN and ERROR by default (`--all-levels` includes routine activity, `--last N` changes the count, `--no-diagnostics` attaches none). Every record goes through the allowlist and scrubber first, so paths, hostnames, tokens and usernames are stripped before anything is shown. `--repo owner/name` files against some other repository; nothing else can redirect a report, not even the environment.
+
+Getting the report off your machine takes a human, and there are two ways to do it.
+
+`--open` prints a preview, copies the log tail to your clipboard, and opens GitHub's real bug form, prefilled. This is the route that runs the template's own required-field validation and gives you the reproducibility confirmation to tick.
+
+`--body-only` writes **just the issue body to stdout** — no `destination:` header, no prefilled link, no footer — so it pipes straight into a filing command you run yourself:
+
+```bash
+flk report bug --file bug.md --body-only > "$HOME/flock-bug.md"
+gh issue create --repo gerchowl/flock --title "pane read never returns" --body-file "$HOME/flock-bug.md"
+```
+
+The preview, any advisories and the exact command to run go to **stderr**, so what you reviewed is what gets piped and the preview never lands inside the body. The body has no URL length cap, so on this route the redacted log tail rides inside it rather than going to the clipboard: a headless report carries more evidence than a browser one, not less. `gh` posts a raw body and bypasses the issue form, so nothing validates it and the reproducibility confirmation is not one `gh` can set — use `--open` when you want GitHub's own form to run the checks.
+
+Where you redirect that body is your call and worth choosing deliberately: unlike `--open`, this route writes a file, and the file holds paths, versions and the log tail. Keep it out of a checkout you might commit from, and delete it once the issue is filed.
+
+Flock never files the report itself (ADR-0010 decision 6). The one write path it has is `flk issue drop --file-it`, which is yours to confirm.
+
 ## Read sources
 
 | Source | Meaning |
