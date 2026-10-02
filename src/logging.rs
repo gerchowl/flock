@@ -2552,6 +2552,22 @@ pub(crate) fn worktree_remove_completed(workspace_id: &str, path: &str) {
     );
 }
 
+/// #402: the fleet sweep forced past a refusal with nobody to ask, so the
+/// escalation has to be in the audit trail — it is the one worktree removal
+/// flock performs without a human having seen it. `refusal` is the classified
+/// reason (`Dirty` / `Submodules`), never git's raw wording, so the record says
+/// what was agreed-to-lose rather than only that something was.
+pub(crate) fn worktree_remove_force_recovered(path: &str, refusal: &str) {
+    tracing::warn!(
+        event = "worktree.remove",
+        subsystem = "worktree",
+        outcome = "force_recovered",
+        path,
+        refusal,
+        "git refused the remove; forced past a refusal that destroys no uncommitted work"
+    );
+}
+
 pub(crate) fn worktree_remove_failed(workspace_id: &str, path: &str, err: &str) {
     tracing::warn!(
         event = "worktree.remove",

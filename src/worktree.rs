@@ -184,6 +184,144 @@ pub(crate) fn classify_worktree_remove_error(message: &str) -> Option<WorktreeRe
     None
 }
 
+/// Whether `checkout` is provably free of work that a `--force` would destroy.
+///
+/// A FACT about the checkout, never an inference from git's message ordering.
+/// Both halves of the probe are load-bearing, and the first is easy to miss:
+///
+/// * `--ignore-submodules=none` on the COMMAND LINE. A checkout can carry
+///   `submodule.<name>.ignore = all` in its own config, and then plain
+///   `git status` reports a submodule containing untracked files as perfectly
+///   clean — verified against real git, with an untracked file sitting in the
+///   submodule and `git worktree remove --force` destroying it. The flag
+///   overrides that config; the config is the user's to set, and a decision to
+///   spend `--force` must not silently inherit it.
+/// * the checkout's own `git status`, which transitively reports each submodule
+///   as ` M <path>` when anything inside it is untracked, edited, or committed
+///   past the gitlink recorded in the superproject. One probe therefore covers
+///   the submodule's own state, including an unpushed commit made inside it —
+///   the only copy of which the superproject does not hold.
+///
+/// `false` is returned only on a positive answer. Anything unknown — git
+/// unreadable, the command failing for any reason — counts as "there may be
+/// work here", matching the `unwrap_or(true)` convention the sweep's own probe
+/// uses. Nothing a `--force` does is reversible, so the ambiguous reading has
+/// to be the safe one.
+pub(crate) fn force_destroys_nothing(checkout: &Path) -> bool {
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            &checkout.to_string_lossy(),
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+        None,
+    )
+    .is_ok_and(|status| status.trim().is_empty())
+}
+
+/// Whether a caller with nobody to ask may spend `--force` on `refusal`
+/// against `checkout` (#402).
+///
+/// Two independent gates, because neither is sufficient alone — and the first
+/// is not the one that protects the work:
+///
+/// 1. The refusal must not itself BE an admission of uncommitted work. `Dirty`
+///    is git saying "this checkout has modified or untracked files"; that is the
+///    one escalation a person must be asked about, and no probe taken after the
+///    fact can un-ask it.
+/// 2. The checkout must be PROVABLY clean right now
+///    ([`force_destroys_nothing`]). This is the gate that actually protects the
+///    work, and it has to be a separate check because `Submodules` is NOT an
+///    admission of anything: git runs `validate_no_submodules` before it ever
+///    looks at the tree, so a checkout carrying both a gitlink and uncommitted
+///    work still classifies as `Submodules`. The classifier answers "which check
+///    fired first", and reading that as "there is nothing to lose" is what let
+///    an earlier version of this function destroy a checkout's work with nobody
+///    present (#402 review).
+///
+/// Both must hold. Because gate 2 does not depend on the refusal's variant,
+/// git's check ordering stops mattering here at all.
+fn may_force_unattended(checkout: &Path, refusal: WorktreeRemoveRefusal) -> bool {
+    matches!(refusal, WorktreeRemoveRefusal::Submodules) && force_destroys_nothing(checkout)
+}
+
+/// What one worktree-removal attempt sequence actually cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeRemoveOutcome {
+    /// Removed on the first attempt. `forced` is whether the caller had already
+    /// armed `--force` before asking.
+    Removed { forced: bool },
+    /// git refused with something `--force` clears, this caller was allowed to
+    /// clear it, and the forced retry worked. `refusal` is which refusal it was
+    /// — the classification, not git's raw wording, so a caller can report what
+    /// it agreed to lose instead of re-deriving it from a string.
+    Recovered { refusal: WorktreeRemoveRefusal },
+    /// Not removed. The message is git's own, from whichever attempt got
+    /// furthest.
+    Failed(String),
+}
+
+/// Remove a worktree checkout for a caller with nobody to ask (#402).
+///
+/// The one thing this does that the kill dialog and the socket do not is decide
+/// the escalation itself, because it has no human to ask: those two classify
+/// git's refusal and hand back something the operator can act on (a second
+/// confirmation, an exit-4 code) — this one acts. Everything else is shared —
+/// the same command, the same [`classify_worktree_remove_error`], the same
+/// meaning of `--force`. That sharing is the whole point: #351 landed the
+/// classifier for two callers, the sweep was the third seam and had drifted
+/// into predicting the answer from a `dirty` probe, which cannot see a
+/// submodule at all.
+///
+/// `force` carries whatever escalation the caller's PLAN already decided for
+/// this row, before anyone looked at a git refusal — for the fleet sweep that
+/// is `KillAction`'s own `dirty`, so a merged dirty row force-removes with no
+/// `f` pressed (pre-existing, deliberately unchanged here). It authorises
+/// forcing past `Dirty` and nothing else. This function never consults it about
+/// a refusal it is seeing for the first time: that is
+/// [`may_force_unattended`]'s question, and it is asked of the checkout rather
+/// than of the caller.
+pub(crate) fn remove_worktree_unattended(
+    repo_root: &Path,
+    path: &Path,
+    force: bool,
+) -> WorktreeRemoveOutcome {
+    let attempt =
+        |force: bool| run_worktree_command(&build_worktree_remove_command(repo_root, path, force));
+    let Err(err) = attempt(force) else {
+        return WorktreeRemoveOutcome::Removed { forced: force };
+    };
+    let Some(refusal) = classify_worktree_remove_error(&err) else {
+        // Not one `--force` clears: a locked worktree, a missing registration,
+        // anything else. Git's own words are the answer.
+        return WorktreeRemoveOutcome::Failed(err);
+    };
+    // Already forced and still refused: the operator spent their confirmation
+    // and it was not enough (#351's rule, unchanged). Forcing again would just
+    // be the same command twice.
+    if force || !may_force_unattended(path, refusal) {
+        return WorktreeRemoveOutcome::Failed(err);
+    }
+    match attempt(true) {
+        // Logged only once the retry has actually worked — a record of a
+        // recovery that did not happen is worse than no record, because this
+        // is the seam where flock removes a checkout with no human present.
+        Ok(()) => {
+            crate::logging::worktree_remove_force_recovered(
+                &path.display().to_string(),
+                &format!("{refusal:?}"),
+            );
+            WorktreeRemoveOutcome::Recovered { refusal }
+        }
+        // Report the forced attempt's words: the first refusal is no longer the
+        // news, whatever it was.
+        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err),
+    }
+}
+
 pub(crate) fn build_worktree_add_new_branch_command(
     repo_root: &Path,
     path: &Path,
@@ -1730,6 +1868,14 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
 ///
 /// The branch is NEVER deleted. That is the reap-scheduled invariant this
 /// function encodes at the ONLY place scheduled reap touches the disk.
+///
+/// #402: git refuses this for the same reason it refuses `worktree remove` —
+/// "working trees containing submodules cannot be moved **or removed**" — so
+/// the reap dead-ends on a submodule worktree today, exactly where the sweep
+/// did. It is non-destructive and out of scope here (it decides nothing about
+/// `force`, and it has no branch to lose), but whoever wires scheduled removal
+/// must come through [`remove_worktree_unattended`] rather than deciding force
+/// from a `dirty` probe a second time.
 pub(crate) fn quarantine_worktree(
     repo_root: &Path,
     checkout: &Path,
@@ -2176,97 +2322,13 @@ mod tests {
         std::env::remove_var("XDG_CONFIG_HOME");
     }
 
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn run_git(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
-
-    fn create_committed_repo(name: &str) -> PathBuf {
-        let repo = unique_temp_path(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Flock Test"]);
-        std::fs::write(repo.join("README.md"), "test\n").unwrap();
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-        repo
-    }
-
-    /// git blocks the file transport for submodules by default, so a fixture
-    /// that clones one from a sibling temp dir has to opt back in.
-    fn run_git_over_file_protocol(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
-
-    /// A repo carrying a populated submodule, plus a linked worktree of it —
-    /// the shape that dead-ended #351 (`hyrr` with `nucl-parquet` inside).
-    /// Returns (main checkout, linked worktree path).
-    fn create_repo_with_submodule_worktree(name: &str) -> (PathBuf, PathBuf) {
-        let sub = create_committed_repo(&format!("{name}-sub"));
-        let repo = create_committed_repo(name);
-        run_git_over_file_protocol(
-            &repo,
-            &[
-                "submodule",
-                "add",
-                "--quiet",
-                &sub.display().to_string(),
-                "sub",
-            ],
-        );
-        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
-        let checkout = repo.join("wt");
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                "issue/351-submodule",
-                &checkout.display().to_string(),
-            ],
-        );
-        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
-        (repo, checkout)
-    }
+    // Git fixtures and the App event helper live in `crate::test_support`: the
+    // classifier tests, the kill dialog, the fleet sweep and the socket API all
+    // need these same shapes, and three copies of one fixture is how a fix to
+    // one seam quietly stops covering the others (#402).
+    use crate::test_support::{
+        create_committed_repo, create_submodule_worktree, run_git, unique_temp_path,
+    };
 
     /// A committed repo wired to a fresh bare `origin` remote (no upstream
     /// tracking set yet) — the shape `prepare_peer_checkout` operates on.
@@ -2642,7 +2704,8 @@ prunable stale
     /// really does clear it.
     #[test]
     fn real_git_refuses_submodule_worktree_until_forced() {
-        let (repo, checkout) = create_repo_with_submodule_worktree("submodule-refusal");
+        let (_sub, repo, checkout) =
+            create_submodule_worktree("submodule-refusal", "issue/351-submodule");
         let checkout_str = checkout.display().to_string();
 
         let status =
