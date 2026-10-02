@@ -1,6 +1,11 @@
 //! Integration tests for auto-detect launch behavior.
 
-#![cfg(not(target_os = "macos"))]
+// This file used to open with `#![cfg(not(target_os = "macos"))]`, compiling all
+// 10 tests out of every Mac build. The guard was collateral from e97413d rather
+// than a judgement about this platform, and the harness already bound under a
+// short `/tmp` path. Nothing here needed accommodating, so the gate simply went;
+// see #269 and the note on `tests/cli_wrapper.rs`.
+//
 // TracedCommand (logging redesign PR-3) polices flock's shipped code; this
 // harness drives the compiled flock binary through raw Command.
 #![allow(clippy::disallowed_methods)]

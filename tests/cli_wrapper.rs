@@ -1,4 +1,11 @@
-#![cfg(not(target_os = "macos"))]
+// This file used to open with `#![cfg(not(target_os = "macos"))]`, which
+// compiled all 47 tests out of every Mac build. That guard arrived in e97413d
+// alongside the switch to short `/tmp` harness paths — the change that actually
+// makes the suite portable — and was collateral to a codex-detection fix rather
+// than a judgement about this platform. Removed in #269 once each assumption was
+// triaged: see `SpawnedFlock::close_master` for the one Darwin behaviour the
+// harness does have to accommodate.
+//
 // TracedCommand (logging redesign PR-3) polices flock's shipped code; this
 // harness drives the compiled flock binary through raw Command.
 #![allow(clippy::disallowed_methods)]
@@ -54,8 +61,73 @@ fn create_committed_repo(path: &Path) {
 }
 
 struct SpawnedFlock {
-    _master: Box<dyn MasterPty + Send>,
+    /// The PTY master, held open for as long as the server lives.
+    ///
+    /// Deliberately kept on *every* platform, and deliberately never read.
+    /// Dropping the master closes its fd (`portable_pty::FileDescriptor` is
+    /// RAII), and closing the last master of a PTY hangs up the slave — the
+    /// kernel SIGHUPs the foreground process group. So on Linux this field is
+    /// not dead weight to be cfg'd away: it is the thing *stopping* the SIGHUP
+    /// that `wait_for_stopped_server`'s Linux branch is written to avoid. Only
+    /// the Darwin arm may drop it, and only there it is what unblocks the hang.
+    ///
+    /// The leading underscore is load-bearing, not laziness: `dead_code` cannot
+    /// tell a keep-alive from an oversight, and clippy runs with `-D warnings`.
+    /// An `#[allow(dead_code)]` here would be worse — it would hide a genuinely
+    /// unused field later, which is the mistake `cfg` was used to avoid.
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+impl SpawnedFlock {
+    /// Hang up the PTY, which on Darwin is the only way a session leader's
+    /// `exit()` can complete. Darwin-only, hence the `cfg`: on Linux this would
+    /// SIGHUP a shutdown that may not have finished.
+    #[cfg(target_os = "macos")]
+    fn close_master(&mut self) {
+        self._master = None;
+    }
+
+    /// Reap a server that has already been told to stop.
+    ///
+    /// Two platforms, two genuinely different strategies, chosen by `cfg`. This
+    /// was previously a poll-then-close with a 2s budget, which read as a
+    /// guarantee ("on Linux the master is never closed") while actually being a
+    /// bet on the server exiting inside two seconds. It is a `cfg` now, so the
+    /// Linux branch closes nothing under any timing whatsoever.
+    ///
+    /// The returned status is authoritative and is what the callers assert on:
+    /// portable-pty's `Child` for `std::process::Child` delegates to std, which
+    /// caches a reaped status, so this is a single reap and a later `wait()`
+    /// would not fail with `ECHILD`. The callers read `process_id()` before
+    /// calling in any case.
+    #[cfg(not(target_os = "macos"))]
+    fn wait_for_stopped_server(&mut self) -> portable_pty::ExitStatus {
+        // The server exits on its own once `server stop` has been acknowledged,
+        // so the plain blocking wait is correct here and the PTY master is
+        // deliberately left alone: closing it would SIGHUP a shutdown that may
+        // not have finished, and the caller's `assert!(exit_status.success())`
+        // would fail. This branch cannot reach `close_master` at all.
+        self.child.wait().unwrap()
+    }
+
+    /// Reap a server that has already been told to stop.
+    ///
+    /// Darwin will not let a session leader finish `exit()` while the master end
+    /// of its controlling terminal is still open, and `flock` is a session
+    /// leader whose controlling terminal is this PTY. By this point the server
+    /// has already logged "flock exiting", so a blocking wait simply hangs — it
+    /// did, indefinitely, before this was split out. Dropping the master lets
+    /// the kernel complete the exit path.
+    #[cfg(target_os = "macos")]
+    fn wait_for_stopped_server(&mut self) -> portable_pty::ExitStatus {
+        // Safe to close first *here* precisely because the alternative is an
+        // indefinite hang: there is no "wait a bit and see" that could succeed.
+        // If the SIGHUP ever did beat the shutdown, the caller's status
+        // assertion catches it as a failure rather than a silent pass.
+        self.close_master();
+        self.child.wait().unwrap()
+    }
 }
 
 struct SpawnedServerProcess {
@@ -278,7 +350,7 @@ fn spawn_flock_with_config(
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     }
 }
@@ -1567,8 +1639,11 @@ fn server_stop_command_shuts_down_running_server() {
         String::from_utf8_lossy(&stopped.stdout)
     );
 
+    // `wait_for_stopped_server` picks its strategy by `cfg`, because the two
+    // platforms genuinely need opposite things here; see its doc comment before
+    // changing it.
     let pid = flock.child.process_id();
-    let exit_status = flock.child.wait().unwrap();
+    let exit_status = flock.wait_for_stopped_server();
     unregister_spawned_flock_pid(pid);
     assert!(exit_status.success(), "server stop should exit cleanly");
 
@@ -1640,8 +1715,11 @@ fn server_stop_then_restart_restores_pane_history() {
         String::from_utf8_lossy(&stopped.stderr)
     );
 
+    // `wait_for_stopped_server` picks its strategy by `cfg`, because the two
+    // platforms genuinely need opposite things here; see its doc comment before
+    // changing it.
     let pid = flock.child.process_id();
-    let exit_status = flock.child.wait().unwrap();
+    let exit_status = flock.wait_for_stopped_server();
     unregister_spawned_flock_pid(pid);
     assert!(exit_status.success(), "server stop should exit cleanly");
     drop(flock);
