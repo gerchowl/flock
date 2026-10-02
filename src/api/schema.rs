@@ -758,9 +758,36 @@ pub struct AgentStartParams {
     pub tab_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitDirection>,
+    /// #398: name the active workspace as the placement, on purpose.
+    ///
+    /// It used to be what an untargeted `--split` fell back to, which is an
+    /// answer for a human in front of the TUI and an arbitrary one for
+    /// everybody else — four agents resumed over ssh with four distinct
+    /// `--cwd` all landed in the one focused workspace. Absent means "you did
+    /// not ask for it", which for a caller flock cannot place is a refusal
+    /// rather than a guess.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active: bool,
+    /// #398: name the space this caller's OWN pane is in, on purpose.
+    ///
+    /// A different question from `active`, and deliberately so. `active` is a
+    /// recollection — whichever workspace a human last focused — which is why
+    /// it needs asking for. `here` is a locality: the workspace the calling
+    /// process's ancestry attests it is sitting in, so a script run from a pane
+    /// gets the space it is actually in rather than the one being looked at.
+    /// Refused rather than guessed when ancestry places the caller nowhere.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub here: bool,
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+}
+
+/// `skip_serializing_if` predicate for a defaulted `bool` flag: absent on the
+/// wire for the default, so an older client and a newer server agree on what
+/// "not asked for" means.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Params for `agent.spawn` (#329). Every field is narrowed relative to

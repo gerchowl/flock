@@ -5,7 +5,8 @@
 )]
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams,
-    AgentStatus, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
+    AgentStatus, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, SplitDirection,
+    Subscription,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -41,12 +42,124 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
 
 pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
 
 pub(super) const AGENT_WAIT_USAGE: &str =
     "flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]";
+
+/// Everything `agent start` accepts between the name and the `--` terminator.
+///
+/// A type rather than a pile of `Option`s out-param'd into the request, and a
+/// pure function over `args`, so the flags can be pinned by tests that do not
+/// need a server: this parser decides what a caller said, and the placement
+/// rules on the other end of the socket are worth nothing if the flag that opts
+/// into them never reaches the request.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AgentStartFlags {
+    cwd: Option<String>,
+    workspace_id: Option<String>,
+    tab_id: Option<String>,
+    /// #398: ask for the workspace you are LOOKING AT — a recollection the
+    /// server reads from `state.active`.
+    active: bool,
+    /// #398: ask for the workspace your own PANE is in — a locality the server
+    /// reads from the caller's process ancestry. Two different questions, so
+    /// two different flags; `parse_agent_start_flags` keeps them apart rather
+    /// than aliasing one for the other.
+    here: bool,
+    split: Option<SplitDirection>,
+    focus: bool,
+    wait_ready: bool,
+    ready_timeout_ms: Option<u64>,
+}
+
+/// Parse the flags before `--`. `separator` is the index of the terminator, so
+/// a value that happens to be `--` cannot be swallowed as one.
+///
+/// The error is the line to print: every refusal here is a usage error, so each
+/// one carries the whole remedy in the words rather than sending the caller to
+/// `--help` for a flag that exists.
+fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentStartFlags, String> {
+    let mut flags = AgentStartFlags::default();
+
+    let mut index = 1;
+    while index < separator {
+        // Every value-taking flag reads the next word, and only if it is still
+        // on this side of `--`.
+        let value_for = |flag: &str| -> Result<String, String> {
+            args.get(index + 1)
+                .filter(|_| index + 1 < separator)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {flag}"))
+        };
+        match args[index].as_str() {
+            "--cwd" => {
+                flags.cwd = Some(value_for("--cwd")?);
+                index += 2;
+            }
+            "--workspace" => {
+                flags.workspace_id =
+                    Some(super::normalize_workspace_id(&value_for("--workspace")?));
+                index += 2;
+            }
+            "--tab" => {
+                flags.tab_id = Some(super::normalize_tab_id(&value_for("--tab")?));
+                index += 2;
+            }
+            // #398. Not an alias pair: `--active` is "the workspace you are
+            // looking at", which the server remembers, and `--here` is "the
+            // workspace your own pane is in", which the server attests from
+            // the caller's process ancestry. The second was originally spelled
+            // as an alias of the first and promised a locality the code did
+            // not implement; for a caller in a pane of a background space those
+            // are different workspaces, which is the #398 defect with the
+            // exemption bolted on.
+            "--active" => {
+                flags.active = true;
+                index += 1;
+            }
+            "--here" => {
+                flags.here = true;
+                index += 1;
+            }
+            "--split" => {
+                flags.split = Some(
+                    super::parse_split_direction(&value_for("--split")?)
+                        .map_err(|err| err.to_string())?,
+                );
+                index += 2;
+            }
+            "--focus" => {
+                flags.focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                flags.focus = false;
+                index += 1;
+            }
+            "--wait-ready" => {
+                flags.wait_ready = true;
+                index += 1;
+            }
+            "--ready-timeout" => {
+                let value = value_for("--ready-timeout")?;
+                flags.ready_timeout_ms = Some(
+                    super::parse_u64_flag("--ready-timeout", &value)
+                        .map_err(|err| err.to_string())?,
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+
+    if flags.ready_timeout_ms.is_some() && !flags.wait_ready {
+        return Err("--ready-timeout only means something with --wait-ready".into());
+    }
+    Ok(flags)
+}
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
@@ -63,80 +176,24 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    let mut cwd = None;
-    let mut workspace_id = None;
-    let mut tab_id = None;
-    let mut split = None;
-    let mut focus = false;
-    let mut wait_ready = false;
-    let mut ready_timeout_ms = None;
-
-    let mut index = 1;
-    while index < separator {
-        match args[index].as_str() {
-            "--cwd" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --cwd");
-                    return Ok(2);
-                };
-                cwd = Some(value.clone());
-                index += 2;
-            }
-            "--workspace" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --workspace");
-                    return Ok(2);
-                };
-                workspace_id = Some(super::normalize_workspace_id(value));
-                index += 2;
-            }
-            "--tab" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --tab");
-                    return Ok(2);
-                };
-                tab_id = Some(super::normalize_tab_id(value));
-                index += 2;
-            }
-            "--split" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --split");
-                    return Ok(2);
-                };
-                split = Some(super::parse_split_direction(value)?);
-                index += 2;
-            }
-            "--focus" => {
-                focus = true;
-                index += 1;
-            }
-            "--no-focus" => {
-                focus = false;
-                index += 1;
-            }
-            "--wait-ready" => {
-                wait_ready = true;
-                index += 1;
-            }
-            "--ready-timeout" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --ready-timeout");
-                    return Ok(2);
-                };
-                ready_timeout_ms = Some(super::parse_u64_flag("--ready-timeout", value)?);
-                index += 2;
-            }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
+    let flags = match parse_agent_start_flags(args, separator) {
+        Ok(flags) => flags,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return Ok(2);
         }
-    }
-
-    if ready_timeout_ms.is_some() && !wait_ready {
-        eprintln!("--ready-timeout only means something with --wait-ready");
-        return Ok(2);
-    }
+    };
+    let AgentStartFlags {
+        cwd,
+        workspace_id,
+        tab_id,
+        active,
+        here,
+        split,
+        focus,
+        wait_ready,
+        ready_timeout_ms,
+    } = flags;
 
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
@@ -146,6 +203,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             workspace_id,
             tab_id,
             split,
+            active,
+            here,
             focus,
             argv: args[separator + 1..].to_vec(),
         }),
@@ -650,6 +709,22 @@ fn print_agent_help() {
     eprintln!(
         "    a cwd matching nothing gets a space of its own, and --workspace/--tab still win"
     );
+    eprintln!(
+        "  --active names the workspace you are LOOKING AT as the placement; --here names the"
+    );
+    eprintln!(
+        "    workspace your own PANE is in, read from your process ancestry rather than from"
+    );
+    eprintln!("    what was last focused — so a script run from a background space gets its own");
+    eprintln!("    space, not the one somebody is looking at;");
+    eprintln!(
+        "  a start with no placement at all is refused unless the caller is running inside a"
+    );
+    eprintln!("    pane of this session, because \"the workspace you are looking at\" is only an");
+    eprintln!(
+        "    answer to a caller that has one — so ssh dispatch and resume scripts are told to"
+    );
+    eprintln!("    pass --workspace/--tab/--cwd, or --active, instead of being placed at random;");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"
@@ -657,4 +732,111 @@ fn print_agent_help() {
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
     eprintln!("    working or blocked is a real answer rather than flock not being able to tell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_agent_start_flags, AGENT_START_USAGE};
+
+    /// `-- active` is the terminator in these tests, so the parser sees exactly
+    /// what it would see on the command line before the child's argv.
+    fn flags(words: &[&str]) -> Result<super::AgentStartFlags, String> {
+        let mut args = vec!["worker".to_string()];
+        args.extend(words.iter().map(|word| word.to_string()));
+        args.push("--".into());
+        args.push("claude".into());
+        let separator = args.iter().position(|arg| arg == "--").expect("terminator");
+        parse_agent_start_flags(&args, separator)
+    }
+
+    /// #398: the flags have to actually reach the request, and they have to
+    /// arrive as TWO fields. The server-side gate is only escapable by a caller
+    /// that asked for a placement, so a parser that dropped either would leave a
+    /// headless dispatcher with a refusal and no way out of it — and a parser
+    /// that mapped `--here` onto `active` would answer "the space my pane is
+    /// in" with "the space somebody last looked at", which is the bug the two
+    /// questions exist to keep apart.
+    #[test]
+    fn active_and_here_are_separate_requests_not_one_flag_twice() {
+        let parsed = flags(&["--active"]).expect("a flag this build documents");
+        assert!(
+            parsed.active,
+            "--active asks for the workspace being looked at"
+        );
+        assert!(!parsed.here, "and nothing else");
+
+        let parsed = flags(&["--here"]).expect("a flag this build documents");
+        assert!(parsed.here, "--here asks for the caller's own space");
+        assert!(
+            !parsed.active,
+            "--here must not be answered by the remembered workspace"
+        );
+
+        let parsed = flags(&["--active", "--here"]).expect("parses");
+        assert!(
+            parsed.active && parsed.here,
+            "both may be sent; the server refuses the combination, since only it knows whether \
+             they name different spaces"
+        );
+    }
+
+    /// Absent means "not asked for", which the server reads as a refusal rather
+    /// than a guess. A parser defaulting it the other way would reopen the bug.
+    #[test]
+    fn a_start_without_the_flag_does_not_ask_for_the_active_workspace() {
+        let parsed = flags(&["--cwd", "/tmp"]).expect("parses");
+        assert!(!parsed.active && !parsed.here);
+        let parsed = flags(&["--split", "right"]).expect("parses");
+        assert!(!parsed.active && !parsed.here);
+    }
+
+    /// `--no-focus` is the CLI's DEFAULT, which is why #398 could not use it as
+    /// the headless signal. Pins the two as independent: a caller may name the
+    /// active workspace and still not want to be taken to it.
+    #[test]
+    fn focus_and_the_active_workspace_are_independent_flags() {
+        let parsed = flags(&["--active", "--no-focus"]).expect("parses");
+        assert!(parsed.active && !parsed.here);
+        assert!(!parsed.focus);
+
+        let parsed = flags(&["--here", "--focus"]).expect("parses");
+        assert!(parsed.here && !parsed.active);
+        assert!(parsed.focus);
+    }
+
+    /// The `--` terminator ends the flags, so a value that looks like one is
+    /// data. `--cwd --active` is a cwd named `--active`, not a placement.
+    #[test]
+    fn a_value_is_never_read_as_a_flag() {
+        let parsed = flags(&["--cwd", "--active", "--split", "right"]).expect("parses");
+        assert_eq!(parsed.cwd.as_deref(), Some("--active"));
+        assert!(
+            !parsed.active && !parsed.here,
+            "the flag loop must stop at the value it just consumed"
+        );
+        assert_eq!(
+            parsed.split,
+            Some(crate::api::schema::SplitDirection::Right)
+        );
+    }
+
+    #[test]
+    fn a_flag_missing_its_value_is_refused_by_name() {
+        for (words, flag) in [
+            (vec!["--cwd"], "--cwd"),
+            (vec!["--split"], "--split"),
+            (vec!["--workspace"], "--workspace"),
+        ] {
+            let err = flags(&words).expect_err("a value-taking flag needs a value");
+            assert_eq!(err, format!("missing value for {flag}"));
+        }
+    }
+
+    /// The help row and the parser have to agree in both directions, or a
+    /// caller is told about a flag that does nothing.
+    #[test]
+    fn the_usage_line_documents_the_flag_the_parser_accepts() {
+        assert!(AGENT_START_USAGE.contains("[--active|--here]"));
+        assert!(AGENT_START_USAGE.contains("[--split"));
+    }
 }

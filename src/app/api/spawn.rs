@@ -23,7 +23,7 @@ use super::responses::{encode_error, encode_error_with_data, encode_success};
 /// Process ancestry of the API peer is the only evidence either way. A
 /// caller-supplied identity would be a claim, and depth is exactly the thing a
 /// runaway caller would want to lie about.
-pub(super) enum SpawnCaller {
+pub(in crate::app) enum SpawnCaller {
     /// Ancestry attests a live pane that is running an agent. Whatever it
     /// asks for is agent-initiated, whichever verb it reached for.
     Agent {
@@ -46,7 +46,71 @@ pub(super) enum SpawnCaller {
     /// unbounded. `agent.spawn` has no CLI surface at all — every caller is an
     /// MCP client — so an unattested one there is a caller the ceiling cannot
     /// bound, and it refuses.
-    Operator,
+    ///
+    /// `pane` is what #398 added, and it is the one distinction the unit
+    /// variant threw away. An operator sitting in a pane of this session is
+    /// somewhere flock can point at; an operator's terminal three windows away
+    /// — and an ssh dispatch, and a launchd job — are not. Both are the
+    /// operator, so both are unbounded for the ceiling; only the first has a
+    /// "here" for placement to mean.
+    Operator {
+        /// The pane the peer's ancestry landed in, when it landed anywhere.
+        pane: Option<(usize, crate::layout::PaneId)>,
+    },
+}
+
+impl SpawnCaller {
+    /// May "the workspace the operator last focused" stand in for a placement
+    /// this caller did not name? (#398)
+    ///
+    /// True for exactly one shape: an operator attested INSIDE a pane of this
+    /// session. That is the caller `--split` was written for — it is asking to
+    /// put a pane beside the one it is sitting in, and "the active workspace"
+    /// is a real answer to that question. Everything else must say where it
+    /// means, with `--workspace`, `--tab`, `--cwd`, or `--active`.
+    ///
+    /// Note what this does NOT claim: ancestry cannot see a keyboard. It
+    /// cannot tell a human typing in a pane from a resume script running in
+    /// one, and it cannot tell an operator's terminal outside flock from an
+    /// ssh dispatch — both are unattested, so both are refused, and the one
+    /// flag that gets the old behaviour back is `--active`. The alternative
+    /// was a TTY stamp from the client, which is a claim the server cannot
+    /// verify (pitfall 5 in #398): any caller could allocate a pty and turn
+    /// the guess back on.
+    ///
+    /// An AGENT pane is not here either. ADR-0014 §7 already holds that an
+    /// agent-initiated call is not a human keystroke, so its "here" is
+    /// somebody else's decision.
+    pub(in crate::app) fn may_default_to_active(&self) -> bool {
+        matches!(self, SpawnCaller::Operator { pane: Some(_) })
+    }
+
+    /// The workspace this caller's OWN pane is in — the "here" `--here` means,
+    /// and the only placement default that is a locality rather than a
+    /// recollection.
+    ///
+    /// The distinction from [`Self::may_default_to_active`] is the whole reason
+    /// this accessor exists. `state.active` is whichever workspace a human last
+    /// focused, which for a caller sitting in a pane of some *other* space is
+    /// somewhere else entirely: a resume script run from a pane in the
+    /// background would be answered with the space the operator is looking at,
+    /// which is #398's defect with the exemption bolted on. Ancestry knows
+    /// which workspace the caller is actually in, so `--here` asks the
+    /// attested question rather than the remembered one.
+    ///
+    /// Both classes can have a pane, and both get a real answer here: an agent
+    /// asking to place something beside itself is naming an address, not
+    /// asking for a default. What neither gets is `may_default_to_active` —
+    /// having a "here" is not a claim to be a keystroke.
+    pub(in crate::app) fn own_workspace(&self) -> Option<usize> {
+        match self {
+            SpawnCaller::Agent { ws_idx, .. } => Some(*ws_idx),
+            SpawnCaller::Operator {
+                pane: Some((ws_idx, _)),
+            } => Some(*ws_idx),
+            SpawnCaller::Operator { pane: None } => None,
+        }
+    }
 }
 
 /// The lineage a child admitted by the funnel must be stamped with.
@@ -263,10 +327,16 @@ impl App {
     /// is running one. Anything else — a shell pane, an operator's terminal
     /// outside flock, a caller ancestry cannot place at all — is the operator,
     /// because none of them is an agent whose children the ceiling is counting.
-    pub(super) fn spawn_caller(&mut self) -> SpawnCaller {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)
-        else {
-            return SpawnCaller::Operator;
+    ///
+    /// The pane the ancestry landed in rides along (#398) rather than being
+    /// discarded: placement needs to tell "the operator is in here" from "the
+    /// operator is somewhere else", and this is the walk that knows. One walk,
+    /// one answer — a second classification over the same evidence is the
+    /// drift #124 / #197 / #199-#210 are.
+    pub(in crate::app) fn spawn_caller(&mut self) -> SpawnCaller {
+        let peer_pane = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
+        let Some((ws_idx, pane_id)) = peer_pane else {
+            return SpawnCaller::Operator { pane: None };
         };
         let agent_id = self
             .state
@@ -283,7 +353,9 @@ impl App {
                 pane_id,
                 agent_id,
             },
-            None => SpawnCaller::Operator,
+            None => SpawnCaller::Operator {
+                pane: Some((ws_idx, pane_id)),
+            },
         }
     }
 
@@ -625,19 +697,30 @@ mod tests {
                 assert_eq!(resolved, pane_id);
                 assert_eq!(resolved_id, agent_id);
             }
-            super::SpawnCaller::Operator => panic!("an agent pane must attest as an agent"),
+            super::SpawnCaller::Operator { .. } => panic!("an agent pane must attest as an agent"),
         }
     }
 
     /// An operator's own shell — inside flock or outside it — is not an agent,
     /// and neither is a caller ancestry cannot place at all. Both read as the
     /// operator, because neither is an agent whose children the cap counts.
+    ///
+    /// #398 added the distinction WITHIN the operator, and it is the one that
+    /// matters for placement: the shell pane is somewhere flock can point at,
+    /// and the unattested caller is not. Asserted here as well as asserted at
+    /// the placement site, because the predicate these tests read is the one
+    /// `agent.start` gates a refusal on.
     #[tokio::test]
-    async fn an_operators_shell_and_an_unattested_caller_are_both_the_operator() {
+    async fn an_operators_shell_is_not_an_agent_and_only_the_in_pane_one_has_a_here() {
         let mut app = app_with_one_pane();
+        let unattested = app.spawn_caller();
         assert!(
-            matches!(app.spawn_caller(), super::SpawnCaller::Operator),
+            matches!(unattested, super::SpawnCaller::Operator { pane: None }),
             "no peer pid attests nothing"
+        );
+        assert!(
+            !unattested.may_default_to_active(),
+            "a caller ancestry cannot place has no here, so the active workspace cannot answer for it"
         );
 
         let pane_id = app.state.workspaces[0]
@@ -645,9 +728,28 @@ mod tests {
             .expect("workspace has a pane");
         app.test_pane_child_pids.insert(pane_id, std::process::id());
         app.current_api_peer_pid = Some(std::process::id());
+        let in_pane = app.spawn_caller();
         assert!(
-            matches!(app.spawn_caller(), super::SpawnCaller::Operator),
+            matches!(in_pane, super::SpawnCaller::Operator { pane: Some((0, _)) }),
             "a shell pane is the operator's, not an agent's"
+        );
+        assert!(
+            in_pane.may_default_to_active(),
+            "and it is the one caller 'beside what I am looking at' means something to"
+        );
+    }
+
+    /// An agent pane is attested — ancestry found it — and is still not a
+    /// keystroke. ADR-0014 §7 already holds that an agent-initiated call is
+    /// not a human one, so the active workspace does not stand in for a
+    /// placement it never named.
+    #[tokio::test]
+    async fn an_agent_pane_is_attested_but_has_no_active_workspace_default() {
+        let mut app = app_with_one_pane();
+        caller_pane_is_an_agent(&mut app);
+        assert!(
+            !app.spawn_caller().may_default_to_active(),
+            "the ceiling already treats an agent as not-an-operator, and placement agrees"
         );
     }
 
