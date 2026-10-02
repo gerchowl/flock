@@ -4,11 +4,11 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    Method, PaneClearHeaderFieldParams, PaneListParams, PaneMoveDestination, PaneMoveParams,
-    PaneReadParams, PaneRenameParams, PaneReportAgentParams, PaneReportMetadataParams,
-    PaneReportRecapParams, PaneReportReplyParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSetHeaderFieldParams, PaneSplitParams, PaneTarget, ReadFormat,
-    ReadSource, Request, SplitDirection,
+    Method, PaneAgentState, PaneClearHeaderFieldParams, PaneListParams, PaneMoveDestination,
+    PaneMoveParams, PaneReadParams, PaneRenameParams, PaneReportAgentParams,
+    PaneReportMetadataParams, PaneReportRecapParams, PaneReportReplyParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSetHeaderFieldParams, PaneSplitParams, PaneTarget,
+    ReadFormat, ReadSource, Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -549,13 +549,44 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
-fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-        return Ok(2);
-    };
+const REPORT_AGENT_USAGE: &str = "usage: flk pane report-agent [<pane_id>] --source ID --agent LABEL --state idle|working|blocked|unknown [--pane <pane_id>] [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]";
 
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+/// Everything `flk pane report-agent` was told, before the pane is resolved.
+///
+/// `pane_id` stays `None` when the caller named no pane, so the resolution
+/// happens in one place ([`pane_report_agent`]) rather than in the parser.
+#[derive(Debug, Clone, PartialEq)]
+struct ReportAgentArgs {
+    pane_id: Option<String>,
+    source: String,
+    agent: String,
+    state: PaneAgentState,
+    message: Option<String>,
+    custom_status: Option<String>,
+    seq: Option<u64>,
+    agent_session_id: Option<String>,
+    agent_session_path: Option<String>,
+}
+
+/// Parse `flk pane report-agent`'s argv (#454).
+///
+/// Split out from [`pane_report_agent`] and pure, because the defect this
+/// fixes is a PARSING defect and asserting on it must not need a server: the
+/// pane id used to be a required positional read as `args[0]`, so a caller
+/// that omitted it had its first flag eaten as the pane id — and the first
+/// flag is `--source`. A reporting hook wraps its call in
+/// `>/dev/null 2>&1 || true` (a hook must never break what it reports on), so
+/// that swallow turned every state transition into a discard.
+///
+/// The pane id is therefore optional and resolves exactly the way
+/// `report-recap`/`report-reply` resolve it: `--pane`, else the legacy leading
+/// positional, else the calling pane ($FLOCK_PANE_ID, healed server-side by
+/// socket-peer process ancestry). A flag can no longer be consumed as the pane
+/// id, and a bare word that arrives after the first token is refused by name
+/// rather than adopted — so this verb is no laxer than its siblings about a
+/// caller's stray word.
+fn parse_report_agent_args(args: &[String]) -> Result<ReportAgentArgs, String> {
+    let mut pane_id: Option<String> = None;
     let mut source = None;
     let mut agent = None;
     let mut state = None;
@@ -565,77 +596,96 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     let mut agent_session_id = None;
     let mut agent_session_path = None;
 
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
+        let arg = args[index].as_str();
+        // The pane id is positional and comes FIRST, so only the first token
+        // may be one. Every value-taking arm below reads `args[index + 1]`,
+        // which is why a flag's value never reaches this test — but a bare
+        // word arriving AFTER the first token is not a pane id the caller
+        // meant: it is an unquoted multi-word value (`--message waiting`).
+        // Reading it as the pane would report to a pane nobody named, which
+        // is the shape of trap #454 moved rather than closed, and it would
+        // make this verb laxer than report-recap/report-reply, which have no
+        // positional at all and refuse such a word by name.
+        if index == 0 && !arg.starts_with('-') {
+            pane_id = Some(super::normalize_pane_id(arg));
+            index += 1;
+            continue;
+        }
+        match arg {
+            "--pane" => {
+                // No flock pane id can begin with `-` (the server accepts only
+                // `p_<n>`, `p_<ws>_<n>`, `<ws>:p<n>` and legacy `<ws>-<n>`), so
+                // a flag here is a missing value, not an exotic pane id. Naming
+                // that is the difference between a diagnosis and a puzzle.
+                match args.get(index + 1) {
+                    Some(value) if !value.starts_with('-') => {}
+                    _ => return Err("missing value for --pane".to_string()),
+                }
+                if pane_id.is_some() {
+                    return Err("the pane id was already given".to_string());
+                }
+                pane_id = Some(super::normalize_pane_id(&args[index + 1]));
+                index += 2;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --source");
-                    return Ok(2);
+                    return Err("missing value for --source".to_string());
                 };
                 source = Some(value.clone());
                 index += 2;
             }
             "--agent" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --agent");
-                    return Ok(2);
+                    return Err("missing value for --agent".to_string());
                 };
                 agent = Some(value.clone());
                 index += 2;
             }
             "--state" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --state");
-                    return Ok(2);
+                    return Err("missing value for --state".to_string());
                 };
-                state = Some(super::parse_pane_agent_state(value)?);
+                state = Some(super::parse_pane_agent_state(value).map_err(|err| err.to_string())?);
                 index += 2;
             }
             "--message" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --message");
-                    return Ok(2);
+                    return Err("missing value for --message".to_string());
                 };
                 message = Some(value.clone());
                 index += 2;
             }
             "--custom-status" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --custom-status");
-                    return Ok(2);
+                    return Err("missing value for --custom-status".to_string());
                 };
                 custom_status = Some(value.clone());
                 index += 2;
             }
             "--seq" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --seq");
-                    return Ok(2);
+                    return Err("missing value for --seq".to_string());
                 };
-                seq = Some(super::parse_u64_flag("--seq", value)?);
+                seq = Some(super::parse_u64_flag("--seq", value).map_err(|err| err.to_string())?);
                 index += 2;
             }
             "--agent-session-id" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --agent-session-id");
-                    return Ok(2);
+                    return Err("missing value for --agent-session-id".to_string());
                 };
                 agent_session_id = Some(value.clone());
                 index += 2;
             }
             "--agent-session-path" => {
                 let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --agent-session-path");
-                    return Ok(2);
+                    return Err("missing value for --agent-session-path".to_string());
                 };
                 agent_session_path = Some(value.clone());
                 index += 2;
             }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
+            other => return Err(format!("unknown option: {other}")),
         }
     }
 
@@ -643,19 +693,16 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         let source = source.trim().to_string();
         (!source.is_empty()).then_some(source)
     }) else {
-        eprintln!("missing required --source");
-        return Ok(2);
+        return Err("missing required --source".to_string());
     };
     let Some(agent) = agent else {
-        eprintln!("missing required --agent");
-        return Ok(2);
+        return Err("missing required --agent".to_string());
     };
     let Some(state) = state else {
-        eprintln!("missing required --state");
-        return Ok(2);
+        return Err("missing required --state".to_string());
     };
 
-    super::send_ok_request(Method::PaneReportAgent(PaneReportAgentParams {
+    Ok(ReportAgentArgs {
         pane_id,
         source,
         agent,
@@ -665,6 +712,42 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         seq,
         agent_session_id,
         agent_session_path,
+    })
+}
+
+/// `flk pane report-agent`: report an agent lifecycle state onto a pane.
+///
+/// The pane id is optional (#454) and defaults to the calling pane, the same
+/// resolution `report-recap` and `report-reply` use — so the reporting verbs
+/// agree on how a pane is supplied. A parse failure exits 2 with the reason on
+/// stderr, and when no pane resolves at all the server answers
+/// `pane_not_found`, which [`super::send_ok_request`] turns into exit 1.
+///
+/// That narrows #454's trap; it does not make the failure unswallowable. A
+/// reporter that omits the pane, has no `$FLOCK_PANE_ID`, and whose ancestry
+/// the server cannot attribute still gets `pane_not_found` → exit 1, which a
+/// `|| true` eats — the same as `report-recap` has always behaved. What is
+/// fixed is the parser: a flag can no longer be consumed as the pane id.
+fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
+    let parsed = match parse_report_agent_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            eprintln!("{REPORT_AGENT_USAGE}");
+            return Ok(2);
+        }
+    };
+
+    super::send_ok_request(Method::PaneReportAgent(PaneReportAgentParams {
+        pane_id: parsed.pane_id.unwrap_or_else(calling_pane_id),
+        source: parsed.source,
+        agent: parsed.agent,
+        state: parsed.state,
+        message: parsed.message,
+        custom_status: parsed.custom_status,
+        seq: parsed.seq,
+        agent_session_id: parsed.agent_session_id,
+        agent_session_path: parsed.agent_session_path,
     }))
 }
 
@@ -1164,7 +1247,7 @@ fn pane_help_text() -> String {
     let _ = writeln!(out, "  flk pane close <pane_id>");
     let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
     let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
-    let _ = writeln!(out, "  flk pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+    let _ = writeln!(out, "  flk pane report-agent [<pane_id>] --source ID --agent LABEL --state idle|working|blocked|unknown [--pane <pane_id>] [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     let _ = writeln!(out, "  flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
     let _ = writeln!(
         out,
@@ -1200,6 +1283,15 @@ fn pane_help_text() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
+        "report-agent, report-recap and report-reply all take an optional pane id: a leading"
+    );
+    let _ = writeln!(
+        out,
+        "positional or --pane. With neither, the report lands on the calling pane."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
         "report-recap appends a Stop-hook recap to the pane's prompt-history scrollback"
     );
     let _ = writeln!(
@@ -1227,7 +1319,28 @@ fn print_pane_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_help_text, pane_run_steps, PaneRunStep};
+    use super::{
+        pane_help_text, pane_run_steps, parse_report_agent_args, PaneRunStep, ReportAgentArgs,
+    };
+    use crate::api::schema::PaneAgentState;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn working(source: &str) -> ReportAgentArgs {
+        ReportAgentArgs {
+            pane_id: None,
+            source: source.to_string(),
+            agent: "zzz".to_string(),
+            state: PaneAgentState::Working,
+            message: None,
+            custom_status: None,
+            seq: None,
+            agent_session_id: None,
+            agent_session_path: None,
+        }
+    }
 
     /// #362 (4): `pane run` sent the text and the Enter as one burst, and a
     /// TUI that reads raw stdin cannot tell that burst from a paste — so the
@@ -1292,6 +1405,260 @@ mod tests {
         assert!(
             help.contains("~1000 rendered lines"),
             "help should explain the cap semantics"
+        );
+    }
+
+    /// #454: the pane id used to be a required positional read as `args[0]`,
+    /// so a caller that omitted it had its FIRST flag eaten as the pane id —
+    /// and the first flag is `--source`. The reporting hook that hit this
+    /// wrapped its call in `>/dev/null 2>&1 || true`, so every state
+    /// transition became a discard and the orchestrator looked wired up while
+    /// observing nothing.
+    #[test]
+    fn a_leading_source_flag_is_a_flag_and_not_a_pane_id() {
+        assert_eq!(
+            parse_report_agent_args(&argv(&[
+                "--source",
+                "ax-dispatch",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+            ])),
+            Ok(working("ax-dispatch")),
+            "with no pane named, the report targets the calling pane — the flags \
+             must survive intact rather than one of them becoming the pane id"
+        );
+    }
+
+    /// The form `scripts/seed_navigator_demo.sh:90` uses, and the form the
+    /// docs show. Breaking it would break the callers that already work.
+    /// Note that the integration hook assets do NOT come through here: they
+    /// either shell to `flk hook <agent>` (which builds the request in Rust)
+    /// or speak the socket directly, so neither parses this argv.
+    #[test]
+    fn the_legacy_positional_pane_id_still_parses() {
+        assert_eq!(
+            parse_report_agent_args(&argv(&[
+                "p_12",
+                "--source",
+                "ax-dispatch",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+            ])),
+            Ok(ReportAgentArgs {
+                pane_id: Some("p_12".into()),
+                ..working("ax-dispatch")
+            })
+        );
+    }
+
+    /// `report-recap`/`report-reply` spell the same pane `--pane`; so does
+    /// report-agent now, so one reporter can target a pane the same way for
+    /// every report verb.
+    #[test]
+    fn a_pane_flag_names_the_pane_like_the_other_report_verbs() {
+        assert_eq!(
+            parse_report_agent_args(&argv(&[
+                "--pane",
+                "p_12",
+                "--source",
+                "ax-dispatch",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+            ])),
+            Ok(ReportAgentArgs {
+                pane_id: Some("p_12".into()),
+                ..working("ax-dispatch")
+            })
+        );
+    }
+
+    /// A pane id named twice is a caller bug, not a pane to guess at: quietly
+    /// preferring one of the two would put the report on a pane the caller did
+    /// not mean.
+    #[test]
+    fn naming_the_pane_twice_is_refused() {
+        let err = parse_report_agent_args(&argv(&[
+            "p_1", "--pane", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+        ]))
+        .expect_err("two panes are ambiguous");
+        assert!(
+            err.contains("pane"),
+            "the refusal must say the pane is the problem: {err}"
+        );
+
+        // A second BARE word is not a second pane the parser can diagnose — it
+        // reaches the unknown-option arm, which is exactly how `report-recap`
+        // and `report-reply` treat a stray word. The verb stays strict, and the
+        // message is the sibling one.
+        let err = parse_report_agent_args(&argv(&[
+            "p_1", "p_2", "--source", "s", "--agent", "a", "--state", "idle",
+        ]))
+        .expect_err("a second bare word is not a pane");
+        assert!(
+            err.contains("unknown option"),
+            "a stray word is refused by name, as the sibling verbs do: {err}"
+        );
+    }
+
+    /// #454 follow-up: the fix must not have MOVED the trap rather than closed
+    /// it. Accepting the positional only at index 0 is what keeps this true —
+    /// with the guard at every position, `--message waiting` set the pane id to
+    /// `waiting` and exited 0, where the old parser said `unknown option:
+    /// waiting` and exited 2.
+    #[test]
+    fn a_stray_bare_word_after_a_flag_is_refused_not_eaten_as_the_pane() {
+        // A flag's OWN value belongs to that flag wherever it sits: `--message
+        // waiting` is a message, never a pane. What must be refused is a bare
+        // word no flag claimed — which is exactly what an unquoted multi-word
+        // value leaves behind (`--message waiting for the build`).
+        assert_eq!(
+            parse_report_agent_args(&argv(&[
+                "--source",
+                "ax",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+                "--message",
+                "waiting",
+            ])),
+            Ok(ReportAgentArgs {
+                message: Some("waiting".into()),
+                ..working("ax")
+            })
+        );
+
+        for args in [
+            // `--message waiting for the build` with the value unquoted.
+            argv(&[
+                "--source",
+                "ax",
+                "--agent",
+                "zzz",
+                "--state",
+                "working",
+                "--message",
+                "waiting",
+                "for",
+                "the",
+                "build",
+            ]),
+            // No flag at all claims the trailing word.
+            argv(&[
+                "--source", "ax", "--agent", "zzz", "--state", "working", "waiting",
+            ]),
+            // Nor when the pane was named with `--pane`…
+            argv(&[
+                "--pane", "p_1", "--source", "ax", "--agent", "a", "--state", "idle", "stray",
+            ]),
+            // …or with the leading positional.
+            argv(&[
+                "w1:p3", "--source", "ax", "--agent", "a", "--state", "idle", "stray",
+            ]),
+        ] {
+            let err = parse_report_agent_args(&args).expect_err("a stray word must be refused");
+            assert!(
+                err.contains("unknown option"),
+                "a stray word is refused by name, as the sibling verbs do: {err}"
+            );
+            assert!(
+                err.starts_with("unknown option"),
+                "and the word it refused leads the message: {err}"
+            );
+        }
+    }
+
+    /// `--pane` with no value, or with a flag where the value belongs. No flock
+    /// pane id can begin with `-`, so a flag there is a missing value — and
+    /// saying "unexpected argument: x" points at the wrong word entirely.
+    #[test]
+    fn a_pane_flag_without_a_value_says_so() {
+        for args in [
+            argv(&["--pane"]),
+            argv(&[
+                "--pane", "--source", "ax", "--agent", "a", "--state", "idle",
+            ]),
+        ] {
+            let err = parse_report_agent_args(&args).expect_err("--pane needs a pane id");
+            assert!(
+                err.contains("missing value for --pane"),
+                "the refusal must name the option that has no value: {err}"
+            );
+        }
+    }
+
+    /// An unrecognised flag is refused by name, and never read as the pane id —
+    /// the one shape that made this failure swallowable.
+    #[test]
+    fn an_unknown_option_is_refused_by_name() {
+        let err = parse_report_agent_args(&argv(&[
+            "--sauce",
+            "--source",
+            "ax-dispatch",
+            "--agent",
+            "zzz",
+            "--state",
+            "working",
+        ]))
+        .expect_err("an unknown option must be refused");
+        assert!(err.contains("--sauce"), "the refusal names the flag: {err}");
+    }
+
+    #[test]
+    fn a_missing_value_or_a_blank_source_is_refused_before_the_socket() {
+        for (args, expected) in [
+            (argv(&["--source", "ax", "--agent", "zzz"]), "--state"),
+            (argv(&["--source"]), "--source"),
+            (
+                argv(&["--source", "   ", "--agent", "zzz", "--state", "working"]),
+                "missing required --source",
+            ),
+            (
+                argv(&["--source", "ax", "--state", "working"]),
+                "missing required --agent",
+            ),
+        ] {
+            let err = parse_report_agent_args(&args).expect_err("this must not reach the socket");
+            assert!(err.contains(expected), "expected {expected:?}, got {err:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_state_is_refused_by_name() {
+        let err = parse_report_agent_args(&argv(&[
+            "--source",
+            "ax",
+            "--agent",
+            "zzz",
+            "--state",
+            "pondering",
+        ]))
+        .expect_err("an unknown state must be refused");
+        assert!(
+            err.contains("pondering"),
+            "the refusal names the value: {err}"
+        );
+    }
+
+    #[test]
+    fn help_advertises_an_optional_pane_for_report_agent() {
+        let help = pane_help_text();
+        assert!(
+            help.contains("flk pane report-agent [<pane_id>] --source ID"),
+            "help must show the pane id as optional, or the next reader assumes \
+             it is still required: {help}"
+        );
+        assert!(
+            help.contains(
+                "report-agent, report-recap and report-reply all take an optional pane id"
+            ),
+            "help should say the reporting verbs agree on how a pane is supplied"
         );
     }
 }
