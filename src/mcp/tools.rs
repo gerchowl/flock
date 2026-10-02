@@ -883,6 +883,27 @@ mod tests {
         );
     }
 
+    /// The schema is generated from the enum, so the caller-visible set of
+    /// launchable agents widens with a variant and no schema edit. Asserted
+    /// against the enum rather than a restated literal list, so this is a
+    /// statement about the wiring — and one that would fail if someone ever
+    /// hand-wrote the enum here and let the two drift.
+    #[test]
+    fn the_agent_start_schema_advertises_exactly_the_spawn_agent_kinds() {
+        let descriptor = super::find("flock_agent_start")
+            .expect("the tool exists")
+            .descriptor();
+        assert_eq!(
+            descriptor["inputSchema"]["properties"]["agent"]["enum"],
+            json!(crate::spawn::AgentKind::supported())
+        );
+        assert_eq!(
+            descriptor["inputSchema"]["properties"]["agent"]["enum"],
+            json!(["claude", "opencode"]),
+            "a caller can launch opencode over MCP without a schema change (#452)"
+        );
+    }
+
     #[test]
     fn every_descriptor_has_required_fields() {
         for tool in table() {

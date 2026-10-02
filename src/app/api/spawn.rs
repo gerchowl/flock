@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(error["data"]["retryable"], false);
         assert_eq!(
             error["data"]["supported"],
-            serde_json::json!(["claude"]),
+            serde_json::json!(["claude", "opencode"]),
             "the refusal must name what IS accepted"
         );
     }
