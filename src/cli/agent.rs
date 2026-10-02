@@ -38,7 +38,15 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+/// The usage lines live here rather than inside the parsers that print them,
+/// because `cli::help` answers `flk agent <verb> --help` from the same
+/// constants (#455) — one answer per verb, not two that can disagree.
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
+
+pub(super) const AGENT_WAIT_USAGE: &str =
+    "flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]";
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
@@ -165,9 +173,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
 /// prompt; omitting the flag uses the `worktrees.branch_pivot_message`
 /// template with `<branch>` resolved server-side.
 fn agent_fork(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
     let Some(target) = args.first() else {
-        eprintln!("{USAGE}");
+        eprintln!("usage: {AGENT_FORK_USAGE}");
         return Ok(2);
     };
 
@@ -359,9 +366,6 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
     crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
     Ok(0)
 }
-
-const AGENT_WAIT_USAGE: &str =
-    "flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]";
 
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {

@@ -45,25 +45,38 @@ use serde::{Deserialize, Serialize};
 /// Which agent a spawn may launch. CLOSED — a free string would let a caller
 /// select a weaker-sandboxed profile, or name a binary outright. Adding an
 /// agent is a variant here plus its argv assembly, never a config string that
-/// reaches a shell (ADR-0014 §1).
+/// reaches a shell (ADR-0014 §1, ADR-0020 §1).
+///
+/// Closure is a type-level invariant, not a "claude only for now" policy: the
+/// caller names an agent and flock assembles that agent's argv server-side
+/// from the reviewed arms below. It also means this enum is not where an
+/// argv reaches the environment — `allowlist::for_argv` and
+/// `env::agent_for_argv` resolve the child's agent from argv[0], so a kind
+/// only needs a variant here and its own argv to be fully wired, and
+/// `allowlist`'s tests fail the build if a variant assembles an argv[0]
+/// `identify_agent` does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     Claude,
+    OpenCode,
 }
 
 impl AgentKind {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "claude" => Some(Self::Claude),
+            "opencode" => Some(Self::OpenCode),
             _ => None,
         }
     }
 
     /// Every kind a caller may name. Echoed in the `unknown_agent_kind`
-    /// refusal so a caller learns the set without a docs round-trip.
+    /// refusal so a caller learns the set without a docs round-trip, and
+    /// generated into the MCP tool's `agent` enum, so a new variant widens
+    /// the schema without a second edit (ADR-0020 §1).
     pub fn supported() -> &'static [&'static str] {
-        &["claude"]
+        &["claude", "opencode"]
     }
 
     /// Assemble the child's argv. This is the whole point of the closed enum:
@@ -83,6 +96,7 @@ impl AgentKind {
     pub fn argv(self, prompt: &prompt::SpawnPrompt) -> Vec<String> {
         match self {
             Self::Claude => vec!["claude".to_string(), prompt.as_argv_element().to_string()],
+            Self::OpenCode => vec!["opencode".to_string(), prompt.as_argv_element().to_string()],
         }
     }
 }
@@ -476,14 +490,50 @@ mod tests {
 
     /// A closed kind is the difference between "pick an agent" and "run a
     /// binary". An unknown name must not fall through to anything.
+    ///
+    /// Every hostile string is checked against BOTH kinds' neighbourhoods: the
+    /// closed set is a property of the whole enum, not a property of the one
+    /// variant that happened to be there first, so widening it must not widen
+    /// what parses (ADR-0020 §1).
     #[test]
     fn agent_kind_is_closed() {
         assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
-        for hostile in ["sh", "claude; rm -rf /", "CLAUDE", "", "../claude"] {
+        assert_eq!(AgentKind::parse("opencode"), Some(AgentKind::OpenCode));
+        for hostile in [
+            "sh",
+            "claude; rm -rf /",
+            "CLAUDE",
+            "",
+            "../claude",
+            // The opencode half of the same property: a shell string, a
+            // case variant, a relative path, and the two spellings
+            // `detect::identify_agent` accepts but a caller may NOT name —
+            // those resolve an operator's argv, never this enum.
+            "opencode; rm -rf /",
+            "OPENCODE",
+            "../opencode",
+            "open-code",
+            "opencode.exe",
+        ] {
             assert_eq!(
                 AgentKind::parse(hostile),
                 None,
                 "{hostile:?} must not parse"
+            );
+        }
+    }
+
+    /// Acceptance: every name `supported()` publishes parses, and parsing is
+    /// the only way in. The MCP tool schema and the `unknown_agent_kind`
+    /// refusal are both generated from this list, so a kind listed but not
+    /// parseable would be advertised and then refused (ADR-0020 §1).
+    #[test]
+    fn supported_is_exactly_the_parseable_set() {
+        assert_eq!(AgentKind::supported(), &["claude", "opencode"]);
+        for name in AgentKind::supported() {
+            assert!(
+                AgentKind::parse(name).is_some(),
+                "{name:?} is advertised to callers but does not parse"
             );
         }
     }
@@ -500,6 +550,28 @@ mod tests {
             argv[1].contains(raw),
             "the caller's text is carried verbatim, quoting and all"
         );
+    }
+
+    /// `[<agent name>, <prompt>]` for every kind, and the name is the same
+    /// string `parse` accepts — because argv[0] is what `agent_for_argv`
+    /// resolves the child's agent from. A kind whose argv[0] were, say, an
+    /// absolute path would still exec, but it would resolve to no agent and
+    /// silently lose every per-agent environment key
+    /// (`allowlist::every_supported_agent_kind_is_recognised_from_its_own_argv`
+    /// is the same property asserted through the environment).
+    #[test]
+    fn every_agent_kind_assembles_its_own_name_and_the_prompt() {
+        let composed = prompt::SpawnPrompt::compose("ship it").expect("valid");
+        for name in AgentKind::supported() {
+            let kind = AgentKind::parse(name).expect("supported kinds parse");
+            let argv = kind.argv(&composed);
+            assert_eq!(argv.len(), 2, "{name:?} assembled {argv:?}");
+            assert_eq!(
+                argv[0], *name,
+                "{name:?} must exec the name its own argv is resolved from"
+            );
+            assert_eq!(argv[1], composed.as_argv_element());
+        }
     }
 
     /// Every argv this enum assembles carries the preamble, because the only

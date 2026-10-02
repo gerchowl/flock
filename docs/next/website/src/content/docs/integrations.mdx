@@ -184,12 +184,14 @@ Integrations can report a short visual label without changing the semantic state
 For example, an agent can remain semantically `working` while showing `indexing` in the UI.
 
 ```bash
-flk pane report-agent 1-1 \
+flk pane report-agent \
   --source custom:docs \
   --agent docs-bot \
   --state working \
   --custom-status indexing
 ```
+
+A hook running inside the pane's agent can leave the pane id out: `report-agent` then reports to the calling pane, exactly as `report-recap` and `report-reply` do. Pass it as the leading argument, or with `--pane <pane_id>`, when the reporter runs outside the pane.
 
 User hooks that run next to a Flock-managed integration should use metadata instead of `report-agent`. Metadata changes presentation without taking over the integration's `idle`, `working`, `blocked`, or session restore authority. `--agent` guards the report so it only applies while that authoritative agent is active. `--applies-to-source` guards the report so it only applies while that lifecycle authority source is active. `--display-agent` changes the visible name.
 
