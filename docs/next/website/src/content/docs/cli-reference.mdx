@@ -201,16 +201,19 @@ flk pane run <pane_id> <command>
 Report agent state from custom hooks:
 
 ```bash
-flk pane report-agent <pane_id> \
+flk pane report-agent [<pane_id>] \
   --source ID \
   --agent LABEL \
   --state idle|working|blocked|unknown \
+  [--pane <pane_id>] \
   [--message TEXT] \
   [--custom-status TEXT] \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH]
 ```
+
+The pane id is optional, as it is for `report-recap` and `report-reply`: name it as the leading argument or with `--pane`, and with neither the report lands on the calling pane — the one your hook is running in, resolved from `$FLOCK_PANE_ID` or from process ancestry. A pane that cannot be resolved is refused with `pane_not_found` and a non-zero exit, so a hook that only checks the exit status cannot mistake a discarded report for a delivered one.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
