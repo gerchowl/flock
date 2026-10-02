@@ -67,6 +67,11 @@ pub struct WorktreeRemoveResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeKillAllResult {
     pub outcomes: Vec<(String, Result<(), String>)>,
+    /// Rows whose removal git refused first and the sweep cleared by forcing
+    /// (#402). Separate from `outcomes` because a recovered row is still an
+    /// `Ok`, and an `Ok` that quietly cost a `--force` is exactly what the
+    /// sweep's own operator should not have to find in a log file.
+    pub force_recovered: Vec<String>,
 }
 
 /// An event from a background task to the main loop.
