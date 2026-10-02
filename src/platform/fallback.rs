@@ -1,9 +1,21 @@
 use std::path::PathBuf;
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{ClipboardImage, ForegroundJob, SessionHealth, Signal};
 
 /// Unsupported platform stub.
 pub fn raise_server_nofile_limit() {}
+
+/// Always [`SessionHealth::Healthy`] (#426).
+///
+/// Deliberate rather than unimplemented. Every platform that reaches this
+/// module is one flock does not support at all — no PTY enumeration, no
+/// clipboard, no foreground job tracking — so there is no session left to
+/// poison and no caller whose panes would break. Reporting `Broken` here would
+/// claim a fault flock has no way to observe, and would train the warning to be
+/// ignored on exactly the platforms it cannot mean anything on.
+pub fn session_health() -> SessionHealth {
+    SessionHealth::Healthy
+}
 
 /// Unsupported platform stub.
 pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {

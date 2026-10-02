@@ -302,6 +302,15 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                // Probed here rather than read from the App's cache, and that is
+                // deliberate: this runs on the API connection's task, which has
+                // no handle on the App, and a stale cached reading would be
+                // worse than a fresh one — `flk status` is exactly where someone
+                // is asking whether the session is broken, so it must not be
+                // answered from a value that stopped being refreshed. The cost is
+                // ~200ns warm / ~1ms cold on a socket round trip, and this is a
+                // per-request path, not the render hot loop that #262 hardened.
+                session_health: Some(crate::platform::session_health()),
             },
         })
         .unwrap_or_else(|_| {

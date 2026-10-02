@@ -2580,6 +2580,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            session_health: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2634,6 +2635,7 @@ mod tests {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
+                session_health: None,
             },
         };
 
@@ -2829,6 +2831,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            session_health: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),

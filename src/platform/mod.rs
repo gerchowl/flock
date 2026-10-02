@@ -25,6 +25,31 @@ pub enum Signal {
     Kill,
 }
 
+/// Whether this process can still reach the operating system's user directory.
+///
+/// #426. A process whose launchd session has gone away — orphaned to PID 1 by a
+/// parent that died — keeps running and keeps its PTYs, but every lookup that
+/// needs a mach service (the passwd database, hence `ssh`, `sudo` and `whoami`)
+/// fails. Nothing in flock notices, so agents sit in panes that cannot resolve
+/// a name or open a socket while the UI reports them healthy.
+///
+/// This is deliberately about the passwd lookup rather than `launchctl
+/// managername`. Measured on Darwin 25.4.0: with mach-lookup denied —
+/// opendirectoryd unreachable, which is the shape of the fault — `getpwuid`
+/// returns NULL and `whoami` prints a bare uid, while `launchctl managername`
+/// still answers `Background` with exit 0. It reports which launchd manager a
+/// process is attached to, and a process with a refused mach lookup is still
+/// attached. So the tell the issue nominated does not detect this fault at all,
+/// and it costs a fork+exec to ask. `getpwuid` detects the symptom the user
+/// actually hits, for ~200ns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SessionHealth {
+    /// The user directory answers for our own uid.
+    Healthy,
+    /// No usable user session: our own uid has no passwd entry.
+    Broken,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {
     pub program: &'static str,

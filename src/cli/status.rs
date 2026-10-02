@@ -95,6 +95,7 @@ pub(crate) enum ServerRuntimeStatus {
         version: Option<String>,
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
+        session_health: Option<crate::platform::SessionHealth>,
     },
     NotRunning,
 }
@@ -170,6 +171,37 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             println!("{indent}socket: {}", api::socket_path().display());
         }
     }
+
+    // #426. Printed after the identity block and before anything else, because
+    // every line above it is reassuring: version, protocol, socket, all healthy
+    // while every pane is unable to resolve a name. The one line that explains
+    // why belongs where a reader's eye lands before they conclude all is well.
+    if session_broken(server) {
+        println!(
+            "{indent}session: {}",
+            crate::health::session_warning::STATUS_LINE
+        );
+        println!(
+            "{indent}warning: {}",
+            crate::health::session_warning::BANNER
+        );
+    }
+}
+
+/// #426: whether the running server reports a lost user session.
+///
+/// `None` — a server older than this field, or no server at all — is not
+/// broken. The alternative reading, "unknown", would warn on every upgraded
+/// client talking to an un-upgraded server, which is how a warning stops being
+/// read.
+fn session_broken(server: &ServerRuntimeStatus) -> bool {
+    matches!(
+        server,
+        ServerRuntimeStatus::Running {
+            session_health: Some(crate::platform::SessionHealth::Broken),
+            ..
+        }
+    )
 }
 
 pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
@@ -178,6 +210,7 @@ pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatu
             version: status.version,
             protocol: status.protocol,
             capabilities: status.capabilities,
+            session_health: status.session_health,
         }),
         Err(ApiClientError::Io(err)) if server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -256,6 +289,11 @@ struct ServerStatusJson {
     socket: String,
     session: Option<String>,
     restart_needed: Option<bool>,
+    /// #426: `broken` only when the server says so. A missing field is `None`,
+    /// not `"broken"` and not `"healthy"` — an older server genuinely did not
+    /// report this, and collapsing that into a value would assert something
+    /// nobody knows.
+    session_health: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -284,6 +322,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version,
             protocol,
             capabilities,
+            session_health,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -298,6 +337,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
+            session_health: session_health_label(*session_health),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -309,7 +349,15 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: Some(false),
+            session_health: None,
         },
+    }
+}
+
+fn session_health_label(health: Option<crate::platform::SessionHealth>) -> Option<&'static str> {
+    match health? {
+        crate::platform::SessionHealth::Healthy => Some("healthy"),
+        crate::platform::SessionHealth::Broken => Some(crate::health::session_warning::STATUS_LINE),
     }
 }
 

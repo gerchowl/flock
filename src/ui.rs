@@ -69,7 +69,8 @@ pub(crate) use self::sidebar::format_age;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     banner_offset_in_frame, config_diagnostic_lines, copy_feedback_rect, render_config_diagnostic,
-    render_copy_feedback, render_status_line, render_toast_notification, toast_notification_rect,
+    render_copy_feedback, render_session_warning, render_status_line, render_toast_notification,
+    toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -246,6 +247,19 @@ fn refresh_prompt_layout(app: &mut AppState) {
     app.sync_prompt_search(generation);
 }
 
+/// Rows the lost-session banner (#426) occupies this frame.
+///
+/// Reads an `AppState` field the scheduled-tasks tick already filled — no probe,
+/// no syscall. Wrapped and clamped through the same helper the config-warning
+/// rows use so the two stacks cannot disagree about how many rows they take,
+/// which is the #239 invariant.
+fn session_warning_lines(app: &crate::app::state::AppState, terminal_area: Rect) -> Vec<String> {
+    app.session_warning
+        .as_deref()
+        .map(|message| config_diagnostic_lines(message, terminal_area))
+        .unwrap_or_default()
+}
+
 fn compute_view_internal(
     app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -368,6 +382,7 @@ fn compute_view_internal(
         .as_deref()
         .map(|message| config_diagnostic_lines(message, terminal_area))
         .unwrap_or_default();
+    let session_warning_lines = session_warning_lines(app, terminal_area);
 
     let toast_hit_area = app
         .toast
@@ -401,6 +416,7 @@ fn compute_view_internal(
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
         config_diagnostic_lines: banner_lines,
+        session_warning_lines,
         pane_infos,
         split_borders,
     };
@@ -461,6 +477,7 @@ fn compute_mobile_view(
         .as_deref()
         .map(|message| config_diagnostic_lines(message, terminal_area))
         .unwrap_or_default();
+    let session_warning_lines = session_warning_lines(app, terminal_area);
 
     let toast_hit_area = app
         .toast
@@ -487,6 +504,7 @@ fn compute_mobile_view(
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
         config_diagnostic_lines: banner_lines,
+        session_warning_lines,
         pane_infos,
         split_borders,
     };
@@ -616,10 +634,28 @@ pub fn render_with_runtime_registry(
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    let banner_lines = app.view.config_diagnostic_lines.as_slice();
-    let banner_rows = banner_lines.len() as u16;
-    if banner_rows > 0 {
-        render_config_diagnostic(frame, terminal_area, banner_lines, &app.palette);
+    // #426: the lost-session banner takes the top row, and the config warnings
+    // stack under it. One combined row count feeds `banner_offset_in_frame`, so
+    // the toast and copy feedback keep clearing both stacks — #239 was exactly
+    // this disagreement between what the renderer drew and what the offset
+    // reserved.
+    let session_lines = app.view.session_warning_lines.as_slice();
+    let config_lines = app.view.config_diagnostic_lines.as_slice();
+    let banner_rows = (session_lines.len() + config_lines.len()) as u16;
+
+    if !session_lines.is_empty() {
+        render_session_warning(frame, terminal_area, session_lines, &app.palette);
+    }
+    if !config_lines.is_empty() {
+        let below = Rect::new(
+            terminal_area.x,
+            terminal_area.y + session_lines.len() as u16,
+            terminal_area.width,
+            terminal_area
+                .height
+                .saturating_sub(session_lines.len() as u16),
+        );
+        render_config_diagnostic(frame, below, config_lines, &app.palette);
     }
 
     // Rows consumed at the top of `terminal_area`: the banner, then the action
@@ -1049,6 +1085,141 @@ mod tests {
         assert!(
             screen.contains(&version),
             "expected {version:?} in the keybinds overlay, screen was:\n{screen}"
+        );
+    }
+
+    // ---- lost-session banner (#426) ----
+
+    fn app_with_session_warning(
+        warning: &str,
+        diagnostic: Option<&str>,
+    ) -> (crate::app::state::AppState, Rect) {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.session_warning = Some(warning.to_string());
+        app.config_diagnostic = diagnostic.map(str::to_string);
+        (app, Rect::new(0, 0, 100, 20))
+    }
+
+    /// The banner reaches the screen. The detection is proven against the real
+    /// primitive in `platform::macos`; what is under test here is that a broken
+    /// session produces a *visible* strip rather than a field nobody reads —
+    /// which is the entire deliverable, since the fault's signature is that the
+    /// UI looks fine.
+    #[test]
+    fn a_broken_session_renders_a_visible_banner() {
+        let (mut app, area) =
+            app_with_session_warning(crate::health::session_warning::BANNER, None);
+        compute_view(&mut app, area);
+        let top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+
+        assert!(
+            rows[top].contains("session warning:") && rows[top].contains("cannot resolve names"),
+            "the lost-session banner must be on screen; row {top} was {:?}",
+            rows[top]
+        );
+        let block =
+            rendered_rows(&app, area)[top..top + app.view.session_warning_lines.len()].join("\n");
+        assert!(
+            block.contains("flk server stop"),
+            "the banner must tell the operator what to do; was {block:?}"
+        );
+    }
+
+    /// The symptom words must survive the render, not just the constant: a
+    /// banner that said "broken session" alone would leave the reader to
+    /// re-derive ssh and sudo from scratch, which is the diagnostic expense
+    /// #426 exists to remove.
+    #[test]
+    fn the_rendered_banner_names_the_symptoms() {
+        let (mut app, area) =
+            app_with_session_warning(crate::health::session_warning::BANNER, None);
+        compute_view(&mut app, area);
+        let top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+        // The whole block, not one row: the banner is wrapped, and the point is
+        // that every clause reaches the screen somewhere in it.
+        let screen = rows[top..top + app.view.session_warning_lines.len()].join("\n");
+
+        for clause in ["resolve names", "use sudo", "reach the network"] {
+            assert!(
+                screen.contains(clause),
+                "rendered banner must name {clause:?}; was {screen:?}"
+            );
+        }
+        // And the recovery, which is the other half of not leaving the operator
+        // to work it out unaided.
+        assert!(
+            screen.contains("flk server stop"),
+            "the banner must name the recovery; was {screen:?}"
+        );
+    }
+
+    /// A healthy session renders nothing at all. A warning that cannot go away
+    /// is worse than no warning, because it teaches the reader to ignore it.
+    #[test]
+    fn a_healthy_session_renders_no_banner() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+
+        assert!(app.view.session_warning_lines.is_empty());
+        let screen = rendered_rows(&app, area).join("\n");
+        assert!(
+            !screen.contains("session warning"),
+            "a healthy session must not render a lost-session banner"
+        );
+    }
+
+    /// The two stacks must not collide. The session warning takes the top row
+    /// and the config warnings stack beneath it; #239 was precisely this
+    /// disagreement between the rows drawn and the rows reserved, so the
+    /// combined count is what the toast offset consumes.
+    #[test]
+    fn the_session_banner_and_config_warnings_stack_without_overdrawing() {
+        let (mut app, area) = app_with_session_warning(
+            crate::health::session_warning::BANNER,
+            Some("config one\nconfig two"),
+        );
+        app.toast = Some(top_right_toast());
+        compute_view(&mut app, area);
+        let top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+
+        let session_rows = app.view.session_warning_lines.len();
+        let config_rows = app.view.config_diagnostic_lines.len();
+        assert!(session_rows > 0, "the session warning must claim rows");
+        assert_eq!(config_rows, 2);
+        assert!(
+            rows[top].contains("session warning:") && rows[top].contains("cannot resolve names"),
+            "row {top} should hold the banner's first line, was {:?}",
+            rows[top]
+        );
+        assert!(
+            rows[top + session_rows - 1].contains("flk server stop"),
+            "the recovery must be on the banner's last row, was {:?}",
+            rows[top + session_rows - 1]
+        );
+        assert!(
+            rows[top + session_rows].contains("config warning: config one"),
+            "the first config warning must sit under the banner, was {:?}",
+            rows[top + session_rows]
+        );
+        assert!(
+            rows[top + session_rows + 1].contains("config warning: config two"),
+            "the second config warning must sit under that, was {:?}",
+            rows[top + session_rows + 1]
+        );
+        assert!(
+            rows[top + session_rows + config_rows + 1].contains("reloaded config"),
+            "the toast must clear BOTH stacks, rows were {:?}",
+            &rows[top..top + session_rows + config_rows + 4]
         );
     }
 

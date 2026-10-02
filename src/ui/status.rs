@@ -261,6 +261,33 @@ pub(super) fn render_config_diagnostic(
     }
 }
 
+/// Render the lost-session banner (#426), stacked above the config warnings.
+///
+/// Deliberately louder than a config warning, and deliberately not the sidebar
+/// strip `fleet_paused_banner` uses: this is the one fault where the whole
+/// failure is that the UI looks fine. Agents keep taking turns in panes that
+/// cannot resolve a name or open a socket, so the banner is full-width, on the
+/// far edge opposite the sidebar, and red rather than yellow.
+pub(super) fn render_session_warning(frame: &mut Frame, area: Rect, lines: &[String], p: &Palette) {
+    let style = Style::default()
+        .fg(panel_contrast_fg(p))
+        .bg(p.red)
+        .add_modifier(Modifier::BOLD);
+
+    for (row, line) in lines.iter().enumerate() {
+        let text = format!(" session warning: {line} ");
+        let width = display_width(&text).min(area.width);
+        let strip = Rect::new(
+            area.x + area.width.saturating_sub(width),
+            area.y + row as u16,
+            width,
+            1,
+        );
+        frame.render_widget(Clear, strip);
+        frame.render_widget(Paragraph::new(Span::styled(text, style)), strip);
+    }
+}
+
 /// Leading state circle: shape carries seen/unseen (`●` live signal or
 /// unseen-done, `○` settled idle, `·` none), color comes from the shared
 /// severity mapping ([`crate::ui::state_signal::StateClass`]).

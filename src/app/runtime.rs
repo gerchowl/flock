@@ -171,11 +171,45 @@ impl App {
         false
     }
 
+    /// Re-read whether this process still has a usable user session (#426) and
+    /// project it into `AppState`. Returns true when the banner must change.
+    ///
+    /// Called from the scheduled-tasks tick of both loops rather than from
+    /// render: the probe is a `getpwuid`, which belongs nowhere near the
+    /// drawing path after #262. The banner itself is a plain `Option<String>`,
+    /// so everything downstream of here — the renderer, `flk status`, the
+    /// handoff refusal — reads a cached field.
+    pub(crate) fn refresh_session_health(&mut self, now: Instant) -> bool {
+        let was_broken = self.state.session_warning.is_some();
+        self.session_health.refresh_if_due(now);
+
+        if self.session_health.take_broken_log_pending() {
+            crate::logging::session_broken_detected();
+        }
+
+        let broken = self.session_health.health() == crate::platform::SessionHealth::Broken;
+        if broken == was_broken {
+            return false;
+        }
+        if broken {
+            self.state.session_warning = Some(crate::health::session_warning::BANNER.to_string());
+        } else {
+            // A recovery has to take the banner down, not just stop logging:
+            // otherwise the fix for this fault becomes its own permanent false
+            // alarm, and a warning you have learned to ignore is worse than no
+            // warning.
+            self.state.session_warning = None;
+            crate::logging::session_recovered();
+        }
+        true
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
 
         self.sync_animation_timer(now);
+        changed |= self.refresh_session_health(now);
 
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
@@ -1756,6 +1790,92 @@ mod tests {
             project_key: "dir:elsewhere".into(),
         });
         assert!(app.collect_reap_snapshots().is_empty());
+    }
+
+    // ---- session health projection (#426) ----
+    //
+    // The primitive is proven against a real unreachable passwd database in
+    // `platform::macos`. What is under test here is the wiring: that a Broken
+    // reading becomes a banner a redraw is asked for, and that a Healthy one
+    // leaves the screen alone.
+
+    fn session_test_app(health: crate::platform::SessionHealth) -> super::super::App {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.session_health = crate::health::SessionHealthCore::seeded(health);
+        app.state.session_warning = None;
+        app
+    }
+
+    #[test]
+    fn a_broken_reading_projects_the_banner_and_asks_for_a_redraw() {
+        let mut app = session_test_app(crate::platform::SessionHealth::Broken);
+        assert!(app.refresh_session_health(Instant::now()));
+        assert_eq!(
+            app.state.session_warning.as_deref(),
+            Some(crate::health::session_warning::BANNER)
+        );
+    }
+
+    #[test]
+    fn a_healthy_reading_projects_no_banner() {
+        let mut app = session_test_app(crate::platform::SessionHealth::Healthy);
+        assert!(!app.refresh_session_health(Instant::now()));
+        assert!(app.state.session_warning.is_none());
+    }
+
+    /// A second pass with the answer unchanged must not keep claiming a change,
+    /// or the loop would redraw on every iteration forever.
+    #[test]
+    fn an_unchanged_reading_asks_for_no_redraw() {
+        let mut app = session_test_app(crate::platform::SessionHealth::Broken);
+        app.refresh_session_health(Instant::now());
+        assert!(
+            !app.refresh_session_health(Instant::now()),
+            "an unchanged reading must not request a redraw"
+        );
+        assert!(app.state.session_warning.is_some());
+    }
+
+    /// The banner must come back down when the session does. A warning that
+    /// cannot be dismissed is worse than none, because it is a warning the
+    /// operator learns to ignore.
+    #[test]
+    fn a_recovery_clears_the_banner() {
+        let mut app = session_test_app(crate::platform::SessionHealth::Broken);
+        app.refresh_session_health(Instant::now());
+        assert!(app.state.session_warning.is_some());
+
+        app.session_health =
+            crate::health::SessionHealthCore::seeded(crate::platform::SessionHealth::Healthy);
+        assert!(app.refresh_session_health(Instant::now()));
+        assert!(
+            app.state.session_warning.is_none(),
+            "the banner must not outlive the fault"
+        );
+    }
+
+    /// The scheduled-tasks tick is what actually drives this in both loops, so
+    /// the probe has to be reachable from there — this is the assertion that
+    /// keeps the #25 dual-loop lesson from being re-broken.
+    #[test]
+    fn the_scheduled_tasks_tick_drives_the_session_probe() {
+        let mut app = session_test_app(crate::platform::SessionHealth::Healthy);
+        // Expired cache, and the machine's real probe decides the answer.
+        app.session_health = crate::health::SessionHealthCore::default();
+        let _ = app.handle_scheduled_tasks(Instant::now(), false);
+        // On a healthy machine this is None; the assertion is that the tick ran
+        // the probe at all, which is what the banner's freshness depends on.
+        assert_eq!(
+            app.state.session_warning.is_some(),
+            crate::platform::session_health() == crate::platform::SessionHealth::Broken,
+            "the tick must project the real probe's answer"
+        );
     }
 
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {

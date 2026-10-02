@@ -331,6 +331,27 @@ fn apply_terminal_attach_input(
         .map_err(|err| format!("terminal attach input failed: {err}"))
 }
 
+/// Why a live handoff did not happen (#426).
+///
+/// Two variants, not one, because the two failures call for opposite reactions:
+/// `Failed` is worth retrying, `SessionBroken` is not and retrying it — which is
+/// the reflex, because handoff is the tool you reach for to avoid losing
+/// sessions — cannot work. The new server is forked from this one and inherits
+/// its launchd bootstrap, so it would arrive equally poisoned. Collapsing both
+/// into `io::Error` is exactly how that ends up looking like a success followed
+/// by a mysteriously still-broken server.
+#[derive(Debug)]
+enum HandoffError {
+    SessionBroken,
+    Failed(io::Error),
+}
+
+impl From<io::Error> for HandoffError {
+    fn from(err: io::Error) -> Self {
+        HandoffError::Failed(err)
+    }
+}
+
 impl HeadlessServer {
     /// Creates and starts the headless server.
     ///
@@ -906,7 +927,24 @@ impl HeadlessServer {
     fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
-    ) -> io::Result<()> {
+    ) -> Result<(), HandoffError> {
+        // #426: refuse before anything is spawned or any client is
+        // disconnected. This check is first on purpose — the failure it catches
+        // is silent until the very end, and every step after this point tears
+        // down the working session the operator was trying to protect.
+        //
+        // The probe is fresh rather than the App's cached reading: handoff is a
+        // one-shot decision, not a frame, and it is the last moment at which
+        // acting on a stale answer would be most expensive.
+        if crate::platform::session_health() == crate::platform::SessionHealth::Broken {
+            tracing::warn!(
+                event = "session.handoff",
+                subsystem = "handoff",
+                outcome = "error",
+                "refusing live handoff from a server with no usable user session"
+            );
+            return Err(HandoffError::SessionBroken);
+        }
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -922,7 +960,7 @@ impl HeadlessServer {
             Ok(listener) => listener,
             Err(err) => {
                 self.handoff_in_progress = false;
-                return Err(err);
+                return Err(err.into());
             }
         };
 
@@ -942,7 +980,7 @@ impl HeadlessServer {
                     "live handoff supports at most {} panes in one update; close panes or restart flock normally",
                     crate::server::handoff::MAX_FDS_PER_HANDOFF
                 ),
-            ));
+            ).into());
         }
 
         self.handoff_in_progress = true;
@@ -954,7 +992,7 @@ impl HeadlessServer {
             if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
                 if let Err(err) = runtime.pause_handoff_reader(Duration::from_secs(2)) {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(err);
+                    return Err(err.into());
                 }
                 paused_terminal_ids.push(terminal_id.clone());
             }
@@ -1014,7 +1052,7 @@ impl HeadlessServer {
             Ok(child) => child,
             Err(err) => {
                 self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(err);
+                return Err(err.into());
             }
         };
         let child_pid = import_child.id();
@@ -1036,7 +1074,7 @@ impl HeadlessServer {
             }
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-            return Err(err);
+            return Err(err.into());
         }
 
         let mut stream = match crate::server::handoff::accept_and_validate_on(
@@ -1052,7 +1090,7 @@ impl HeadlessServer {
                 }
                 crate::server::handoff::cleanup_failed_import_child(&mut import_child);
                 self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(err);
+                return Err(err.into());
             }
         };
 
@@ -1063,7 +1101,7 @@ impl HeadlessServer {
         if let Err(err) = send_result {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-            return Err(err);
+            return Err(err.into());
         }
 
         if let Some(api_server) = &self.api_server {
@@ -1082,12 +1120,14 @@ impl HeadlessServer {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
                     return Err(io::Error::other(format!(
                         "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
-                    )));
+                    ))
+                    .into());
                 }
             }
             return Err(io::Error::other(format!(
                 "handoff replacement server did not become ready: {err}"
-            )));
+            ))
+            .into());
         }
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
@@ -1099,10 +1139,11 @@ impl HeadlessServer {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
                     return Err(io::Error::other(format!(
                         "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
-                    )));
+                    ))
+                    .into());
                 }
             }
-            return Err(err);
+            return Err(err.into());
         }
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
@@ -2525,13 +2566,29 @@ impl HeadlessServer {
                     id: msg.request.id,
                     result: api::schema::ResponseResult::Ok {},
                 }),
-                Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
-                    id: msg.request.id,
-                    error: api::schema::ErrorBody {
-                        code: "handoff_failed".into(),
-                        message: err.to_string(),
-                    },
-                }),
+                // #426: its own error code, not `handoff_failed`. The refusal is
+                // the one handoff outcome an operator can act on differently —
+                // retrying is pointless and the recovery destroys their sessions
+                // — so `flk server live-handoff` prints the message as prose
+                // rather than as the JSON every other failure gets.
+                Err(HandoffError::SessionBroken) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "session_broken".into(),
+                            message: crate::health::session_warning::HANDOFF_REFUSAL.into(),
+                        },
+                    })
+                }
+                Err(HandoffError::Failed(err)) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "handoff_failed".into(),
+                            message: err.to_string(),
+                        },
+                    })
+                }
             }
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
@@ -3351,10 +3408,16 @@ impl HeadlessServer {
     ///
     /// Similar to `App::handle_scheduled_tasks` but without resize polling
     /// (the server doesn't have a terminal to resize).
+    ///
+    /// This is the half of #426 that matters most in practice: the headless
+    /// server is the process that gets orphaned, and its AppState is what
+    /// clients render, so a session probe that only ran in the monolithic loop
+    /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
         self.app.sync_headless_animation_timer(now);
+        changed |= self.app.refresh_session_health(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
