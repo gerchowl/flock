@@ -72,6 +72,10 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+/// Re-exported so placement in `agents.rs` asks the same classifier the spawn
+/// ceiling does (#398). See `api::spawn::SpawnCaller`.
+use api::SpawnCaller;
+
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
@@ -3773,6 +3777,38 @@ sidebar_pane_gap = 99
         }
     }
 
+    /// Make the API peer look like an operator sitting in a pane of this
+    /// session (#398): its process ancestry lands on a pane, and that pane is
+    /// not an agent's. This is the caller the active-workspace default exists
+    /// for — the one whose "here" is a pane flock can point at.
+    ///
+    /// Every placement test now has to say which caller it is, because the two
+    /// shapes answer differently: a peer ancestry cannot place (which is what
+    /// an unattested unit test has, and what ssh dispatch and a resume script
+    /// have) is refused rather than guessed for.
+    fn attest_caller_in_pane(app: &mut App) {
+        let ws_idx = app.state.active.expect("a workspace to be sitting in");
+        let pane_id = app.state.workspaces[ws_idx]
+            .focused_pane_id()
+            .expect("a pane to be sitting in");
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+    }
+
+    /// A caller outside this session: a peer whose process ancestry lands in
+    /// no pane of it. What an ssh dispatch, a launchd resume script, and an
+    /// operator's own terminal three windows away all look like (#398) — and
+    /// what a unit test has by default, since nothing stands in for a pane's
+    /// child process until a test says so.
+    fn attest_caller_outside_flock(app: &mut App) {
+        app.current_api_peer_pid = Some(std::process::id());
+        assert!(
+            !app.spawn_caller().may_default_to_active(),
+            "this helper must produce a caller flock cannot place, or the tests using it \\
+             are not testing the gate"
+        );
+    }
+
     fn agent_start_with_cwd(cwd: Option<String>) -> crate::api::schema::Request {
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
@@ -3782,6 +3818,7 @@ sidebar_pane_gap = 99
                 workspace_id: None,
                 tab_id: None,
                 split: None,
+                active: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
             }),
@@ -3865,6 +3902,13 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        // #398: a cwd that is not a directory is not a placement, so a caller
+        // flock cannot place is refused here outright (see
+        // `a_headless_start_whose_cwd_is_not_a_directory_is_refused`). This test
+        // is about the MATCHER, so it runs as an operator in a pane and keeps
+        // asserting exactly what #360 established: the vanished workspace never
+        // wins the match, and the agent gets a space of its own.
+        attest_caller_in_pane(&mut app);
         std::fs::remove_dir_all(&checkout).expect("remove the fixture checkout");
 
         let response =
@@ -3893,6 +3937,10 @@ sidebar_pane_gap = 99
         // whatever workspace happens to sit there, which is #364 rebuilt out
         // of a default. (Asserted this way round rather than by reading the
         // process cwd, which the `hermetic-tests` gate rightly forbids.)
+        //
+        // #398: an operator in a pane, which is the one caller that reaches
+        // this arm at all with no cwd — anybody else is refused here rather
+        // than started in `$HOME`.
         let checkout = cwd_fixture_dir("nocwd");
         let mut app = test_app();
         let mut workspace = Workspace::test_new("dotfiles");
@@ -3901,6 +3949,7 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        attest_caller_in_pane(&mut app);
 
         let response = app.handle_api_request(agent_start_with_cwd(None));
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3940,6 +3989,7 @@ sidebar_pane_gap = 99
                 workspace_id: Some(workspace_id),
                 tab_id: None,
                 split: None,
+                active: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
             }),
@@ -3962,6 +4012,27 @@ sidebar_pane_gap = 99
                 workspace_id: None,
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
+                active: false,
+                focus: false,
+                argv: vec![crate::test_support::live_program()],
+            }),
+        }
+    }
+
+    /// `flk agent start <name> --active [--split DIR] -- …`, as the socket sees
+    /// it: the placement named on purpose, and nothing else.
+    fn agent_start_active(
+        split: Option<crate::api::schema::SplitDirection>,
+    ) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: "req_agent_start_398_active".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                split,
+                active: true,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
             }),
@@ -4006,11 +4077,235 @@ sidebar_pane_gap = 99
     }
 
     #[tokio::test]
-    async fn split_without_a_cwd_still_means_the_active_workspace() {
+    async fn four_headless_agents_with_distinct_cwds_each_land_in_their_own_checkouts_space() {
+        // The reported repro, as a test. After a reboot four agents were
+        // resumed over ssh with a DISTINCT `--cwd` each and no `--focus`, and
+        // all four landed in the one focused workspace — then had to be moved
+        // by hand. `--no-focus` is not the signal and never was (it is the
+        // CLI's default), so what makes these calls headless here is the same
+        // thing that makes them headless in the report: nothing in the peer's
+        // ancestry belongs to a pane of this session.
+        let mut app = test_app();
+        let mut checkouts = Vec::new();
+        for name in ["flock", "dotfiles", "scripts", "notes"] {
+            let checkout = cwd_fixture_dir(name);
+            let mut workspace = Workspace::test_new(name);
+            workspace.worktree_space = Some(membership_at(&checkout));
+            app.state.workspaces.push(workspace);
+            checkouts.push(checkout);
+        }
+        app.state.ensure_test_terminals();
+        // Somebody is looking at the last one, and none of the four dispatchers
+        // is the person doing it.
+        let focused = app.state.workspaces.len() - 1;
+        app.state.active = Some(focused);
+        app.state.selected = focused;
+        attest_caller_outside_flock(&mut app);
+
+        for (index, checkout) in checkouts.iter().enumerate() {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: format!("req_agent_start_398_{index}"),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: format!("worker-{index}"),
+                        cwd: Some(checkout.display().to_string()),
+                        workspace_id: None,
+                        tab_id: None,
+                        split: None,
+                        active: false,
+                        focus: false,
+                        argv: vec![crate::test_support::live_program()],
+                    },
+                ),
+            });
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                response["result"]["type"], "agent_started",
+                "dispatch {index} named a checkout and must be placed: {response}"
+            );
+        }
+
+        assert_eq!(
+            app.state.workspaces.len(),
+            checkouts.len(),
+            "a cwd naming an open checkout joins that space, so four dispatchers add no spaces"
+        );
+        for (ws_idx, checkout) in checkouts.iter().enumerate() {
+            let ws = &app.state.workspaces[ws_idx];
+            assert_eq!(
+                ws.tabs.len(),
+                2,
+                "agent for {} belongs in its own space, as its own tab",
+                checkout.display()
+            );
+            assert_eq!(ws.tabs[1].panes.len(), 1, "and it is that tab's only pane");
+        }
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_headless_caller_splitting_with_a_cwd_matches_no_space_is_refused_naming_the_remedy()
+    {
+        // #398. The `--split` fallback to the focused workspace is the defect
+        // the repro walked into wearing `--split` as a hat, and a caller
+        // ancestry cannot place has no "here" for it to be beside. Refusing
+        // names what would have worked — a refusal that only said "no
+        // placement" would read as a bug (#365).
+        let mut app = test_app();
+        let other = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![other];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        attest_caller_outside_flock(&mut app);
+        let before = app.state.workspaces.len();
+
+        let response = app.handle_api_request(agent_start_split_with_cwd(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "agent_placement_required");
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        for remedy in ["--workspace", "--tab", "--cwd", "--active"] {
+            assert!(
+                message.contains(remedy),
+                "the refusal must name {remedy}, or a caller cannot act on it: {message}"
+            );
+        }
+        assert_eq!(
+            app.state.workspaces.len(),
+            before,
+            "a refused start must create nothing"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn a_headless_untargeted_start_with_no_cwd_is_refused_rather_than_started_in_the_servers_home(
+    ) {
+        // The other half, and the one #365's trust prompt lives on: with no
+        // placement and no cwd, `agent_start_cwd` answers with the SERVER's
+        // working directory, which for a daemon launched from a login shell is
+        // `$HOME`. A Claude agent started there opens with a request for read,
+        // edit and execute over every file the operator has. A caller that
+        // named nothing cannot have meant that.
+        let mut app = test_app();
+        let other = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![other];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        attest_caller_outside_flock(&mut app);
+        let before = app.state.workspaces.len();
+
+        let response = app.handle_api_request(agent_start_with_cwd(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "agent_placement_required");
+        assert_eq!(
+            app.state.workspaces.len(),
+            before,
+            "a refused start must create nothing"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    /// A `--cwd` that names a real directory is placement enough, even with no
+    /// open space behind it: flock mints the space at it (#364), and this is
+    /// the only way a dispatcher can start work in a checkout this server has
+    /// not got open. Refusing here would take away a capability with no flag
+    /// left that expresses it.
+    #[tokio::test]
+    async fn a_headless_start_naming_an_unopened_checkout_still_gets_a_space_of_its_own() {
+        let checkout = cwd_fixture_dir("headless-new-space");
+        let mut app = test_app();
+        let other = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![other];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        attest_caller_outside_flock(&mut app);
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(checkout.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "the named directory gets a space, and the caller's shape is not what forbids it"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    /// A `--cwd` that is not there is not a placement, and it is not the
+    /// server's working directory either — it is a typo in a script, and the
+    /// refusal names the flags instead of leaving a PTY error to explain it.
+    #[tokio::test]
+    async fn a_headless_start_whose_cwd_is_not_a_directory_is_refused() {
+        let missing = cwd_fixture_dir("headless-missing").join("not-created");
+        let mut app = test_app();
+        let other = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![other];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        attest_caller_outside_flock(&mut app);
+
+        let response =
+            app.handle_api_request(agent_start_with_cwd(Some(missing.display().to_string())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "agent_placement_required");
+        drain_test_runtimes(&mut app);
+    }
+
+    /// An MCP client runs inside an agent's pane, so it is attested — as an
+    /// AGENT, whose "here" is somebody else's decision (ADR-0014 §7). It does
+    /// not get the operator's active-workspace default either, so the
+    /// classification's existing distinction does real work here rather than
+    /// being decoration on the ceiling's path.
+    #[tokio::test]
+    async fn an_agent_pane_caller_gets_no_active_workspace_default() {
+        let mut app = test_app();
+        let other = Workspace::test_new("elsewhere");
+        app.state.workspaces = vec![other];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("a pane to run the agent in");
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .launch_argv = Some(vec!["claude".into()]);
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+
+        let response = app.handle_api_request(agent_start_split_with_cwd(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["error"]["code"], "agent_placement_required",
+            "an agent caller is attested, and still not a keystroke"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn an_interactive_caller_splitting_without_a_cwd_still_means_the_active_workspace() {
         // The gesture `--split` exists for: "put this beside what I am looking
-        // at", with no target named. That reading survives, and it is the only
-        // one under which falling back to the active workspace is an answer to
-        // the question rather than a guess at it.
+        // at", with no target named. That reading survives #398 — but only for
+        // a caller flock has attested to be INSIDE this session, which is what
+        // `attest_caller_in_pane` stands for. The test this replaces pinned the
+        // same behaviour for every caller, which is the bug: four agents
+        // resumed over ssh with four distinct `--cwd` all landed in the one
+        // focused workspace because the active default answered a question
+        // they had not asked.
         let mut app = test_app();
         let matched = Workspace::test_new("dotfiles");
         let focused = Workspace::test_new("elsewhere");
@@ -4018,6 +4313,7 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(1);
         app.state.selected = 1;
+        attest_caller_in_pane(&mut app);
 
         let response = app.handle_api_request(agent_start_split_with_cwd(None));
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4028,6 +4324,116 @@ sidebar_pane_gap = 99
             2,
             "no cwd to place by means --split still splits the active workspace"
         );
+        drain_test_runtimes(&mut app);
+    }
+
+    /// #398: `--active` is the opt-in, and it has to work from a caller flock
+    /// CANNOT place — that is the whole reason it exists. A headless dispatcher
+    /// that genuinely wants the focused workspace now has one flag between it
+    /// and today's behaviour, instead of a silent guess it never opted into.
+    #[tokio::test]
+    async fn active_reaches_the_active_workspace_from_a_caller_flock_cannot_place() {
+        let mut app = test_app();
+        let first = Workspace::test_new("first");
+        let second = Workspace::test_new("second");
+        app.state.workspaces = vec![first, second];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        attest_caller_outside_flock(&mut app);
+
+        let response = app.handle_api_request(agent_start_active(Some(
+            crate::api::schema::SplitDirection::Right,
+        )));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "--active splits, it does not mint"
+        );
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].panes.len(),
+            2,
+            "--active --split splits the workspace the operator last focused"
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    /// Without `--split`, `--active` is a PLACEMENT rather than a pane gesture,
+    /// so it takes the shape `--workspace` takes for #364: a tab of the
+    /// agent's own inside the named workspace.
+    #[tokio::test]
+    async fn active_without_split_puts_the_agent_in_the_active_workspace_as_a_tab_of_its_own() {
+        let mut app = test_app();
+        let first = Workspace::test_new("first");
+        let second = Workspace::test_new("second");
+        app.state.workspaces = vec![first, second];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        attest_caller_outside_flock(&mut app);
+
+        let response = app.handle_api_request(agent_start_active(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.workspaces[1].tabs.len(),
+            2,
+            "the agent's own tab, in the active workspace"
+        );
+        assert_eq!(app.state.workspaces[1].tabs[1].panes.len(), 1);
+        drain_test_runtimes(&mut app);
+    }
+
+    /// Two placements, both named. flock will not silently prefer one: a
+    /// caller reasoning about a workspace it did not ask for is the shape #365
+    /// is about.
+    #[tokio::test]
+    async fn active_named_alongside_an_explicit_workspace_is_refused() {
+        let mut app = test_app();
+        let only = Workspace::test_new("only");
+        let workspace_id = only.id.clone();
+        app.state.workspaces = vec![only];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        attest_caller_outside_flock(&mut app);
+
+        let mut request = agent_start_active(None);
+        let crate::api::schema::Method::AgentStart(params) = &mut request.method else {
+            unreachable!("built as an agent start");
+        };
+        params.workspace_id = Some(workspace_id);
+        let response = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "agent_placement_conflict");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--active"),
+            "the refusal says which flag to drop: {response}"
+        );
+        drain_test_runtimes(&mut app);
+    }
+
+    /// `--active` with nothing focused is not a refusal to guess — the caller
+    /// named a placement and there was none, which is a different answer.
+    #[tokio::test]
+    async fn active_with_nothing_focused_is_refused_as_its_own_error() {
+        let mut app = test_app();
+        let only = Workspace::test_new("only");
+        app.state.workspaces = vec![only];
+        app.state.ensure_test_terminals();
+        app.state.active = None;
+        attest_caller_outside_flock(&mut app);
+
+        let response = app.handle_api_request(agent_start_active(None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "agent_no_active_workspace");
         drain_test_runtimes(&mut app);
     }
 
@@ -4166,6 +4572,10 @@ sidebar_pane_gap = 99
         // workspace, so the agent landed beside whatever the operator was
         // looking at and the space it should have had never existed. Two
         // unrelated things then shared a tab, a width, and a close.
+        //
+        // #398: this is the operator-in-a-pane case, which is the one that
+        // still reaches the untargeted arm with no cwd — a caller flock cannot
+        // place is refused there instead.
         let mut app = test_app();
         let workspace = Workspace::test_new("occupied");
         let root = workspace.tabs[0].root_pane;
@@ -4173,6 +4583,7 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        attest_caller_in_pane(&mut app);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
@@ -4183,6 +4594,7 @@ sidebar_pane_gap = 99
                 tab_id: None,
                 // The point of the test: no target AND no split.
                 split: None,
+                active: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
             }),
@@ -4223,6 +4635,9 @@ sidebar_pane_gap = 99
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        // A `--split` with no cwd is the gesture #398 keeps for a caller
+        // attested to be in here; see `attest_caller_in_pane`.
+        attest_caller_in_pane(&mut app);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
@@ -4232,6 +4647,7 @@ sidebar_pane_gap = 99
                 workspace_id: None,
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
+                active: false,
                 focus: true,
                 argv: vec![crate::test_support::live_program()],
             }),

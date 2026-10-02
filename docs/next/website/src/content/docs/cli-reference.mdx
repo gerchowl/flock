@@ -250,7 +250,7 @@ flk agent rename <target> <name>|--clear
 flk agent focus <target>
 flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
-flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
+flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
 flk agent hibernate <target>
 flk agent resume <target>
@@ -273,6 +273,8 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 `agent start --wait-ready` and `agent wait --ready` block until the pane reports an agent status other than `unknown`, then print the agent exactly as `agent get` would. `unknown` is the only status Flock reports when its detector has not recognised the agent's own chrome, so it is what a booting TUI looks like — for a Claude pane, for 30-60 seconds during which "still booting", "crashed on launch" and "blocked on a first-run dialog" are the same observation. Ready is the first moment the question is answerable, and the status it lands on is the answer: `blocked` returns immediately rather than waiting a dialog out, which `--status idle` cannot do. A wait that fails says what it saw — the last status and the last line the pane printed — and an agent whose pane exits during the wait ends it straight away with `agent_exited_before_ready` instead of running out the clock. A pane running something Flock does not detect never becomes ready; that is reported at the timeout rather than being papered over. The default timeout is 60s.
 
 `--wait-ready` is opt-in and off unless passed. Because readiness is a detector verdict rather than a liveness check, **a headless agent never becomes ready**: `opencode run "…"`, a CI step, or anything that paints nothing while it works will sit at `unknown` for the whole window and then time out, however healthy it is. Do not pass `--wait-ready` to those; the start itself already refuses a child that dies in its first moments, and `pane_exited` reports the rest.
+
+`agent start` with no placement is refused (`agent_placement_required`) unless the caller is running inside a pane of that server's session, because "the workspace you are looking at" is only an answer to a caller that has one — an `ssh` dispatch or a resume script is told to pass `--workspace`, `--tab`, `--cwd`, or `--active` instead of being placed wherever a human last focused. `--active` (also spelled `--here`) names the active workspace as the placement, from any caller.
 
 `agent start` registers the name it returns itself, before the child has printed anything and independently of any hook the agent runs. The `name` in the `agent_started` result resolves with `agent get`, `agent read`, `agent send` and `agent wait` straight away, so `agent_not_found` for a just-started name is a real failure rather than a race. An agent name cannot look like a pane ID: targets resolve as a pane ID first, so a name written `1:p1` or `p_1_2` is read as that pane.
 

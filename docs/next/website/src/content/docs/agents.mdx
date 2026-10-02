@@ -156,6 +156,31 @@ the agent in that target's checkout:
 flk agent start docs --workspace 1 --tab 1-1 -- claude
 ```
 
+## Where a start lands when you named nothing
+
+"The workspace you are looking at" is an answer for a person in front of the
+TUI. For anything else it is arbitrary — a launchd resume job, an `ssh` dispatch,
+an MCP client — and it races every other start in flight, which is how four
+agents with four different `--cwd` all ended up in one space. So the active
+workspace is now something you ask for:
+
+```bash
+flk agent start reviewer --active --split right -- pi   # beside the focused space, on purpose
+flk agent start reviewer --here -- claude                # same flag, said from inside a pane
+```
+
+A start that names **no** place — no `--workspace`, no `--tab`, no `--cwd`, no
+`--active` — is refused with `agent_placement_required` unless the caller is
+running inside a pane of that Flock session. The refusal names the flags that
+would have worked. `--active` is the one to reach for if what you meant really
+was "wherever I'm looking"; `--workspace`/`--tab`/`--cwd` are better if you know.
+
+Flock decides this from the calling process's ancestry, not from anything the
+caller says about itself, and it can therefore tell an operator sitting in a
+pane from a dispatch arriving over `ssh` — but not a human from a script, which
+is why a start from a terminal window *outside* the session is treated as
+headless and needs `--active` too.
+
 A start returns as soon as the child has exec'd and outlived a short liveness
 window. That is a statement about the process, not about the agent: a TUI takes
 another 30-60 seconds to paint anything Flock's detector recognises, and until

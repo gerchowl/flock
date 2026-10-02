@@ -22,6 +22,12 @@ mod worktrees;
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 
+/// The one caller classification, shared by every verb that has to answer
+/// "who is asking" (#398). `agent.start` reads it for PLACEMENT the way
+/// `agent.spawn` reads it for the ceiling, rather than walking peer ancestry a
+/// second time and drifting from it.
+pub(in crate::app) use spawn::SpawnCaller;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
     RespawnShell,
