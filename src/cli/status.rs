@@ -36,6 +36,17 @@ enum StatusScope {
 }
 
 fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
+    // #455: a help request is a help request wherever it sits, and it exits 0.
+    // This used to be a first-position arm that printed help and then failed
+    // anyway whenever anything followed it, so `flk status --json --help`
+    // answered with the right text and the wrong exit code.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "help" | "--help" | "-h"))
+    {
+        return Some((StatusScope::Help, false));
+    }
+
     match args.first().map(|arg| arg.as_str()) {
         None => Some((StatusScope::Full, false)),
         Some("--json") if args.len() == 1 => Some((StatusScope::Full, true)),
@@ -44,13 +55,6 @@ fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
         }
         Some("client") => {
             parse_status_scope_args(args, StatusScope::Client, "flk status client [--json]")
-        }
-        Some("help" | "--help" | "-h") => {
-            if args.len() > 1 {
-                print_status_help();
-                return None;
-            }
-            Some((StatusScope::Help, false))
         }
         Some(_) => {
             print_status_help();
