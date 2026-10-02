@@ -533,6 +533,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resume_whose_shell_will_not_spawn_clears_the_agent_name_in_place() {
+        // #456: this is the second production call site of
+        // `clear_agent_runtime_identity_after_respawn`, and the reason "a name
+        // stops resolving only when the pane goes away" is not a true thing to
+        // tell a reader. The pane is still here; the name is gone, so
+        // `agent get <name>` answers `agent_not_found` on a live pane.
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("restored");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.view.pane_infos = workspace.tabs[0]
+            .layout
+            .panes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
+            foreground: Some(crate::terminal_theme::RgbColor {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 20,
+                g: 20,
+                b: 20,
+            }),
+        };
+        {
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal should exist");
+            terminal.set_agent_name("reviewer".into());
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+                dedupe_key: "flock:codex\0codex\0Id\0codex-session".into(),
+            });
+        }
+        assert!(
+            app.agent_info_for_target("reviewer").is_ok(),
+            "the name resolves before the resume is attempted"
+        );
+
+        // A shell that does not exist, so `TerminalRuntime::spawn` fails and
+        // the failure arm runs. Derived from `temp_dir` rather than a literal
+        // path, and never created.
+        app.state.default_shell = std::env::temp_dir()
+            .join(format!("flock-no-such-shell-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(!app.start_pending_agent_resumes(false));
+
+        assert!(
+            app.state.workspaces[0].terminal_id(pane_id).is_some(),
+            "the pane is still there — only the agent identity was cleared"
+        );
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal should survive a failed resume");
+        assert!(
+            terminal.agent_name.is_none(),
+            "a resume that cannot spawn its shell drops the agent name in place"
+        );
+        assert!(
+            !terminal.is_agent_terminal(),
+            "with no name and nothing else naming it, the pane stops being an \
+             agent target and `agent get <name>` answers agent_not_found"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_agent_resume_can_launch_after_theme_wait_expires() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");

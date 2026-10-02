@@ -100,6 +100,11 @@ flk agent rename reviewer --clear
 
 Targets accept terminal IDs, unique agent names, detected or reported agent labels, and legacy pane IDs.
 
+An agent name cannot look like a pane ID. Targets are resolved as a pane ID
+before they are resolved as a name, so a name written `1:p1` or `p_1_2` is read
+as that pane and never as the agent you named. Pick a name that is not
+pane-shaped.
+
 ## Custom status labels
 
 Integrations can report a visual status label without changing semantic state.
@@ -154,9 +159,9 @@ flk agent start docs --workspace 1 --tab 1-1 -- claude
 A start returns as soon as the child has exec'd and outlived a short liveness
 window. That is a statement about the process, not about the agent: a TUI takes
 another 30-60 seconds to paint anything Flock's detector recognises, and until
-it does, `pane read` returns an empty string and a booting agent, one that
-crashed on launch, and one stuck on a first-run permission dialog all look the
-same. `--wait-ready` waits out that window and prints the agent when it is over:
+it does, a booting agent, one that crashed on launch, and one stuck on a
+first-run permission dialog all look the same. `--wait-ready` waits out that
+window and prints the agent when it is over:
 
 ```bash
 flk agent start docs --cwd ~/project --wait-ready --ready-timeout 90000 -- claude
@@ -170,7 +175,75 @@ the timeout; if the timeout is reached, the refusal names the status Flock last
 saw and quotes the last line the pane printed. `flk agent wait <target> --ready`
 asks the same question about an agent that is already running.
 
+`--wait-ready` is opt-in and off unless you pass it. Waiting on readiness is not
+a liveness check: "ready" means Flock's detector has recognised the agent's own
+chrome on screen, which is a question only a TUI can answer. **A headless agent
+never becomes ready.** `opencode run "…"`, a CI step, anything that writes its
+result at the end and paints nothing while it works will sit at `unknown` for the
+whole window and then time out, however healthy it is. For those, drop
+`--wait-ready` and watch for the pane's process instead — the start itself
+already refuses a child that dies inside its first moments, and
+`pane_exited` events report the rest.
+
+### The name a start returns is registered immediately
+
+The `name` in the `agent_started` result is the agent's name at the moment the
+response is written, and it is registered by `agent start` itself — not by the
+agent, and not by its hooks. Nothing has to run inside the child before the name
+resolves.
+
+```bash
+name=$(flk agent start reviewer --cwd ~/project -- pi | jq -r '.result.agent.name')
+flk agent get "$name"    # resolves now, before the agent has printed anything
+```
+
+If `agent get <name>` ever answers `agent_not_found` for a name a start just
+returned, that is a real failure and worth reporting — not a race to wait out.
+
+A name stops resolving in two situations, and only the first is obvious:
+
+- **The pane goes away** — closed, or taken with an agent that exited.
+- **The pane's agent runtime is rebuilt and the rebuild fails.** Flock clears
+  the agent identity when it cannot spawn the replacement shell for a resumed
+  agent, so `agent resume` on a pane whose shell will not start leaves the pane
+  in place with the name gone. The server log carries the spawn error; the pane
+  itself looks fine. A successful `agent resume` keeps the name.
+
+So if a name you just started stops resolving while its pane is still on
+screen, the pane is still there and the answer is in the log, not in a race.
+
 Use `flk pane ...` commands for ordinary terminals, servers, tests, shells, and low-level terminal input. For example, use `pane split` and `pane run` for `cargo test`, not `agent start`, unless that terminal is intentionally being treated as an agent target.
+
+## Read what an agent did
+
+`flk pane read` and `flk agent read` read the **pane**: they scrape what is drawn
+on the terminal, wrapped at the width it was drawn at. That is the right tool for
+a shell, a build, a test run, anything whose output *is* its result.
+
+For an agent TUI it is a different thing, and a weaker one. What a TUI draws is
+its own chrome — a header, a message area, an input box — and that is what a
+scrape returns: not the conversation, and not a stable shape to parse. It also
+tracks whatever the agent last repainted, so two reads a second apart are two
+different documents.
+
+**To read what an agent actually said, read the conversation:**
+
+```bash
+flk agent history reviewer --limit 20
+flk agent history reviewer --detail full --cursor "$next"
+```
+
+`agent history` reads the agent's own session transcript, one entry per turn,
+unwrapped, with a cursor so a poll reads only what was appended. It touches no
+pane state, so polling it is safe. It is Claude-only today, because Claude's is
+the transcript format Flock parses; for any other agent it refuses with
+`unsupported_for_agent` rather than inventing an answer.
+
+One more difference between the sources: `pane read --source visible` follows the
+operator's scroll position, so a human who has scrolled a pane back changes what
+a script sees. `--source recent` does not — it reads the bottom of the screen,
+reaching further up past blank rows so a pane whose last rows are empty still
+answers with its content rather than an empty string.
 
 ## Attach directly to an agent
 
