@@ -261,34 +261,87 @@ pub(super) fn render_config_diagnostic(
     }
 }
 
+/// The prefix every lost-session banner row carries (`session warning: `).
+pub(crate) const SESSION_WARNING_PREFIX: &str = " session warning: ";
+
 /// Render the lost-session banner (#426), stacked above the config warnings.
 ///
 /// Deliberately louder than a config warning, and deliberately not the sidebar
 /// strip `fleet_paused_banner` uses: this is the one fault where the whole
 /// failure is that the UI looks fine. Agents keep taking turns in panes that
-/// cannot resolve a name or open a socket, so the banner is full-width, on the
-/// far edge opposite the sidebar, and red rather than yellow.
+/// cannot resolve a name or open a socket, so the banner is full-width and red
+/// rather than yellow.
+///
+/// **Left-aligned, unlike the config-warning banner.** This one wraps, and
+/// right-aligning variable-length rows makes the block ragged — each line then
+/// starts at a different column and the wrapped text stops reading as one
+/// sentence. Left-aligned with a hanging indent it reads as a paragraph.
 pub(super) fn render_session_warning(frame: &mut Frame, area: Rect, lines: &[String], p: &Palette) {
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.red)
         .add_modifier(Modifier::BOLD);
+    // Continuation rows line up with where the first row's *text* begins, which
+    // is just past the prefix's own leading space. Indenting by the whole prefix
+    // width instead would push wrapped text 16 columns right of where the
+    // sentence starts, and the block would read as ragged rather than as one
+    // wrapped message.
+    let indent =
+        " ".repeat(SESSION_WARNING_PREFIX.len() - SESSION_WARNING_PREFIX.trim_start().len());
 
     for (row, line) in lines.iter().enumerate() {
-        let text = format!(" session warning: {line} ");
+        let prefix = if row == 0 {
+            SESSION_WARNING_PREFIX
+        } else {
+            indent.as_str()
+        };
+        let text = format!("{prefix}{line}");
         let width = display_width(&text).min(area.width);
-        let strip = Rect::new(
-            area.x + area.width.saturating_sub(width),
-            area.y + row as u16,
-            width,
-            1,
-        );
+        let strip = Rect::new(area.x, area.y + row as u16, width, 1);
         frame.render_widget(Clear, strip);
         frame.render_widget(Paragraph::new(Span::styled(text, style)), strip);
     }
 }
 
-/// Leading state circle: shape carries seen/unseen (`●` live signal or
+/// Rows the lost-session banner (#426) occupies at this width.
+///
+/// Wrapped to whatever the pane actually has, rather than shipped pre-broken
+/// against an assumed width. The previous hand-wrapped string looked correct at
+/// 100 columns and lost both `resolve names` and the recovery at 80 — the
+/// commonest terminal width there is — while nothing failed, because the
+/// renderer clips quietly and a test at the one width nobody uses cannot see it.
+///
+/// Words longer than the content width are left whole and clipped by the
+/// renderer; breaking mid-token would be worse than a clipped one.
+pub(crate) fn session_warning_lines(message: &str, area: Rect) -> Vec<String> {
+    let prefix = SESSION_WARNING_PREFIX.chars().count();
+    let content_width = (area.width as usize).saturating_sub(prefix);
+    if content_width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in message.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if usize::from(display_width(&line)) + 1 + usize::from(display_width(word))
+            <= content_width
+        {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut line));
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out.truncate(area.height as usize);
+    out
+}
+
+/// Leading state circle: shape carries seen/unseen/// Leading state circle: shape carries seen/unseen (`●` live signal or
 /// unseen-done, `○` settled idle, `·` none), color comes from the shared
 /// severity mapping ([`crate::ui::state_signal::StateClass`]).
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {

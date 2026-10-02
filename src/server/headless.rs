@@ -933,10 +933,13 @@ impl HeadlessServer {
         // is silent until the very end, and every step after this point tears
         // down the working session the operator was trying to protect.
         //
-        // The probe is fresh rather than the App's cached reading: handoff is a
-        // one-shot decision, not a frame, and it is the last moment at which
-        // acting on a stale answer would be most expensive.
-        if crate::platform::session_health() == crate::platform::SessionHealth::Broken {
+        // It reads the SAME debounced core the banner reads, and demands one
+        // more consecutive Broken reading than the banner does. It used to take
+        // its own fresh, uncached, un-debounced single probe, which made the
+        // more consequential decision the less evidenced one — the inversion the
+        // review caught. Sharing the core also means the two surfaces can never
+        // contradict each other about what has been observed.
+        if self.app.session_health.handoff_should_refuse() {
             tracing::warn!(
                 event = "session.handoff",
                 subsystem = "handoff",
@@ -3964,6 +3967,28 @@ mod tests {
         // Idempotent: a later send leaves it set and does not re-fire.
         log_first_frame_sent(7, &mut client);
         assert!(client.first_frame_sent);
+    }
+
+    /// The headless loop must drive the session probe (#426).
+    ///
+    /// This is the half of the dual-loop lesson that matters: the headless
+    /// server is the process that actually gets orphaned, so a probe wired only
+    /// into the monolithic loop would never see the fault that only the server
+    /// can have. Asserted on a probe being *in flight* — state only this call
+    /// can change — so it fails if the wiring is dropped, on a healthy machine
+    /// as much as a broken one.
+    #[test]
+    fn the_headless_tick_launches_the_session_probe() {
+        let mut server = test_headless_server();
+        server.app.session_health = crate::health::SessionHealthCore::default();
+        assert!(!server.app.session_health.probe_in_flight());
+
+        let _ = server.handle_scheduled_tasks_headless(Instant::now(), false);
+
+        assert!(
+            server.app.session_health.probe_in_flight(),
+            "the headless loop must drive the session probe"
+        );
     }
 
     fn test_headless_server() -> HeadlessServer {

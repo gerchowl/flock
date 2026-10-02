@@ -35,7 +35,7 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use support::{cleanup_test_base, register_runtime_dir, wait_for_socket};
 
@@ -152,12 +152,31 @@ fn stdout_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// How long to allow the server to *confirm* a broken session.
+///
+/// The verdict needs consecutive Broken readings, not one, so a test that
+/// asserts on the warning has to wait for the confirmation rather than for the
+/// socket. Polling for it rather than sleeping a fixed amount keeps this honest
+/// on a loaded machine without turning into a flake: the deadline is generous and
+/// the assertion below it is the real one.
+fn wait_for_confirmed_broken(harness: &Harness) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < deadline {
+        if stdout_of(&harness.client(&["status"])).contains("session: broken") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("the server never confirmed a broken session");
+}
+
 /// The headline requirement: a healthy `flk status` must report the server's
 /// broken session instead of printing an entirely reassuring block.
 #[test]
 fn status_reports_a_broken_session() {
     let mut harness = Harness::new("broken");
     harness.spawn_server(true);
+    wait_for_confirmed_broken(&harness);
 
     let output = harness.client(&["status"]);
     let text = stdout_of(&output);
@@ -202,6 +221,7 @@ fn status_is_quiet_for_a_healthy_session() {
 fn status_json_reports_a_broken_session() {
     let mut harness = Harness::new("json");
     harness.spawn_server(true);
+    wait_for_confirmed_broken(&harness);
 
     let text = stdout_of(&harness.client(&["status", "--json"]));
     let value: serde_json::Value =
@@ -223,6 +243,11 @@ fn status_json_reports_a_broken_session() {
 fn live_handoff_refuses_from_a_broken_session() {
     let mut harness = Harness::new("handoff");
     harness.spawn_server(true);
+    wait_for_confirmed_broken(&harness);
+    // Handoff's threshold is deliberately stricter than the banner's, so
+    // confirming the banner is not enough to make this test meaningful. Wait for
+    // the extra reading rather than asserting against the looser state.
+    std::thread::sleep(Duration::from_secs(7));
 
     let output = harness.client(&["server", "live-handoff"]);
     let text = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -246,16 +271,28 @@ fn live_handoff_refuses_from_a_broken_session() {
 
 /// The control for the refusal: a healthy server still hands off. Without this,
 /// the refusal test would also pass if handoff were simply broken.
+/// The control for the refusal.
+///
+/// Previously this asserted only that the text `refusing live handoff` was
+/// absent, which a wholly broken handoff would satisfy — a control that cannot
+/// fail is false confidence, and it is exactly the shape that let the review's
+/// point 5 stand. It now asserts the handoff **succeeded**: the command must
+/// exit 0 and report the completion it reports on a healthy server. If handoff
+/// regressed entirely, this goes red.
 #[test]
-fn live_handoff_is_not_refused_for_a_healthy_session() {
+fn live_handoff_still_succeeds_for_a_healthy_session() {
     let mut harness = Harness::new("handoff-ok");
     harness.spawn_server(false);
 
     let output = harness.client(&["server", "live-handoff"]);
     let text = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        !text.contains("refusing live handoff"),
+        output.status.success(),
         "a healthy server must still hand off; stderr was:\n{text}"
+    );
+    assert!(
+        text.contains("live handoff complete"),
+        "a healthy handoff must report success, not just the absence of a refusal; stderr was:\n{text}"
     );
 }
 

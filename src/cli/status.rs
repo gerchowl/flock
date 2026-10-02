@@ -181,10 +181,12 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             "{indent}session: {}",
             crate::health::session_warning::STATUS_LINE
         );
-        println!(
-            "{indent}warning: {}",
-            crate::health::session_warning::BANNER
-        );
+        // Indented per line, not once for the whole string. The warning is
+        // prose that can wrap, and a second line starting at column 0 reads as
+        // a new top-level key rather than the tail of this one.
+        for line in crate::health::session_warning::BANNER.lines() {
+            println!("{indent}warning: {line}");
+        }
     }
 }
 
@@ -354,7 +356,9 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
     }
 }
 
-fn session_health_label(health: Option<crate::platform::SessionHealth>) -> Option<&'static str> {
+pub(crate) fn session_health_label(
+    health: Option<crate::platform::SessionHealth>,
+) -> Option<&'static str> {
     match health? {
         crate::platform::SessionHealth::Healthy => Some("healthy"),
         crate::platform::SessionHealth::Broken => Some(crate::health::session_warning::STATUS_LINE),

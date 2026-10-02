@@ -302,15 +302,16 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
-                // Probed here rather than read from the App's cache, and that is
-                // deliberate: this runs on the API connection's task, which has
-                // no handle on the App, and a stale cached reading would be
-                // worse than a fresh one — `flk status` is exactly where someone
-                // is asking whether the session is broken, so it must not be
-                // answered from a value that stopped being refreshed. The cost is
-                // ~200ns warm / ~1ms cold on a socket round trip, and this is a
-                // per-request path, not the render hot loop that #262 hardened.
-                session_health: Some(crate::platform::session_health()),
+                // The server's own confirmed verdict, mirrored process-wide (#426).
+                // Not a second probe: this task cannot reach the App's core,
+                // and an undebounced second opinion here could say `Broken` a
+                // full reading before the banner is allowed to — the two
+                // surfaces disagreeing about the same fault is worse than a
+                // reading that is up to one TTL behind. Nothing blocks here at
+                // all, which matters because a blocking `getpwuid` on an
+                // unavailable opendirectoryd would hang `flk status` for
+                // exactly as long as the fault lasts.
+                session_health: Some(crate::health::confirmed()),
             },
         })
         .unwrap_or_else(|_| {
