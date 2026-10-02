@@ -40,6 +40,24 @@ const ALLOCATING_VERBS: &[&[&str]] = &[
     &["pane", "split"],
 ];
 
+/// Identity and config overrides for every git call this file makes.
+///
+/// They are on EVERY call, not just `init`, and that is the whole point: a
+/// developer's machine will infer an author from the local username and
+/// hostname, so a missing `-c user.email` here looks fine locally and fails on
+/// a CI runner with no configured identity ("Author identity unknown"). This
+/// suite's rule is that a fixture must not depend on whose machine it runs on.
+const GIT_IDENTITY: &[&str] = &[
+    "-c",
+    "init.defaultBranch=main",
+    "-c",
+    "user.name=flock test",
+    "-c",
+    "user.email=test@flock.invalid",
+    "-c",
+    "commit.gpgsign=false",
+];
+
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -275,6 +293,7 @@ impl StandInServer {
 fn allocate_worktree(repo: &Path) {
     let checkout = repo.parent().unwrap_or(repo).join("worktree-stand-in");
     let status = Command::new("git")
+        .args(GIT_IDENTITY)
         .args(["worktree", "add", "-b", "worktree/stand-in"])
         .arg(&checkout)
         .current_dir(repo)
@@ -305,23 +324,14 @@ impl TempRepo {
         std::fs::create_dir_all(&path).expect("temp repo");
 
         let repo = Self { base, path };
-        // The `-c` overrides are what the rest of the suite does: a developer's
-        // global git config must not decide what this fixture looks like.
-        repo.git(&[
-            "-c",
-            "init.defaultBranch=main",
-            "-c",
-            "user.name=flock test",
-            "-c",
-            "user.email=test@flock.invalid",
-            "init",
-        ]);
+        repo.git(&["init"]);
         repo.git(&["commit", "--allow-empty", "-m", "initial"]);
         repo
     }
 
     fn git(&self, args: &[&str]) -> Output {
         let output = Command::new("git")
+            .args(GIT_IDENTITY)
             .args(args)
             .current_dir(&self.path)
             .env_remove("GIT_DIR")
