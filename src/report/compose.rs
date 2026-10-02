@@ -184,9 +184,9 @@ fn render_preview(
 /// route has no query string. A headless report is therefore strictly richer
 /// than a browser one, not a thinner copy of it.
 ///
-/// With nothing collected the diagnostics heading is left out entirely rather
-/// than rendered as a placeholder — the preview says so on stderr, and an
-/// issue body reading "## diagnostics (none collected)" is worse than silence.
+/// With nothing collected the body says nothing about diagnostics at all —
+/// no heading, no placeholder. The preview says so on stderr, and an issue
+/// body reading "## diagnostics (none collected)" is worse than silence.
 fn render_body(values: &[(&str, String)], diagnostics_block: Option<&str>) -> String {
     let mut out = String::new();
     for (id, value) in values {
@@ -195,11 +195,10 @@ fn render_body(values: &[(&str, String)], diagnostics_block: Option<&str>) -> St
     if let Some(block) = diagnostics_block {
         out.push_str(block);
     }
-    let body = out.trim_end().to_string();
-    if body.is_empty() {
-        return body;
-    }
-    body + "\n"
+    // Never empty in practice — `environment` is machine-filled and always
+    // pushed — so the trim cannot empty the body and there is no empty-body
+    // branch to defend.
+    format!("{}\n", out.trim_end())
 }
 
 #[cfg(test)]

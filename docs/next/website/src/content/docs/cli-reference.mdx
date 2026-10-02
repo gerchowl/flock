@@ -428,11 +428,13 @@ Getting the report off your machine takes a human, and there are two ways to do 
 `--body-only` writes **just the issue body to stdout** — no `destination:` header, no prefilled link, no footer — so it pipes straight into a filing command you run yourself:
 
 ```bash
-flk report bug --file bug.md --body-only > body.md
-gh issue create --repo gerchowl/flock --title "pane read never returns" --body-file body.md
+flk report bug --file bug.md --body-only > "$HOME/flock-bug.md"
+gh issue create --repo gerchowl/flock --title "pane read never returns" --body-file "$HOME/flock-bug.md"
 ```
 
 The preview, any advisories and the exact command to run go to **stderr**, so what you reviewed is what gets piped and the preview never lands inside the body. The body has no URL length cap, so on this route the redacted log tail rides inside it rather than going to the clipboard: a headless report carries more evidence than a browser one, not less. `gh` posts a raw body and bypasses the issue form, so nothing validates it and the reproducibility confirmation is not one `gh` can set — use `--open` when you want GitHub's own form to run the checks.
+
+Where you redirect that body is your call and worth choosing deliberately: unlike `--open`, this route writes a file, and the file holds paths, versions and the log tail. Keep it out of a checkout you might commit from, and delete it once the issue is filed.
 
 Flock never files the report itself (ADR-0010 decision 6). The one write path it has is `flk issue drop --file-it`, which is yours to confirm.
 

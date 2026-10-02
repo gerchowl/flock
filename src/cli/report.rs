@@ -128,6 +128,15 @@ fn run_report(kind: ReportKind, args: &[String]) -> std::io::Result<i32> {
     // Checked here rather than by letting one flag win, because these two ask
     // for opposite things and the loser's effect — a browser opening behind a
     // body that was piped somewhere — is not what either of them meant.
+    //
+    // Not applied to `--print`, and deliberately: `--print` is the default
+    // route spelled out, and it has always been "the flag after this one
+    // wins" against `--open`. So the rule is not "no silent winners" applied
+    // uniformly, it is this: `--print` names the absence of a route, and
+    // order between two modes is pre-existing CLI behaviour nobody has to
+    // learn. `--body-only` and `--open` are two positive, different
+    // destinations — stdout versus a browser — and a browser opening behind a
+    // piped body is the one outcome neither spelling asked for.
     if options.body_only && options.open {
         eprintln!("--body-only writes the body to stdout and --open launches a browser; pick one");
         eprintln!("run 'flk report help' for usage");
@@ -443,9 +452,7 @@ fn print_report_help() {
     eprintln!("  flk report template bug > bug.md    write the form to edit");
     eprintln!("  flk report bug --file bug.md        compose and preview it");
     eprintln!("  flk report bug --file bug.md --open review it on GitHub and submit");
-    eprintln!(
-        "  flk report bug --file bug.md --body-only > body.md   body on stdout, nothing sent"
-    );
+    eprintln!("  flk report bug --file bug.md --body-only > /somewhere/you/choose.md");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --file <path>      read a filled-in form");
@@ -456,6 +463,8 @@ fn print_report_help() {
     eprintln!("  --open             open GitHub's form, prefilled, for you to submit");
     eprintln!("  --body-only        write just the body to stdout, so it pipes into");
     eprintln!("                     `gh issue create --body-file -`. Preview on stderr.");
+    eprintln!("                     Redirect it where you want it, not into a checkout:");
+    eprintln!("                     the body carries paths, versions and the log tail.");
     eprintln!("  --print            preview only, send nothing (default)");
     eprintln!("  --last <n>         attach n log records (default {DEFAULT_RECORDS})");
     eprintln!("  --all-levels       attach INFO records too, not just WARN/ERROR");

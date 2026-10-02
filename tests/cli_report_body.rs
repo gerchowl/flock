@@ -46,6 +46,11 @@ an agent cannot read its own pane
 /// it proves the log tail travelled rather than that a substring matched.
 const LOG_MARKER: &str = "zzdiagnosticzz";
 
+/// Credential-shaped for `secret_token_re`, which is the whole point: a
+/// placeholder like `ghp_TEST` is too short to match, so it would prove the
+/// masking rules nothing.
+const TOKEN: &str = "ghp_ABCdef0123456789XYZabc";
+
 /// A private root for one test.
 ///
 /// Under `/tmp` rather than `std::env::temp_dir()` because this harness hands
@@ -106,19 +111,41 @@ impl Sandbox {
     /// One WARN record, in the shape `report::redact` reads. `program` is
     /// allowlisted, so this is exactly the path a real record takes — the test
     /// does not need the logging spine to have run.
-    fn seed_a_log_record(&self) {
+    ///
+    /// `kind` and `message` are the two fields that can carry free text out
+    /// (`ALLOWED_FIELDS` / `SCRUBBED_FIELDS`), so the secrets in
+    /// [`seed_a_hostile_record`] travel exactly as far as a real one would.
+    fn write_record(&self, record: &str) {
         let dir = self.config_home.join(app_dir_name());
         fs::create_dir_all(&dir).expect("log dir");
-        fs::write(
-            dir.join("flock-server.log"),
-            format!(
-                "{{\"timestamp\":\"2026-09-29T11:06:13.873997Z\",\"level\":\"WARN\",\
-                 \"message\":\"process exec exited non-zero\",\"event\":\"process.exec\",\
-                 \"subsystem\":\"peers\",\"outcome\":\"error\",\"program\":\"{LOG_MARKER}\",\
-                 \"target\":\"flk::logging\"}}\n"
-            ),
-        )
-        .expect("seed log");
+        fs::write(dir.join("flock-server.log"), format!("{record}\n")).expect("seed log");
+    }
+
+    fn seed_a_log_record(&self) {
+        self.write_record(&format!(
+            "{{\"timestamp\":\"2026-09-29T11:06:13.873997Z\",\"level\":\"WARN\",\
+             \"message\":\"process exec exited non-zero\",\"event\":\"process.exec\",\
+             \"subsystem\":\"peers\",\"outcome\":\"error\",\"program\":\"{LOG_MARKER}\",\
+             \"target\":\"flk::logging\"}}"
+        ));
+    }
+
+    /// A record shaped like the ones #232 was filed with: the sandbox `$HOME`
+    /// in an allowlisted value, and a GitHub token in the free-text fields.
+    ///
+    /// The token shape is the one `secret_token_re` matches on (`ghp_` plus
+    /// 16+ alphanumerics) — long enough to be a real credential to the regex
+    /// and to anything reading the file.
+    fn seed_a_hostile_record(&self) {
+        self.write_record(&format!(
+            "{{\"timestamp\":\"2026-09-29T11:06:14.873997Z\",\"level\":\"ERROR\",\
+             \"message\":\"remote install failed at {home} with {token}\",\
+             \"event\":\"remote.install\",\"subsystem\":\"remote\",\"outcome\":\"error\",\
+             \"kind\":\"{home}/Projects/private-client\",\"err\":\"auth failed: \
+             github_token={token}\",\"target\":\"flk::logging\"}}",
+            home = self.home.display(),
+            token = TOKEN,
+        ));
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
@@ -161,6 +188,13 @@ fn stdout_of(output: &std::process::Output) -> String {
 
 fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Single-quote a path for `sh`, escaping any quote inside it. Without this a
+/// sandbox path with an apostrophe would build a script that runs something
+/// other than the test — the harness testing itself, and passing.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 #[test]
@@ -274,6 +308,54 @@ fn diagnostics_ride_inline_rather_than_going_to_a_clipboard() {
     );
 }
 
+/// The promise this route makes, asserted on the bytes a person would paste
+/// into a public issue.
+///
+/// The other diagnostics test seeds a benign record, which proves the log tail
+/// *travels* and nothing about what it is allowed to carry. This one seeds what
+/// #232 was actually made of — a `$HOME` path and a GitHub token — and reads
+/// the body off **stdout**, because that is the stream whose whole job is to
+/// become somebody else's public issue. `redact`'s own unit tests cover the
+/// scrubber; this covers the route, i.e. that a body written to stdout is still
+/// run through it on the way.
+#[test]
+fn the_body_on_stdout_is_masked() {
+    let sandbox = Sandbox::new("masked");
+    sandbox.seed_a_hostile_record();
+
+    let output = sandbox.report(&["--body-only"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+
+    let body = stdout_of(&output);
+    assert!(
+        !body.contains(TOKEN),
+        "a GitHub token reached stdout:\n{body}"
+    );
+    assert!(
+        !body.contains(&sandbox.home.display().to_string()),
+        "the $HOME path reached stdout:\n{body}"
+    );
+    // Masked, not deleted: a body with the failure removed from it is worse
+    // than useless, so the record must still be there in redacted form.
+    assert!(
+        body.contains("remote.install"),
+        "the record should survive redaction:\n{body}"
+    );
+    assert!(
+        body.contains("<redacted-token>") || body.contains("github_token=<redacted>"),
+        "the token should be masked, not merely absent:\n{body}"
+    );
+    assert!(
+        body.contains('~'),
+        "the home path should be shortened:\n{body}"
+    );
+}
+
 #[test]
 fn body_only_and_open_are_refused_together() {
     let sandbox = Sandbox::new("conflict");
@@ -311,23 +393,106 @@ fn help_documents_the_flag() {
     }
 }
 
+/// The two matrix rows that were hand-checked and left unpinned: a `--file`
+/// that is not there, and a diagnostics count. Both are places where a failure
+/// could leave something half-written on a pipe, which is the only way this
+/// route can hurt anybody.
+#[test]
+fn a_missing_file_fails_without_writing_a_partial_body() {
+    let sandbox = Sandbox::new("missing-file");
+    let missing = sandbox.base.join("not-there.md");
+    let output = sandbox.run(&[
+        "report",
+        "bug",
+        "--file",
+        missing.to_str().expect("utf-8 path"),
+        "--repo",
+        "gerchowl/flock",
+        "--body-only",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stdout_of(&output).is_empty(),
+        "a failed compose must not put a partial body on a pipe: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("could not read"),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn the_record_count_is_the_reporter_s_and_the_shortfall_is_said_out_loud() {
+    let sandbox = Sandbox::new("last");
+    sandbox.seed_a_log_record();
+
+    // One seeded WARN record against a request for 5: the shortfall note is
+    // the difference between "that is all there was" and "I asked for more",
+    // and on this route it has to arrive on stderr or it arrives nowhere.
+    let output = sandbox.report(&["--body-only", "--last", "5"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("fewer than the 5 requested"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stdout_of(&output).contains(LOG_MARKER),
+        "--last changes how much rides along, not whether it does"
+    );
+}
+
 /// The flag is only useful if it survives the shell, so it goes through the
 /// template the issue's own reproduction describes.
 #[test]
-fn a_body_pipes_straight_into_gh_without_hand_surgery() {
-    let sandbox = Sandbox::new("pipe");
-    let output = sandbox.report(&["--body-only", "--no-diagnostics"]);
-    let body = stdout_of(&output);
+fn a_redirect_writes_exactly_the_body_and_nothing_else() {
+    let sandbox = Sandbox::new("redirect");
+    let piped = sandbox.report(&["--body-only", "--no-diagnostics"]);
 
-    // What `gh issue create --body-file -` does with it: a byte-for-byte
-    // document. Asserted as the absence of the shapes that needed stripping
-    // before, because "we printed a report" is true of the broken version too.
-    assert!(!body.contains("\r"), "a body must not carry CR");
-    assert!(!body.trim().is_empty(), "an empty body is not a report");
-    assert_eq!(
-        body.matches("## ").count(),
-        5,
-        "five sections, no header line that would read as a sixth:\n{body}"
+    // A real `>` rather than a string comparison: the report lands on disk on
+    // this route in a way `--open` never does, so the file a filing command
+    // reads is itself worth proving is byte-for-byte the body and not the
+    // preview. `sh` is the one interpreter POSIX guarantees.
+    let destination = sandbox.base.join("redirected.md");
+    let script = format!(
+        "{} report bug --file {} --repo gerchowl/flock --body-only --no-diagnostics > {}",
+        sh_quote(&PathBuf::from(env!("CARGO_BIN_EXE_flk"))),
+        sh_quote(&sandbox.bug_file),
+        sh_quote(&destination),
     );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .env("HOME", &sandbox.home)
+        .env("XDG_CONFIG_HOME", &sandbox.config_home)
+        .env("FLOCK_SOCKET_PATH", &sandbox.socket)
+        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_ENV")
+        .output()
+        .expect("run flk through a redirect");
+    assert!(
+        output.status.success(),
+        "flk through sh: {script}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = fs::read_to_string(&destination).expect("the redirect created the file");
+    assert_eq!(
+        written,
+        stdout_of(&piped),
+        "the file and stdout must be the same bytes — otherwise the preview is \
+         being redirected somewhere it was not meant to go"
+    );
+    assert!(written.starts_with("## current-behavior\n"), "{written}");
+    assert!(!written.contains("destination:"), "{written}");
     assert!(Path::new(&sandbox.bug_file).exists(), "fixture untouched");
 }
