@@ -185,6 +185,17 @@ pub(crate) fn create_submodule_worktree(name: &str, branch: &str) -> (PathBuf, P
         ],
     );
     run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+    // The submodule CLONE carries none of its superproject's config, so a
+    // commit made inside it resolves its author from the machine's global git
+    // config: present on a laptop, absent on a CI runner. Declared here so any
+    // test that commits inside the submodule is hermetic rather than
+    // accidentally machine-dependent (#262's lesson).
+    let submodule = checkout.join("sub");
+    run_git(
+        &submodule,
+        &["config", "user.email", "flock@example.invalid"],
+    );
+    run_git(&submodule, &["config", "user.name", "Flock Test"]);
     (sub, repo, checkout)
 }
 

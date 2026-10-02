@@ -4026,13 +4026,13 @@ mod tests {
         let (_sub, repo, checkout) =
             create_submodule_worktree("app-sweep-submodule-unpushed", branch);
 
-        // A commit inside the submodule that nothing else holds.
-        std::fs::write(checkout.join("sub").join("inside.txt"), "only copy\n").unwrap();
-        run_git(&checkout.join("sub"), &["add", "inside.txt"]);
-        run_git(
-            &checkout.join("sub"),
-            &["commit", "--quiet", "-m", "never pushed"],
-        );
+        // A commit inside the submodule that nothing else holds. The submodule's
+        // git identity comes from the fixture, not from this machine's global
+        // git config — see `crate::test_support::create_submodule_worktree`.
+        let submodule = checkout.join("sub");
+        std::fs::write(submodule.join("inside.txt"), "only copy\n").unwrap();
+        run_git(&submodule, &["add", "inside.txt"]);
+        run_git(&submodule, &["commit", "--quiet", "-m", "never pushed"]);
         assert!(
             !crate::worktree::force_destroys_nothing(&checkout),
             "an unpushed submodule commit is work a --force would destroy"
