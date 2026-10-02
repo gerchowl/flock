@@ -1604,31 +1604,15 @@ fn worktree_membership(
 mod tests {
     use super::*;
     use crate::api::schema::{ErrorResponse, Request, SuccessResponse};
+    // Git fixtures and the App event helper live in `crate::test_support`: the
+    // classifier tests, the TUI kill dialog and this module all need the same
+    // submodule shape, and three copies of one fixture is how a fix to one seam
+    // quietly stops covering the others (#402).
+    use crate::test_support::{
+        create_committed_repo, create_submodule_worktree, run_git, run_git_over_file_protocol,
+        unique_temp_path, wait_for_event,
+    };
     use crate::{config::Config, workspace::Workspace};
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn run_git(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
 
     /// Attach a workspace to an existing linked checkout and return its public
     /// id — the shape every `worktree.kill` caller starts from.
@@ -1663,18 +1647,6 @@ mod tests {
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false)
-    }
-
-    fn create_committed_repo(name: &str) -> PathBuf {
-        let repo = unique_temp_path(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "flock@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Flock Test"]);
-        std::fs::write(repo.join("README.md"), "test\n").unwrap();
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-        repo
     }
 
     fn test_app() -> App {
@@ -3201,29 +3173,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(repo);
     }
 
-    /// git blocks the file transport for submodules by default, so a fixture
-    /// cloning one from a sibling temp dir has to opt back in.
-    fn run_git_over_file_protocol(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "protocol.file.allow=always",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "git command failed: git -C {} {}",
-            repo.display(),
-            args.join(" ")
-        );
-    }
-
     /// #351: a clean checkout that merely holds a submodule is refused by git
     /// too, and the socket has to say so in a way a caller can act on —
     /// `worktree_remove_failed` reads as "give up", not "retry with force".
@@ -3316,60 +3265,6 @@ mod tests {
     // have to run against ONE real repo state, in an order that leaves the
     // checkout standing until the last of them needs it gone.
     // ---------------------------------------------------------------
-
-    /// A repo whose committed gitlink is populated, plus a linked worktree of
-    /// it carrying that submodule. Both are clean — which is the premise the
-    /// `dirty` probe cannot model, and the reason to assert it here rather than
-    /// assume it.
-    fn create_submodule_worktree(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let sub = create_committed_repo(&format!("{name}-sub"));
-        let repo = create_committed_repo(name);
-        run_git_over_file_protocol(
-            &repo,
-            &[
-                "submodule",
-                "add",
-                "--quiet",
-                &sub.display().to_string(),
-                "sub",
-            ],
-        );
-        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
-        let checkout = unique_temp_path(&format!("{name}-checkout"));
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                branch,
-                checkout.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
-        (sub, repo, checkout)
-    }
-
-    /// Wait for the one event of interest, ignoring whatever else is in flight.
-    /// The kill dialog and the sweep both share the gate event/worker, so a
-    /// test that assumed first-event-wins would be racing the fixture itself.
-    fn wait_for_event(
-        app: &mut App,
-        want: fn(&crate::events::AppEvent) -> bool,
-    ) -> crate::events::AppEvent {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if let Ok(event) = app.event_rx.try_recv() {
-                if want(&event) {
-                    return event;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for worktree event");
-    }
 
     #[test]
     fn every_worktree_remove_seam_agrees_on_one_submodule_worktree() {
