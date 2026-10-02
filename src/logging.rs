@@ -1552,6 +1552,33 @@ pub(crate) fn server_auto_detect_starting(path: &Path) {
     );
 }
 
+// --- session health (#426) ---------------------------------------------------
+// A server that has lost its macOS launchd session keeps working: panes render,
+// agents take turns, every socket call succeeds. Only the things a *pane* runs
+// fail — `ssh`, `sudo`, `whoami`, DNS. The tail's job is to say so once, at the
+// moment it starts, with the recovery attached; the operator's other evidence
+// is a wall of unrelated `process exec exited non-zero` lines that look like a
+// broken SSH key.
+
+pub(crate) fn session_broken_detected() {
+    tracing::warn!(
+        event = "session.health",
+        subsystem = "platform",
+        outcome = "error",
+        uid = unsafe { libc::getuid() },
+        "server has no usable user session: panes cannot resolve names, use sudo, or reach the network"
+    );
+}
+
+pub(crate) fn session_recovered() {
+    tracing::info!(
+        event = "session.health",
+        subsystem = "platform",
+        outcome = "ok",
+        "user session is answering again"
+    );
+}
+
 // --- handoff family: rollback + ownership ack (logging redesign PR-4) ------
 // Live handoff (#38) forks a fresh server and hands the current runtime to
 // it. The story the tail must answer: WHICH import server, WHICH phase, and

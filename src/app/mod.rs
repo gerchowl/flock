@@ -259,6 +259,9 @@ pub struct App {
     /// stamps failure. `PeerPollTracker` still owns the per-peer overlap
     /// guards and the earliest-in-flight instant that surfaces here.
     pub(crate) peer_poll_health: crate::health::PollerHealthCore<crate::health::PeerPollErrorKind>,
+    /// Cached "does this process still have a usable user session?" (#426).
+    /// Refreshed from the scheduled-tasks tick, never from render.
+    pub(crate) session_health: crate::health::SessionHealthCore,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -597,6 +600,10 @@ impl App {
             // struct is constructed first so keep this None here — the
             // App constructor syncs it right after both are in place.
             fleet_paused_banner: None,
+            // Seeded by `refresh_session_health` at the end of the App
+            // constructor, for the same reason: the struct is built before the
+            // probe core is in place.
+            session_warning: None,
             agent_aliases: config.ui.agent_aliases.clone(),
             adopt_external_worktrees: config.worktrees.adopt_external,
             branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
@@ -673,6 +680,7 @@ impl App {
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
                 config_diagnostic_lines: Vec::new(),
+                session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },
@@ -895,8 +903,14 @@ impl App {
             git_refresh_health: crate::health::PollerHealthCore::default(),
             checks_runner_health: crate::health::PollerHealthCore::default(),
             peer_poll_health: crate::health::PollerHealthCore::default(),
+            session_health: crate::health::SessionHealthCore::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
+        // #426: read the session once up front so the banner is correct on the
+        // very first frame instead of appearing a few seconds in. A server that
+        // is already poisoned at startup must not spend its first seconds
+        // looking healthy — that is the failure being fixed.
+        this.refresh_session_health(Instant::now());
         // Sync the render-facing pause banner from the persisted state so
         // a paused fleet renders the banner immediately on restart.
         Self::sync_fleet_pause_banner(&this.fleet_pause, &mut this.state);

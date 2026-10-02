@@ -69,7 +69,8 @@ pub(crate) use self::sidebar::format_age;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     banner_offset_in_frame, config_diagnostic_lines, copy_feedback_rect, render_config_diagnostic,
-    render_copy_feedback, render_status_line, render_toast_notification, toast_notification_rect,
+    render_copy_feedback, render_session_warning, render_status_line, render_toast_notification,
+    toast_notification_rect,
 };
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
@@ -246,6 +247,19 @@ fn refresh_prompt_layout(app: &mut AppState) {
     app.sync_prompt_search(generation);
 }
 
+/// Rows the lost-session banner (#426) occupies this frame.
+///
+/// Reads an `AppState` field the scheduled-tasks tick already filled — no probe,
+/// no syscall. Wrapped and clamped through the same helper the config-warning
+/// rows use so the two stacks cannot disagree about how many rows they take,
+/// which is the #239 invariant.
+fn session_warning_lines(app: &crate::app::state::AppState, terminal_area: Rect) -> Vec<String> {
+    app.session_warning
+        .as_deref()
+        .map(|message| self::status::session_warning_lines(message, terminal_area))
+        .unwrap_or_default()
+}
+
 fn compute_view_internal(
     app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -368,6 +382,7 @@ fn compute_view_internal(
         .as_deref()
         .map(|message| config_diagnostic_lines(message, terminal_area))
         .unwrap_or_default();
+    let session_warning_lines = session_warning_lines(app, terminal_area);
 
     let toast_hit_area = app
         .toast
@@ -401,6 +416,7 @@ fn compute_view_internal(
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
         config_diagnostic_lines: banner_lines,
+        session_warning_lines,
         pane_infos,
         split_borders,
     };
@@ -461,6 +477,7 @@ fn compute_mobile_view(
         .as_deref()
         .map(|message| config_diagnostic_lines(message, terminal_area))
         .unwrap_or_default();
+    let session_warning_lines = session_warning_lines(app, terminal_area);
 
     let toast_hit_area = app
         .toast
@@ -487,6 +504,7 @@ fn compute_mobile_view(
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
         config_diagnostic_lines: banner_lines,
+        session_warning_lines,
         pane_infos,
         split_borders,
     };
@@ -616,10 +634,28 @@ pub fn render_with_runtime_registry(
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    let banner_lines = app.view.config_diagnostic_lines.as_slice();
-    let banner_rows = banner_lines.len() as u16;
-    if banner_rows > 0 {
-        render_config_diagnostic(frame, terminal_area, banner_lines, &app.palette);
+    // #426: the lost-session banner takes the top row, and the config warnings
+    // stack under it. One combined row count feeds `banner_offset_in_frame`, so
+    // the toast and copy feedback keep clearing both stacks — #239 was exactly
+    // this disagreement between what the renderer drew and what the offset
+    // reserved.
+    let session_lines = app.view.session_warning_lines.as_slice();
+    let config_lines = app.view.config_diagnostic_lines.as_slice();
+    let banner_rows = (session_lines.len() + config_lines.len()) as u16;
+
+    if !session_lines.is_empty() {
+        render_session_warning(frame, terminal_area, session_lines, &app.palette);
+    }
+    if !config_lines.is_empty() {
+        let below = Rect::new(
+            terminal_area.x,
+            terminal_area.y + session_lines.len() as u16,
+            terminal_area.width,
+            terminal_area
+                .height
+                .saturating_sub(session_lines.len() as u16),
+        );
+        render_config_diagnostic(frame, below, config_lines, &app.palette);
     }
 
     // Rows consumed at the top of `terminal_area`: the banner, then the action
@@ -1049,6 +1085,267 @@ mod tests {
         assert!(
             screen.contains(&version),
             "expected {version:?} in the keybinds overlay, screen was:\n{screen}"
+        );
+    }
+
+    // ---- lost-session banner (#426) ----
+
+    fn app_with_session_warning(
+        warning: &str,
+        diagnostic: Option<&str>,
+    ) -> (crate::app::state::AppState, Rect) {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.session_warning = Some(warning.to_string());
+        app.config_diagnostic = diagnostic.map(str::to_string);
+        (app, Rect::new(0, 0, 100, 20))
+    }
+
+    /// The banner block as rendered, **sliced to the pane area**.
+    ///
+    /// Slicing matters: the full row includes the sidebar, whose own content
+    /// differs from row to row, so an assertion about where the banner's text
+    /// begins would be reading the sidebar.
+    fn rendered_session_banner(app: &crate::app::state::AppState, area: Rect) -> String {
+        let pane = app.view.terminal_area;
+        let top = usize::from(pane.y);
+        let rows = rendered_rows(app, area);
+        let height = app.view.session_warning_lines.len();
+        rows[top..top + height]
+            .iter()
+            .map(|row| {
+                let start = usize::from(pane.x).min(row.chars().count());
+                row.chars().skip(start).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The banner's text with the wrapping undone.
+    ///
+    /// The banner wraps on word boundaries, so a phrase can straddle a row
+    /// break — `` `flk server `` / `` stop`, `` at 80 columns. That is correct
+    /// rendering, not a lost clause, so the "nothing was dropped" assertions
+    /// compare against whitespace-normalised text.
+    fn unwrapped_session_banner(app: &crate::app::state::AppState, area: Rect) -> String {
+        rendered_session_banner(app, area)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The banner reaches the screen. The detection is proven against the real
+    /// primitive in `platform::macos`; what is under test here is that a broken
+    /// session produces a *visible* strip rather than a field nobody reads —
+    /// which is the entire deliverable, since the fault's signature is that the
+    /// UI looks fine.
+    #[test]
+    fn a_broken_session_renders_a_visible_banner() {
+        let (mut app, area) =
+            app_with_session_warning(crate::health::session_warning::BANNER, None);
+        compute_view(&mut app, area);
+
+        let top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+        assert!(
+            rows[top].contains("session warning:"),
+            "the lost-session banner must be on screen; row {top} was {:?}",
+            rows[top]
+        );
+        assert!(
+            unwrapped_session_banner(&app, area).contains("flk server stop"),
+            "the banner must tell the operator what to do"
+        );
+    }
+
+    /// A healthy session renders nothing at all. A warning that cannot go away
+    /// is worse than no warning, because it teaches the reader to ignore it.
+    #[test]
+    fn a_healthy_session_renders_no_banner() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+
+        assert!(app.view.session_warning_lines.is_empty());
+        let screen = rendered_rows(&app, area).join("\n");
+        assert!(
+            !screen.contains("session warning"),
+            "a healthy session must not render a lost-session banner"
+        );
+    }
+
+    /// The symptom words must survive the render, not just the constant.
+    #[test]
+    fn the_rendered_banner_names_the_symptoms() {
+        let (mut app, area) =
+            app_with_session_warning(crate::health::session_warning::BANNER, None);
+        compute_view(&mut app, area);
+
+        let unwrapped = unwrapped_session_banner(&app, area);
+        for clause in ["resolve names", "use sudo", "reach the network"] {
+            assert!(
+                unwrapped.contains(clause),
+                "rendered banner must name {clause:?}; was {unwrapped:?}"
+            );
+        }
+        assert!(
+            unwrapped.contains("flk server stop"),
+            "the banner must name the recovery; was {unwrapped:?}"
+        );
+    }
+
+    /// **80 columns, not 100.**
+    ///
+    /// The banner used to be a hand-wrapped string tuned against one assumed
+    /// width, and at 80 columns — the commonest terminal width there is — it
+    /// silently clipped away both `resolve names` and `from a good terminal`.
+    /// Nothing failed, because the renderer truncates quietly and every test
+    /// rendered at the one width nobody uses. This walks the widths instead of
+    /// trusting one, and asserts on the *whole* block so wrapping cannot hide a
+    /// lost clause from an exact-substring check.
+    #[test]
+    fn the_banner_survives_every_narrow_width() {
+        // 80 is the width this was caught at and the commonest terminal width
+        // there is. Below 80 the pane area, after the sidebar and the 17-column
+        // prefix, cannot hold the sentence — which is a real limit, and one the
+        // narrowest-terminal case above pins honestly rather than pretending
+        // away.
+        for width in [80u16, 90, 100, 120, 160] {
+            let (mut app, _) =
+                app_with_session_warning(crate::health::session_warning::BANNER, None);
+            let area = Rect::new(0, 0, width, 40);
+            compute_view(&mut app, area);
+            assert!(
+                !app.view.session_warning_lines.is_empty(),
+                "no banner rows at width {width}"
+            );
+            let screen = rendered_session_banner(&app, area);
+            for clause in [
+                "resolve names",
+                "use sudo",
+                "reach the network",
+                "flk server stop",
+            ] {
+                assert!(
+                    unwrapped_session_banner(&app, area).contains(clause),
+                    "at width {width} the banner lost {clause:?}; rendered:\n{screen}"
+                );
+            }
+        }
+    }
+
+    /// Wrapping must not lose the tail on the width that caught the old bug,
+    /// and it must not grow without bound either.
+    #[test]
+    fn the_banner_wraps_rather_than_clips_at_80_columns() {
+        let (mut app, _) = app_with_session_warning(crate::health::session_warning::BANNER, None);
+        let area = Rect::new(0, 0, 80, 40);
+        compute_view(&mut app, area);
+        let rows = app.view.session_warning_lines.clone();
+
+        assert!(
+            rows.len() > 1,
+            "an 80-column banner must wrap onto several rows, got {rows:?}"
+        );
+        // Every row has to fit what was actually available, or the renderer
+        // clips it and we are back to silent truncation.
+        let pane_width = app.view.terminal_area.width;
+        let prefix = self::status::SESSION_WARNING_PREFIX.chars().count() as u16;
+        for row in &rows {
+            assert!(
+                crate::ui::widgets::display_width(row) + prefix <= pane_width,
+                "row {row:?} plus the prefix is wider than the {pane_width}-column pane area"
+            );
+        }
+    }
+
+    /// A pane too narrow for the prefix must render nothing rather than a strip
+    /// of clipped text.
+    #[test]
+    fn a_pane_too_narrow_for_the_banner_renders_nothing() {
+        let lines = self::status::session_warning_lines(
+            crate::health::session_warning::BANNER,
+            Rect::new(0, 0, 8, 10),
+        );
+        assert!(
+            lines.is_empty(),
+            "an 8-column pane cannot hold the banner and must not be clipped into one"
+        );
+    }
+
+    /// The two stacks must not collide. The session warning takes the top rows
+    /// and the config warnings stack beneath it; #239 was precisely this
+    /// disagreement between the rows drawn and the rows reserved, so the
+    /// combined count is what the toast offset consumes.
+    #[test]
+    fn the_session_banner_and_config_warnings_stack_without_overdrawing() {
+        let (mut app, area) = app_with_session_warning(
+            crate::health::session_warning::BANNER,
+            Some("config one\nconfig two"),
+        );
+        app.toast = Some(top_right_toast());
+        compute_view(&mut app, area);
+        let top = usize::from(app.view.terminal_area.y);
+        let rows = rendered_rows(&app, area);
+
+        let session_rows = app.view.session_warning_lines.len();
+        let config_rows = app.view.config_diagnostic_lines.len();
+        assert!(session_rows > 0, "the session warning must claim rows");
+        assert_eq!(config_rows, 2);
+        assert!(
+            rows[top].contains("session warning:"),
+            "row {top} should hold the session banner, was {:?}",
+            rows[top]
+        );
+        assert!(
+            rows[top + session_rows].contains("config warning: config one"),
+            "the first config warning must sit under the banner, was {:?}",
+            rows[top + session_rows]
+        );
+        assert!(
+            rows[top + session_rows + 1].contains("config warning: config two"),
+            "the second config warning must sit under that, was {:?}",
+            rows[top + session_rows + 1]
+        );
+        assert!(
+            rows[top + session_rows + config_rows + 1].contains("reloaded config"),
+            "the toast must clear BOTH stacks, rows were {:?}",
+            &rows[top..top + session_rows + config_rows + 4]
+        );
+    }
+
+    /// Wrapped continuation rows must line up under the first line's text, not
+    /// restart at the strip's edge and read as a separate message.
+    /// Wrapped continuation rows must line up under the first line's text, not
+    /// restart at the strip's edge and read as a separate message.
+    #[test]
+    fn wrapped_banner_rows_share_the_first_lines_indent() {
+        let (mut app, _) = app_with_session_warning(crate::health::session_warning::BANNER, None);
+        let area = Rect::new(0, 0, 80, 40);
+        compute_view(&mut app, area);
+        let top = usize::from(app.view.terminal_area.y);
+        let pane_x = usize::from(app.view.terminal_area.x);
+        let rows = rendered_rows(&app, area);
+        let text_at = |row: &str| -> usize {
+            let chars: Vec<char> = row.chars().collect();
+            let slice: String = chars.iter().skip(pane_x).collect();
+            slice.chars().take_while(|c| *c == ' ').count()
+        };
+        assert!(
+            app.view.session_warning_lines.len() > 1,
+            "this test needs a wrapped banner"
+        );
+        assert_eq!(
+            text_at(&rows[top]),
+            text_at(&rows[top + 1]),
+            "wrapped rows must align: row 0 indents {}, row 1 indents {}",
+            text_at(&rows[top]),
+            text_at(&rows[top + 1])
         );
     }
 

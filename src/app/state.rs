@@ -1277,6 +1277,13 @@ pub struct ViewState {
     /// below the banner offsets by `.len()`, so the two can't disagree (#239).
     /// Empty when there is no diagnostic.
     pub config_diagnostic_lines: Vec<String>,
+    /// #426: rows for the lost-session banner, wrapped and clamped the same way
+    /// as the config-warning rows above and counted by the renderer into the
+    /// same total. Kept as its own list rather than appended to
+    /// `config_diagnostic_lines` because it renders in the alert palette and
+    /// with its own prefix — a "config warning: broken session" line would be a
+    /// lie about where it came from.
+    pub session_warning_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
 }
@@ -2208,6 +2215,15 @@ pub struct AppState {
     /// pure render (`ui::sidebar::render_sidebar`) never needs to reach
     /// past `AppState`. `None` when running normally.
     pub fleet_paused_banner: Option<String>,
+    /// #426: banner shown when this process has lost its user session and its
+    /// panes can no longer resolve names, use `sudo`, or reach the network.
+    /// Projected from `App::session_health` by `App::refresh_session_health`,
+    /// so the pure render never probes. `None` on a healthy session.
+    ///
+    /// This is a whole-width banner over the panes rather than a sidebar strip:
+    /// a sidebar banner disappears when the sidebar is collapsed, and the whole
+    /// point is that this fault is invisible until you are told.
+    pub session_warning: Option<String>,
     /// Sidebar display aliases for agent labels ([ui] agent_aliases).
     pub agent_aliases: std::collections::HashMap<String, String>,
     /// Auto-adopt external linked worktrees into managed groups.
@@ -3276,6 +3292,7 @@ impl AppState {
             pending_ui_events: Vec::new(),
             action_notice: None,
             fleet_paused_banner: None,
+            session_warning: None,
             agent_aliases: std::collections::HashMap::new(),
             adopt_external_worktrees: true,
             branch_pivot_message: String::new(),
@@ -3339,6 +3356,7 @@ impl AppState {
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
                 config_diagnostic_lines: Vec::new(),
+                session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },

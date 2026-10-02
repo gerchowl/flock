@@ -7,10 +7,25 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, SessionHealth, Signal,
 };
 
 pub fn raise_server_nofile_limit() {}
+
+/// Always [`SessionHealth::Healthy`] — and this is a considered answer, not an
+/// unimplemented stub (#426).
+///
+/// The macOS fault is a process losing its launchd bootstrap and with it the
+/// mach route to the user directory. Linux has no equivalent: `/etc/passwd` and
+/// nsswitch are files the kernel and libc read directly, reachable from any
+/// process regardless of how it was reparented. An orphaned flock server on
+/// Linux keeps resolving names. A PAM or SSSD backend can of course fail, but
+/// that is an authentication-domain outage rather than a dead session, it
+/// reports itself through the commands that hit it, and folding it into this
+/// signal would warn about a machine flock cannot fix any better than macOS.
+pub fn session_health() -> SessionHealth {
+    SessionHealth::Healthy
+}
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {

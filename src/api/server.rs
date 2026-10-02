@@ -302,6 +302,16 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                // The server's own confirmed verdict, mirrored process-wide (#426).
+                // Not a second probe: this task cannot reach the App's core,
+                // and an undebounced second opinion here could say `Broken` a
+                // full reading before the banner is allowed to — the two
+                // surfaces disagreeing about the same fault is worse than a
+                // reading that is up to one TTL behind. Nothing blocks here at
+                // all, which matters because a blocking `getpwuid` on an
+                // unavailable opendirectoryd would hang `flk status` for
+                // exactly as long as the fault lasts.
+                session_health: Some(crate::health::confirmed()),
             },
         })
         .unwrap_or_else(|_| {

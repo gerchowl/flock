@@ -1874,6 +1874,12 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// #426: whether this server still has a usable user session. The
+        /// client asking the question is usually a healthy terminal, so it
+        /// cannot answer for the server — only the server's own passwd lookup
+        /// can, and it is the server's context that panes inherit.
+        #[serde(default)]
+        session_health: Option<crate::platform::SessionHealth>,
     },
     NotificationShow {
         shown: bool,
@@ -3844,6 +3850,7 @@ mod tests {
                 version: "0.1.2".into(),
                 protocol: 6,
                 capabilities: Some(ServerCapabilities { live_handoff: true }),
+                session_health: Some(crate::platform::SessionHealth::Healthy),
             },
         };
 

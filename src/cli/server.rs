@@ -59,6 +59,15 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
         method: Method::ServerLiveHandoff(params),
     })?;
     if response.get("error").is_some() {
+        // #426: the lost-session refusal is the one failure whose message is
+        // written to be read by a person, and it is the one where raw JSON is
+        // actively unhelpful — the operator needs to be told that the obvious
+        // next move cannot work and what does. Everything else keeps the
+        // machine-readable shape.
+        if let Some(message) = error_message_for_human(&response) {
+            eprintln!("{message}");
+            return Ok(1);
+        }
         let rendered = serde_json::to_string(&response).unwrap_or_else(|err| {
             format!(
                 "{{\"error\":{{\"code\":\"render_failed\",\"message\":\"failed to render error response: {err}\"}}}}"
@@ -75,6 +84,20 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
             .display()
     );
     Ok(0)
+}
+
+/// The prose message for the errors whose message was written for a person, or
+/// `None` to keep the JSON rendering every other failure uses.
+///
+/// Keyed on the code rather than matched by text, so an unrelated failure can
+/// never start being pretty-printed because its message happens to read like
+/// one of these.
+fn error_message_for_human(response: &serde_json::Value) -> Option<&str> {
+    let error = response.get("error")?;
+    match error.get("code")?.as_str()? {
+        "session_broken" => error.get("message")?.as_str(),
+        _ => None,
+    }
 }
 
 fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHandoffParams> {

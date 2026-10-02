@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, SessionHealth, Signal,
 };
 
 const PROC_PGRP_ONLY: u32 = 2;
@@ -775,6 +775,34 @@ fn procargs2_argv(buf: &[u8]) -> Option<Vec<String>> {
     Some(argv)
 }
 
+/// Whether this process still has a usable user session (#426).
+///
+/// One `getpwuid` of our own uid. On macOS the passwd database is served by
+/// opendirectoryd over mach, so a process whose launchd bootstrap has gone away
+/// gets NULL here — which is the same lookup `ssh`, `sudo` and `whoami` fail,
+/// which is why they fail.
+///
+/// Only the NULL check is made. `getpwuid` returns a pointer into a static
+/// buffer that libc reuses across calls, so reading `pw_name` out of it would
+/// race any other thread calling into the resolver; we never dereference it.
+///
+/// Cost measured on Darwin 25.4.0 / aarch64: ~200ns once warm, ~1ms on the
+/// first call in a process (the mach round-trip to opendirectoryd), ~0.3ms when
+/// the lookup is already failing. Cheap enough that the TTL cache in
+/// `health::SessionHealthCore` is about not paying it on every frame rather
+/// than about this being expensive.
+pub fn session_health() -> SessionHealth {
+    // SAFETY: `getpwuid` has no preconditions beyond a valid uid (which
+    // `getuid` always supplies). The returned pointer is either null or owned by
+    // libc; we only compare it against null and never free or dereference it.
+    let entry = unsafe { libc::getpwuid(libc::getuid()) };
+    if entry.is_null() {
+        SessionHealth::Broken
+    } else {
+        SessionHealth::Healthy
+    }
+}
+
 /// Get the current working directory of a process.
 ///
 /// Uses `proc_pidinfo(PROC_PIDVNODEPATHINFO)` to read `pvi_cdir.vip_path`.
@@ -1109,6 +1137,99 @@ printf '%s\n' "$@" > "$FLOCK_NOTIFY_ARGS"
         assert_eq!(
             args,
             "-e\non run argv\n-e\ndisplay notification (item 2 of argv) with title (item 1 of argv)\n-e\nend run\ntitle\nbody\n"
+        );
+    }
+
+    // ---- session health (#426) ----
+
+    /// Env var that turns this test binary into the probe child.
+    const PROBE_ENV: &str = "FLOCK_TEST_SESSION_PROBE";
+    /// The line the probe child prints and the parent reads back.
+    const PROBE_MARKER: &str = "FLOCK_SESSION_PROBE";
+
+    /// The probe child. Prints the verdict and exits; the parent asserts on it.
+    ///
+    /// Run as its own process so it can be launched under a sandbox that makes
+    /// the passwd lookup genuinely unreachable — which is the only way to test
+    /// the Broken arm without inventing a failure.
+    #[test]
+    fn session_probe_child_reports_the_real_primitive() {
+        if std::env::var_os(PROBE_ENV).is_none() {
+            return;
+        }
+        // guardrails-ok(debug-leftovers): this test IS the child's output
+        // channel. The parent launches this binary under `sandbox-exec` and
+        // parses the marker line off its stdout to learn what the real
+        // primitive returned in a session with no mach route to
+        // opendirectoryd. There is no pane, no log file and no client to
+        // route it to — stdout is the interface.
+        println!("{PROBE_MARKER}={:?}", session_health()); // guardrails-ok(debug-leftovers)
+    }
+
+    /// The real primitive returns `Healthy` in a normal process.
+    ///
+    /// Asserting the happy arm against the actual machine is the point: a test
+    /// that only ever injected `Broken` would pass with the probe inverted.
+    #[test]
+    fn session_health_is_healthy_when_the_passwd_database_answers() {
+        assert_eq!(session_health(), SessionHealth::Healthy);
+    }
+
+    /// The real primitive returns `Broken` when the passwd lookup is genuinely
+    /// unreachable — the fault #426 is about, produced for real.
+    ///
+    /// `deny mach-lookup` is not a mock of the failure, it is the failure's
+    /// mechanism: opendirectoryd is unreachable over mach, so `getpwuid` returns
+    /// NULL exactly as it does for an orphaned server whose launchd session has
+    /// gone. Verified alongside it on this machine: under the same sandbox
+    /// `whoami` prints a bare uid and `id -un` fails, and `launchctl
+    /// managername` still succeeds — which is why this primitive is used instead
+    /// of the one the issue nominated.
+    ///
+    /// `sandbox-exec` is resolved through PATH rather than hardcoded, per the
+    /// hermetic-tests gate.
+    #[test]
+    fn session_health_is_broken_when_the_passwd_lookup_is_unreachable() {
+        let sandbox = crate::test_support::program_path("sandbox-exec");
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = Command::new(&sandbox)
+            .arg("-p")
+            .arg("(version 1)(allow default)(deny mach-lookup)")
+            .arg(&exe)
+            .arg("--exact")
+            .arg("platform::macos::tests::session_probe_child_reports_the_real_primitive")
+            .arg("--nocapture")
+            .env(PROBE_ENV, "1")
+            .output()
+            .expect("sandbox-exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("{PROBE_MARKER}=Broken")),
+            "with mach-lookup denied the real probe must report Broken.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The same child, unsandboxed, must report the opposite — otherwise the
+    /// test above would pass for the wrong reason (a probe that always says
+    /// Broken, or a broken binary).
+    #[test]
+    fn the_probe_child_reports_healthy_without_the_sandbox() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = Command::new(&exe)
+            .arg("--exact")
+            .arg("platform::macos::tests::session_probe_child_reports_the_real_primitive")
+            .arg("--nocapture")
+            .env(PROBE_ENV, "1")
+            .output()
+            .expect("test binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("{PROBE_MARKER}=Healthy")),
+            "without the sandbox the real probe must report Healthy.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

@@ -171,11 +171,48 @@ impl App {
         false
     }
 
+    /// Fold the session-health core's current verdict into `AppState`. Returns true
+    /// when the banner must change.
+    ///
+    /// Called from the scheduled-tasks tick of both loops rather than from
+    /// render. The tick does the (bounded, off-loop) probing; this only reads
+    /// the confirmed verdict and writes it into the banner field, so the render
+    /// path is a field read like every other projection.
+    pub(crate) fn refresh_session_health(&mut self, now: Instant) -> bool {
+        let was_broken = self.state.session_warning.is_some();
+        self.session_health.refresh_if_due(now);
+
+        if self.session_health.take_broken_log_pending() {
+            crate::logging::session_broken_detected();
+        }
+
+        let broken = self.session_health.health() == crate::platform::SessionHealth::Broken;
+        // Mirror for the API task, which answers `flk status` and cannot reach
+        // this core. Published on every tick, not only on a change, so the
+        // mirror cannot drift if a reader arrives after a restart.
+        crate::health::publish_confirmed(self.session_health.health());
+        if broken == was_broken {
+            return false;
+        }
+        if broken {
+            self.state.session_warning = Some(crate::health::session_warning::BANNER.to_string());
+        } else {
+            // A recovery has to take the banner down, not just stop logging:
+            // otherwise the fix for this fault becomes its own permanent false
+            // alarm, and a warning you have learned to ignore is worse than no
+            // warning.
+            self.state.session_warning = None;
+            crate::logging::session_recovered();
+        }
+        true
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
 
         self.sync_animation_timer(now);
+        changed |= self.refresh_session_health(now);
 
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
@@ -1756,6 +1793,106 @@ mod tests {
             project_key: "dir:elsewhere".into(),
         });
         assert!(app.collect_reap_snapshots().is_empty());
+    }
+
+    // ---- session health projection (#426) ----
+    //
+    // The primitive is proven against a real unreachable passwd database in
+    // `platform::macos`, and the debounce in `health::SessionHealthCore`. What
+    // is under test here is the wiring: that a confirmed verdict becomes a
+    // banner a redraw is asked for, that a Healthy one leaves the screen alone,
+    // and that BOTH event loops actually drive the probe.
+
+    fn session_test_app(confirmed: bool, streak: u32) -> super::super::App {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.session_health = crate::health::SessionHealthCore::seeded_confirmed(confirmed, streak);
+        app.state.session_warning = None;
+        app
+    }
+
+    #[test]
+    fn a_confirmed_broken_reading_projects_the_banner_and_asks_for_a_redraw() {
+        let mut app = session_test_app(true, crate::health::SESSION_HEALTH_BROKEN_CONFIRMATIONS);
+        assert!(app.refresh_session_health(Instant::now()));
+        assert_eq!(
+            app.state.session_warning.as_deref(),
+            Some(crate::health::session_warning::BANNER)
+        );
+    }
+
+    #[test]
+    fn a_healthy_reading_projects_no_banner() {
+        let mut app = session_test_app(false, 0);
+        assert!(!app.refresh_session_health(Instant::now()));
+        assert!(app.state.session_warning.is_none());
+    }
+
+    /// An *unconfirmed* streak must project nothing, even though the core is
+    /// counting Broken readings. This is the banner half of the review's
+    /// objection, pinned at the projection rather than only in the core.
+    #[test]
+    fn a_single_unconfirmed_reading_projects_no_banner() {
+        let mut app = session_test_app(false, 1);
+        assert!(!app.refresh_session_health(Instant::now()));
+        assert!(
+            app.state.session_warning.is_none(),
+            "one unconfirmed NULL must not put destructive advice on screen"
+        );
+    }
+
+    /// A second pass with the answer unchanged must not keep claiming a change,
+    /// or the loop would redraw on every iteration forever.
+    #[test]
+    fn an_unchanged_reading_asks_for_no_redraw() {
+        let mut app = session_test_app(true, crate::health::SESSION_HEALTH_BROKEN_CONFIRMATIONS);
+        app.refresh_session_health(Instant::now());
+        assert!(
+            !app.refresh_session_health(Instant::now()),
+            "an unchanged reading must not request a redraw"
+        );
+        assert!(app.state.session_warning.is_some());
+    }
+
+    /// The banner must come back down when the session does. A warning that
+    /// cannot be dismissed is worse than none, because it is a warning the
+    /// operator learns to ignore.
+    #[test]
+    fn a_recovery_clears_the_banner() {
+        let mut app = session_test_app(true, crate::health::SESSION_HEALTH_BROKEN_CONFIRMATIONS);
+        app.refresh_session_health(Instant::now());
+        assert!(app.state.session_warning.is_some());
+
+        app.session_health = crate::health::SessionHealthCore::seeded_confirmed(false, 0);
+        assert!(app.refresh_session_health(Instant::now()));
+        assert!(
+            app.state.session_warning.is_none(),
+            "the banner must not outlive the fault"
+        );
+    }
+
+    /// The TUI loop must drive the probe.
+    ///
+    /// Asserted on *observable state that only the call can change* — a probe
+    /// being in flight. The previous version of this test compared the banner
+    /// against the real machine's verdict, which on any healthy machine was
+    /// `false == false`: it could not fail, so it proved nothing. This one fails
+    /// if the wiring is removed, on a healthy machine as much as a broken one.
+    #[test]
+    fn the_tui_scheduled_tasks_tick_launches_the_session_probe() {
+        let mut app = session_test_app(false, 0);
+        app.session_health = crate::health::SessionHealthCore::default();
+        assert!(!app.session_health.probe_in_flight());
+        let _ = app.handle_scheduled_tasks(Instant::now(), false);
+        assert!(
+            app.session_health.probe_in_flight(),
+            "the monolithic loop must drive the session probe"
+        );
     }
 
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {
