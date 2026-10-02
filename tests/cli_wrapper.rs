@@ -1,4 +1,11 @@
-#![cfg(not(target_os = "macos"))]
+// This file used to open with `#![cfg(not(target_os = "macos"))]`, which
+// compiled all 47 tests out of every Mac build. That guard arrived in e97413d
+// alongside the switch to short `/tmp` harness paths — the change that actually
+// makes the suite portable — and was collateral to a codex-detection fix rather
+// than a judgement about this platform. Removed in #269 once each assumption was
+// triaged: see `SpawnedFlock::close_master` for the one Darwin behaviour the
+// harness does have to accommodate.
+//
 // TracedCommand (logging redesign PR-3) polices flock's shipped code; this
 // harness drives the compiled flock binary through raw Command.
 #![allow(clippy::disallowed_methods)]
@@ -54,8 +61,29 @@ fn create_committed_repo(path: &Path) {
 }
 
 struct SpawnedFlock {
-    _master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+impl SpawnedFlock {
+    fn close_master(&mut self) {
+        self.master = None;
+    }
+
+    /// Wait for the server to exit under its own steam, up to `grace`.
+    ///
+    /// Returns whether it exited. This exists so `close_master` is a fallback
+    /// rather than the first move — see the `server_stop` tests for why.
+    fn wait_until_exited(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                _ if Instant::now() >= deadline => return false,
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
 }
 
 struct SpawnedServerProcess {
@@ -278,7 +306,7 @@ fn spawn_flock_with_config(
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
-        _master: pair.master,
+        master: Some(pair.master),
         child,
     }
 }
@@ -1567,6 +1595,21 @@ fn server_stop_command_shuts_down_running_server() {
         String::from_utf8_lossy(&stopped.stdout)
     );
 
+    // ORDERING IS LOAD-BEARING. Read this before tidying it.
+    //
+    // `flock` is a session leader whose controlling terminal is this PTY, and
+    // Darwin will not let a session leader finish `exit()` while the master end
+    // of its controlling terminal is still open. The server has already logged
+    // "flock exiting" here, so a plain blocking `wait()` hangs forever on a Mac
+    // (#269). Closing the master unblocks it — but closing it *first*, before
+    // the process is known to have exited, would SIGHUP a shutdown that may not
+    // have finished, and that is a regression on Linux, which does not need the
+    // help at all: there the server has already exited, `try_wait` reports it,
+    // and the master is never closed. So: poll first, drop the master only as a
+    // fallback, and leave the assertion below exactly as it was.
+    if !flock.wait_until_exited(Duration::from_secs(2)) {
+        flock.close_master();
+    }
     let pid = flock.child.process_id();
     let exit_status = flock.child.wait().unwrap();
     unregister_spawned_flock_pid(pid);
@@ -1640,6 +1683,21 @@ fn server_stop_then_restart_restores_pane_history() {
         String::from_utf8_lossy(&stopped.stderr)
     );
 
+    // ORDERING IS LOAD-BEARING. Read this before tidying it.
+    //
+    // `flock` is a session leader whose controlling terminal is this PTY, and
+    // Darwin will not let a session leader finish `exit()` while the master end
+    // of its controlling terminal is still open. The server has already logged
+    // "flock exiting" here, so a plain blocking `wait()` hangs forever on a Mac
+    // (#269). Closing the master unblocks it — but closing it *first*, before
+    // the process is known to have exited, would SIGHUP a shutdown that may not
+    // have finished, and that is a regression on Linux, which does not need the
+    // help at all: there the server has already exited, `try_wait` reports it,
+    // and the master is never closed. So: poll first, drop the master only as a
+    // fallback, and leave the assertion below exactly as it was.
+    if !flock.wait_until_exited(Duration::from_secs(2)) {
+        flock.close_master();
+    }
     let pid = flock.child.process_id();
     let exit_status = flock.child.wait().unwrap();
     unregister_spawned_flock_pid(pid);

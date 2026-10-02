@@ -216,7 +216,6 @@ impl JsonLineReader {
 ///
 /// The readiness wait is a client-side composition — subscribe, filter, report
 /// — so the binary is the only place it exists whole.
-#[cfg(not(target_os = "macos"))]
 // TracedCommand is flock's funnel for the subprocesses FLOCK spawns; this is
 // the harness spawning flock, which is the funnel's own subject.
 #[allow(clippy::disallowed_methods)]
@@ -237,13 +236,33 @@ fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     reader.read_json_line(Duration::from_secs(5))
 }
 
+/// Assert that a path the server reported names the directory we asked for.
+///
+/// The server reports the agent's cwd the way the OS resolved it, not the way we
+/// spelled it. On Linux `/tmp` is a real directory so the two coincide and a raw
+/// string compare passes; on macOS `/tmp` is a symlink to `/private/tmp`, so the
+/// server answers `/private/tmp/...` and the raw compare fails on an assertion
+/// about path identity that was never the point. Compare canonicalized, so what
+/// is under test is *which directory* the agent landed in.
+fn assert_same_dir(reported: &serde_json::Value, expected: &Path) {
+    let reported = reported.as_str().expect("cwd should be a string");
+    let reported = PathBuf::from(reported);
+    let expected = expected
+        .canonicalize()
+        .unwrap_or_else(|_| expected.to_path_buf());
+    assert_eq!(
+        reported.canonicalize().unwrap_or(reported),
+        expected,
+        "reported cwd should name the requested directory"
+    );
+}
+
 fn open_subscription(socket_path: &Path, json: &str) -> JsonLineReader {
     let mut reader = JsonLineReader::connect(socket_path);
     reader.send_line(json);
     reader
 }
 
-#[cfg(not(target_os = "macos"))]
 fn wait_for_event(
     reader: &mut JsonLineReader,
     expected: &str,
@@ -252,7 +271,6 @@ fn wait_for_event(
     wait_for_event_matching(reader, expected, timeout, |_| true)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn wait_for_event_matching<F>(
     reader: &mut JsonLineReader,
     expected: &str,
@@ -297,7 +315,6 @@ fn ping_over_socket_returns_version() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn workspace_list_and_create_round_trip() {
     let _lock = test_lock();
@@ -495,7 +512,6 @@ fn workspace_list_and_create_round_trip() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn tab_methods_round_trip_over_socket() {
     let _lock = test_lock();
@@ -614,6 +630,12 @@ fn tab_methods_round_trip_over_socket() {
     cleanup_spawned_flock(child, base);
 }
 
+// Genuinely Linux-only, and not for a removable reason (#269): the assertion
+// below reads `/proc/<pid>/cwd` to prove the *process* moved directories while
+// the *pane*'s recorded cwd did not. `/proc` has no macOS equivalent reachable
+// from a test without a platform helper, so this stays gated rather than being
+// made portable on paper. (It would trip over `/tmp` being a symlink too, but
+// the `/proc` read is the real blocker.)
 #[cfg(target_os = "linux")]
 #[test]
 fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
@@ -734,7 +756,6 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn agent_start_creates_named_terminal_over_socket() {
     let _lock = test_lock();
@@ -755,10 +776,7 @@ fn agent_start_creates_named_terminal_over_socket() {
     );
     assert_eq!(started["result"]["type"], "agent_started");
     assert_eq!(started["result"]["agent"]["name"], "main");
-    assert_eq!(
-        started["result"]["agent"]["cwd"],
-        base.display().to_string()
-    );
+    assert_same_dir(&started["result"]["agent"]["cwd"], &base);
     assert_eq!(started["result"]["argv"][0], "/bin/sh");
     let terminal_id = started["result"]["agent"]["terminal_id"]
         .as_str()
@@ -798,7 +816,6 @@ fn agent_start_creates_named_terminal_over_socket() {
 /// the server's detector decides what `unknown` means, and the pane's death
 /// arrives as an event through the app loop. A test that constructed the
 /// status it asserts on could not tell whether anything produces it.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn agent_wait_ready_reports_booting_then_returns_on_the_first_real_status() {
     let _lock = test_lock();
@@ -880,7 +897,6 @@ fn agent_wait_ready_reports_booting_then_returns_on_the_first_real_status() {
 /// the start-time liveness window (#178, 250ms) and used to be
 /// indistinguishable from a slow boot until the caller's whole timeout
 /// expired.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn agent_wait_ready_gives_up_immediately_when_the_agent_exits() {
     let _lock = test_lock();
@@ -1151,7 +1167,6 @@ fn tab_create_with_no_focus_preserves_active_tab() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn events_subscribe_streams_workspace_tab_and_agent_events() {
     let _lock = test_lock();
@@ -1285,7 +1300,6 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn events_subscribe_streams_pane_split_and_close_events() {
     let _lock = test_lock();
@@ -1359,7 +1373,6 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn events_subscribe_streams_tab_and_workspace_close_events() {
     let _lock = test_lock();
@@ -1445,8 +1458,6 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn pane_report_agent_updates_effective_state() {
     let _lock = test_lock();
@@ -1656,7 +1667,6 @@ fn pane_report_agent_updates_effective_state() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn pane_report_agent_accepts_unknown_agent_labels() {
     let _lock = test_lock();
@@ -1701,7 +1711,6 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     let _lock = test_lock();
@@ -1849,7 +1858,6 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
     cleanup_spawned_flock(child, base);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn pane_clear_agent_authority_restores_fallback_state() {
     let _lock = test_lock();
