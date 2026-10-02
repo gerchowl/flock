@@ -55,8 +55,13 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     // answer "unknown option", and `flk worktree create` without it allocated
     // a git worktree and a branch). Group-level help is left to the groups,
     // which print their full command lists.
+    //
+    // stdout, like `flk --help`: this is a request that was honoured, so it is
+    // the command's output and `flk worktree create --help > usage.txt` has to
+    // write something. Usage printed alongside a FAILED parse still goes to
+    // stderr, which is where every error path below already puts it.
     if let Some(usage) = help::help_usage(args) {
-        eprintln!("usage: {usage}");
+        println!("usage: {usage}");
         return Ok(CommandOutcome::Handled(0));
     }
 

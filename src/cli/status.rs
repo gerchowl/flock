@@ -21,7 +21,10 @@ pub(super) fn run_status_command(args: &[String]) -> std::io::Result<i32> {
             Ok(0)
         }
         StatusScope::Help => {
-            print_status_help();
+            // stdout, like `flk --help`: the request was honoured, so this is
+            // the command's output and can be redirected or paged. The same text
+            // printed after a FAILED parse still goes to stderr below.
+            print!("{}", status_help_text());
             Ok(0)
         }
     }
@@ -36,13 +39,16 @@ enum StatusScope {
 }
 
 fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
-    // #455: a help request is a help request wherever it sits, and it exits 0.
-    // This used to be a first-position arm that printed help and then failed
-    // anyway whenever anything followed it, so `flk status --json --help`
-    // answered with the right text and the wrong exit code.
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "help" | "--help" | "-h"))
+    // #455: a help request is a help request wherever it sits, and this used to
+    // be a first-position arm that printed the right help and then failed
+    // anyway whenever anything followed it — so `flk status --json --help`
+    // answered with correct text and exit 2.
+    //
+    // The predicate is `cli::help`'s, shared rather than reimplemented: a third
+    // copy of this rule is a third copy to drift. `help` stays accepted as a
+    // first-position word because `status` has never taken a literal-text
+    // argument that could collide with it.
+    if super::help::asks_for_help(args) || matches!(args.first().map(String::as_str), Some("help"))
     {
         return Some((StatusScope::Help, false));
     }
@@ -335,9 +341,26 @@ pub(crate) fn current_exe_label() -> String {
         .unwrap_or_else(|err| format!("unknown ({err})"))
 }
 
+/// Usage after a bad argument: stderr, because it accompanies a failure.
 fn print_status_help() {
-    eprintln!("flk status commands:");
-    eprintln!("  flk status [--json]         show local client and running server status");
-    eprintln!("  flk status server [--json]  show running server status");
-    eprintln!("  flk status client [--json]  show local client binary status");
+    eprint!("{}", status_help_text());
+}
+
+fn status_help_text() -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "flk status commands:");
+    let _ = writeln!(
+        out,
+        "  flk status [--json]         show local client and running server status"
+    );
+    let _ = writeln!(
+        out,
+        "  flk status server [--json]  show running server status"
+    );
+    let _ = writeln!(
+        out,
+        "  flk status client [--json]  show local client binary status"
+    );
+    out
 }

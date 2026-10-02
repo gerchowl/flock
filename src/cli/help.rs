@@ -26,7 +26,17 @@
 //! The cost is one table to keep true. That is the trade this makes on
 //! purpose: a usage line that has drifted is a wrong answer, not a wrong
 //! action, and the alternative was fifty parsers each owning its own idea of
-//! what `--help` means.
+//! what `--help` means. Three tests walk the table against the dispatchers and
+//! the parsers to keep that cost honest.
+//!
+//! What the table deliberately does NOT hold is any command that already prints
+//! a better answer: `flk web --help` is forty lines including the loopback and
+//! tailscale-funnel posture for exposing a full shell, and `flk lineage --help`
+//! is the only place that says what a target resolves from. Those six commands
+//! (`SELF_SERVED` in the tests below names them) keep their own text and share
+//! the RULE through [`asks_for_help`] — one predicate, no table row, no
+//! downgrade. That is the same call made for `flk report bug`, applied to the
+//! whole CLI rather than one verb.
 //!
 //! The entries are the invocation WITHOUT the leading `usage: ` — the
 //! dispatcher prints that prefix, so every help answer on the CLI starts with
@@ -287,29 +297,6 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("session", "delete", "flk session delete <name> [--json]"),
 ];
 
-/// Groups that take a target in the verb position instead of a verb, so the
-/// first token after the group is an argument rather than a subcommand.
-const POSITIONAL: &[(&str, &str)] = &[
-    ("lineage", "flk lineage <target> [--json]"),
-    (
-        "digest",
-        "flk digest [--since <duration>] [--path FILE] [--json]",
-    ),
-    (
-        "preflight",
-        "flk preflight [--require TARGET]...  (exit 0 ready, 1 advisory, 2 blocking)",
-    ),
-    ("revert-run", "flk revert-run <run-id> [--dry-run] [--json]"),
-    (
-        "hook",
-        "flk hook <agent> <session|prompt|stop|working|idle|blocked|release>",
-    ),
-    (
-        "web",
-        "flk web [--bind <addr>]  (requires the `web` feature)",
-    ),
-];
-
 /// Verbs whose trailing argument is literal text the caller means to deliver,
 /// not a flag.
 ///
@@ -320,6 +307,12 @@ const POSITIONAL: &[(&str, &str)] = &[
 /// (`msg send` and `msg reply` are deliberately absent — their parsers already
 /// refuse an unrecognised flag rather than taking it as body text, so nothing
 /// is lost by answering `--help` there.)
+///
+/// `pane send-keys` is absent for a different reason: it shares the `args[1..]`
+/// shape of its `send-text`/`run` siblings, but what it forwards are key NAMES
+/// from a fixed vocabulary (`enter`, `ctrl+c`), and `--help` is not one of
+/// them. There is no message anyone could mean by sending it, so answering with
+/// usage loses nothing.
 const LITERAL_TEXT: &[(&str, &str)] = &[
     ("agent", "send"),
     ("agent", "rename"),
@@ -341,31 +334,40 @@ fn verb_usage(group: &str, verb: &str) -> Option<&'static str> {
         .map(|(_, _, usage)| *usage)
 }
 
-fn positional_usage(group: &str) -> Option<&'static str> {
-    POSITIONAL
-        .iter()
-        .find(|(g, _)| *g == group)
-        .map(|(_, usage)| *usage)
-}
-
 fn takes_literal_text(group: &str, verb: &str) -> bool {
     LITERAL_TEXT.iter().any(|(g, v)| *g == group && *v == verb)
+}
+
+/// Whether these arguments are asking for help.
+///
+/// The one definition of the rule, exported because six commands answer
+/// `--help` from their own handler with their own — richer — text and still
+/// have to agree on WHEN they are being asked: `lineage`, `digest`,
+/// `preflight`, `revert-run`, `web` and `status`. Sharing the predicate is what
+/// stops those six from drifting into a second, looser rule of their own.
+///
+/// Anything from a bare `--` onwards is the caller's payload rather than this
+/// verb's flags, so the scan stops there: `flk agent start api -- claude
+/// --help` starts an agent whose argv asks claude for its own help.
+pub(super) fn asks_for_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| is_help_flag(arg))
 }
 
 /// The usage text for `args` when `args` is asking for help, and `None` when it
 /// is not — in which case the verb's own parser gets the arguments untouched.
 ///
-/// `args` is the whole argv, `args[0]` being the binary. Anything from a bare
-/// `--` onwards is the caller's payload, not this verb's flags, so the scan
-/// stops there: `flk agent start api -- claude --help` starts an agent whose
-/// argv asks claude for its own help.
+/// `args` is the whole argv, `args[0]` being the binary.
+///
+/// `None` is also the answer for every command that already prints its own
+/// better help. `flk web --help` documents forty lines including the loopback
+/// and tailscale-funnel posture; `flk lineage --help` is the only place that
+/// says what a target resolves from. A table row would replace those with one
+/// line, so the rule is shared and the text is not (see [`asks_for_help`]).
 pub(super) fn help_usage(args: &[String]) -> Option<&'static str> {
     let group = args.get(1).map(String::as_str)?;
     let tail = args.get(2..)?;
-
-    if let Some(usage) = positional_usage(group) {
-        return asks_help_in(tail).then_some(usage);
-    }
 
     let verb = tail.first()?.as_str();
     let usage = verb_usage(group, verb)?;
@@ -379,18 +381,12 @@ pub(super) fn help_usage(args: &[String]) -> Option<&'static str> {
             .map(|_| usage);
     }
 
-    asks_help_in(verb_args).then_some(usage)
-}
-
-fn asks_help_in(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| is_help_flag(arg))
+    asks_for_help(verb_args).then_some(usage)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{asks_help_in, help_usage, LITERAL_TEXT, POSITIONAL, VERBS};
+    use super::{asks_for_help, help_usage, LITERAL_TEXT, VERBS};
 
     fn argv(words: &[&str]) -> Vec<String> {
         std::iter::once("flk")
@@ -441,7 +437,7 @@ mod tests {
     fn help_after_the_terminator_belongs_to_the_payload() {
         assert!(usage_for(&["agent", "start", "api", "--", "claude", "--help"]).is_none());
         assert!(usage_for(&["msg", "send", "w1", "--", "--help"]).is_none());
-        assert!(!asks_help_in(&argv(&["--", "--help"])));
+        assert!(!asks_for_help(&argv(&["--", "--help"])));
     }
 
     /// The verbs that write literal text somewhere still have to be able to
@@ -494,12 +490,6 @@ mod tests {
                 "{group} {verb} is documented as: {usage}"
             );
         }
-        for (group, usage) in POSITIONAL {
-            assert!(
-                usage.starts_with(&format!("flk {group}")),
-                "{group} is documented as: {usage}"
-            );
-        }
     }
 
     /// Two rows for one (group, verb) means one of them is dead weight that
@@ -513,43 +503,222 @@ mod tests {
         assert_eq!(seen.len(), count);
     }
 
-    /// Every group `cli::maybe_run` dispatches is either in the verb table or
-    /// in the positional table — otherwise one group quietly has no per-verb
-    /// help while the rest of the CLI does.
+    /// Commands that answer `--help` from their own handler, with text richer
+    /// than one usage line, and so are deliberately absent from the table.
+    ///
+    /// This is the `report bug` rule applied to the whole CLI: the table only
+    /// covers commands with nothing better to print. A row here would be a
+    /// downgrade, so these groups keep their own answer and share the rule
+    /// through `asks_for_help`.
+    ///
+    /// Naming them here rather than only in the module docs is what keeps the
+    /// choice reviewable: adding a seventh name is a visible act.
+    const SELF_SERVED: &[&str] = &[
+        // What a target resolves from, and how reused branch names disambiguate.
+        "lineage",
+        // `--since` suffixes and where the rendered file lands by default.
+        "digest",
+        // Why `--require` exists, and the exit-code legend.
+        "preflight",
+        // What a run-id looks like (`^Agent-Run: <id>$` trailers).
+        "revert-run",
+        // Every option, the config/env precedence, and the loopback +
+        // tailscale-funnel posture for exposing a full shell.
+        "web",
+        // `hook` has no help of its own to keep — it is listed because it is a
+        // verb this table does not cover, and because `flk hook --help` used to
+        // exit 2 rather than answer.
+        "hook",
+    ];
+
+    /// The source of the dispatcher, read at compile time so the group list
+    /// below is DERIVED from it rather than transcribed.
+    ///
+    /// Transcribing the list was the bug this test used to have: adding a
+    /// `"foo" =>` arm to `maybe_run` without a table entry left that group
+    /// with no per-verb help and the test still green — the exact silent
+    /// regression #455 exists to remove, one `mod` line away.
+    const DISPATCH_SOURCE: &str = include_str!("../cli.rs");
+
+    /// The match arms of `maybe_run`'s command dispatch.
+    fn dispatched_groups() -> Vec<String> {
+        let mut groups: Vec<String> = DISPATCH_SOURCE
+            .lines()
+            .skip_while(|line| !line.contains("let exit_code = match command"))
+            .take_while(|line| !line.trim_start().starts_with("_ =>"))
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix('"')?;
+                let name = name.split('"').next()?;
+                // `Some("x")` style arms and the `server` arm's inner match are
+                // not command names; a command arm is exactly `"name" =>`.
+                (line.contains("=>") && name.starts_with(|c: char| c.is_ascii_lowercase()))
+                    .then(|| name.to_string())
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups
+    }
+
+    /// The source of the module that owns a group's parser.
+    fn group_parser_source(group: &str) -> &'static str {
+        match group {
+            "server" => include_str!("server.rs"),
+            "status" => include_str!("status.rs"),
+            "workspace" => include_str!("workspace.rs"),
+            "worktree" => include_str!("worktree.rs"),
+            "tab" => include_str!("tab.rs"),
+            "notification" => include_str!("notification.rs"),
+            "agent" => include_str!("agent.rs"),
+            "msg" => include_str!("msg.rs"),
+            "mcp" => include_str!("mcp.rs"),
+            "pane" => include_str!("pane.rs"),
+            "peers" => include_str!("peers.rs"),
+            "report" => include_str!("report.rs"),
+            "issue" => include_str!("issue.rs"),
+            "integration" => include_str!("integration.rs"),
+            "checks" => include_str!("checks.rs"),
+            "fleet" => include_str!("fleet.rs"),
+            // These six live inline in the dispatcher itself.
+            "config" | "channel" | "terminal" | "wait" | "session" | "hook" => {
+                include_str!("../cli.rs")
+            }
+            _ => "",
+        }
+    }
+
+    /// Every `--flag` literal the group's parser can accept.
+    ///
+    /// Deliberately an over-approximation on two axes, because narrowing either
+    /// is the fragile source-scraping that stops being maintained: it is the
+    /// whole module rather than the one verb, and it always includes
+    /// `cli.rs` itself, where the shared parsers live (`--takeover` is parsed
+    /// by `parse_attach_target` for both `agent attach` and `terminal
+    /// attach`, not by either group's module). Over-approximating can only make
+    /// the check below weaker, never wrong.
+    fn parser_flags(group: &str) -> Vec<String> {
+        let module = group_parser_source(group);
+        let source: String = [module, DISPATCH_SOURCE].concat();
+        let source = source.as_str();
+        let mut flags: Vec<String> = source
+            .match_indices('"')
+            .step_by(2)
+            .filter_map(|(index, _)| {
+                source[index + 1..]
+                    .find('"')
+                    .map(|end| source[index + 1..index + 1 + end].to_string())
+            })
+            .filter(|value| value.starts_with("--") && value.len() > 2)
+            .collect();
+        flags.sort();
+        flags.dedup();
+        flags
+    }
+
+    /// The `--flag` tokens a usage row claims its verb accepts.
+    ///
+    /// Scans for the flag itself rather than splitting on whitespace: usage
+    /// writes flags inside brackets (`[--scan] [--json]`), and a token-wise
+    /// split drops every one of them — which is how this check came to pass
+    /// while the row it exists to police was nonsense.
+    fn row_flags(usage: &str) -> Vec<String> {
+        let bytes = usage.as_bytes();
+        let mut flags = Vec::new();
+        let mut index = 0;
+        while index + 1 < bytes.len() {
+            if bytes[index] != b'-' || bytes[index + 1] != b'-' {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'-')
+            {
+                index += 1;
+            }
+            let flag = &usage[start..index];
+            // A bare `--` is the terminator, not a flag.
+            if flag.len() > 2 {
+                flags.push(flag.to_string());
+            }
+        }
+        flags
+    }
+
+    /// Every group `cli::maybe_run` dispatches is served — by the table or by
+    /// its own richer handler. A new dispatch arm with neither is the silent
+    /// regression this PR exists to remove, so the list is derived from the
+    /// dispatcher's own source.
     #[test]
-    fn every_dispatched_group_is_documented() {
-        for group in [
-            "server",
-            "status",
-            "hook",
-            "config",
-            "channel",
-            "workspace",
-            "worktree",
-            "tab",
-            "notification",
-            "agent",
-            "lineage",
-            "msg",
-            "mcp",
-            "terminal",
-            "pane",
-            "peers",
-            "report",
-            "issue",
-            "wait",
-            "integration",
-            "preflight",
-            "checks",
-            "digest",
-            "fleet",
-            "revert-run",
-            "session",
-            "web",
-        ] {
-            let documented = POSITIONAL.iter().any(|(g, _)| *g == group)
-                || VERBS.iter().any(|(g, _, _)| *g == group);
-            assert!(documented, "{group} has no help entry at all");
+    fn every_dispatched_group_is_served() {
+        let groups = dispatched_groups();
+        assert!(
+            groups.len() > 20,
+            "the dispatch scan found nothing to check: {groups:?}"
+        );
+        for group in groups {
+            let served =
+                VERBS.iter().any(|(g, _, _)| *g == group) || SELF_SERVED.contains(&group.as_str());
+            assert!(served, "{group} has no help entry anywhere");
+        }
+    }
+
+    /// Every verb the table claims exists is a verb its dispatcher routes.
+    ///
+    /// The other direction of the same walk: a row left behind by a renamed or
+    /// deleted verb is a help answer for a command that no longer exists.
+    #[test]
+    fn every_tabelled_verb_is_still_dispatched() {
+        for (group, verb, _) in VERBS {
+            let source = group_parser_source(group);
+            assert!(
+                source.contains(&format!("\"{verb}\" =>"))
+                    || source.contains(&format!("Some(\"{verb}\")")),
+                "{group} no longer routes a {verb} verb, but the help table does"
+            );
+        }
+    }
+
+    /// ONE DIRECTION ONLY — a row may not document a flag its parser dropped.
+    ///
+    /// `every_row_documents_the_verb_it_is_keyed_by` catches a row that drifted
+    /// into prose. It cannot catch a row that documents a flag the parser no
+    /// longer accepts — and 90 of the 93 rows are hand-copies, so that is the
+    /// drift a reader would actually notice. This asserts that direction: every
+    /// flag a row claims must be a flag that module accepts.
+    ///
+    /// ## What this test does NOT cover
+    ///
+    /// The reverse — a parser GAINED a flag the row omits — is **not** checked,
+    /// and must not be read as checked. Asserting it means deciding that every
+    /// accepted flag is documented, which the CLI does not currently hold: `peers
+    /// logs` takes `-n` for `--lines` and documents neither, and the group help
+    /// omits both. Asserting it would mean either failing on today's aliases or
+    /// inventing an allowlist of undocumented flags, and an allowlist rots in
+    /// exactly the way this file exists to avoid.
+    ///
+    /// So that half is a reviewer's eye, deliberately: adding `--foo` to a
+    /// parser means adding it to the row in the same change. This test makes
+    /// the other half impossible to get wrong; it does not make drift
+    /// impossible, and a reader who takes it as complete coverage would be
+    /// wrong.
+    ///
+    /// (The name says which direction on purpose. The first version of this
+    /// check claimed to police the rows and silently did nothing — it split the
+    /// usage line on whitespace and so dropped every `[--bracket]`-wrapped flag,
+    /// which is nearly all of them. A guard that cannot fail is worse than no
+    /// guard: it buys confidence it has not earned.)
+    #[test]
+    fn a_row_may_not_document_a_flag_the_parser_dropped() {
+        for (group, verb, usage) in VERBS {
+            let accepted = parser_flags(group);
+            for flag in row_flags(usage) {
+                assert!(
+                    accepted.contains(&flag),
+                    "{group} {verb} documents {flag}, which no longer appears \
+                     anywhere in its parser"
+                );
+            }
         }
     }
 
