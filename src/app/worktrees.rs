@@ -868,6 +868,22 @@ impl App {
     /// Execute the sweep: fire the checkout removals (+ branch deletes for merged
     /// rows) on a worker thread; main-checkout "close pane" rows and the final
     /// workspace closes are applied when the worker reports back.
+    ///
+    /// A removal is planned by tier, but the `force` it carries into git is only
+    /// the operator's escalation — what git actually refused is classified at the
+    /// point of removal (#402), so a checkout git will not remove without help
+    /// for a reason no `dirty` probe can see (a submodule) recovers here the way
+    /// it already recovered through the kill dialog and the socket.
+    ///
+    /// The unattended policy, stated rather than inherited: this seam force-
+    /// recovers a refusal that destroys nothing and LOGS it
+    /// (`worktree.remove` / `force_recovered`), because reporting-and-skipping
+    /// would leave the checkout sitting there forever for a reason no operator
+    /// action could clear — the dialog and the socket can both hand the problem
+    /// to a human, and this one cannot. It does NOT force past a refusal that
+    /// destroys uncommitted work unless the operator already armed force here:
+    /// that is the one escalation a person must be asked about, and the sweep
+    /// has nobody to ask.
     pub(crate) fn start_kill_all_worktrees(&mut self) {
         let Some(kill_all) = &mut self.state.worktree_kill_all else {
             return;
@@ -900,7 +916,9 @@ impl App {
                 }
                 KillAction::CheckoutOnly => {
                     row.status = WorktreeKillRowStatus::Removing;
-                    // Force-remove only when dirty (the forced unmerged-dirty case).
+                    // Not a prediction about what git will do — the operator's
+                    // escalation, carried in so a refusal the classifier can
+                    // clear on its own is cleared on its own (#402).
                     jobs.push((
                         row.workspace_id.clone(),
                         row.repo_root.clone(),
@@ -946,13 +964,30 @@ impl App {
         std::thread::spawn(move || {
             let mut outcomes = Vec::new();
             for (ws_id, repo_root, checkout, branch_to_delete, force_remove) in jobs {
-                let command = crate::worktree::build_worktree_remove_command(
+                // #402: attempt the removal, then act on git's ACTUAL refusal,
+                // through the same classifier the kill dialog and the socket
+                // use. This used to decide `force_remove` up front from the
+                // `dirty` probe, which cannot see a submodule — and a
+                // submodule worktree is not dirty, so the sweep asked for a
+                // non-forced removal, git refused on the gitlink's mere
+                // presence, and the sweep dead-ended exactly where #351 had
+                // already rescued the other two seams.
+                //
+                // `force_remove` is now only the operator's prior decision (the
+                // sweep dialog's `f` escalation), never a prediction.
+                //
+                // The escalation buys the CHECKOUT and nothing else:
+                // `branch_to_delete` is `Some` solely for `KillBranch` rows,
+                // whose tier already demanded positive merge evidence and an
+                // unprotected branch (#396), so no force decision made here can
+                // reach `git branch -D` (#351's pitfall 1).
+                let outcome = match crate::worktree::remove_worktree_unattended(
                     &repo_root,
                     &checkout,
                     force_remove,
-                );
-                let outcome = match crate::worktree::run_worktree_command(&command) {
-                    Ok(()) => {
+                ) {
+                    crate::worktree::WorktreeRemoveOutcome::Removed { .. }
+                    | crate::worktree::WorktreeRemoveOutcome::Recovered { .. } => {
                         if let Some(branch) = branch_to_delete {
                             // Best-effort: the checkout is already gone; a failed
                             // branch delete is surfaced via tracing, not a row error.
@@ -964,7 +999,7 @@ impl App {
                         }
                         Ok(())
                     }
-                    Err(err) => Err(err),
+                    crate::worktree::WorktreeRemoveOutcome::Failed(err) => Err(err),
                 };
                 outcomes.push((ws_id, outcome));
             }
@@ -2566,9 +2601,17 @@ mod tests {
         );
     }
 
-    /// A repo with a populated submodule — the shape (`hyrr` carrying
-    /// `nucl-parquet`) whose kill dead-ended in #351.
-    fn create_repo_with_submodule(name: &str) -> std::path::PathBuf {
+    /// #402: a repo with a committed gitlink and a linked worktree that populates
+    /// it. Both checkout and submodule are clean, so nothing here is dirty —
+    /// which is the whole reason git's refusal surprises a `dirty` probe.
+    ///
+    /// Shared by the two seams that kill checkouts (#402): the dialog and the
+    /// fleet sweep. Two builders for one fixture shape is how a fix to one seam
+    /// quietly stops covering the other.
+    fn create_submodule_worktree(
+        name: &str,
+        branch: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let sub = create_committed_repo(&format!("{name}-sub"));
         let repo = create_committed_repo(name);
         run_git_over_file_protocol(
@@ -2582,19 +2625,7 @@ mod tests {
             ],
         );
         run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
-        repo
-    }
-
-    /// #351: git refuses to remove a worktree holding a submodule, and the
-    /// refusal has to become the force confirmation rather than a dead end.
-    /// Drives real git end to end, because the value under test is git's own
-    /// stderr — a hand-written message would only prove the matcher matches
-    /// itself.
-    #[test]
-    fn submodule_worktree_remove_retries_with_force_and_deletes_merged_branch() {
-        let repo = create_repo_with_submodule("app-worktree-submodule-remove");
-        let checkout = unique_temp_path("app-worktree-submodule-remove-checkout");
-        let branch = "worktree/submodule-remove";
+        let checkout = unique_temp_path(&format!("{name}-checkout"));
         run_git(
             &repo,
             &[
@@ -2608,6 +2639,18 @@ mod tests {
             ],
         );
         run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+        (repo, checkout)
+    }
+
+    /// #351: git refuses to remove a worktree holding a submodule, and the
+    /// refusal has to become the force confirmation rather than a dead end.
+    /// Drives real git end to end, because the value under test is git's own
+    /// stderr — a hand-written message would only prove the matcher matches
+    /// itself.
+    #[test]
+    fn submodule_worktree_remove_retries_with_force_and_deletes_merged_branch() {
+        let branch = "worktree/submodule-remove";
+        let (repo, checkout) = create_submodule_worktree("app-worktree-submodule-remove", branch);
 
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
@@ -2693,22 +2736,9 @@ mod tests {
     /// an unmerged branch survives a forced-past-submodules removal.
     #[test]
     fn forcing_past_the_submodule_refusal_keeps_an_unmerged_branch() {
-        let repo = create_repo_with_submodule("app-worktree-submodule-keep-branch");
-        let checkout = unique_temp_path("app-worktree-submodule-keep-branch-checkout");
         let branch = "worktree/submodule-keep";
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                branch,
-                checkout.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+        let (repo, checkout) =
+            create_submodule_worktree("app-worktree-submodule-keep-branch", branch);
 
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
@@ -3735,6 +3765,261 @@ mod tests {
             row.tier,
             crate::worktree::KillTier::KillBranch { dirty: false }
         );
+    }
+
+    // ---------------------------------------------------------------
+    // #402: the sweep seam. It used to decide `force` from the `dirty`
+    // probe, which cannot see a submodule — so this checkout, clean by every
+    // measure the sweep has, dead-ended in the one caller nobody is watching.
+    // ---------------------------------------------------------------
+
+    /// One real sweep row over a real checkout, with the gate already resolved
+    /// so `start_kill_all_worktrees` will plan rather than wait.
+    fn sweep_row_over(
+        repo_root: &std::path::Path,
+        checkout: &std::path::Path,
+        branch: &str,
+        dirty: bool,
+        tier: crate::worktree::KillTier,
+    ) -> WorktreeKillRow {
+        WorktreeKillRow {
+            workspace_id: "ws-sweep".into(),
+            label: branch.into(),
+            repo_root: repo_root.to_path_buf(),
+            checkout: checkout.to_path_buf(),
+            managed: true,
+            branch: Some(branch.to_string()),
+            dirty,
+            working_agent: false,
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+            protected: false,
+            tier,
+            status: WorktreeKillRowStatus::Pending,
+        }
+    }
+
+    /// Run the sweep's worker and wait for the one event it reports back on.
+    fn run_sweep(app: &mut App) -> crate::events::WorktreeKillAllResult {
+        app.start_kill_all_worktrees();
+        match wait_for_worktree_event(app) {
+            AppEvent::WorktreeKillAllFinished(result) => result,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The single row's outcome. One row in, one outcome out — a sweep that
+    /// dropped one silently would otherwise look identical to a clean run.
+    fn only_sweep_outcome(result: &crate::events::WorktreeKillAllResult) -> &Result<(), String> {
+        assert_eq!(result.outcomes.len(), 1, "one row, one outcome");
+        &result.outcomes[0].1
+    }
+
+    /// #402, P0: a pristine submodule. The checkout is clean, so the sweep's
+    /// probe says "nothing to lose" and its plan asks for a non-forced
+    /// removal — which real git refuses, because `validate_no_submodules` fires
+    /// on the gitlink's presence and not on any dirtiness. Before this the row
+    /// ended in `Err` and the sweep had nowhere to go.
+    #[test]
+    fn the_sweep_force_recovers_a_pristine_submodule_checkout() {
+        let branch = "worktree/sweep-submodule";
+        let (repo, checkout) = create_submodule_worktree("app-sweep-submodule", branch);
+        // The premise, read off real git rather than assumed. Without this the
+        // test would pass on a fixture that had quietly become dirty.
+        assert_eq!(
+            crate::worktree::checkout_is_dirty(&checkout),
+            Some(false),
+            "a populated submodule is not a dirty checkout"
+        );
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row_over(
+                &repo,
+                &checkout,
+                branch,
+                false,
+                crate::worktree::KillTier::CheckoutOnly,
+            )],
+            executing: false,
+            force_dirty: false,
+        });
+
+        let result = run_sweep(&mut app);
+
+        assert_eq!(
+            only_sweep_outcome(&result),
+            &Ok(()),
+            "the sweep dead-ended on a refusal git would have dropped for --force"
+        );
+        assert!(!checkout.exists());
+        // Forcing is not merge evidence (#351's pitfall 1, and this seam's
+        // own version of it): a checkout-only row keeps its branch even when the
+        // removal had to be forced.
+        assert!(
+            branch_still_exists(&repo, branch),
+            "the sweep force-recovered the checkout and took the branch with it"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// #402, P0: the same repo with the submodule deinitialized to an empty
+    /// directory. git's refusal is unchanged — the gitlink is still committed
+    /// in the superproject — so a fix that only handled a *populated*
+    /// submodule would still dead-end here.
+    #[test]
+    fn the_sweep_force_recovers_a_deinitialized_submodule_checkout() {
+        let branch = "worktree/sweep-deinit";
+        let (repo, checkout) = create_submodule_worktree("app-sweep-submodule-deinit", branch);
+        run_git_over_file_protocol(
+            &checkout,
+            &["submodule", "deinit", "--force", "--quiet", "sub"],
+        );
+        assert_eq!(
+            crate::worktree::checkout_is_dirty(&checkout),
+            Some(false),
+            "a deinitialized submodule leaves the checkout clean too"
+        );
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row_over(
+                &repo,
+                &checkout,
+                branch,
+                false,
+                crate::worktree::KillTier::CheckoutOnly,
+            )],
+            executing: false,
+            force_dirty: false,
+        });
+
+        let result = run_sweep(&mut app);
+
+        assert_eq!(only_sweep_outcome(&result), &Ok(()));
+        assert!(!checkout.exists());
+        assert!(branch_still_exists(&repo, branch));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// The escalation is bounded: it clears refusals that destroy nothing, and
+    /// a refusal that DOES destroy work is still refused. The shape is the race
+    /// the `dirty` probe cannot win — the checkout was clean when the sweep
+    /// probed it and is dirty by the time git looks — and the answer has to be
+    /// "report it", not "force it", because nobody is there to be asked.
+    ///
+    /// No submodule here, deliberately. git runs `validate_no_submodules` before
+    /// it ever asks whether the tree is dirty, so a submodule checkout cannot
+    /// produce a `Dirty` refusal at all — and a test that put one here would
+    /// pass while proving the escalation force-deletes untracked files.
+    #[test]
+    fn the_sweep_still_refuses_a_checkout_that_became_dirty_after_the_probe() {
+        let branch = "worktree/sweep-dirty-race";
+        let repo = create_committed_repo("app-sweep-dirty-race");
+        let checkout = unique_temp_path("app-sweep-dirty-race-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(crate::worktree::checkout_is_dirty(&checkout), Some(false));
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row_over(
+                &repo,
+                &checkout,
+                branch,
+                false,
+                crate::worktree::KillTier::CheckoutOnly,
+            )],
+            executing: false,
+            force_dirty: false,
+        });
+        // Dirty AFTER the probe the row above records, and with an untracked
+        // file rather than an edit, so no commit holds it.
+        std::fs::write(checkout.join("scratch.txt"), "unsaved work\n").unwrap();
+        assert_eq!(
+            crate::worktree::checkout_is_dirty(&checkout),
+            Some(true),
+            "the race under test is dirtiness arriving after the probe"
+        );
+
+        let result = run_sweep(&mut app);
+
+        let Err(err) = only_sweep_outcome(&result) else {
+            panic!("the sweep forced away uncommitted work nobody authorised");
+        };
+        assert_eq!(
+            crate::worktree::classify_worktree_remove_error(err),
+            Some(crate::worktree::WorktreeRemoveRefusal::Dirty),
+            "the failure must reach the operator as git's own dirty refusal: {err}"
+        );
+        assert!(
+            checkout.exists(),
+            "a genuinely dirty worktree must survive a sweep that was not asked to force"
+        );
+        assert!(checkout.join("scratch.txt").exists());
+        assert!(branch_still_exists(&repo, branch));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// #402, acceptance: an unmerged branch still survives a sweep that DID
+    /// force. This is the row the operator escalated by hand (`f`), so force is
+    /// authorised — and it still buys the checkout only.
+    ///
+    /// Dirty as well as submodule-bearing, because `f` is what an operator
+    /// presses on a row the probe called dirty. Both refusals are in play and
+    /// the operator has seen both.
+    #[test]
+    fn a_forced_sweep_removal_still_keeps_an_unmerged_branch() {
+        let branch = "worktree/sweep-force-keep-branch";
+        let (repo, checkout) = create_submodule_worktree("app-sweep-force-keep", branch);
+        std::fs::write(checkout.join("scratch.txt"), "unsaved work\n").unwrap();
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_kill_all = Some(WorktreeKillAllState {
+            rows: vec![sweep_row_over(
+                &repo,
+                &checkout,
+                branch,
+                true,
+                crate::worktree::KillTier::SkipUnmergedDirty,
+            )],
+            executing: false,
+            // The operator's escalation, which is what authorises the force.
+            force_dirty: true,
+        });
+
+        let result = run_sweep(&mut app);
+
+        assert_eq!(only_sweep_outcome(&result), &Ok(()));
+        assert!(!checkout.exists());
+        assert!(
+            branch_still_exists(&repo, branch),
+            "forcing the checkout away deleted a branch with no merge evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    fn branch_still_exists(repo: &std::path::Path, branch: &str) -> bool {
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listed.stdout).contains(branch)
     }
 
     #[test]

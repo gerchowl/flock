@@ -184,6 +184,84 @@ pub(crate) fn classify_worktree_remove_error(message: &str) -> Option<WorktreeRe
     None
 }
 
+/// Whether spending `--force` on `refusal` destroys nothing that is not already
+/// recorded somewhere.
+///
+/// The distinction the TUI draws for a human, restated for a caller that has
+/// nobody to ask. `Submodules` is git refusing on the gitlink's mere presence,
+/// and that gitlink is committed in the superproject, so forcing past it loses
+/// no uncommitted work. `Dirty` is the refusal that DOES destroy work, so it
+/// may only be forced by an operator who was shown a dirty checkout and agreed
+/// — never inferred, and never by a sweep nobody is watching.
+pub(crate) fn refusal_forces_nothing(refusal: WorktreeRemoveRefusal) -> bool {
+    matches!(refusal, WorktreeRemoveRefusal::Submodules)
+}
+
+/// What one worktree-removal attempt sequence actually cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeRemoveOutcome {
+    /// Removed on the first attempt. `forced` is whether the caller had already
+    /// armed `--force` before asking.
+    Removed { forced: bool },
+    /// git refused with something `--force` clears, this caller was allowed to
+    /// clear it, and the forced retry worked. `refusal` is which refusal it was
+    /// — the classification, not git's raw wording, so a caller can report what
+    /// it agreed to lose instead of re-deriving it from a string.
+    Recovered { refusal: WorktreeRemoveRefusal },
+    /// Not removed. The message is git's own, from whichever attempt got
+    /// furthest.
+    Failed(String),
+}
+
+/// Remove a worktree checkout for a caller with nobody to ask (#402).
+///
+/// The one thing this does that the kill dialog and the socket do not is decide
+/// the escalation itself, because it has no human to ask: those two classify
+/// git's refusal and hand back something the operator can act on (a second
+/// confirmation, an exit-4 code) — this one acts. Everything else is shared —
+/// the same command, the same [`classify_worktree_remove_error`], the same
+/// meaning of `--force`. That sharing is the whole point: #351 landed the
+/// classifier for two callers, the sweep was the third seam and had drifted
+/// into predicting the answer from a `dirty` probe, which cannot see a
+/// submodule at all.
+///
+/// `force` is an operator's PRIOR decision, never a prediction — pass what the
+/// sweep dialog already decided (`f`). It is what authorises forcing past
+/// `Dirty`, because an operator was shown a dirty checkout and said so. Without
+/// it, this clears only refusals that destroy nothing.
+pub(crate) fn remove_worktree_unattended(
+    repo_root: &Path,
+    path: &Path,
+    force: bool,
+) -> WorktreeRemoveOutcome {
+    let attempt =
+        |force: bool| run_worktree_command(&build_worktree_remove_command(repo_root, path, force));
+    let Err(err) = attempt(force) else {
+        return WorktreeRemoveOutcome::Removed { forced: force };
+    };
+    let Some(refusal) = classify_worktree_remove_error(&err) else {
+        // Not one `--force` clears: a locked worktree, a missing registration,
+        // anything else. Git's own words are the answer.
+        return WorktreeRemoveOutcome::Failed(err);
+    };
+    // Already forced and still refused: the operator spent their confirmation
+    // and it was not enough (#351's rule, unchanged). Forcing again would just
+    // be the same command twice.
+    if force || !refusal_forces_nothing(refusal) {
+        return WorktreeRemoveOutcome::Failed(err);
+    }
+    crate::logging::worktree_remove_force_recovered(
+        &path.display().to_string(),
+        &format!("{refusal:?}"),
+    );
+    match attempt(true) {
+        Ok(()) => WorktreeRemoveOutcome::Recovered { refusal },
+        // Report the forced attempt's words: the first refusal is no longer the
+        // news, whatever it was.
+        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err),
+    }
+}
+
 pub(crate) fn build_worktree_add_new_branch_command(
     repo_root: &Path,
     path: &Path,

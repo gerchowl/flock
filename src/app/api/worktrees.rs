@@ -3302,6 +3302,226 @@ mod tests {
         let _ = std::fs::remove_dir_all(sub);
     }
 
+    // ---------------------------------------------------------------
+    // #402: ONE decision, THREE seams. #351 routed the TUI kill dialog and
+    // this socket through `classify_worktree_remove_error` and left the
+    // fleet-wide sweep (#81) predicting `force` from a `dirty` probe — which
+    // cannot see a submodule at all, so a clean submodule worktree refused
+    // and the sweep dead-ended. This test lives HERE, and asserts the seams
+    // against each other, rather than beside any one of them.
+    //
+    // Three separate per-seam tests would not have caught it: #351's two were
+    // both green while the third drifted. The defect is the disagreement, so
+    // the test has to hold all three in one frame — which means all three
+    // have to run against ONE real repo state, in an order that leaves the
+    // checkout standing until the last of them needs it gone.
+    // ---------------------------------------------------------------
+
+    /// A repo whose committed gitlink is populated, plus a linked worktree of
+    /// it carrying that submodule. Both are clean — which is the premise the
+    /// `dirty` probe cannot model, and the reason to assert it here rather than
+    /// assume it.
+    fn create_submodule_worktree(name: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let sub = create_committed_repo(&format!("{name}-sub"));
+        let repo = create_committed_repo(name);
+        run_git_over_file_protocol(
+            &repo,
+            &[
+                "submodule",
+                "add",
+                "--quiet",
+                &sub.display().to_string(),
+                "sub",
+            ],
+        );
+        run_git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
+        let checkout = unique_temp_path(&format!("{name}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git_over_file_protocol(&checkout, &["submodule", "update", "--init", "--quiet"]);
+        (sub, repo, checkout)
+    }
+
+    /// Wait for the one event of interest, ignoring whatever else is in flight.
+    /// The kill dialog and the sweep both share the gate event/worker, so a
+    /// test that assumed first-event-wins would be racing the fixture itself.
+    fn wait_for_event(
+        app: &mut App,
+        want: fn(&crate::events::AppEvent) -> bool,
+    ) -> crate::events::AppEvent {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(event) = app.event_rx.try_recv() {
+                if want(&event) {
+                    return event;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for worktree event");
+    }
+
+    #[test]
+    fn every_worktree_remove_seam_agrees_on_one_submodule_worktree() {
+        let branch = "worktree/seam-agreement";
+        let (sub, repo, checkout) = create_submodule_worktree("api-seam-agreement", branch);
+
+        // The state all three seams are about, read off real git. If this ever
+        // stops holding, the test below is no longer testing the submodule
+        // refusal and would quietly pass for the wrong reason.
+        assert_eq!(
+            crate::worktree::checkout_is_dirty(&checkout),
+            Some(false),
+            "the fixture must be clean, or nothing here exercises the submodule refusal"
+        );
+
+        let mut app = app_with_parent(&repo);
+        let child_id = push_worktree_workspace(&mut app, &repo, &checkout);
+
+        // ---- seam 1: the socket API -------------------------------------
+        // Asks for the cheapest removal it can and must be told, in its own
+        // vocabulary, that this one needs force. Its answer is a CODE, because
+        // a script can retry with it.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: child_id.clone(),
+                force: false,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code, "submodule_worktree_requires_force",
+            "the socket lost the submodule/dirty distinction: {response}"
+        );
+        assert!(
+            checkout.exists(),
+            "a refused remove must not delete anything"
+        );
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "a refused remove must not close the workspace"
+        );
+
+        // ---- seam 2: the TUI kill dialog --------------------------------
+        // Same repo state, same refusal. A human is present here, so the seam's
+        // job is to turn the refusal into the second confirmation rather than
+        // spend the force itself — which is why its answer is a DIALOG, not a
+        // deletion.
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
+            workspace_id: child_id.clone(),
+            repo_root: repo.clone(),
+            path: checkout.clone(),
+            error: None,
+            removing: false,
+            force_confirmation: None,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
+            force: false,
+            probe: None,
+            delete_branch: true,
+            branch: Some(branch.to_string()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+            branch_protected: false,
+            gate_timed_out: false,
+        });
+        app.state.mode = crate::app::state::Mode::ConfirmRemoveWorktree;
+        app.start_worktree_remove();
+        match wait_for_event(&mut app, |event| {
+            matches!(event, crate::events::AppEvent::WorktreeRemoveFinished(_))
+        }) {
+            crate::events::AppEvent::WorktreeRemoveFinished(result) => {
+                assert!(result.result.is_err(), "git refused, as seam 1 saw");
+                app.handle_worktree_remove_finished(result);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(
+            remove.force_confirmation,
+            Some(crate::worktree::WorktreeRemoveRefusal::Submodules),
+            "the dialog must name the same refusal the socket coded"
+        );
+        assert_eq!(
+            remove.error, None,
+            "the dialog must not read a force-clearable refusal as a dead end"
+        );
+        assert_eq!(remove.primary_label(), "force remove");
+        assert!(checkout.exists());
+
+        // ---- seam 3: the fleet sweep ------------------------------------
+        // Same repo state again, and nobody to ask. This is the seam that
+        // drifted, and the one that has to ACT rather than report: a clean
+        // submodule worktree is not a dead end, it is a removal git will drop
+        // for `--force` and loses no uncommitted work to grant.
+        app.state.worktree_remove = None;
+        app.state.worktree_kill_all = Some(crate::app::state::WorktreeKillAllState {
+            rows: vec![crate::app::state::WorktreeKillRow {
+                workspace_id: child_id.clone(),
+                label: branch.into(),
+                repo_root: repo.clone(),
+                checkout: checkout.clone(),
+                managed: true,
+                branch: Some(branch.to_string()),
+                // What the sweep's probe would have said about this checkout.
+                dirty: false,
+                working_agent: false,
+                merge_gate: Some(crate::worktree::WorktreeMergeGate::NotMerged),
+                protected: false,
+                tier: crate::worktree::KillTier::CheckoutOnly,
+                status: crate::app::state::WorktreeKillRowStatus::Pending,
+            }],
+            executing: false,
+            force_dirty: false,
+        });
+        app.start_kill_all_worktrees();
+        let sweep = match wait_for_event(&mut app, |event| {
+            matches!(event, crate::events::AppEvent::WorktreeKillAllFinished(_))
+        }) {
+            crate::events::AppEvent::WorktreeKillAllFinished(result) => result,
+            other => panic!("unexpected event: {other:?}"),
+        };
+
+        assert_eq!(sweep.outcomes.len(), 1, "one row, one outcome");
+        assert_eq!(
+            sweep.outcomes[0].1,
+            Ok(()),
+            "the sweep disagreed with the other two seams: it could not remove what \
+             they were both told only needs force"
+        );
+        assert!(!checkout.exists());
+
+        // The sweep's own finalisation, so "no dead end" is asserted where the
+        // operator reads it rather than only in the worker's return value.
+        app.handle_worktree_kill_all_finished(sweep);
+        let notice = app.state.action_notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("0 error(s)"),
+            "the sweep reported a failure the other two seams recovered from: {notice}"
+        );
+
+        // All three agreed on the removal, and force bought the checkout only:
+        // no merge evidence, so the branch survives (#351's pitfall 1).
+        assert!(
+            branch_exists(&repo, branch),
+            "the sweep force-recovered the checkout and deleted an unmerged branch"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(sub);
+    }
+
     /// #175 ADR-0005: a workspace close announces itself exactly once, whether
     /// the operator pressed a key or a socket caller asked for it. The socket
     /// handlers used to emit directly while the keyboard emitted nothing, so
