@@ -8,16 +8,38 @@ use crate::api::schema::{LineageParams, Method, Request};
 /// `flk lineage <target>` (#175 O1, US-4): print the fork ancestry chain of
 /// a pane / worktree / branch, reconstructed from the durable event log so
 /// it works across server restarts and after the panes are gone.
+/// The one place that says what a target resolves from, and how a reused
+/// branch name is disambiguated. Kept whole: a usage line alone would be a
+/// downgrade of what this command already explained.
+fn lineage_help_text() -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "usage: flk lineage <target> [--json]");
+    let _ = writeln!(
+        out,
+        "  target: pane id, agent name, worktree path or basename, or branch name"
+    );
+    let _ = writeln!(
+        out,
+        "  ambiguous identities (reused branch names) resolve to the most recent fork"
+    );
+    out
+}
+
 pub(super) fn run_lineage_command(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk lineage <target> [--json]";
     let Some(first) = args.first().map(|arg| arg.as_str()) else {
         eprintln!("{USAGE}");
         return Ok(2);
     };
-    if matches!(first, "help" | "--help" | "-h") {
-        eprintln!("{USAGE}");
-        eprintln!("  target: pane id, agent name, worktree path or basename, or branch name");
-        eprintln!("  ambiguous identities (reused branch names) resolve to the most recent fork");
+    // #455: `cli::help`'s predicate, so this command's own richer usage (what a
+    // target resolves from, and how reused branch names disambiguate) is
+    // answered on the same terms as the table's — and is honoured anywhere in
+    // the argument list, not only in first position.
+    if super::help::asks_for_help(args) || first == "help" {
+        // stdout, like `flk --help`: the request was honoured, so this is the
+        // command's output and can be redirected or paged.
+        print!("{}", lineage_help_text());
         return Ok(0);
     }
     let mut json = false;

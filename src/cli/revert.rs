@@ -16,8 +16,14 @@ pub(super) fn run_revert_run_command(args: &[String]) -> std::io::Result<i32> {
         print_help();
         return Ok(2);
     };
-    if matches!(first, "help" | "--help" | "-h") {
-        print_help();
+    // #455: `cli::help`'s predicate, so `flk revert-run <run-id> --help`
+    // answers with this command's own help — including what a run-id looks
+    // like — instead of an unknown-option error. A run-id is an id, not literal
+    // text, so there is nothing here for the flag to be mistaken for.
+    if super::help::asks_for_help(args) || first == "help" {
+        // stdout, like `flk --help`: the request was honoured, so this is the
+        // command's output and can be redirected or paged.
+        print!("{}", help_text());
         return Ok(0);
     }
     let run_id = first.to_string();
@@ -82,9 +88,23 @@ pub(super) fn run_revert_run_command(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
+/// Usage after a bad argument: stderr, because it accompanies a failure.
 fn print_help() {
-    eprintln!("flk revert-run <run-id> [--dry-run] [--json]");
-    eprintln!("  <run-id>    the id to revert (matches `^Agent-Run: <id>$` trailers)");
-    eprintln!("  --dry-run   list matches + would-be branches; write nothing");
-    eprintln!("  --json      print the raw JSON envelope");
+    eprint!("{}", help_text());
+}
+
+fn help_text() -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "flk revert-run <run-id> [--dry-run] [--json]");
+    let _ = writeln!(
+        out,
+        "  <run-id>    the id to revert (matches `^Agent-Run: <id>$` trailers)"
+    );
+    let _ = writeln!(
+        out,
+        "  --dry-run   list matches + would-be branches; write nothing"
+    );
+    let _ = writeln!(out, "  --json      print the raw JSON envelope");
+    out
 }

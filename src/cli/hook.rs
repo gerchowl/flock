@@ -159,6 +159,17 @@ struct HookOutcome {
 }
 
 pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
+    // #455: `hook` is the one dispatched command with no help answer of its
+    // own — `flk hook --help` used to exit 2 — and the predicate is
+    // `cli::help`'s so it cannot become a second rule. Ahead of the pane-env
+    // guard on purpose: asking what a hook is must never wake anything.
+    if super::help::asks_for_help(args) {
+        // stdout, like `flk --help`: the request was honoured, so this is the
+        // command's output and can be redirected or paged.
+        println!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
+        return Ok(0);
+    }
+
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
         eprintln!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
         return Ok(2);

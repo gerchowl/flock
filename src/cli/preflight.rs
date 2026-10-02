@@ -60,6 +60,16 @@ pub(crate) struct Check {
 }
 
 pub(super) fn run_preflight_command(args: &[String]) -> std::io::Result<i32> {
+    // #455: the rule comes from `cli::help` so this command's own, richer usage
+    // is answered on the same terms as the table's. It was already correct for
+    // `--help` anywhere; this removes the private copy that could drift.
+    if super::help::asks_for_help(args) {
+        // stdout, like `flk --help`: the request was honoured, so this is the
+        // command's output and can be redirected or paged.
+        print!("{}", usage_text());
+        return Ok(0);
+    }
+
     let mut required: Vec<String> = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -83,10 +93,6 @@ pub(super) fn run_preflight_command(args: &[String]) -> std::io::Result<i32> {
                     return Ok(super::CONFIG_CHECK_PARSE_FAILURE);
                 }
             },
-            "-h" | "--help" => {
-                print_usage();
-                return Ok(0);
-            }
             other => {
                 eprintln!("flk preflight: unknown argument {other}");
                 print_usage();
@@ -121,15 +127,32 @@ pub(super) fn run_preflight_command(args: &[String]) -> std::io::Result<i32> {
     Ok(worst.exit_code())
 }
 
+/// Usage after a bad argument: stderr, because it accompanies a failure.
 fn print_usage() {
-    eprintln!("usage: flk preflight [--require TARGET]...");
-    eprintln!();
-    eprintln!("  --require TARGET  treat TARGET's integration as intended, so a");
-    eprintln!("                    missing hook is blocking rather than advisory.");
-    eprintln!("                    Repeatable. The deployment knows its own intent;");
-    eprintln!("                    flock cannot infer it.");
-    eprintln!();
-    eprintln!("exit: 0 ready · 1 advisory · 2 blocking");
+    eprint!("{}", usage_text());
+}
+
+fn usage_text() -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "usage: flk preflight [--require TARGET]...");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  --require TARGET  treat TARGET's integration as intended, so a"
+    );
+    let _ = writeln!(
+        out,
+        "                    missing hook is blocking rather than advisory."
+    );
+    let _ = writeln!(
+        out,
+        "                    Repeatable. The deployment knows its own intent;"
+    );
+    let _ = writeln!(out, "                    flock cannot infer it.");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "exit: 0 ready · 1 advisory · 2 blocking");
+    out
 }
 
 pub(crate) fn collect_checks(required: &[String]) -> Vec<Check> {

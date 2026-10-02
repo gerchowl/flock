@@ -14,11 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::api::schema::{DigestRenderParams, Method, Request};
 
 pub(super) fn run_digest_command(args: &[String]) -> std::io::Result<i32> {
-    if let Some(first) = args.first().map(|arg| arg.as_str()) {
-        if matches!(first, "help" | "--help" | "-h") {
-            print_digest_help();
-            return Ok(0);
-        }
+    // #455: `cli::help`'s predicate rather than a private first-position check,
+    // so `flk digest --json --help` prints this command's own richer usage (the
+    // `--since` suffixes, the default output path) instead of an unknown-option
+    // error.
+    if super::help::asks_for_help(args) || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        // stdout, like `flk --help`: the request was honoured, so this is the
+        // command's output and can be redirected or paged.
+        print!("{}", digest_help_text());
+        return Ok(0);
     }
     let mut json = false;
     let mut path: Option<String> = None;
@@ -127,11 +132,31 @@ fn parse_duration_secs(raw: &str) -> Option<u64> {
     }
 }
 
+/// Usage after a bad argument: stderr, because it accompanies a failure.
 fn print_digest_help() {
-    eprintln!("flk digest [--since <duration>] [--path FILE] [--json]");
-    eprintln!("  --since <dur>  keep only events younger than <dur>; supports 30m/24h/7d/3600s");
-    eprintln!("  --path FILE    write to FILE instead of data_dir()/digest/<YYYY-MM-DD>.html");
-    eprintln!("  --json         print the raw JSON envelope instead of the file path");
+    eprint!("{}", digest_help_text());
+}
+
+fn digest_help_text() -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "flk digest [--since <duration>] [--path FILE] [--json]"
+    );
+    let _ = writeln!(
+        out,
+        "  --since <dur>  keep only events younger than <dur>; supports 30m/24h/7d/3600s"
+    );
+    let _ = writeln!(
+        out,
+        "  --path FILE    write to FILE instead of data_dir()/digest/<YYYY-MM-DD>.html"
+    );
+    let _ = writeln!(
+        out,
+        "  --json         print the raw JSON envelope instead of the file path"
+    );
+    out
 }
 
 #[cfg(test)]
