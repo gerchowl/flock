@@ -1450,6 +1450,34 @@ impl App {
         id: String,
         params: crate::api::schema::NotificationShowParams,
     ) -> String {
+        // The verb is a caller announcing something, so it files as `Notice`
+        // — the bucket ADR-0016 documents for a refusal, an update or an
+        // announcement — and it names no pane, because the caller named none.
+        self.show_notification(
+            id,
+            params,
+            crate::app::notifications::NotificationFiling {
+                kind: crate::api::schema::NotificationRecordKind::Notice,
+                pane_id: None,
+            },
+        )
+    }
+
+    /// Show a notification and file it, classified by whoever raised it.
+    ///
+    /// The delivery path and the record are one thing (#372 / ADR-0016: file
+    /// it whether or not it was shown, because every refusal above discards
+    /// the caller's text) but they are not the same *question*. `kind` and
+    /// `pane_id` are the record's, and only the raiser knows them: the verb
+    /// files a caller's announcement as a `Notice` about nothing, while an
+    /// escalation flock decides for itself (ADR-0018 §4) files as an
+    /// `Attention` naming the pane that is waiting on the operator.
+    pub(super) fn show_notification(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationShowParams,
+        filing: crate::app::notifications::NotificationFiling,
+    ) -> String {
         use crate::api::schema::{NotificationShowReason, ResponseResult};
 
         let requested_sound = params.sound;
@@ -1524,10 +1552,10 @@ impl App {
                 id: crate::app::notifications::mint_notification_id(),
                 title,
                 body,
-                kind: crate::api::schema::NotificationRecordKind::Notice,
+                kind: filing.kind,
                 source: crate::api::schema::NotificationSource::Api,
                 workspace_id: None,
-                pane_id: None,
+                pane_id: filing.pane_id,
                 origin_host: crate::app::short_host_name(),
                 filed_at_ms: crate::app::notifications::now_ms(),
                 seen: false,
