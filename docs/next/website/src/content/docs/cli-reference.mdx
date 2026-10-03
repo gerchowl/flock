@@ -318,6 +318,8 @@ flk notification read <notification-id> | --all
 
 `show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
 
+The notification log panel inside the TUI (`prefix+i`, or the sidebar `menu` row → `notifications`) lists and acknowledges the same records: all three surfaces read one filter over one projection, so `--unread` and the panel's `u` filter can never disagree about what is unread.
+
 Each row carries a `kind`, which is what makes the log readable rather than a stream: `attention` is something waiting on you — an agent that went blocked, or `blocking` mail for a recipient that muted itself — `outcome` is something that finished and produced a result, and `notice` is everything else worth keeping, which is every `show` call and every fleet failure. An escalation of that kind also names the pane that is waiting, so the title badge does not count a blocked pane twice.
 
 Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks for no popups, not for Flock to forget: the outcome is still recorded and still readable here. Records survive a server restart, and reading the list is not the same as acknowledging it, because acknowledging is what lets an old record be dropped.

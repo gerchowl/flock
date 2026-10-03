@@ -1318,6 +1318,10 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// The operator's notification log (#516) — the reading surface ADR-0016
+    /// §6 promised. A reader only: it renders the projection and
+    /// acknowledges through the same seam `notification.ack` uses.
+    Notifications,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2306,6 +2310,9 @@ pub struct AppState {
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
     pub navigator: NavigatorState,
+    /// Panel-only cursor and filter for the notification log (#516). Not part
+    /// of the log: closing the panel loses nothing.
+    pub notifications_panel: crate::app::notification_panel::NotificationPanelState,
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
@@ -3113,12 +3120,18 @@ impl AppState {
     }
 
     pub(crate) fn global_menu_attention_badge_visible(&self) -> bool {
-        self.update_available.is_some() || self.integration_updates_available()
+        self.update_available.is_some()
+            || self.integration_updates_available()
+            // #516: unread outcomes want the operator, so the pinned `menu` row
+            // wears the same dot the sidebar already uses for "something is
+            // waiting" rather than waiting for them to find the log by key.
+            || self.notifications.unread() > 0
     }
 
     pub(crate) fn global_menu_item_has_badge(&self, item: &str) -> bool {
         (item == "update ready" && self.update_available.is_some())
             || (item == "settings" && self.integration_updates_available())
+            || (item == "notifications" && self.notifications.unread() > 0)
     }
 
     pub(crate) fn settings_section_has_badge(&self, section: SettingsSection) -> bool {
@@ -3331,6 +3344,7 @@ impl AppState {
             product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
             navigator: NavigatorState::default(),
+            notifications_panel: crate::app::notification_panel::NotificationPanelState::default(),
             copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,

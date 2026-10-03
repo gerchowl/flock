@@ -622,6 +622,8 @@ pub(crate) enum NavigateAction {
     Settings,
     ReloadConfig,
     OpenNotificationTarget,
+    /// Open the notification log panel (#516).
+    Notifications,
     Detach,
     OpenNavigator,
 }
@@ -753,6 +755,7 @@ fn action_for_key(
             &kb.open_notification_target,
             NavigateAction::OpenNotificationTarget,
         ),
+        (&kb.notifications, NavigateAction::Notifications),
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::OpenNavigator),
     ] {
@@ -1052,6 +1055,7 @@ pub(super) fn execute_navigate_action_in_context(
                 leave_navigate_mode(state);
             }
         }
+        NavigateAction::Notifications => state.open_notification_panel(),
         NavigateAction::Detach => {
             super::modal::request_detach(state);
             leave_navigate_mode(state);
@@ -1673,6 +1677,48 @@ mod tests {
 
         assert!(state.request_reload_config);
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    /// #514 shipped a probe whose keybindings were unbound, so its assertions
+    /// passed with the feature reverted. This drives the key the way the
+    /// default config actually binds it — a prefix chord included — so a
+    /// binding that stops being wired fails here rather than only on screen.
+    #[test]
+    fn the_default_notifications_key_opens_the_panel_from_navigate_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Navigate;
+
+        let bindings = crate::config::Config::default().keybinds().notifications;
+        assert!(
+            !bindings.bindings.is_empty(),
+            "the panel must ship with a key, not only a menu entry"
+        );
+        for binding in &bindings.bindings {
+            let (code, modifiers) = binding.trigger.combo();
+            assert!(binding.trigger.is_prefix(), "the default is a prefix chord");
+            handle_navigate_key(&mut state, KeyEvent::new(code, modifiers));
+            assert_eq!(
+                state.mode,
+                Mode::Notifications,
+                "{} opens the panel",
+                binding.label
+            );
+            state.mode = Mode::Navigate;
+        }
+    }
+
+    #[test]
+    fn custom_notifications_key_replaces_the_default() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Navigate;
+        state.keybinds.notifications = crate::config::ActionKeybinds::prefix("g");
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.mode, Mode::Notifications);
     }
 
     #[test]

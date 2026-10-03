@@ -285,6 +285,7 @@ pub struct Keybinds {
     pub detach: ActionKeybinds,
     pub reload_config: ActionKeybinds,
     pub open_notification_target: ActionKeybinds,
+    pub notifications: ActionKeybinds,
     pub previous_workspace: ActionKeybinds,
     pub next_workspace: ActionKeybinds,
     pub previous_agent: ActionKeybinds,
@@ -504,6 +505,7 @@ impl Config {
                 "keys.open_notification_target",
                 &self.keys.open_notification_target
             ),
+            notifications: action!("keys.notifications", &self.keys.notifications),
             previous_workspace: action!("keys.previous_workspace", &self.keys.previous_workspace),
             next_workspace: action!("keys.next_workspace", &self.keys.next_workspace),
             previous_agent: action!("keys.previous_agent", &self.keys.previous_agent),

@@ -14,6 +14,7 @@ mod medallion;
 mod menus;
 mod mobile;
 mod navigator;
+mod notifications;
 mod onboarding;
 mod panes;
 mod prompt_layout;
@@ -48,6 +49,11 @@ use self::mobile::{
     render_mobile_toast_banner,
 };
 use self::navigator::render_navigator_overlay;
+use self::notifications::render_notifications_panel;
+pub(crate) use self::notifications::{
+    notifications_panel_body_rect, notifications_panel_button_rects, notifications_panel_stack,
+    NOTIFICATIONS_PANEL_MODAL_SIZE,
+};
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
@@ -107,7 +113,7 @@ pub(crate) use self::{
     },
     panes::pane_is_scrolled_back,
     tabs::{compute_member_strip_view, compute_tab_bar_view},
-    widgets::{centered_popup_rect, modal_stack_areas},
+    widgets::{centered_popup_rect, modal_stack_areas, ModalStackAreas},
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
@@ -629,6 +635,7 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, frame),
+        Mode::Notifications => render_notifications_panel(app, frame, frame.area()),
         Mode::Terminal => {}
     }
 }

@@ -224,6 +224,10 @@ impl AppState {
         } else if self.latest_release_notes_available {
             labels.push("what's new");
         }
+        // #516: the notification log's TUI surface. On the menu because the
+        // menu is the launcher flock already reaches by click — a reading
+        // surface behind a keybind only would not be mouse-reachable.
+        labels.push("notifications");
         labels.push("detach");
         labels
     }
@@ -787,6 +791,7 @@ mod tests {
                 "keybinds",
                 "reload config",
                 "update ready",
+                "notifications",
                 "detach"
             ]
         );
@@ -807,14 +812,20 @@ mod tests {
 
         assert_eq!(
             app.state.global_menu_labels(),
-            vec!["settings", "keybinds", "reload config", "detach"]
+            vec![
+                "settings",
+                "keybinds",
+                "reload config",
+                "notifications",
+                "detach"
+            ]
         );
 
         let menu = app.state.global_menu_rect();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 4,
+            menu.y + 5,
         ));
 
         assert!(app.state.detach_requested);
@@ -834,6 +845,7 @@ mod tests {
                 "keybinds",
                 "reload config",
                 "what's new",
+                "notifications",
                 "detach"
             ]
         );

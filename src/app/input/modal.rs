@@ -74,6 +74,11 @@ pub(crate) enum GlobalMenuAction {
     Keybinds,
     ReloadConfig,
     Settings,
+    /// The operator's notification log (#516). On the menu because the menu is
+    /// the surface flock already reaches by click, and because a log that can
+    /// only be opened from a keybind is not reachable by the mouse the rest of
+    /// the app is built for.
+    Notifications,
 }
 
 pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
@@ -85,6 +90,7 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
+    actions.push(GlobalMenuAction::Notifications);
     actions.push(GlobalMenuAction::Detach);
     actions
 }
@@ -134,6 +140,31 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
             leave_modal(state);
         }
         GlobalMenuAction::Settings => super::settings::open_settings(state),
+        GlobalMenuAction::Notifications => state.open_notification_panel(),
+    }
+}
+
+/// The notification panel's keys (#516). Enter acknowledges the selected
+/// record, `a` acknowledges every unread one, `u` toggles the same
+/// `--unread` filter the CLI takes, and Esc leaves — the same four actions the
+/// panel's buttons and the menu entry reach.
+pub(crate) fn handle_notifications_key(state: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => leave_modal(state),
+        KeyCode::Enter => {
+            state.acknowledge_selected_notification();
+        }
+        KeyCode::Char('a') => {
+            state.acknowledge_all_notifications_from_panel();
+        }
+        KeyCode::Up | KeyCode::Char('k') => state.move_notification_panel_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => state.move_notification_panel_selection(1),
+        KeyCode::PageUp => state.move_notification_panel_selection(-10),
+        KeyCode::PageDown => state.move_notification_panel_selection(10),
+        KeyCode::Home => state.select_notification_panel_row(0),
+        KeyCode::End => state.select_notification_panel_row(usize::MAX),
+        KeyCode::Char('u') => state.toggle_notification_panel_unread_only(),
+        _ => {}
     }
 }
 
