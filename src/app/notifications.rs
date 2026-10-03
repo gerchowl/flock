@@ -49,6 +49,25 @@ pub(crate) struct NotificationEntry {
     pub seen: bool,
 }
 
+/// How a record raised through `notification.show`'s delivery path is
+/// *classified*.
+///
+/// The verb and the escalation share that path — one delivery, one filing —
+/// but not the question. `notification.show` is a caller announcing
+/// something, so it files as `Notice` ("a refusal, an update, an
+/// announcement") about no pane in particular. An escalation (ADR-0018 §4) is
+/// flock deciding, for a pane whose public id it minted, that a question is
+/// unanswered because the recipient muted itself: that is literally
+/// `Attention`'s definition — "something is waiting on the operator" — and
+/// the pane is what tells the badge the live tally may already be speaking
+/// for it. Only the raiser knows either field, so neither is a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotificationFiling {
+    pub kind: NotificationRecordKind,
+    /// The public pane id this record is about, when there is one.
+    pub pane_id: Option<String>,
+}
+
 /// Oldest at the front, newest at the back.
 #[derive(Debug, Default)]
 pub(crate) struct NotificationLog {

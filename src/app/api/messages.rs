@@ -1445,18 +1445,37 @@ impl App {
     /// disagreement about urgency, and neither side wins it silently — the
     /// operator is told. Sender, recipient and count only: the body never
     /// leaves the inbox (ADR-0008). Once per message.
+    ///
+    /// The record is filed as `Attention` and names the pane it is about
+    /// (#517). Both are things the escalation knows and the verb does not: the
+    /// sender identity in the body is one this server validated (ADR-0018 §1),
+    /// so this is an ask raised *at* the operator, which is `Attention`'s
+    /// definition — not the `Notice` bucket an announcement or a refusal
+    /// belongs in, where a question was indistinguishable from a peer-connect
+    /// failure. The pane id is this server's own mint of it, and it is what
+    /// lets the badge stop reporting one fact twice: a recipient still
+    /// blocked already shows as `B`, so its unread escalation must not add a
+    /// `U` for the same pane.
+    ///
+    /// Deliberately unchanged: the body still names sender, recipient and
+    /// count and never the question, and this still files through a path no
+    /// agent can reach by a verb of its own.
     pub(super) fn escalate_muted_blocking(&mut self, pane: &str) {
         if self.mailboxes.muted_until(pane, now_ms()).is_none() {
             return;
         }
         for (sender, count) in self.mailboxes.take_unescalated_blocking(pane) {
-            let _ = self.handle_notification_show(
+            let _ = self.show_notification(
                 format!("msg:escalate:{pane}"),
                 crate::api::schema::NotificationShowParams {
                     title: "blocking message for a muted agent".to_string(),
                     body: Some(escalation_body(&sender, pane, count)),
                     position: None,
                     sound: crate::api::schema::NotificationShowSound::Request,
+                },
+                crate::app::notifications::NotificationFiling {
+                    kind: crate::api::schema::NotificationRecordKind::Attention,
+                    pane_id: Some(pane.to_string()),
                 },
             );
         }
@@ -3151,6 +3170,155 @@ mod tests {
             newest.contains("1 blocking message"),
             "names the count: {newest}"
         );
+    }
+
+    /// The escalation row out of `notification.list`, newest first.
+    fn escalation(app: &mut crate::app::App) -> serde_json::Value {
+        filed_notifications(app)
+            .into_iter()
+            .find(|row| row["title"].as_str() == Some("blocking message for a muted agent"))
+            .expect("the escalation reached the operator's log")
+    }
+
+    /// Drive the escalation the only way it happens — a `blocking` send that
+    /// lands on a muted recipient — and read the record back through the
+    /// surface an operator reads (`notification.list`, i.e. `flk notification
+    /// list`). Asserting on a record built by hand would prove only that the
+    /// enum has three variants.
+    #[tokio::test]
+    async fn an_escalation_is_filed_as_attention_and_names_the_pane_waiting() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let pane = pane_target(&app, 1);
+
+        // A caller's own announcement goes in first, so the reclassification
+        // below is provably the escalation's and not the verb's: the verb
+        // files `Notice`, which is what ADR-0016 documents it for.
+        let response = app.handle_api_request(wire_request(serde_json::json!({
+            "id": "req",
+            "method": "notification.show",
+            "params": {"title": "peer connect failed"},
+        })));
+        assert!(response.contains("\"result\""), "{response}");
+
+        mute(&mut app, &pane, 600);
+        tiered_send(&mut app, &pane, "c-k1", "blocking", "SECRET rebase first");
+
+        let filed = filed_notifications(&mut app);
+        let announcement = filed
+            .iter()
+            .find(|row| row["title"] == "peer connect failed")
+            .expect("the announcement is filed too");
+        assert_eq!(
+            announcement["kind"], "notice",
+            "an announcement stays an announcement: {announcement}"
+        );
+        assert!(
+            announcement["pane_id"].is_null(),
+            "and names no pane, because the caller named none: {announcement}"
+        );
+
+        // ADR-0018 §4's escalation is the one record that means "something is
+        // waiting on the operator", so it files as `Attention` and about the
+        // pane that is waiting.
+        let filed = escalation(&mut app);
+        assert_eq!(
+            filed["kind"], "attention",
+            "a question raised at the operator is filed as the weakest kind \
+             instead: {filed}"
+        );
+        assert_eq!(
+            filed["pane_id"],
+            pane.as_str(),
+            "the record knows which pane is waiting, and does not say: {filed}"
+        );
+        assert_eq!(filed["seen"], false, "and it is unread: {filed}");
+
+        // The classification is durable, not projection-only: the record is
+        // derived from the `notification_filed` event, so rebuilding the log
+        // the way a restart does has to bring the kind and the pane back.
+        // Otherwise the operator reads it correctly until they reboot.
+        let events: Vec<EventEnvelope> = hub
+            .events_after(0)
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .collect();
+        let mut rebuilt = crate::app::notifications::NotificationLog::default();
+        rebuilt.seed_from_events(events.iter());
+        let durable = rebuilt
+            .newest_first()
+            .find(|entry| entry.title == "blocking message for a muted agent")
+            .expect("the escalation outlives the session that raised it");
+        assert_eq!(
+            durable.kind,
+            crate::api::schema::NotificationRecordKind::Attention
+        );
+        assert_eq!(durable.pane_id.as_deref(), Some(pane.as_str()));
+        assert!(!durable.seen, "and a restart does not read it for you");
+    }
+
+    /// The badge is the operator's ambient read of the same record, and it
+    /// counts a record only when no live pane can already speak for it. An
+    /// escalation filed about no pane could never be excluded, so a recipient
+    /// still blocked showed as both `B` and a `U` — one fact, two terms.
+    #[tokio::test]
+    async fn an_escalation_does_not_double_count_a_pane_the_badge_already_speaks_for() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let pane = pane_target(&app, 1);
+        mute(&mut app, &pane, 600);
+        tiered_send(&mut app, &pane, "c-k2", "blocking", "SECRET rebase first");
+
+        // Nothing in this pane's live state claims the question, so the record
+        // is the only thing telling the operator it is unanswered.
+        assert_eq!(
+            app.state.unread_notifications_beyond_live_states(),
+            1,
+            "an unread question must not go unmentioned: {:?}",
+            title_for(&app)
+        );
+        assert!(title_for(&app).contains("1U"), "{}", title_for(&app));
+
+        // Now the agent is blocked, so the badge's own `B` speaks for it.
+        let (ws_idx, pane_id) = app.parse_pane_id(&pane).expect("the pane");
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .state = crate::detect::AgentState::Blocked;
+
+        assert_eq!(
+            app.state.unread_notifications_beyond_live_states(),
+            0,
+            "one blocked pane is one `B`: {}",
+            title_for(&app)
+        );
+        let title = title_for(&app);
+        assert!(title.contains('B'), "{title}");
+        assert!(!title.contains('U'), "the same fact twice: {title}");
+    }
+
+    /// The title the operator's terminal shows: this server's real pane tally
+    /// and the app's real unread count, through the real renderer. Pure, so
+    /// nothing here depends on the machine it runs on.
+    fn title_for(app: &crate::app::App) -> String {
+        let tally = crate::ui::state_signal::tally_states(
+            app.state
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.pane_states(&app.state.terminals))
+                .map(|(state, seen)| crate::ui::state_signal::StateClass::of(state, seen)),
+        );
+        crate::ui::window_title::render_window_title(
+            &tally,
+            app.state.unread_notifications_beyond_live_states(),
+            None,
+            "node.invalid",
+        )
     }
 
     #[tokio::test]
