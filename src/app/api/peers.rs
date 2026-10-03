@@ -1672,7 +1672,7 @@ mod tests {
                         dial: None,
                         name: "loop-back".into(),
                         ssh_target: "operator@loop".into(),
-                        host: Some("loop-back".into()),
+                        host: Some("loop-back".into()), // guardrails-ok(fixture): a ProxyJump chain hop, not a fleet member
                         version: None,
                         protocol: None,
                         system: None,

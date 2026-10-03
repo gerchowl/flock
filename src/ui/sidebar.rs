@@ -4477,7 +4477,7 @@ mod tests {
         // OS hostname; the row must show the configured name (#42).
         let p = crate::app::state::AppState::test_new().palette;
         let mut peer = peer_with_workspaces("kiln", vec![]);
-        peer.host = Some("mac-atlas-12345.local".into());
+        peer.host = Some("mac-atlas-12345.local".into()); // guardrails-ok(fixture): a raw OS hostname (Bonjour `.local`), which must NOT become the identity
         peer.latency_ms = Some(10);
 
         let name =
