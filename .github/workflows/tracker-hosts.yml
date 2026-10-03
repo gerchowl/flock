@@ -1,0 +1,70 @@
+# guardrails-ok(ci-shim): text-only gate over event payloads — nothing is built, so there is no nix flake check equivalent
+name: Tracker hosts
+
+# A file-scanning gate cannot reach a PR title, a PR body, an issue, or a comment —
+# and that is where the leak was worst: 97 issue and PR bodies, 28 comments and 2
+# titles, all of which named the author's real machines (#510). This job runs the
+# public half of the fixture-host rules over those payloads and nothing else.
+#
+# It never checks out the pull request's code. `actions/checkout` is pinned to the
+# default branch and `persist-credentials` is off, so an untrusted fork cannot
+# influence what runs here; the only inputs are event payloads, passed through the
+# environment rather than interpolated into the script body, for the same reason
+# ci.yml does it for a PR title.
+#
+# What this job can and cannot catch, stated plainly. It judges the three
+# unambiguous shapes: `user@host`, `agent_<host>_<suffix>`, and a MagicDNS FQDN.
+# It cannot judge a BARE hostname in prose — neither can the local gate, because a
+# bare word in a sentence is indistinguishable from an ordinary one. So the habit
+# worth having is to write the host as a destination when reporting a cross-host
+# bug: `operator@box` is checkable, a naked hostname is not.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracker-hosts-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tracker-hosts:
+    name: tracker hosts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Check the title, body and comment for machine names
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -eu
+          args=()
+          for var in PR_TITLE PR_BODY ISSUE_TITLE ISSUE_BODY COMMENT_BODY; do
+            value="$(printenv "$var" || true)"
+            if [ -n "$value" ]; then
+              printf '%s' "$value" > "$RUNNER_TEMP/$var"
+              args+=(--text-file "$RUNNER_TEMP/$var")
+            fi
+          done
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "no title, body or comment in this event"
+            exit 0
+          fi
+          # --no-private: this runner has no ssh state, so the private rule set is
+          # empty here by construction rather than by omission.
+          python3 scripts/fixture_hosts.py --no-private "${args[@]}"

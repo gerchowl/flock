@@ -287,7 +287,7 @@ def candidates(home: Path | None = None, include_local: bool = True) -> dict[str
     if include_local and (
         _run(["command", "-v", "tailscale"]) or Path("/Applications/Tailscale.app").exists()
     ):
-        raw = _run(["tailscale", "status", "--json"], timeout=5)
+        raw = _run(["tailscale", "status", "--json"], timeout=2)
         if raw:
             try:
                 status = json.loads(raw)

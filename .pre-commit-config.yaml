@@ -169,3 +169,14 @@ repos:
         language: system
         stages: [commit-msg]
         pass_filenames: true
+      # The commit message is published too, and `scripts/changelog.py` turns
+      # subjects into release notes — so a hostname in one outlives the commit.
+      # `conventional-commits` checks the message's SHAPE; this checks its
+      # CONTENT for the three shapes that are unambiguous in prose: `user@host`,
+      # `agent_<host>_<suffix>`, and a tailnet FQDN.
+      - id: commit-message-hosts
+        name: "commit message names no machine"
+        entry: python3 scripts/fixture_hosts.py --message-file
+        language: system
+        stages: [commit-msg]
+        pass_filenames: true

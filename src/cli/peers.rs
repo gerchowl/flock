@@ -952,7 +952,7 @@ mod tests {
             target: "flock::\u{1b}]52;c;cHduZWQ=\u{7}peers".into(),
             message: "\u{1b}[2Jdial failed\r\nagain".into(),
             source: None,
-            host: Some("node-b\u{1b}[31m".into()),
+            host: Some("node-b\u{1b}[31m".into()), // guardrails-ok(fixture): an escape byte planted in a host name; the reader must strip it
         };
         let line = super::log_line_human(&record, true);
         assert!(!line.chars().any(char::is_control), "{line:?}");

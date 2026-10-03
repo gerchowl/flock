@@ -107,7 +107,7 @@ class LabelTests(unittest.TestCase):
 class CheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.mod = load_module()
-        self.allowed = {"kiln", "atlas", "kiln-dev", "node-b"}
+        self.allowed = {"kiln", "atlas", "kiln-dev", "node-b", "operator"}
 
     def _check(self, text: str, name: str = "tests/x.rs"):
         path = Path(name)
@@ -155,6 +155,83 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(code, [])
 
 
+class FreeTextTests(unittest.TestCase):
+    """Commit messages, PR/issue titles and bodies — published, and previously ungated."""
+
+    def setUp(self) -> None:
+        self.mod = load_module()
+        self.allowed = {"kiln", "kiln-dev", "operator"}
+
+    def _findings(self, text: str, labels=None):
+        return self.mod.check_free_text(text, self.allowed, labels or {})
+
+    def test_a_user_at_host_destination_is_caught(self) -> None:
+        self.assertEqual([f[1] for f in self._findings("operator@undeclared-box\n")], ["undeclared-box"])
+
+    def test_a_tailnet_fqdn_is_caught(self) -> None:
+        findings = self._findings("undeclared-box.tail1234.ts.net is unreachable\n")
+        self.assertIn("undeclared-box.tail1234.ts.net", {f[1] for f in findings})
+
+    def test_an_agent_id_host_is_caught_when_structured(self) -> None:
+        self.assertIn("undeclared-box-dev", {f[1] for f in self._findings('id "agent_undeclared-box-dev_1"\n')})
+
+    def test_the_project_own_domain_is_not_a_machine(self) -> None:
+        for text in ("see flock.dev for docs\n", "reconcile with github.com/org/repo\n"):
+            self.assertEqual(self._findings(text), [], text)
+
+    def test_a_filename_that_looks_like_a_tld_is_not_a_host(self) -> None:
+        # `config.local` is a file this repository ships; `.local` is not a
+        # tailnet shape and judging it would flag ordinary commit subjects.
+        self.assertEqual(self._findings("config.local was not in the overlay\n"), [])
+
+    def test_a_git_ref_is_not_a_login(self) -> None:
+        self.assertEqual(self._findings("pins nothing (dtolnay/rust-toolchain@stable)\n"), [])
+
+    def test_an_attribution_trailer_is_identity_not_a_machine(self) -> None:
+        for text in ("Co-authored-by: someone <someone@their-corp.example>\n",
+                     "Signed-off-by: bot <bot@github.com>\n"):
+            self.assertEqual(self._findings(text), [], text)
+
+    def test_documentation_placeholders_are_not_machines(self) -> None:
+        for text in ("literals like `user@host:port` still dial\n", "Co-authored-by: T <t@t>\n"):
+            self.assertEqual(self._findings(text), [], text)
+
+    def test_an_ordinary_identifier_is_never_judged(self) -> None:
+        # Prose is full of hyphenated words that are not hosts.
+        for text in ("fix(sidebar): sidecar nextest no-such-host\n", "chore: bump cross-platform-pty\n"):
+            self.assertEqual(self._findings(text), [], text)
+
+    def test_a_declared_host_and_rfc2606_pass(self) -> None:
+        self.assertEqual(self._findings("operator@kiln-dev and spoke9.invalid\n"), [])
+
+    def test_a_bare_hostname_in_prose_is_caught_nowhere(self) -> None:
+        """The honest limit, pinned so it cannot be quietly misremembered.
+
+        Prose has no `host = "..."` key, and a bare word in a sentence is
+        indistinguishable from an ordinary one — so neither half judges it, not
+        even the private one with the exact label in hand. What both halves judge
+        is the three structured shapes, which is why those are the ones to use in
+        a commit subject or a bug report.
+        """
+        import importlib.util as _u
+
+        spec = _u.spec_from_file_location("sshgate", ROOT / "scripts" / "ssh_hosts_gate.py")
+        gate = _u.module_from_spec(spec); spec.loader.exec_module(gate)
+        labels = {"localbox": {"known_hosts"}}
+        self.assertEqual(gate.check_text("switch to localbox failed\n", ROOT / "x.md", labels), [])
+        self.assertEqual(self._findings("switch to localbox failed\n", labels), [])
+
+    def test_the_private_half_still_judges_prose_shaped_destinations(self) -> None:
+        import importlib.util as _u
+
+        spec = _u.spec_from_file_location("sshgate", ROOT / "scripts" / "ssh_hosts_gate.py")
+        gate = _u.module_from_spec(spec); spec.loader.exec_module(gate)
+        labels = {"localbox": {"known_hosts"}}
+        self.assertTrue(
+            gate.check_text("ssh = \"operator@localbox\"\n", ROOT / "x.rs", labels)
+        )
+
+
 class EndToEndTests(unittest.TestCase):
     """The gate as a process, because the exit code is the contract."""
 
@@ -172,6 +249,21 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(self._run(str(bad)).returncode, 1)
             write(bad, 'fn t() { let ssh = "operator@kiln-dev"; }\n')
             self.assertEqual(self._run(str(bad)).returncode, 0)
+
+    def test_a_message_file_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "msg"
+            write(good, "fix(remote): a switch now says why\n")
+            self.assertEqual(self._run("--message-file", str(good)).returncode, 0)
+            bad = Path(tmp) / "msg2"
+            write(bad, "fix: operator@undeclared-box never dialled\n")
+            self.assertEqual(self._run("--message-file", str(bad)).returncode, 1)
+
+    def test_no_message_file_still_checks_rust_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rs = Path(tmp) / "tests" / "x.rs"
+            write(rs, 'let ssh = "operator@kiln-dev";\n')
+            self.assertEqual(self._run(str(rs)).returncode, 0)
 
     def test_non_rust_paths_are_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
