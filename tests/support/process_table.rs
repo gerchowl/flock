@@ -33,11 +33,20 @@
 use std::io;
 use std::path::PathBuf;
 
-/// The facts the reap sweep needs about one process.
+/// The identity of one process: what it is running, and nothing else.
+///
+/// Deliberately excludes the environment. The reap sweep runs on a 1 Hz
+/// watchdog over every pid on the machine, calls this for all of them, and
+/// reads the environment only for the handful that pass the executable-path and
+/// `server` gates. Bundling the environment in here — which the first draft of
+/// this module did — meant reading `/proc/<pid>/environ` for every process in
+/// existence on Linux, which is a real syscall per pid per sweep for a file that
+/// does not even exist for some of them. See [`process_environment`] for the
+/// second call.
 ///
 /// Each field degrades independently. A process whose argv could not be read
 /// reports an empty `argv` rather than an error, which is what makes the
-/// sweep's `argv.contains("server")` test fail closed — the same thing
+/// sweep's `argv.contains("server")` test reject it — the same thing
 /// `/proc/<pid>/cmdline` failing used to do.
 #[derive(Debug, Default, Clone)]
 pub struct ProcessInfo {
@@ -45,20 +54,19 @@ pub struct ProcessInfo {
     pub exe_path: Option<PathBuf>,
     /// The argument vector, excluding the executable path.
     pub argv: Vec<String>,
-    /// Raw `KEY=VALUE` entries, in the order the OS reported them.
-    pub environment: Vec<String>,
 }
 
-impl ProcessInfo {
-    /// The value of `key`, or `None` if it is unset or has no `=`.
-    pub fn environment_value(&self, key: &str) -> Option<&str> {
-        self.environment.iter().find_map(|entry| {
-            entry
-                .split_once('=')
-                .filter(|(name, _)| *name == key)
-                .map(|(_, value)| value)
-        })
-    }
+/// The raw `KEY=VALUE` entries of one process's environment.
+///
+/// A separate call from [`process_info`] because it is only worth making once a
+/// pid has been identified as a candidate: on Linux this is a second `/proc`
+/// read, and on Darwin the blob is refetched — a syscall per *candidate*, not
+/// per process.
+///
+/// An `Err` means the same thing it does there: the pid exited, or the kernel
+/// will not say. Callers skip the pid.
+pub fn process_environment(pid: u32) -> io::Result<Vec<String>> {
+    imp::process_environment(pid)
 }
 
 /// Every process id visible to this process, excluding this process.
@@ -70,7 +78,7 @@ pub fn list_process_ids() -> io::Result<Vec<u32>> {
     imp::list_process_ids()
 }
 
-/// Reads the executable path, argv and environment of one process.
+/// Reads the executable path and argv of one process.
 ///
 /// An `Err` is always per-process and never fatal to a sweep: the pid exited
 /// between enumeration and inspection, or the kernel will not tell us about it
@@ -107,14 +115,23 @@ mod imp {
         Ok(pids)
     }
 
+    /// Exactly the two reads the sweep used to make per pid, in the same order
+    /// and no more: the exe link for every pid, and `cmdline` only once the exe
+    /// has been resolved by the caller. `environ` is a separate call so it stays
+    /// on the candidate side of that filter, where it was before this moved here.
     pub fn process_info(pid: u32) -> io::Result<ProcessInfo> {
         Ok(ProcessInfo {
             // A process we may not read the exe of (it exited, or it is not
             // ours) is simply one the exe filter will reject.
             exe_path: std::fs::read_link(format!("/proc/{pid}/exe")).ok(),
             argv: split_nul_separated(&read_best_effort(format!("/proc/{pid}/cmdline"))),
-            environment: split_nul_separated(&read_best_effort(format!("/proc/{pid}/environ"))),
         })
+    }
+
+    pub fn process_environment(pid: u32) -> io::Result<Vec<String>> {
+        Ok(split_nul_separated(&read_best_effort(format!(
+            "/proc/{pid}/environ"
+        ))))
     }
 
     fn read_best_effort(path: String) -> Vec<u8> {
@@ -170,19 +187,27 @@ mod imp {
                 continue;
             }
 
-            let count = written / std::mem::size_of::<libc::c_int>();
-            let mut pids = Vec::with_capacity(count);
-            for slot in buffer[..written].chunks_exact(std::mem::size_of::<libc::c_int>()) {
-                pids.push(u32::from_ne_bytes([slot[0], slot[1], slot[2], 0]));
-            }
+            // `as_chunks` hands back the whole slots plus a remainder, so the
+            // `..written` slice can never yield a short final chunk.
+            let (slots, _) = buffer[..written].as_chunks::<4>();
+            let pids: Vec<u32> = slots.iter().map(|slot| u32::from_ne_bytes(*slot)).collect();
             // `proc_listallpids` omits the calling process; the sweep skips its
             // own pid anyway, so nothing depends on that.
             return Ok(pids);
         }
     }
 
+    /// One `KERN_PROCARGS2` fetch per call. The identity call and the
+    /// environment call each fetch the whole blob, so a candidate costs two
+    /// syscalls where the old bundled shape cost one — the price of not reading
+    /// the environment for every pid on the machine, which is the more expensive
+    /// mistake by a factor of the process count.
     pub fn process_info(pid: u32) -> io::Result<ProcessInfo> {
-        Ok(parse_procargs(&read_procargs2(pid)?))
+        Ok(parse_procargs(&read_procargs2(pid)?).identity)
+    }
+
+    pub fn process_environment(pid: u32) -> io::Result<Vec<String>> {
+        Ok(parse_procargs(&read_procargs2(pid)?).environment)
     }
 
     /// `sysctl KERN_PROCARGS2` for one pid.
@@ -294,12 +319,21 @@ mod imp {
 /// simply absorbs the remaining strings and the environment comes back empty,
 /// which makes the sweep skip the process rather than mis-attribute it. A
 /// count that is too small loses the environment the same way. Both directions
-/// fail closed, which is the property worth having when the number is not ours.
-fn parse_procargs(blob: &[u8]) -> ProcessInfo {
+/// cost the sweep a process it might have reaped and buy it no wrong answer,
+/// which is the trade worth making when the number is not ours.
+///
+/// "No wrong answer" is specific to the environment, which is a keyed lookup on
+/// `XDG_RUNTIME_DIR`. The argv side is looser: with an over-large count the
+/// `server` gate is applied to environment strings too, so a process carrying
+/// a bare `server` entry in its environment would pass it. That cannot cause a
+/// wrong kill — the executable-path filter runs first and admits only this
+/// checkout's own `flk` — but it is why this is described as skipping rather
+/// than as closing.
+fn parse_procargs(blob: &[u8]) -> ParsedProcargs {
     const HEADER: usize = std::mem::size_of::<u32>();
 
     if blob.len() < HEADER {
-        return ProcessInfo::default();
+        return ParsedProcargs::default();
     }
 
     let max_arg = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
@@ -315,19 +349,34 @@ fn parse_procargs(blob: &[u8]) -> ProcessInfo {
     // strings[0] is the executable path; `strings[1..]` starts at argv[0].
     // A blob with no executable path has no argv worth trusting either.
     let Some((exe_path, rest)) = strings.split_first() else {
-        return ProcessInfo::default();
+        return ParsedProcargs::default();
     };
 
     let argv_end = rest.len().min(max_arg);
     let (argv, environment) = rest.split_at(argv_end);
 
-    ProcessInfo {
-        exe_path: Some(PathBuf::from(
-            String::from_utf8_lossy(exe_path).into_owned(),
-        )),
-        argv: to_strings(argv),
+    ParsedProcargs {
+        identity: ProcessInfo {
+            exe_path: Some(PathBuf::from(
+                String::from_utf8_lossy(exe_path).into_owned(),
+            )),
+            argv: to_strings(argv),
+        },
         environment: to_strings(environment),
     }
+}
+
+/// Both halves of a parsed blob.
+///
+/// The Darwin caller wants the identity for every pid but the environment only
+/// for candidates, and a blob is all-or-nothing: it arrives with both halves in
+/// it. So the parse returns both and the two public entry points pick. The
+/// platform-independent parser stays one function rather than growing a
+/// boundary argument whose only job would be to be threaded through.
+#[derive(Debug, Default)]
+struct ParsedProcargs {
+    identity: ProcessInfo,
+    environment: Vec<String>,
 }
 
 fn to_strings(chunks: &[&[u8]]) -> Vec<String> {
@@ -358,6 +407,17 @@ mod tests {
         bytes
     }
 
+    /// Look a key up in a parsed blob's environment, the way the sweep's
+    /// `runtime_dir_for` does, without going back to the kernel.
+    fn env_value(parsed: &ParsedProcargs, key: &str) -> Option<String> {
+        parsed.environment.iter().find_map(|entry| {
+            entry
+                .split_once('=')
+                .filter(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
     #[test]
     fn parses_exec_path_argv_and_environment() {
         let bytes = blob(
@@ -370,44 +430,46 @@ mod tests {
             ],
         );
 
-        let info = parse_procargs(&bytes);
+        let parsed = parse_procargs(&bytes);
 
         assert_eq!(
-            info.exe_path,
+            parsed.identity.exe_path,
             Some(PathBuf::from("/checkout/target/debug/flk"))
         );
-        assert_eq!(info.argv, vec!["flk".to_string(), "server".to_string()]);
         assert_eq!(
-            info.environment_value("XDG_RUNTIME_DIR"),
-            Some("/run/flock")
+            parsed.identity.argv,
+            vec!["flk".to_string(), "server".to_string()]
         );
         assert_eq!(
-            info.environment_value("FLOCK_SOCKET_PATH"),
-            Some("/run/flock/flock.sock")
+            env_value(&parsed, "XDG_RUNTIME_DIR"),
+            Some("/run/flock".to_string())
         );
-        assert_eq!(info.environment_value("PATH"), None);
+        assert_eq!(
+            env_value(&parsed, "FLOCK_SOCKET_PATH"),
+            Some("/run/flock/flock.sock".to_string())
+        );
+        assert_eq!(env_value(&parsed, "PATH"), None);
     }
 
     /// The layout a process that has NOT finished `execve` presents, measured
-    /// on Darwin 25.4.0: `argv` is already the final argv, but the environment
-    /// is not in the blob at all and `MAXARG` is one higher than the argv count
-    /// because it counts the duplicated executable path.
+    /// on Darwin 25.4.0: `argv` is already the final argv and `MAXARG` already
+    /// equals its length, but the environment is absent from the blob entirely.
     ///
-    /// It matters because it is what the reap sweep sees for a process it is
-    /// looking at in the microseconds after spawning. The environment comes
-    /// back empty, which is the safe direction: the sweep cannot attribute the
-    /// process to a runtime dir, skips it, and catches it on the next pass. A
-    /// parser that guessed the boundary differently here would instead read the
-    /// first argv string as an environment entry.
+    /// It matters because it is what the reap sweep sees for a process in the
+    /// microseconds after spawning. The environment comes back empty, which is
+    /// the safe direction: the sweep cannot attribute the process to a runtime
+    /// dir, skips it, and catches it on the next pass. A parser that guessed
+    /// the boundary differently here would instead read the first environment
+    /// entry as an argv element.
     #[test]
     fn pre_exec_shaped_blob_reports_no_environment() {
         let bytes = blob(3, "/bin/sh", &["/bin/sh", "-c", "sleep 30"], &[]);
 
-        let info = parse_procargs(&bytes);
+        let parsed = parse_procargs(&bytes);
 
-        assert_eq!(info.argv, vec!["/bin/sh", "-c", "sleep 30"]);
+        assert_eq!(parsed.identity.argv, vec!["/bin/sh", "-c", "sleep 30"]);
         assert!(
-            info.environment.is_empty(),
+            parsed.environment.is_empty(),
             "a process mid-exec has no environment to attribute it with"
         );
     }
@@ -426,16 +488,16 @@ mod tests {
             &["XDG_RUNTIME_DIR=/run/flock"],
         );
 
-        let info = parse_procargs(&bytes);
+        let parsed = parse_procargs(&bytes);
 
-        assert_eq!(info.exe_path, Some(PathBuf::from("/flk")));
+        assert_eq!(parsed.identity.exe_path, Some(PathBuf::from("/flk")));
         assert_eq!(
-            info.argv.len() + info.environment.len(),
+            parsed.identity.argv.len() + parsed.environment.len(),
             3,
             "every string in the blob is reported exactly once"
         );
         assert_eq!(
-            info.environment_value("XDG_RUNTIME_DIR"),
+            env_value(&parsed, "XDG_RUNTIME_DIR"),
             None,
             "an over-large MAXARG hides the environment instead of inventing one"
         );
@@ -445,12 +507,12 @@ mod tests {
     fn zero_max_arg_reports_no_argv_and_leaves_the_environment_intact() {
         let bytes = blob(0, "/flk", &[], &["XDG_RUNTIME_DIR=/run/flock"]);
 
-        let info = parse_procargs(&bytes);
+        let parsed = parse_procargs(&bytes);
 
-        assert!(info.argv.is_empty());
+        assert!(parsed.identity.argv.is_empty());
         assert_eq!(
-            info.environment_value("XDG_RUNTIME_DIR"),
-            Some("/run/flock")
+            env_value(&parsed, "XDG_RUNTIME_DIR"),
+            Some("/run/flock".to_string())
         );
     }
 
@@ -472,10 +534,10 @@ mod tests {
 
     #[test]
     fn header_only_and_empty_blobs_are_not_parsed() {
-        assert_eq!(parse_procargs(&[]).argv, Vec::<String>::new());
-        assert_eq!(parse_procargs(&[]).exe_path, None);
-        assert_eq!(parse_procargs(&[1, 2, 3]).exe_path, None);
-        assert_eq!(parse_procargs(&[1, 0, 0, 0]).exe_path, None);
+        assert_eq!(parse_procargs(&[]).identity.argv, Vec::<String>::new());
+        assert_eq!(parse_procargs(&[]).identity.exe_path, None);
+        assert_eq!(parse_procargs(&[1, 2, 3]).identity.exe_path, None);
+        assert_eq!(parse_procargs(&[1, 0, 0, 0]).identity.exe_path, None);
     }
 
     /// Non-UTF-8 must not lose the rest of the blob — the environment is
@@ -485,53 +547,108 @@ mod tests {
         let mut bytes = blob(1, "/flk", &["flk"], &["XDG_RUNTIME_DIR=/run/flock"]);
         bytes.extend_from_slice(&[0xff, 0xfe, 0]);
 
-        let info = parse_procargs(&bytes);
+        let parsed = parse_procargs(&bytes);
 
         assert_eq!(
-            info.environment_value("XDG_RUNTIME_DIR"),
-            Some("/run/flock")
+            env_value(&parsed, "XDG_RUNTIME_DIR"),
+            Some("/run/flock".to_string())
         );
     }
 
     #[test]
     fn environment_value_ignores_a_bare_key_and_a_key_prefix() {
-        let info = ProcessInfo {
+        let parsed = ParsedProcargs {
+            identity: ProcessInfo::default(),
             environment: vec![
                 "XDG_RUNTIME_DIR".to_string(),
                 "XDG_RUNTIME_DIR_EXTRA=nope".to_string(),
                 "=leading-equals".to_string(),
             ],
-            ..ProcessInfo::default()
         };
 
-        assert_eq!(info.environment_value("XDG_RUNTIME_DIR"), None);
+        assert_eq!(env_value(&parsed, "XDG_RUNTIME_DIR"), None);
     }
 
-    /// The narrowest integration check that the sweep's two calls work on this
-    /// platform: enumerate, then read back a process this test spawned, keyed
-    /// on an environment variable it set.
+    /// The environment of THIS process, read back the way the sweep reads a
+    /// daemon's.
     ///
-    /// Nothing here reads another session's processes — every assertion is
-    /// about a pid this test created, and the runtime dir it keys on is derived
-    /// from this test's own pid and clock, which is why this can run alongside
-    /// other sessions' suites without coupling to them.
+    /// Self, rather than a spawned child, and the reason is a Darwin fact that
+    /// cost this test a rewrite to find: macOS withholds the environment from
+    /// process introspection for **Apple platform binaries**. Measured on
+    /// Darwin 25.4.0 — `/bin/sh`, `/bin/sleep` and everything else under
+    /// `/bin`, `/usr/bin`, `/usr/sbin` and `/usr/libexec` report zero
+    /// environment entries from `KERN_PROCARGS2`, while third-party binaries
+    /// (`/nix/store/...`, `node`, python, and this repository's own
+    /// `target/debug/flk`) report theirs. `ps eww` agrees, so it is the kernel
+    /// withholding the block rather than a decoding bug. A full scan of a Mac
+    /// splits cleanly along the same line: the pids with no environment are
+    /// exactly the Apple agents (`launchd`, `distnoted`, `lsd`, `Finder`,
+    /// `Dock`).
+    ///
+    /// A Rust test binary is not a platform binary, so introspecting self works
+    /// here and on Linux identically — no `#[cfg]`, and no dependence on which
+    /// binaries happen to be installed on the developer's machine.
+    #[test]
+    fn reads_back_this_process_environment() {
+        let me = std::process::id();
+        let environment = process_environment(me).expect("introspect this process's environment");
+
+        assert!(
+            !environment.is_empty(),
+            "the sweep reads a server's environment to decide which test owns it, and \
+             this process reported none"
+        );
+
+        // Every variable this process can see in-process is reported by the
+        // kernel for the same pid, with the same value. This is the direction
+        // that has to hold: the kernel adds entries of its own on Darwin
+        // (`th_port`, `security_config`, `arm64e_abi`, `executable_cdhash`), so
+        // the kernel set is a superset and set equality would be the wrong
+        // assertion.
+        let lookup = |key: &str| {
+            environment.iter().find_map(|entry| {
+                entry
+                    .split_once('=')
+                    .filter(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+
+        let mut disagreements = Vec::new();
+        for (key, value) in std::env::vars_os() {
+            let key = key.to_string_lossy().into_owned();
+            match lookup(&key) {
+                Some(seen) if seen == value.to_string_lossy() => {}
+                Some(_) => disagreements.push(format!("{key} (value differs)")),
+                None => disagreements.push(format!("{key} (absent)")),
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "the environment read disagreed with the process's own view of it: \
+             {disagreements:?}"
+        );
+    }
+
+    /// The pid this test spawned is visible to enumeration, and its identity —
+    /// executable path and argv — reads back. These are the two calls the sweep
+    /// makes per pid before it decides anything about that pid.
+    ///
+    /// No environment assertion here, and that is a measured constraint rather
+    /// than an omission: `/bin/sh` is an Apple platform binary and reports none.
+    /// The environment half of the sweep is covered by
+    /// `reads_back_this_process_environment`, against a process that reports
+    /// one.
+    ///
+    /// `/bin/sh` is also the only interpreter POSIX guarantees, which is why
+    /// this spawns it rather than something more convenient — NixOS ships
+    /// nothing else in `/bin`.
     #[allow(clippy::disallowed_methods)]
     // Test harness spawn — TracedCommand polices product code, and crate::process is unreachable from an integration test binary.
     #[test]
-    fn reads_back_a_process_this_test_spawned() {
-        let runtime_dir = std::env::temp_dir().join(format!(
-            "flock-procargs-selfcheck-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-
+    fn enumerates_and_inspects_a_process_this_test_spawned() {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 30"])
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -539,57 +656,40 @@ mod tests {
             .expect("spawn child");
         let pid = child.id();
 
-        // Enumeration must include the pid we just made. This is the call the
-        // whole reap sweep starts from, and on Darwin it used to enumerate
-        // nothing at all.
         let listed = list_process_ids().expect("enumerate processes");
         assert!(
             listed.contains(&pid),
             "the sweep's enumeration missed the pid this test spawned"
         );
 
-        // Inspection must report the environment variable we set. This polls
-        // rather than reading once, because a process that has not finished
-        // `execve` reports no environment at all — see
-        // `pre_exec_shaped_blob_reports_no_environment`. The reap sweep gets
-        // that for free (it re-runs), but a single-shot read here would be a
-        // test of kernel startup timing rather than of the parser.
+        // Polled, not read once. A process that has not finished `execve` has no
+        // argv to report — Linux's `/proc/<pid>/cmdline` is empty until the exec
+        // lands, and on Darwin the blob carries no argv either (see
+        // `pre_exec_shaped_blob_reports_no_environment`). The sweep is a
+        // snapshot, so it simply sees a process it cannot identify and moves on;
+        // a single-shot read here would be testing spawn-versus-inspect timing
+        // rather than the read.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut observed: Option<ProcessInfo> = None;
         while std::time::Instant::now() < deadline {
             let info = process_info(pid).expect("inspect spawned process");
-            if info.environment_value("XDG_RUNTIME_DIR").is_some() {
+            if !info.argv.is_empty() && info.exe_path.is_some() {
                 observed = Some(info);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
 
         let Some(info) = observed else {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_dir_all(&runtime_dir);
             panic!(
-                "the sweep reads XDG_RUNTIME_DIR to decide which servers to reap, and \
-                 this process never reported the one it was given"
+                "the sweep reads argv and the executable path to decide what a \
+                     process is, and this one never reported either"
             );
         };
 
-        assert_eq!(
-            info.environment_value("XDG_RUNTIME_DIR"),
-            runtime_dir.to_str()
-        );
-        // Non-empty because the sweep tells a server from any other process by
-        // looking for `server` in argv. Whether the shell execs `sleep` or stays
-        // itself is a platform difference (`sh` execs on macOS, does not under
-        // dash), so the assertion is that argv came back at all.
-        assert!(
-            !info.argv.is_empty(),
-            "the sweep reads argv to tell a server from any other process, got none"
-        );
-        let exe = info
-            .exe_path
-            .expect("the sweep filters on the executable path, so it must be reported");
+        let exe = info.exe_path.expect("checked above");
         assert!(
             exe.is_absolute() && exe.exists(),
             "the reported executable should be a real absolute path, got {}",
@@ -598,7 +698,6 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 
     /// A pid that is not running must never be attributable to a test. On
@@ -622,7 +721,7 @@ mod tests {
             return;
         };
         assert!(
-            info.argv.is_empty() && info.exe_path.is_none() && info.environment.is_empty(),
+            info.argv.is_empty() && info.exe_path.is_none(),
             "a pid with no process behind it reported {:?}",
             info
         );

@@ -72,11 +72,14 @@ pub fn unregister_runtime_dir(path: &Path) {
 /// to tell it from an honest one.
 pub fn flock_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
-    for pid in iter_worktree_server_pids()? {
-        let Some(process_runtime_dir) = process_runtime_dir(pid)? else {
-            continue;
-        };
-        if process_runtime_dir == runtime_dir {
+    for (pid, _) in iter_worktree_server_pids()? {
+        // Skip, not propagate. This helper is reachable on macOS as of #521,
+        // where `process_environment` returns `Err` for any pid that exits
+        // mid-sweep or cannot be inspected — measured at 407 of 1148 pids on a
+        // real machine. Propagating would turn one unreadable process into an
+        // empty answer for the entire machine, which is indistinguishable from
+        // "no servers running".
+        if runtime_dir_for(pid).as_deref() == Some(runtime_dir) {
             pids.push(pid);
         }
     }
@@ -102,8 +105,10 @@ pub fn cleanup_test_base(base: &Path) {
 /// needs it for an fd assertion) — the other eleven leave a
 /// `flk server --handoff-import <base>/...` behind that nothing owns.
 ///
-/// `terminate_servers_for_runtime_dirs` would be the backstop, but it walks
-/// `/proc`, so on macOS it enumerates nothing and reports success.
+/// `terminate_servers_for_runtime_dirs` is the other backstop, and one that
+/// needs no argv match at all — but it can only attribute a process through its
+/// environment, so it cannot see a daemon whose argv is a bare `flk server` with
+/// no path in it (#521).
 ///
 /// Matching on the base path is what makes this reliable without every call
 /// site having to remember: `base` is a unique per-test temp dir, so any
@@ -934,11 +939,11 @@ fn cleanup_servers_with_missing_runtime_dir() -> std::io::Result<()> {
         return Ok(());
     }
 
-    for pid in iter_worktree_server_pids()? {
+    for (pid, _) in iter_worktree_server_pids()? {
         // A pid we cannot inspect (it exited, or the kernel will not tell us
         // about it) is skipped rather than propagated: one unreadable process
         // must not abort the sweep of the other six hundred.
-        let Ok(Some(runtime_dir)) = process_runtime_dir(pid) else {
+        let Some(runtime_dir) = runtime_dir_for(pid) else {
             continue;
         };
 
@@ -959,8 +964,8 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
         return;
     };
 
-    for pid in pids {
-        let Ok(Some(runtime_dir)) = process_runtime_dir(pid) else {
+    for (pid, _) in pids {
+        let Some(runtime_dir) = runtime_dir_for(pid) else {
             continue;
         };
 
@@ -988,7 +993,11 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
 /// checkout's `target/debug/flk`, so a daemon built by another session from
 /// its own worktree — or an installed `flock` — is never in the returned set.
 /// The `server` argv check narrows it further to servers.
-fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
+///
+/// The `ProcessInfo` is returned alongside each pid rather than discarded, so
+/// the caller can reuse it. Re-reading it was the other half of the cost
+/// problem: on Linux a candidate's exe/cmdline/environ were read twice.
+fn iter_worktree_server_pids() -> std::io::Result<Vec<(u32, process_table::ProcessInfo)>> {
     let own_pid = std::process::id();
     let mut pids = Vec::new();
 
@@ -997,21 +1006,21 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
             continue;
         }
 
-        if is_test_flock_server_process(pid) {
-            pids.push(pid);
+        let Ok(info) = process_table::process_info(pid) else {
+            // Exited, or unreadable (ENOENT/EIO/EPERM). Either way this pid is
+            // not a server we should kill, and the rest of the sweep continues.
+            continue;
+        };
+
+        if is_test_flock_server_process(&info) {
+            pids.push((pid, info));
         }
     }
 
     Ok(pids)
 }
 
-fn is_test_flock_server_process(pid: u32) -> bool {
-    let Ok(info) = process_table::process_info(pid) else {
-        // Exited, or unreadable (ENOENT/EIO/EPERM). Either way this pid is not
-        // a server we should kill, and the rest of the sweep continues.
-        return false;
-    };
-
+fn is_test_flock_server_process(info: &process_table::ProcessInfo) -> bool {
     let Some(exe_path) = info.exe_path.as_deref() else {
         return false;
     };
@@ -1025,17 +1034,30 @@ fn is_test_flock_server_process(pid: u32) -> bool {
 /// fallback for a server whose runtime dir was unset. Both are inherited from
 /// the client that spawned the daemon, which is what lets the sweep connect a
 /// process it never spawned back to the test that owns it.
-fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
-    let info = process_table::process_info(pid)?;
+///
+/// Returns `None` for every way this can fail — an unreadable environment, an
+/// unset variable, a socket path with no parent — because every caller treats
+/// `None` as "not mine, skip it". A sweep must not abandon the remaining
+/// processes over one that cannot be read.
+fn runtime_dir_for(pid: u32) -> Option<PathBuf> {
+    let environment = process_table::process_environment(pid).ok()?;
 
-    if let Some(runtime_dir) = info.environment_value("XDG_RUNTIME_DIR") {
-        return Ok(Some(PathBuf::from(runtime_dir)));
+    let value = |key: &str| {
+        environment.iter().find_map(|entry| {
+            entry
+                .split_once('=')
+                .filter(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    };
+
+    if let Some(runtime_dir) = value("XDG_RUNTIME_DIR") {
+        return Some(PathBuf::from(runtime_dir));
     }
 
-    Ok(info
-        .environment_value("FLOCK_SOCKET_PATH")
+    value("FLOCK_SOCKET_PATH")
         .map(PathBuf::from)
-        .and_then(|path| path.parent().map(Path::to_path_buf)))
+        .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 fn runtime_dir_owner_alive(runtime_dir: &Path) -> bool {
@@ -1055,8 +1077,43 @@ fn current_checkout_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The one executable this sweep is ever allowed to kill: this checkout's own
+/// debug build of `flk`.
+///
+/// Equality against a canonicalised path, not a component-prefix test. The
+/// earlier `path.ends_with("target/debug/flk") && path.starts_with(root)` admits
+/// `<root>/.worktrees/foo/target/debug/flk` — a nested worktree's binary, built
+/// by whoever made that worktree, reaped by this checkout's tests. AGENTS.md
+/// prescribes SIBLING worktrees (`../flock-worktrees/<slug>`), where that cannot
+/// arise, but "cannot arise under the documented layout" is a weaker guarantee
+/// than "is false", and this filter is what stands between the sweep and a
+/// developer's other sessions.
+///
+/// Canonicalising both sides is also what makes the symlink case work. On Darwin
+/// the kernel reports the exec path as it was invoked, so a checkout reached
+/// through a symlink would match nothing — the product passes
+/// `std::env::current_exe()` (`src/server/autodetect.rs`), which std resolves
+/// with `realpath`, while `CARGO_MANIFEST_DIR` is however cargo was invoked.
+/// Comparing resolved paths removes the disagreement instead of leaving it to
+/// whichever side happens to be canonical.
+///
+/// Resolved lazily and cached: `canonicalize` is a syscall per component, and
+/// this runs for every pid on the machine on a 1 Hz watchdog. `OnceLock` because
+/// the answer cannot change within a process.
 fn is_test_flock_binary(path: &Path) -> bool {
-    path.ends_with("target/debug/flk") && path.starts_with(current_checkout_root())
+    static EXPECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    let expected = EXPECTED
+        .get_or_init(|| fs::canonicalize(current_checkout_root().join("target/debug/flk")).ok())
+        .as_deref();
+
+    match expected {
+        // No canonicalised binary to compare against (not built yet, or the
+        // checkout moved): match nothing. A sweep that cannot prove a process is
+        // ours must not kill it.
+        None => false,
+        Some(expected) => fs::canonicalize(path).ok().as_deref() == Some(expected),
+    }
 }
 
 extern "C" fn run_atexit_cleanup() {
@@ -1193,5 +1250,89 @@ mod tests {
             !is_test_flock_binary(Path::new("/home/can/.local/bin/flock")),
             "installed binaries must not be considered test-owned"
         );
+    }
+
+    /// The shape that a component-prefix test admits and this one must not: a
+    /// nested worktree's binary, `<root>/.worktrees/foo/target/debug/flk`. It is
+    /// under the checkout and it ends in `target/debug/flk`, and it belongs to
+    /// someone else.
+    #[test]
+    fn test_binary_matcher_rejects_a_nested_worktree_binary() {
+        let nested = current_checkout_root()
+            .join(".worktrees")
+            .join("someone-elses")
+            .join("target/debug/flk");
+
+        assert!(
+            nested.starts_with(current_checkout_root()),
+            "the fixture must actually be the shape this test claims to reject"
+        );
+        assert!(
+            nested.ends_with("target/debug/flk"),
+            "the fixture must actually be the shape this test claims to reject"
+        );
+        assert!(
+            !is_test_flock_binary(&nested),
+            "another session's nested worktree binary must never be reaped by this \
+             checkout's tests"
+        );
+    }
+
+    /// A sibling worktree — the layout AGENTS.md prescribes — is a different
+    /// path and stays out. Stated because it is the case that was measured
+    /// against 172 real stray daemons, and it is worth a test rather than a
+    /// comment given what is on the other end of it.
+    #[test]
+    fn test_binary_matcher_rejects_a_sibling_worktree_binary() {
+        let sibling = current_checkout_root()
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("flock-worktrees")
+            .join("issue-999")
+            .join("target/debug/flk");
+
+        assert!(
+            !is_test_flock_binary(&sibling),
+            "a sibling worktree's binary belongs to another session"
+        );
+    }
+
+    /// A symlink INTO this checkout's own binary resolves to it and must still
+    /// be accepted: the point of canonicalising is to compare resolved paths, so
+    /// an equivalent spelling of the same file is the same answer, not a
+    /// different one.
+    #[test]
+    fn test_binary_matcher_accepts_a_symlink_to_the_checkout_binary() {
+        let real = current_checkout_root().join("target/debug/flk");
+        if !real.exists() {
+            // Not built in this test's environment; the accept-case above
+            // already covers the direct path.
+            return;
+        }
+
+        let link_dir = std::env::temp_dir().join(format!(
+            "flock-binary-matcher-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&link_dir).expect("create link dir");
+        let link = link_dir.join("flk");
+        let linked = symlink(&real, &link);
+
+        if linked.is_ok() {
+            assert!(
+                is_test_flock_binary(&link),
+                "a symlink resolving to this checkout's binary is that binary"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&link_dir);
+    }
+
+    fn symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
     }
 }
