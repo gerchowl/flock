@@ -230,6 +230,15 @@ pub(crate) fn server_field_label(
 /// rendered location that fits `max_width` columns; the leading
 /// `<icon> <agent> ` is the caller's responsibility and is excluded from
 /// `max_width`.
+///
+/// Last resort, when even the server name alone overflows the budget (#394):
+/// middle-truncate the row the ladder has already reduced to `server` +
+/// target. Before the tab segment existed that fallback truncated the FULL
+/// `<server> <project> <target>` string, so it resurrected the project — the
+/// very segment the ladder had just dropped — and spent the last columns on an
+/// ellipsis straddling two segments (`workst…k main`, where `k` is the tail of
+/// a discarded project). The target renders whole either way; what changes is
+/// that the fallback no longer contradicts the ladder.
 pub(crate) fn agent_location_label(
     server: &str,
     tab: Option<&str>,
@@ -244,9 +253,15 @@ pub(crate) fn agent_location_label(
     // project because it is the narrower of the two answers: it only
     // distinguishes rows within one workspace, while the project identifies
     // the workspace every row already shares.
+    //
+    // Both are trimmed and an all-blank one is dropped rather than rendered: a
+    // tab label reaches `custom_name` untrimmed on the `pane move
+    // --tab-label` path, and a `"  "` segment would otherwise show up as a
+    // double space in the middle of the row.
     let optional: Vec<&str> = [tab, project]
         .into_iter()
         .flatten()
+        .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect();
     // Width of `server` plus every segment preceding the target, separators
@@ -297,7 +312,7 @@ pub(crate) fn agent_location_label(
             );
         }
     }
-    // Server alone overflows: middle-truncate the whole thing.
+    // Server alone overflows: middle-truncate the row the ladder reduced to.
     crate::terminal::middle_truncate_chars(&render(&[], target), max_width)
 }
 
@@ -387,11 +402,12 @@ mod tests {
         );
     }
 
-    /// #394: an absent tab leaves the location exactly as a single-tab
-    /// workspace rendered it — no empty segment, no double separator, and it
-    /// always fits the budget it was handed.
+    /// #394: a single-tab workspace must grow no tab segment — no empty
+    /// column to read past, and the row must always fit the budget it was
+    /// handed. NOT "byte-identical to before": the last-resort truncation
+    /// deliberately differs, and is pinned separately below.
     #[test]
-    fn agent_location_without_a_tab_is_unchanged() {
+    fn agent_location_without_a_tab_adds_no_segment() {
         assert_eq!(
             agent_location_label("mba22", None, Some("flock"), "keyboard-shorcuts", 80),
             "mba22 flock keyboard-shorcuts"
@@ -402,18 +418,73 @@ mod tests {
             assert!(out.chars().count() <= width, "{width}: {out:?}");
             assert!(!out.contains("  "), "{width}: {out:?}");
         }
-        // An empty tab label is no tab at all — a blank rename must not render
-        // as a double space.
-        assert_eq!(
-            agent_location_label("mba22", Some(""), Some("flock"), "main", 80),
-            "mba22 flock main"
-        );
         // And the tab segment is genuinely consumed: the same row with and
         // without a tab differs, at a width that fits both.
         assert_ne!(
             agent_location_label("mba22", Some("logs"), Some("flock"), "main", 80),
             agent_location_label("mba22", None, Some("flock"), "main", 80)
         );
+    }
+
+    /// #394 review: a tab label reaches `custom_name` UNTRIMMED on the
+    /// `pane move --tab-label` path (`Tab::from_existing_pane` stores it raw),
+    /// so `"  "` is reachable. Rendered as a segment it would put a double
+    /// space in the middle of every row of that workspace. Blank is no tab.
+    #[test]
+    fn agent_location_drops_a_blank_tab_label_instead_of_rendering_it() {
+        for blank in ["", " ", "   ", "\t", "\n"] {
+            let out = agent_location_label("mba22", Some(blank), Some("flock"), "main", 80);
+            assert_eq!(out, "mba22 flock main", "blank={blank:?}");
+            assert!(!out.contains("  "), "blank={blank:?}: {out:?}");
+        }
+        // A label with content around the whitespace is trimmed, not dropped.
+        assert_eq!(
+            agent_location_label("mba22", Some("  logs  "), Some("flock"), "main", 80),
+            "mba22 logs flock main"
+        );
+    }
+
+    /// #394 review: the last-resort branch, pinned because it CHANGED. When
+    /// even the server name alone overflows the budget, the row is truncated
+    /// to the `server` + `target` the ladder already reduced it to.
+    ///
+    /// It used to truncate the FULL `<server> <project> <target>` string, so
+    /// the fallback resurrected the project — the segment the ladder had just
+    /// dropped — and the ellipsis straddled the project/target boundary
+    /// (`workst…k main`, tail of a discarded project). Both renderings keep
+    /// the target whole; what changes is that the fallback no longer
+    /// contradicts the ladder above it.
+    ///
+    /// Reachable, not theoretical: at the default 26-column sidebar the
+    /// location budget is ~19 columns, so a 14-character hostname reaches this
+    /// branch.
+    #[test]
+    fn agent_location_last_resort_truncates_the_reduced_row() {
+        // 14 cols cannot hold `workstation-14 flock main` (23). Pinned exactly,
+        // because a property assertion does not separate this from the old
+        // branch: the old output was `worksta…ck main`, which also fits the
+        // budget, keeps the target, and has no literal "flock" in it — the
+        // ellipsis simply ate a different segment.
+        assert_eq!(
+            agent_location_label("workstation-14", None, Some("flock"), "main", 14),
+            "worksta\u{2026}4 main",
+            "the ellipsis eats the hostname, not the discarded project"
+        );
+        let out = agent_location_label("workstation-14", None, Some("flock"), "main", 14);
+        assert!(out.ends_with(" main"), "the target survives whole: {out:?}");
+        // Not a coincidence of this input: the fallback must never exceed its
+        // budget or emit an empty segment, for any server length.
+        for len in 1..=24 {
+            let server: String = "h".repeat(len);
+            for width in 1..=len {
+                let out = agent_location_label(&server, Some("logs"), Some("flock"), "main", width);
+                assert!(
+                    out.chars().count() <= width,
+                    "server={len} width={width}: {out:?}"
+                );
+                assert!(!out.contains("  "), "server={len} width={width}: {out:?}");
+            }
+        }
     }
 
     #[test]

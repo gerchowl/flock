@@ -392,7 +392,13 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
                     p.overlay1
                 }))
                 .bg(p.surface0);
-            if tab.is_auto_named() {
+            // A tab CARRYING STATE is dimmed, exactly as every unselected
+            // member slot is: the same red must not read louder in one strip
+            // than in the other (#394). On an untinted tab DIM keeps its older,
+            // separate meaning here — a derived label, paired with the dimmer
+            // `overlay0` — so an agent-free named tab is left exactly as it
+            // was rather than restyled by a change about state.
+            if tint.is_some() || tab.is_auto_named() {
                 base.add_modifier(Modifier::DIM)
             } else {
                 base
@@ -613,6 +619,8 @@ fn render_member_strip(app: &AppState, frame: &mut Frame, area: Rect, active_ws_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::AgentState;
+    use crate::layout::PaneId;
     use crate::workspace::Workspace;
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -782,23 +790,95 @@ mod tests {
     #[test]
     fn tab_strip_tints_by_the_worst_state_in_the_tab() {
         let mut app = tabs_app();
-        // Tab 1 holds a working pane; the sibling tab's blocked pane must not
-        // bleed into it.
-        set_tab_pane_state(&mut app, 1, crate::detect::AgentState::Working);
-        set_tab_pane_state(&mut app, 2, crate::detect::AgentState::Blocked);
+        // Focus the middle tab, then SPLIT it, so it holds two panes of
+        // different states. One pane per tab would only prove the tints differ
+        // ACROSS tabs, which says nothing about the join this name claims.
+        app.workspaces[0].active_tab = 1;
+        let split = app.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.ensure_test_terminals();
+
+        let root = app.workspaces[0].tabs[1].root_pane;
+        let set = |app: &mut crate::app::state::AppState, pane: PaneId, state: AgentState| {
+            let tid = app.workspaces[0].tabs[1].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().state = state;
+        };
+        // Working + blocked in one tab: the join head is the WORSE class, so
+        // the slot reads blocked. Flipping the blocked pane to idle must make
+        // the same slot read working — which is what proves the join is being
+        // taken over this tab's panes rather than over one arbitrary pane.
+        set(&mut app, root, AgentState::Working);
+        set(&mut app, split, AgentState::Blocked);
+        // Hand focus back to tab 0: only an UNSELECTED slot is tinted, so the
+        // two-pane tab has to be in the background to be read at all.
+        app.workspaces[0].active_tab = 0;
+
+        let area = Rect::new(0, 0, 48, 1);
+        let mut buffer = render_tabs(&mut app, area);
+        let slot = app.view.tab_hit_areas[1];
+        assert_eq!(
+            buffer[(slot.x + 1, slot.y)].style().fg,
+            Some(app.palette.red),
+            "two panes, worst class wins"
+        );
+        // The sibling tab holds one working pane and must be unaffected by its
+        // neighbour's blocked pane.
+        set(&mut app, split, AgentState::Idle);
+        buffer = render_tabs(&mut app, area);
+        assert_eq!(
+            buffer[(slot.x + 1, slot.y)].style().fg,
+            Some(app.palette.yellow),
+            "the same slot re-reads as working once the blocked pane settles"
+        );
+    }
+
+    /// #394 — the strips must not disagree about a pane: a state-carrying
+    /// unselected tab is DIM, the same treatment every unselected member slot
+    /// gets, so the same red never reads louder in one strip than the other.
+    /// An agent-free named tab keeps the undimmed foreground it always had.
+    #[test]
+    fn a_tinted_unselected_tab_is_dimmed_like_a_member_slot() {
+        let mut app = tabs_app();
+        set_tab_pane_state(&mut app, 1, AgentState::Blocked);
 
         let area = Rect::new(0, 0, 48, 1);
         let buffer = render_tabs(&mut app, area);
-        let working = app.view.tab_hit_areas[1];
-        assert_eq!(
-            buffer[(working.x + 1, working.y)].style().fg,
-            Some(app.palette.yellow)
-        );
-        let blocked = app.view.tab_hit_areas[2];
-        assert_eq!(
-            buffer[(blocked.x + 1, blocked.y)].style().fg,
-            Some(app.palette.red)
-        );
+
+        // Tab 1 is NAMED (not auto-named) and blocked: dim red, so it reads
+        // with the same weight a blocked member slot does.
+        let tinted = app.view.tab_hit_areas[1];
+        let cell = buffer[(tinted.x + 1, tinted.y)].style();
+        assert_eq!(cell.fg, Some(app.palette.red));
+        assert!(cell.add_modifier.contains(Modifier::DIM));
+
+        // Tab 2 is auto-named with no agent: still dim, unchanged.
+        let idle = app.view.tab_hit_areas[2];
+        assert!(buffer[(idle.x + 1, idle.y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM));
+    }
+
+    /// #394 — and the named, agent-free tab is NOT restyled: this change is
+    /// about state, and DIM on this strip already means "derived label".
+    #[test]
+    fn an_untinted_named_tab_keeps_its_undimmed_foreground() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("main");
+        ws.test_add_tab(Some("logs"));
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+        app.tab_mode = crate::config::TabModeConfig::Tabs;
+
+        let area = Rect::new(0, 0, 48, 1);
+        let buffer = render_tabs(&mut app, area);
+        let named = app.view.tab_hit_areas[1];
+        let cell = buffer[(named.x + 1, named.y)].style();
+        assert_eq!(cell.fg, Some(app.palette.overlay1));
+        assert!(!cell.add_modifier.contains(Modifier::DIM));
     }
 
     /// #33 must be untouched: workspace tab-mode still renders its member

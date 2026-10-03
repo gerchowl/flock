@@ -272,16 +272,22 @@ fn agent_panel_entries_with_runtimes(
             let project = ws.project_key().map(super::grammar::project_identity_label);
             let target = super::grammar::local_member_target(app, ws, terminal_runtimes);
             let sort_family_key = ws.sort_family_key();
+            // Same rule as the all-scope arm: the tab label is carried only
+            // when there is more than one tab to tell apart. #394 shipped the
+            // all-scope arm with this left `None`, so "current workspace" —
+            // the default scope — kept the original defect while the fleet-wide
+            // scope was fixed.
+            let multi_tab = ws.tabs.len() > 1;
             // Current scope is local-by-definition (it follows the focused
             // local workspace); no remote rows fold in here.
             ws.pane_details(&app.terminals)
                 .into_iter()
-                .map(|detail| AgentPanelEntry {
+                .map(move |detail| AgentPanelEntry {
                     ws_idx,
                     tab_idx: detail.tab_idx,
                     pane_id: detail.pane_id,
                     primary_label: detail.label,
-                    primary_tab_label: None,
+                    primary_tab_label: multi_tab.then_some(detail.tab_label),
                     agent_label: Some(detail.agent_label),
                     state: detail.state,
                     seen: detail.seen,
@@ -1426,6 +1432,28 @@ pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Optio
         1,
         body.height,
     ))
+}
+
+/// The agents-panel tab segment, disambiguated from the row's own
+/// quick-jump ordinal (#394). An auto-named tab displays as its bare number,
+/// so a tab labelled `2` sitting beside the agent whose ordinal renders `2`
+/// puts the same digit on one row twice, meaning two unrelated things.
+///
+/// Only the ambiguous shape is marked: a label of nothing but ASCII digits
+/// renders `#N`, which is the shape flock already gives a numbered thing (a
+/// PR row renders `#12 ⊙`). A named tab renders bare — there is nothing to
+/// confuse it with — and a mixed label like `2-of-3` is left alone, since a
+/// reader does not take it for the ordinal.
+fn agent_row_tab_segment(label: &str) -> Option<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        format!("#{trimmed}")
+    } else {
+        trimmed.to_string()
+    })
 }
 
 pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
@@ -3361,9 +3389,13 @@ fn render_agent_detail(
         // workspace rendered byte-identical location text. The mobile
         // switcher has rendered it since it was computed; the desktop panel
         // computed it and dropped it here.
+        let tab_segment = detail
+            .primary_tab_label
+            .as_deref()
+            .and_then(agent_row_tab_segment);
         let location = super::grammar::agent_location_label(
             &server_field,
-            detail.primary_tab_label.as_deref(),
+            tab_segment.as_deref(),
             detail.project.as_deref(),
             &detail.target,
             location_budget,
@@ -7259,15 +7291,9 @@ mod tests {
             .collect()
     }
 
-    /// #394 — the panel computes `primary_tab_label` per pane
-    /// (`multi_tab.then_some(detail.tab_label)`) and only the mobile
-    /// switcher ever rendered it, so two agents in different tabs of ONE
-    /// workspace drew byte-identical location text and were separable only by
-    /// alias. Asserted on the RENDERED buffer, not on the entry: the drop was
-    /// in `render_agent_detail`, so a test that stopped at
-    /// `agent_panel_entries` would have stayed green through the whole bug.
-    #[test]
-    fn agents_band_renders_each_rows_tab_label_in_a_multi_tab_workspace() {
+    /// One workspace, two tabs, one detected agent in each, under `scope`.
+    /// Tab 0 is auto-named (so its label is its number); tab 1 is `beta`.
+    fn multi_tab_agent_app(scope: AgentPanelScope) -> AppState {
         let mut app = AppState::test_new();
         let mut ws = Workspace::test_new("one");
         let beta = ws.test_add_tab(Some("beta"));
@@ -7283,8 +7309,20 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        app.set_agent_panel_scope(scope);
+        app
+    }
 
+    /// #394 — the panel computes `primary_tab_label` per pane
+    /// (`multi_tab.then_some(detail.tab_label)`) and only the mobile
+    /// switcher ever rendered it, so two agents in different tabs of ONE
+    /// workspace drew byte-identical location text and were separable only by
+    /// alias. Asserted on the RENDERED buffer, not on the entry: the drop was
+    /// in `render_agent_detail`, so a test that stopped at
+    /// `agent_panel_entries` would have stayed green through the whole bug.
+    #[test]
+    fn agents_band_renders_each_rows_tab_label_in_a_multi_tab_workspace() {
+        let app = multi_tab_agent_app(AgentPanelScope::AllWorkspaces);
         let rows = agents_band_row_texts(&app);
         assert_eq!(rows.len(), 2, "one row per pane: {rows:?}");
         // The workspace's first tab is auto-named and so labels by its number.
@@ -7306,6 +7344,87 @@ mod tests {
             );
         }
         assert_ne!(rows[0], rows[1], "the two tabs must not render alike");
+    }
+
+    /// #394 review: the first fix populated the tab label on the
+    /// all-scope arm only, so `CurrentWorkspace` — the DEFAULT scope, and the
+    /// one a single-space user actually looks at — kept the original defect
+    /// while the fleet-wide view was fixed. Both arms now carry the label.
+    #[test]
+    fn agents_band_renders_the_tab_label_in_the_current_workspace_scope_too() {
+        let mut app = multi_tab_agent_app(AgentPanelScope::CurrentWorkspace);
+        app.active = Some(0);
+        app.selected = 0;
+
+        let entries = agent_panel_entries(&app);
+        assert_eq!(entries.len(), 2, "one row per pane");
+        assert_eq!(
+            entries[1].primary_tab_label.as_deref(),
+            Some("beta"),
+            "the current-workspace arm must carry the tab label too"
+        );
+
+        let rows = agents_band_row_texts(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("beta")),
+            "and it must reach the screen: {rows:?}"
+        );
+    }
+
+    /// #394 review: an auto-named tab displays as a bare number, which on this
+    /// row sits in the same shape as the quick-jump ordinal. The ordinal means
+    /// "press alt+N for this agent"; the tab means "which tab of the
+    /// workspace". The two must not be the same digit on the same line.
+    #[test]
+    fn agents_band_marks_a_numeric_tab_label_away_from_the_row_ordinal() {
+        let mut app = multi_tab_agent_app(AgentPanelScope::AllWorkspaces);
+        // Bind the jump keys so the ordinal gutter is actually rendered —
+        // unbound, the collision cannot happen and the test proves nothing.
+        let config: crate::config::Config =
+            toml::from_str("[keys]\nfocus_agent = \"alt+1..9\"\n").unwrap();
+        app.keybinds = config.keybinds();
+
+        let rows = agents_band_row_texts(&app);
+        // The workspace's first tab is auto-named, so its label is the digit
+        // "1" — read it off the workspace rather than assuming it.
+        assert_eq!(app.workspaces[0].tabs[0].display_name(), "1");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.split_whitespace().any(|token| token == "#1"))
+                .count(),
+            1,
+            "the numeric tab is marked so it cannot be read as the ordinal: \
+             {rows:?}"
+        );
+        assert!(
+            rows[0].trim_start().starts_with('1'),
+            "the ordinal itself still renders bare: {rows:?}"
+        );
+    }
+
+    /// #394 review: only the ALL-DIGITS shape is ambiguous, so only it is
+    /// marked. A named tab and a mixed label are left as the workspace spells
+    /// them.
+    #[test]
+    fn only_a_bare_numeric_tab_label_gets_the_mark() {
+        assert_eq!(
+            agent_row_tab_segment("2").as_deref(),
+            Some("#2"),
+            "bare digits collide with the ordinal"
+        );
+        assert_eq!(agent_row_tab_segment("logs").as_deref(), Some("logs"));
+        assert_eq!(
+            agent_row_tab_segment("2-of-3").as_deref(),
+            Some("2-of-3"),
+            "a mixed label is not read as the ordinal"
+        );
+        assert_eq!(agent_row_tab_segment("  logs  ").as_deref(), Some("logs"));
+        assert_eq!(
+            agent_row_tab_segment("   "),
+            None,
+            "an all-blank label is no segment at all, or it renders a double \
+             space mid-row"
+        );
     }
 
     /// #394, pitfall 3: `primary_tab_label` is `None` for a single-tab
