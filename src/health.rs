@@ -109,6 +109,19 @@ pub(crate) struct SessionHealthCore {
     confirmed_broken: bool,
     /// A probe is out and has not reported yet.
     in_flight: Option<std::sync::mpsc::Receiver<SessionHealth>>,
+    /// Test-only: probes this core has launched (#523). The slot cannot witness
+    /// this. `collect_finished_probe` empties it the moment a probe reports, and
+    /// empties it for a probe that died without reporting too, so `false` says
+    /// "nothing is outstanding" and never "nothing was launched" — and "was not
+    /// relaunched" is a claim about launches. Compiled out of release builds.
+    #[cfg(test)]
+    probes_launched: u32,
+    /// Test-only: the probe a launch puts out instead of a thread, if the test
+    /// armed one (#523). A real probe reports whenever `getpwuid` returns, which
+    /// no test can decide; an armed one reports when the test says so. See
+    /// [`Self::arm_probe`].
+    #[cfg(test)]
+    armed_probe: Option<std::sync::mpsc::Receiver<SessionHealth>>,
     /// Whether the transition into `Broken` has been logged. #426 wants the
     /// server's log to say why agents stopped being able to reach anything,
     /// and #318 established that a warning repeating every tick is what makes
@@ -138,9 +151,49 @@ impl SessionHealthCore {
     /// Observable state, not a verdict — which is what makes the dual-loop
     /// wiring testable: it changes when the tick runs and cannot change when
     /// the tick does not, on a healthy machine as much as a broken one.
+    ///
+    /// It witnesses the *slot*, and the slot is not one claim twice over. It
+    /// empties when a probe reports and when one dies unreported, so `false`
+    /// does not mean "no probe was launched", and `true` does not mean one is
+    /// still running. A test that needs the second reading wants
+    /// [`Self::probes_launched`]; `getpwuid` is exercised for real in
+    /// `platform::macos`, against an actually unreachable passwd database.
     #[cfg(test)]
     pub(crate) fn probe_in_flight(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// How many probes this core has launched. Test-only, and the only witness
+    /// for "was not relaunched" (#523) — see [`Self::probe_in_flight`] for why
+    /// the slot cannot serve.
+    #[cfg(test)]
+    pub(crate) fn probes_launched(&self) -> u32 {
+        self.probes_launched
+    }
+
+    /// Arm the probe the next launch puts out, and return the sender that holds
+    /// it. Test-only, and the shape `crate::peers` already uses to pin an
+    /// in-flight instant: the slot is state the tick refuses to overwrite, so a
+    /// test can supply the probe that fills it without a thread.
+    ///
+    /// An armed probe stands in for the whole launch, thread included. That is
+    /// deliberate rather than a shortcut: *when* a probe in flight reports is the
+    /// one timing the overlap guard has, and it is a fact about `getpwuid` and
+    /// the scheduler rather than about flock. What the probe does is not what is
+    /// under test here, and it is not left untested — `platform::macos` drives
+    /// the real call, including the broken one.
+    ///
+    /// Send a reading to report it, and keep the sender alive to model a probe
+    /// still running; drop it to model a probe that died without reporting.
+    /// Arming again replaces the standing probe, so a test can supply a fresh
+    /// one for a relaunch. The core keeps no sender of its own — holding one
+    /// would keep the channel alive and make the died-without-reporting half
+    /// unreachable.
+    #[cfg(test)]
+    pub(crate) fn arm_probe(&mut self) -> std::sync::mpsc::Sender<SessionHealth> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.armed_probe = Some(rx);
+        tx
     }
 
     /// Whether the transition into `Broken` is still waiting to be logged.
@@ -185,6 +238,17 @@ impl SessionHealthCore {
     }
 
     fn launch_probe(&mut self) {
+        #[cfg(test)]
+        {
+            self.probes_launched = self.probes_launched.saturating_add(1);
+            if let Some(rx) = self.armed_probe.take() {
+                // The probe this test armed, occupying the slot exactly as a
+                // spawned one would — the guard is about the slot, so a launch
+                // that skipped filling it would be testing nothing.
+                self.in_flight = Some(rx);
+                return;
+            }
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.in_flight = Some(rx);
         std::thread::Builder::new()
@@ -254,6 +318,10 @@ impl SessionHealthCore {
             confirmed_broken: confirmed,
             in_flight: None,
             logged_broken: confirmed,
+            #[cfg(test)]
+            probes_launched: 0,
+            #[cfg(test)]
+            armed_probe: None,
         }
     }
 }
@@ -786,18 +854,140 @@ mod tests {
         );
     }
 
-    /// A probe that has not reported yet must not be launched again — otherwise
-    /// a wedged resolver would accumulate one thread per tick.
+    /// An outstanding probe must not be replaced by another one — otherwise a
+    /// wedged resolver would accumulate one thread per tick.
+    ///
+    /// Counted in launches, against a probe the test arms. Both halves are the
+    /// fix (#523), and they are different jobs. The old version read
+    /// `probe_in_flight()` across a tick that *collects before it launches*, so
+    /// it asserted "still running" where the invariant is "not replaced" — two
+    /// claims that diverge exactly when the first probe finished, and clearing
+    /// the slot then is the correct answer, not a fault. The real probe is one
+    /// `getpwuid`, so on the runner that lost the race the test watched the slot
+    /// empty and called it a failure. Counting launches is also the only way to
+    /// see the risk the doc comment names: a wedged resolver holds the slot
+    /// forever, so the damage is one thread per tick, and a boolean read off the
+    /// slot cannot tell that apart from a healthy idle core.
     #[test]
     fn an_unreported_probe_is_not_relaunched() {
+        let base = Instant::now();
         let mut core = SessionHealthCore::default();
-        core.refresh_if_due(Instant::now());
-        let launched = core.probe_in_flight();
-        core.refresh_if_due(Instant::now() + Duration::from_secs(600));
+        // Never sent and never dropped: the probe answers nothing, forever.
+        let _unanswered = core.arm_probe();
+
+        // Nothing has ever been dated, so every tick below is due whatever the
+        // TTL says — these offsets mean "later than the last one" and nothing
+        // else, and a retune of `SESSION_HEALTH_MAX_AGE` cannot move them.
+        core.refresh_if_due(base + Duration::from_secs(60));
+        assert_eq!(core.probes_launched(), 1, "the first due tick probes");
+
+        for tick in 2..=9 {
+            core.refresh_if_due(base + Duration::from_secs(60 * tick));
+            assert_eq!(
+                core.probes_launched(),
+                1,
+                "tick {tick} must not replace the probe in flight: a wedged resolver \
+                 would otherwise leave one thread per tick behind"
+            );
+            assert!(
+                core.probe_in_flight(),
+                "the unanswered probe is the one still holding the slot"
+            );
+        }
+    }
+
+    /// The guard is against overlap, not against ever probing again: a probe
+    /// that reports frees the slot, and the next due tick replaces it once.
+    ///
+    /// The steps are derived from [`SESSION_HEALTH_MAX_AGE`] rather than written
+    /// as literals, so retuning the TTL cannot move a step in a test about the
+    /// guard (#523) — the class where a test silently starts measuring a
+    /// different constant than it names.
+    ///
+    /// The middle assertion is the one honest dependency, and it is *not* about
+    /// the guard: the tick that takes a reading dates it at itself, so that tick
+    /// is not due again until a TTL later. Change how a collected reading is
+    /// dated and this line is what notices, which is worth knowing but is not
+    /// what the test is for — so it says so where it fails. It cannot simply be
+    /// dropped: the count is the only witness for "not replaced", so every tick
+    /// in a multi-tick launch count is observed, and the alternative to
+    /// depending on the dating is not a narrower test but a blind one.
+    #[test]
+    fn a_reported_probe_is_replaced_by_exactly_one_new_probe() {
+        let base = Instant::now();
+        let mut core = SessionHealthCore::default();
+        let first = core.arm_probe();
+
+        core.refresh_if_due(base + Duration::from_secs(60));
+        assert_eq!(core.probes_launched(), 1);
+
+        first
+            .send(SessionHealth::Healthy)
+            .expect("the armed probe's receiver");
+        let collecting_tick = base + Duration::from_secs(60) + SESSION_HEALTH_MAX_AGE;
+        core.refresh_if_due(collecting_tick);
         assert_eq!(
-            core.probe_in_flight(),
-            launched,
-            "one probe in flight must stay one probe in flight"
+            core.probes_launched(),
+            1,
+            "the tick that takes a reading dates it at itself and is not due \
+             again until a TTL later — a fact about dating, not about the guard"
+        );
+
+        let _replacement = core.arm_probe();
+        core.refresh_if_due(collecting_tick + SESSION_HEALTH_MAX_AGE);
+        assert_eq!(
+            core.probes_launched(),
+            2,
+            "a collected probe frees the slot for the next one"
+        );
+        core.refresh_if_due(collecting_tick + SESSION_HEALTH_MAX_AGE + Duration::from_secs(1));
+        assert_eq!(
+            core.probes_launched(),
+            2,
+            "and the replacement is guarded exactly as the first one was"
+        );
+        assert!(core.probe_in_flight());
+    }
+
+    /// The other half of the slot's two meanings: a probe that *dies* without
+    /// reporting frees it too, is relaunched, and credits nothing.
+    ///
+    /// This is why `probe_in_flight()` cannot witness a launch (#523) even with
+    /// nothing racing it — the slot empties here with no probe ever having run,
+    /// and the same tick that emptied it launches a replacement. Both facts are
+    /// pinned, and neither depends on a thread's timing.
+    #[test]
+    fn a_probe_that_died_without_reporting_is_replaced_and_credits_nothing() {
+        let base = Instant::now();
+        let mut core = SessionHealthCore::default();
+        drop(core.arm_probe());
+
+        core.refresh_if_due(base + Duration::from_secs(60));
+
+        assert_eq!(
+            core.probes_launched(),
+            1,
+            "a probe that never came back must not wedge the reading forever"
+        );
+        assert!(
+            core.checked_at.is_none(),
+            "and it must not be folded in as a reading: no evidence either way"
+        );
+
+        // A fresh stand-in, so the retry asserted here is the one the tick would
+        // make in production — with no thread to schedule. An unanswered probe
+        // never dates anything, so this tick is due for the same reason the
+        // first one was, and its offset carries no TTL meaning either.
+        let _replacement = core.arm_probe();
+        core.refresh_if_due(base + Duration::from_secs(61));
+        assert_eq!(
+            core.probes_launched(),
+            2,
+            "and the replacement is tried on the next tick rather than skipped"
+        );
+        assert!(
+            core.checked_at.is_none(),
+            "still no reading: an unanswered probe is not evidence"
         );
     }
 
