@@ -3355,8 +3355,15 @@ fn render_agent_detail(
             detail.icon.as_deref(),
             &detail.server,
         );
+        // #394: `primary_tab_label` is `Some` only for a multi-tab workspace,
+        // and this is the surface that needed it: the panel has one row per
+        // pane, so without the tab two agents in different tabs of one
+        // workspace rendered byte-identical location text. The mobile
+        // switcher has rendered it since it was computed; the desktop panel
+        // computed it and dropped it here.
         let location = super::grammar::agent_location_label(
             &server_field,
+            detail.primary_tab_label.as_deref(),
             detail.project.as_deref(),
             &detail.target,
             location_budget,
@@ -7228,6 +7235,94 @@ mod tests {
         let header = read_row(detail_area.y + 1);
         let first_row = read_row(agent_panel_body_rect(detail_area, false).y);
         (header, first_row)
+    }
+
+    fn agents_band_row_texts(app: &AppState) -> Vec<String> {
+        let area = Rect::new(0, 0, 60, 40);
+        let mut terminal =
+            Terminal::new(TestBackend::new(60, 40)).expect("test terminal should initialize");
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_sidebar(app, &runtimes, frame, area))
+            .expect("sidebar should render");
+        let (_, detail_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
+        let body = agent_panel_body_rect(detail_area, false);
+        let buffer = terminal.backend().buffer();
+        (body.y..body.y + body.height)
+            .map(|y| {
+                (body.x..body.x + body.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .filter(|row| !row.trim().is_empty())
+            .collect()
+    }
+
+    /// #394 — the panel computes `primary_tab_label` per pane
+    /// (`multi_tab.then_some(detail.tab_label)`) and only the mobile
+    /// switcher ever rendered it, so two agents in different tabs of ONE
+    /// workspace drew byte-identical location text and were separable only by
+    /// alias. Asserted on the RENDERED buffer, not on the entry: the drop was
+    /// in `render_agent_detail`, so a test that stopped at
+    /// `agent_panel_entries` would have stayed green through the whole bug.
+    #[test]
+    fn agents_band_renders_each_rows_tab_label_in_a_multi_tab_workspace() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("one");
+        let beta = ws.test_add_tab(Some("beta"));
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        for (tab_idx, agent) in [(0usize, Agent::Pi), (beta, Agent::Claude)] {
+            let pane = app.workspaces[0].tabs[tab_idx].root_pane;
+            let tid = app.workspaces[0].tabs[tab_idx].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().detected_agent = Some(agent);
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+
+        let rows = agents_band_row_texts(&app);
+        assert_eq!(rows.len(), 2, "one row per pane: {rows:?}");
+        // The workspace's first tab is auto-named and so labels by its number.
+        // Read the labels off the workspace rather than hardcoding them — each
+        // row must carry its OWN tab's label, whichever that turns out to be.
+        let labels: Vec<String> = app.workspaces[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.display_name())
+            .collect();
+        assert_eq!(labels[1], "beta");
+        for label in &labels {
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.contains(label.as_str()))
+                    .count(),
+                1,
+                "exactly one row names tab {label:?}: {rows:?}"
+            );
+        }
+        assert_ne!(rows[0], rows[1], "the two tabs must not render alike");
+    }
+
+    /// #394, pitfall 3: `primary_tab_label` is `None` for a single-tab
+    /// workspace by construction, and the common case must not grow an empty
+    /// column — no bare tab token on the row.
+    #[test]
+    fn agents_band_renders_no_tab_token_for_a_single_tab_workspace() {
+        let app = app_with_two_agents();
+        let rows = agents_band_row_texts(&app);
+        assert_eq!(rows.len(), 2, "one row per pane: {rows:?}");
+        for row in &rows {
+            assert!(
+                !row.split_whitespace().any(|token| token == "1"),
+                "a single-tab workspace must not render a tab token: {row:?}"
+            );
+            assert!(!row.trim().contains("  "), "no empty segment: {row:?}");
+        }
     }
 
     #[test]

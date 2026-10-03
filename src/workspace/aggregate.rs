@@ -36,6 +36,22 @@ impl Tab {
         })
     }
 
+    /// (state, seen) for every pane in THIS tab with a live terminal — the
+    /// per-tab counterpart of [`Workspace::pane_states`] (#394). The tab
+    /// strip tints a tab by its own panes' join; deriving it here, over the
+    /// same `(terminal.state, pane.seen)` pair the workspace scope reads, is
+    /// what keeps the two strips from disagreeing about the same pane.
+    pub fn pane_states<'a>(
+        &'a self,
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+    ) -> impl Iterator<Item = (AgentState, bool)> + 'a {
+        self.panes.values().filter_map(|pane| {
+            terminals
+                .get(&pane.attached_terminal_id)
+                .map(|terminal| (terminal.state, pane.seen))
+        })
+    }
+
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
         self.layout
             .pane_ids()
@@ -87,14 +103,7 @@ impl Workspace {
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
     ) -> impl Iterator<Item = (AgentState, bool)> + 'a {
-        self.tabs
-            .iter()
-            .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| {
-                terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
-            })
+        self.tabs.iter().flat_map(|tab| tab.pane_states(terminals))
     }
 
     pub fn aggregate_state(

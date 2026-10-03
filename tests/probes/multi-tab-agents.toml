@@ -1,0 +1,72 @@
+# #394 end-to-end: a multi-tab workspace on the desktop — does the agents
+# panel name the tab a row belongs to, and does a blocked agent in a
+# BACKGROUND tab tint that tab in the strip?
+#
+# Both claims are about what a user sees, so both are asserted on a real flk
+# rendering a real screen. Agent state is driven through the same socket path
+# an integration uses (`flk pane report-agent`), so the tint comes from the
+# state rollup the strip reads — not from a value injected into the renderer.
+#
+# Isolated flk instance. Sockets live in a SHORT dir: unix sun_path caps at
+# ~104 bytes. State comes from a sandbox HOME; FLOCK_* is unset so a nested
+# flock can start at all.
+#
+# STATUS: authored but NOT YET EXECUTED. In the environment this was written
+# in, tmux key injection reached the pty (a `cat` control echoed what was sent)
+# but no flock build read it: this runbook, the repo's own
+# prompt-history-hydration.toml, and the user's RELEASE `flk` all rendered their
+# first frame and then ignored F1, `s` and `prefix+shift+n` alike. The rendered
+# side is covered meanwhile by the cell-level assertions in
+# `src/ui/tabs.rs` and `src/ui/sidebar.rs`; run this to reproduce the same two
+# claims against a real screen.
+[session]
+command = ["${bin}"]
+cols = 200
+rows = 50
+startup_wait = 12
+timeout = 240
+env = { HOME = "${home}", XDG_CONFIG_HOME = "${xdg}", SHELL = "/bin/sh" }
+env_unset = ["FLOCK_ENV", "FLOCK_PANE_ID", "FLOCK_SOCKET_PATH", "FLOCK_BIN"]
+
+[[step]]
+wait_for = "No workspaces yet"
+
+[[step]]                      # a workspace with a shell pane
+keys = "F1"
+sleep = 5
+[[step]]
+wait_for = "\\$"
+
+[[step]]                      # a SECOND tab in the same workspace, named
+type = "$FLOCK_BIN tab create --label betalogs --focus; echo TAB_CREATE_DONE"
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 6
+[[step]]
+wait_for = "TAB_CREATE_DONE"
+[[step]]
+wait_for = "\\$"
+
+[[step]]                      # the agent in this tab reports itself blocked
+type = "$FLOCK_BIN pane report-agent --source probe --agent claude --state blocked; echo REPORT_DONE"
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 6
+[[step]]
+wait_for = "REPORT_DONE"
+
+[[step]]                      # back to tab 1: the blocked agent is now in a
+keys = "F3"                   # BACKGROUND tab, which is the case the strip
+sleep = 3                     # showed nothing for.
+
+[[step]]
+capture = "background-blocked"
+
+[[step]]                      # THE claim: the agents panel names the tab its
+assert_text = "betalogs"      # row belongs to, so two tabs of one workspace
+                             # are told apart without reading the alias.
+
+[[step]]                      # and the strip shows the tab by that same label,
+assert_text = "betalogs"      # which is the surface the tint lands on.

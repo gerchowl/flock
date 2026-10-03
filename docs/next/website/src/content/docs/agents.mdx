@@ -49,7 +49,15 @@ The sidebar rolls state upward.
 
 A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
 
+An unselected tab in the tab strip wears the tint of its own panes, so a blocked agent waiting in a background tab is visible in the strip rather than hidden behind a tab number. The selected tab stays accent — the tint speaks for tabs you are not looking at. The strip is only drawn for the active workspace, so this tells you about that workspace's tabs and nothing about another workspace's.
+
 This is the main Flock workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.
+
+## Telling agents apart in a multi-tab workspace
+
+A workspace with more than one tab shows one agents-panel row per pane, and each row names the tab its agent is in: `<server> <tab> <project> <branch>`, for example `mba22 logs flock keyboard-shorcuts`. Two agents in different tabs of one project are told apart by that segment rather than by their alias.
+
+Under a narrow sidebar the row gives segments up rather than widening: the branch shrinks first, then the tab, then the project, and the server name always stays. A single-tab workspace renders exactly as it always has — there is no empty tab column to read past.
 
 ## Jumping to the agent that needs you
 
