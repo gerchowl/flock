@@ -28,20 +28,23 @@ Do all code edits, tests, and validation inside the task worktree.
 
 Commit on the task branch in that worktree.
 
-When the change is ready, fast-forward the shared checkout at `../flock` to the task branch commit, then push `origin/main` from `../flock`. Do not treat the task branch as the final landing branch.
+When the change is ready, fast-forward the shared checkout at `../flock` to the merge commit, then continue from `main`. The task branch is never the final landing branch.
 
-### Fork fleet flow (gerchowl/flock, feat/sidebar-row-gap)
+### Fork fleet flow (gerchowl/flock)
 
-On this fork, `feat/sidebar-row-gap` is the integration branch the dotfiles
-flake pins. Multiple agent sessions develop it concurrently, so direct pushes
-cause pin races and skip review. Instead, EVERY change lands through a PR:
+Every change lands through a PR against `main`. Multiple agent sessions develop
+on this fork concurrently, so direct pushes cause pin races and skip review.
+
+**The landing branch is `main`.** It was briefly documented here as
+`feat/sidebar-row-gap`; that branch does not exist, and every PR since has
+targeted `main`. Check `gh pr list --base main` before assuming anything else.
 
 1. Isolate in a worktree (flock's `branch_session` keybind, `flock worktree`
    CLI, or `git worktree add`). External worktrees are auto-adopted.
-2. Commit on the task branch; push; `gh pr create --base feat/sidebar-row-gap`
-   with test/probe evidence in the description.
-3. Merge via the PR (merge commit, matching PRs #1-#5), then
-   `git pull --rebase` in the shared checkout.
+2. Commit on the task branch; push; `gh pr create --base main` with
+   test/probe evidence in the description.
+3. Merge via the PR — **squash**, matching every recent merge — then
+   `git pull --ff-only` in the shared checkout.
 4. Deploying: bump the dotfiles flake (`nix flake update flock`), VERIFY the
    pinned rev in flake.lock (pin races happen), `home-manager switch`, then
    `flock server live-handoff`. Commit the dotfiles pin.
@@ -50,6 +53,31 @@ cause pin races and skip review. Instead, EVERY change lands through a PR:
    by hand.
 
 Doc-only changes still take a PR, but skip step 4.
+
+**The queue is serial, and that is structural.** This is a user-owned repo, so
+GitHub's merge queue cannot be enabled (`owner.type == "User"` rejects the
+`merge_queue` rule with 422, and `required_merge_queue` is silently ignored).
+With `strict: true` on `main`, every merge moves `main` and puts every other open
+PR into `BEHIND`, so one PR is landed at a time: update-branch, wait for the
+**new** CI run, merge, re-inventory. `--auto` will not update a `BEHIND` branch
+and will stall the queue after the first merge.
+
+Two traps this repo has actually hit:
+
+- **Wait for the run to exist, then for it to finish.** A one-phase wait fires
+  two ways, both silently: `gh pr checks` prints "no checks reported" and exits
+  non-zero right after a push, and after `update-branch` the *previous* run's
+  green is still what it returns until the new workflow registers.
+- **After resolving a stacked PR, verify the diff reduces to the child's own
+  commit.** A squash rewrites the parent's commits, so where the child's copy
+  lands at a different offset git appends it with no conflict and the parent's
+  content ends up in the tree twice.
+
+A **red** run is not automatically your change: this suite has contention flakes
+in multi-process and socket tests, and macOS CI going red mid-run *cancels* the
+rest of nextest, so a few thousand tests may never have executed. Check the
+cancellation count, rerun a red once, and confirm the failure is in code the PR
+touched before treating it as yours.
 
 If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
 
