@@ -67,7 +67,7 @@ Two-line server rows, reformatted for the narrow sidebar:
 <CPU> <RAM> <DISK> <GPU (if exists)>
 ```
 
-- Line 1: name + latency (peers) | battery (self/laptop) + net i/o (self only — peer summaries don't carry net).
+- Line 1: name + latency (peers) | battery (self/hopper) + net i/o (self only — peer summaries don't carry net).
 - Line 2: the metric glyphs+values, SPACE-separated — **drop the `·` separators** (the dots cost width for nothing at this density).
 - **CPU & GPU always 3-digit-spaced** (right-aligned width-3: `  8%`, ` 42%`, `100%`) so columns are stable across refreshes.
 - **mem: pad used to the width of total** (` 92G/512G`, ` 8G/17G`) so the slash column doesn't jitter.

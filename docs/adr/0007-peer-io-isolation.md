@@ -20,7 +20,7 @@ socket plus fleet peers reached over an ssh-stdio bridge (an `ssh` subprocess
 whose stdio is bridged to a local `UnixStream`). Switching servers flips which
 slot feeds the painter, in-process, without releasing the terminal.
 
-#176 exposed the flaw: a single slow/flaky peer (`ksb-meatgrinder` via
+#176 exposed the flaw: a single slow/flaky peer (`node-b-meatgrinder` via
 ProxyJump; ssh exit 255; probes taking 2.7–3.8 s vs ~20–50 ms healthy) froze the
 **entire** client — local tabs and healthy peers included — until the user
 killed the terminal and relaunched. The server stayed healthy throughout; it was
@@ -34,7 +34,7 @@ purely a client-side freeze. Two mechanisms, both on the loop thread:
    `child.wait()`; three `handle_dead` sites dropped a dead peer's bridge inline
    on the loop thread, blocking it until ssh keepalive expired (~tens of seconds).
 
-Peer flakiness (a sleeping laptop, ProxyJump latency, ssh 255, a paused remote)
+Peer flakiness (a sleeping hopper, ProxyJump latency, ssh 255, a paused remote)
 is a **normal, expected** condition on a fleet — not exceptional. The client must
 degrade the affected peer and keep rendering.
 

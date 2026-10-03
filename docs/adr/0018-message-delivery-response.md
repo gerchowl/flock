@@ -18,7 +18,7 @@ behaviourally incomplete, in three ways measured on the fleet:
 
 1. **An idle agent is unreachable.** The wake rides the `Stop` hook, so an agent
    that has already stopped never learns it has mail until a human prompts it.
-   Delivery latency for an idle pane is unbounded. On sage (2026-09-15) a
+   Delivery latency for an idle pane is unbounded. On atlas (2026-09-15) a
    `tvk376 → tvk377` message sat 131 minutes with an idle recipient and zero
    delivery attempts.
 2. **Urgency is only half expressible.** #280 landed `fyi` / `needs_reply`, but

@@ -445,7 +445,7 @@ fn schema_msg_send() -> Value {
                     },
                     "agent": {
                         "type": "string",
-                        "description": "Required for `agent`: a fleet-global agent id such as `agent_sage_6f21c4`, exactly as `flock_agent_list` reports it. Not a pane id — a pane id here is refused, not guessed at.",
+                        "description": "Required for `agent`: a fleet-global agent id such as `agent_atlas_6f21c4`, exactly as `flock_agent_list` reports it. Not a pane id — a pane id here is refused, not guessed at.",
                     },
                 },
                 "required": ["type"],
@@ -1300,7 +1300,7 @@ mod tests {
     #[test]
     fn build_msg_send_parses_agent_target() {
         let method = build_msg_send(json!({
-            "to": {"type": "agent", "agent": "agent_sage_6f21c4"},
+            "to": {"type": "agent", "agent": "agent_atlas_6f21c4"},
             "body": "cross-host",
             "intent": "fyi",
         }))
@@ -1309,7 +1309,7 @@ mod tests {
             panic!("expected MsgSend");
         };
         match params.to {
-            MessageTarget::Agent { agent } => assert_eq!(agent, "agent_sage_6f21c4"),
+            MessageTarget::Agent { agent } => assert_eq!(agent, "agent_atlas_6f21c4"),
             other => panic!("expected agent target, got {other:?}"),
         }
     }
@@ -1331,7 +1331,7 @@ mod tests {
                 pane: "p2".into(),
             },
             MessageTarget::Agent {
-                agent: "agent_sage_6f21c4".into(),
+                agent: "agent_atlas_6f21c4".into(),
             },
         ];
         // Compile-time exhaustiveness: a fourth variant has to break HERE,

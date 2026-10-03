@@ -5,7 +5,7 @@
 //! it across logins; the inherited value then points at a socket nobody
 //! listens on. A passphrase-protected key under `BatchMode` is usable ONLY
 //! through an agent, so every dial fails auth — for as long as the server
-//! lives. mba22 ran that way for five days, 2,229 failed dials a day.
+//! lives. hopper ran that way for five days, 2,229 failed dials a day.
 //!
 //! The fix has one hard constraint: no process spawn per dial. Asking
 //! `launchctl getenv SSH_AUTH_SOCK` on every dial is the exec-storm class of
@@ -298,7 +298,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The mba22 outage: the inherited socket is dead, the current login's
+    /// The hopper outage: the inherited socket is dead, the current login's
     /// is alive in the launchd directory. One scan finds it, and the cache
     /// means every later dial is back to a single connect on the new path.
     #[test]

@@ -24,7 +24,7 @@ url: https://github.com/gerchowl/herdr/issues/103
 1. **CI (durable)**: extend peer_federation.rs with a slots-ENABLED variant of the switch tests -- spawn the spoke server, drive the switch with slots on, assert the rendered spoke frame contains the home row + folded hub spaces. This exact test fails on #102 and passes on its fix. Parameterize the existing switch e2e over `[slots] {disabled, enabled}`.
 2. **Config-fork lint**: any behavior gated on a config flag (slots, tab_mode, server_state_mark) should have a paired e2e or a documented why-not.
 3. **Pre-flip smoke (process)**: before flipping a fleet-wide config like slots-on in g-fleet, run a federation smoke (below) -- don't flip blind.
-4. **Live smoke harness (tui-probe / VMs)**: a scripted real switch (mba22->vm-dev) that screenshots the spoke frame and asserts the servers band. We HAVE the VMs; wire a `just herdr-smoke` that drives it headlessly.
+4. **Live smoke harness (tui-probe / VMs)**: a scripted real switch (hopper->bastion) that screenshots the spoke frame and asserts the servers band. We HAVE the VMs; wire a `just herdr-smoke` that drives it headlessly.
 
 ## Acceptance
 - A red-then-green slots-enabled federation e2e committed alongside the #102 fix.

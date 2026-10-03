@@ -21,10 +21,10 @@ A collapsible **`servers`** section above `spaces`, one row per federated peer:
 
 ```
  servers
- ● mba22    12ms   cpu 19% mem 13/16G   3 agents
- ● anvil    34ms   cpu 71% mem 48/64G   1 ● blocked
- ◐ sage    210ms   cpu  4% mem  2/8G    idle
- ○ ksb      —      unreachable 2m
+ ● hopper    12ms   cpu 19% mem 13/16G   3 agents
+ ● kiln    34ms   cpu 71% mem 48/64G   1 ● blocked
+ ◐ atlas    210ms   cpu  4% mem  2/8G    idle
+ ○ node-b      —      unreachable 2m
 ```
 
 Builds on #18 (peer federation). Answers the spike question — *what is informative per machine without throttling*.

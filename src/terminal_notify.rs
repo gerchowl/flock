@@ -191,8 +191,8 @@ mod tests {
         // OSC 0 would also set the ICON name, which some tiling WMs match
         // windows on.
         assert_eq!(
-            set_window_title_sequence("main \u{00b7} mba22 \u{2014} flk"),
-            b"\x1b]2;main \xc2\xb7 mba22 \xe2\x80\x94 flk\x1b\\".to_vec()
+            set_window_title_sequence("main \u{00b7} hopper \u{2014} flk"),
+            b"\x1b]2;main \xc2\xb7 hopper \xe2\x80\x94 flk\x1b\\".to_vec()
         );
     }
 

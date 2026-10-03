@@ -29,7 +29,7 @@ place to push from. The spike built that behind `[msg] channel_push`
 
 ## What was measured
 
-All on sage, Claude Code 2.1.281, Opus 5.5, in an isolated flk instance (a
+All on atlas, Claude Code 2.1.281, Opus 5.5, in an isolated flk instance (a
 sandbox `XDG_CONFIG_HOME`, never the operator's server). T0 is stamped in
 the sender's pane immediately before `flk msg send`. "working" is flk's own
 screen detector seeing the recipient start a turn, so it includes detector

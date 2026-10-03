@@ -1690,7 +1690,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -1699,10 +1699,10 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
-                    host: "anvil-host".into(),
+                    host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),
                     system: Some(crate::api::schema::PeerSystemSummary {
@@ -1733,7 +1733,7 @@ mod tests {
             },
         ));
         let summary = &app.state.peer_summaries[0];
-        assert_eq!(summary.host.as_deref(), Some("anvil-host"));
+        assert_eq!(summary.host.as_deref(), Some("kiln-host"));
         assert_eq!(summary.version.as_deref(), Some("0.6.8"));
         assert_eq!(summary.latency_ms, Some(34));
         assert_eq!(
@@ -1748,7 +1748,7 @@ mod tests {
         // Errors keep the last good data but record the failure.
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Err("ssh: connect timed out".into()),
             },
@@ -1782,7 +1782,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.peers = vec![crate::config::PeerConfig {
-            name: "sage".into(),
+            name: "atlas".into(),
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -1793,7 +1793,7 @@ mod tests {
             crate::logging::capture_logs(|| {
                 app.handle_internal_event(AppEvent::PeerSummaryFetched(
                     crate::peers::PeerSummaryFetch {
-                        peer: "sage".into(),
+                        peer: "atlas".into(),
                         result: Err(dead_agent.clone()),
                         stream_error: Some(dead_agent.clone()),
                     },
@@ -1859,9 +1859,9 @@ mod tests {
         let recovered = crate::logging::capture_logs(|| {
             app.handle_internal_event(AppEvent::PeerSummaryFetched(
                 crate::peers::PeerSummaryFetch {
-                    peer: "sage".into(),
+                    peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
-                        host: "sage".into(),
+                        host: "atlas".into(),
                         version: None,
                         protocol: None,
                         system: None,
@@ -1886,7 +1886,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -1921,10 +1921,10 @@ mod tests {
         let fetch = |system: Option<crate::api::schema::PeerSystemSummary>,
                      ws: Vec<crate::api::schema::PeerWorkspaceSummary>| {
             AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
-                    host: "anvil-host".into(),
+                    host: "kiln-host".into(),
                     version: None,
                     protocol: None,
                     system,
@@ -2763,7 +2763,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -2771,10 +2771,10 @@ mod tests {
         // Freshest peer-poll answer is a success.
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
-                    host: "anvil-host".into(),
+                    host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),
                     system: None,
@@ -2801,7 +2801,7 @@ mod tests {
         );
         app.handle_internal_event(AppEvent::PeerSummaryFetched(
             crate::peers::PeerSummaryFetch {
-                peer: "anvil".into(),
+                peer: "kiln".into(),
                 stream_error: None,
                 result: Err(leaky.clone()),
             },
@@ -2829,26 +2829,26 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.peers = vec![
             crate::config::PeerConfig {
-                name: "anvil".into(),
+                name: "kiln".into(),
                 ..Default::default()
             },
             crate::config::PeerConfig {
-                name: "sage".into(),
+                name: "atlas".into(),
                 ..Default::default()
             },
         ];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
-        // Pin two peers to controlled in-flight instants — sage 5s in
-        // (fresh), anvil 45s in (wedging). The `should_poll_now` public API
+        // Pin two peers to controlled in-flight instants — atlas 5s in
+        // (fresh), kiln 45s in (wedging). The `should_poll_now` public API
         // arms next_due off the passed instant, which would interact with
         // the aggregate age we're trying to assert; the test seam sets the
         // one field this projection reads.
         let now = std::time::Instant::now();
         app.peer_poll_tracker
-            .set_in_flight_since_for_test("sage", now - std::time::Duration::from_secs(5));
+            .set_in_flight_since_for_test("atlas", now - std::time::Duration::from_secs(5));
         app.peer_poll_tracker
-            .set_in_flight_since_for_test("anvil", now - std::time::Duration::from_secs(45));
+            .set_in_flight_since_for_test("kiln", now - std::time::Duration::from_secs(45));
 
         let pollers = peers_summary_pollers(&mut app);
         assert_eq!(pollers["peer_poll"]["in_flight"], true);

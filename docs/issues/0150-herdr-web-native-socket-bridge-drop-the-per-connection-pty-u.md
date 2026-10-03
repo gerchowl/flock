@@ -40,7 +40,7 @@ Verified against the code while scoping the stdio mode — **the premise that #1
 - The server already parses SGR mouse sequences straight out of the `ClientMessage::Input` byte stream (`src/raw_input.rs:644` `parse_sgr_mouse`; `src/server/client_transport.rs:424` → `ServerEvent::ClientInput`). So **#130 (mouse/wheel)** is frontend-only: xterm enables mouse reporting and forwards the escape bytes over today’s PTY transport.
 - **#128** (badge) and **#129** (key bar) are pure `index.html`.
 
-This matches the round-1 transport review ("all three are frontend-only"). So #150’s only real benefit is **scaling** (dropping the PTY-per-connection ceiling), which does not bite a personal phone+laptop fleet — especially now that #148 added a concurrent-session cap.
+This matches the round-1 transport review ("all three are frontend-only"). So #150’s only real benefit is **scaling** (dropping the PTY-per-connection ceiling), which does not bite a personal phone+hopper fleet — especially now that #148 added a concurrent-session cap.
 
 Additional cost found: a `herdr client --stdio` mode has **no TTY**, so resize needs a new side-channel (no PTY `winsize`/SIGWINCH) — real client surgery for marginal benefit today.
 

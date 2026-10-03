@@ -853,14 +853,14 @@ mod tests {
     fn switch_failure_label_names_the_target() {
         assert_eq!(switch_failure_label(&AttachLeg::Local), "home");
         let leg = AttachLeg::Remote(remote::RemoteLaunch {
-            target: "lars@sage".to_string(),
+            target: "operator@atlas".to_string(),
             keybindings: remote::RemoteKeybindings::Local,
             live_handoff: false,
             fleet: None,
             context: remote::LaunchContext::Cli,
             proxy_jump: None,
         });
-        assert_eq!(switch_failure_label(&leg), "lars@sage");
+        assert_eq!(switch_failure_label(&leg), "operator@atlas");
     }
 
     #[test]
@@ -889,17 +889,17 @@ mod tests {
     #[test]
     fn decide_next_leg_chains_into_requested_switch() {
         let switch = Some(client::RecordedSwitch {
-            target: "lars@sage".to_string(),
+            target: "operator@atlas".to_string(),
             fleet: None,
             focus_workspace: None,
             proxy_jump: None,
         });
         match decide_next_leg(&AttachLeg::Local, switch, Ok(()), None, false) {
             LegStep::Switch { next, previous } => {
-                assert_eq!(next, remote_leg("lars@sage"));
+                assert_eq!(next, remote_leg("operator@atlas"));
                 // Falls back to where we came from, labeled by the target.
                 assert_eq!(previous.0, AttachLeg::Local);
-                assert_eq!(previous.1, "lars@sage");
+                assert_eq!(previous.1, "operator@atlas");
                 // The switch leg MUST be non-interactive: the previous leg
                 // may still hold the alt-screen for the seamless swap, so a
                 // remote install/upgrade prompt here would corrupt the
@@ -926,7 +926,7 @@ mod tests {
         let args = vec![
             "flock".to_string(),
             "--remote".to_string(),
-            "lars@sage".to_string(),
+            "operator@atlas".to_string(),
         ];
         let (_cleaned, remote) =
             remote::extract_remote_args(&args).expect("--remote parses cleanly");
@@ -937,14 +937,23 @@ mod tests {
 
     #[test]
     fn decide_next_leg_falls_back_with_notice_on_failed_switch() {
-        // The switch leg (sage) died before its client attached: no switch
+        // The switch leg (atlas) died before its client attached: no switch
         // recorded, an error, and a previous leg to bounce back to.
         let err = io::Error::other("connection refused\nis flock running?");
-        let previous = Some((AttachLeg::Local, "lars@sage".to_string()));
-        match decide_next_leg(&remote_leg("lars@sage"), None, Err(err), previous, true) {
+        let previous = Some((AttachLeg::Local, "operator@atlas".to_string()));
+        match decide_next_leg(
+            &remote_leg("operator@atlas"),
+            None,
+            Err(err),
+            previous,
+            true,
+        ) {
             LegStep::FallBack { to, notice, .. } => {
                 assert_eq!(to, AttachLeg::Local);
-                assert_eq!(notice, "switch to lars@sage failed: connection refused");
+                assert_eq!(
+                    notice,
+                    "switch to operator@atlas failed: connection refused"
+                );
             }
             _ => panic!("expected FallBack"),
         }
@@ -958,14 +967,20 @@ mod tests {
         let err = io::Error::new(
             io::ErrorKind::ConnectionAborted,
             remote::ReconnectGaveUp {
-                target: "lars@sage".to_string(),
+                target: "operator@atlas".to_string(),
             },
         );
-        let previous = Some((AttachLeg::Local, "lars@sage".to_string()));
-        match decide_next_leg(&remote_leg("lars@sage"), None, Err(err), previous, true) {
+        let previous = Some((AttachLeg::Local, "operator@atlas".to_string()));
+        match decide_next_leg(
+            &remote_leg("operator@atlas"),
+            None,
+            Err(err),
+            previous,
+            true,
+        ) {
             LegStep::FallBack { to, notice, .. } => {
                 assert_eq!(to, AttachLeg::Local);
-                assert_eq!(notice, "lost connection to lars@sage");
+                assert_eq!(notice, "lost connection to operator@atlas");
             }
             _ => panic!("expected FallBack"),
         }
@@ -982,15 +997,15 @@ mod tests {
             },
         );
         assert_eq!(
-            fallback_notice("lars@sage", &from_bridge),
-            "switch to lars@sage failed: auth refused"
+            fallback_notice("operator@atlas", &from_bridge),
+            "switch to operator@atlas failed: auth refused"
         );
         let raw_ssh = io::Error::other(
-            "remote platform probe failed: ssh: connect to host sage port 22: Connection refused",
+            "remote platform probe failed: ssh: connect to host atlas port 22: Connection refused",
         );
         assert_eq!(
-            fallback_notice("lars@sage", &raw_ssh),
-            "switch to lars@sage failed: connection refused"
+            fallback_notice("operator@atlas", &raw_ssh),
+            "switch to operator@atlas failed: connection refused"
         );
     }
 
@@ -1000,18 +1015,18 @@ mod tests {
     #[test]
     fn a_fallback_remote_leg_runs_as_a_federation_switch() {
         let err = io::Error::other("connection refused");
-        // The chain started as `flk --remote lars@sage`: a CLI launch.
-        let AttachLeg::Remote(mut cli_launch) = remote_leg("lars@sage") else {
+        // The chain started as `flk --remote operator@atlas`: a CLI launch.
+        let AttachLeg::Remote(mut cli_launch) = remote_leg("operator@atlas") else {
             unreachable!("remote_leg builds a remote leg")
         };
         cli_launch.context = remote::LaunchContext::Cli;
-        let previous = Some((AttachLeg::Remote(cli_launch), "lars@anvil".to_string()));
-        match decide_next_leg(&remote_leg("lars@anvil"), None, Err(err), previous, true) {
+        let previous = Some((AttachLeg::Remote(cli_launch), "operator@kiln".to_string()));
+        match decide_next_leg(&remote_leg("operator@kiln"), None, Err(err), previous, true) {
             LegStep::FallBack {
                 to: AttachLeg::Remote(launch),
                 ..
             } => {
-                assert_eq!(launch.target, "lars@sage");
+                assert_eq!(launch.target, "operator@atlas");
                 assert_eq!(launch.context, remote::LaunchContext::FederationSwitch);
             }
             _ => panic!("expected a FallBack to the remote leg"),

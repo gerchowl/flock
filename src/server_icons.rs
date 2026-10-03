@@ -95,7 +95,7 @@ pub fn glyph(name: &str) -> Option<&'static str> {
         "diamond" => "\u{f01c8}", // md-diamond_stone
         "hexagon" => "\u{f02d8}",
         "cube" => "\u{f01a7}", // md-cube_outline
-        // — Medical (e.g. ksb) —
+        // — Medical (e.g. hospital) —
         "hospital" => "\u{f02e1}",       // md-hospital_building
         "cross" | "plus" => "\u{f0415}", // md-plus (medical cross look)
         "medical" => "\u{f06ef}",        // md-medical_bag

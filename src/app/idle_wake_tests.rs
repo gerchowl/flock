@@ -652,8 +652,8 @@ async fn a_message_relayed_from_another_host_wakes_the_same_way() {
     let response = app.handle_api_request(Request {
         id: "req".into(),
         method: Method::MsgSend(MsgSendParams {
-            from_agent: Some("agent_anvil_far".into()),
-            from_host: Some("anvil".into()),
+            from_agent: Some("agent_kiln_far".into()),
+            from_host: Some("kiln".into()),
             to: MessageTarget::Pane { pane: pane.clone() },
             body: format!("from the other host: {MARKER}"),
             correlation_id: Some("relayed-1".into()),
@@ -665,7 +665,7 @@ async fn a_message_relayed_from_another_host_wakes_the_same_way() {
     assert!(response.contains("\"queued\""), "{response}");
     let typed = drain(&mut pty);
     assert_eq!(typed, vec![super::idle_wake_text(1).into_bytes()]);
-    assert!(!String::from_utf8_lossy(&typed[0]).contains("anvil"));
+    assert!(!String::from_utf8_lossy(&typed[0]).contains("toad"));
     tick_past_gap(&mut app);
     assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
 }

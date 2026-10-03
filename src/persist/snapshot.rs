@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(persisted, minted);
 
         // And it is genuinely per-agent, not per-process.
-        let other = crate::terminal::AgentId::alloc("sage").to_string();
+        let other = crate::terminal::AgentId::alloc("atlas").to_string();
         assert_ne!(other, minted);
     }
 

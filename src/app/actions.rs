@@ -5247,7 +5247,7 @@ mod tests {
         // Filtered to the peer: the local pane is not visible, so the only
         // stop left is the peer's agent.
         state.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "sage".into(),
+            ssh_target: "atlas".into(),
         });
         state.focus_attention_agent();
         assert!(
@@ -5680,14 +5680,14 @@ mod tests {
         assert_eq!(state.mode, Mode::Terminal);
     }
 
-    /// A config peer named `sage` with one `gerchowl/flock` workspace on `main`,
+    /// A config peer named `atlas` with one `gerchowl/flock` workspace on `main`,
     /// as it would arrive from a `peers.summary` poll.
     fn fleet_peer_flock_main() -> crate::peers::PeerSummaryState {
         let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "sage".into(),
+            name: "atlas".into(),
             ..Default::default()
         });
-        peer.host = Some("sage".into());
+        peer.host = Some("atlas".into());
         peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
             id: "ws_1".into(),
             workspace: "flock".into(),
@@ -5722,7 +5722,7 @@ mod tests {
             })
             .expect("fleet-wide navigator should surface the peer workspace");
         // Same self-contained grammar the sidebar shows: `owner/repo · host:branch`.
-        assert_eq!(remote.label, "gerchowl/flock \u{00b7} sage:main");
+        assert_eq!(remote.label, "gerchowl/flock \u{00b7} atlas:main");
         assert_eq!(remote.status, AgentState::Working);
     }
 
@@ -5824,10 +5824,10 @@ mod tests {
         // Fleet-wide search finds a remote workspace by its label text (the
         // host / project / branch all feed the searchable string).
         let mut state = app_with_workspaces(&["scratch"]);
-        state.peer_summaries = vec![fleet_peer_flock_main()]; // sage · gerchowl/flock:main
+        state.peer_summaries = vec![fleet_peer_flock_main()]; // atlas · gerchowl/flock:main
         state.open_navigator();
 
-        state.navigator.query = "sage".into();
+        state.navigator.query = "atlas".into();
         assert!(any_remote_row(&state), "host segment should match");
         state.navigator.query = "gerchowl/flock".into();
         assert!(any_remote_row(&state), "project segment should match");
@@ -5841,12 +5841,12 @@ mod tests {
     #[test]
     fn navigator_peer_server_filter_narrows_to_one_server() {
         let mut state = app_with_workspaces(&["scratch"]);
-        let mut anvil = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "anvil".into(),
+        let mut kiln = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "kiln".into(),
             ..Default::default()
         });
-        anvil.host = Some("anvil".into());
-        anvil.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
+        kiln.host = Some("kiln".into());
+        kiln.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
             id: "ws_9".into(),
             workspace: "proj".into(),
             project_key: Some("github.com/gerchowl/proj".into()),
@@ -5859,10 +5859,10 @@ mod tests {
             activity: None,
             agents: Vec::new(),
         }];
-        anvil.last_ok = Some(std::time::Instant::now());
-        state.peer_summaries = vec![fleet_peer_flock_main(), anvil];
+        kiln.last_ok = Some(std::time::Instant::now());
+        state.peer_summaries = vec![fleet_peer_flock_main(), kiln];
         state.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "sage".into(),
+            ssh_target: "atlas".into(),
         });
         state.open_navigator();
 
@@ -5883,8 +5883,8 @@ mod tests {
             "a Peer filter keeps only that server's rows: {remote_labels:?}"
         );
         assert!(
-            remote_labels[0].contains("sage") && !remote_labels[0].contains("anvil"),
-            "kept sage, dropped anvil: {remote_labels:?}"
+            remote_labels[0].contains("atlas") && !remote_labels[0].contains("toad"),
+            "kept atlas, dropped kiln: {remote_labels:?}"
         );
         // The same filter hides the LOCAL rows: it narrows to one server, and
         // this is not that server (#80).
@@ -5925,7 +5925,7 @@ mod tests {
         );
 
         state.server_filter = Some(crate::app::state::ServerFilter::Peer {
-            ssh_target: "sage".into(),
+            ssh_target: "atlas".into(),
         });
         assert!(
             crate::ui::agent_panel_entries(&state).is_empty(),
@@ -5947,10 +5947,10 @@ mod tests {
         // rows (and never panics on the empty enumerate).
         let mut state = app_with_workspaces(&["scratch"]);
         let mut empty = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "sage".into(),
+            name: "atlas".into(),
             ..Default::default()
         });
-        empty.host = Some("sage".into());
+        empty.host = Some("atlas".into());
         empty.last_ok = Some(std::time::Instant::now());
         state.peer_summaries = vec![empty];
         state.open_navigator();
@@ -8280,7 +8280,7 @@ mod tests {
         assert!(state.collapsible_space_keys().is_empty());
 
         // A peer carrying the same project tips it over the threshold.
-        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        state.peer_summaries = vec![peer_with_project("kiln", "github.com/gerchowl/flock")];
         let keys = state.collapsible_space_keys();
         assert_eq!(keys.len(), 1);
         // The set stays in the section-key namespace (toggle_all / auto-collapse
@@ -8301,7 +8301,7 @@ mod tests {
             is_linked_worktree: false,
             project_key: "github.com/gerchowl/flock".into(),
         });
-        state.peer_summaries = vec![peer_with_project("anvil", "github.com/other/repo")];
+        state.peer_summaries = vec![peer_with_project("kiln", "github.com/other/repo")];
         assert!(state.collapsible_space_keys().is_empty());
     }
 
@@ -8322,11 +8322,11 @@ mod tests {
         });
 
         // A FRESH peer on the same project aggregates it.
-        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        state.peer_summaries = vec![peer_with_project("kiln", "github.com/gerchowl/flock")];
         assert_eq!(state.collapsible_space_keys().len(), 1);
 
         // The same peer, now stale, stops counting → back to a lone checkout.
-        let mut stale = peer_with_project("anvil", "github.com/gerchowl/flock");
+        let mut stale = peer_with_project("kiln", "github.com/gerchowl/flock");
         stale.origin_last_ok_secs = Some(10_000); // well past the 60s cut
         state.peer_summaries = vec![stale];
         assert!(
@@ -8350,7 +8350,7 @@ mod tests {
             is_linked_worktree: false,
             project_key: "dir:foo".into(),
         });
-        state.peer_summaries = vec![peer_with_project("anvil", "dir:foo")];
+        state.peer_summaries = vec![peer_with_project("kiln", "dir:foo")];
         assert!(state.collapsible_space_keys().is_empty());
     }
 
@@ -8413,7 +8413,7 @@ mod tests {
             is_linked_worktree: false,
             project_key: "github.com/gerchowl/flock".into(),
         });
-        state.peer_summaries = vec![peer_with_project("anvil", "github.com/gerchowl/flock")];
+        state.peer_summaries = vec![peer_with_project("kiln", "github.com/gerchowl/flock")];
         state.server_filter = Some(crate::app::state::ServerFilter::Local);
         assert!(state.collapsible_space_keys().is_empty());
     }

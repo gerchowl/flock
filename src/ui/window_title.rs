@@ -15,9 +15,9 @@
 //!
 //! | situation | title |
 //! | --- | --- |
-//! | all idle, focused on `main` | `main · mba22 — flk` |
-//! | 2 blocked, 3 working | `● 2B  feat/foo · mba22 — flk` |
-//! | remote, 1 blocked | `● 1B  main · anvil — flk` |
+//! | all idle, focused on `main` | `main · hopper — flk` |
+//! | 2 blocked, 3 working | `● 2B  feat/foo · hopper — flk` |
+//! | remote, 1 blocked | `● 1B  main · kiln — flk` |
 //! | empty flock | `flk` |
 //!
 //! The ordering is not aesthetic. Titles are read in their first ~2 words and
@@ -211,8 +211,8 @@ mod tests {
     #[test]
     fn calm_flock_renders_no_badge() {
         assert_eq!(
-            render_window_title(&tally(0, 0, 0, 3), 0, Some("main"), "mba22"),
-            "main \u{00b7} mba22 \u{2014} flk"
+            render_window_title(&tally(0, 0, 0, 3), 0, Some("main"), "hopper"),
+            "main \u{00b7} hopper \u{2014} flk"
         );
     }
 
@@ -220,8 +220,8 @@ mod tests {
     fn blocked_agents_lead_the_title() {
         // The badge is FIRST: it is the only part that changes, and the only
         // part reliably read before truncation.
-        let title = render_window_title(&tally(2, 0, 3, 0), 0, Some("feat/foo"), "mba22");
-        assert_eq!(title, "\u{25cf} 2B  feat/foo \u{00b7} mba22 \u{2014} flk");
+        let title = render_window_title(&tally(2, 0, 3, 0), 0, Some("feat/foo"), "hopper");
+        assert_eq!(title, "\u{25cf} 2B  feat/foo \u{00b7} hopper \u{2014} flk");
         assert!(title.starts_with('\u{25cf}'), "got {title:?}");
     }
 
@@ -230,10 +230,10 @@ mod tests {
         // W3C Badging's documented failure mode: a count that is always there
         // stops being a signal. Only attention states qualify, so a fleet that
         // is merely busy renders exactly like a calm one.
-        let busy = render_window_title(&tally(0, 0, 9, 4), 0, Some("main"), "mba22");
+        let busy = render_window_title(&tally(0, 0, 9, 4), 0, Some("main"), "hopper");
         assert_eq!(
             busy,
-            render_window_title(&tally(0, 0, 0, 0), 0, Some("main"), "mba22")
+            render_window_title(&tally(0, 0, 0, 0), 0, Some("main"), "hopper")
         );
         assert!(!busy.contains('\u{25cf}'), "got {busy:?}");
         assert!(!busy.contains('W'), "got {busy:?}");
@@ -242,12 +242,12 @@ mod tests {
     #[test]
     fn done_unseen_badges_after_blocked() {
         assert_eq!(
-            render_window_title(&tally(1, 1, 0, 0), 0, Some("main"), "anvil"),
-            "\u{25cf} 1B 1D  main \u{00b7} anvil \u{2014} flk"
+            render_window_title(&tally(1, 1, 0, 0), 0, Some("main"), "kiln"),
+            "\u{25cf} 1B 1D  main \u{00b7} kiln \u{2014} flk"
         );
         assert_eq!(
-            render_window_title(&tally(0, 2, 0, 0), 0, Some("main"), "anvil"),
-            "\u{25cf} 2D  main \u{00b7} anvil \u{2014} flk"
+            render_window_title(&tally(0, 2, 0, 0), 0, Some("main"), "kiln"),
+            "\u{25cf} 2D  main \u{00b7} kiln \u{2014} flk"
         );
     }
 
@@ -257,12 +257,12 @@ mod tests {
     #[test]
     fn unread_outcomes_badge_after_the_live_states() {
         assert_eq!(
-            render_window_title(&tally(1, 1, 0, 0), 3, Some("main"), "anvil"),
-            "\u{25cf} 1B 1D 3U  main \u{00b7} anvil \u{2014} flk"
+            render_window_title(&tally(1, 1, 0, 0), 3, Some("main"), "kiln"),
+            "\u{25cf} 1B 1D 3U  main \u{00b7} kiln \u{2014} flk"
         );
         assert_eq!(
-            render_window_title(&tally(0, 0, 4, 2), 1, Some("main"), "anvil"),
-            "\u{25cf} 1U  main \u{00b7} anvil \u{2014} flk",
+            render_window_title(&tally(0, 0, 4, 2), 1, Some("main"), "kiln"),
+            "\u{25cf} 1U  main \u{00b7} kiln \u{2014} flk",
             "an unread outcome badges on its own, with nothing live to lead it"
         );
     }
@@ -272,19 +272,19 @@ mod tests {
     #[test]
     fn no_unread_outcomes_adds_nothing_to_the_badge() {
         assert_eq!(
-            render_window_title(&tally(0, 0, 9, 4), 0, Some("main"), "mba22"),
-            "main \u{00b7} mba22 \u{2014} flk"
+            render_window_title(&tally(0, 0, 9, 4), 0, Some("main"), "hopper"),
+            "main \u{00b7} hopper \u{2014} flk"
         );
     }
 
     #[test]
     fn empty_flock_is_the_bare_identity_marker() {
         assert_eq!(
-            render_window_title(&tally(0, 0, 0, 0), 0, None, "mba22"),
+            render_window_title(&tally(0, 0, 0, 0), 0, None, "hopper"),
             "flk"
         );
         assert_eq!(
-            render_window_title(&tally(0, 0, 0, 0), 0, Some("  "), "mba22"),
+            render_window_title(&tally(0, 0, 0, 0), 0, Some("  "), "hopper"),
             "flk"
         );
     }
@@ -292,10 +292,10 @@ mod tests {
     #[test]
     fn long_targets_are_middle_truncated() {
         let branch = "feat/".to_string() + &"x".repeat(200);
-        let title = render_window_title(&tally(0, 0, 0, 0), 0, Some(&branch), "mba22");
+        let title = render_window_title(&tally(0, 0, 0, 0), 0, Some(&branch), "hopper");
         assert!(title.contains('\u{2026}'), "got {title:?}");
         assert!(
-            title.ends_with("\u{00b7} mba22 \u{2014} flk"),
+            title.ends_with("\u{00b7} hopper \u{2014} flk"),
             "got {title:?}"
         );
         assert!(title.chars().count() < 80, "got {title:?}");
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn control_bytes_in_a_branch_name_cannot_terminate_the_sequence() {
         // A workspace name is user data on its way into an OSC payload.
-        let title = render_window_title(&tally(0, 0, 0, 0), 0, Some("a\u{1b}]0;b\u{7}"), "mba22");
+        let title = render_window_title(&tally(0, 0, 0, 0), 0, Some("a\u{1b}]0;b\u{7}"), "hopper");
         assert!(!title.contains('\u{1b}'), "got {title:?}");
         assert!(!title.contains('\u{7}'), "got {title:?}");
     }

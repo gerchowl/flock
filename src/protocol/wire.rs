@@ -230,7 +230,7 @@ pub struct FleetPeer {
     #[serde(default)]
     pub proxy_jump: Option<String>,
     /// The peer's SELF-DECLARED fleet icon NAME (#164): a semantic name
-    /// (`"laptop"`) the receiver maps to a flat Nerd Font glyph, so a server's
+    /// (`"hopper"`) the receiver maps to a flat Nerd Font glyph, so a server's
     /// icon renders identically on every node. Only an ASCII name travels;
     /// unknown/absent → no icon. Additive with `#[serde(default)]`; positional
     /// bincode wire, so a deliberate `PROTOCOL_VERSION` bump ships with it.
@@ -1212,11 +1212,11 @@ mod tests {
 
     fn sample_fleet_snapshot() -> FleetSnapshot {
         FleetSnapshot {
-            origin: "mba22".to_owned(),
+            origin: "hopper".to_owned(),
             peers: vec![FleetPeer {
-                name: "anvil".to_owned(),
-                ssh_target: "lars@anvil".to_owned(),
-                host: Some("anvil".to_owned()),
+                name: "kiln".to_owned(),
+                ssh_target: "operator@kiln".to_owned(),
+                host: Some("kiln".to_owned()),
                 version: Some("0.9.0".to_owned()),
                 protocol: Some(21),
                 system: Some(FleetSystem {
@@ -1254,13 +1254,13 @@ mod tests {
                 age_secs: Some(5),
                 error: None,
                 origin_last_ok_secs: Some(5),
-                proxy_jump: Some("mba22".to_owned()),
+                proxy_jump: Some("hopper".to_owned()),
                 icon: Some("anvil".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
-                name: "mba22".to_owned(),
+                name: "hopper".to_owned(),
                 ssh_target: HOME_SWITCH_TARGET.to_owned(),
-                host: Some("mba22".to_owned()),
+                host: Some("hopper".to_owned()),
                 version: Some("0.9.0".to_owned()),
                 protocol: Some(21),
                 system: Some(FleetSystem {
@@ -1291,7 +1291,7 @@ mod tests {
                 error: None,
                 origin_last_ok_secs: Some(0),
                 proxy_jump: None,
-                icon: Some("laptop".to_owned()),
+                icon: Some("hopper".to_owned()),
             })),
         }
     }
@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn server_switch_server_with_fleet_snapshot_roundtrip() {
         let msg = ServerMessage::SwitchServer {
-            ssh_target: "lars@sage".to_owned(),
+            ssh_target: "operator@atlas".to_owned(),
             fleet: Some(sample_fleet_snapshot()),
             focus_workspace: Some("ws_3".to_owned()),
             proxy_jump: Some("hub".to_owned()),
@@ -1979,7 +1979,7 @@ mod tests {
             (
                 "SwitchServer",
                 ServerMessage::SwitchServer {
-                    ssh_target: "lars@sage".to_string(),
+                    ssh_target: "operator@atlas".to_string(),
                     // Carry a real snapshot so the golden also covers the
                     // nested FleetSnapshot / FleetPeer wire shape (#58).
                     fleet: Some(sample_fleet_snapshot()),
@@ -1990,7 +1990,7 @@ mod tests {
             (
                 "SetWindowTitle",
                 ServerMessage::SetWindowTitle {
-                    title: "\u{25cf} 1B  main \u{00b7} mba22 \u{2014} flk".to_string(),
+                    title: "\u{25cf} 1B  main \u{00b7} hopper \u{2014} flk".to_string(),
                 },
             ),
         ]
@@ -2071,8 +2071,8 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0x2d3af25d23eaadf5),
-            ("SetWindowTitle", 0x00dd463b8dd23476),
+            ("SwitchServer", 0xbaea5f0b8386b93e),
+            ("SetWindowTitle", 0x942464eba5877d51),
         ];
 
         if actual.as_slice() != GOLDEN {

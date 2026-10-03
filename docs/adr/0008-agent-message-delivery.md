@@ -6,7 +6,7 @@
   addressing where it assumes a server-local pane id is an address; builds on
   ADR-0005 (durable event log as the audit substrate) and #175 M1/M2.
 - Decision owner: operator; design from the cross-machine failure observed
-  sending mba22 → anvil-dev on 2026-08-03.
+  sending hopper → kiln-dev on 2026-08-03.
 
 ## Context
 

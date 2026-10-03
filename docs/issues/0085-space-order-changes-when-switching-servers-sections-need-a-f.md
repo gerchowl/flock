@@ -14,7 +14,7 @@ url: https://github.com/gerchowl/herdr/issues/85
 
 ## Bug (live dogfood)
 
-Switching servers reorders the spaces list: each server renders ITS OWN section order (its local storage order first, then folds), so sage's sidebar ≠ mba22's — disorienting on every leap.
+Switching servers reorders the spaces list: each server renders ITS OWN section order (its local storage order first, then folds), so atlas's sidebar ≠ hopper's — disorienting on every leap.
 
 ## Fix
 Sections sort by a fleet-stable key (project identity, e.g. owner/repo alphabetical; misc last) — identical on every server by construction. Manual/drag order is a VIEWER preference and belongs in the viewer profile (#79) once that lands (carried per-client, applied everywhere); until then the stable sort replaces per-server storage order for SECTIONS (members within a section keep local-first/server order per #62).

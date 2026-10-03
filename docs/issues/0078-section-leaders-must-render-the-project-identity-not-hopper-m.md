@@ -1,6 +1,6 @@
 ---
 number: 78
-title: "section leaders must render the project identity, not mba22:main; rects only on collapsed leaders"
+title: "section leaders must render the project identity, not hopper:main; rects only on collapsed leaders"
 kind: issue
 state: CLOSED
 author: gerchowl
@@ -10,16 +10,16 @@ closed: 2026-06-12T09:05:36Z
 url: https://github.com/gerchowl/herdr/issues/78
 ---
 
-# section leaders must render the project identity, not mba22:main; rects only on collapsed leaders
+# section leaders must render the project identity, not hopper:main; rects only on collapsed leaders
 
 ## Live regression vs #62 spec + one refinement (post-fd0dd50 dogfood, screenshot in chat)
 
-1. **Section leaders render member grammar instead of the project identity.** Spec (#62): space row = the gh-origin-shared identity (`owner/repo` per #27), members = `<server>:<target>`. Shipped: leaders read `mba22:main` / `mba22:dompt` — the PROJECT NAME is gone; two different repos both head as `mba22:main`, distinguishable only by children. Fix: the leader label = project identity (owner/repo when project_key resolves; the repo/dir display label as fallback) — NEVER server:branch. The leader stays the selectable main-checkout row (selection/close semantics unchanged); ahead/behind + PR glyph for the main checkout may stay on the leader line. Members keep `<server>:<target>`.
+1. **Section leaders render member grammar instead of the project identity.** Spec (#62): space row = the gh-origin-shared identity (`owner/repo` per #27), members = `<server>:<target>`. Shipped: leaders read `hopper:main` / `hopper:dompt` — the PROJECT NAME is gone; two different repos both head as `hopper:main`, distinguishable only by children. Fix: the leader label = project identity (owner/repo when project_key resolves; the repo/dir display label as fallback) — NEVER server:branch. The leader stays the selectable main-checkout row (selection/close semantics unchanged); ahead/behind + PR glyph for the main checkout may stay on the leader line. Members keep `<server>:<target>`.
 2. **Packed rects only where they inform**: on EXPANDED leaders the group-join `▮▮` duplicates the member icons right beneath — drop them there; keep on COLLAPSED leaders (members hidden → the aggregate is the only signal) and wherever a row summarizes hidden state. Hollow ▯ no-agents marker follows the same rule.
 
 ## Acceptance
 - Leader rows: `<icon> <owner/repo|label> [↑↓ main's git info] [#PR]` — no server:branch on leaders.
-- `mba22:main`-style labels appear ONLY on member rows.
+- `hopper:main`-style labels appear ONLY on member rows.
 - Rects: collapsed leaders yes, expanded leaders no; tests for both.
 
 ## References

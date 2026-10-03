@@ -2170,7 +2170,7 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         });
         peer.last_ok = Some(std::time::Instant::now());
@@ -2273,10 +2273,10 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers: vec![federated_peer(
-                "anvil",
-                "lars@anvil",
+                "kiln",
+                "operator@kiln",
                 vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
             )],
             origin_summary: None,
@@ -2305,14 +2305,14 @@ mod tests {
         let prepared = app
             .prepare_switch_server(app.state.request_peer_switch.clone().unwrap())
             .expect("snapshot row resolves");
-        assert_eq!(prepared.ssh_target, "lars@anvil");
+        assert_eq!(prepared.ssh_target, "operator@kiln");
         let fleet = prepared.fleet.expect("pass-through fleet rides the leap");
-        assert_eq!(fleet.origin, "mba22");
+        assert_eq!(fleet.origin, "hopper");
     }
 
     /// Issue #63 (the live bug): a CONFIG-peer remote row folded under a
     /// local project block (indented, sharing the project key) must emit
-    /// the same switch the servers band does — clicking `sage:main` under a
+    /// the same switch the servers band does — clicking `atlas:main` under a
     /// local `flock` checkout requests ConfigPeer carrying the target ws.
     #[tokio::test]
     async fn folded_config_peer_row_click_requests_switch() {
@@ -2324,8 +2324,8 @@ mod tests {
         // A config peer (live-polled, not a snapshot) whose workspace shares
         // the local project key, so its row folds INTO the local block.
         app.state.peer_summaries = vec![federated_peer(
-            "sage",
-            "lars@sage",
+            "atlas",
+            "operator@atlas",
             vec![remote_row("github.com/gerchowl/flock", "main")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 40));
@@ -2357,7 +2357,7 @@ mod tests {
         let prepared = app
             .prepare_switch_server(app.state.request_peer_switch.clone().unwrap())
             .expect("config-peer row resolves to a switch");
-        assert_eq!(prepared.ssh_target, "lars@sage");
+        assert_eq!(prepared.ssh_target, "operator@atlas");
     }
 
     #[tokio::test]
@@ -2369,8 +2369,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.peer_summaries = vec![federated_peer(
-            "anvil",
-            "lars@anvil",
+            "kiln",
+            "operator@kiln",
             vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
@@ -2391,7 +2391,7 @@ mod tests {
         assert_eq!(
             app.state.server_filter,
             Some(ServerFilter::Peer {
-                ssh_target: "lars@anvil".into()
+                ssh_target: "operator@kiln".into()
             })
         );
         let entries = crate::ui::workspace_list_entries(&app.state);
@@ -2465,8 +2465,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.peer_summaries = vec![federated_peer(
-            "anvil",
-            "lars@anvil",
+            "kiln",
+            "operator@kiln",
             vec![remote_row("github.com/gerchowl/flock", "fix/pty")],
         )];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 30));
@@ -2518,8 +2518,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".into(),
-            peers: vec![federated_peer("anvil", "lars@anvil", vec![])],
+            origin: "hopper".into(),
+            peers: vec![federated_peer("kiln", "operator@kiln", vec![])],
             origin_summary: None,
             received_at: std::time::Instant::now(),
         });

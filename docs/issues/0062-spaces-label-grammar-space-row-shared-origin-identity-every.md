@@ -22,11 +22,11 @@ url: https://github.com/gerchowl/herdr/issues/62
 The spaces list unifies to two levels:
 
 1. **Space row = the project identity itself** — the gh-origin-shared key (project_key, `owner/repo` label per #27), NOT a particular checkout. Status = the group join (packed rects) across ALL members everywhere.
-2. **Every member — local AND remote — renders uniformly as `<server>:<target>`** (`mba22:main`, `mba22:keyboard-shorcuts`, `sage:main`), status circle per member. This dissolves #56's asymmetry where local members render bare names + a separate branch line while remote rows render `host:target`: one label grammar for all concrete checkouts; the server qualifier is always present (the local server name included — "where is this checkout" is always answered).
+2. **Every member — local AND remote — renders uniformly as `<server>:<target>`** (`hopper:main`, `hopper:keyboard-shorcuts`, `atlas:main`), status circle per member. This dissolves #56's asymmetry where local members render bare names + a separate branch line while remote rows render `host:target`: one label grammar for all concrete checkouts; the server qualifier is always present (the local server name included — "where is this checkout" is always answered).
 
 ## Consequences / decisions
-- #56's "main checkout = primary row" recasts: the space row is the identity header; the local main checkout becomes a member row like any other (`mba22:main`). Selection: the space row focuses the local main checkout when present (preserves today's muscle memory), else the most recently active member; members select themselves.
-- The two-line workspace row (name + branch line) collapses for members: the branch IS the label (`mba22:keyboard-shorcuts` for worktrees, `mba22:main` for the main checkout). ahead/behind + PR glyph append to the member line. (Supersedes the branch-glyph polish for member rows; the space row keeps no branch — it's not a checkout.)
+- #56's "main checkout = primary row" recasts: the space row is the identity header; the local main checkout becomes a member row like any other (`hopper:main`). Selection: the space row focuses the local main checkout when present (preserves today's muscle memory), else the most recently active member; members select themselves.
+- The two-line workspace row (name + branch line) collapses for members: the branch IS the label (`hopper:keyboard-shorcuts` for worktrees, `hopper:main` for the main checkout). ahead/behind + PR glyph append to the member line. (Supersedes the branch-glyph polish for member rows; the space row keeps no branch — it's not a checkout.)
 - Member tab-strip (#56) labels follow the same grammar minus the local server prefix (strip is local-session scoped): `<ID> <branch/name>`.
 - misc (non-git) workspaces: label stays `<server>:<workspace-name>`.
 - Ordering within a space: local members first (main, then worktrees), then remote by server.
@@ -78,7 +78,7 @@ Each agent entry becomes ONE row:
 `<status-symbol> <agent> <server> <proj> <workspace|branch>`
 
 - The status TEXT ('idle', 'working', …) is removed — the symbol (✓/spinner/escalation, same set as everywhere after this issue) carries the state.
-- Location grammar matches the spaces list: server-qualified, project, then workspace/branch — e.g. `✓ cc mba22 herdr keyboard-shorcuts`.
+- Location grammar matches the spaces list: server-qualified, project, then workspace/branch — e.g. `✓ cc hopper herdr keyboard-shorcuts`.
 - The two-line agent entry (name line + '<agent> · <status>' line) retires; live-activity text and custom-status/header-field chips drop from the panel per this spec (they remain in the pane header, navigator, and member rows).
 - Width pressure: truncate location right-to-left (branch first, then proj), middle-truncate per existing conventions.
 
@@ -93,7 +93,7 @@ This makes the whole sidebar one visual grammar: icon + identity + location, sin
 
 ### gerchowl — 2026-06-11T20:00:12Z
 
-## Addition (user, via the sage gap): REMOTE agents in the agents panel
+## Addition (user, via the atlas gap): REMOTE agents in the agents panel
 
 The agents panel is local-only on every machine — the hub never showed peer agents either. Under this issue's single-row grammar the remote case is free: peer/origin summaries already carry per-workspace agent + status, exactly the fields of `<status-symbol> <agent> <server> <proj> <workspace|branch>`. Render remote agent rows from the same summaries that feed the spaces folding (config peers on the hub, carried snapshot + origin summary on spokes — see the origin-gossip issue), scope-respecting (all/current), selecting one = the same switch the workspace row would do.
 

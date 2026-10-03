@@ -14,12 +14,12 @@ url: https://github.com/gerchowl/herdr/issues/109
 
 ## Feature (user): xterm.js endpoint served over tailscale -> attach the phone to the fleet
 
-Get a phone (browser) into the same herdr fleet via a web terminal, served over the tailnet (the 9ern/`tailscale serve` infra already exists on sage).
+Get a phone (browser) into the same herdr fleet via a web terminal, served over the tailnet (the 9ern/`tailscale serve` infra already exists on atlas).
 
 ## Shape
 - **herdr web-serve mode**: a small server that bridges a browser websocket <-> a herdr CLIENT (or directly to the session server), rendering into xterm.js. Reuses herdr's existing client (semantic frames -> the client paints) OR a raw-PTY bridge to xterm.js. The mobile single-column layout already exists for narrow widths -> the phone gets the mobile UI.
 - **Transport**: `tailscale serve` / `funnel` fronts the websocket endpoint (HTTPS, tailnet-auth) like 9ern does -- no public exposure, fleet-auth via tailscale identity.
-- **Attach target**: the phone endpoint attaches to the local server on whichever host runs it (sage, always-on) and -- via federation -- can switch to any fleet server (the spoke gossip, once #102/slots settle).
+- **Attach target**: the phone endpoint attaches to the local server on whichever host runs it (atlas, always-on) and -- via federation -- can switch to any fleet server (the spoke gossip, once #102/slots settle).
 
 ## Open questions (spike-worthy)
 - xterm.js consuming herdr SEMANTIC frames vs raw PTY: the semantic-frame client paints locally (mosh-like, #responsiveness); a browser can't run libghostty-vt, so the web bridge likely streams a RENDERED cell grid (server-side render -> xterm.js writes ANSI), accepting the heavier-bytes tradeoff for the phone case. Decide.

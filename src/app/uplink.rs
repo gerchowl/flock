@@ -157,7 +157,7 @@ pub(crate) struct Uplink {
 /// The relay's methods arrive over the local socket, which any same-user
 /// process can reach. Binding them to ONE process — the relay the hub's ssh
 /// session started, identified by its socket peer pid — means a stray process
-/// cannot take a spoke's pending messages, forge the hub's answer to them, or
+/// cannot take a spoke's pending messages, kiln the hub's answer to them, or
 /// plant fleet rows, unless it first displaces a relay that is still alive.
 #[derive(Debug, Clone)]
 struct AttachedRelay {
@@ -498,10 +498,10 @@ mod tests {
         assert!(!uplink.is_relay(Some(200), alive));
         assert!(!uplink.is_relay(None, alive), "an unreadable pid is nobody");
 
-        assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
+        assert_eq!(uplink.record_hub("hopper").as_deref(), Some("hopper"));
         assert_eq!(
             uplink.record_hub("attacker").as_deref(),
-            Some("mba22"),
+            Some("hopper"),
             "a later frame cannot rename the hub"
         );
 
@@ -510,7 +510,7 @@ mod tests {
         let dead = |_: u32| None;
         assert!(uplink.attach_relay(300, 11, dead).is_ok());
         assert!(uplink.is_relay(Some(300), |pid| (pid == 300).then_some(11)));
-        assert_eq!(uplink.record_hub("mba22").as_deref(), Some("mba22"));
+        assert_eq!(uplink.record_hub("hopper").as_deref(), Some("hopper"));
     }
 
     #[test]

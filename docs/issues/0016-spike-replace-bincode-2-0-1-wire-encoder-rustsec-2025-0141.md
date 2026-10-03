@@ -22,7 +22,7 @@ url: https://github.com/gerchowl/herdr/issues/16
 
 Herdr should be off bincode 2.0.1 within the next few releases. This issue spikes the *which-replacement* decision and the *how-to-migrate* path so the actual implementation PR can be uncontroversial.
 
-The decision is sharpened by proposal #0002 (C′ symmetric peer federation): once federation lands, four machines (mba22, anvil, sage, ksb-meatgrinder) will run independently-versioned herdr servers gossiping with each other. **Wire-format stability across encoder versions stops being a nice-to-have and becomes a hard requirement.** Any candidate whose wire format drifts between encoder releases is disqualified.
+The decision is sharpened by proposal #0002 (C′ symmetric peer federation): once federation lands, four machines (hopper, kiln, atlas, node-b-meatgrinder) will run independently-versioned herdr servers gossiping with each other. **Wire-format stability across encoder versions stops being a nice-to-have and becomes a hard requirement.** Any candidate whose wire format drifts between encoder releases is disqualified.
 
 ## Decision / proposed approach
 

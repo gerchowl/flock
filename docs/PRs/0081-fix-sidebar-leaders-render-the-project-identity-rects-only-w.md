@@ -18,7 +18,7 @@ url: https://github.com/gerchowl/herdr/pull/81
 Fixes #78 — a live-dogfood regression against the #62 spec, found minutes after the #74 sidebar restyle deployed.
 
 ## What was mislabeled where
-Section-leader rows rendered the **member** grammar (`mba22:main`), erasing the project name — two different repos both headed as `mba22:main`, distinguishable only by their children. The leader is the selectable main-checkout row, so it took the same `local_member_label` every member did.
+Section-leader rows rendered the **member** grammar (`hopper:main`), erasing the project name — two different repos both headed as `hopper:main`, distinguishable only by their children. The leader is the selectable main-checkout row, so it took the same `local_member_label` every member did.
 
 ## Fix 1 — leader label = project identity, never `server:branch`
 - New `grammar::leader_label`: `owner/repo` from the project key (#27's `project_identity_label`), falling back to the workspace **display label** when the git identity hasn't resolved. Never `<server>:<branch>`.

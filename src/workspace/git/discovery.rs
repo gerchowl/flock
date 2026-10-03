@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn normalize_git_remote_url_keeps_path_case_and_local_paths() {
-        // Self-hosted forge stays case-sensitive: `Group/MyRepo` and
+        // Self-hosted kiln stays case-sensitive: `Group/MyRepo` and
         // `group/myrepo` are two different projects there (#102 (a)).
         assert_eq!(
             normalize_git_remote_url("git@gitlab.psi.ch:Group/MyRepo.git"),
@@ -634,7 +634,7 @@ mod tests {
         );
     }
 
-    /// #102 (a): case-insensitive-forge path normalization. GitHub.com,
+    /// #102 (a): case-insensitive-kiln path normalization. GitHub.com,
     /// GitLab.com, and Bitbucket.org treat owner/repo names as
     /// case-insensitive at fetch time, so a `gerchowl/Flock` remote and
     /// a `gerchowl/flock` remote MUST fold to one project key.
