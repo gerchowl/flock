@@ -875,6 +875,9 @@ mod tests {
         // Never sent and never dropped: the probe answers nothing, forever.
         let _unanswered = core.arm_probe();
 
+        // Nothing has ever been dated, so every tick below is due whatever the
+        // TTL says — these offsets mean "later than the last one" and nothing
+        // else, and a retune of `SESSION_HEALTH_MAX_AGE` cannot move them.
         core.refresh_if_due(base + Duration::from_secs(60));
         assert_eq!(core.probes_launched(), 1, "the first due tick probes");
 
@@ -896,10 +899,19 @@ mod tests {
     /// The guard is against overlap, not against ever probing again: a probe
     /// that reports frees the slot, and the next due tick replaces it once.
     ///
-    /// The tick that collects a reading dates it at itself, so that tick is no
-    /// longer due — collect and relaunch are never the same tick, and a test
-    /// that assumed they were would be asserting about the TTL as much as about
-    /// the guard.
+    /// The steps are derived from [`SESSION_HEALTH_MAX_AGE`] rather than written
+    /// as literals, so retuning the TTL cannot move a step in a test about the
+    /// guard (#523) — the class where a test silently starts measuring a
+    /// different constant than it names.
+    ///
+    /// The middle assertion is the one honest dependency, and it is *not* about
+    /// the guard: the tick that takes a reading dates it at itself, so that tick
+    /// is not due again until a TTL later. Change how a collected reading is
+    /// dated and this line is what notices, which is worth knowing but is not
+    /// what the test is for — so it says so where it fails. It cannot simply be
+    /// dropped: the count is the only witness for "not replaced", so every tick
+    /// in a multi-tick launch count is observed, and the alternative to
+    /// depending on the dating is not a narrower test but a blind one.
     #[test]
     fn a_reported_probe_is_replaced_by_exactly_one_new_probe() {
         let base = Instant::now();
@@ -912,21 +924,23 @@ mod tests {
         first
             .send(SessionHealth::Healthy)
             .expect("the armed probe's receiver");
-        core.refresh_if_due(base + Duration::from_secs(65));
+        let collecting_tick = base + Duration::from_secs(60) + SESSION_HEALTH_MAX_AGE;
+        core.refresh_if_due(collecting_tick);
         assert_eq!(
             core.probes_launched(),
             1,
-            "the tick that collects a reading is not also the tick that re-probes"
+            "the tick that takes a reading dates it at itself and is not due \
+             again until a TTL later — a fact about dating, not about the guard"
         );
 
         let _replacement = core.arm_probe();
-        core.refresh_if_due(base + Duration::from_secs(70));
+        core.refresh_if_due(collecting_tick + SESSION_HEALTH_MAX_AGE);
         assert_eq!(
             core.probes_launched(),
             2,
             "a collected probe frees the slot for the next one"
         );
-        core.refresh_if_due(base + Duration::from_secs(75));
+        core.refresh_if_due(collecting_tick + SESSION_HEALTH_MAX_AGE + Duration::from_secs(1));
         assert_eq!(
             core.probes_launched(),
             2,
@@ -961,9 +975,11 @@ mod tests {
         );
 
         // A fresh stand-in, so the retry asserted here is the one the tick would
-        // make in production — with no thread to schedule.
+        // make in production — with no thread to schedule. An unanswered probe
+        // never dates anything, so this tick is due for the same reason the
+        // first one was, and its offset carries no TTL meaning either.
         let _replacement = core.arm_probe();
-        core.refresh_if_due(base + Duration::from_secs(65));
+        core.refresh_if_due(base + Duration::from_secs(61));
         assert_eq!(
             core.probes_launched(),
             2,
