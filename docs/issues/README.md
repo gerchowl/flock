@@ -1,4 +1,4 @@
-# issue archive (gerchowl/herdr) — 72 items
+# issue archive (gerchowl/flock) — 72 items
 
 - [#16](0016-spike-replace-bincode-2-0-1-wire-encoder-rustsec-2025-0141.md) `OPEN` — Spike: replace bincode 2.0.1 wire encoder (RUSTSEC-2025-0141)
 - [#25](0025-spike-workspace-as-unit-creation-floating-throwaway-pane-de.md) `CLOSED` — spike: workspace-as-unit creation + floating throwaway pane; de-emphasize tabs
