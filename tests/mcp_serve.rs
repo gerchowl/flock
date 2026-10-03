@@ -42,9 +42,25 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/mcp-{}-{nanos}", std::process::id()))
 }
 
+/// Serialises this binary's server-spawning tests: at most one flock server at
+/// a time *within this process*.
+///
+/// The `OnceLock` below is function-local, so it is per-crate-per-binary. It
+/// does NOT coordinate with the identical `test_lock()` in api_ping.rs,
+/// client_mode.rs, cross_area.rs and the rest: nextest runs each integration
+/// binary as its own process, concurrently. "One flock server per test at a
+/// time" therefore holds per binary, not across binaries — do not read this as
+/// a global lock, and do not assume a sibling binary's server is idle.
+///
+/// What actually keeps concurrent binaries off each other's paths is naming:
+/// each test roots its config home, runtime dir and socket inside its own
+/// `unique_test_dir()` (a per-binary prefix plus this process's pid and a
+/// unique suffix), and the spawn helpers pass explicit `XDG_CONFIG_HOME`,
+/// `XDG_RUNTIME_DIR` and `FLOCK_SOCKET_PATH`. No two tests, in this binary or
+/// any other, share a socket, config or runtime dir. Cross-binary CPU
+/// contention is nextest's to schedule — see the `serial-pty` group and the
+/// retries in `.config/nextest.toml`.
 fn test_lock() -> MutexGuard<'static, ()> {
-    // Shared with api_ping.rs's harness lock so parallel test binaries don't
-    // race on the shared /tmp namespace — one flock server per test at a time.
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
