@@ -6,7 +6,7 @@ mod support;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,16 +112,37 @@ fn spawn_server(
     }
 }
 
-fn ping_socket(socket_path: &PathBuf) -> String {
-    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+/// Ask the API socket for a pong, or `None` if it did not answer in time.
+///
+/// Fallible on purpose. This runs inside `wait_until` predicates that read as
+/// "has the server come back yet?", and a `connect().expect()` / `read_line()
+/// .unwrap()` in that position turns any transient failure — `EMFILE` from a
+/// loaded process table, `ECONNREFUSED` mid-restart, EOF from a dropped
+/// connection — into a panicked test instead of an answer of "not yet" (#444).
+/// The read timeout is what gives `wait_until`'s budget teeth: without one,
+/// `read_line` blocks indefinitely and the enclosing deadline is decorative.
+fn ping_socket(socket_path: &Path) -> Option<String> {
+    /// One second, and deliberately *under* the two seconds
+    /// `wait_until(Duration::from_secs(2), ..)` gives these predicates. The
+    /// timeout exists so that budget is a budget; a probe that can outlast it
+    /// makes the deadline decorative again, which is the defect this function
+    /// was made fallible to fix (#444).
+    const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
-    let request = r#"{"id":"1","method":"ping","params":{}}"#;
-    writeln!(stream, "{}", request).unwrap();
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    stream.set_read_timeout(Some(PING_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(PING_TIMEOUT)).ok()?;
+    writeln!(stream, r#"{{"id":"1","method":"ping","params":{{}}}}"#).ok()?;
+    stream.flush().ok()?;
 
-    let mut reader = BufReader::new(stream);
     let mut response = String::new();
-    reader.read_line(&mut response).unwrap();
-    response.trim().to_string()
+    BufReader::new(stream).read_line(&mut response).ok()?;
+    Some(response.trim().to_string())
+}
+
+/// [`ping_socket`] reduced to the question the wait loops actually ask.
+fn server_responds_to_ping(socket_path: &Path) -> bool {
+    ping_socket(socket_path).is_some_and(|response| response.contains("pong"))
 }
 
 fn send_json_request(socket_path: &PathBuf, request: &str) -> Value {
@@ -293,13 +314,13 @@ fn navigate_q_detaches_client_and_server_persists() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should still respond to ping after client detach"
     );
 
     // Verify server is still alive and responsive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should still respond to ping after client detach: {response}"
@@ -350,13 +371,13 @@ fn explicit_detach_message_causes_clean_disconnect() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist after client Detach message"
     );
 
     // Verify server is still alive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should persist after client Detach message: {response}"
@@ -421,13 +442,13 @@ fn reattach_after_detach_shows_current_state() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist after detach"
     );
 
     // Verify server is still alive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should persist after detach: {response}"
@@ -507,7 +528,7 @@ fn processes_survive_during_and_after_detach() {
     wait_for_file(&client_socket, Duration::from_secs(10));
 
     // Verify server starts with a workspace (session restore or fresh state).
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should respond to ping: {response}"
@@ -535,13 +556,13 @@ fn processes_survive_during_and_after_detach() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist after detach"
     );
 
     // Verify server is still alive after detach.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should persist after detach: {response}"
@@ -616,13 +637,13 @@ fn server_persists_after_client_connection_drop() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist after client connection drop"
     );
 
     // Verify server is still alive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should persist after client connection drop: {response}"
@@ -676,7 +697,7 @@ fn detached_output_preserves_last_attached_pty_size() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist after detach"
     );
@@ -731,13 +752,13 @@ fn output_accumulated_while_detached_visible_on_reattach() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should persist"
     );
 
     // Verify server alive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should persist: {response}"

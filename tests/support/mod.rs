@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
@@ -373,38 +373,277 @@ pub fn client_handshake_with_fleet_and_theme(
     stream.write_all(&framed).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 2 * 1024 * 1024 {
-        return Err(format!("oversized response: {len}"));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    let grace = completion_grace_for(stream);
+    let payload = read_framed_payload(stream, grace).map_err(|e| e.to_string())?;
     decode_welcome(&payload)
 }
 
-pub fn read_server_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), String> {
-    let mut len_buf = [0u8; 4];
+/// How long a frame that has already *started* arriving is given to finish.
+///
+/// The server writes each message with a single `write_all`, so a frame either
+/// arrives whole or the peer is gone; this exists only so a peer that sends a
+/// prefix and then neither data nor EOF cannot hang a test. Five seconds is
+/// far longer than a socket buffer needs to hand over a frame that is already
+/// written, and it sits below every wait budget in this suite. It is *not* a
+/// substitute for those budgets: a reader is given a grace derived from the
+/// caller's own poll slice (see [`completion_grace_for`]) and capped here.
+const FRAME_COMPLETION_CAP: Duration = Duration::from_secs(5);
+
+/// How many poll slices a started frame gets to finish over and above the one
+/// that read its prefix.
+const FRAME_COMPLETION_SLICES: u32 = 8;
+
+/// The least patience a started frame gets, whatever slice the caller polls on.
+///
+/// The slice answers "how often do I check", not "how long do I wait", so
+/// multiplying it alone would let a reader polling every 50 ms declare a frame
+/// lost after 400 ms — which is how the first version of this went flaky
+/// against its own regression test. Two seconds is the floor because that is
+/// roughly what a socket needs to hand over a frame the peer has already
+/// written, and it is still well inside every wait budget in this suite.
+const FRAME_COMPLETION_FLOOR: Duration = Duration::from_secs(2);
+
+/// The grace to give a frame that has started arriving on `stream`.
+///
+/// Derived from the caller's own poll slice so a reader cannot quietly outlast
+/// the deadline it sits inside, then clamped: a 200 ms `drain_messages` and a
+/// 10 s `read_next_frame_payload` both stay bounded, and neither can talk a
+/// reader into abandoning a frame that was merely slow. The cap also covers the
+/// blocking handshake reads, which set no read timeout at all and would
+/// otherwise get an unbounded grace.
+pub fn completion_grace_for(stream: &UnixStream) -> Duration {
+    let slice = stream
+        .read_timeout()
+        .ok()
+        .flatten()
+        .unwrap_or(DEFAULT_READ_SLICE);
+    (slice * FRAME_COMPLETION_SLICES).clamp(FRAME_COMPLETION_FLOOR, FRAME_COMPLETION_CAP)
+}
+
+/// Read one length-prefixed message off `stream`, keeping whatever has already
+/// arrived instead of throwing it away.
+///
+/// ## Why this is not `read_exact` twice
+///
+/// The wire is length-prefixed, so the reader has to know where a message
+/// ends. `read_exact` cannot be interrupted without losing that knowledge: if
+/// it times out having consumed part of a payload, those bytes are gone, and
+/// the next call reads payload bytes as if they were the next length prefix.
+/// Every frame after that is garbage, and no amount of further waiting
+/// recovers — the message the test was looking for is unreachable for the rest
+/// of the run.
+///
+/// That is not hypothetical. A pane frame is tens of kilobytes, and these
+/// readers poll on short slices (75–400 ms) so they can notice a peer going
+/// away. Under parallel load a slice is not a guarantee, and
+/// `client_mode::resume_reasserts_geometry_so_panes_render_at_new_width` and
+/// `multi_client::multi_client_broadcasts_frame_updates_to_all_clients` both
+/// desynchronized this way and then waited out their full budget against a
+/// dead stream (#444).
+///
+/// ## The policy, and what it promises
+///
+/// * **Before** any byte of the frame has arrived, a timeout is an ordinary
+///   "nothing yet": the caller may retry, because framing is intact. This is
+///   the only retryable outcome, and it is the only one with a timeout *kind*.
+/// * **After** the prefix, the frame is finished or the stream is reported
+///   lost. When `completion_grace` runs out the error is `InvalidData`, not a
+///   timeout — a caller that polls on timeout would otherwise retry against a
+///   half-consumed frame and desynchronize, which is the very thing this
+///   function exists to prevent. Losing the stream loudly beats losing it
+///   quietly.
+///
+/// The socket's read timeout, which the caller owns and sets as it always
+/// has, still governs the first byte.
+///
+/// Note that a read timeout surfaces as `TimedOut` on Linux but as
+/// `WouldBlock` on macOS, so both kinds are treated as "not yet" here; a
+/// caller that genuinely cannot wait asks for
+/// [`read_framed_io_nonblocking`], which is a different question rather than
+/// a guess about which platform it is on.
+pub fn read_framed_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), String> {
+    read_framed_io(stream, completion_grace_for(stream)).map_err(|e| e.to_string())
+}
+
+/// [`read_framed_message`] for a socket the caller has put in nonblocking mode
+/// to poll it, which therefore cannot be made to wait out a frame it has
+/// already started. Only `wait_for_disconnect` needs this.
+pub fn read_framed_message_nonblocking(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), String> {
+    read_framed_io_nonblocking(stream).map_err(|e| e.to_string())
+}
+
+/// [`read_framed_message`] after setting the socket's read timeout, for callers
+/// that would rather name the slice than set it themselves.
+pub fn read_framed_message_within(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<(u32, Vec<u8>), String> {
     stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| format!("read length prefix: {e}"))?;
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    read_framed_message(stream)
+}
+
+/// The slice a reader waits for a message's *first* byte. Short, so a wait
+/// loop notices a peer that has gone away; long enough not to be a busy poll.
+pub const DEFAULT_READ_SLICE: Duration = Duration::from_millis(200);
+
+/// [`read_framed_message`] under the name the wait loops already use, with the
+/// read timeout left exactly as the caller set it.
+pub fn read_server_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), String> {
+    read_framed_message(stream)
+}
+
+/// Read one frame's raw payload, variant prefix included.
+///
+/// What the handshake decoders want: they parse the variant themselves out of
+/// the front of the buffer. Sharing the framing with [`read_framed_io`] is the
+/// point — these readers used to be private `read_exact` copies, which is how
+/// the same defect ended up in five places.
+pub fn read_framed_payload(
+    stream: &mut UnixStream,
+    completion_grace: Duration,
+) -> io::Result<Vec<u8>> {
+    let payload = read_frame(stream, completion_grace)?;
+    if payload.len() < 2 {
+        // A payload too short to even hold a varint variant.
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("payload too short for a variant: {} bytes", payload.len()),
+        ));
+    }
+    Ok(payload)
+}
+
+/// [`read_framed_message`], keeping the `io::ErrorKind` intact so a caller that
+/// tells "nothing yet" apart from "the stream is gone" — `multi_client.rs`
+/// and `cross_area.rs` do, through their `is_timeout` — still can.
+pub fn read_framed_io(
+    stream: &mut UnixStream,
+    completion_grace: Duration,
+) -> io::Result<(u32, Vec<u8>)> {
+    let payload = read_frame(stream, completion_grace)?;
+    let (variant, consumed) =
+        decode_varint_u32(&payload, 0).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    Ok((variant, payload[consumed..].to_vec()))
+}
+
+/// [`read_framed_io`] for a socket the caller is polling in nonblocking mode.
+pub fn read_framed_io_nonblocking(stream: &mut UnixStream) -> io::Result<(u32, Vec<u8>)> {
+    let payload = read_frame(stream, Duration::ZERO)?;
+    let (variant, consumed) =
+        decode_varint_u32(&payload, 0).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    Ok((variant, payload[consumed..].to_vec()))
+}
+
+/// The one place a frame is read off a socket. Everything above is a policy
+/// choice about how long to wait; the framing lives here exactly once.
+fn read_frame(stream: &mut UnixStream, completion_grace: Duration) -> io::Result<Vec<u8>> {
+    // A zero grace means "a frame that has started cannot be waited for",
+    // which is what a nonblocking poller needs.
+    let wait_out_partial = !completion_grace.is_zero();
+    let can_wait = |filled: usize| wait_out_partial && filled > 0;
+
+    // The prefix is four bytes and nothing has been consumed yet, so a timeout
+    // here is safe to report as "nothing yet" — but a timeout *partway* through
+    // it has already eaten bytes, so those are retained and the wait continues.
+    let mut len_buf = [0u8; 4];
+    let mut prefix_filled = 0;
+    let grace_deadline = Instant::now() + completion_grace;
+    while prefix_filled < len_buf.len() {
+        match stream.read(&mut len_buf[prefix_filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed before a length prefix",
+                ))
+            }
+            Ok(n) => prefix_filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if is_read_timeout(&e) => {
+                if can_wait(prefix_filled) && Instant::now() < grace_deadline {
+                    continue;
+                }
+                // Nothing consumed: the only retryable outcome, so it keeps the
+                // timeout kind and every existing wait loop still works.
+                if prefix_filled == 0 {
+                    return Err(prefix_error(&e));
+                }
+                return Err(abandoned("length prefix", prefix_filled, len_buf.len()));
+            }
+            Err(e) => return Err(prefix_error(&e)),
+        }
+    }
+
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 2 * 1024 * 1024 {
-        return Err(format!("oversized frame: {len} bytes"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("oversized frame: {len} bytes"),
+        ));
     }
     if len == 0 {
-        return Err("zero-length frame".into());
+        return Err(io::Error::new(ErrorKind::InvalidData, "zero-length frame"));
     }
 
     let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .map_err(|e| format!("read payload: {e}"))?;
+    let mut filled = 0;
+    while filled < payload.len() {
+        match stream.read(&mut payload[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "peer closed with {filled} of {} payload bytes",
+                        payload.len()
+                    ),
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if is_read_timeout(&e) => {
+                if wait_out_partial && Instant::now() < grace_deadline {
+                    continue;
+                }
+                // Never a timeout kind once bytes are in hand: a caller that
+                // polls on timeout would retry against a half-read frame and
+                // resynchronize, which is the failure this reader removes.
+                return Err(abandoned("payload", filled, payload.len()));
+            }
+            Err(e) => return Err(payload_error(&e)),
+        }
+    }
 
-    let (variant, consumed) = decode_varint_u32(&payload, 0)?;
-    Ok((variant, payload[consumed..].to_vec()))
+    Ok(payload)
+}
+
+/// A frame abandoned partway through. `InvalidData`, never a timeout: see
+/// [`read_frame`]. The byte counts are in the message because "the reader gave
+/// up" without them is indistinguishable from "the peer sent a short frame".
+fn abandoned(what: &str, filled: usize, total: usize) -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "frame abandoned after {filled} of {total} {what} bytes within the completion grace"
+        ),
+    )
+}
+
+/// Keep the *kind* a timeout arrived with — `TimedOut` on Linux, `WouldBlock`
+/// on macOS — because that is what the wait loops poll on.
+fn prefix_error(err: &io::Error) -> io::Error {
+    io::Error::new(err.kind(), format!("read length prefix: {err}"))
+}
+
+fn payload_error(err: &io::Error) -> io::Error {
+    io::Error::new(err.kind(), format!("read payload: {err}"))
+}
+
+/// A socket read that ran out of time. Linux says `TimedOut`, macOS says
+/// `WouldBlock`; `tests/multi_client.rs::is_timeout` already matches both, and
+/// this is that same rule with a name.
+fn is_read_timeout(err: &io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
 }
 
 pub fn send_input(stream: &mut UnixStream, data: &[u8]) -> Result<(), String> {
@@ -470,9 +709,7 @@ pub fn send_set_frame_subscription(stream: &mut UnixStream, enabled: bool) -> Re
 }
 
 pub fn drain_messages(stream: &mut UnixStream) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
+    stream.set_read_timeout(Some(DEFAULT_READ_SLICE)).unwrap();
     while read_server_message(stream).is_ok() {}
     stream.set_read_timeout(None).unwrap();
 }
@@ -497,7 +734,7 @@ pub fn wait_for_message_variant(
     variant: u32,
 ) -> Result<bool, String> {
     stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(DEFAULT_READ_SLICE))
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -510,12 +747,63 @@ pub fn wait_for_message_variant(
     Ok(false)
 }
 
+/// `ServerMessage::Notify` = variant 5.
+pub const VARIANT_NOTIFY: u32 = 5;
+
+/// Wait for a `ServerMessage::Notify` whose `message` is `expected`.
+///
+/// Narrower than [`wait_for_message_variant`] on purpose, and not just for
+/// tidiness. Every state change on an agent pane raises a Notify, so matching
+/// on the variant alone cannot tell the notification a test is about from the
+/// ones it caused on the way there — `client_receives_notify_on_agent_state_change`
+/// reports Blocked, then Working, then Idle, and all three can notify. Matching
+/// the message is what makes the assertion mean what it says.
+///
+/// The `message` is the sound label the server sends (`"agent done"`,
+/// `"Request"`, …); `src/client/mod.rs` maps it back to a `sound::Sound`, so it
+/// is a real part of the wire rather than a display string.
+pub fn wait_for_notify_message(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    expected: &str,
+) -> Result<bool, String> {
+    stream
+        .set_read_timeout(Some(DEFAULT_READ_SLICE))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match read_server_message(stream) {
+            Ok((VARIANT_NOTIFY, payload)) => {
+                if notify_message(&payload).as_deref() == Some(expected) {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    Ok(false)
+}
+
+/// The `message` field of a `Notify` payload: `kind`, then the string.
+///
+/// Hand-decoded for the same reason [`decode_welcome`] is — it is the same
+/// varint wire, and a partial decode here only means "not the one we want".
+fn notify_message(payload: &[u8]) -> Option<String> {
+    let (_, kind_len) = decode_varint_u32(payload, 0).ok()?; // NotifyKind
+    let (len, len_bytes) = decode_varint_u32(payload, kind_len).ok()?;
+    let start = kind_len + len_bytes;
+    let end = start.checked_add(len as usize)?;
+    let text = payload.get(start..end)?;
+    std::str::from_utf8(text).ok().map(str::to_string)
+}
+
 pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result<bool, String> {
     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     let mut idle_since = None;
     let result = loop {
-        match read_server_message(stream) {
+        match read_framed_message_nonblocking(stream) {
             Ok(_) => idle_since = None,
             Err(err)
                 if err.to_ascii_lowercase().contains("would block")

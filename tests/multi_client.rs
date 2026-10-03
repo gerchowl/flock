@@ -4,7 +4,7 @@ mod support;
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -473,25 +473,17 @@ fn is_timeout(err: &io::Error) -> bool {
     )
 }
 
+/// Both readers below used to be private copies of the framed read, and both
+/// copies had the defect `support::read_framed_message` documents: a read
+/// timeout partway through a payload discarded the bytes already consumed and
+/// the next call read payload bytes as a length prefix, after which no frame
+/// could ever be found again. `multi_client_broadcasts_frame_updates_to_all_clients`
+/// polls on an 80 ms slice, so under load that is where it lost the stream and
+/// then waited out its full budget (#444). One implementation, in `support`.
 fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result<u32> {
     stream.set_read_timeout(Some(timeout))?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zero-length payload",
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let (variant, _consumed) = decode_varint_u32(&payload, 0)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(variant)
+    let grace = support::completion_grace_for(stream);
+    support::read_framed_io(stream, grace).map(|(variant, _payload)| variant)
 }
 
 fn client_handshake(
@@ -527,11 +519,12 @@ fn client_handshake(
     stream.flush().map_err(|e| e.to_string())?;
 
     // Read ServerMessage::Welcome = variant 0
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    // Framed by `support`'s one reader rather than a private `read_exact`
+    // pair: these copies are how the same partial-read defect ended up in five
+    // places, and the Welcome frame is not special — it is the same
+    // length-prefixed wire (#444).
+    let grace = support::completion_grace_for(stream);
+    let payload = support::read_framed_payload(stream, grace).map_err(|e| e.to_string())?;
 
     let mut offset = 0;
     let (variant, consumed) = decode_varint_u32(&payload, offset)?;
@@ -646,24 +639,8 @@ fn read_server_message_payload(
     timeout: Duration,
 ) -> io::Result<(u32, Vec<u8>)> {
     stream.set_read_timeout(Some(timeout))?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zero-length payload",
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let (variant, consumed) = decode_varint_u32(&payload, 0)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    Ok((variant, payload[consumed..].to_vec()))
+    let grace = support::completion_grace_for(stream);
+    support::read_framed_io(stream, grace)
 }
 
 fn drain_server_messages(stream: &mut UnixStream, max_drain: Duration) {
@@ -1065,4 +1042,112 @@ fn multi_client_rapid_connect_disconnect_stress_10_cycles() {
     );
 
     cleanup_spawned_flock(server, base);
+}
+
+/// The framed reader must survive a message that arrives in pieces, because
+/// that is what a large frame under load looks like to a polling test.
+///
+/// This is the regression test for the desynchronization
+/// `multi_client_broadcasts_frame_updates_to_all_clients` hit (#444), and it
+/// is here rather than in `support` because it is a property of the reader as
+/// *these* wait loops call it: a slice far shorter than the gap between the
+/// writer's two writes. The old `read_exact`-twice reader consumed the
+/// four-byte prefix, timed out on the payload, dropped what it had read, and
+/// then interpreted the middle of the payload as the next length prefix — so
+/// the message after it was unreachable no matter how long the caller waited.
+///
+/// No `flock` process is involved: the writer is this thread and the only
+/// thing under test is the reader.
+#[test]
+fn framed_reader_survives_a_message_that_arrives_in_pieces() {
+    let (mut writer, mut reader) = UnixStream::pair().expect("socketpair");
+
+    // A payload long enough that a slice cannot plausibly cover it, written as
+    // prefix-then-payload with a gap several slices wide.
+    let body = vec![b'x'; 256 * 1024];
+    let mut payload = support::encode_varint_u32(1); // ServerMessage::Frame
+    payload.extend_from_slice(&body);
+    let framed = support::frame_message(&payload);
+
+    let writer_thread = thread::spawn(move || {
+        writer.write_all(&framed[..4]).expect("write prefix");
+        writer.flush().expect("flush prefix");
+        thread::sleep(Duration::from_millis(400));
+        writer.write_all(&framed[4..]).expect("write payload");
+        writer.flush().expect("flush payload");
+    });
+
+    // A 50 ms slice: the prefix arrives, then the reader sits waiting for a
+    // payload that is 400 ms out. Under the old reader that first attempt
+    // failed and left the stream desynchronized.
+    let (variant, decoded) =
+        support::read_framed_message_within(&mut reader, Duration::from_millis(50))
+            .expect("a split message must still be read whole");
+    writer_thread.join().expect("writer thread");
+
+    assert_eq!(variant, 1);
+    assert_eq!(decoded, body);
+}
+
+/// When the completion grace runs out on a frame that has started, the reader
+/// must report the stream as lost — never as "nothing yet".
+///
+/// This is the second half of the invariant, and it is a separate defect if it
+/// is wrong. Every wait loop in this suite polls on timeout, so a
+/// timeout-kinded error for a half-consumed frame sends the caller straight
+/// back to `read_exact` against bytes that are the middle of a payload: the
+/// desync this reader exists to remove, arriving late and more quietly than
+/// the `read_exact` pair did (#444).
+#[test]
+fn framed_reader_reports_a_stalled_frame_as_lost_not_as_nothing_yet() {
+    let (mut writer, mut reader) = UnixStream::pair().expect("socketpair");
+
+    let mut payload = support::encode_varint_u32(1);
+    payload.extend_from_slice(&[b'x'; 64 * 1024]);
+    let framed = support::frame_message(&payload);
+
+    // The socket needs a read timeout of its own: the grace bounds how long a
+    // *started* frame may take, while the timeout is what each individual read
+    // attempt waits. Without one this read blocks until the writer gives up.
+    reader
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set read timeout");
+
+    // The prefix and nothing else: the frame has started and will never finish.
+    let writer_thread = thread::spawn(move || {
+        writer.write_all(&framed[..4]).expect("write prefix");
+        writer.flush().expect("flush prefix");
+        thread::sleep(Duration::from_millis(800));
+    });
+
+    // A short grace so the test is quick; the value is the point, not the wait.
+    let err = support::read_framed_io(&mut reader, Duration::from_millis(50))
+        .expect_err("a frame that never finishes must not read as a message");
+    writer_thread.join().expect("writer thread");
+
+    assert!(
+        !is_timeout(&err),
+        "a half-read frame must not be reported as retryable, or the caller resynchronizes: {err}"
+    );
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+/// And the same reader must still report "nothing yet" fast rather than
+/// hanging, because every wait loop in this suite is built on that being a
+/// quick, recoverable answer — and it must do so without having consumed
+/// anything, so the stream is still aligned for the message that follows.
+#[test]
+fn framed_reader_reports_nothing_yet_without_consuming_framing() {
+    let (mut writer, mut reader) = UnixStream::pair().expect("socketpair");
+
+    assert!(
+        support::read_framed_message_within(&mut reader, Duration::from_millis(50)).is_err(),
+        "an idle peer must not read as a message"
+    );
+
+    let payload = support::frame_message(&support::encode_varint_u32(7));
+    writer.write_all(&payload).expect("write");
+    let (variant, _) = support::read_framed_message_within(&mut reader, Duration::from_millis(500))
+        .expect("framing survived the idle wait");
+    assert_eq!(variant, 7);
 }

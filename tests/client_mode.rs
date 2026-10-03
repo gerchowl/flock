@@ -9,7 +9,7 @@ mod support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,8 +20,8 @@ use support::{
     cleanup_test_base, client_handshake, encode_live_handoff_refusal, encode_varint_u16,
     encode_varint_u32, frame_message, read_server_message, register_runtime_dir,
     register_spawned_flock_pid, send_input, send_set_frame_subscription,
-    unregister_spawned_flock_pid, wait_for_file, wait_for_message_variant, wait_for_socket,
-    wait_until,
+    unregister_spawned_flock_pid, wait_for_file, wait_for_message_variant, wait_for_notify_message,
+    wait_for_socket, wait_until,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -159,16 +159,34 @@ fn spawn_server(
     }
 }
 
-fn ping_socket(socket_path: &PathBuf) -> String {
-    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+/// Ask the API socket for a pong, or `None` if it did not answer in time.
+///
+/// Fallible on purpose: this runs inside `wait_until` predicates that read as
+/// "is the server responsive?", and panicking on a transient connect or read
+/// failure reports contention as a broken server (#444). See the identically
+/// named helper in `detach_reattach.rs` for the longer note.
+fn ping_socket(socket_path: &Path) -> Option<String> {
+    /// One second, and deliberately *under* the two seconds
+    /// `wait_until(Duration::from_secs(2), ..)` gives these predicates. The
+    /// timeout exists so that budget is a budget; a probe that can outlast it
+    /// makes the deadline decorative again, which is the defect this function
+    /// was made fallible to fix (#444).
+    const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
-    let request = r#"{"id":"1","method":"ping","params":{}}"#;
-    writeln!(stream, "{}", request).unwrap();
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    stream.set_read_timeout(Some(PING_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(PING_TIMEOUT)).ok()?;
+    writeln!(stream, r#"{{"id":"1","method":"ping","params":{{}}}}"#).ok()?;
+    stream.flush().ok()?;
 
-    let mut reader = BufReader::new(stream);
     let mut response = String::new();
-    reader.read_line(&mut response).unwrap();
-    response.trim().to_string()
+    BufReader::new(stream).read_line(&mut response).ok()?;
+    Some(response.trim().to_string())
+}
+
+/// [`ping_socket`] reduced to the question the wait loops actually ask.
+fn server_responds_to_ping(socket_path: &Path) -> bool {
+    ping_socket(socket_path).is_some_and(|response| response.contains("pong"))
 }
 
 #[allow(dead_code)]
@@ -221,7 +239,7 @@ fn decode_frame_payload(payload: &[u8]) -> std::io::Result<FrameWire> {
 
 fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, String> {
     stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(support::DEFAULT_READ_SLICE))
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -547,13 +565,13 @@ fn client_input_forwarded_to_pane() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should still respond to ping after input"
     );
 
     // Verify the server is still alive and responsive via API.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should still respond to ping after input: {response}"
@@ -606,13 +624,13 @@ fn client_resize_sends_message() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should respond after resize"
     );
 
     // Verify the server is still alive.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should respond after resize: {response}"
@@ -967,13 +985,13 @@ fn navigate_mode_keybind_dispatch_in_server() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should still respond after navigate mode input"
     );
 
     // Verify the server is still alive and the API still works.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should still respond after navigate mode input: {response}"
@@ -1001,7 +1019,7 @@ fn pane_spawn_cwd_fallback_in_server() {
     // The server should have started successfully even though there are
     // no existing sessions (fresh state). The test verifies that the
     // server doesn't crash during initial pane creation.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket).unwrap_or_default();
     assert!(
         response.contains("pong"),
         "server should respond to ping after startup: {response}"
@@ -1085,6 +1103,20 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     cleanup_test_base(&base);
 }
 
+/// The value of a `"<name>":"<value>"` field in a raw API response.
+///
+/// These responses are read with `read_line` rather than parsed, so the field
+/// is located textually — but located *exactly*, by its own name. Scraping for
+/// a prefix and falling back to a hardcoded id is how this test ended up
+/// reporting against panes the server never created.
+fn field<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("\"{name}\":\"");
+    let start = response.find(&needle)? + needle.len();
+    let rest = &response[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
 #[test]
 fn client_receives_notify_on_agent_state_change() {
     // Notification events (sound/toast) are forwarded as
@@ -1099,9 +1131,14 @@ fn client_receives_notify_on_agent_state_change() {
 
     // Enable toast and sound in config so the server produces notifications.
     fs::create_dir_all(config_home.join("flock")).unwrap();
+    // `delay_seconds = 0` so a notification goes out on the transition rather
+    // than behind `[ui.toast]`'s dwell gate (#36). The gate is real behaviour
+    // with its own tests; what is under test here is the notify path, and
+    // leaving the default 1s in made the assertion wait on a timer it does not
+    // name.
     fs::write(
         config_home.join("flock/config.toml"),
-        "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
+        "onboarding = false\n[ui.toast]\nenabled = true\ndelay_seconds = 0\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
@@ -1164,28 +1201,17 @@ fn client_receives_notify_on_agent_state_change() {
     let mut ws_response = String::new();
     reader.read_line(&mut ws_response).unwrap();
 
-    // Extract the workspace ID and pane ID from the response.
-    let ws_id = ws_response
-        .split('"')
-        .find(|s| s.starts_with("w_"))
-        .unwrap_or("w_1")
-        .to_string();
-
-    // Get pane list to find a pane ID.
-    let mut pane_stream = UnixStream::connect(&api_socket).expect("connect to API");
-    let pane_request =
-        format!(r#"{{"id":"2","method":"pane.list","params":{{"workspace_id":"{ws_id}"}}}}"#);
-    writeln!(pane_stream, "{}", pane_request).unwrap();
-    let mut pane_reader = BufReader::new(pane_stream);
-    let mut pane_response = String::new();
-    pane_reader.read_line(&mut pane_response).unwrap();
-
-    // Extract first pane ID (format: p_<ws>_<pane>).
-    let pane_id = pane_response
-        .split('"')
-        .find(|s| s.starts_with("p_"))
-        .unwrap_or("p_1_1")
-        .to_string();
+    // The pane id, read out of the response rather than invented. It used to be
+    // scraped with `find(|s| s.starts_with("p_"))` and then given the fallback
+    // `"p_1_1"` when the scrape found nothing — which it always did, because
+    // the real id is `w1:p1`. So every `pane.report_agent` below named a pane
+    // the server had never issued, the report silently resolved to nothing, and
+    // the assertions held or failed on timing rather than on the notify path
+    // they are about (#444).
+    //
+    // `workspace.create` already names the root pane it made, so there is no
+    // `pane.list` round trip here to find one.
+    let pane_id = field(&ws_response, "pane_id").expect("workspace.create names its root pane");
 
     // Report agent as Blocked via the API — this should trigger a
     // ServerMessage::Notify with kind=Sound (Request sound).
@@ -1198,31 +1224,16 @@ fn client_receives_notify_on_agent_state_change() {
     let mut report_response = String::new();
     report_reader.read_line(&mut report_response).unwrap();
 
-    // Read messages from the client stream and look for Notify (variant 5).
-    // Notify = ServerMessage variant index 5.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut found_notify = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match read_server_message(&mut stream) {
-            Ok((variant, _payload)) => {
-                if variant == 5 {
-                    // ServerMessage::Notify — found it!
-                    found_notify = true;
-                    break;
-                }
-                // Continue reading — Frame messages (variant 1) will come first.
-            }
-            Err(_) => {
-                break;
-            }
-        }
-    }
-
+    // Read messages from the client stream and look for Notify.
+    //
+    // `wait_for_message_variant` rather than a hand-rolled loop: this used to
+    // set one five-second read timeout and `break` on the first read error, so
+    // a single partial or timed-out read ended the whole wait while the notify
+    // was still on its way (#444). The helper polls on a short slice to the
+    // deadline, which is the behaviour the assertion was written for.
     assert!(
-        found_notify,
+        wait_for_notify_message(&mut stream, Duration::from_secs(10), "agent attention")
+            .expect("reading the client stream should not error"),
         "client should receive a ServerMessage::Notify after pane.report_agent"
     );
 
@@ -1237,11 +1248,8 @@ fn client_receives_notify_on_agent_state_change() {
     ws2_reader.read_line(&mut ws2_response).unwrap();
 
     // Focus the new workspace (making the first one background).
-    let ws2_id = ws2_response
-        .split('"')
-        .find(|s| s.starts_with("w_"))
-        .unwrap_or("w_2")
-        .to_string();
+    let ws2_id = field(&ws2_response, "workspace_id")
+        .expect("the second workspace.create should name that workspace");
     let mut focus_stream = UnixStream::connect(&api_socket).expect("connect to API");
     let focus_request = format!(
         r#"{{"id":"5","method":"workspace.focus","params":{{"workspace_id":"{ws2_id}"}}}}"#
@@ -1253,7 +1261,7 @@ fn client_receives_notify_on_agent_state_change() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should stay responsive after workspace focus"
     );
@@ -1271,10 +1279,17 @@ fn client_receives_notify_on_agent_state_change() {
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-            ping_socket(&api_socket).contains("pong")
+            server_responds_to_ping(&api_socket)
         }),
         "server should stay responsive after working state report"
     );
+
+    // Drain what the Blocked and Working reports already put on the stream.
+    // This is best-effort hygiene, not the barrier: it stops at the first read
+    // gap, so it cannot prove those Notifies are gone. The barrier is the
+    // message match below — a Blocked or Working Notify says "Request", and
+    // only the Idle transition says "agent done".
+    support::drain_messages(&mut stream);
 
     let mut idle_stream = UnixStream::connect(&api_socket).expect("connect to API");
     let idle_request = format!(
@@ -1285,33 +1300,14 @@ fn client_receives_notify_on_agent_state_change() {
     let mut idle_response = String::new();
     idle_reader.read_line(&mut idle_response).unwrap();
 
-    // Read messages and look for Done sound notify.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut found_done_notify = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match read_server_message(&mut stream) {
-            Ok((variant, _payload)) => {
-                if variant == 5 {
-                    // Found a Notify message — that's good enough.
-                    // The test already verified the Blocked→Notify path above.
-                    found_done_notify = true;
-                    break;
-                }
-                // Continue reading — Frame messages will come first.
-            }
-            Err(e) => {
-                eprintln!("read error while looking for Done Notify: {e}");
-                break;
-            }
-        }
-    }
-
+    // Read messages and look for the Done sound notify. Matched on the message
+    // rather than the variant: every state change on this pane notifies, and
+    // the two earlier reports in this test are still candidates for a
+    // variant-only match.
     assert!(
-        found_done_notify,
-        "client should receive a Sound Notify with 'agent done' when background pane transitions Working→Idle"
+        wait_for_notify_message(&mut stream, Duration::from_secs(10), "agent done")
+            .expect("reading the client stream should not error"),
+        "client should receive a Sound Notify with 'agent done' when a background pane goes Working to Idle"
     );
 
     cleanup_spawned_flock(spawned, base);

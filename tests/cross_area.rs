@@ -438,17 +438,10 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
         .expect("write hello");
     stream.flush().expect("flush hello");
 
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .expect("read welcome length");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    assert!(len > 0 && len <= 2 * 1024 * 1024, "unexpected welcome size");
-
-    let mut welcome_payload = vec![0u8; len];
-    stream
-        .read_exact(&mut welcome_payload)
-        .expect("read welcome payload");
+    // `support`'s one reader, like every other Welcome read in the suite: a
+    // private `read_exact` pair is what put this defect in five places (#444).
+    let grace = support::completion_grace_for(stream);
+    let welcome_payload = support::read_framed_payload(stream, grace).expect("read framed welcome");
 
     let mut offset = 0;
     let (variant, consumed) = decode_varint_u32(&welcome_payload, offset).expect("decode variant");
@@ -593,25 +586,15 @@ fn frame_shows_agent_state(frame: &FrameWire, agent: &str, glyphs: &[&str]) -> b
         .any(|glyph| text.contains(&format!("{glyph} {agent}")))
 }
 
+/// Both readers below used to be private `read_exact` copies, and
+/// `wait_for_frame_matching` polls them on an 80 ms slice — the exact shape
+/// that loses framing when a payload does not arrive inside one slice. They now
+/// share `support`'s frame-atomic reader, so `cross_area` cannot drift back
+/// into the defect `multi_client` and `client_mode` were fixed for (#444).
 fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result<u32> {
     stream.set_read_timeout(Some(timeout))?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zero-length payload",
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let (variant, _consumed) = decode_varint_u32(&payload, 0)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(variant)
+    let grace = support::completion_grace_for(stream);
+    support::read_framed_io(stream, grace).map(|(variant, _payload)| variant)
 }
 
 fn read_server_message_payload(
@@ -619,23 +602,8 @@ fn read_server_message_payload(
     timeout: Duration,
 ) -> io::Result<(u32, Vec<u8>)> {
     stream.set_read_timeout(Some(timeout))?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zero-length payload",
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let (variant, consumed) = decode_varint_u32(&payload, 0)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok((variant, payload[consumed..].to_vec()))
+    let grace = support::completion_grace_for(stream);
+    support::read_framed_io(stream, grace)
 }
 
 fn wait_for_frame_matching(

@@ -77,7 +77,7 @@ pub(crate) fn path_env_pair() -> (String, String) {
 // ---------------------------------------------------------------------
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A temp path unique to this test, derived from the fixture's own name.
 ///
@@ -90,6 +90,51 @@ pub(crate) fn unique_temp_path(name: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
+}
+
+/// How long a test waits for a file some *other* process owes it.
+///
+/// Deliberately generous, because the thing being waited on is routinely a
+/// `/bin/sh -lc` — a fork, an exec, and a login profile — and on a loaded
+/// machine those are seconds, not milliseconds. Waiting longer is not the
+/// interesting half; the interesting half is that these waits are for a real
+/// out-of-process effect and have no other signal to synchronize on.
+const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How far apart two reads have to be before agreeing counts as "finished".
+const FILE_SETTLE_GAP: Duration = Duration::from_millis(50);
+
+/// Wait until `path` exists and whatever is writing it has finished, then
+/// return its content.
+///
+/// "Finished" means two reads [`FILE_SETTLE_GAP`] apart that agree and are not
+/// empty. "Readable" is not "complete": a redirect truncates before it writes,
+/// and `cp` fills a file in pieces, so stopping at the first successful read
+/// hands back `""` or a prefix for a command that ran perfectly well. That is
+/// the flake this replaces — a `wait_for_file` whose 2 s budget was also too
+/// short for the `/bin/sh -lc` it was waiting on (#444).
+///
+/// The assertions stay with the caller on purpose. An earlier version of this
+/// took the caller's assertion as its readiness predicate, which made every
+/// assertion downstream of it provably true; deciding *when the file is done*
+/// is all a wait can know, and *what it should say* is the caller's business.
+pub(crate) fn wait_for_file_stable(path: &Path) -> String {
+    let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
+    let mut last_seen: Option<String> = None;
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if !content.is_empty() && last_seen.as_deref() == Some(content.as_str()) {
+                return content;
+            }
+            last_seen = Some(content);
+        }
+        std::thread::sleep(FILE_SETTLE_GAP);
+    }
+    panic!(
+        "timed out waiting for {} to settle, last saw {:?}",
+        path.display(),
+        last_seen.unwrap_or_default()
+    );
 }
 
 /// Run `git` in `repo`, asserting it succeeded.
