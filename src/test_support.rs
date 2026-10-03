@@ -77,7 +77,7 @@ pub(crate) fn path_env_pair() -> (String, String) {
 // ---------------------------------------------------------------------
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A temp path unique to this test, derived from the fixture's own name.
 ///
@@ -90,6 +90,62 @@ pub(crate) fn unique_temp_path(name: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
+}
+
+/// How long a test waits for a file some *other* process owes it.
+///
+/// Deliberately generous, because the thing being waited on is routinely a
+/// `/bin/sh -lc` — a fork, an exec, and a login profile — and on a loaded
+/// machine those are seconds, not milliseconds. Waiting longer is not the
+/// interesting half; the interesting half is that these waits are for a real
+/// out-of-process effect and have no other signal to synchronize on.
+const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait for `path` to exist and return whatever it holds.
+///
+/// Returns on the *first* readable state, which for a file a shell redirects
+/// into is not the finished state: `printf direct > f` truncates first and
+/// writes second, so this can return `""` for a command that ran perfectly
+/// well. Callers asserting on what is inside want
+/// [`wait_for_file_matching`].
+pub(crate) fn wait_for_file(path: &Path) -> String {
+    let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return content;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+/// Wait until `path` holds content `ready` accepts, then return that content.
+///
+/// The distinction from [`wait_for_file`] is the whole point. Handing the
+/// caller the predicate it is about to assert on means the wait cannot return
+/// mid-write, so a failure here means the output never arrived rather than
+/// that the test happened to look in the gap between a truncating redirect and
+/// the write behind it (#444).
+///
+/// A predicate rather than an expected string because most of these tests
+/// assert on a substring or a line count, and pinning exact bytes would fail
+/// them on formatting they were deliberately not asserting.
+pub(crate) fn wait_for_file_matching(path: &Path, ready: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
+    let mut last_seen: Option<String> = None;
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(path) {
+            Ok(content) if ready(&content) => return content,
+            Ok(content) => last_seen = Some(content),
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for {}, last saw {:?}",
+        path.display(),
+        last_seen.unwrap_or_default()
+    );
 }
 
 /// Run `git` in `repo`, asserting it succeeded.

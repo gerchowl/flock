@@ -82,11 +82,29 @@ impl TerminalState {
         &mut self,
         report: AgentMetadataReport,
     ) -> Option<TerminalStateMutation> {
+        self.set_agent_metadata_at(report, Instant::now())
+    }
+
+    /// [`Self::set_agent_metadata`] with the clock supplied.
+    ///
+    /// The seam exists because a report's own TTL is the shortest interval in
+    /// this module — a report may carry a TTL of a millisecond — so anything
+    /// that has to observe metadata *across* two reports cannot be written
+    /// against `Instant::now()`: whether the seeded entry is still live when
+    /// the second report lands is then a property of how loaded the machine
+    /// is, not of the behaviour under test (#444). Every other time-dependent
+    /// entry point here already takes `now` this way —
+    /// `expire_agent_metadata_at`, `effective_presentation_for_state_at` —
+    /// and this is the same pair shape, not a second mechanism.
+    pub fn set_agent_metadata_at(
+        &mut self,
+        report: AgentMetadataReport,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
         if !self.accept_metadata_report(&report.source, report.seq) {
             return None;
         }
 
-        let now = Instant::now();
         if self
             .agent_metadata
             .get(&report.source)
@@ -252,7 +270,14 @@ impl TerminalState {
     }
 
     pub fn next_agent_metadata_expiry(&self) -> Option<Instant> {
-        let now = Instant::now();
+        self.next_agent_metadata_expiry_at(Instant::now())
+    }
+
+    /// [`Self::next_agent_metadata_expiry`] with the clock supplied, for the
+    /// same reason as [`Self::set_agent_metadata_at`]: the answer is "the
+    /// soonest deadline that has not passed", so reading it against a wall
+    /// clock means a deadline that was live a moment ago reads as absent.
+    pub fn next_agent_metadata_expiry_at(&self, now: Instant) -> Option<Instant> {
         self.agent_metadata
             .values()
             .filter(|metadata| self.agent_metadata_matches_guards(metadata))
@@ -517,6 +542,18 @@ mod tests {
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
     }
+
+    /// A TTL for the tests that assert TTL *semantics* rather than TTL
+    /// *expiry*, injected alongside a clock (#444).
+    ///
+    /// It only has to be longer than the gap between the instants those tests
+    /// inject; making it a real duration rather than the millisecond the code
+    /// accepts is the point. A one-millisecond TTL is not "a short TTL" to
+    /// this code — it is a TTL that has already expired by the time the next
+    /// statement runs on a loaded machine, which is how
+    /// `metadata_clear_only_without_ttl_does_not_extend_old_ttl` came to
+    /// assert against scheduling latency.
+    const METADATA_TTL: Duration = Duration::from_secs(30);
 
     fn set_metadata_custom_status(
         terminal: &mut TerminalState,
@@ -878,6 +915,7 @@ mod tests {
 
     #[test]
     fn metadata_clear_plus_set_without_ttl_does_not_keep_old_ttl() {
+        let reported_at = Instant::now();
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
             "flock:claude".into(),
@@ -886,52 +924,62 @@ mod tests {
             None,
             None,
         );
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:status".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: Some("Old title".into()),
-            display_agent: None,
-            custom_status: Some("old".into()),
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
-            seq: None,
-        });
-        let old_deadline = terminal.next_agent_metadata_expiry().unwrap();
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:status".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: Some("Old title".into()),
+                display_agent: None,
+                custom_status: Some("old".into()),
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: Some(METADATA_TTL),
+                seq: None,
+            },
+            reported_at,
+        );
+        let old_deadline = terminal
+            .next_agent_metadata_expiry_at(reported_at)
+            .expect("a ttl'd report schedules an expiry");
+        assert_eq!(old_deadline, reported_at + METADATA_TTL);
 
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:status".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: None,
-            display_agent: None,
-            custom_status: Some("fresh".into()),
-            state_labels: HashMap::new(),
-            clear_title: true,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: None,
-            seq: None,
-        });
+        let updated_at = reported_at + Duration::from_secs(1);
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:status".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: None,
+                display_agent: None,
+                custom_status: Some("fresh".into()),
+                state_labels: HashMap::new(),
+                clear_title: true,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: None,
+                seq: None,
+            },
+            updated_at,
+        );
 
-        assert_eq!(terminal.next_agent_metadata_expiry(), None);
-        assert_eq!(terminal.effective_custom_status().as_deref(), Some("fresh"));
+        assert_eq!(terminal.next_agent_metadata_expiry_at(updated_at), None);
+        let presentation = terminal.effective_presentation_for_state_at(terminal.state, updated_at);
+        assert_eq!(presentation.custom_status.as_deref(), Some("fresh"));
         assert!(terminal
-            .expire_agent_metadata_at(
-                old_deadline + Duration::from_millis(1),
-                old_deadline + Duration::from_millis(1)
-            )
+            .expire_agent_metadata_at(old_deadline, updated_at)
             .is_none());
-        assert_eq!(terminal.effective_custom_status().as_deref(), Some("fresh"));
+        let presentation = terminal.effective_presentation_for_state_at(terminal.state, updated_at);
+        assert_eq!(presentation.custom_status.as_deref(), Some("fresh"));
     }
 
     #[test]
     fn metadata_clear_only_without_ttl_does_not_extend_old_ttl() {
+        let reported_at = Instant::now();
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
             "flock:claude".into(),
@@ -940,55 +988,75 @@ mod tests {
             None,
             None,
         );
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:status".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: Some("Prompt title".into()),
-            display_agent: None,
-            custom_status: Some("old".into()),
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
-            seq: None,
-        });
-        let old_deadline = terminal.next_agent_metadata_expiry().unwrap();
-
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:status".into(),
-            agent_label: None,
-            applies_to_source: None,
-            title: None,
-            display_agent: None,
-            custom_status: None,
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: true,
-            clear_state_labels: false,
-            ttl: None,
-            seq: None,
-        });
-
-        assert_eq!(terminal.next_agent_metadata_expiry(), Some(old_deadline));
-        assert_eq!(
-            terminal.effective_presentation().title.as_deref(),
-            Some("Prompt title")
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:status".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: Some("Prompt title".into()),
+                display_agent: None,
+                custom_status: Some("old".into()),
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: Some(METADATA_TTL),
+                seq: None,
+            },
+            reported_at,
         );
-        assert_eq!(terminal.effective_custom_status(), None);
+        let old_deadline = terminal
+            .next_agent_metadata_expiry_at(reported_at)
+            .expect("a ttl'd report schedules an expiry");
+        assert_eq!(old_deadline, reported_at + METADATA_TTL);
+
+        // A clear-only report carries no field values and no TTL, so it must
+        // leave `reported_at` — and therefore the deadline — exactly where the
+        // ttl'd report put it. Injecting both instants is what makes that the
+        // thing under test: this used to wait out a one-millisecond TTL in real
+        // time, and on a loaded machine the seeded entry was expired and
+        // dropped before this report even landed (#444).
+        let cleared_at = reported_at + Duration::from_secs(1);
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:status".into(),
+                agent_label: None,
+                applies_to_source: None,
+                title: None,
+                display_agent: None,
+                custom_status: None,
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: true,
+                clear_state_labels: false,
+                ttl: None,
+                seq: None,
+            },
+            cleared_at,
+        );
+
+        assert_eq!(
+            terminal.next_agent_metadata_expiry_at(cleared_at),
+            Some(old_deadline)
+        );
+        let presentation = terminal.effective_presentation_for_state_at(terminal.state, cleared_at);
+        assert_eq!(presentation.title.as_deref(), Some("Prompt title"));
+        assert_eq!(presentation.custom_status, None);
 
         let mutation = terminal
             .expire_agent_metadata_at(old_deadline, old_deadline)
-            .unwrap();
+            .expect("the original deadline is still the one that fires");
         assert!(mutation.effective_state_change.is_some());
-        assert_eq!(terminal.effective_presentation().title, None);
+        let presentation =
+            terminal.effective_presentation_for_state_at(terminal.state, old_deadline);
+        assert_eq!(presentation.title, None);
     }
 
     #[test]
     fn metadata_ttl_expiry_reports_presentation_change() {
+        let reported_at = Instant::now();
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
             "flock:claude".into(),
@@ -997,27 +1065,34 @@ mod tests {
             None,
             None,
         );
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:status".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: None,
-            display_agent: None,
-            custom_status: Some("activity".into()),
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
-            seq: None,
-        });
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:status".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: None,
+                display_agent: None,
+                custom_status: Some("activity".into()),
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: Some(METADATA_TTL),
+                seq: None,
+            },
+            reported_at,
+        );
 
-        let deadline = terminal.next_agent_metadata_expiry().unwrap();
+        let deadline = terminal
+            .next_agent_metadata_expiry_at(reported_at)
+            .expect("a ttl'd report schedules an expiry");
         let mutation = terminal
             .expire_agent_metadata_at(deadline, deadline)
-            .unwrap();
-        let change = mutation.effective_state_change.unwrap();
+            .expect("the deadline fires at the deadline");
+        let change = mutation
+            .effective_state_change
+            .expect("presentation changed");
 
         assert_eq!(change.previous_state, AgentState::Working);
         assert_eq!(change.state, AgentState::Working);
@@ -1026,7 +1101,12 @@ mod tests {
             Some("activity")
         );
         assert_eq!(change.presentation.custom_status, None);
-        assert_eq!(terminal.effective_custom_status(), None);
+        assert_eq!(
+            terminal
+                .effective_presentation_for_state_at(terminal.state, deadline)
+                .custom_status,
+            None
+        );
     }
 
     #[test]
@@ -1051,7 +1131,7 @@ mod tests {
             clear_display_agent: false,
             clear_custom_status: false,
             clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
+            ttl: Some(METADATA_TTL),
             seq: None,
         });
         let deadline = terminal
@@ -1081,6 +1161,13 @@ mod tests {
 
     #[test]
     fn late_metadata_expiry_reports_all_due_visible_changes() {
+        let first_reported_at = Instant::now();
+        // Two sources whose deadlines differ by more than a scheduler tick, so
+        // "the later tick finds both due" is a fact about the TTLs rather than
+        // about how long the test took to get here. At one and two milliseconds
+        // the ordering held only if the whole test ran inside a millisecond
+        // (#444).
+        let first_ttl = Duration::from_secs(10);
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
             "flock:claude".into(),
@@ -1089,47 +1176,58 @@ mod tests {
             None,
             None,
         );
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:first".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: Some("First".into()),
-            display_agent: None,
-            custom_status: None,
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
-            seq: None,
-        });
-        let first_deadline = terminal.next_agent_metadata_expiry().unwrap();
-        terminal.set_agent_metadata(AgentMetadataReport {
-            source: "user:second".into(),
-            agent_label: Some("claude".into()),
-            applies_to_source: Some("flock:claude".into()),
-            title: None,
-            display_agent: Some("Second".into()),
-            custom_status: None,
-            state_labels: HashMap::new(),
-            clear_title: false,
-            clear_display_agent: false,
-            clear_custom_status: false,
-            clear_state_labels: false,
-            ttl: Some(Duration::from_millis(2)),
-            seq: None,
-        });
-        let second_deadline = terminal
-            .agent_metadata
-            .get("user:second")
-            .and_then(|metadata| terminal.agent_metadata_expiry(metadata))
-            .unwrap();
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:first".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: Some("First".into()),
+                display_agent: None,
+                custom_status: None,
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: Some(first_ttl),
+                seq: None,
+            },
+            first_reported_at,
+        );
+        let first_deadline = first_reported_at + first_ttl;
+        assert_eq!(
+            terminal.next_agent_metadata_expiry_at(first_reported_at),
+            Some(first_deadline)
+        );
+
+        let second_reported_at = first_reported_at + Duration::from_secs(1);
+        terminal.set_agent_metadata_at(
+            AgentMetadataReport {
+                source: "user:second".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: Some("flock:claude".into()),
+                title: None,
+                display_agent: Some("Second".into()),
+                custom_status: None,
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                ttl: Some(METADATA_TTL),
+                seq: None,
+            },
+            second_reported_at,
+        );
+        let second_deadline = second_reported_at + METADATA_TTL;
+        assert!(first_deadline < second_deadline);
 
         let mutation = terminal
             .expire_agent_metadata_at(first_deadline, second_deadline)
-            .unwrap();
-        let change = mutation.effective_state_change.unwrap();
+            .expect("both sources are due, so the tick reports them together");
+        let change = mutation
+            .effective_state_change
+            .expect("presentation changed");
 
         assert_eq!(change.previous_presentation.title.as_deref(), Some("First"));
         assert_eq!(

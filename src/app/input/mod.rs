@@ -692,23 +692,9 @@ fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> 
     }
 }
 
+// `unique_temp_path` and the `wait_for_file*` family live in
+// `crate::test_support`, not here. They were a second copy of helpers
+// `test_support` already owned, and a second copy is how a fix to one seam
+// quietly stops covering the other (#402).
 #[cfg(test)]
-fn unique_temp_path(name: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("flock-{name}-{}-{nanos}", std::process::id()))
-}
-
-#[cfg(test)]
-fn wait_for_file(path: &std::path::Path) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return content;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {}", path.display());
-}
+use crate::test_support::{unique_temp_path, wait_for_file, wait_for_file_matching};
