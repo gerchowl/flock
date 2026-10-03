@@ -36,6 +36,22 @@ impl Tab {
         })
     }
 
+    /// (state, seen) for every pane in THIS tab with a live terminal — the
+    /// per-tab counterpart of [`Workspace::pane_states`] (#394). The tab
+    /// strip tints a tab by its own panes' join; deriving it here, over the
+    /// same `(terminal.state, pane.seen)` pair the workspace scope reads, is
+    /// what keeps the two strips from disagreeing about the same pane.
+    pub fn pane_states<'a>(
+        &'a self,
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+    ) -> impl Iterator<Item = (AgentState, bool)> + 'a {
+        self.panes.values().filter_map(|pane| {
+            terminals
+                .get(&pane.attached_terminal_id)
+                .map(|terminal| (terminal.state, pane.seen))
+        })
+    }
+
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
         self.layout
             .pane_ids()
@@ -87,14 +103,7 @@ impl Workspace {
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
     ) -> impl Iterator<Item = (AgentState, bool)> + 'a {
-        self.tabs
-            .iter()
-            .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| {
-                terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
-            })
+        self.tabs.iter().flat_map(|tab| tab.pane_states(terminals))
     }
 
     pub fn aggregate_state(
@@ -144,6 +153,70 @@ mod tests {
 
     fn terminal_for_pane(ws: &Workspace, pane_id: PaneId) -> TerminalState {
         TerminalState::new(ws.terminal_id(pane_id).unwrap().clone(), "/tmp".into())
+    }
+
+    /// #394: the per-tab scope is the tab strip's whole input, and it must
+    /// cover every pane of ITS OWN tab — no more (a sibling tab's state must
+    /// not leak in) and no fewer (a second pane in the same tab must).
+    #[test]
+    fn tab_pane_states_cover_exactly_its_own_panes() {
+        let mut ws = Workspace::test_new("test");
+        // Tab 0 is split, so it holds two panes; tab 1 holds one.
+        let split = ws.test_split(Direction::Horizontal);
+        let other_tab = ws.test_add_tab(Some("logs"));
+        let panes = [
+            (0usize, ws.tabs[0].root_pane, AgentState::Working),
+            (0usize, split, AgentState::Blocked),
+            (1usize, ws.tabs[other_tab].root_pane, AgentState::Idle),
+        ];
+
+        let mut terminals = HashMap::new();
+        for (tab_idx, pane, state) in panes {
+            let mut terminal = terminal_for_pane(&ws, pane);
+            terminal.state = state;
+            terminals.insert(terminal.id.clone(), terminal);
+            // `seen` lives on the pane, and only the pane can be told.
+            ws.tabs[tab_idx].panes.get_mut(&pane).unwrap().seen = true;
+        }
+
+        let tab0 = ws.tabs[0].pane_states(&terminals).collect::<Vec<_>>();
+        assert_eq!(tab0.len(), 2, "{tab0:?}");
+        assert!(tab0.contains(&(AgentState::Working, true)), "{tab0:?}");
+        assert!(tab0.contains(&(AgentState::Blocked, true)), "{tab0:?}");
+
+        let tab1 = ws.tabs[other_tab]
+            .pane_states(&terminals)
+            .collect::<Vec<_>>();
+        assert_eq!(tab1, vec![(AgentState::Idle, true)]);
+
+        // The workspace scope is exactly the union over tabs, so the two
+        // readers cannot drift.
+        assert_eq!(ws.pane_states(&terminals).count(), tab0.len() + tab1.len());
+    }
+
+    /// #394: `seen` is half of the signal, not a detail — it is what splits
+    /// settled idle from done-unseen, so a tab scope that dropped it would
+    /// tint a finished agent as merely idle.
+    #[test]
+    fn tab_pane_states_carry_the_seen_bit() {
+        let mut ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root);
+        terminal.state = AgentState::Idle;
+        terminals.insert(terminal.id.clone(), terminal);
+
+        assert_eq!(
+            ws.tabs[0].pane_states(&terminals).collect::<Vec<_>>(),
+            vec![(AgentState::Idle, true)],
+            "a pane is seen until something marks it otherwise"
+        );
+        ws.tabs[0].panes.get_mut(&root).unwrap().seen = false;
+        assert_eq!(
+            ws.tabs[0].pane_states(&terminals).collect::<Vec<_>>(),
+            vec![(AgentState::Idle, false)],
+            "unseen is carried, not flattened away"
+        );
     }
 
     #[test]

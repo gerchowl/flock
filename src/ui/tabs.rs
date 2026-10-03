@@ -368,6 +368,15 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             continue;
         }
         let active = idx == ws.active_tab;
+        // #394: an unselected tab wears the state tint of its own panes — the
+        // same signal, palette and code shape the workspace-mode strip already
+        // uses, so a blocked agent in a background tab is visible in the strip
+        // instead of reading as an idle numbered tab. `None` (no live agent in
+        // the tab) keeps the neutral fg, and the background stays the neutral
+        // `surface0`: state whispers here exactly as it does there (#42).
+        let tint = (!active)
+            .then(|| tab_state_tint(app, active_ws_idx, idx, p))
+            .flatten();
         let style = if active {
             let base = Style::default().fg(panel_contrast_fg(p)).bg(p.accent);
             if tab.is_auto_named() {
@@ -375,13 +384,25 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             } else {
                 base.add_modifier(Modifier::BOLD)
             }
-        } else if tab.is_auto_named() {
-            Style::default()
-                .fg(p.overlay0)
-                .bg(p.surface0)
-                .add_modifier(Modifier::DIM)
         } else {
-            Style::default().fg(p.overlay1).bg(p.surface0)
+            let base = Style::default()
+                .fg(tint.unwrap_or(if tab.is_auto_named() {
+                    p.overlay0
+                } else {
+                    p.overlay1
+                }))
+                .bg(p.surface0);
+            // A tab CARRYING STATE is dimmed, exactly as every unselected
+            // member slot is: the same red must not read louder in one strip
+            // than in the other (#394). On an untinted tab DIM keeps its older,
+            // separate meaning here — a derived label, paired with the dimmer
+            // `overlay0` — so an agent-free named tab is left exactly as it
+            // was rather than restyled by a change about state.
+            if tint.is_some() || tab.is_auto_named() {
+                base.add_modifier(Modifier::DIM)
+            } else {
+                base
+            }
         };
         let width = rect.width as usize;
         let name = tab.display_name();
@@ -422,6 +443,27 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// The state tint of a strip slot that is not the selected one (#33/#42 for
+/// member slots, #394 for tabs): the head (worst class) of that slot's own
+/// pane-state join, or `None` when nothing in it carries a live agent signal.
+///
+/// One derivation for both strips, over the shared severity ladder
+/// ([`join_states`] + [`StateClass::of`]) — the tabs strip and
+/// [`render_member_strip`] must never disagree about the same pane (#394).
+fn slot_state_tint(
+    states: impl IntoIterator<Item = (crate::detect::AgentState, bool)>,
+    p: &crate::app::state::Palette,
+) -> Option<ratatui::style::Color> {
+    use super::state_signal::{join_states, StateClass};
+    join_states(
+        states
+            .into_iter()
+            .map(|(state, seen)| StateClass::of(state, seen)),
+    )
+    .head()
+    .map(|class| class.color(p))
+}
+
 /// The state tint of an unselected member tab (#33/#42): the head (worst
 /// class) of the member's own pane-state join, muted when nothing is live.
 fn member_state_tint(
@@ -429,18 +471,27 @@ fn member_state_tint(
     ws_idx: usize,
     p: &crate::app::state::Palette,
 ) -> ratatui::style::Color {
-    use super::state_signal::{join_states, StateClass};
     app.workspaces
         .get(ws_idx)
-        .and_then(|ws| {
-            join_states(
-                ws.pane_states(&app.terminals)
-                    .map(|(state, seen)| StateClass::of(state, seen)),
-            )
-            .head()
-            .map(|class| class.color(p))
-        })
+        .and_then(|ws| slot_state_tint(ws.pane_states(&app.terminals), p))
         .unwrap_or(p.overlay1)
+}
+
+/// The state tint of an unselected tab in `tab_mode = tabs` (#394): the same
+/// signal, over that tab's own panes. `None` leaves the tab on its neutral fg,
+/// so a strip with no agents in it looks exactly as it did before — the tint
+/// is additive, not a repaint.
+fn tab_state_tint(
+    app: &AppState,
+    ws_idx: usize,
+    tab_idx: usize,
+    p: &crate::app::state::Palette,
+) -> Option<ratatui::style::Color> {
+    app.workspaces
+        .get(ws_idx)?
+        .tabs
+        .get(tab_idx)
+        .and_then(|tab| slot_state_tint(tab.pane_states(&app.terminals), p))
 }
 
 /// Workspace tab-mode (#33): the strip renders the active session's
@@ -568,6 +619,8 @@ fn render_member_strip(app: &AppState, frame: &mut Frame, area: Rect, active_ws_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::AgentState;
+    use crate::layout::PaneId;
     use crate::workspace::Workspace;
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -643,6 +696,215 @@ mod tests {
         (area.x..area.x + area.width)
             .map(|x| buffer[(x, area.y)].symbol().to_string())
             .collect()
+    }
+
+    /// #394 fixture: one workspace, three tabs, `tab_mode = tabs` — the
+    /// strip's normal shape. The first tab is auto-named (its number) and is
+    /// the active one, the second carries a custom name.
+    fn tabs_app() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("main");
+        ws.test_add_tab(Some("logs"));
+        ws.test_add_tab(None);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.tab_mode = crate::config::TabModeConfig::Tabs;
+        app
+    }
+
+    fn set_tab_pane_state(
+        app: &mut crate::app::state::AppState,
+        tab_idx: usize,
+        state: crate::detect::AgentState,
+    ) {
+        let pane = app.workspaces[0].tabs[tab_idx].root_pane;
+        let tid = app.workspaces[0].tabs[tab_idx].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&tid).unwrap().state = state;
+    }
+
+    fn render_tabs(app: &mut crate::app::state::AppState, area: Rect) -> ratatui::buffer::Buffer {
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            area,
+            app.tab_scroll,
+            app.tab_scroll_follow_active,
+            app.mouse_capture,
+        );
+        app.tab_scroll = view.scroll;
+        app.view.tab_bar_rect = area;
+        app.view.tab_hit_areas = view.tab_hit_areas;
+        app.view.tab_scroll_left_hit_area = view.scroll_left_hit_area;
+        app.view.tab_scroll_right_hit_area = view.scroll_right_hit_area;
+        app.view.new_tab_hit_area = view.new_tab_hit_area;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_tab_bar(app, frame, area))
+            .expect("tab bar should render");
+        terminal.backend().buffer().clone()
+    }
+
+    /// #394 — `tab_mode = tabs` styled a tab on active/auto-named only, so a
+    /// blocked agent sitting in a background tab was invisible: the strip
+    /// showed a number, tinted exactly like an idle one. Asserted on the
+    /// RENDERED cells, because that is the surface that was wrong —
+    /// `render_member_strip`'s equivalent tint was already working, so no
+    /// test over `member_state_tint` alone could have shown the tabs strip
+    /// missing it.
+    #[test]
+    fn tab_strip_tints_an_unselected_tab_by_its_panes_state() {
+        let mut app = tabs_app();
+        set_tab_pane_state(&mut app, 1, crate::detect::AgentState::Blocked);
+
+        let area = Rect::new(0, 0, 48, 1);
+        let buffer = render_tabs(&mut app, area);
+        let p = &app.palette;
+
+        // The ACTIVE tab stays accent — focus speaks (#43); only unselected
+        // slots carry state, exactly as in workspace mode.
+        let active = app.view.tab_hit_areas[0];
+        assert_eq!(buffer[(active.x + 1, active.y)].style().bg, Some(p.accent));
+
+        // The background tab holding the blocked agent reads red, over the
+        // same neutral surface the member strip uses (no state background).
+        let blocked = app.view.tab_hit_areas[1];
+        let cell = &buffer[(blocked.x + 1, blocked.y)];
+        assert_eq!(cell.style().fg, Some(p.red));
+        assert_eq!(cell.style().bg, Some(p.surface0));
+
+        // An unselected tab with no live agent keeps the neutral fg it always
+        // had — the tint is additive, not a repaint of the strip.
+        let idle = app.view.tab_hit_areas[2];
+        assert_eq!(
+            buffer[(idle.x + 1, idle.y)].style().fg,
+            Some(p.overlay0),
+            "an auto-named tab with no agent signal is unchanged"
+        );
+    }
+
+    #[test]
+    fn tab_strip_tints_by_the_worst_state_in_the_tab() {
+        let mut app = tabs_app();
+        // Focus the middle tab, then SPLIT it, so it holds two panes of
+        // different states. One pane per tab would only prove the tints differ
+        // ACROSS tabs, which says nothing about the join this name claims.
+        app.workspaces[0].active_tab = 1;
+        let split = app.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.ensure_test_terminals();
+
+        let root = app.workspaces[0].tabs[1].root_pane;
+        let set = |app: &mut crate::app::state::AppState, pane: PaneId, state: AgentState| {
+            let tid = app.workspaces[0].tabs[1].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&tid).unwrap().state = state;
+        };
+        // Working + blocked in one tab: the join head is the WORSE class, so
+        // the slot reads blocked. Flipping the blocked pane to idle must make
+        // the same slot read working — which is what proves the join is being
+        // taken over this tab's panes rather than over one arbitrary pane.
+        set(&mut app, root, AgentState::Working);
+        set(&mut app, split, AgentState::Blocked);
+        // Hand focus back to tab 0: only an UNSELECTED slot is tinted, so the
+        // two-pane tab has to be in the background to be read at all.
+        app.workspaces[0].active_tab = 0;
+
+        let area = Rect::new(0, 0, 48, 1);
+        let mut buffer = render_tabs(&mut app, area);
+        let slot = app.view.tab_hit_areas[1];
+        assert_eq!(
+            buffer[(slot.x + 1, slot.y)].style().fg,
+            Some(app.palette.red),
+            "two panes, worst class wins"
+        );
+        // The sibling tab holds one working pane and must be unaffected by its
+        // neighbour's blocked pane.
+        set(&mut app, split, AgentState::Idle);
+        buffer = render_tabs(&mut app, area);
+        assert_eq!(
+            buffer[(slot.x + 1, slot.y)].style().fg,
+            Some(app.palette.yellow),
+            "the same slot re-reads as working once the blocked pane settles"
+        );
+    }
+
+    /// #394 — the strips must not disagree about a pane: a state-carrying
+    /// unselected tab is DIM, the same treatment every unselected member slot
+    /// gets, so the same red never reads louder in one strip than the other.
+    /// An agent-free named tab keeps the undimmed foreground it always had.
+    #[test]
+    fn a_tinted_unselected_tab_is_dimmed_like_a_member_slot() {
+        let mut app = tabs_app();
+        set_tab_pane_state(&mut app, 1, AgentState::Blocked);
+
+        let area = Rect::new(0, 0, 48, 1);
+        let buffer = render_tabs(&mut app, area);
+
+        // Tab 1 is NAMED (not auto-named) and blocked: dim red, so it reads
+        // with the same weight a blocked member slot does.
+        let tinted = app.view.tab_hit_areas[1];
+        let cell = buffer[(tinted.x + 1, tinted.y)].style();
+        assert_eq!(cell.fg, Some(app.palette.red));
+        assert!(cell.add_modifier.contains(Modifier::DIM));
+
+        // Tab 2 is auto-named with no agent: still dim, unchanged.
+        let idle = app.view.tab_hit_areas[2];
+        assert!(buffer[(idle.x + 1, idle.y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM));
+    }
+
+    /// #394 — and the named, agent-free tab is NOT restyled: this change is
+    /// about state, and DIM on this strip already means "derived label".
+    #[test]
+    fn an_untinted_named_tab_keeps_its_undimmed_foreground() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("main");
+        ws.test_add_tab(Some("logs"));
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+        app.tab_mode = crate::config::TabModeConfig::Tabs;
+
+        let area = Rect::new(0, 0, 48, 1);
+        let buffer = render_tabs(&mut app, area);
+        let named = app.view.tab_hit_areas[1];
+        let cell = buffer[(named.x + 1, named.y)].style();
+        assert_eq!(cell.fg, Some(app.palette.overlay1));
+        assert!(!cell.add_modifier.contains(Modifier::DIM));
+    }
+
+    /// #33 must be untouched: workspace tab-mode still renders its member
+    /// slots — tinted by the member's aggregate, labelled `<ID> <name>` —
+    /// not tabs, even where the member has tabs of its own.
+    #[test]
+    fn workspace_tab_mode_still_renders_the_member_strip() {
+        let mut app = strip_app();
+        app.workspaces[1].test_add_tab(Some("logs"));
+        app.ensure_test_terminals();
+        set_pane_state(&mut app, 1, crate::detect::AgentState::Blocked);
+
+        let area = Rect::new(0, 0, 48, 1);
+        let buffer = render_strip(&mut app, area);
+        let text = row_text(&buffer, area);
+        assert!(text.contains("2 keys"), "{text:?}");
+        assert!(
+            !text.contains("logs"),
+            "member slots are not tabs: {text:?}"
+        );
+        assert_eq!(app.view.tab_hit_areas.len(), 3, "one slot per member");
+        let blocked = app.view.tab_hit_areas[1];
+        assert_eq!(
+            buffer[(blocked.x + 1, blocked.y)].style().fg,
+            Some(app.palette.red)
+        );
     }
 
     /// #33 — workspace tab-mode: the strip renders the session's members as
