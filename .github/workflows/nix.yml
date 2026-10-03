@@ -13,6 +13,15 @@ on:
       - "flake.nix"
       - "nix/**"
       - "vendor/**"
+      # The gate sweep is where scripts/*.py gates run. Filtering to build inputs
+      # meant a PR touching only tests/ or docs/ never ran a gate at all — which is
+      # how a hostname reached docs/next/ twice from ordinary feature commits
+      # (#514, #515). guardrails-ok(nix-paths): the gate layer is the point.
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - "docs/**"
+      - ".pre-commit-config.yaml"
   push:
     branches: [main]
     paths:
@@ -25,6 +34,15 @@ on:
       - "flake.nix"
       - "nix/**"
       - "vendor/**"
+      # The gate sweep is where scripts/*.py gates run. Filtering to build inputs
+      # meant a PR touching only tests/ or docs/ never ran a gate at all — which is
+      # how a hostname reached docs/next/ twice from ordinary feature commits
+      # (#514, #515). guardrails-ok(nix-paths): the gate layer is the point.
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
+      - "docs/**"
+      - ".pre-commit-config.yaml"
 
 permissions:
   contents: read

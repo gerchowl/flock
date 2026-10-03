@@ -937,7 +937,7 @@ mod tests {
             "\n",
             r#"{"push":"msg.uplink","frame":{"uplink_id":"u2"}}"#,
             "\n",
-            r#"{"push":"some.future.kind","result":{"host":"not a summary"}}"#,
+            r#"{"push":"some.future.kind","result":{"host":"not a summary"}}"#, // guardrails-ok(fixture): a prose fragment in a host field, asserting it is not a name
             "\n",
         );
         route_relay_lines("atlas", Cursor::new(wire), &tx, &push_slot, &uplink_tx);

@@ -110,7 +110,21 @@ Two things follow for anyone adding a test here. A platform gate is a claim, not
 
 A test that reads the process cwd, the machine's hostname, or a hardcoded FHS path is asserting about your hopper rather than about flock — it passes for you and fails confusingly for everyone else. The `hermetic-tests` gate enforces this over `tests/` and `#[cfg(test)]` regions; use `guardrails-ok(hermetic): <reason>` for fixture DATA that is parsed rather than executed.
 
-Concretely: derive fixture paths from the fixture's own name (`Workspace::test_new` does this), use `std::env::temp_dir()` when a test just needs *a* directory, pick fixture hostnames that cannot collide with real machines (RFC 2606 reserves `.invalid`), and prefer `/bin/sh` — it is the only `/bin` path POSIX guarantees, and NixOS ships nothing else there. Determinism pins for the test environment belong in `.config/nextest.toml`'s `[env]`, so a bare `cargo nextest run` gets them too, not only `just`.
+Concretely: derive fixture paths from the fixture's own name (`Workspace::test_new` does this), use `std::env::temp_dir()` when a test just needs *a* directory, declare fixture hostnames as fictions (see **Fixture hosts must be declared fictions** below, which gates it), and prefer `/bin/sh` — it is the only `/bin` path POSIX guarantees, and NixOS ships nothing else there. Determinism pins for the test environment belong in `.config/nextest.toml`'s `[env]`, so a bare `cargo nextest run` gets them too, not only `just`.
+
+### Fixture hosts must be declared fictions
+
+This repository is public and it federates a private SSH fleet, so a hostname that reaches a commit is a hostname the world can read. It happened: 92 files and the whole tracker (#510, #511), and then twice more within the hour from ordinary feature commits (#514, #515).
+
+Two gates, with different reach on purpose:
+
+- **`scripts/fixture_hosts.py` (public, binds in CI).** Every *structured* host-shaped string in test code — an ssh destination, a reported host, an origin, a routing endpoint, an `agent_<host>_<suffix>` id — must be declared in `scripts/fixture-hosts.toml` or use an RFC 2606 name. A real machine is undeclared by construction, which is why this rule needs no private data and works for a contributor who has never seen your fleet. Add a label to `[hosts]` with a one-line reason, or put `guardrails-ok(fixture): <reason>` on the line.
+- **`scripts/ssh_hosts_gate.py` (local only, no CI).** Candidates are derived from *this machine's own* ssh state — `~/.ssh/config`, plaintext `known_hosts`, the local hostname, `tailscale` — so it has no false positives to suppress and is the only rule that can judge a **bare** hostname, which the public gate deliberately does not try. It fails open: no ssh state means nothing to check. Nothing it reads is ever written anywhere.
+
+Two consequences worth internalising:
+
+- **A declared fixture host must not also be a registered icon name.** `declared_fixture_hosts_are_not_icon_names` in `src/server_icons.rs` enforces it, because the two vocabularies colliding is how a servers-band row renders a glyph where the test meant a hostname — and how an assertion checking "icon and host agree" silently stops discriminating between them.
+- **Judging bare words in the public gate would be noise**, not safety: host fields legitimately hold `panel`, `status` and `session`. A gate that cries wolf on ordinary words is a gate that gets `--no-verify`'d, and that habit then covers the real leak too.
 
 ### Unit tests can be green while the feature has never run
 

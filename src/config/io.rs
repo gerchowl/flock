@@ -977,11 +977,11 @@ ssh = "kiln-dev"
             r#"
 [[peers]]
 name = "sneaky"
-ssh = "-oProxyCommand=id"
+ssh = "-oProxyCommand=id"  # guardrails-ok(fixture): an ssh OPTION, not a destination — the case #392 exists for
 
 [[peers]]
 name = "spaced"
-ssh = "host with spaces"
+ssh = "host with spaces"  # guardrails-ok(fixture): a destination with a space, rejected before dialling
 
 [[peers]]
 name = "-oProxyCommand=id"
