@@ -1170,9 +1170,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
 
-    use super::super::{
-        state_with_workspaces, unique_temp_path, wait_for_file, wait_for_file_matching,
-    };
+    use super::super::{state_with_workspaces, unique_temp_path, wait_for_file_stable};
     use super::*;
     use crate::{
         app::App, config::Config, input::TerminalKey, terminal::TerminalState, workspace::Workspace,
@@ -2364,11 +2362,11 @@ last_pane = "prefix+tab"
         app.handle_key(TerminalKey::new(KeyCode::Char('m'), KeyModifiers::empty()))
             .await;
 
-        // The command redirects into `output_path`, so the file exists — and reads
-        // empty — for a moment before the three lines land. Wait for the bytes
-        // rather than for the path.
+        // The command redirects into `output_path`, so the file exists — and
+        // reads empty — for a moment before the three lines land. The wait is
+        // for the file to settle; what it should say is asserted below.
         let workspace_id = app.state.workspaces[0].id.clone();
-        let content = wait_for_file_matching(&output_path, |content| content.lines().count() == 3);
+        let content = wait_for_file_stable(&output_path);
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], workspace_id);
@@ -2445,7 +2443,7 @@ last_pane = "prefix+tab"
             Some(overlay_pane)
         );
 
-        let _ = wait_for_file(&output_path);
+        let _ = wait_for_file_stable(&output_path);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if app.drain_internal_events()
@@ -2514,9 +2512,7 @@ last_pane = "prefix+tab"
             None => std::env::remove_var("EDITOR"),
         }
 
-        let content = wait_for_file_matching(&output_path, |content| {
-            content.contains("alpha") && content.contains("beta")
-        });
+        let content = wait_for_file_stable(&output_path);
         assert!(content.contains("alpha"));
         assert!(content.contains("beta"));
         assert_eq!(app.state.mode, Mode::Terminal);

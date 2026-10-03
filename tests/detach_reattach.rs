@@ -122,7 +122,12 @@ fn spawn_server(
 /// The read timeout is what gives `wait_until`'s budget teeth: without one,
 /// `read_line` blocks indefinitely and the enclosing deadline is decorative.
 fn ping_socket(socket_path: &Path) -> Option<String> {
-    const PING_TIMEOUT: Duration = Duration::from_secs(5);
+    /// One second, and deliberately *under* the two seconds
+    /// `wait_until(Duration::from_secs(2), ..)` gives these predicates. The
+    /// timeout exists so that budget is a budget; a probe that can outlast it
+    /// makes the deadline decorative again, which is the defect this function
+    /// was made fallible to fix (#444).
+    const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
     let mut stream = UnixStream::connect(socket_path).ok()?;
     stream.set_read_timeout(Some(PING_TIMEOUT)).ok()?;

@@ -20,8 +20,8 @@ use support::{
     cleanup_test_base, client_handshake, encode_live_handoff_refusal, encode_varint_u16,
     encode_varint_u32, frame_message, read_server_message, register_runtime_dir,
     register_spawned_flock_pid, send_input, send_set_frame_subscription,
-    unregister_spawned_flock_pid, wait_for_file, wait_for_message_variant, wait_for_socket,
-    wait_until,
+    unregister_spawned_flock_pid, wait_for_file, wait_for_message_variant, wait_for_notify_message,
+    wait_for_socket, wait_until,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -166,7 +166,12 @@ fn spawn_server(
 /// failure reports contention as a broken server (#444). See the identically
 /// named helper in `detach_reattach.rs` for the longer note.
 fn ping_socket(socket_path: &Path) -> Option<String> {
-    const PING_TIMEOUT: Duration = Duration::from_secs(5);
+    /// One second, and deliberately *under* the two seconds
+    /// `wait_until(Duration::from_secs(2), ..)` gives these predicates. The
+    /// timeout exists so that budget is a budget; a probe that can outlast it
+    /// makes the deadline decorative again, which is the defect this function
+    /// was made fallible to fix (#444).
+    const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
     let mut stream = UnixStream::connect(socket_path).ok()?;
     stream.set_read_timeout(Some(PING_TIMEOUT)).ok()?;
@@ -1112,10 +1117,6 @@ fn field<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// `ServerMessage::Notify`, by wire index. Spelled out once so the two places
-/// in this test that look for it do not each carry a bare `5`.
-const NOTIFY_VARIANT: u32 = 5;
-
 #[test]
 fn client_receives_notify_on_agent_state_change() {
     // Notification events (sound/toast) are forwarded as
@@ -1130,9 +1131,14 @@ fn client_receives_notify_on_agent_state_change() {
 
     // Enable toast and sound in config so the server produces notifications.
     fs::create_dir_all(config_home.join("flock")).unwrap();
+    // `delay_seconds = 0` so a notification goes out on the transition rather
+    // than behind `[ui.toast]`'s dwell gate (#36). The gate is real behaviour
+    // with its own tests; what is under test here is the notify path, and
+    // leaving the default 1s in made the assertion wait on a timer it does not
+    // name.
     fs::write(
         config_home.join("flock/config.toml"),
-        "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
+        "onboarding = false\n[ui.toast]\nenabled = true\ndelay_seconds = 0\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
@@ -1226,7 +1232,7 @@ fn client_receives_notify_on_agent_state_change() {
     // was still on its way (#444). The helper polls on a short slice to the
     // deadline, which is the behaviour the assertion was written for.
     assert!(
-        wait_for_message_variant(&mut stream, Duration::from_secs(10), NOTIFY_VARIANT)
+        wait_for_notify_message(&mut stream, Duration::from_secs(10), "agent attention")
             .expect("reading the client stream should not error"),
         "client should receive a ServerMessage::Notify after pane.report_agent"
     );
@@ -1278,11 +1284,11 @@ fn client_receives_notify_on_agent_state_change() {
         "server should stay responsive after working state report"
     );
 
-    // The Blocked report above already put a Notify on this stream, and the
-    // Working one may have added another. Both are still buffered, so the
-    // search below would match either of them and pass without the Done sound
-    // ever arriving. Drain them first: nothing after this point can put a
-    // Notify on the stream until the Idle report does.
+    // Drain what the Blocked and Working reports already put on the stream.
+    // This is best-effort hygiene, not the barrier: it stops at the first read
+    // gap, so it cannot prove those Notifies are gone. The barrier is the
+    // message match below — a Blocked or Working Notify says "Request", and
+    // only the Idle transition says "agent done".
     support::drain_messages(&mut stream);
 
     let mut idle_stream = UnixStream::connect(&api_socket).expect("connect to API");
@@ -1294,10 +1300,12 @@ fn client_receives_notify_on_agent_state_change() {
     let mut idle_response = String::new();
     idle_reader.read_line(&mut idle_response).unwrap();
 
-    // Read messages and look for the Done sound notify. The stream was drained
-    // above, so a Notify found here can only be this transition's.
+    // Read messages and look for the Done sound notify. Matched on the message
+    // rather than the variant: every state change on this pane notifies, and
+    // the two earlier reports in this test are still candidates for a
+    // variant-only match.
     assert!(
-        wait_for_message_variant(&mut stream, Duration::from_secs(10), NOTIFY_VARIANT)
+        wait_for_notify_message(&mut stream, Duration::from_secs(10), "agent done")
             .expect("reading the client stream should not error"),
         "client should receive a Sound Notify with 'agent done' when a background pane goes Working to Idle"
     );

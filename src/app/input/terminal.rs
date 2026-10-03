@@ -462,7 +462,7 @@ mod tests {
 
     use super::super::{
         app_for_mouse_test, app_with_visible_float, mouse, numbered_lines_bytes, unique_temp_path,
-        wait_for_file_matching,
+        wait_for_file_stable,
     };
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
@@ -1170,9 +1170,7 @@ mod tests {
             None => std::env::remove_var("EDITOR"),
         }
 
-        let content = wait_for_file_matching(&output_path, |content| {
-            content.contains("alpha") && content.contains("beta")
-        });
+        let content = wait_for_file_stable(&output_path);
         assert!(content.contains("alpha"));
         assert!(content.contains("beta"));
         assert_eq!(app.state.mode, Mode::Terminal);
@@ -1211,7 +1209,7 @@ mod tests {
         ))
         .await;
 
-        let content = wait_for_file_matching(&output_path, |content| content == "direct");
+        let content = wait_for_file_stable(&output_path);
         assert_eq!(content, "direct");
         assert_eq!(app.state.mode, Mode::Terminal);
         let _ = std::fs::remove_file(output_path);

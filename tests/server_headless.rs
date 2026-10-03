@@ -190,17 +190,12 @@ fn client_handshake(
     stream.write_all(&framed).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
-    // Read the framed response.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    if len > 2 * 1024 * 1024 {
-        return Err(format!("oversized response: {len}"));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    // Read the framed response, through `support`'s one reader rather than a
+    // private `read_exact` pair — the Welcome frame is not special, it is the
+    // same length-prefixed wire, and a private copy is how this defect reached
+    // five places in the first place (#444).
+    let grace = support::completion_grace_for(stream);
+    let payload = support::read_framed_payload(stream, grace).map_err(|e| e.to_string())?;
 
     // Decode Welcome: ServerMessage variant 0 = Welcome { version: u32, error: Option<String> }
     decode_welcome(&payload)

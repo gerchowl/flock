@@ -101,48 +101,37 @@ pub(crate) fn unique_temp_path(name: &str) -> PathBuf {
 /// out-of-process effect and have no other signal to synchronize on.
 const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Wait for `path` to exist and return whatever it holds.
-///
-/// Returns on the *first* readable state, which for a file a shell redirects
-/// into is not the finished state: `printf direct > f` truncates first and
-/// writes second, so this can return `""` for a command that ran perfectly
-/// well. Callers asserting on what is inside want
-/// [`wait_for_file_matching`].
-pub(crate) fn wait_for_file(path: &Path) -> String {
-    let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return content;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {}", path.display());
-}
+/// How far apart two reads have to be before agreeing counts as "finished".
+const FILE_SETTLE_GAP: Duration = Duration::from_millis(50);
 
-/// Wait until `path` holds content `ready` accepts, then return that content.
+/// Wait until `path` exists and whatever is writing it has finished, then
+/// return its content.
 ///
-/// The distinction from [`wait_for_file`] is the whole point. Handing the
-/// caller the predicate it is about to assert on means the wait cannot return
-/// mid-write, so a failure here means the output never arrived rather than
-/// that the test happened to look in the gap between a truncating redirect and
-/// the write behind it (#444).
+/// "Finished" means two reads [`FILE_SETTLE_GAP`] apart that agree and are not
+/// empty. "Readable" is not "complete": a redirect truncates before it writes,
+/// and `cp` fills a file in pieces, so stopping at the first successful read
+/// hands back `""` or a prefix for a command that ran perfectly well. That is
+/// the flake this replaces — a `wait_for_file` whose 2 s budget was also too
+/// short for the `/bin/sh -lc` it was waiting on (#444).
 ///
-/// A predicate rather than an expected string because most of these tests
-/// assert on a substring or a line count, and pinning exact bytes would fail
-/// them on formatting they were deliberately not asserting.
-pub(crate) fn wait_for_file_matching(path: &Path, ready: impl Fn(&str) -> bool) -> String {
+/// The assertions stay with the caller on purpose. An earlier version of this
+/// took the caller's assertion as its readiness predicate, which made every
+/// assertion downstream of it provably true; deciding *when the file is done*
+/// is all a wait can know, and *what it should say* is the caller's business.
+pub(crate) fn wait_for_file_stable(path: &Path) -> String {
     let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
     let mut last_seen: Option<String> = None;
     while Instant::now() < deadline {
-        match std::fs::read_to_string(path) {
-            Ok(content) if ready(&content) => return content,
-            Ok(content) => last_seen = Some(content),
-            Err(_) => {}
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if !content.is_empty() && last_seen.as_deref() == Some(content.as_str()) {
+                return content;
+            }
+            last_seen = Some(content);
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(FILE_SETTLE_GAP);
     }
     panic!(
-        "timed out waiting for {}, last saw {:?}",
+        "timed out waiting for {} to settle, last saw {:?}",
         path.display(),
         last_seen.unwrap_or_default()
     );

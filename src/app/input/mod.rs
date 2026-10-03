@@ -697,4 +697,4 @@ fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> 
 // `test_support` already owned, and a second copy is how a fix to one seam
 // quietly stops covering the other (#402).
 #[cfg(test)]
-use crate::test_support::{unique_temp_path, wait_for_file, wait_for_file_matching};
+use crate::test_support::{unique_temp_path, wait_for_file_stable};
