@@ -16,7 +16,7 @@ url: https://github.com/gerchowl/herdr/pull/97
 # fix(sidebar): solo local rows carry the project identity (#92)
 
 ## Summary
-- Solo local workspaces (one local member, no remote folds, no group) used to render as bare member grammar (`mba22:keyboard-shorcuts #17`) with no project identity anywhere on the row. They now adopt the solo-remote form #81 already produces: `<icon> <owner/repo> · <server>:<branch> [#PR]` — identity first, locator second, one line, no synthetic group.
+- Solo local workspaces (one local member, no remote folds, no group) used to render as bare member grammar (`hopper:keyboard-shorcuts #17`) with no project identity anywhere on the row. They now adopt the solo-remote form #81 already produces: `<icon> <owner/repo> · <server>:<branch> [#PR]` — identity first, locator second, one line, no synthetic group.
 - A new `grammar::solo_local_label` is the single formatter; it mirrors the shape `remote_entry_label` returns for lone remote checkouts. The sidebar render picks it for unindented non-leader rows. Leaders (≥2 local members) and indented member rows are untouched, so a second member (worktree add or remote fold) graduates to the existing leader+members form automatically.
 - Unresolved identity falls back to the workspace display label alone — never bare `<server>:<branch>`, which would read like a member of an absent group.
 

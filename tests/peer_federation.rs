@@ -32,7 +32,7 @@ const VARIANT_SWITCH_SERVER: u32 = 9;
 /// The origin host label the binary pins at slot 0, computed the same way as
 /// `app::api::peers::short_host_name` (macOS `scutil` LocalHostName, else the
 /// `hostname` base). Keeps the home-row assertion portable across dev machines
-/// and CI runners — it was previously hardcoded to one laptop's `mba22`.
+/// and CI runners — it was previously hardcoded to one machine's own hostname.
 fn local_short_host() -> String {
     if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
         let name = name.trim();
@@ -242,9 +242,9 @@ fn frame_rows(frame: &FrameWire) -> Vec<String> {
 /// group MEMBER (>= 2 leading spaces), then return its 0-based row index.
 ///
 /// Since the restyle's uniform `<server>:<target>` grammar (#62) the LOCAL
-/// section-head row also reads `host:branch` (e.g. ` ○ mba22:main`), so a bare
+/// section-head row also reads `host:branch` (e.g. ` ○ hopper:main`), so a bare
 /// `starts_with(whitespace)` no longer distinguishes it from the folded REMOTE
-/// member (`   ○ mba22:main`). The remote row folds UNDER the group as an
+/// member (`   ○ hopper:main`). The remote row folds UNDER the group as an
 /// indented member, carrying the deeper 3-space member indent — this matches on
 /// that member-level indent so the click lands on the remote card, not the
 /// local head.
@@ -513,7 +513,7 @@ fn folded_remote_member_row_click_switches_server() {
     // branch so its folded remote member row is uniquely identifiable: since
     // #153 the local checkout is ALSO an indented member under the project
     // header (not an unindented leader), so both members would otherwise read
-    // the same `mba22:main` in this single-host harness. B on `peerwork` gives
+    // the same `hopper:main` in this single-host harness. B on `peerwork` gives
     // the remote row a `:peerwork` tail the local `:main` row can't collide on.
     let repo_b = base.join("shared-b");
     init_repo_with_origin(&repo_b, shared_origin);
@@ -581,7 +581,7 @@ fn folded_remote_member_row_click_switches_server() {
     // local checkout and the peer both render as INDENTED members (>= 2 leading
     // spaces) beneath it — the local is no longer an unindented leader. Both
     // read `<host>:<branch>` (#62 uniform grammar) and, in this single-host
-    // harness, the same `mba22` host — so we key on B's DISTINCT `:peerwork`
+    // harness, the same `hopper` host — so we key on B's DISTINCT `:peerwork`
     // branch tail to land on the REMOTE member and not the local `:main` row.
     // It appears once the peer's workspace summary lands (second poll).
     let row = wait_for_indented_peer_row(&mut stream, ":peerwork", Duration::from_secs(60))

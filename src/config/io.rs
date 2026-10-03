@@ -870,8 +870,8 @@ stop_transcript_wait_ms = 250
 
     #[test]
     fn load_live_config_reads_top_level_node_name() {
-        let loaded = load_live_config_from_str("name = \"mba22\"\n").unwrap();
-        assert_eq!(loaded.config.name, "mba22");
+        let loaded = load_live_config_from_str("name = \"hopper\"\n").unwrap();
+        assert_eq!(loaded.config.name, "hopper");
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert!(loaded.invalid_sections.is_empty());
     }
@@ -880,8 +880,8 @@ stop_transcript_wait_ms = 250
     fn load_live_config_reads_top_level_icon() {
         // Regression: #164 self-icon parsed nowhere, so the field stayed None
         // and no node ever gossiped an icon.
-        let loaded = load_live_config_from_str("icon = \"laptop\"\n").unwrap();
-        assert_eq!(loaded.config.icon.as_deref(), Some("laptop"));
+        let loaded = load_live_config_from_str("icon = \"hopper\"\n").unwrap();
+        assert_eq!(loaded.config.icon.as_deref(), Some("hopper"));
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert!(loaded.invalid_sections.is_empty());
     }
@@ -896,11 +896,11 @@ stop_transcript_wait_ms = 250
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
         std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
-        std::fs::write(&overlay, "icon = \"laptop\"\n").unwrap();
+        std::fs::write(&overlay, "icon = \"hopper\"\n").unwrap();
 
         let loaded = load_live_config_with_base(&base);
 
-        assert_eq!(loaded.config.icon.as_deref(), Some("laptop"));
+        assert_eq!(loaded.config.icon.as_deref(), Some("hopper"));
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
@@ -914,11 +914,11 @@ stop_transcript_wait_ms = 250
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
         std::fs::write(&base, "[ui]\nsidebar_row_gap = 1\n").unwrap();
-        std::fs::write(&overlay, "name = \"ksb\"\n").unwrap();
+        std::fs::write(&overlay, "name = \"node-b\"\n").unwrap();
 
         let loaded = load_live_config_with_base(&base);
 
-        assert_eq!(loaded.config.name, "ksb");
+        assert_eq!(loaded.config.name, "node-b");
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 
@@ -927,22 +927,19 @@ stop_transcript_wait_ms = 250
         let loaded = load_live_config_from_str(
             r#"
 [[peers]]
-name = "anvil"
+name = "kiln"
 
 [[peers]]
-name = "sage"
-ssh = "sage.tail22bd7c.ts.net"
+name = "atlas"
+ssh = "atlas.tail1234.ts.net"
 "#,
         )
         .unwrap();
 
         assert_eq!(loaded.config.peers.len(), 2);
-        assert_eq!(loaded.config.peers[0].name, "anvil");
-        assert_eq!(loaded.config.peers[0].ssh_target(), "anvil");
-        assert_eq!(
-            loaded.config.peers[1].ssh_target(),
-            "sage.tail22bd7c.ts.net"
-        );
+        assert_eq!(loaded.config.peers[0].name, "kiln");
+        assert_eq!(loaded.config.peers[0].ssh_target(), "kiln");
+        assert_eq!(loaded.config.peers[1].ssh_target(), "atlas.tail1234.ts.net");
         assert!(loaded.diagnostics.is_empty());
     }
 
@@ -954,17 +951,17 @@ ssh = "sage.tail22bd7c.ts.net"
 ssh = "nameless"
 
 [[peers]]
-name = "anvil"
+name = "kiln"
 
 [[peers]]
-name = "anvil"
-ssh = "anvil-dev"
+name = "kiln"
+ssh = "kiln-dev"
 "#,
         )
         .unwrap();
 
         assert_eq!(loaded.config.peers.len(), 1);
-        assert_eq!(loaded.config.peers[0].ssh_target(), "anvil");
+        assert_eq!(loaded.config.peers[0].ssh_target(), "kiln");
         assert_eq!(loaded.diagnostics.len(), 2);
         assert!(loaded.diagnostics[0].contains("missing name"));
         assert!(loaded.diagnostics[1].contains("duplicate"));
@@ -990,7 +987,7 @@ ssh = "host with spaces"
 name = "-oProxyCommand=id"
 
 [[peers]]
-name = "anvil"
+name = "kiln"
 "#,
         )
         .unwrap();
@@ -1003,7 +1000,7 @@ name = "anvil"
             .iter()
             .map(|peer| peer.ssh_target())
             .collect();
-        assert_eq!(targets, vec!["anvil"]);
+        assert_eq!(targets, vec!["kiln"]);
         assert_eq!(loaded.diagnostics.len(), 3, "{:?}", loaded.diagnostics);
         assert!(
             loaded
@@ -1029,11 +1026,11 @@ name = "anvil"
             r#"
 [[peers]]
 name = "loop"
-ssh = "lars@[fe80::1]:2222"
+ssh = "operator@[fe80::1]:2222"
 
 [[peers]]
 name = "ported"
-ssh = "lars@anvil.tail22bd7c.ts.net:22"
+ssh = "operator@kiln.tail1234.ts.net:22"
 "#,
         )
         .unwrap();
@@ -1096,7 +1093,7 @@ onboarding = false
 delivery = "flock"
 
 [[peers]]
-name = "anvil"
+name = "kiln"
 "#,
         )
         .unwrap();
@@ -1387,8 +1384,8 @@ mouse_capture = false
         let dir = unique_test_dir("flock-overlay-peers");
         let base = dir.join("config.toml");
         let overlay = dir.join("config.local.toml");
-        std::fs::write(&base, "[[peers]]\nname = \"anvil\"\n").unwrap();
-        std::fs::write(&overlay, "[[peers]]\nname = \"sage\"\n").unwrap();
+        std::fs::write(&base, "[[peers]]\nname = \"kiln\"\n").unwrap();
+        std::fs::write(&overlay, "[[peers]]\nname = \"atlas\"\n").unwrap();
 
         let loaded = load_live_config_with_base(&base);
 
@@ -1398,7 +1395,7 @@ mouse_capture = false
             .iter()
             .map(|p| p.name.as_str())
             .collect();
-        assert_eq!(names, vec!["anvil", "sage"], "overlay peers should append");
+        assert_eq!(names, vec!["kiln", "atlas"], "overlay peers should append");
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
     }
 

@@ -35,7 +35,7 @@ Makes Claude Code awkward to use inside herdr for any flow that needs pasting (U
 
 ## Versions / environment
 - herdr `0.6.8-fork.27beb41`
-- macOS `26.4`, Apple Silicon (mba22)
+- macOS `26.4`, Apple Silicon (hopper)
 - Terminal: Alacritty
 - `TERM=xterm-256color`
 - Shell: zsh

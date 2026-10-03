@@ -736,27 +736,27 @@ mod tests {
     #[test]
     fn warm_all_targets_dedup_home_first_and_capped() {
         let targets = warm_all_targets(
-            &["anvil".into(), "sage".into()],
-            &["sage".into(), "<home>".into(), "mba".into()],
+            &["kiln".into(), "atlas".into()],
+            &["atlas".into(), "<home>".into(), "bastion".into()],
             8,
         );
         assert_eq!(
             targets,
-            vec![SlotTarget::Home, ssh("anvil"), ssh("sage"), ssh("mba")]
+            vec![SlotTarget::Home, ssh("kiln"), ssh("atlas"), ssh("bastion")]
         );
 
         // Cap of 2 keeps home + one peer.
-        let capped = warm_all_targets(&["anvil".into(), "sage".into()], &[], 2);
-        assert_eq!(capped, vec![SlotTarget::Home, ssh("anvil")]);
+        let capped = warm_all_targets(&["kiln".into(), "atlas".into()], &[], 2);
+        assert_eq!(capped, vec![SlotTarget::Home, ssh("kiln")]);
     }
 
     #[test]
     fn new_registry_makes_home_active_and_rest_cold() {
-        let reg = SlotRegistry::new(SlotTarget::Home, vec![ssh("anvil"), ssh("sage")], 8);
+        let reg = SlotRegistry::new(SlotTarget::Home, vec![ssh("kiln"), ssh("atlas")], 8);
         assert_eq!(reg.active_target(), Some(&SlotTarget::Home));
         assert_eq!(reg.phase(&SlotTarget::Home), Some(SlotPhase::Active));
         assert_eq!(
-            reg.phase(&ssh("anvil")),
+            reg.phase(&ssh("kiln")),
             Some(SlotPhase::Cold { failed_at: None })
         );
     }
@@ -935,28 +935,28 @@ mod tests {
         let (home_local, mut home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
             test_conn(SlotTarget::Home, home_local),
-            vec![ssh("anvil")],
+            vec![ssh("kiln")],
             8,
         );
 
-        // Warm the anvil slot with its own socketpair; add_warm pauses it.
+        // Warm the kiln slot with its own socketpair; add_warm pauses it.
         let (anvil_local, mut anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(test_conn(ssh("anvil"), anvil_local))
+            .add_warm(test_conn(ssh("kiln"), anvil_local))
             .unwrap();
-        // anvil received a pause on warm registration.
+        // kiln received a pause on warm registration.
         assert_eq!(
             read_one_client_message(&mut anvil_peer),
             ClientMessage::SetFrameSubscription { enabled: false }
         );
 
-        // Flip to anvil: returns its stream (in-process swap, no relaunch).
-        let new_stream = manager.flip_to(&ssh("anvil")).unwrap();
+        // Flip to kiln: returns its stream (in-process swap, no relaunch).
+        let new_stream = manager.flip_to(&ssh("kiln")).unwrap();
         assert!(
             new_stream.is_some(),
             "warm flip must return a stream to rebind input, not fall back to dial"
         );
-        // home (old active) was paused; anvil (new active) was resumed.
+        // home (old active) was paused; kiln (new active) was resumed.
         assert_eq!(
             read_one_client_message(&mut home_peer),
             ClientMessage::SetFrameSubscription { enabled: false }
@@ -965,7 +965,7 @@ mod tests {
             read_one_client_message(&mut anvil_peer),
             ClientMessage::SetFrameSubscription { enabled: true }
         );
-        assert_eq!(manager.registry.active_target(), Some(&ssh("anvil")));
+        assert_eq!(manager.registry.active_target(), Some(&ssh("kiln")));
 
         // Switching BACK to home must ALSO be an instant flip (home stayed
         // warm), not a respawn — the previous server is still a held slot.
@@ -995,11 +995,11 @@ mod tests {
 
     #[test]
     fn route_stale_frame_from_old_slot_is_dropped() {
-        // The load-bearing apply-time check: after a flip to "anvil", a frame
+        // The load-bearing apply-time check: after a flip to "kiln", a frame
         // the OLD home reader had already queued arrives tagged "<home>". It is
         // dropped, not painted over the new active slot's redraw (blocker 2).
         assert_eq!(
-            route_slot_event(HOME_SWITCH_TARGET, "anvil", false),
+            route_slot_event(HOME_SWITCH_TARGET, "kiln", false),
             SlotRouting::Drop
         );
     }
@@ -1009,7 +1009,7 @@ mod tests {
         // A non-active slot's lifecycle death (reader disconnect / ServerShutdown)
         // demotes that slot — it never tears the active session down (blocker 1).
         assert_eq!(
-            route_slot_event("anvil", HOME_SWITCH_TARGET, true),
+            route_slot_event("kiln", HOME_SWITCH_TARGET, true),
             SlotRouting::DemoteDead
         );
     }
@@ -1018,7 +1018,7 @@ mod tests {
     fn route_active_slot_death_applies_connection_lost() {
         // The active slot's death routes to Apply — the loop then returns
         // ConnectionLost, today's semantics for the slot driving the terminal.
-        assert_eq!(route_slot_event("anvil", "anvil", true), SlotRouting::Apply);
+        assert_eq!(route_slot_event("kiln", "kiln", true), SlotRouting::Apply);
     }
 
     /// A warm slot's transport dying (its socketpair peer closes) must demote
@@ -1032,26 +1032,26 @@ mod tests {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
             test_conn(SlotTarget::Home, home_local),
-            vec![ssh("anvil")],
+            vec![ssh("kiln")],
             8,
         );
-        // Warm anvil over its own socketpair.
+        // Warm kiln over its own socketpair.
         let (anvil_local, anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(test_conn(ssh("anvil"), anvil_local))
+            .add_warm(test_conn(ssh("kiln"), anvil_local))
             .unwrap();
-        assert_eq!(manager.registry.phase(&ssh("anvil")), Some(SlotPhase::Warm));
+        assert_eq!(manager.registry.phase(&ssh("kiln")), Some(SlotPhase::Warm));
 
         // Kill the warm slot's transport: drop its peer end (EOF on the reader).
         drop(anvil_peer);
         // The loop's reaction to that reader's ServerDisconnected:
         let died_at = Instant::now();
-        manager.handle_dead(&ssh("anvil"), died_at);
+        manager.handle_dead(&ssh("kiln"), died_at);
 
         // The warm slot is demoted to cold (stamped for breaker backoff); the
         // ACTIVE (home) slot is intact — the session did NOT tear down.
         assert_eq!(
-            manager.registry.phase(&ssh("anvil")),
+            manager.registry.phase(&ssh("kiln")),
             Some(SlotPhase::Cold {
                 failed_at: Some(died_at)
             })
@@ -1059,8 +1059,8 @@ mod tests {
         assert_eq!(manager.registry.active_target(), Some(&SlotTarget::Home));
         // A later switch to the dead slot re-dials it (cold fallback).
         assert_eq!(
-            manager.registry.request_switch(&ssh("anvil")),
-            SwitchOutcome::ColdDial(ssh("anvil"))
+            manager.registry.request_switch(&ssh("kiln")),
+            SwitchOutcome::ColdDial(ssh("kiln"))
         );
     }
 
@@ -1073,24 +1073,24 @@ mod tests {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
             test_conn(SlotTarget::Home, home_local),
-            vec![ssh("anvil")],
+            vec![ssh("kiln")],
             8,
         );
         // Active slot: connected. Cold/unknown peers: not.
         assert!(manager.has_connection(&SlotTarget::Home));
-        assert!(!manager.has_connection(&ssh("anvil")));
+        assert!(!manager.has_connection(&ssh("kiln")));
         assert!(!manager.has_connection(&ssh("never-registered")));
 
         // Warming a slot gives it a connection.
         let (anvil_local, _anvil_peer) = UnixStream::pair().unwrap();
         manager
-            .add_warm(test_conn(ssh("anvil"), anvil_local))
+            .add_warm(test_conn(ssh("kiln"), anvil_local))
             .unwrap();
-        assert!(manager.has_connection(&ssh("anvil")));
+        assert!(manager.has_connection(&ssh("kiln")));
 
         // A demoted (dead) slot loses its connection, so a re-dial may re-add it.
-        manager.handle_dead(&ssh("anvil"), Instant::now());
-        assert!(!manager.has_connection(&ssh("anvil")));
+        manager.handle_dead(&ssh("kiln"), Instant::now());
+        assert!(!manager.has_connection(&ssh("kiln")));
     }
 
     #[test]
@@ -1098,11 +1098,11 @@ mod tests {
         let (home_local, _home_peer) = UnixStream::pair().unwrap();
         let mut manager = SlotManager::new(
             test_conn(SlotTarget::Home, home_local),
-            vec![ssh("anvil")],
+            vec![ssh("kiln")],
             8,
         );
-        // anvil is cold (never warmed): flip falls back to the dial/leg path.
-        assert!(manager.flip_to(&ssh("anvil")).unwrap().is_none());
+        // kiln is cold (never warmed): flip falls back to the dial/leg path.
+        assert!(manager.flip_to(&ssh("kiln")).unwrap().is_none());
     }
 
     // --- SlotWriter actor (#176): the per-peer write bulkhead ---

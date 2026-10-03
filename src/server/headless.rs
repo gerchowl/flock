@@ -4257,11 +4257,11 @@ mod tests {
         let (writer_b, _control_b, _render_b) = test_client_writer();
 
         let fleet = protocol::FleetSnapshot {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
-                name: "anvil".to_string(),
-                ssh_target: "lars@anvil".to_string(),
-                host: Some("anvil".to_string()),
+                name: "kiln".to_string(),
+                ssh_target: "operator@kiln".to_string(),
+                host: Some("kiln".to_string()),
                 version: None,
                 protocol: None,
                 system: None,
@@ -4295,9 +4295,9 @@ mod tests {
             .fleet_snapshot
             .as_ref()
             .expect("carried snapshot stored for the sidebar");
-        assert_eq!(snapshot.origin, "mba22");
+        assert_eq!(snapshot.origin, "hopper");
         assert_eq!(snapshot.peers.len(), 1);
-        assert_eq!(snapshot.peers[0].ssh_target, "lars@anvil");
+        assert_eq!(snapshot.peers[0].ssh_target, "operator@kiln");
 
         // A later origin-less app attach clears it: no stale home row.
         assert!(server.handle_server_event(ServerEvent::ClientConnected {
@@ -4322,7 +4322,7 @@ mod tests {
         let mut server = test_headless_server();
         let (writer_a, _control_a, _render_a) = test_client_writer();
         server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: Vec::new(),
             origin_summary: None,
             received_at: Instant::now(),
@@ -4453,13 +4453,13 @@ mod tests {
             direct_attach_requested: false,
             fleet: None,
             host_theme: None,
-            notice: Some("switch to sage failed: connection refused".to_string()),
+            notice: Some("switch to atlas failed: connection refused".to_string()),
             writer,
         }));
 
         assert_eq!(
             server.app.state.action_notice.as_deref(),
-            Some("switch to sage failed: connection refused"),
+            Some("switch to atlas failed: connection refused"),
             "the launcher's failed-switch notice must render top-right"
         );
     }
@@ -4483,18 +4483,21 @@ mod tests {
             direct_attach_requested: false,
             fleet: None,
             host_theme: None,
-            notice: Some("switch to lars@sage failed: auth refused".to_string()),
+            notice: Some("switch to operator@atlas failed: auth refused".to_string()),
             writer,
         }));
 
         assert_eq!(
-            server.app.state.switch_failures.get("lars@sage"),
+            server.app.state.switch_failures.get("operator@atlas"),
             Some(&crate::peers::SshFailureReason::AuthRefused),
             "the reason goes on that host's row"
         );
         let filed: Vec<_> = server.app.state.notifications.newest_first().collect();
         assert_eq!(filed.len(), 1, "one notification filed");
-        assert_eq!(filed[0].title, "switch to lars@sage failed: auth refused");
+        assert_eq!(
+            filed[0].title,
+            "switch to operator@atlas failed: auth refused"
+        );
         assert_eq!(
             filed[0].source,
             crate::api::schema::NotificationSource::Fleet
@@ -4509,13 +4512,13 @@ mod tests {
     fn a_fleet_failure_record_is_masked_and_stripped() {
         let mut server = test_headless_server();
         server.app.note_fleet_failure_notice(
-            "switch to sage failed: token ghp_abcdefghijklmnopqrstuvwxyz0123 \u{1b}[31mred",
+            "switch to atlas failed: token ghp_abcdefghijklmnopqrstuvwxyz0123 \u{1b}[31mred",
         );
         let filed: Vec<_> = server.app.state.notifications.newest_first().collect();
         assert_eq!(filed.len(), 1);
         assert!(!filed[0].title.contains("ghp_"), "{}", filed[0].title);
         assert!(!filed[0].title.contains('\u{1b}'), "{:?}", filed[0].title);
-        assert!(filed[0].title.starts_with("switch to sage failed:"));
+        assert!(filed[0].title.starts_with("switch to atlas failed:"));
     }
 
     /// A direct terminal attach is not an app leg — it must never raise the
@@ -4536,7 +4539,7 @@ mod tests {
             direct_attach_requested: true,
             fleet: None,
             host_theme: None,
-            notice: Some("switch to sage failed: boom".to_string()),
+            notice: Some("switch to atlas failed: boom".to_string()),
             writer,
         }));
 
@@ -7878,7 +7881,7 @@ next_tab = ""
         // #434: a notice armed on the server being left must not greet the
         // operator when they come back inside its window.
         let (mut server, _control_rx, _render_rx) = window_title_test_server();
-        server.app.show_action_notice("switching to sage…");
+        server.app.show_action_notice("switching to atlas…");
 
         server.handle_server_event(ServerEvent::ClientSetFrameSubscription {
             client_id: 1,
@@ -7897,7 +7900,7 @@ next_tab = ""
     fn dispatching_a_switch_clears_the_leaving_servers_notice() {
         let (mut server, _control_rx, _render_rx) = window_title_test_server();
         server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: Vec::new(),
             origin_summary: None,
             received_at: Instant::now(),
@@ -7929,7 +7932,7 @@ next_tab = ""
             ),
         );
         server.app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: Vec::new(),
             origin_summary: None,
             received_at: Instant::now(),

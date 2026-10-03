@@ -11,8 +11,8 @@ This is flock's first ADR; it seeds `docs/adr/` with sequential numbering.
 ## Context
 
 We want a phone (browser) to view the flock fleet via a web terminal served
-over the tailnet, hosted on an always-on machine (e.g. sage) so it works even
-when the laptop is off. An MVP existed out-of-tree (g-fleet `pkgs/flock-web/`:
+over the tailnet, hosted on an always-on machine (e.g. atlas) so it works even
+when the hopper is off. An MVP existed out-of-tree (g-fleet `pkgs/flock-web/`:
 an axum + portable-pty WS bridge spawning a `flock` client with
 `FLOCK_RENDER_ENCODING=terminal-ansi`). The decision was where this belongs and
 how it should be shaped, given flock's existing client/server/gossip design.
@@ -37,7 +37,7 @@ Key facts established during the spike (file:line in the issues):
    just another client.** On an always-on host, run one persistent `flock server`
    daemon (it owns the gossip). `flock web` spawns a `flock` client per WS that
    attaches to that daemon. A phone over `tailscale serve` therefore shares that
-   node's live session *and* its fleet view, independently of the laptop. The TUI,
+   node's live session *and* its fleet view, independently of the hopper. The TUI,
    if also run there, attaches to the same server as a peer client.
 
 2. **Server-attach model — persistent, not ephemeral-per-WS.** Ephemeral
@@ -52,7 +52,7 @@ Key facts established during the spike (file:line in the issues):
    the PTY-per-connection ceiling, but it reimplements non-trivial client logic.
 
 4. **15s gossip cadence accepted for v1.** The phone's view of its *attached*
-   node is instant (render stream); only cross-fleet rows (e.g. "is the laptop
+   node is instant (render stream); only cross-fleet rows (e.g. "is the hopper
    up") lag ≤15s + staleness, which is fine for a glance. A faster poll or
    push-on-change is a fleet-wide change with real blast radius and is explicitly
    out of scope; if needed, the smallest correct step is a client-initiated peer

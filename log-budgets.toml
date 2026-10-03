@@ -32,7 +32,7 @@ event_field = "event"
 default_max_pct = 100.0
 
 # --- NOISE: the two events that actually regressed --------------------------
-# Measured on mba22 (2026-08-18, all rotations) BEFORE the #318 fix:
+# Measured on hopper (2026-08-18, all rotations) BEFORE the #318 fix:
 #   flock-client.log   16,468 records, 93.3% one event: client.tick   (INFO)
 #   flock-server.log    7,965 records, 98.9% process.exec             (INFO)
 # and worse on later rotations — 99.8% / 99.9% of 61,014 / 52,317 records.
@@ -59,7 +59,7 @@ mode = "gate"
 
 # `peer.dial.*` (#418) is deliberately NOT declared either, for the same
 # reason: the capture has no peers, so it never dials one. The defect it
-# guards is the one mba22 hit — every poll to every peer failing, one WARN per
+# guards is the one hopper hit — every poll to every peer failing, one WARN per
 # poll, 2,229 a day. The fix is structural (WARN on the onset, a change of
 # reason, and one `peer.dial.still_failing` summary per
 # `[gossip] dial_failure_summary_secs`; DEBUG otherwise), pinned by

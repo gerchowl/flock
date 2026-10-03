@@ -4504,17 +4504,17 @@ mod tests {
 
     #[test]
     fn the_first_title_of_a_session_saves_the_host_title_first() {
-        let sequence = host_window_title_sequence("main \u{00b7} mba22 \u{2014} flk", true, false);
+        let sequence = host_window_title_sequence("main \u{00b7} hopper \u{2014} flk", true, false);
         assert!(
             sequence.starts_with(crate::terminal_notify::PUSH_WINDOW_TITLE),
             "the first publish pushes the title stack so exit can hand it back"
         );
         // Every later publish is the title alone.
-        let later = host_window_title_sequence("main \u{00b7} mba22 \u{2014} flk", false, false);
+        let later = host_window_title_sequence("main \u{00b7} hopper \u{2014} flk", false, false);
         assert!(!later.starts_with(crate::terminal_notify::PUSH_WINDOW_TITLE));
         assert_eq!(
             later,
-            crate::terminal_notify::set_window_title_sequence("main \u{00b7} mba22 \u{2014} flk")
+            crate::terminal_notify::set_window_title_sequence("main \u{00b7} hopper \u{2014} flk")
         );
     }
 
@@ -4686,11 +4686,11 @@ mod tests {
 
         // A switch with a carried snapshot survives the file round-trip.
         let fleet = protocol::FleetSnapshot {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
-                name: "anvil".to_string(),
-                ssh_target: "lars@anvil".to_string(),
-                host: Some("anvil".to_string()),
+                name: "kiln".to_string(),
+                ssh_target: "operator@kiln".to_string(),
+                host: Some("kiln".to_string()),
                 version: None,
                 protocol: None,
                 system: None,
@@ -4705,7 +4705,7 @@ mod tests {
             origin_summary: None,
         };
         let recorded = RecordedSwitch {
-            target: "lars@sage".to_string(),
+            target: "operator@atlas".to_string(),
             fleet: Some(fleet),
             focus_workspace: None,
             proxy_jump: None,
@@ -4729,9 +4729,9 @@ mod tests {
         assert!(taken.fleet.is_none());
 
         // Defensive bare-target fallback.
-        std::fs::write(&path, "lars@anvil\n").unwrap();
+        std::fs::write(&path, "operator@kiln\n").unwrap();
         let taken = take_switch_target(&path).expect("bare target parsed");
-        assert_eq!(taken.target, "lars@anvil");
+        assert_eq!(taken.target, "operator@kiln");
         assert!(taken.fleet.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4745,11 +4745,11 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _notice = EnvVarGuard::set(SWITCH_NOTICE_ENV_VAR, "switch to sage failed: boom");
+        let _notice = EnvVarGuard::set(SWITCH_NOTICE_ENV_VAR, "switch to atlas failed: boom");
 
         assert_eq!(
             take_attach_notice().as_deref(),
-            Some("switch to sage failed: boom")
+            Some("switch to atlas failed: boom")
         );
         // Consumed: a second read (a handshake retry) sees nothing.
         assert!(take_attach_notice().is_none());
@@ -4787,9 +4787,9 @@ mod tests {
             crate::remote::FLEET_SNAPSHOT_ENV_VAR,
             &serde_json::to_string(&env_snap).unwrap(),
         );
-        let hub = sample_snapshot("mba22");
+        let hub = sample_snapshot("hopper");
         let resolved = resolve_handshake_fleet(Some(&hub)).expect("override carried");
-        assert_eq!(resolved.origin, "mba22", "explicit override wins over env");
+        assert_eq!(resolved.origin, "hopper", "explicit override wins over env");
     }
 
     /// With no override (the initial attach / legs path), the env carry is the
@@ -4894,7 +4894,7 @@ mod tests {
         });
 
         // Hub snapshot the slots arm would forward into the next leg.
-        let hub = sample_snapshot("hub-mba22");
+        let hub = sample_snapshot("hub-hopper");
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(4);
 
         spawn_switch_dial(
@@ -4940,7 +4940,7 @@ mod tests {
              reintroducing `let _ = &fleet;` regresses #102 here",
         );
         assert_eq!(
-            fleet.origin, "hub-mba22",
+            fleet.origin, "hub-hopper",
             "slots dial must carry the hub's snapshot, not env (empty) or None"
         );
     }
@@ -5521,13 +5521,13 @@ mod tests {
 
     #[test]
     fn classify_pending_match_routes_to_pending() {
-        let disposition = classify_dial_event(7, "anvil", Some((7, "anvil", false)), None);
+        let disposition = classify_dial_event(7, "kiln", Some((7, "kiln", false)), None);
         assert_eq!(disposition, DialDisposition::Pending);
     }
 
     #[test]
     fn classify_sweep_match_routes_to_sweep() {
-        let disposition = classify_dial_event(3, "sage", None, Some(3));
+        let disposition = classify_dial_event(3, "atlas", None, Some(3));
         assert_eq!(disposition, DialDisposition::Sweep);
     }
 
@@ -5535,7 +5535,7 @@ mod tests {
     fn classify_stale_success_after_cancel_is_dropped() {
         // Cancel bumped pending.gen to 9; an earlier dial's success (gen 7)
         // is stale and MUST drop its stream — never flip the active slot.
-        let disposition = classify_dial_event(7, "anvil", Some((9, "anvil", false)), None);
+        let disposition = classify_dial_event(7, "kiln", Some((9, "kiln", false)), None);
         assert_eq!(disposition, DialDisposition::Stale);
     }
 
@@ -5543,21 +5543,21 @@ mod tests {
     fn classify_stale_failure_during_outcome_beat_is_dropped() {
         // Once the pending switch is in an outcome_beat (cancel / failure),
         // further dial outcomes are stale by construction.
-        let disposition = classify_dial_event(7, "anvil", Some((7, "anvil", true)), None);
+        let disposition = classify_dial_event(7, "kiln", Some((7, "kiln", true)), None);
         assert_eq!(disposition, DialDisposition::Stale);
     }
 
     #[test]
     fn classify_wrong_key_with_matching_gen_is_stale() {
-        // Pending switch is to "anvil"; an event for "sage" with the same
+        // Pending switch is to "kiln"; an event for "atlas" with the same
         // gen never matches.
-        let disposition = classify_dial_event(7, "sage", Some((7, "anvil", false)), None);
+        let disposition = classify_dial_event(7, "atlas", Some((7, "kiln", false)), None);
         assert_eq!(disposition, DialDisposition::Stale);
     }
 
     #[test]
     fn classify_no_pending_no_sweep_is_stale() {
-        let disposition = classify_dial_event(1, "anvil", None, None);
+        let disposition = classify_dial_event(1, "kiln", None, None);
         assert_eq!(disposition, DialDisposition::Stale);
     }
 
@@ -5588,10 +5588,10 @@ mod tests {
 
     #[test]
     fn popup_lines_neutral_window_shows_cancel_subtitle() {
-        let p = make_pending("anvil", 1);
+        let p = make_pending("kiln", 1);
         let now = p.started_at + Duration::from_secs(1);
         let lines = popup_lines(&p, now);
-        assert!(lines[0].contains("switching to anvil"));
+        assert!(lines[0].contains("switching to kiln"));
         assert!(lines[0].contains("1s"));
         assert!(lines[1].contains("[esc] cancel"));
         assert!(lines[1].contains("returns to home"));
@@ -5602,7 +5602,7 @@ mod tests {
 
     #[test]
     fn popup_lines_yellow_at_three_seconds() {
-        let p = make_pending("anvil", 1);
+        let p = make_pending("kiln", 1);
         let now = p.started_at + POPUP_YELLOW_AT;
         let (border, text) = popup_tone_ansi(&p, now);
         assert_eq!(border, "\x1b[33m");
@@ -5611,7 +5611,7 @@ mod tests {
 
     #[test]
     fn popup_lines_unresponsive_at_ten_seconds() {
-        let p = make_pending("anvil", 1);
+        let p = make_pending("kiln", 1);
         let now = p.started_at + POPUP_UNRESPONSIVE_AT;
         let lines = popup_lines(&p, now);
         assert!(lines[1].contains("host not responding"));
@@ -5620,7 +5620,7 @@ mod tests {
 
     #[test]
     fn popup_lines_retry_ending_late_window() {
-        let p = make_pending("anvil", 1);
+        let p = make_pending("kiln", 1);
         let now = p.started_at + POPUP_RETRY_ENDING_AT;
         let lines = popup_lines(&p, now);
         assert!(lines[1].contains("retry window ending soon"));
@@ -5636,7 +5636,7 @@ mod tests {
 
     #[test]
     fn popup_lines_outcome_beat_overrides_live_title() {
-        let mut p = make_pending("anvil", 1);
+        let mut p = make_pending("kiln", 1);
         p.outcome_beat = Some((
             Instant::now() + Duration::from_secs(1),
             "cancelled".to_string(),
@@ -5656,7 +5656,7 @@ mod tests {
     #[test]
     fn cancel_bumps_gen_and_leaves_active_slot_unchanged() {
         let active_slot_key = "<home>".to_string();
-        let mut pending = make_pending("anvil", 7);
+        let mut pending = make_pending("kiln", 7);
         let original_gen = pending.gen;
 
         // Simulate the StdinInput Esc handling: bump gen + beat cancelled.
@@ -5678,7 +5678,7 @@ mod tests {
         // dispatcher must drop it.
         let disposition = classify_dial_event(
             original_gen,
-            "anvil",
+            "kiln",
             Some((
                 pending.gen,
                 pending.target.key(),
@@ -5697,14 +5697,14 @@ mod tests {
     #[test]
     fn rapid_switch_cancel_switch_only_second_pending_matches() {
         // First switch arms gen=1.
-        let mut pending = make_pending("anvil", 1);
+        let mut pending = make_pending("kiln", 1);
         // User hits Esc: gen advances to 2, beat is set.
         pending.gen = 2;
         pending.outcome_beat = Some((Instant::now() + POPUP_CANCEL_BEAT, "cancelled".to_string()));
         // First dial's late success (gen=1) is stale.
         let d1 = classify_dial_event(
             1,
-            "anvil",
+            "kiln",
             Some((
                 pending.gen,
                 pending.target.key(),
@@ -5719,7 +5719,7 @@ mod tests {
         // Second dial's success (gen=3) is the live pending one.
         let d2 = classify_dial_event(
             3,
-            "anvil",
+            "kiln",
             Some((
                 pending.gen,
                 pending.target.key(),
@@ -5731,7 +5731,7 @@ mod tests {
         // First dial's success arriving later (gen=1) is still stale.
         let d3 = classify_dial_event(
             1,
-            "anvil",
+            "kiln",
             Some((
                 pending.gen,
                 pending.target.key(),
@@ -5806,7 +5806,7 @@ mod tests {
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(8);
         let should_quit = Arc::new(AtomicBool::new(false));
-        let target = slots::SlotTarget::Ssh("anvil".to_string());
+        let target = slots::SlotTarget::Ssh("kiln".to_string());
         // The new transport the flip makes active — mirror production: derive the
         // writer handle + a reserved reader clone from one SlotConnection.
         let new_conn =
@@ -5830,7 +5830,7 @@ mod tests {
         .expect("flip should succeed against a live socketpair");
 
         // Active slot key flipped to the new target.
-        assert_eq!(active_slot_key, "anvil");
+        assert_eq!(active_slot_key, "kiln");
         // The new stream is what we get; reading on the new peer should see
         // the Resize re-assert that apply_slot_flip just wrote.
         new_peer
@@ -5865,10 +5865,10 @@ mod tests {
     #[test]
     fn degrade_active_peer_flips_to_home_instead_of_exiting() {
         use std::os::unix::net::UnixStream;
-        // Active = a peer ("anvil"); home is a warm fallback.
+        // Active = a peer ("kiln"); home is a warm fallback.
         let (peer_local, _peer_peer) = UnixStream::pair().unwrap();
         let peer_conn = slots::SlotConnection::new(
-            slots::SlotTarget::Ssh("anvil".to_string()),
+            slots::SlotTarget::Ssh("kiln".to_string()),
             peer_local,
             None,
             Box::new(|| {}),
@@ -5897,7 +5897,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut active_slot_key = "anvil".to_string();
+        let mut active_slot_key = "kiln".to_string();
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
@@ -6118,7 +6118,7 @@ mod tests {
     fn an_explicit_exit_never_reconnects() {
         let rt = reconnect_test_runtime();
         let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let plan = ("sage".to_string(), fast_policy(Duration::from_secs(10)));
+        let plan = ("atlas".to_string(), fast_policy(Duration::from_secs(10)));
         let attached = AttachSignal::default();
         let quit = AtomicBool::new(false);
         for reason in ["detached", "switching", "server quit"] {
@@ -6200,7 +6200,7 @@ mod tests {
     fn a_slots_client_that_flipped_home_never_redials_the_original_remote() {
         let mut config = crate::config::Config::default();
         assert!(
-            remote_reconnect_plan(&config, Some("sage".to_string())).is_some(),
+            remote_reconnect_plan(&config, Some("atlas".to_string())).is_some(),
             "a launcher-leg remote client reconnects"
         );
         assert!(
@@ -6208,7 +6208,7 @@ mod tests {
             "a local leg has no transport to redial"
         );
         config.slots.enabled = true;
-        let plan = remote_reconnect_plan(&config, Some("sage".to_string()));
+        let plan = remote_reconnect_plan(&config, Some("atlas".to_string()));
         assert!(
             plan.is_none(),
             "a slots client never redials the leg bridge"
@@ -6248,7 +6248,7 @@ mod tests {
             max: Duration::from_secs(30),
             deadline: Duration::from_secs(300),
         };
-        let plan = ("sage".to_string(), policy);
+        let plan = ("atlas".to_string(), policy);
         let attached = AttachSignal::default();
         stdin_tx.try_send(b"typed".to_vec()).expect("queue input");
         stdin_tx.try_send(vec![0x1b]).expect("queue Esc");
@@ -6270,7 +6270,7 @@ mod tests {
         assert_eq!(attempts, 1, "Esc during the first wait: no redial");
         match result {
             Err(AttachAttemptError::Session(ClientError::ReconnectGaveUp { target, .. })) => {
-                assert_eq!(target, "sage");
+                assert_eq!(target, "atlas");
             }
             other => panic!(
                 "expected ReconnectGaveUp, got {:?}",
@@ -6288,7 +6288,7 @@ mod tests {
         let rt = reconnect_test_runtime();
         let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let deadline = Duration::from_millis(500);
-        let plan = ("sage".to_string(), fast_policy(deadline));
+        let plan = ("atlas".to_string(), fast_policy(deadline));
         let attached = AttachSignal::default();
         let started = Instant::now();
         let mut attempts = 0u32;
@@ -6333,7 +6333,7 @@ mod tests {
     fn a_refused_redial_ends_the_reconnect() {
         let rt = reconnect_test_runtime();
         let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let plan = ("sage".to_string(), fast_policy(Duration::from_secs(10)));
+        let plan = ("atlas".to_string(), fast_policy(Duration::from_secs(10)));
         let attached = AttachSignal::default();
         let mut attempts = 0u32;
         let result = attach_until_done(

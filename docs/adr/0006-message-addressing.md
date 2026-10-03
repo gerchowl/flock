@@ -16,7 +16,7 @@ binary rename — but the underlying worry is real, because `:` is already
 load-bearing in three grammars:
 
 - public pane ids: `<workspace>:p<n>` (`flock:p1`),
-- fleet member labels: `<server>:<branch>` (`sage:main`),
+- fleet member labels: `<server>:<branch>` (`atlas:main`),
 - agent-source labels: `flock:claude`, matched by target resolution today.
 
 A free-text `<repo>:<pane>` tier layered onto the same flat string that

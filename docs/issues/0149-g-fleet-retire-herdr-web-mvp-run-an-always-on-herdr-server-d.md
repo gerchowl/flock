@@ -1,6 +1,6 @@
 ---
 number: 149
-title: "g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on sage"
+title: "g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas"
 kind: issue
 state: OPEN
 author: gerchowl
@@ -10,7 +10,7 @@ closed:
 url: https://github.com/gerchowl/herdr/issues/149
 ---
 
-# g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on sage
+# g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
 
 Follow-up to #131. The herdr side has landed (`herdr web`, feature-gated, assets embedded). This is the g-fleet (~/dotfiles) side to close #131 acceptance "g-fleet module shrinks to enable + tailscale serve".
 
@@ -23,7 +23,7 @@ Follow-up to #131. The herdr side has landed (`herdr web`, feature-gated, assets
 
 ## Acceptance
 - [ ] `pkgs/herdr-web/` removed; herdr pin built with `--features web`
-- [ ] sage runs a persistent `herdr server` daemon; `herdr web` attaches as a client
+- [ ] atlas runs a persistent `herdr server` daemon; `herdr web` attaches as a client
 - [ ] `modules/herdr-web.nix` is `enable + tailscale serve` only
 
 Refs #131, #109.

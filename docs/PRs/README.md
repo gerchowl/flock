@@ -1,4 +1,4 @@
-# pr archive (gerchowl/herdr) — 86 items
+# pr archive (gerchowl/flock) — 86 items
 
 - [#1](0001-feat-pane-float-the-last-submitted-prompt-over-agent-panes.md) `MERGED` — feat(pane): float the last submitted prompt over agent panes
 - [#2](0002-fix-worktree-close-two-merge-gate-blind-spots.md) `MERGED` — fix(worktree): close two merge-gate blind spots

@@ -365,19 +365,19 @@ The two-step is the whole story:
 ```jsonc
 // 1. flock_agent_list  →  find the agent, wherever it is
 { "fleet": [
-  { "agent_id": "agent_sage_6f21c4", "host": "sage",  "local": false, "route": "sage" },
-  { "agent_id": "agent_mba22_9d0e17", "host": "mba22", "local": true,  "pane_id": "w1:p2" }
+  { "agent_id": "agent_atlas_6f21c4", "host": "atlas",  "local": false, "route": "atlas" },
+  { "agent_id": "agent_hopper_9d0e17", "host": "hopper", "local": true,  "pane_id": "w1:p2" }
 ]}
 
 // 2. flock_msg_send  →  address it by identity
-{ "to": { "type": "agent", "agent": "agent_sage_6f21c4" }, "body": "…" }
+{ "to": { "type": "agent", "agent": "agent_atlas_6f21c4" }, "body": "…" }
 ```
 
 Replies need no addressing at all: `flock_msg_reply` carries the incoming `correlation_id` and the server routes it home by identity.
 
-**Spokes reach each other through the hub.** A fleet is hub-and-spoke: only the hub carries `[[peers]]`, and a spoke holds no key to any other machine. A spoke's message for an agent it cannot reach itself goes *up* the `flk peers relay --push` connection the hub holds into it, the hub delivers it with its ordinary `msg.send`, and the outcome comes back down — so the send result says `"path": "via mba22"` (or `"direct"` when this server dialled the recipient's host itself), and `msg.status` says the same afterwards. Replies take the same way back. The originating agent and host stay the sender; the hub only vouches for which spoke handed the message up, and refuses a spoke that claims to speak for another host. A message crosses at most one hub. Do **not** give spokes `[[peers]]` to make this work — that is the N×N trust the topology exists to avoid.
+**Spokes reach each other through the hub.** A fleet is hub-and-spoke: only the hub carries `[[peers]]`, and a spoke holds no key to any other machine. A spoke's message for an agent it cannot reach itself goes *up* the `flk peers relay --push` connection the hub holds into it, the hub delivers it with its ordinary `msg.send`, and the outcome comes back down — so the send result says `"path": "via hopper"` (or `"direct"` when this server dialled the recipient's host itself), and `msg.status` says the same afterwards. Replies take the same way back. The originating agent and host stay the sender; the hub only vouches for which spoke handed the message up, and refuses a spoke that claims to speak for another host. A message crosses at most one hub. Do **not** give spokes `[[peers]]` to make this work — that is the N×N trust the topology exists to avoid.
 
-A cross-host send is refused, never dropped, and a refusal names the hop that failed: `msg_target_not_found` (no such agent anywhere in the fleet — on a spoke with no hub attached, the message says so), `peer_not_configured` (found it, but this server has no edge to its host and no hub holds a relay to hand it up to), `peer_unreachable` (a hop's ssh dial failed — the message reads `mba22 cannot reach ksb (auth refused): …`, and `data.hop` / `data.reason` carry the same as `connect_refused`, `auth_refused`, `host_key`, `timeout`, `jump_hop_refused`, …), `uplink_timeout` (handed up, but the hub never answered within `[msg] uplink_timeout_secs`; `data.taken_by_hub` says whether a hub ever took it, and a retry with the same `correlation_id` cannot deliver twice), `msg_not_allowed` (the receiver's `[msg] allow_from` declines), `sender_unresolved` (the caller has no attestable identity — a cross-host send must come from inside a pane, which is where an MCP client normally runs).
+A cross-host send is refused, never dropped, and a refusal names the hop that failed: `msg_target_not_found` (no such agent anywhere in the fleet — on a spoke with no hub attached, the message says so), `peer_not_configured` (found it, but this server has no edge to its host and no hub holds a relay to hand it up to), `peer_unreachable` (a hop's ssh dial failed — the message reads `hopper cannot reach node-b (auth refused): …`, and `data.hop` / `data.reason` carry the same as `connect_refused`, `auth_refused`, `host_key`, `timeout`, `jump_hop_refused`, …), `uplink_timeout` (handed up, but the hub never answered within `[msg] uplink_timeout_secs`; `data.taken_by_hub` says whether a hub ever took it, and a retry with the same `correlation_id` cannot deliver twice), `msg_not_allowed` (the receiver's `[msg] allow_from` declines), `sender_unresolved` (the caller has no attestable identity — a cross-host send must come from inside a pane, which is where an MCP client normally runs).
 
 The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
@@ -408,7 +408,7 @@ Tools are not the whole surface. A file dropped on a pane used to reach its agen
 { "resources": [{
   "uri": "flock://handoff/file:1a04ff2c3b:0",
   "name": "client-1-clipboard-1756-0.pdf",
-  "description": "file handed to agent_sage_6f21c4; staged at /tmp/… on this host",
+  "description": "file handed to agent_atlas_6f21c4; staged at /tmp/… on this host",
   "mimeType": "application/pdf",
   "size": 184320
 }]}

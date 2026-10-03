@@ -957,7 +957,7 @@ mod tests {
             custom_status: None,
             header_fields: Vec::new(),
             state_labels: std::collections::HashMap::new(),
-            server: "mba22".into(),
+            server: "hopper".into(),
             icon: None,
             project: Some("flock".into()),
             target: "main".into(),

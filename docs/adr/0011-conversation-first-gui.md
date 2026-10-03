@@ -255,7 +255,7 @@ consumer needed."
    desktop notifications via Tauri. **Prerequisite spike:** WebKit 279904 — the
    on-screen keyboard can fail to appear in standalone iOS PWAs, disqualifying
    for a terminal view. **Config prerequisite:** the attached server defines the
-   fleet view; a phone sees the laptop only if that host lists it in
+   fleet view; a phone sees the hopper only if that host lists it in
    `[[peers]]`, at the ≤15s pull cadence.
 5. **Artifacts**, hostname isolation and the desktop mechanism settled first.
 6. **Typed asks** (Decision 6) and the atomic answer operation.

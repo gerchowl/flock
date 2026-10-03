@@ -228,14 +228,14 @@ pub struct PeerSummaryState {
 
 /// Consecutive poll failures a reason must survive before it is shown on the
 /// peer's row and in `flk peers` (#418): past ONE poll. A single failed dial
-/// is a blip — a laptop changing networks — and labelling it would teach the
+/// is a blip — a hopper changing networks — and labelling it would teach the
 /// operator to ignore the label; two in a row is a state.
 pub const DIAL_FAILURE_PERSISTS_AFTER: u32 = 2;
 
 /// A peer's run of failed polls, and the bookkeeping that keeps its log
 /// honest without flooding it (#418).
 ///
-/// mba22 failed every poll to every peer for five days and wrote the same
+/// hopper failed every poll to every peer for five days and wrote the same
 /// bare WARN 2,229 times a day, which is the same as writing nothing. This
 /// logs the EDGES — the first failure, a change of reason, the recovery — and
 /// one summary per `[gossip] dial_failure_summary_secs` while an unchanged
@@ -441,7 +441,7 @@ impl PeerSummaryState {
     /// The name to DISPLAY for this node (#42): the configured `[[peers]]`
     /// name (validated non-empty), chosen over the peer's self-reported
     /// gethostname (`host`) so a node always shows the name you gave it —
-    /// `anvil`, not a raw OS hostname like `mac-studio-12345.local`.
+    /// `kiln`, not a raw OS hostname like `mac-atlas-12345.local`.
     pub fn display_name(&self) -> &str {
         &self.peer
     }
@@ -607,8 +607,8 @@ pub fn wire_row_identity(row: &crate::api::schema::RelayedFleetPeer) -> String {
 }
 
 /// A host identity every viewer derives the same way (#422): lowercased, any
-/// `user@` prefix dropped, and cut at the first dot so `sage`, `sage.local` and
-/// a tailnet `sage.tail1234.ts.net` are one machine. An IP address is kept
+/// `user@` prefix dropped, and cut at the first dot so `atlas`, `atlas.local` and
+/// a tailnet `atlas.tail1234.ts.net` are one machine. An IP address is kept
 /// whole — cutting it would fold unrelated hosts together.
 pub fn normalized_host_key(raw: &str) -> String {
     let host = raw.rsplit_once('@').map_or(raw, |(_, host)| host).trim();
@@ -787,8 +787,8 @@ fn merge_relayed_rows(
         }
         let host_key = wire_row_identity(&entry);
         // Identity is keyed before the row's names are cleaned, so a host
-        // carrying control bytes (`mba22\x07`) would slip past every exact
-        // comparison and then render as a second `mba22`. No real host has
+        // carrying control bytes (`hopper\x07`) would slip past every exact
+        // comparison and then render as a second `hopper`. No real host has
         // one: drop the row.
         if host_key.chars().any(char::is_control) {
             continue;
@@ -1234,7 +1234,7 @@ impl PeerMessageFailure {
 
     /// The caller-facing message, naming the hop as a whole — which machine
     /// failed to reach which, and how (#410). Once a message can cross a hub,
-    /// "could not reach ksb" no longer says enough: the reader needs to know it
+    /// "could not reach node-b" no longer says enough: the reader needs to know it
     /// was the HUB that could not, so it is not chasing the spoke's own network.
     pub fn hop_message(&self, from: &str, host: &str, reason: SshFailureReason) -> String {
         match self {
@@ -1541,7 +1541,7 @@ fn peer_message_command(
     // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
     // closes the outer quote and the shell then word-splits the message. A
     // live cross-host send arrived as "cross-machine" instead of
-    // "cross-machine hello from sage" for exactly that reason.
+    // "cross-machine hello from atlas" for exactly that reason.
     //
     // So: build the inner command with the body quoted, then quote the whole
     // inner command once more for `sh -lc`. Nesting handled by the same POSIX
@@ -1567,7 +1567,7 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
 /// `ControlMaster=no` + `ControlPath=none` (#418) make each dial its own
 /// connection, whatever the operator's ssh config says. With a global
 /// `ControlMaster auto`, flock's dials silently rode any mux an interactive
-/// session had left behind: that is what hid mba22's dead agent for five days
+/// session had left behind: that is what hid hopper's dead agent for five days
 /// (dials "worked" exactly while some shell's mux was alive), and a STALE mux
 /// hangs a dial instead of failing it, which ADR-0009's transport notes
 /// already rejected ControlMaster for. flock's fast path is its own held
@@ -1810,7 +1810,7 @@ mod tests {
             workspaces: Vec::new(),
             age_secs: Some(3),
             error: None,
-            origin: "anvil".into(),
+            origin: "kiln".into(),
             origin_last_ok_secs: Some(3),
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
@@ -1820,23 +1820,24 @@ mod tests {
     #[test]
     fn a_fleet_failure_notice_reads_back_what_the_launcher_wrote() {
         let failed = FleetFailureNotice::SwitchFailed {
-            target: "lars@sage".to_string(),
+            target: "operator@atlas".to_string(),
             reason: SshFailureReason::HostKey.describe().to_string(),
         };
         let text = failed.to_string();
-        assert_eq!(text, "switch to lars@sage failed: host key rejected");
+        assert_eq!(text, "switch to operator@atlas failed: host key rejected");
         let parsed = FleetFailureNotice::parse(&text).expect("parses");
         assert_eq!(parsed, failed);
         assert_eq!(parsed.reason(), Some(SshFailureReason::HostKey));
 
         let lost = FleetFailureNotice::ConnectionLost {
-            target: "sage".to_string(),
+            target: "atlas".to_string(),
         };
         assert_eq!(FleetFailureNotice::parse(&lost.to_string()), Some(lost));
         // A reason that is flock's own words still files, with no row reason.
-        let own =
-            FleetFailureNotice::parse("switch to sage failed: matching remote flock not installed")
-                .expect("parses");
+        let own = FleetFailureNotice::parse(
+            "switch to atlas failed: matching remote flock not installed",
+        )
+        .expect("parses");
         assert_eq!(own.reason(), None);
         assert_eq!(FleetFailureNotice::parse("already home"), None);
     }
@@ -1844,11 +1845,11 @@ mod tests {
     #[test]
     fn failure_text_says_the_kind_of_broken_not_ssh_stderr() {
         assert_eq!(
-            failure_text("ssh: connect to host sage port 22: Connection refused"),
+            failure_text("ssh: connect to host atlas port 22: Connection refused"),
             "connection refused"
         );
         assert_eq!(
-            failure_text("lars@sage: Permission denied (publickey)."),
+            failure_text("operator@atlas: Permission denied (publickey)."),
             "auth refused"
         );
         assert_eq!(
@@ -1871,7 +1872,7 @@ mod tests {
             );
         });
         assert!(
-            logs.contains("anvil"),
+            logs.contains("kiln"),
             "the drop must name the sending peer: {logs}"
         );
         assert!(
@@ -1882,7 +1883,7 @@ mod tests {
         // A space is not injection here (no shell is involved) but it is still
         // not a destination, and ssh would read the tail as another argument.
         assert!(
-            super::relayed_entry_from_wire(wire_peer("lars@anvil -oProxyCommand=id", None))
+            super::relayed_entry_from_wire(wire_peer("operator@kiln -oProxyCommand=id", None))
                 .is_none()
         );
     }
@@ -1893,13 +1894,13 @@ mod tests {
         // `-o ProxyJump=<value>`, so it needs the same rule.
         let logs = crate::logging::capture_logs(|| {
             assert!(super::relayed_entry_from_wire(wire_peer(
-                "lars@spoke2.invalid",
+                "operator@spoke2.invalid",
                 Some("-oProxyCommand=id")
             ))
             .is_none());
         });
         assert!(
-            logs.contains("proxy_jump") && logs.contains("anvil"),
+            logs.contains("proxy_jump") && logs.contains("kiln"),
             "the drop must name the field and the sender: {logs}"
         );
 
@@ -1907,7 +1908,7 @@ mod tests {
         // bad hop rejects the chain even when the first one looks fine.
         assert!(
             super::relayed_entry_from_wire(wire_peer(
-                "lars@spoke2.invalid",
+                "operator@spoke2.invalid",
                 Some("hub,-oProxyCommand=id")
             ))
             .is_none(),
@@ -1921,12 +1922,12 @@ mod tests {
         // working fleets. Bracketed IPv6 literals, `:port` suffixes and
         // multi-hop chains are all legitimate.
         for target in [
-            "lars@spoke2.invalid",
+            "operator@spoke2.invalid",
             "[::1]",
-            "lars@[fe80::1]:2222",
+            "operator@[fe80::1]:2222",
             "spoke2.invalid:22",
         ] {
-            let entry = super::relayed_entry_from_wire(wire_peer(target, Some("hub,anvil")))
+            let entry = super::relayed_entry_from_wire(wire_peer(target, Some("hub,kiln")))
                 .unwrap_or_else(|| panic!("{target} is a legitimate destination"));
             assert_eq!(entry.peer.ssh_target, target);
         }
@@ -1938,14 +1939,14 @@ mod tests {
         // hostile or typo'd entry drops itself and nothing else.
         let wire = vec![
             wire_peer("-oProxyCommand=id", None),
-            wire_peer("lars@spoke2.invalid", None),
+            wire_peer("operator@spoke2.invalid", None),
         ];
         let kept: Vec<String> = wire
             .into_iter()
             .filter_map(super::relayed_entry_from_wire)
             .map(|entry| entry.peer.ssh_target)
             .collect();
-        assert_eq!(kept, vec!["lars@spoke2.invalid".to_string()]);
+        assert_eq!(kept, vec!["operator@spoke2.invalid".to_string()]);
     }
 
     #[test]
@@ -1972,9 +1973,9 @@ mod tests {
         // (#320). An answer that cannot be matched to its question is not an
         // answer when an agent has more than one outstanding.
         let command = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "pong",
             "c-reply",
             Some("c-question"),
@@ -1989,9 +1990,9 @@ mod tests {
         // A first message has nothing to thread to, and must not grow an
         // empty flag the remote CLI would then reject.
         let command = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "ping",
             "c-first",
             None,
@@ -2008,9 +2009,9 @@ mod tests {
         // here is a cross-host question arriving as a notice, which is the
         // mislabel the field exists to remove.
         let command = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "re-derive both parameters and report back",
             "c-question",
             None,
@@ -2026,9 +2027,9 @@ mod tests {
         // existed, so the far side needing a build that understands `--intent`
         // is confined to the case that actually carries new signal.
         let command = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "landed the fix",
             "c-notice",
             None,
@@ -2043,9 +2044,9 @@ mod tests {
         // ADR-0018 §1: the tier rides the envelope across the hop, so the
         // escalation happens on the recipient's own server.
         let command = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "I cannot merge until you rebase",
             "c-blocking",
             None,
@@ -2119,7 +2120,7 @@ mod tests {
         use crate::platform::ssh_agent::AgentSocket;
         let socket = std::env::temp_dir().join("flk418-dead-agent.sock");
         let dead = AgentSocket::Dead(socket.clone());
-        let auth = "lars@sage: Permission denied (publickey).".to_string();
+        let auth = "operator@atlas: Permission denied (publickey).".to_string();
 
         let blamed = attribute_dial_failure(auth.clone(), &dead);
         assert_eq!(
@@ -2136,7 +2137,7 @@ mod tests {
             "the local socket path must not ride the relayed error: {blamed}"
         );
 
-        let refused = "ssh: connect to host sage port 22: Connection refused".to_string();
+        let refused = "ssh: connect to host atlas port 22: Connection refused".to_string();
         assert_eq!(
             SshFailureReason::classify(&attribute_dial_failure(refused, &dead)),
             SshFailureReason::ConnectRefused
@@ -2209,7 +2210,7 @@ mod tests {
         assert_eq!(health.persistent_reason(), None);
     }
 
-    /// The budget the rate limit buys, in the mba22 numbers: five days of a
+    /// The budget the rate limit buys, in the hopper numbers: five days of a
     /// 15s poll failing the same way.
     #[test]
     fn a_five_day_outage_is_hundreds_of_warns_not_tens_of_thousands() {
@@ -2267,8 +2268,8 @@ mod tests {
     fn an_old_peers_free_text_error_is_passed_on_as_a_token() {
         // #428 review: a v(N-1) peer still relays ssh's words as `error`. This
         // hub reads the reason out of them, and passes on only the token.
-        let mut row = wire_peer("ws00860001", Some("anvil"));
-        row.error = Some("ksb.invalid: Permission denied (publickey).".into());
+        let mut row = wire_peer("ws00860001", Some("kiln"));
+        row.error = Some("node-b.invalid: Permission denied (publickey).".into());
         let entry = super::relayed_entry_from_wire(row).expect("valid row");
         assert_eq!(
             entry.peer.shown_failure_reason(),
@@ -2286,18 +2287,21 @@ mod tests {
         use super::SshFailureReason as R;
         for (stderr, expected) in [
             (
-                "ssh: connect to host ksb port 22: Connection refused",
+                "ssh: connect to host node-b port 22: Connection refused",
                 R::ConnectRefused,
             ),
-            ("lars@ksb: Permission denied (publickey).", R::AuthRefused),
+            (
+                "operator@node-b: Permission denied (publickey).",
+                R::AuthRefused,
+            ),
             ("Host key verification failed.", R::HostKey),
             (
-                "ssh: connect to host ksb port 22: Operation timed out",
+                "ssh: connect to host node-b port 22: Operation timed out",
                 R::Timeout,
             ),
             ("Connection closed by UNKNOWN port 65535", R::JumpHopRefused),
             (
-                "ssh: Could not resolve hostname ksb: nodename nor servname provided",
+                "ssh: Could not resolve hostname node-b: nodename nor servname provided",
                 R::UnknownHost,
             ),
             ("sh: 1: flk: not found", R::NoFlk),
@@ -2310,12 +2314,12 @@ mod tests {
     #[test]
     fn a_hop_failure_names_both_ends_and_the_reason() {
         let failure = super::PeerMessageFailure::Unreachable(
-            "ssh: connect to host ksb port 22: Connection refused".into(),
+            "ssh: connect to host node-b port 22: Connection refused".into(),
         );
         let reason = super::SshFailureReason::classify(failure.detail());
-        let message = failure.hop_message("mba22", "ksb", reason);
+        let message = failure.hop_message("hopper", "node-b", reason);
         assert!(
-            message.starts_with("mba22 cannot reach ksb (connection refused)"),
+            message.starts_with("hopper cannot reach node-b (connection refused)"),
             "{message}"
         );
     }
@@ -2337,10 +2341,10 @@ mod tests {
         assert!(!refused.retryable(), "the identical relay is refused again");
         assert!(
             refused
-                .hop_message("mba22", "sage", super::SshFailureReason::Other)
+                .hop_message("hopper", "atlas", super::SshFailureReason::Other)
                 .contains("--intent"),
             "the peer's own words ARE the diagnosis and must survive the hop: {}",
-            refused.hop_message("mba22", "sage", super::SshFailureReason::Other)
+            refused.hop_message("hopper", "atlas", super::SshFailureReason::Other)
         );
 
         for (exit_code, what) in [
@@ -2366,14 +2370,14 @@ mod tests {
         // which is what lets this drive the real entry point rather than
         // hand-building the variant it is supposed to produce.
         let peer = PeerConfig {
-            name: "sage".into(),
+            name: "atlas".into(),
             ..Default::default()
         };
         let failure = super::send_peer_message(
             &peer,
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "pong",
             "c-reply",
             Some("c'; rm -rf /"),
@@ -2395,9 +2399,9 @@ mod tests {
         // new one is guarded by the same rule as the rest rather than trusted
         // for being server-minted.
         let err = super::peer_message_command(
-            "agent_sage_1",
-            "agent_mba22_2",
-            "mba22",
+            "agent_atlas_1",
+            "agent_hopper_2",
+            "hopper",
             "pong",
             "c-reply",
             Some("c'; rm -rf /"),
@@ -2429,9 +2433,9 @@ mod tests {
         let mut peers: Vec<PeerSummaryState> = (0..FLEET_SNAPSHOT_MAX_PEERS + 3)
             .map(|i| mk(&format!("p{i}")))
             .collect();
-        peers.push(mk("mba22")); // a hub that lists itself in [[peers]]
+        peers.push(mk("hopper")); // a hub that lists itself in [[peers]]
         let snapshot = FleetSnapshotState {
-            origin: "mba22".into(),
+            origin: "hopper".into(),
             peers,
             origin_summary: None,
             received_at: Instant::now(),
@@ -2440,7 +2444,7 @@ mod tests {
         let wire = snapshot.to_wire("p0");
 
         assert!(
-            wire.peers.iter().all(|p| p.name != "mba22"),
+            wire.peers.iter().all(|p| p.name != "hopper"),
             "origin owns the home row"
         );
         assert!(
@@ -2499,7 +2503,7 @@ mod tests {
 
     #[test]
     fn fleet_peer_wire_roundtrip_preserves_summary_and_freshness() {
-        let state = summary_state("anvil", "lars@anvil", Some(5));
+        let state = summary_state("kiln", "operator@kiln", Some(5));
         let wire = peer_to_wire(&state);
         assert_eq!(wire.age_secs, Some(5));
 
@@ -2520,29 +2524,33 @@ mod tests {
 
         // ...while an old one decays to Down with no polling involved.
         let stale = peer_from_wire(peer_to_wire(&summary_state(
-            "sage",
-            "lars@sage",
+            "atlas",
+            "operator@atlas",
             Some(PEER_STALE_AFTER_SECS + 30),
         )));
         assert_eq!(stale.reachability(), PeerReachability::Down);
 
         // Never-reached peers stay never-reached.
-        let never = peer_from_wire(peer_to_wire(&summary_state("ksb", "lars@ksb", None)));
+        let never = peer_from_wire(peer_to_wire(&summary_state(
+            "node-b",
+            "operator@node-b",
+            None,
+        )));
         assert!(never.last_ok.is_none());
     }
 
     #[test]
     fn fleet_peer_wire_carries_icon_both_directions() {
         // #164: the self-declared icon survives the bincode roundtrip present...
-        let mut state = summary_state("anvil", "lars@anvil", Some(5));
-        state.icon = Some("anvil".to_string());
+        let mut state = summary_state("kiln", "operator@kiln", Some(5));
+        state.icon = Some("toad".to_string());
         assert_eq!(
             peer_from_wire(peer_to_wire(&state)).icon.as_deref(),
-            Some("anvil")
+            Some("toad")
         );
 
         // ...and absent (a v(N-1) peer never sets it) decodes to None.
-        let mut none = summary_state("sage", "lars@sage", Some(5));
+        let mut none = summary_state("atlas", "operator@atlas", Some(5));
         none.icon = None;
         assert_eq!(peer_from_wire(peer_to_wire(&none)).icon, None);
     }
@@ -2554,7 +2562,7 @@ mod tests {
         // #291: GPU utilization and the self-declared thermal report survive
         // the bincode roundtrip. GPU is the older half of this: it was sampled
         // locally for a long time with nowhere on the wire to go.
-        let mut state = summary_state("anvil", "lars@anvil", Some(5));
+        let mut state = summary_state("kiln", "operator@kiln", Some(5));
         state.system.as_mut().unwrap().gpu_percent = Some(96);
         state.system.as_mut().unwrap().thermal = Some(ThermalReport {
             severity: 3,
@@ -2570,7 +2578,7 @@ mod tests {
 
         // Absent (a node that declares nothing, or any microVM) decodes to
         // None rather than a synthesized nominal reading.
-        let none = summary_state("sage", "lars@sage", Some(5));
+        let none = summary_state("atlas", "operator@atlas", Some(5));
         let system = peer_from_wire(peer_to_wire(&none)).system.unwrap();
         assert_eq!(system.gpu_percent, None);
         assert_eq!(system.thermal, None);
@@ -2584,7 +2592,7 @@ mod tests {
 
         // A peer running a broken reporter must not be able to push an
         // out-of-range rank or an unbounded label into our render pass.
-        let mut state = summary_state("anvil", "lars@anvil", Some(5));
+        let mut state = summary_state("kiln", "operator@kiln", Some(5));
         state.system.as_mut().unwrap().thermal = Some(ThermalReport {
             severity: 200,
             component: ThermalComponent::Cpu,
@@ -2603,7 +2611,7 @@ mod tests {
         // 3 bytes per char, so the cap at 16 lands MID-character — the case
         // that makes the char-boundary walk load-bearing. A plain
         // `String::truncate(16)` would panic here.
-        let mut wide = summary_state("sage", "lars@sage", Some(5));
+        let mut wide = summary_state("atlas", "operator@atlas", Some(5));
         wide.system.as_mut().unwrap().thermal = Some(ThermalReport {
             severity: 2,
             component: ThermalComponent::Node,
@@ -2625,7 +2633,7 @@ mod tests {
         // #291: the JSON path does not pass through the bincode `From` impl,
         // so it sanitizes independently — regression guard for exactly that.
         let hot = concat!(
-            r#"{"id":"x","result":{"host":"anvil","system":{"cpu_percent":4,"gpu_percent":97,"#,
+            r#"{"id":"x","result":{"host":"kiln","system":{"cpu_percent":4,"gpu_percent":97,"#,
             r#""thermal":{"severity":9,"component":"gpu","label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"#,
             r#""workspaces":[]}}"#
         );
@@ -2639,7 +2647,7 @@ mod tests {
         // A node that emits neither field parses cleanly to None — the shape
         // every pre-#291 peer sends.
         let quiet =
-            r#"{"id":"x","result":{"host":"sage","system":{"cpu_percent":4},"workspaces":[]}}"#;
+            r#"{"id":"x","result":{"host":"atlas","system":{"cpu_percent":4},"workspaces":[]}}"#;
         let system = parse_summary_response(quiet, 5).unwrap().system.unwrap();
         assert_eq!(system.gpu_percent, None);
         assert_eq!(system.thermal, None);
@@ -2653,10 +2661,10 @@ mod tests {
         // direct `system` block is not enough — without the relayed loop a
         // hostile rank/label reaches the render pass through the second hop.
         let relayed = concat!(
-            r#"{"id":"x","result":{"host":"mba22","workspaces":[],"relayed_fleet":[{"#,
-            r#""name":"anvil","ssh_target":"lars@anvil","system":{"cpu_percent":9,"#,
+            r#"{"id":"x","result":{"host":"hopper","workspaces":[],"relayed_fleet":[{"#,
+            r#""name":"kiln","ssh_target":"operator@kiln","system":{"cpu_percent":9,"#,
             r#""thermal":{"severity":250,"component":"cpu","label":"zzzzzzzzzzzzzzzzzzzzzzzzzz"}}"#,
-            r#","origin":"mba22"}]}}"#
+            r#","origin":"hopper"}]}}"#
         );
         let payload = parse_summary_response(relayed, 5).unwrap();
         let thermal = payload.relayed_fleet[0]
@@ -2673,36 +2681,36 @@ mod tests {
     #[test]
     fn fleet_snapshot_to_wire_keeps_origin_and_excludes_hop_target() {
         let snapshot = FleetSnapshotState {
-            origin: "mba22".to_string(),
+            origin: "hopper".to_string(),
             peers: vec![
-                summary_state("anvil", "lars@anvil", Some(3)),
-                summary_state("sage", "lars@sage", Some(9)),
+                summary_state("kiln", "operator@kiln", Some(3)),
+                summary_state("atlas", "operator@atlas", Some(9)),
             ],
             origin_summary: None,
             received_at: Instant::now(),
         };
 
-        let wire = snapshot.to_wire("lars@sage");
+        let wire = snapshot.to_wire("operator@atlas");
         // Pass-through: the ORIGINAL origin survives nested leaps.
-        assert_eq!(wire.origin, "mba22");
+        assert_eq!(wire.origin, "hopper");
         // The hop target becomes the self row on the receiving end.
         assert_eq!(wire.peers.len(), 1);
-        assert_eq!(wire.peers[0].ssh_target, "lars@anvil");
+        assert_eq!(wire.peers[0].ssh_target, "operator@kiln");
     }
 
     #[test]
     fn origin_summary_survives_wire_roundtrip_and_passthrough() {
-        let mut origin = summary_state("mba22", crate::protocol::HOME_SWITCH_TARGET, Some(0));
+        let mut origin = summary_state("hopper", crate::protocol::HOME_SWITCH_TARGET, Some(0));
         origin.workspaces[0].workspace = "flock".to_string();
         let snapshot = FleetSnapshotState {
-            origin: "mba22".to_string(),
-            peers: vec![summary_state("anvil", "lars@anvil", Some(3))],
+            origin: "hopper".to_string(),
+            peers: vec![summary_state("kiln", "operator@kiln", Some(3))],
             origin_summary: Some(origin),
             received_at: Instant::now(),
         };
 
         // Round-trip carries the hub's own workspaces home-targeted.
-        let back = FleetSnapshotState::from_wire(snapshot.to_wire("lars@anvil"));
+        let back = FleetSnapshotState::from_wire(snapshot.to_wire("operator@kiln"));
         let carried = back
             .origin_summary
             .clone()
@@ -2710,7 +2718,7 @@ mod tests {
         assert_eq!(carried.ssh_target, crate::protocol::HOME_SWITCH_TARGET);
         assert_eq!(carried.workspaces[0].workspace, "flock");
         // A nested leap (pass-through) keeps the hub's own summary too.
-        let nested = FleetSnapshotState::from_wire(back.to_wire("lars@anvil"));
+        let nested = FleetSnapshotState::from_wire(back.to_wire("operator@kiln"));
         assert!(nested.origin_summary.is_some());
     }
 
@@ -2718,10 +2726,10 @@ mod tests {
     fn parse_summary_response_reads_envelope() {
         let stdout = r#"
 Last login: whatever banner
-{"id":"cli:peers:summary","result":{"host":"anvil","version":"0.6.8","system":{"cpu_percent":71,"mem_used":48000000000,"mem_total":64000000000,"disk_free":200000000000},"workspaces":[{"workspace":"flock","project_key":"github.com/gerchowl/flock","project_label":"flock","branch":"fix/pty","is_linked_worktree":true,"agent":"cc","status":"blocked","status_age_secs":840}]}}
+{"id":"cli:peers:summary","result":{"host":"kiln","version":"0.6.8","system":{"cpu_percent":71,"mem_used":48000000000,"mem_total":64000000000,"disk_free":200000000000},"workspaces":[{"workspace":"flock","project_key":"github.com/gerchowl/flock","project_label":"flock","branch":"fix/pty","is_linked_worktree":true,"agent":"cc","status":"blocked","status_age_secs":840}]}}
 "#;
         let payload = parse_summary_response(stdout, 34).unwrap();
-        assert_eq!(payload.host, "anvil");
+        assert_eq!(payload.host, "kiln");
         assert_eq!(payload.version.as_deref(), Some("0.6.8"));
         assert_eq!(payload.latency_ms, 34);
         let system = payload.system.expect("system stats present");
@@ -2739,7 +2747,7 @@ Last login: whatever banner
         // Gossip v3 (#101): peers.summary carries relayed_fleet — one hop of
         // the polling hub's own peers, so a spoke attaching to this hub sees
         // the FULL fleet, not just this hub's direct rows.
-        let stdout = r#"{"id":"x","result":{"host":"hub","workspaces":[],"relayed_fleet":[{"name":"spoke2","ssh_target":"lars@spoke2","host":"spoke2","workspaces":[],"origin":"hub"}]}}"#;
+        let stdout = r#"{"id":"x","result":{"host":"hub","workspaces":[],"relayed_fleet":[{"name":"spoke2","ssh_target":"operator@spoke2","host":"spoke2","workspaces":[],"origin":"hub"}]}}"#;
         let payload = parse_summary_response(stdout, 4).unwrap();
         assert_eq!(payload.relayed_fleet.len(), 1);
         assert_eq!(payload.relayed_fleet[0].name, "spoke2");
@@ -2750,7 +2758,7 @@ Last login: whatever banner
     fn parse_summary_response_treats_missing_relayed_fleet_as_empty() {
         // Additive-with-default: a v(N-1) peer that never emits relayed_fleet
         // parses cleanly and the merged cache stays empty.
-        let stdout = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        let stdout = r#"{"id":"x","result":{"host":"atlas","workspaces":[]}}"#;
         let payload = parse_summary_response(stdout, 5).unwrap();
         assert!(payload.relayed_fleet.is_empty());
     }
@@ -2758,21 +2766,21 @@ Last login: whatever banner
     #[test]
     fn parse_summary_response_reads_icon_and_tolerates_absence() {
         // #164: the self-declared icon name parses from the JSON envelope...
-        let with = r#"{"id":"x","result":{"host":"mba22","icon":"laptop","workspaces":[]}}"#;
+        let with = r#"{"id":"x","result":{"host":"hopper","icon":"toad","workspaces":[]}}"#;
         assert_eq!(
             parse_summary_response(with, 5).unwrap().icon.as_deref(),
-            Some("laptop")
+            Some("toad")
         );
         // ...and a v(N-1) peer that never emits it parses as None.
-        let without = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        let without = r#"{"id":"x","result":{"host":"atlas","workspaces":[]}}"#;
         assert_eq!(parse_summary_response(without, 5).unwrap().icon, None);
     }
 
     #[test]
     fn parse_summary_response_tolerates_missing_system_block() {
-        let stdout = r#"{"id":"x","result":{"host":"sage","workspaces":[]}}"#;
+        let stdout = r#"{"id":"x","result":{"host":"atlas","workspaces":[]}}"#;
         let payload = parse_summary_response(stdout, 5).unwrap();
-        assert_eq!(payload.host, "sage");
+        assert_eq!(payload.host, "atlas");
         assert!(payload.system.is_none());
         assert!(payload.version.is_none());
         assert!(payload.workspaces.is_empty());
@@ -2825,7 +2833,7 @@ Last login: banner noise
     #[test]
     fn checkout_prepare_command_rejects_unsafe_workspace_ids() {
         let peer = PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         };
         // Never spawns ssh: the guard rejects shell-unsafe ids before dialing.
@@ -2838,7 +2846,7 @@ Last login: banner noise
         // Login-shell banner before the envelope, as a real peer would emit.
         let stdout = r#"
 Last login: banner noise
-{"id":"cli:peers:logs","result":{"type":"peers_logs","host":"anvil","lines":[{"ts":"2026-06-29T00:00:01Z","level":"INFO","target":"flock::app","message":"up","source":"flock-server.log"}]}}
+{"id":"cli:peers:logs","result":{"type":"peers_logs","host":"kiln","lines":[{"ts":"2026-06-29T00:00:01Z","level":"INFO","target":"flock::app","message":"up","source":"flock-server.log"}]}}
 "#;
         let lines = parse_logs_response(stdout).unwrap();
         assert_eq!(lines.len(), 1);
@@ -2865,7 +2873,7 @@ Last login: banner noise
         };
         let envelope = serde_json::json!({
             "id": "cli:peers:logs",
-            "result": { "type": "peers_logs", "host": "anvil", "lines": [original.clone()] },
+            "result": { "type": "peers_logs", "host": "kiln", "lines": [original.clone()] },
         });
         let parsed = parse_logs_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed, vec![original]);
@@ -2874,7 +2882,7 @@ Last login: banner noise
     #[test]
     fn reachability_reflects_latency_and_staleness() {
         let mut peer = PeerSummaryState::new(&PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         });
         assert_eq!(peer.reachability(), PeerReachability::Down); // never polled
@@ -2893,7 +2901,7 @@ Last login: banner noise
         // thresholds, not the const default. A 30s-stale peer is Live when
         // stale_after=60, Down when stale_after=15.
         let mut peer = PeerSummaryState::new(&PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         });
         peer.last_ok = Instant::now().checked_sub(std::time::Duration::from_secs(30));
@@ -3042,7 +3050,7 @@ Last login: banner noise
         // entries from an older peer — the 60s cliff dies for those too.
         let wire = crate::protocol::FleetPeer {
             name: "old".into(),
-            ssh_target: "lars@old".into(),
+            ssh_target: "operator@old".into(),
             host: Some("old".into()),
             version: None,
             protocol: None,
@@ -3069,15 +3077,15 @@ Last login: banner noise
 
         // v(N-1) JSON → v(N) struct: origin_last_ok_secs missing → None.
         let json_old =
-            r#"{"name":"sage","ssh_target":"lars@sage","workspaces":[],"origin":"anvil"}"#;
+            r#"{"name":"atlas","ssh_target":"operator@atlas","workspaces":[],"origin":"kiln"}"#;
         let decoded: RelayedFleetPeer = serde_json::from_str(json_old).expect("parse old wire");
         assert_eq!(decoded.origin_last_ok_secs, None);
 
         // v(N) struct → JSON → v(N) struct: value preserved.
         let full = RelayedFleetPeer {
             dial: None,
-            name: "sage".into(),
-            ssh_target: "lars@sage".into(),
+            name: "atlas".into(),
+            ssh_target: "operator@atlas".into(),
             host: None,
             version: None,
             protocol: None,
@@ -3086,9 +3094,9 @@ Last login: banner noise
             workspaces: Vec::new(),
             age_secs: Some(3),
             error: None,
-            origin: "anvil".into(),
+            origin: "kiln".into(),
             origin_last_ok_secs: Some(3),
-            proxy_jump: Some("anvil".into()),
+            proxy_jump: Some("kiln".into()),
             icon: None,
         };
         let json = serde_json::to_string(&full).unwrap();
@@ -3099,7 +3107,7 @@ Last login: banner noise
         // serde_json's default; simulate by decoding into a value and checking
         // known fields, which is the only cross-version compat guarantee.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["name"], "sage");
+        assert_eq!(value["name"], "atlas");
         assert_eq!(value["origin_last_ok_secs"], 3);
     }
 
@@ -3118,10 +3126,10 @@ Last login: banner noise
         // backtrace that makes a passing test read like a failing one.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let fetched = fetch_with_panic_guard("anvil", || panic!("summary parser blew up"));
+        let fetched = fetch_with_panic_guard("kiln", || panic!("summary parser blew up"));
         std::panic::set_hook(previous_hook);
 
-        assert_eq!(fetched.peer, "anvil", "the completion names the right peer");
+        assert_eq!(fetched.peer, "kiln", "the completion names the right peer");
         assert!(
             fetched.result.is_err(),
             "a panicked fetch reports as a failed poll, not a success"
@@ -3132,11 +3140,11 @@ Last login: banner noise
         let mut tracker = PeerPollTracker::new();
         let now = Instant::now();
         assert!(tracker.should_poll_now(&fetched.peer, now, Duration::from_secs(15)));
-        assert!(tracker.in_flight("anvil"));
+        assert!(tracker.in_flight("kiln"));
         tracker.mark_finished(&fetched.peer);
         assert!(
             tracker.should_poll_now(
-                "anvil",
+                "kiln",
                 now + Duration::from_secs(15),
                 Duration::from_secs(15)
             ),
@@ -3151,18 +3159,18 @@ Last login: banner noise
         let mut tracker = PeerPollTracker::new();
         let now = Instant::now();
         assert!(
-            tracker.should_poll_now("anvil", now, Duration::from_secs(15)),
+            tracker.should_poll_now("kiln", now, Duration::from_secs(15)),
             "first call must dispatch"
         );
-        assert!(tracker.in_flight("anvil"));
+        assert!(tracker.in_flight("kiln"));
         assert!(
-            !tracker.should_poll_now("anvil", now, Duration::from_secs(15)),
+            !tracker.should_poll_now("kiln", now, Duration::from_secs(15)),
             "second call while in-flight must skip (overlap guard)"
         );
-        tracker.mark_finished("anvil");
+        tracker.mark_finished("kiln");
         assert!(
             !tracker.should_poll_now(
-                "anvil",
+                "kiln",
                 now + Duration::from_secs(1),
                 Duration::from_secs(15)
             ),
@@ -3170,7 +3178,7 @@ Last login: banner noise
         );
         assert!(
             tracker.should_poll_now(
-                "anvil",
+                "kiln",
                 now + Duration::from_secs(15),
                 Duration::from_secs(15)
             ),
@@ -3186,23 +3194,23 @@ Last login: banner noise
         // reload (peer still present) preserves the in-flight lock.
         let mut tracker = PeerPollTracker::new();
         let t0 = Instant::now();
-        assert!(tracker.should_poll_now("sage", t0, Duration::from_secs(2)));
+        assert!(tracker.should_poll_now("atlas", t0, Duration::from_secs(2)));
 
         // Two rounds later, the slow SSH is still running.
         assert!(
-            !tracker.should_poll_now("sage", t0 + Duration::from_secs(4), Duration::from_secs(2)),
+            !tracker.should_poll_now("atlas", t0 + Duration::from_secs(4), Duration::from_secs(2)),
             "in-flight guard MUST hold even past next_due — a hung SSH cannot pile"
         );
         // Config reload (peer still present): the in-flight lock survives.
-        tracker.retain_only(vec!["sage"]);
+        tracker.retain_only(vec!["atlas"]);
         assert!(
-            !tracker.should_poll_now("sage", t0 + Duration::from_secs(8), Duration::from_secs(2)),
+            !tracker.should_poll_now("atlas", t0 + Duration::from_secs(8), Duration::from_secs(2)),
             "reload must NOT drop the in-flight lock for a surviving peer"
         );
         // Retain that drops the peer clears its state.
         tracker.retain_only::<Vec<&str>>(vec![]);
         assert!(
-            tracker.should_poll_now("sage", t0 + Duration::from_secs(9), Duration::from_secs(2)),
+            tracker.should_poll_now("atlas", t0 + Duration::from_secs(9), Duration::from_secs(2)),
             "peer dropped from config, then re-added, starts fresh"
         );
     }
@@ -3210,11 +3218,16 @@ Last login: banner noise
     #[test]
     fn normalized_host_key_is_one_spelling_per_machine() {
         // #422: every viewer must derive the same key for the same machine.
-        for raw in ["sage", "SAGE", "sage.local", "lars@sage.tail1234.ts.net"] {
-            assert_eq!(normalized_host_key(raw), "sage", "{raw}");
+        for raw in [
+            "atlas",
+            "ATLAS",
+            "atlas.local",
+            "operator@atlas.tail1234.ts.net",
+        ] {
+            assert_eq!(normalized_host_key(raw), "atlas", "{raw}");
         }
         // An address is kept whole: cutting it would fold unrelated hosts.
         assert_eq!(normalized_host_key("100.64.0.7"), "100.64.0.7");
-        assert_eq!(normalized_host_key("lars@::1"), "::1");
+        assert_eq!(normalized_host_key("operator@::1"), "::1");
     }
 }

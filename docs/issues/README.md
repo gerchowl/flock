@@ -1,4 +1,4 @@
-# issue archive (gerchowl/herdr) — 72 items
+# issue archive (gerchowl/flock) — 72 items
 
 - [#16](0016-spike-replace-bincode-2-0-1-wire-encoder-rustsec-2025-0141.md) `OPEN` — Spike: replace bincode 2.0.1 wire encoder (RUSTSEC-2025-0141)
 - [#25](0025-spike-workspace-as-unit-creation-floating-throwaway-pane-de.md) `CLOSED` — spike: workspace-as-unit creation + floating throwaway pane; de-emphasize tabs
@@ -18,13 +18,13 @@
 - [#62](0062-spaces-label-grammar-space-row-shared-origin-identity-every.md) `CLOSED` — spaces label grammar: space row = shared origin identity; every member = <server>:<branch>
 - [#63](0063-spaces-remote-row-switch-broken-band-works-pre-connected-swa.md) `CLOSED` — spaces remote-row switch broken (band works); pre-connected swap + top-right failure toast
 - [#65](0065-connection-slots-multi-connection-client-pre-load-switch-pau.md) `CLOSED` — connection slots: multi-connection client — pre-load/switch/pause instead of exit-and-relaunch legs
-- [#66](0066-down-gossip-the-hub-s-own-workspaces-origin-summary-spokes-c.md) `CLOSED` — down-gossip the hub's OWN workspaces (origin summary) — spokes can't see mba22's spaces
+- [#66](0066-down-gossip-the-hub-s-own-workspaces-origin-summary-spokes-c.md) `CLOSED` — down-gossip the hub's OWN workspaces (origin summary) — spokes can't see hopper's spaces
 - [#68](0068-tracking-federation-v2-spoke-parity-restyle-v3-connection-sl.md) `CLOSED` — tracking: federation v2 — spoke parity, restyle v3, connection slots
 - [#69](0069-reconnect-after-handoff-idle-hang-behind-frozen-frame-shell.md) `CLOSED` — reconnect after handoff: idle hang behind frozen frame + shell left unusable (proto-16 hold path)
 - [#70](0070-numpad-emits-nothing-inside-herdr-kitty-enhancement-kp-codes.md) `CLOSED` — numpad emits nothing inside herdr (kitty enhancement: KP_* codes dropped)
 - [#75](0075-slots-stage-2-live-status-over-paused-slots-retire-the-ssh-s.md) `OPEN` — slots stage 2 — live status over paused slots, retire the ssh summary poller + snapshot staleness
 - [#77](0077-stale-pane-geometry-after-restart-switch-scrollback-doesn-t.md) `CLOSED` — stale pane geometry after restart/switch + scrollback doesn't reflow (we ship libghostty-vt — use its reflow)
-- [#78](0078-section-leaders-must-render-the-project-identity-not-mba22-m.md) `CLOSED` — section leaders must render the project identity, not mba22:main; rects only on collapsed leaders
+- [#78](0078-section-leaders-must-render-the-project-identity-not-hopper-m.md) `CLOSED` — section leaders must render the project identity, not hopper:main; rects only on collapsed leaders
 - [#79](0079-viewer-profile-rides-the-client-portable-per-client-sidebar.md) `OPEN` — viewer profile rides the client: portable + per-client sidebar state (width/collapse/scopes/filter)
 - [#80](0080-fleet-wide-attention-cycle-server-visibility-as-a-selection.md) `OPEN` — fleet-wide attention cycle + server visibility as a selection set (SSoT with sidebar + switcher)
 - [#83](0083-pane-keystrokes-stall-while-the-pane-is-under-load-ui-stays.md) `OPEN` — pane keystrokes stall while the pane is under load (UI stays responsive — input→PTY leg starves)
@@ -35,7 +35,7 @@
 - [#94](0094-server-management-ui-add-remove-from-ssh-hosts-aliases-clien.md) `OPEN` — server management UI: add/remove from ssh hosts, aliases, client-side overlay over nix peers
 - [#95](0095-switch-crash-next-leg-s-ratatui-init-unwrap-aborts-via-doubl.md) `CLOSED` — switch crash: next leg's ratatui::init() unwrap aborts via double panic (try_init + unfailable hook)
 - [#96](0096-pane-header-prompt-history-scrollback-with-recaps-bounded-ex.md) `CLOSED` — pane header: prompt history scrollback with recaps (bounded expandable panel)
-- [#100](0100-release-pipeline-sage-built-gh-release-binaries-harmonia-cac.md) `OPEN` — release pipeline: sage-built GH release binaries + harmonia cache (transport v2)
+- [#100](0100-release-pipeline-atlas-built-gh-release-binaries-harmonia-cac.md) `OPEN` — release pipeline: atlas-built GH release binaries + harmonia cache (transport v2)
 - [#102](0102-slots-switch-drops-the-hub-fleet-snapshot-spokes-lose-the-se.md) `CLOSED` — slots switch drops the hub fleet snapshot -- spokes lose the servers band/home row
 - [#103](0103-test-gap-federation-switch-and-render-needs-slots-enabled-e2.md) `CLOSED` — test gap: federation switch-and-render needs slots-enabled e2e + a live smoke harness
 - [#105](0105-workspace-creation-ux-new-blank-from-home-new-on-spaces-head.md) `CLOSED` — workspace creation UX: new-blank-from-home + 'new' on spaces header + right-click->branch on any row
@@ -67,7 +67,7 @@
 - [#145](0145-keys-and-clipboard-not-reaching-inner-pane-when-claude-code.md) `OPEN` — Keys and clipboard not reaching inner pane when Claude Code runs inside a herdr pane
 - [#147](0147-herdr-web-map-tailscale-identity-to-a-herdr-user-allow-list.md) `CLOSED` — herdr web: map tailscale identity to a herdr user / allow-list (auth beyond loopback)
 - [#148](0148-herdr-web-idle-ws-timeout-concurrent-session-cap.md) `CLOSED` — herdr web: idle WS timeout + concurrent-session cap
-- [#149](0149-g-fleet-retire-herdr-web-mvp-run-an-always-on-herdr-server-d.md) `OPEN` — g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on sage
+- [#149](0149-g-fleet-retire-herdr-web-mvp-run-an-always-on-herdr-server-d.md) `OPEN` — g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
 - [#150](0150-herdr-web-native-socket-bridge-drop-the-per-connection-pty-u.md) `OPEN` — herdr web: native socket bridge (drop the per-connection PTY) — unblocks #128/#129/#130
 - [#151](0151-herdr-web-first-class-session-name-flag.md) `CLOSED` — herdr web: first-class `--session <name>` flag
 - [#152](0152-server-switch-stage-3-idle-evict-unused-warm-ssh-bridges-lar.md) `OPEN` — Server switch (stage-3): idle-evict unused warm ssh bridges (large-fleet only)

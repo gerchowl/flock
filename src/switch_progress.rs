@@ -214,8 +214,8 @@ mod tests {
     /// healthy — so all three have to be on screen at once.
     #[test]
     fn the_surface_names_destination_elapsed_and_stage() {
-        let (title, subtitle) = lines("sage", Stage::Probing, Duration::from_secs(2));
-        assert!(title.contains("sage"), "where: {title}");
+        let (title, subtitle) = lines("atlas", Stage::Probing, Duration::from_secs(2));
+        assert!(title.contains("atlas"), "where: {title}");
         assert!(title.contains("2s"), "how long: {title}");
         assert!(
             subtitle.contains("finding flock"),
@@ -228,7 +228,7 @@ mod tests {
     /// invites killing a switch that is only installing a remote binary.
     #[test]
     fn an_overdue_switch_says_so_without_dropping_the_stage() {
-        let (_, subtitle) = lines("sage", Stage::StartingServer, Duration::from_secs(12));
+        let (_, subtitle) = lines("atlas", Stage::StartingServer, Duration::from_secs(12));
         assert!(subtitle.contains("taking longer"), "{subtitle}");
         assert!(
             subtitle.contains("remote server"),
@@ -252,7 +252,7 @@ mod tests {
             Stage::Attaching,
         ] {
             for secs in [0, 3, 12, 600] {
-                let (_, subtitle) = lines("sage", stage, Duration::from_secs(secs));
+                let (_, subtitle) = lines("atlas", stage, Duration::from_secs(secs));
                 assert!(
                     subtitle.chars().count() <= INNER_WIDTH,
                     "subtitle overflows at {secs}s for {stage:?}: {subtitle:?} \
@@ -274,7 +274,7 @@ mod tests {
     /// a glitch, and the surface is for the slow case.
     #[test]
     fn a_fast_switch_never_paints_and_so_needs_no_erase() {
-        let progress = SwitchProgress::start("sage");
+        let progress = SwitchProgress::start("atlas");
         progress.set_stage(Stage::Connecting);
         assert!(
             !progress.was_visible(),

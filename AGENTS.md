@@ -108,7 +108,7 @@ Two things follow for anyone adding a test here. A platform gate is a claim, not
 
 ### Tests must not assert against ambient machine state
 
-A test that reads the process cwd, the machine's hostname, or a hardcoded FHS path is asserting about your laptop rather than about flock — it passes for you and fails confusingly for everyone else. The `hermetic-tests` gate enforces this over `tests/` and `#[cfg(test)]` regions; use `guardrails-ok(hermetic): <reason>` for fixture DATA that is parsed rather than executed.
+A test that reads the process cwd, the machine's hostname, or a hardcoded FHS path is asserting about your hopper rather than about flock — it passes for you and fails confusingly for everyone else. The `hermetic-tests` gate enforces this over `tests/` and `#[cfg(test)]` regions; use `guardrails-ok(hermetic): <reason>` for fixture DATA that is parsed rather than executed.
 
 Concretely: derive fixture paths from the fixture's own name (`Workspace::test_new` does this), use `std::env::temp_dir()` when a test just needs *a* directory, pick fixture hostnames that cannot collide with real machines (RFC 2606 reserves `.invalid`), and prefer `/bin/sh` — it is the only `/bin` path POSIX guarantees, and NixOS ships nothing else there. Determinism pins for the test environment belong in `.config/nextest.toml`'s `[env]`, so a bare `cargo nextest run` gets them too, not only `just`.
 

@@ -2,11 +2,11 @@
 //!
 //! `run_peer_ssh` spawns a fresh `ssh` per call, so every poll and every
 //! message pays a full handshake to move a few hundred bytes. Measured cold
-//! from sage with multiplexing disabled, exit status checked:
+//! from atlas with multiplexing disabled, exit status checked:
 //!
 //! ```text
-//! anvil           0.13s
-//! anvil-dev       0.16s
+//! kiln           0.13s
+//! kiln-dev       0.16s
 //! ethz-heimdall   0.97s   (Tailscale-remote)
 //! ```
 //!
@@ -24,7 +24,7 @@
 //! stretches, so "no traffic" says nothing about health. Death is observed
 //! directly instead: `run_peer_ssh` already sets `ServerAliveInterval=5
 //! ServerAliveCountMax=2`, so ssh itself tears down a dead or half-open
-//! connection (the roaming-laptop case) and exits — which arrives here as EOF
+//! connection (the roaming-hopper case) and exits — which arrives here as EOF
 //! on the reader thread. No timer decides that.
 //!
 //! Every failure falls back to the one-shot spawn. That is what keeps this
@@ -826,12 +826,12 @@ mod tests {
     /// 15s stall per poll for as long as the name existed.
     #[test]
     fn a_response_mentioning_push_is_not_routed_as_a_push() {
-        let push = r#"{"push":"peers.summary","result":{"host":"anvil","workspaces":[]}}"#;
+        let push = r#"{"push":"peers.summary","result":{"host":"kiln","workspaces":[]}}"#;
         assert!(line_is_push(push), "the emitter's push shape must route");
 
         // The poisoned response: a workspace labelled `push`, which serializes
         // to the very substring the old check looked for.
-        let response = r#"{"id":"stream-1","result":{"host":"anvil","workspaces":[{"label":"push","branch":"main"}]}}"#;
+        let response = r#"{"id":"stream-1","result":{"host":"kiln","workspaces":[{"label":"push","branch":"main"}]}}"#;
         assert!(
             !line_is_push(response),
             "a `push` VALUE in the payload is not a push KEY"
@@ -883,13 +883,13 @@ mod tests {
         let wire = concat!(
             r#"{"id":"stream-1","result":{"workspaces":[{"label":"push"}]}}"#,
             "\n",
-            r#"{"push":"peers.summary","result":{"host":"anvil"}}"#,
+            r#"{"push":"peers.summary","result":{"host":"kiln"}}"#,
             "\n",
-            r#"{"id":"stream-2","result":{"host":"anvil"}}"#,
+            r#"{"id":"stream-2","result":{"host":"kiln"}}"#,
             "\n",
         );
         let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
-        route_relay_lines("anvil", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        route_relay_lines("kiln", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
         drop(tx);
 
         let routed: Vec<String> = responses.iter().collect();
@@ -910,7 +910,7 @@ mod tests {
         let pushed = push_slot.lock().expect("push slot").take();
         assert_eq!(
             pushed.as_ref().map(|(_, line)| line.as_str()),
-            Some(r#"{"push":"peers.summary","result":{"host":"anvil"}}"#),
+            Some(r#"{"push":"peers.summary","result":{"host":"kiln"}}"#),
             "the push is delivered exactly once, to the push slot"
         );
     }
@@ -929,18 +929,18 @@ mod tests {
         let (uplink_tx, uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
 
         let wire = concat!(
-            r#"{"push":"peers.summary","result":{"host":"sage"}}"#,
+            r#"{"push":"peers.summary","result":{"host":"atlas"}}"#,
             "\n",
             r#"{"push":"msg.uplink","frame":{"uplink_id":"u1"}}"#,
             "\n",
-            r#"{"id":"stream-1","result":{"host":"sage"}}"#,
+            r#"{"id":"stream-1","result":{"host":"atlas"}}"#,
             "\n",
             r#"{"push":"msg.uplink","frame":{"uplink_id":"u2"}}"#,
             "\n",
             r#"{"push":"some.future.kind","result":{"host":"not a summary"}}"#,
             "\n",
         );
-        route_relay_lines("sage", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        route_relay_lines("atlas", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
         drop(tx);
         drop(uplink_tx);
 
@@ -1002,8 +1002,8 @@ mod tests {
 
         let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
         route_relay_lines(
-            "anvil",
-            Cursor::new("ssh: connect to host anvil port 22: \"push\"\n"),
+            "kiln",
+            Cursor::new("ssh: connect to host kiln port 22: \"push\"\n"),
             &tx,
             &push_slot,
             &uplink_tx,
@@ -1082,8 +1082,8 @@ mod tests {
     #[test]
     #[ignore = "needs a reachable ssh peer"]
     fn holds_one_connection_across_requests() {
-        let mut peer = peer("anvil");
-        peer.ssh = "anvil".into();
+        let mut peer = peer("kiln");
+        peer.ssh = "kiln".into();
         peer.relay_command =
             r#"sh -lc 'while IFS= read -r line; do echo "{\"id\":\"live\",\"result\":{}}"; done'"#
                 .into();

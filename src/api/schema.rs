@@ -1925,7 +1925,7 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol: Option<u32>,
         /// Self-declared fleet icon NAME of the answering server (#164): a
-        /// semantic name (`"laptop"`) the RECEIVER maps to a flat Nerd Font
+        /// semantic name (`"hopper"`) the RECEIVER maps to a flat Nerd Font
         /// glyph, so every viewer renders the same server icon. Only an ASCII
         /// name crosses the wire; unknown/absent → no icon. Additive/default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2825,8 +2825,8 @@ pub enum EventData {
         /// itself.
         to_host: String,
         /// `[[peers]]` entry the relay actually routed through. Differs from
-        /// `to_host` in any normal fleet (a peer configured `anvil` reports
-        /// its hostname as `vm-dev`), and the route is what a reader needs to
+        /// `to_host` in any normal fleet (a peer configured `kiln` reports
+        /// its hostname as `bastion`), and the route is what a reader needs to
         /// reproduce or debug the hop.
         route: String,
         relayed_at_ms: u64,
@@ -3013,7 +3013,7 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_id: Option<String>,
         /// The node that produced the outcome — the field that makes an
-        /// outcome from `sage` legible on `anvil`.
+        /// outcome from `atlas` legible on `kiln`.
         origin_host: String,
         filed_at_ms: u64,
     },

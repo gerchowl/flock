@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Archive all gerchowl/herdr issues + PRs into docs/issues and docs/PRs as markdown.
+"""Archive this repository's issues + PRs into docs/issues and docs/PRs as markdown.
 
 Run before breaking the fork so the issue/PR history is preserved in-repo.
+
+The repository is resolved from the checkout's own `origin` remote rather than
+hardcoded, so a fork can never inherit an upstream pointer and archive the wrong
+tracker (#512). Every generated filename is derived from the issue title, so a
+title that names a host becomes a filename: the hermetic gate (#510) covers the
+committed tree, which is what catches it.
 """
 import json
 import re
@@ -9,10 +15,44 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = "gerchowl/herdr"
 ROOT = Path(__file__).resolve().parent.parent
 ISSUES_DIR = ROOT / "docs" / "issues"
 PRS_DIR = ROOT / "docs" / "PRs"
+
+_OWNER_REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+# https://host/owner/repo[.git] | ssh://git@host/owner/repo[.git]
+# git://host/owner/repo[.git]     | git@host:owner/repo[.git]
+_REMOTE = re.compile(
+    r"^(?:https?|ssh|git)://[^/]+/(?P<p>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$"
+    r"|^[^/\s]+@[^/\s:]+:(?P<s>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?$"
+)
+
+
+def resolve_repo(root=None):
+    """Return `owner/repo` for the checkout this script lives in.
+
+    Raises if the remote is missing or unparseable: archiving the wrong
+    repository silently is worse than refusing to run.
+    """
+    root = Path(root or ROOT)
+    try:
+        url = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit(
+            f"error: cannot read the origin remote of {root}: {exc}"
+        ) from exc
+    m = _REMOTE.match(url)
+    repo = (m.group("p") or m.group("s")) if m else None
+    if not repo or not _OWNER_REPO.match(repo):
+        # A local-path or otherwise unrecognised remote is refused rather than
+        # guessed at: a wrong owner/repo silently archives another tracker.
+        raise SystemExit(f"error: cannot parse owner/repo from origin remote {url!r}")
+    return repo
 
 
 def gh(args):
@@ -78,12 +118,12 @@ def write_item(kind, dir_, item):
     return path.name
 
 
-def export(kind):
+def export(kind, repo):
     sub = "issue" if kind == "issue" else "pr"
     dir_ = ISSUES_DIR if kind == "issue" else PRS_DIR
     dir_.mkdir(parents=True, exist_ok=True)
     nums = json.loads(
-        gh([sub, "list", "-R", REPO, "--state", "all", "--limit", "1000", "--json", "number"])
+        gh([sub, "list", "-R", repo, "--state", "all", "--limit", "1000", "--json", "number"])
     )
     fields = "number,title,state,author,labels,body,createdAt,closedAt,url,comments"
     if kind == "pr":
@@ -91,23 +131,30 @@ def export(kind):
     index = []
     for i, row in enumerate(sorted(nums, key=lambda r: r["number"]), 1):
         n = row["number"]
-        item = json.loads(gh([sub, "view", str(n), "-R", REPO, "--json", fields]))
+        item = json.loads(gh([sub, "view", str(n), "-R", repo, "--json", fields]))
         name = write_item(kind, dir_, item)
         index.append((item["number"], item.get("state", ""), item.get("title", ""), name))
         print(f"  [{kind}] {i}/{len(nums)} #{n} -> {name}", flush=True)
     # index file
-    lines = [f"# {kind} archive ({REPO}) — {len(index)} items\n"]
+    lines = [f"# {kind} archive ({repo}) — {len(index)} items\n"]
     for num, state, title, name in index:
         lines.append(f"- [#{num}]({name}) `{state}` — {title}")
     (dir_ / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return len(index)
 
 
-if __name__ == "__main__":
-    which = sys.argv[1] if len(sys.argv) > 1 else "both"
+def main(argv):
+    which = argv[0] if argv else "both"
+    if which not in ("both", "issue", "pr"):
+        raise SystemExit(f"error: unknown target {which!r}; use issue, pr or both")
+    repo = resolve_repo()
     total = 0
     if which in ("both", "issue"):
-        total += export("issue")
+        total += export("issue", repo)
     if which in ("both", "pr"):
-        total += export("pr")
-    print(f"done: {total} items archived")
+        total += export("pr", repo)
+    print(f"done: {total} items archived from {repo}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

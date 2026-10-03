@@ -1594,10 +1594,10 @@ mod tests {
         app.selected = 0;
         app.mode = Mode::Terminal;
         let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         });
-        peer.host = Some("anvil".into());
+        peer.host = Some("kiln".into());
         peer.last_ok = Some(std::time::Instant::now());
         peer.latency_ms = Some(34);
         app.peer_summaries = vec![peer];
@@ -1645,7 +1645,7 @@ mod tests {
         assert!(self_health.contains("\u{f0ee0}  42%"), "{self_health}");
 
         let peer_title = buffer_row_text(buffer, card.rect, card.rect.y);
-        assert!(peer_title.contains("anvil"), "{peer_title}");
+        assert!(peer_title.contains("kiln"), "{peer_title}");
         assert!(peer_title.contains("34ms"), "{peer_title}");
     }
 

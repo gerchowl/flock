@@ -15,4 +15,4 @@ url: https://github.com/gerchowl/herdr/pull/84
 
 # refactor(sidebar): kick the home/star ornaments — position + highlight say it
 
-User: home is known (pinned top) and the current machine carries the highlight fill — the `← mba22 home` dressing and the `✦` self-marker are redundant. Both removed; rows render uniformly. 2132/0.
+User: home is known (pinned top) and the current machine carries the highlight fill — the `← hopper home` dressing and the `✦` self-marker are redundant. Both removed; rows render uniformly. 2132/0.

@@ -3569,7 +3569,7 @@ mod tests {
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 dial: None,
                 name: host.into(),
-                ssh_target: format!("lars@{host}"),
+                ssh_target: format!("operator@{host}"),
                 host: Some(host.into()),
                 version: None,
                 protocol: None,

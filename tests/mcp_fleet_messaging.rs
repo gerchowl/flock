@@ -716,13 +716,13 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     // refused and never reaches the directory, and so are the uplink methods
     // that would let it take pending messages or fake the hub's answer.
     let forged = json!({
-        "id": "t:forge-fleet",
+        "id": "t:kiln-fleet",
         "method": "peers.hub_fleet",
         "params": {
             "hub": "nodeb",
             "fleet": [{
                 "name": "evilhost",
-                "ssh_target": "lars@attacker.example",
+                "ssh_target": "operator@attacker.example",
                 "host": "evilhost",
                 "workspaces": [{
                     "id": "w1", "workspace": "x", "status": "idle",
@@ -810,7 +810,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     // vouch for a sender it never saw. Refused, and nothing is relayed.
     let node_b = fleet.node("nodeb");
     let forged = serde_json::json!({
-        "id": "t:forge",
+        "id": "t:kiln",
         "method": "msg.uplink_forward",
         "params": {
             "spoke": "nodea",

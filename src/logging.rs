@@ -3737,7 +3737,7 @@ pub(crate) fn peer_stream_established(peer: &str, down_secs: Option<u64>) {
 /// A peer poll failed, and this failure is news: the first after success, or
 /// a different kind of broken than the last (#418). Carries the classified
 /// `reason` and ssh's own words, which the 2,229-a-day bare
-/// "process exec exited non-zero" lines on mba22 carried neither of.
+/// "process exec exited non-zero" lines on hopper carried neither of.
 pub(crate) fn peer_dial_failed(peer: &str, reason: &str, detail: &str, consecutive: u32) {
     tracing::warn!(
         target: "flock::peers",
@@ -5666,15 +5666,15 @@ mod tests {
     /// flip's sub-millisecond flip averages a cold dial's stall into noise.
     #[test]
     fn client_slot_flipped_is_the_happy_path_info_with_timing() {
-        let warm = capture_logs(|| client_slot_flipped("home", "sage", false, 3));
+        let warm = capture_logs(|| client_slot_flipped("home", "atlas", false, 3));
         assert!(warm.contains("INFO"), "the happy path must be INFO: {warm}");
         assert!(warm.contains("event=\"client.slot.flipped\""), "{warm}");
         assert!(warm.contains("from=\"home\""), "{warm}");
-        assert!(warm.contains("to=\"sage\""), "{warm}");
+        assert!(warm.contains("to=\"atlas\""), "{warm}");
         assert!(warm.contains("cold=false"), "{warm}");
         assert!(warm.contains("elapsed_ms=3"), "{warm}");
 
-        let cold = capture_logs(|| client_slot_flipped("sage", "home", true, 5050));
+        let cold = capture_logs(|| client_slot_flipped("atlas", "home", true, 5050));
         assert!(cold.contains("cold=true"), "{cold}");
         assert!(cold.contains("elapsed_ms=5050"), "{cold}");
     }
@@ -5692,7 +5692,7 @@ mod tests {
         );
         assert!(tick.contains("event=\"client.tick\""), "{tick}");
 
-        let stalled = capture_logs(|| client_render_loop_stalled("sage", 21_000));
+        let stalled = capture_logs(|| client_render_loop_stalled("atlas", 21_000));
         assert!(
             stalled.contains("WARN"),
             "a stall must survive `grep WARN`: {stalled}"
@@ -5703,7 +5703,7 @@ mod tests {
             "the measured gap is the evidence: {stalled}"
         );
         assert!(
-            stalled.contains("active_slot=\"sage\""),
+            stalled.contains("active_slot=\"atlas\""),
             "a stall is attributable to the peer the loop was serving: {stalled}"
         );
     }
@@ -5715,14 +5715,15 @@ mod tests {
     /// that left #282 uninvestigated.
     #[test]
     fn switch_stages_are_debug_until_one_blows_its_budget() {
-        let quick = capture_logs(|| client_switch_stage("sage", "handshake", 12));
+        let quick = capture_logs(|| client_switch_stage("atlas", "handshake", 12));
         assert!(quick.contains("DEBUG"), "{quick}");
         assert!(quick.contains("flock::attach"), "{quick}");
         assert!(quick.contains("stage=\"handshake\""), "{quick}");
-        assert!(quick.contains("to=\"sage\""), "{quick}");
+        assert!(quick.contains("to=\"atlas\""), "{quick}");
         assert!(quick.contains("elapsed_ms=12"), "{quick}");
 
-        let stalled = capture_logs(|| client_switch_stage_slow("sage", "bridge_start", 5050, 1500));
+        let stalled =
+            capture_logs(|| client_switch_stage_slow("atlas", "bridge_start", 5050, 1500));
         assert!(
             stalled.contains("WARN"),
             "a stalled stage must be visible at default level: {stalled}"
@@ -5735,7 +5736,7 @@ mod tests {
 
         // The remote-side split is what separates "the network was slow" from
         // "flock was slow" inside the client's single `bridge_start` leg.
-        let probe = capture_logs(|| remote_switch_stage("sage", "remote_probe", 4900));
+        let probe = capture_logs(|| remote_switch_stage("atlas", "remote_probe", 4900));
         assert!(probe.contains("stage=\"remote_probe\""), "{probe}");
         assert!(probe.contains("flock::attach"), "{probe}");
     }
@@ -6227,10 +6228,10 @@ mod tests {
 
     #[test]
     fn peer_summary_applied_targets_flock_peers_at_debug() {
-        let out = capture_logs(|| peer_summary_applied("sage", "sage.local", true, 3, 42));
+        let out = capture_logs(|| peer_summary_applied("atlas", "atlas.local", true, 3, 42));
         assert!(out.contains("event=\"peer.summary.applied\""), "{out}");
-        assert!(out.contains("peer=\"sage\""), "{out}");
-        assert!(out.contains("host=\"sage.local\""), "{out}");
+        assert!(out.contains("peer=\"atlas\""), "{out}");
+        assert!(out.contains("host=\"atlas.local\""), "{out}");
         assert!(out.contains("has_system=true"), "{out}");
         assert!(out.contains("workspaces=3"), "{out}");
         assert!(out.contains("latency_ms=42"), "{out}");

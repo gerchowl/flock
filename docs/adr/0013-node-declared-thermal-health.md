@@ -88,7 +88,7 @@ the fields cannot be filled on a fanless MBA or in a microVM; and it costs a
 `PROTOCOL_VERSION` bump per sensor type forever. The glyph tint preserves the
 per-component *intent* at zero column cost.
 
-**One numeric temperature per node (`anvil 72°`).** ~6 columns on every row to
+**One numeric temperature per node (`kiln 72°`).** ~6 columns on every row to
 show a number that is nominal almost always, and not comparable across machine
 types without flock-side calibration it must not hold.
 

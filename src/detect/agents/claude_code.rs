@@ -519,7 +519,7 @@ mod tests {
             "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
             "\u{276f} keep going\n",
             "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
-            "  sage \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
+            "  atlas \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
         );
         assert_eq!(detect_structural(idle), Some(AgentState::Idle));
 
@@ -545,7 +545,7 @@ mod tests {
             "\u{23fa} #307 merged. Both of mine are in.\n",
             "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
             "\u{276f} keep going\n",
-            "  sage \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
+            "  atlas \u{b7} Opus 5 \u{b7} ~/Projects/flock main\n",
         );
         assert!(
             !has_prompt_box(torn),
@@ -600,7 +600,7 @@ mod tests {
             "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
             "\u{276f} keep going\n",
             "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
-            "  sage \u{b7} Opus 5 (1M context) \u{b7} ~/Projects/flock main\n",
+            "  atlas \u{b7} Opus 5 (1M context) \u{b7} ~/Projects/flock main\n",
             "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 2 shells, 1 monitor \u{b7} \u{2190} for agents\n",
         );
         assert!(

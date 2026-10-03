@@ -1493,7 +1493,7 @@ mod tests {
             }
         }
         let peer_filter = ServerFilter::Peer {
-            ssh_target: "lars@anvil".into(),
+            ssh_target: "operator@kiln".into(),
         };
 
         // Another row's menu while a filter is active: both the narrowing

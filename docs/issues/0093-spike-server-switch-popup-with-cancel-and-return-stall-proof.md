@@ -18,7 +18,7 @@ Server switches today show #67's frozen last frame + a status line; a stalled di
 
 ## Decision / proposed approach
 
-Overlay popup on switch initiation: `switching to sage… 3s  [esc] cancel`. Two architecture paths, increasingly capable:
+Overlay popup on switch initiation: `switching to atlas… 3s  [esc] cancel`. Two architecture paths, increasingly capable:
 
 1. **Slots path (`[slots] enabled`, #76)**: the old server's live frame stays underneath (no freeze at all); the dial runs async; cancel = abort the dialing slot (demote to cold) and simply stop — the active slot never changed. Stall = elapsed keeps counting; cancel always works. Hypothesis: nearly free.
 2. **Legacy legs path (#67)**: the old client exits before the dial, so "the old view" is a frozen frame held by the launcher chain. Cancel = user-triggered instance of the EXISTING failure path (launcher abandons leg N, relaunches leg N-1 with a notice). Requires: the dialing leg to poll for a cancel keypress while connecting (stdin is held — the #72 status-line precedent paints over the held screen, so reading a key there is plausible), and `decide_next_leg` to treat cancel like failure-with-notice.
@@ -67,7 +67,7 @@ P2: progress detail (dial/handshake/first-frame phases).
 - **Esc gated strictly on pending_switch.is_some()** — no theft otherwise.
 
 ### UX spec (adopted)
-No background dim (live frame stays legible). Three lines: `switching to sage… 3s` / `[esc] cancel · returns to mba22` — the return-destination subtitle is the feature. Tone shifts: neutral 0–3s, yellow 3–10s, "host not responding" 10s+, "retry window ending" ~25s (keyed to #52's ~30s). Esc-flush on success + ~150ms `landed ✓` beat (the muscle-memory race). P1: absorb #72's reconnect wait into the same visual language with honest labels (`[esc] disconnect` — no "previous" exists there).
+No background dim (live frame stays legible). Three lines: `switching to atlas… 3s` / `[esc] cancel · returns to hopper` — the return-destination subtitle is the feature. Tone shifts: neutral 0–3s, yellow 3–10s, "host not responding" 10s+, "retry window ending" ~25s (keyed to #52's ~30s). Esc-flush on success + ~150ms `landed ✓` beat (the muscle-memory race). P1: absorb #72's reconnect wait into the same visual language with honest labels (`[esc] disconnect` — no "previous" exists there).
 
 ### The one fork (architect vs concurrency)
 - Architect: **legs Esc = won't-fix** (ssh inherits stdin at spawn; the #72 OSC-capture precedent doesn't generalize to arbitrary keys); legs gets only a richer status line until slots is default.

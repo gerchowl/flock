@@ -48,8 +48,8 @@ architectural rather than cosmetic:
 2. **A refusal.** `agent_profile_unresolved` (#366), `peer_not_configured`, a
    check that errored. Exactly the events worth reading later, and the ones
    that vanish soonest.
-3. **Anything cross-host.** An outcome produced on `sage` while the operator is
-   attached to `anvil` has no channel home at all.
+3. **Anything cross-host.** An outcome produced on `atlas` while the operator is
+   attached to `kiln` has no channel home at all.
 
 And the cost is already measurable. #316 concluded agent-to-agent messaging had
 no demand from `message_queued: 2` in 35,216 events. The log could not

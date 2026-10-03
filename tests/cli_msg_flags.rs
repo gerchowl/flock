@@ -49,7 +49,7 @@ fn an_unknown_flag_is_refused_instead_of_becoming_the_message_body() {
     let output = flk_msg(&[
         "send",
         "--agent",
-        "agent_sage_1",
+        "agent_atlas_1",
         "--intent-from-a-future-build",
         "needs_reply",
         "the real message",
@@ -127,7 +127,7 @@ fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
     let typed = flk_msg(&[
         "send",
         "--agent",
-        "agent_sage_1",
+        "agent_atlas_1",
         "--intent",
         "on_fire",
         "hello",
@@ -150,11 +150,11 @@ fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
     let relayed = flk_msg(&[
         "send",
         "--agent",
-        "agent_sage_1",
+        "agent_atlas_1",
         "--from-agent",
-        "agent_mba22_2",
+        "agent_hopper_2",
         "--from-host",
-        "mba22",
+        "hopper",
         "--intent",
         "on_fire",
         "--",
@@ -167,7 +167,7 @@ fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
     let blocking = flk_msg(&[
         "send",
         "--agent",
-        "agent_sage_1",
+        "agent_atlas_1",
         "--intent",
         "blocking",
         "hi",

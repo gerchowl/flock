@@ -1214,7 +1214,7 @@ fn confirm_remote_server_stop(
     // A federation switch leg must never prompt OR scribble on the held
     // alt-screen (#115). Any restart reason on a switch leg is a hard error
     // that rides the failure-notice rail (#67) — the switch should
-    // fail-with-notice ("anvil-dev: flock version mismatch"), not silently
+    // fail-with-notice ("kiln-dev: flock version mismatch"), not silently
     // keep running an incompatible remote server.
     if !context.allows_install_prompt() {
         return Err(io::Error::other(format!(
@@ -1791,7 +1791,7 @@ pub(crate) struct SshStdioBridge {
 /// A bridge's run of failed ssh connections (#420).
 ///
 /// A connection that fails and is then redialed successfully is churn, not an
-/// error: mba22 logged `remote.bridge.failed` for 24 of 25 bridges while the
+/// error: hopper logged `remote.bridge.failed` for 24 of 25 bridges while the
 /// switches themselves worked, and a WARN nobody should act on teaches the
 /// operator to ignore WARN. So a failure is DEBUG, with its attempt number,
 /// until the run reaches [`crate::peers::DIAL_FAILURE_PERSISTS_AFTER`] in a
@@ -2325,7 +2325,7 @@ fn write_keepalive_ssh_config() -> io::Result<PathBuf> {
 ///
 /// The charset is drawn from what real destinations need, not from the happy
 /// case — `user@host`, a `:port` suffix, and bracketed IPv6 literals
-/// (`[::1]`, `lars@[fe80::1]:22`) all pass. Whitespace, `=`, `,` and every
+/// (`[::1]`, `operator@[fe80::1]:22`) all pass. Whitespace, `=`, `,` and every
 /// shell metacharacter do not.
 ///
 /// Both ends of the trust boundary use this: `[[peers]]` at config load
@@ -2356,8 +2356,8 @@ pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
 /// A carried `ProxyJump` chain as seen from THIS machine (#441).
 ///
 /// A snapshot row's chain is written by the server that built the snapshot,
-/// hub first: `mba22` for a peer the hub polls, `mba22,anvil` for one only
-/// the relayer `anvil` can reach. When the launcher runs on one of those hops,
+/// hub first: `hopper` for a peer the hub polls, `hopper,kiln` for one only
+/// the relayer `kiln` can reach. When the launcher runs on one of those hops,
 /// every hop up to and including it is a loop back to where the dial already
 /// is, so it is cut: the hub's own client reaches its polled peers directly
 /// and a relayed peer via the relayer alone. `None` when nothing is left.
@@ -2368,7 +2368,7 @@ pub(crate) fn client_relative_proxy_jump(chain: Option<&str>) -> Option<String> 
 }
 
 /// Cut `chain` after the last hop naming one of `self_names`. Matched EXACTLY
-/// (case, `user@` and `:port` aside): on `anvil`, a hop `anvil.other` is some
+/// (case, `user@` and `:port` aside): on `kiln`, a hop `kiln.other` is some
 /// other machine and is kept (the #425 lesson, never the domain-stripped key).
 pub(crate) fn relative_proxy_jump(chain: &str, self_names: &[&str]) -> Option<String> {
     let me: Vec<String> = self_names
@@ -2407,7 +2407,7 @@ fn jump_hop_host(hop: &str) -> String {
 /// With `-J`, ssh reads each hop's name from THIS machine's ssh config, then
 /// asks the hop before it to connect to the resulting host, which that hop
 /// resolves in DNS. A `[[peers]]` target that is a `Host` alias only the hub's
-/// `~/.ssh/config` knows (`ksb-meatgrind`) is therefore unresolvable as a
+/// `~/.ssh/config` knows (`node-b-meatgrind`) is therefore unresolvable as a
 /// later hop, and ssh's own words for it name no alias at all.
 fn explain_jump_failure(err: io::Error, target: &str, proxy_jump: Option<&str>) -> io::Error {
     let Some(jump) = proxy_jump.filter(|jump| !jump.is_empty()) else {
@@ -2933,47 +2933,47 @@ mod tests {
     #[test]
     fn a_jump_through_the_dialling_machine_is_cut() {
         // The client on the hub dials a hub-polled peer directly.
-        assert_eq!(relative_proxy_jump("mba22", &["mba22"]), None);
+        assert_eq!(relative_proxy_jump("hopper", &["hopper"]), None);
         // And a relayed peer via the relayer alone.
         assert_eq!(
-            relative_proxy_jump("mba22,lars@anvil", &["mba22"]).as_deref(),
-            Some("lars@anvil")
+            relative_proxy_jump("hopper,operator@kiln", &["hopper"]).as_deref(),
+            Some("operator@kiln")
         );
         // On the relayer, the target resolves locally: no jump at all.
-        assert_eq!(relative_proxy_jump("mba22,lars@anvil", &["anvil"]), None);
+        assert_eq!(relative_proxy_jump("hopper,operator@kiln", &["kiln"]), None);
         // Mid-chain: everything up to and including us goes.
         assert_eq!(
-            relative_proxy_jump("mba22,anvil,ksb", &["anvil"]).as_deref(),
-            Some("ksb")
+            relative_proxy_jump("hopper,kiln,node-b", &["kiln"]).as_deref(),
+            Some("node-b")
         );
         // Anywhere else the two-hop chain is kept whole.
         assert_eq!(
-            relative_proxy_jump("mba22,lars@anvil", &["ksb"]).as_deref(),
-            Some("mba22,lars@anvil")
+            relative_proxy_jump("hopper,operator@kiln", &["node-b"]).as_deref(),
+            Some("hopper,operator@kiln")
         );
         // `user@`, `:port` and case do not hide us.
         assert_eq!(
-            relative_proxy_jump("lars@MBA22:22,anvil", &["mba22"]).as_deref(),
-            Some("anvil")
+            relative_proxy_jump("operator@HOPPER:22,kiln", &["hopper"]).as_deref(),
+            Some("kiln")
         );
         // The full host name counts as us too.
         assert_eq!(
             relative_proxy_jump(
-                "mba22.tail1234.ts.net,anvil",
-                &["mba22", "mba22.tail1234.ts.net"]
+                "hopper.tail1234.ts.net,kiln",
+                &["hopper", "hopper.tail1234.ts.net"]
             )
             .as_deref(),
-            Some("anvil")
+            Some("kiln")
         );
-        // But a domain is never stripped: `anvil.other` is another machine.
+        // But a domain is never stripped: `kiln.other` is another machine.
         assert_eq!(
-            relative_proxy_jump("mba22,anvil.other", &["anvil"]).as_deref(),
-            Some("mba22,anvil.other")
+            relative_proxy_jump("hopper,kiln.other", &["kiln"]).as_deref(),
+            Some("hopper,kiln.other")
         );
         // Nor is a prefix us.
         assert_eq!(
-            relative_proxy_jump("mba22,anvil", &["mba"]).as_deref(),
-            Some("mba22,anvil")
+            relative_proxy_jump("hopper,kiln", &["hop"]).as_deref(),
+            Some("hopper,kiln")
         );
     }
 
@@ -2983,7 +2983,7 @@ mod tests {
     #[test]
     fn a_route_is_released_when_its_leg_fails() {
         fn failing_leg() -> io::Result<()> {
-            let _route = route_control_plane("ws00860001", Some("mba22,anvil"));
+            let _route = route_control_plane("ws00860001", Some("hopper,kiln"));
             assert!(!control_plane_jump_args("ws00860001").unwrap().is_empty());
             Err(io::Error::other("remote switch probe failed"))?;
             unreachable!("the leg failed above")
@@ -2997,10 +2997,11 @@ mod tests {
     #[test]
     fn a_jump_hop_failure_names_the_alias_trap() {
         let resolve = || io::Error::other("stdio forwarding failed");
-        let explained = explain_jump_failure(resolve(), "ws00860001", Some("mba22,ksb-meatgrind"));
+        let explained =
+            explain_jump_failure(resolve(), "ws00860001", Some("hopper,node-b-meatgrind"));
         let text = explained.to_string();
         assert!(text.starts_with("stdio forwarding failed"), "{text}");
-        assert!(text.contains("mba22,ksb-meatgrind"), "{text}");
+        assert!(text.contains("hopper,node-b-meatgrind"), "{text}");
         assert!(text.contains("Host alias"), "{text}");
         assert!(
             !text.contains('\n'),
@@ -3013,7 +3014,7 @@ mod tests {
         );
         let refused = io::Error::other("Permission denied (publickey)");
         assert_eq!(
-            explain_jump_failure(refused, "ws00860001", Some("mba22")).to_string(),
+            explain_jump_failure(refused, "ws00860001", Some("hopper")).to_string(),
             "Permission denied (publickey)"
         );
     }
@@ -3025,13 +3026,13 @@ mod tests {
     fn control_plane_ssh_rides_the_legs_jump_only_while_it_is_prepared() {
         assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
         {
-            let _route = route_control_plane("ws00860001", Some("mba22,anvil"));
+            let _route = route_control_plane("ws00860001", Some("hopper,kiln"));
             assert_eq!(
                 control_plane_jump_args("ws00860001").unwrap(),
-                vec!["-o".to_string(), "ProxyJump=mba22,anvil".to_string()]
+                vec!["-o".to_string(), "ProxyJump=hopper,kiln".to_string()]
             );
             // Another target on the same thread is not routed.
-            assert!(control_plane_jump_args("sage").unwrap().is_empty());
+            assert!(control_plane_jump_args("atlas").unwrap().is_empty());
         }
         assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
         {
@@ -3056,8 +3057,9 @@ mod tests {
         });
         let session = crate::session::DEFAULT_SESSION_NAME;
 
-        let with_jump = bridge_dial_argv("lars@spoke2", &remote_flock, session, None, Some("hub"))
-            .expect("a well-formed target and jump build an argv");
+        let with_jump =
+            bridge_dial_argv("operator@spoke2", &remote_flock, session, None, Some("hub"))
+                .expect("a well-formed target and jump build an argv");
         assert!(
             with_jump.contains(&"-o".to_string()),
             "argv must include the -o flag: {with_jump:?}"
@@ -3074,21 +3076,21 @@ mod tests {
             .expect("ProxyJump argv slot");
         let target_pos = with_jump
             .iter()
-            .position(|arg| arg == "lars@spoke2")
+            .position(|arg| arg == "operator@spoke2")
             .expect("target argv slot");
         assert!(
             proxy_pos < target_pos,
             "ProxyJump must precede the target: {with_jump:?}"
         );
 
-        let without = bridge_dial_argv("lars@sage", &remote_flock, session, None, None)
+        let without = bridge_dial_argv("operator@atlas", &remote_flock, session, None, None)
             .expect("a well-formed target builds an argv");
         assert!(
             !without.iter().any(|arg| arg.starts_with("ProxyJump=")),
             "no proxy_jump = no ProxyJump argv: {without:?}"
         );
         // Empty-string proxy_jump = None semantically; must not add `-o ProxyJump=`.
-        let empty = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(""))
+        let empty = bridge_dial_argv("operator@atlas", &remote_flock, session, None, Some(""))
             .expect("an empty jump is `no jump`, not an invalid one");
         assert!(
             !empty.iter().any(|arg| arg.starts_with("ProxyJump")),
@@ -3116,7 +3118,7 @@ mod tests {
         for target in [
             "-oProxyCommand=id",
             "-tt",
-            "lars@sage -oProxyCommand=id",
+            "operator@atlas -oProxyCommand=id",
             "",
         ] {
             let err = bridge_dial_argv(target, &remote_flock, session, None, None)
@@ -3126,8 +3128,8 @@ mod tests {
 
         // The same for the second wire-controlled value, including one bad hop
         // in an otherwise fine chain.
-        for jump in ["-oProxyCommand=id", "hub,-oProxyCommand=id", "hub,,anvil"] {
-            let err = bridge_dial_argv("lars@sage", &remote_flock, session, None, Some(jump))
+        for jump in ["-oProxyCommand=id", "hub,-oProxyCommand=id", "hub,,kiln"] {
+            let err = bridge_dial_argv("operator@atlas", &remote_flock, session, None, Some(jump))
                 .expect_err("an invalid proxy jump must not build an argv");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "jump {jump:?}");
         }
@@ -3145,17 +3147,17 @@ mod tests {
 
         for target in [
             "[::1]",
-            "lars@[fe80::1]:2222",
-            "lars@anvil.tail22bd7c.ts.net:22",
-            "anvil-dev",
+            "operator@[fe80::1]:2222",
+            "operator@kiln.tail1234.ts.net:22",
+            "kiln-dev",
         ] {
-            let argv = bridge_dial_argv(target, &remote_flock, session, None, Some("hub,anvil"))
+            let argv = bridge_dial_argv(target, &remote_flock, session, None, Some("hub,kiln"))
                 .unwrap_or_else(|err| panic!("{target} is a legitimate destination: {err}"));
             assert!(
                 argv.contains(&target.to_string()),
                 "target must reach the argv: {argv:?}"
             );
-            assert!(argv.contains(&"ProxyJump=hub,anvil".to_string()));
+            assert!(argv.contains(&"ProxyJump=hub,kiln".to_string()));
         }
     }
 
@@ -3385,7 +3387,7 @@ mod tests {
              n=$((n+1))\n\
              echo \"$n\" > '{counter}'\n\
              if [ \"$n\" -eq 1 ]; then\n\
-               echo 'Connection to sage closed by remote host.' >&2\n\
+               echo 'Connection to atlas closed by remote host.' >&2\n\
                exit 255\n\
              fi\n\
              exec cat\n",
@@ -3507,7 +3509,7 @@ mod tests {
     #[test]
     fn a_redial_asks_the_remote_to_reattach_rather_than_start_a_server() {
         let mut argv = bridge_dial_argv(
-            "lars@sage",
+            "operator@atlas",
             &test_remote_flock(),
             crate::session::DEFAULT_SESSION_NAME,
             None,
@@ -4617,7 +4619,7 @@ mod tests {
             .expect("Linux x86_64 must be a known remote platform");
         let remote_flock = RemoteFlock::for_platform(platform);
         let err = confirm_remote_install(
-            "alice@anvil-dev",
+            "alice@kiln-dev",
             &remote_flock,
             "the 0.6.8 stable asset for linux-x86_64",
             LaunchContext::FederationSwitch,
@@ -4636,7 +4638,7 @@ mod tests {
         // federation switch -- a switch landing on an incompatible remote
         // server must fail-with-notice (#67), not silently keep running.
         let err = confirm_remote_server_stop(
-            "alice@anvil-dev",
+            "alice@kiln-dev",
             Some("0.6.8"),
             Some(CURRENT_PROTOCOL),
             RemoteServerRestartReason::VersionMismatch,
@@ -4653,7 +4655,7 @@ mod tests {
     #[test]
     fn confirm_remote_server_stop_returns_error_under_federation_switch_for_protocol_mismatch() {
         let err = confirm_remote_server_stop(
-            "alice@anvil-dev",
+            "alice@kiln-dev",
             Some("0.6.8"),
             Some(CURRENT_PROTOCOL.wrapping_sub(1)),
             RemoteServerRestartReason::ProtocolMismatch,

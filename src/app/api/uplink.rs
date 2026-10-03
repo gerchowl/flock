@@ -30,7 +30,7 @@ fn now_ms() -> u64 {
 
 /// An uplink id nobody can guess: the counter keeps it unique, and a hash
 /// keyed from the OS's randomness keeps it unpredictable, so a stray process
-/// cannot forge a `msg.uplink_result` for a send it never saw even if the
+/// cannot kiln a `msg.uplink_result` for a send it never saw even if the
 /// relay binding were ever bypassed.
 /// How far up the process tree to look for sshd. The real chain is sshd →
 /// (sshd-session) → login shell → `sh -lc` → flk; the bound is generous, and
@@ -319,7 +319,7 @@ impl App {
     ///
     /// The relay methods ride the local socket, which every same-user process
     /// can reach. Without a binding, a stray process could take a spoke's
-    /// pending messages, forge the hub's answers, or plant fleet rows. The
+    /// pending messages, kiln the hub's answers, or plant fleet rows. The
     /// binding is the caller's socket peer pid AND that process's start time
     /// (so a reused pid is not the relay), refused when either cannot be read,
     /// refused from inside a pane, refused unless the caller descends from
@@ -1142,21 +1142,21 @@ mod tests {
         assert_eq!(frame["message"]["correlation_id"], "c-410");
         let uplink_id = frame["uplink_id"].as_str().expect("uplink id").to_string();
 
-        // The hub answers: it relayed the message on to `ksb`.
+        // The hub answers: it relayed the message on to `node-b`.
         let ack = value(&as_relay(
             &mut app,
             Request {
                 id: "r2".into(),
                 method: Method::MsgUplinkResult(MsgUplinkResultParams {
                     uplink_id: uplink_id.clone(),
-                    hub: "mba22".into(),
+                    hub: "hopper".into(),
                     response: serde_json::json!({
                         "id": "uplink-forward",
                         "result": {
                             "type": "msg_queued",
                             "correlation_id": "c-410",
                             "state": "relayed",
-                            "to_host": "ksb",
+                            "to_host": "node-b",
                             "path": "direct",
                         },
                     }),
@@ -1168,8 +1168,8 @@ mod tests {
         let answer = value(&sender.try_recv().expect("the sender is answered"));
         assert_eq!(answer["id"], "req", "addressed to the caller's own request");
         assert_eq!(answer["result"]["state"], "relayed", "{answer}");
-        assert_eq!(answer["result"]["path"], "via mba22", "{answer}");
-        assert_eq!(answer["result"]["to_host"], "ksb", "{answer}");
+        assert_eq!(answer["result"]["path"], "via hopper", "{answer}");
+        assert_eq!(answer["result"]["to_host"], "node-b", "{answer}");
 
         // And the sender's own log agrees, for a `msg.status` asked later.
         let status = value(&app.handle_api_request(Request {
@@ -1178,7 +1178,7 @@ mod tests {
                 correlation_id: "c-410".into(),
             }),
         }));
-        assert_eq!(status["result"]["path"], "via mba22", "{status}");
+        assert_eq!(status["result"]["path"], "via hopper", "{status}");
 
         // A re-offered frame answered twice resolves nothing the second time.
         let again = value(&as_relay(
@@ -1187,7 +1187,7 @@ mod tests {
                 id: "r4".into(),
                 method: Method::MsgUplinkResult(MsgUplinkResultParams {
                     uplink_id,
-                    hub: "mba22".into(),
+                    hub: "hopper".into(),
                     response: serde_json::json!({"result": {"state": "duplicate"}}),
                 }),
             },
@@ -1211,13 +1211,13 @@ mod tests {
                 id: "r2".into(),
                 method: Method::MsgUplinkResult(MsgUplinkResultParams {
                     uplink_id,
-                    hub: "mba22".into(),
+                    hub: "hopper".into(),
                     response: serde_json::json!({
                         "id": "uplink-forward",
                         "error": {
                             "code": "peer_unreachable",
-                            "message": "mba22 cannot reach ksb (auth refused): Permission denied",
-                            "data": {"hop": "mba22 → ksb", "reason": "auth_refused", "retryable": true},
+                            "message": "hopper cannot reach node-b (auth refused): Permission denied",
+                            "data": {"hop": "hopper → node-b", "reason": "auth_refused", "retryable": true},
                         },
                     }),
                 }),
@@ -1226,8 +1226,8 @@ mod tests {
         let answer = value(&sender.try_recv().expect("answered"));
         let message = answer["error"]["message"].as_str().unwrap_or_default();
         assert_eq!(answer["error"]["code"], "peer_unreachable", "{answer}");
-        assert!(message.contains("mba22 cannot reach ksb"), "{message}");
-        assert_eq!(answer["error"]["data"]["via"], "mba22", "{answer}");
+        assert!(message.contains("hopper cannot reach node-b"), "{message}");
+        assert_eq!(answer["error"]["data"]["via"], "hopper", "{answer}");
         assert_eq!(
             answer["error"]["data"]["reason"], "auth_refused",
             "{answer}"
@@ -1257,24 +1257,24 @@ mod tests {
     #[tokio::test]
     async fn a_hub_vouches_for_its_edge_and_refuses_a_spoke_speaking_for_another_host() {
         // Pitfall 1: the hub must not launder identity. A frame that arrived
-        // over the relay into `sage` may only speak for `sage`.
+        // over the relay into `atlas` may only speak for `atlas`.
         let mut app = test_app();
-        app.state.peers = ["sage", "ksb"]
+        app.state.peers = ["atlas", "node-b"]
             .into_iter()
             .map(|name| crate::config::PeerConfig {
                 name: name.into(),
                 ..Default::default()
             })
             .collect();
-        // sage's own summary claims to BE ksb — a cloned VM, or a lie. The
+        // atlas's own summary claims to BE node-b — a cloned VM, or a lie. The
         // self-report must not be what the hub vouches against.
         app.state.peer_summaries = vec![
-            peer_with_agent("sage", "ksb", "agent_sage_1"),
-            peer_with_agent("ksb", "ksb", "agent_ksb_1"),
+            peer_with_agent("atlas", "node-b", "agent_atlas_1"),
+            peer_with_agent("node-b", "node-b", "agent_node-b_1"),
         ];
         let mut message = frame_from_spoke("agent_nowhere_1");
-        message.from_host = Some("ksb".into());
-        let response = value(&app.forward_uplinked_message("sage", message));
+        message.from_host = Some("node-b".into());
+        let response = value(&app.forward_uplinked_message("atlas", message));
         assert_eq!(
             response["error"]["code"], "uplink_sender_mismatch",
             "{response}"
@@ -1283,8 +1283,8 @@ mod tests {
         // From its own host it is forwarded — and a target the hub cannot place
         // is a plain miss: a forwarded message is never handed up again.
         let mut message = frame_from_spoke("agent_nowhere_1");
-        message.from_host = Some("sage".into());
-        let response = value(&app.forward_uplinked_message("sage", message));
+        message.from_host = Some("atlas".into());
+        let response = value(&app.forward_uplinked_message("atlas", message));
         assert_eq!(
             response["error"]["code"], "msg_target_not_found",
             "{response}"
@@ -1304,14 +1304,14 @@ mod tests {
         let mut relayed =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
                 dial: None,
-                name: "ksb".into(),
-                ssh_target: "ksb".into(),
-                host: Some("ksb".into()),
+                name: "node-b".into(),
+                ssh_target: "node-b".into(),
+                host: Some("node-b".into()),
                 version: None,
                 protocol: None,
                 system: None,
                 latency_ms: None,
-                workspaces: peer_with_agent("ksb", "ksb", "agent_ksb_1").workspaces,
+                workspaces: peer_with_agent("node-b", "node-b", "agent_node-b_1").workspaces,
                 age_secs: Some(1),
                 error: None,
                 origin: "hub2".into(),
@@ -1321,10 +1321,12 @@ mod tests {
             })
             .expect("valid row");
         relayed.via = Some("hub2".into());
-        app.state.relayed_fleet_cache.insert("ksb".into(), relayed);
+        app.state
+            .relayed_fleet_cache
+            .insert("node-b".into(), relayed);
 
         let located = app
-            .locate_agent("agent_ksb_1")
+            .locate_agent("agent_node-b_1")
             .expect("found via the relay");
         assert_eq!(
             located.route.as_deref(),
@@ -1333,8 +1335,8 @@ mod tests {
         );
         assert!(!located.direct);
 
-        let mut forwarded = frame_from_spoke("agent_ksb_1");
-        forwarded.from_host = Some("sage".into());
+        let mut forwarded = frame_from_spoke("agent_node-b_1");
+        forwarded.from_host = Some("atlas".into());
         let response = value(&app.handle_api_request(Request {
             id: "req".into(),
             method: Method::MsgSend(forwarded),
@@ -1348,7 +1350,7 @@ mod tests {
         // process — an agent in a pane included — name a spoke and have the
         // hub vouch for a sender it never saw. It is in-process only now, so
         // the wire has no spelling for it at all.
-        let request = r#"{"id":"x","method":"msg.uplink_forward","params":{"spoke":"sage","message":{"to":{"type":"agent","agent":"a"},"body":"b","from_host":"sage","from_agent":"a"}}}"#;
+        let request = r#"{"id":"x","method":"msg.uplink_forward","params":{"spoke":"atlas","message":{"to":{"type":"agent","agent":"a"},"body":"b","from_host":"atlas","from_agent":"a"}}}"#;
         assert!(
             serde_json::from_str::<Request>(request).is_err(),
             "msg.uplink_forward must not parse as a request"
@@ -1361,12 +1363,12 @@ mod tests {
         let me = crate::app::short_host_name();
         assert_eq!(relay_sender_host(false, None), me, "unvouched, unattested");
         assert_eq!(
-            relay_sender_host(false, Some("sage")),
-            "sage",
+            relay_sender_host(false, Some("atlas")),
+            "atlas",
             "vouched by the hub's in-process uplink path"
         );
         assert_eq!(
-            relay_sender_host(true, Some("sage")),
+            relay_sender_host(true, Some("atlas")),
             me,
             "a locally attested sender is always this host"
         );
@@ -1374,8 +1376,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_hub_stamps_the_configured_edge_not_the_spokes_self_report() {
-        // Blocker A: a spoke configured as `anvil` that calls itself `vm-dev`
-        // may hand up as vm-dev (its unique self-report), but the origin the
+        // Blocker A: a spoke configured as `kiln` that calls itself `bastion`
+        // may hand up as bastion (its unique self-report), but the origin the
         // recipient reads is the edge the hub dialled.
         let mut app = test_app();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
@@ -1390,14 +1392,14 @@ mod tests {
         let pane = app.locate_agent(&local_agent).expect("local").pane_id;
 
         app.state.peers = vec![crate::config::PeerConfig {
-            name: "anvil".into(),
+            name: "kiln".into(),
             ..Default::default()
         }];
-        app.state.peer_summaries = vec![peer_with_agent("anvil", "vm-dev", "agent_vm-dev_1")];
+        app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
         let mut message = frame_from_spoke(&local_agent);
-        message.from_agent = Some("agent_vm-dev_1".into());
-        message.from_host = Some("vm-dev".into());
-        let queued = value(&app.forward_uplinked_message("anvil", message));
+        message.from_agent = Some("agent_bastion_1".into());
+        message.from_host = Some("bastion".into());
+        let queued = value(&app.forward_uplinked_message("kiln", message));
         assert_eq!(queued["result"]["state"], "queued", "{queued}");
 
         let inbox = value(&app.handle_api_request(Request {
@@ -1405,15 +1407,15 @@ mod tests {
             method: Method::MsgRead(crate::api::schema::MsgReadParams { pane: Some(pane) }),
         }));
         let delivered = &inbox["result"]["messages"][0];
-        assert_eq!(delivered["from_host"], "anvil", "{inbox}");
-        assert_eq!(delivered["from_agent"], "agent_vm-dev_1", "{inbox}");
+        assert_eq!(delivered["from_host"], "kiln", "{inbox}");
+        assert_eq!(delivered["from_agent"], "agent_bastion_1", "{inbox}");
     }
 
     #[tokio::test]
     async fn only_the_bound_relay_may_take_answer_or_push() {
         // #416 review, blocker 2: the relay methods are on the local socket,
         // so without a binding any same-user process could take a spoke's
-        // pending messages or forge the hub's answer to them.
+        // pending messages or kiln the hub's answer to them.
         let mut app = test_app();
         attest_caller(&mut app);
         let _take = attach_relay(&mut app);

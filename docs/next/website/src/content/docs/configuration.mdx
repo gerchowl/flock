@@ -120,7 +120,7 @@ bridge_stderr_settle_ms = 200        # wait this long for ssh's last stderr on a
 
 When enabled, `flk --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Flock's generated config.
 
-When the connection to a remote server drops — the laptop slept, the network changed — Flock keeps your last screen up under a `reconnecting to <host>…` bar and redials. Once the server answers it re-attaches to the same session. Press Esc to stop waiting; Flock also stops at `reconnect_deadline_secs`. Either way you land back on the server you switched from, told that the connection was lost, or at your shell if there is none. Quitting, detaching and switching never reconnect. If the remote server itself exited meanwhile, Flock says the session state is lost instead of attaching you to a new, empty server. Clients with `[slots] enabled` do not redial; they fall back to home as before. Set `reconnect = false` to end the session on the first drop instead.
+When the connection to a remote server drops — the hopper slept, the network changed — Flock keeps your last screen up under a `reconnecting to <host>…` bar and redials. Once the server answers it re-attaches to the same session. Press Esc to stop waiting; Flock also stops at `reconnect_deadline_secs`. Either way you land back on the server you switched from, told that the connection was lost, or at your shell if there is none. Quitting, detaching and switching never reconnect. If the remote server itself exited meanwhile, Flock says the session state is lost instead of attaching you to a new, empty server. Clients with `[slots] enabled` do not redial; they fall back to home as before. Set `reconnect = false` to end the session on the first drop instead.
 
 When a switch to a server fails for good, the servers band shows why on that server's row (for example `auth refused`), and the failure is kept in the notification log. ssh's own messages go to the session log (`flock-client.log`), never over your screen.
 
@@ -318,9 +318,9 @@ accent = "cyan"
 
 `servers_panel_scope` can be `all` or `current`. With `current`, the servers section shows only the machine you are attached to (plus the way-home row when you are attached to a remote server). `spaces_panel_scope` can be `all` or `current`. With `current`, the spaces list shows only the focused workspace's space group. Both default to `all`, and clicking the `all`/`current` label in each section header toggles and saves the setting — exactly like the agents panel.
 
-`server_state_mark` controls the leading state mark on each server row. The default `counts` renders fixed red/yellow/green agent-count columns (`0 2 1 mba22` — blocked, working, calm), zeros muted, with a band-global digit width so one busy server aligns every row. `medallion_sextant` / `medallion_quadrant` render the rectangular state medallion instead (nested bands of the worst three states; quadrant for fonts without Symbols for Legacy Computing). Unreachable servers ghost their row: greyed italic name (struck through), a broken-link icon with the outage age, and the last-known stats greyed in place.
+`server_state_mark` controls the leading state mark on each server row. The default `counts` renders fixed red/yellow/green agent-count columns (`0 2 1 hopper` — blocked, working, calm), zeros muted, with a band-global digit width so one busy server aligns every row. `medallion_sextant` / `medallion_quadrant` render the rectangular state medallion instead (nested bands of the worst three states; quadrant for fonts without Symbols for Legacy Computing). Unreachable servers ghost their row: greyed italic name (struck through), a broken-link icon with the outage age, and the last-known stats greyed in place.
 
-`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
+`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "hopper"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
 
@@ -363,13 +363,13 @@ or a row of tabs, which terminal is Flock, which server it is attached to, and
 whether something is blocked and waiting on you.
 
 ```
-● 2B  feat/foo · mba22 — flk
+● 2B  feat/foo · hopper — flk
 ```
 
 The badge leads because it is the only part that changes, and titles are
 truncated from the right. It carries the states that want your attention —
 `B` blocked, `D` finished-but-unseen — and disappears entirely when none of them
-apply, so a calm fleet reads `main · mba22 — flk`. An empty Flock reads `flk`.
+apply, so a calm fleet reads `main · hopper — flk`. An empty Flock reads `flk`.
 
 Flock sets the window title only (OSC 2), never the icon name, and hands the
 title back when it exits.
@@ -587,7 +587,7 @@ max_issues = 50          # open issues fetched per poll; older ones are not eval
 ```
 
 Hibernation is per-host policy: `enable = false` is the right default on a
-big machine and `true` on a laptop. A hibernated pane's resume plan lives in
+big machine and `true` on a hopper. A hibernated pane's resume plan lives in
 memory only — after a server restart the pane comes back as a normal
 restorable agent rather than a hibernated one, so nothing is lost, but the
 memory saving ends with the restart. Only `idle` panes the operator has
@@ -656,7 +656,7 @@ mute_reason_max_chars = 200      # longest `reason` a mute may carry
 deferral_relay_concurrency = 4   # mute deferrals to other hosts in flight at once
 ```
 
-`enabled` and `allow_from` are enforced by the receiver, which is the only party that cannot be bypassed. A node with `enabled = false` still sends. `allow_from` is open by default because a flock fleet is already one trust domain. Narrow it with host names, for example `allow_from = ["mba22"]`.
+`enabled` and `allow_from` are enforced by the receiver, which is the only party that cannot be bypassed. A node with `enabled = false` still sends. `allow_from` is open by default because a flock fleet is already one trust domain. Narrow it with host names, for example `allow_from = ["hopper"]`.
 
 A mute answers (`flock_msg_mute`, `flk msg mute`). Every `needs_reply` sender it defers gets one automatic reply with the mute's `reason` and the time it lifts. `mute_reason_max_chars` bounds that reason: a longer one is truncated, never refused, so a mute cannot fail over its own explanation. A deferral to a sender on another host is an ssh hop, and one mute over a full inbox can owe many of them. `deferral_relay_concurrency` caps how many run at once, and the rest wait their turn.
 ## Waking idle agents

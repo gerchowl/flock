@@ -43,7 +43,7 @@ pub(crate) struct NotificationEntry {
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
     /// The node that produced the outcome. Carried rather than assumed so an
-    /// outcome from `sage` stays legible when read on `anvil`.
+    /// outcome from `atlas` stays legible when read on `kiln`.
     pub origin_host: String,
     pub filed_at_ms: u64,
     pub seen: bool,
