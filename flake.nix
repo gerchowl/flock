@@ -95,6 +95,7 @@
                   && guardrails-adr-matrix \
                   && env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim .github/workflows \
                   && guardrails-log-budget \
+                  && python3 scripts/fixture_hosts.py $(find . -name '*.rs' -not -path './vendor/*') \
                   && touch $out
               '';
           default = self.checks.${system}.flock;

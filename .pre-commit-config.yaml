@@ -56,6 +56,28 @@ repos:
         files: \.rs$
         pass_filenames: true
 
+      # A declared host vocabulary, so a fixture cannot be named after a real
+      # machine (#510). Binds in CI via `nix flake check` because the declaration
+      # is checked in — a deny-list of real names could not be.
+      - id: fixture-hosts
+        name: "test fixtures use declared, fictional hosts"
+        entry: python3 scripts/fixture_hosts.py
+        language: system
+        files: \.rs$
+        pass_filenames: true
+
+      # The complementary half, and LOCAL ONLY: candidates are derived from this
+      # machine's own ssh state (~/.ssh/config, known_hosts, the local hostname,
+      # tailscale), so there is nothing to run in CI and nothing for a contributor
+      # to match against. It is the only rule that can judge a BARE hostname, which
+      # is why the public gate above deliberately does not try.
+      - id: ssh-hosts
+        name: "no real machine name from this host's ssh state"
+        entry: python3 scripts/ssh_hosts_gate.py
+        language: system
+        files: (\.rs$|\.md$|\.mdx$|\.toml$|\.json$|\.ya?ml$|\.py$|\.sh$)
+        pass_filenames: true
+
       # Deterministic, no escape hatch by design: a conflicted merge CAN be
       # committed (git records it and `git status` is clean afterwards).
       - id: no-conflict-markers

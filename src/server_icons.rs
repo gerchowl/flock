@@ -283,6 +283,40 @@ mod tests {
         assert!(is_renderable("anvil"));
     }
 
+    /// #510: a declared fixture host must not also be a registered icon name.
+    ///
+    /// The two vocabularies colliding is not cosmetic. When a fixture peer was
+    /// named after a registered glyph, `server_label = "icon"` rendered a glyph
+    /// where the test meant to read a hostname, and an assertion that had been
+    /// checking "icon and host agree" silently became unable to tell the two
+    /// arguments apart. `scripts/fixture_hosts.py` cannot see this — the
+    /// vocabulary lives in this file — so the check lives here, next to the
+    /// sortedness invariant it protects.
+    #[test]
+    fn declared_fixture_hosts_are_not_icon_names() {
+        let declared: toml::Value = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/fixture-hosts.toml"
+        )))
+        .expect("scripts/fixture-hosts.toml parses");
+        let hosts = declared
+            .get("hosts")
+            .and_then(toml::Value::as_table)
+            .expect("fixture-hosts.toml declares a [hosts] table");
+        assert!(
+            !hosts.is_empty(),
+            "an empty [hosts] table would silently disable every fixture-host check"
+        );
+        let icons: Vec<String> = known_names().iter().map(|n| n.to_lowercase()).collect();
+        for host in hosts.keys() {
+            assert!(
+                !icons.contains(&host.to_lowercase()),
+                "fixture host {host:?} is also a registered icon name — a servers-band \
+                 row would render a glyph where the test means a hostname"
+            );
+        }
+    }
+
     #[test]
     fn known_names_all_resolve_and_stay_sorted() {
         let names = known_names();

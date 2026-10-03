@@ -1,0 +1,53 @@
+# Declared fixture hosts.
+#
+# `scripts/fixture_hosts.py` fails any *structured* host-shaped string in test
+# code that is not declared here. A real machine is undeclared by construction,
+# which is why this rule needs no private data and binds in CI — unlike
+# `scripts/ssh_hosts_gate.py`, which knows the author's real labels and can
+# therefore also judge bare words, but only locally.
+#
+# Keep this list fictional. Two rules, both enforced:
+#
+#   * a label must not be a registered server-icon name — `src/server_icons.rs`
+#     asserts that, because the two vocabularies colliding is how a fixture host
+#     silently becomes an icon (and how a servers-band assertion stops
+#     discriminating between the two);
+#   * prefer a name that cannot resolve. RFC 2606 reserves `.invalid`, `.test`,
+#     `.example` and `.localhost`; where a bare label is needed, keep it obviously
+#     invented.
+#
+# `atlas.tail1234.ts.net` is the pattern for a fleet FQDN: a fictional MagicDNS
+# suffix in the reserved shape, never a real tailnet's domain.
+
+[hosts]
+# The fleet vocabulary these tests order, dedupe and route across. Bare labels
+# are allowed because the servers band sorts on them, which is the behaviour
+# several of these tests exist to pin.
+atlas = "a fleet hub in sidebar ordering tests"
+bastion = "a spoke that reports a different hostname than it is configured as"
+hopper = "the client/home host"
+kiln = "a peer"
+node-a = "a peer in multi-host ordering"
+node-b = "a peer in multi-host ordering"
+node-c = "a peer in multi-host ordering"
+operator = "the human's username in an ssh destination"
+spoke1 = "a spoke reached through a relay"
+spoke2 = "a spoke reached through a relay"
+self = "the server under test"
+
+# Distinct names used where a test needs two hosts that must NOT be conflated.
+kiln-dev = "a peer whose reported host differs from its configured name"
+kiln-elsewhere = "a peer distinguished by route"
+kiln-host = "a peer named for its host rather than its ssh target"
+eth-jump = "a ProxyJump hop"
+
+# MagicDNS-shaped fictions. The suffix is invented, in the reserved shape.
+"atlas.tail1234.ts.net" = "a fleet FQDN in config parsing tests"
+"kiln.tail1234.ts.net" = "a fleet FQDN in config parsing tests"
+attacker = "the short form of a hostile destination"
+"attacker.example" = "a hostile destination in a security test"
+
+# Hosts that are meant not to resolve. Declared so the intent is explicit rather
+# than incidental.
+flk-418-no-such-host = "a host that does not exist, for a dial failure"
+relay-audit-test-nonexistent-host = "a host that does not exist, for an audit row"
