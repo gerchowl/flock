@@ -31,6 +31,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0019](0019-channel-push-delivery.md) | Agent mail may also arrive as a Claude Code channel push, as a first knock over the pull that stays the source of truth | Proposed |
 | [0020](0020-agent-kind-is-a-type.md) | The spawn agent kind is a type, not an allowlist; it gains opencode, and a caller may never name a profile | Accepted |
 | [0021](0021-model-registry-and-tier-matrix.md) | A model is a named capability the agent chooses from a declared set, and a tier is a property of the task rather than of the call | Accepted |
+| [0022](0022-adr-0016-implemented-unaccepted.md) | ADR-0016 shipped without its decision; the log exists and §5 is now the operator's answer to give | Accepted |
 
 ## Conventions
 
