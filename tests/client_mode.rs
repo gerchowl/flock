@@ -74,8 +74,13 @@ fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
     cleanup_test_base(&base);
 }
 
-/// Serialises this binary's server-spawning tests: at most one flock server at
-/// a time *within this process*.
+/// Serialises this binary's server-spawning tests: at most one server-spawning
+/// test at a time *within this process*.
+///
+/// It serialises tests, not servers: one test here may legitimately hold
+/// several `flk server` processes at once — a live handoff runs the old and
+/// the replacement server together by construction, and
+/// `duplicate_server_start_fails_gracefully` starts a second one on purpose.
 ///
 /// The `OnceLock` below is function-local, so it is per-crate-per-binary. It
 /// does NOT coordinate with the identical `test_lock()` in api_ping.rs,
@@ -87,11 +92,17 @@ fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
 /// What actually keeps concurrent binaries off each other's paths is naming:
 /// each test roots its config home, runtime dir and socket inside its own
 /// `unique_test_dir()` (a per-binary prefix plus this process's pid and a
-/// unique suffix), and the spawn helpers pass explicit `XDG_CONFIG_HOME`,
-/// `XDG_RUNTIME_DIR` and `FLOCK_SOCKET_PATH`. No two tests, in this binary or
-/// any other, share a socket, config or runtime dir. Cross-binary CPU
-/// contention is nextest's to schedule — see the `serial-pty` group and the
-/// retries in `.config/nextest.toml`.
+/// unique suffix), and the spawn helpers redirect `XDG_CONFIG_HOME` and
+/// `XDG_RUNTIME_DIR` into that tree. Most also pass an explicit
+/// `FLOCK_SOCKET_PATH` inside it; three deliberately `env_remove` it to
+/// exercise default path resolution (`live_handoff.rs`, `auto_detect.rs`), and
+/// that still lands in the same tree, because the default socket derives from
+/// the config home — pinned by
+/// `socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set` in
+/// `src/api/server.rs`. No two tests, in this binary or any other, share a
+/// socket, config or runtime dir. Cross-binary CPU contention is nextest's to
+/// schedule — see the `serial-pty` group and the retries in
+/// `.config/nextest.toml`.
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
