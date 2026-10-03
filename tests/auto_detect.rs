@@ -287,6 +287,91 @@ fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// #521: the daemon auto-detect spawns is reaped, even though nothing in this
+/// harness ever learns its pid.
+///
+/// The four auto-detect tests that exercise this launch path all leak it, and
+/// before #521 that cost four processes per `just check` run while failing
+/// nothing. The product spawns the daemon detached, in its own process group,
+/// with stdio on `/dev/null`, and `SpawnedFlock::drop` kills only the client pid
+/// — so it survives as PPID 1 still writing `flock-server.log`. None of the
+/// three existing reap paths can see it: the pid registry never heard of it,
+/// `pgrep -f <base>` cannot match a bare `flk server` argv, and the runtime-dir
+/// sweep used to walk `/proc`, which does not exist on Darwin. nextest cannot
+/// see it either — it only catches descendants holding the test's output
+/// pipes, and these hold none.
+///
+/// So this asserts the leak directly: find the daemon by its runtime dir while
+/// it is still running, then assert the sweep in `cleanup_test_base` killed it.
+/// The daemon carries `XDG_RUNTIME_DIR` and `FLOCK_SOCKET_PATH` inherited from
+/// the client, which is the only thing connecting a process this harness never
+/// spawned back to the test that owns it.
+#[test]
+fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client_socket = runtime_dir.join("flock-client.sock");
+
+    let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
+    let client_pid = flock.child.process_id().expect("client should have PID");
+
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // Finding the daemon is itself the capability under test: on macOS the
+    // sweep used to enumerate nothing, so nothing here could ever have reaped
+    // it. Polled rather than read once, because the daemon is a freshly exec'd
+    // process on a machine running twenty test binaries, and a sweep is a
+    // snapshot.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut daemon_pids: Vec<u32> = Vec::new();
+    while Instant::now() < deadline {
+        daemon_pids = support::flock_server_pids_for_runtime_dir(&runtime_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pid| *pid != client_pid)
+            .collect();
+        if !daemon_pids.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !daemon_pids.is_empty(),
+        "the auto-detect daemon should be visible to the reap sweep while it runs, \
+         otherwise nothing here can ever reap it"
+    );
+    assert!(
+        daemon_pids.iter().all(|pid| process_exists(*pid)),
+        "the daemon must still be running when the sweep looks for it, or this \
+         test proves nothing"
+    );
+
+    cleanup_spawned_flock(flock, base);
+
+    // `terminate_pid` escalates SIGTERM to SIGKILL and then waits, but a
+    // reaped-process check can still lag the signal by a moment on a loaded
+    // machine, so this polls rather than reads once.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors: Vec<u32> = daemon_pids
+            .iter()
+            .copied()
+            .filter(|pid| process_exists(*pid))
+            .collect();
+        if survivors.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auto-detect daemons survived cleanup: {survivors:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Running `flock` with no server present starts a server
 /// and attaches as client.
 #[test]

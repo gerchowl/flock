@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub mod fleet;
+pub mod process_table;
 
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -63,7 +64,12 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Every `flk server` on this machine whose runtime dir is `runtime_dir`.
+///
+/// No longer Linux-gated. The gate existed only because the sweep behind it
+/// walked `/proc`, so on a Mac it answered "no servers" for servers that were
+/// provably running — a wrong answer, not a small one, and callers had no way
+/// to tell it from an honest one.
 pub fn flock_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {
@@ -929,7 +935,10 @@ fn cleanup_servers_with_missing_runtime_dir() -> std::io::Result<()> {
     }
 
     for pid in iter_worktree_server_pids()? {
-        let Some(runtime_dir) = process_runtime_dir(pid)? else {
+        // A pid we cannot inspect (it exited, or the kernel will not tell us
+        // about it) is skipped rather than propagated: one unreadable process
+        // must not abort the sweep of the other six hundred.
+        let Ok(Some(runtime_dir)) = process_runtime_dir(pid) else {
             continue;
         };
 
@@ -951,11 +960,7 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     };
 
     for pid in pids {
-        let Ok(runtime_dir) = process_runtime_dir(pid) else {
-            continue;
-        };
-
-        let Some(runtime_dir) = runtime_dir else {
+        let Ok(Some(runtime_dir)) = process_runtime_dir(pid) else {
             continue;
         };
 
@@ -967,36 +972,27 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
 
 /// Test-spawned flock servers visible on this machine.
 ///
-/// LINUX ONLY, by construction: this walks `/proc`, and every caller's
-/// behaviour degrades to a no-op elsewhere. That is deliberate but was silent —
-/// on macOS `read_dir("/proc")` is `NotFound`, so this returned an empty list
-/// and `terminate_servers_for_runtime_dirs` swept nothing, successfully. Any
-/// server the harness did not explicitly register therefore leaked, and a
-/// leaked process fails no test.
+/// CROSS-PLATFORM since #521. It used to walk `/proc`, which does not exist on
+/// Darwin: `read_dir("/proc")` is `NotFound`, the function returned an empty
+/// list, and `terminate_servers_for_runtime_dirs` swept nothing while
+/// reporting success. Any server the harness did not explicitly registered
+/// therefore leaked, and a leaked process fails no test — four detached daemons
+/// per `just check` run on a Mac, invisible to nextest because they hold no
+/// output pipe. The pid registry cannot catch those: the daemon is spawned
+/// inside the product, so the harness never learns its pid.
 ///
-/// So the REGISTRY is the cross-platform guarantee, not this sweep: anything
-/// that must be reaped has to go through `register_spawned_flock_pid`, which
-/// is wired to the atexit / panic / ctrl-c hooks. This stays as a Linux-only
-/// belt-and-braces pass for servers whose runtime dir outlived their owner.
+/// The scan itself now lives in the `process_table` module, which reads `/proc`
+/// on Linux and the Darwin equivalents elsewhere. What identifies a process as ours has
+/// not changed and is the reason this is safe to run on a developer's whole
+/// machine: `is_test_flock_binary` requires the executable to be THIS
+/// checkout's `target/debug/flk`, so a daemon built by another session from
+/// its own worktree — or an installed `flock` — is never in the returned set.
+/// The `server` argv check narrows it further to servers.
 fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
     let mut pids = Vec::new();
 
-    let proc_entries = match fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        // No /proc (macOS): nothing to enumerate. See the doc comment — the
-        // registry, not this sweep, is what guarantees cleanup here.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-
-    for entry in proc_entries {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
-            continue;
-        };
-
+    for pid in process_table::list_process_ids()? {
         if pid == own_pid {
             continue;
         }
@@ -1010,55 +1006,36 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
 }
 
 fn is_test_flock_server_process(pid: u32) -> bool {
-    let Some(exe_path) = proc_link_target(pid, "exe") else {
+    let Ok(info) = process_table::process_info(pid) else {
+        // Exited, or unreadable (ENOENT/EIO/EPERM). Either way this pid is not
+        // a server we should kill, and the rest of the sweep continues.
         return false;
     };
 
-    if !is_test_flock_binary(&exe_path) {
-        return false;
-    }
-
-    let Ok(cmdline) = read_cmdline(pid) else {
+    let Some(exe_path) = info.exe_path.as_deref() else {
         return false;
     };
 
-    cmdline.iter().any(|arg| arg == "server")
+    is_test_flock_binary(exe_path) && info.argv.iter().any(|arg| arg == "server")
 }
 
-fn proc_link_target(pid: u32, link: &str) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/{link}")).ok()
-}
-
-fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))?;
-    Ok(cmdline
-        .split(|byte| *byte == 0)
-        .filter(|chunk| !chunk.is_empty())
-        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
-        .collect())
-}
-
+/// The runtime dir a `flk server` is serving, from its own environment.
+///
+/// `XDG_RUNTIME_DIR` is authoritative; `FLOCK_SOCKET_PATH`'s parent is the
+/// fallback for a server whose runtime dir was unset. Both are inherited from
+/// the client that spawned the daemon, which is what lets the sweep connect a
+/// process it never spawned back to the test that owns it.
 fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
-    let environ = fs::read(format!("/proc/{pid}/environ"))?;
+    let info = process_table::process_info(pid)?;
 
-    let mut socket_path: Option<PathBuf> = None;
-
-    for entry in environ.split(|byte| *byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-
-        let kv = String::from_utf8_lossy(entry);
-        if let Some(value) = kv.strip_prefix("XDG_RUNTIME_DIR=") {
-            return Ok(Some(PathBuf::from(value)));
-        }
-
-        if let Some(value) = kv.strip_prefix("FLOCK_SOCKET_PATH=") {
-            socket_path = Some(PathBuf::from(value));
-        }
+    if let Some(runtime_dir) = info.environment_value("XDG_RUNTIME_DIR") {
+        return Ok(Some(PathBuf::from(runtime_dir)));
     }
 
-    Ok(socket_path.and_then(|path| path.parent().map(Path::to_path_buf)))
+    Ok(info
+        .environment_value("FLOCK_SOCKET_PATH")
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf)))
 }
 
 fn runtime_dir_owner_alive(runtime_dir: &Path) -> bool {
