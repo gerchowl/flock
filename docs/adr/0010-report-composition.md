@@ -1,8 +1,12 @@
 # ADR 0010 — Bug reports compose locally and are submitted by a human, never by the binary
 
-- Status: Proposed (decision 6 amended by ADR-0015 for operator-initiated
+- Status: Accepted (decision 6 amended by ADR-0015 for operator-initiated
   cross-repo filing; every other decision here stands unchanged)
 - Date: 2026-08-06
+- Implemented: decisions 1–5 and 7, behind `src/report/`
+  (`compose`, `redact`, `schema`, `template`, `url`), `MAX_URL_LEN`, and
+  `--open`. Decision 6 still stands as written for `flk report` — it never
+  submits; ADR-0015 adds filing beside it, not into it.
 - Issues: #233 (the spike). Constrained by ADR-0002 (config layers — the report
   destination is deliberately *not* one of them), ADR-0003 (the executable is
   `flk`), and ADR-0005 (the durable event log, which a later phase will use for

@@ -1,7 +1,10 @@
 # ADR 0009 — Fleet transport: one held SSH connection per peer, not a replicated log
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-04
+- Implemented: all of it. `src/peer_stream.rs` holds one long-lived SSH
+  connection per peer, with `PeersRelayAttach` / `MessageRelayed`
+  (`src/api/schema.rs:140,1748`) as the wire surface.
 - Issues: #224 (the transport spike); PRs #225, #226, #227, #228, #229.
   Supersedes the *transport* half of ADR-0008 — its delivery model (messages
   ride the tool surface) stands unchanged. Constrained by ADR-0001 (fleet

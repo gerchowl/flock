@@ -1,7 +1,14 @@
 # ADR 0004 — Per-repo configuration: a committed `.flk.toml` policy layer for repo facts
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-03
+- Implemented: **the bridge only.** `protected_branches` and the hardcoded floor
+  (`is_protected_branch`, `src/worktree.rs:523`) shipped with #121. The committed
+  policy layer this ADR decided — `.flk.toml` / `.flk.local.toml`, the
+  git-toplevel discovery walk, and the read-from-the-common-dir authority rule
+  (decisions 2, 4 and 5) — **has no code**: zero hits for `.flk.toml` anywhere in
+  `src/` at acceptance. What is accepted is the *design* and the floor it
+  protects; the repo-scoped layer is still to be built.
 - Issues: #121 (default-branch protection — the motivating first consumer),
   extends #100/#103/#112 (ADR-0002 config stack)
 - Decision owner: human; advised by the worktree-kill safety thread and the
