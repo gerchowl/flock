@@ -5,6 +5,7 @@ use ratatui::{
 };
 
 use crate::app::{
+    notification_panel::NotificationPanelAction,
     state::{AppState, DragState, DragTarget, Mode, NavigatorTarget},
     App,
 };
@@ -172,6 +173,45 @@ impl App {
                     self.state.navigator.selected = self.state.navigator.scroll;
                     self.state.clamp_navigator_selection();
                 }
+                _ => {}
+            }
+            return true;
+        }
+
+        if self.state.mode == Mode::Notifications {
+            // Deliberately no hover-to-select. The navigator selects on
+            // `Moved` because the next thing that happens is a deliberate
+            // `Down` on a row; here selection feeds `enter`, so sweeping the
+            // pointer across the list would arm an acknowledgement of whatever
+            // row it last touched. The settings overlay is the precedent for a
+            // mutating panel that leaves the cursor alone on hover
+            // (`settings_hover_does_not_change_selection`).
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) = self
+                        .state
+                        .notifications_panel_row_index_at(mouse.column, mouse.row)
+                    {
+                        // Clicking a row only *selects* it. Acknowledging is the
+                        // primary action and gets its own button, so a stray
+                        // click while reading cannot mark a record answered —
+                        // the one transition retention cares about.
+                        self.state.select_notification_panel_row(index);
+                    } else if let Some(action) = self
+                        .state
+                        .notifications_panel_button_at(mouse.column, mouse.row)
+                    {
+                        apply_notification_panel_action(&mut self.state, action);
+                    } else if !self
+                        .state
+                        .notifications_panel_contains(mouse.column, mouse.row)
+                    {
+                        self.state.disarm_notification_panel_ack_all();
+                        leave_modal(&mut self.state);
+                    }
+                }
+                MouseEventKind::ScrollUp => self.state.scroll_notification_panel(-3),
+                MouseEventKind::ScrollDown => self.state.scroll_notification_panel(3),
                 _ => {}
             }
             return true;
@@ -683,6 +723,128 @@ impl AppState {
     }
 }
 
+fn apply_notification_panel_action(state: &mut AppState, action: NotificationPanelAction) {
+    match action {
+        NotificationPanelAction::Acknowledge => {
+            state.acknowledge_selected_notification();
+        }
+        // Armed on the first press, fired on the second — the same two steps
+        // the key takes, and for the same reason: this is the only action here
+        // with no undo, and `trim()` treats every record it marks read as
+        // eviction material.
+        NotificationPanelAction::AcknowledgeAll => {
+            if state.notification_panel_ack_all_armed() {
+                state.commit_acknowledgement_of_every_unread_record();
+            } else {
+                state.toggle_notification_panel_ack_all();
+            }
+        }
+        NotificationPanelAction::Close => {
+            state.disarm_notification_panel_ack_all();
+            leave_modal(state);
+        }
+    }
+}
+
+impl AppState {
+    pub(crate) fn notifications_panel_popup_rect(&self) -> Rect {
+        crate::ui::centered_popup_rect(
+            self.screen_rect(),
+            crate::ui::NOTIFICATIONS_PANEL_MODAL_SIZE.0,
+            crate::ui::NOTIFICATIONS_PANEL_MODAL_SIZE.1,
+        )
+        .unwrap_or_default()
+    }
+
+    fn notifications_panel_inner_rect(&self) -> Rect {
+        let popup = self.notifications_panel_popup_rect();
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    }
+
+    /// The same split the renderer lays out, from the same inner rect — so a
+    /// hit-test can never disagree with what was drawn.
+    pub(crate) fn notifications_panel_stack(&self) -> Option<crate::ui::ModalStackAreas> {
+        let inner = self.notifications_panel_inner_rect();
+        if inner.height < 8 || inner.width < 20 {
+            return None;
+        }
+        Some(crate::ui::notifications_panel_stack(inner))
+    }
+
+    pub(crate) fn notifications_panel_body_rect(&self) -> Rect {
+        self.notifications_panel_stack()
+            .map(|stack| crate::ui::notifications_panel_body_rect(&stack))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn notifications_panel_contains(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.notifications_panel_popup_rect(), col, row)
+    }
+
+    pub(crate) fn notifications_panel_row_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        let body = self.notifications_panel_body_rect();
+        if !rect_contains(body, col, row) {
+            return None;
+        }
+        let index = self.notifications_panel.scroll + (row - body.y) as usize;
+        (index < self.notification_panel_row_count()).then_some(index)
+    }
+
+    pub(crate) fn notifications_panel_button_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<NotificationPanelAction> {
+        let inner = self.notifications_panel_inner_rect();
+        let (ack, ack_unread, close) = crate::ui::notifications_panel_button_rects(inner);
+        [
+            (ack, NotificationPanelAction::Acknowledge),
+            (ack_unread, NotificationPanelAction::AcknowledgeAll),
+            (close, NotificationPanelAction::Close),
+        ]
+        .into_iter()
+        .find_map(|(rect, action)| modal_action_from_buttons(col, row, &[(rect, action)]))
+    }
+
+    pub(crate) fn notification_panel_scroll_max(&self, viewport_rows: u16) -> usize {
+        self.notification_panel_row_count()
+            .saturating_sub(viewport_rows as usize)
+    }
+
+    pub(super) fn scroll_notification_panel(&mut self, delta: i16) {
+        let viewport = self.notifications_panel_body_rect().height;
+        let max_scroll = self.notification_panel_scroll_max(viewport);
+        let current = self.notifications_panel.scroll as i16;
+        self.notifications_panel.scroll =
+            current.saturating_add(delta).clamp(0, max_scroll as i16) as usize;
+    }
+
+    /// Scroll the least that brings the cursor row into the body — the
+    /// navigator's rule, so both lists behave the same way.
+    pub(crate) fn ensure_notification_panel_selection_visible(&mut self) {
+        let viewport = self.notifications_panel_body_rect().height as usize;
+        if viewport == 0 {
+            self.notifications_panel.scroll = 0;
+            return;
+        }
+        let selected = self.notifications_panel.selected;
+        if selected < self.notifications_panel.scroll {
+            self.notifications_panel.scroll = selected;
+        } else if selected >= self.notifications_panel.scroll + viewport {
+            self.notifications_panel.scroll = selected + 1 - viewport;
+        }
+        self.notifications_panel.scroll = self
+            .notifications_panel
+            .scroll
+            .min(self.notification_panel_scroll_max(viewport as u16));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -690,6 +852,209 @@ mod tests {
 
     use super::super::{app_for_mouse_test, mouse};
     use super::*;
+
+    /// A mouse-first TUI: every action the panel offers by key must also be
+    /// reachable by click, and the clicks have to land on the rects the
+    /// renderer drew — these assert against the same helpers render reads.
+    fn app_with_notification_panel(records: &[(&str, bool)]) -> App {
+        fn entry(id: &str, seen: bool) -> crate::app::notifications::NotificationEntry {
+            use crate::api::schema::{NotificationRecordKind, NotificationSource};
+            crate::app::notifications::NotificationEntry {
+                id: id.to_string(),
+                title: format!("{id} finished"),
+                body: None,
+                kind: NotificationRecordKind::Outcome,
+                source: NotificationSource::AgentState,
+                workspace_id: None,
+                pane_id: None,
+                origin_host: "host.invalid".into(),
+                filed_at_ms: 0,
+                seen,
+            }
+        }
+
+        let mut app = app_for_mouse_test();
+        for (id, seen) in records {
+            app.state.file_notification(entry(id, *seen));
+        }
+        app.state.open_notification_panel();
+        app
+    }
+
+    /// Selection feeds `enter`, which acknowledges. So the pointer must not be
+    /// able to move it: sweeping across the list and pressing `enter` would
+    /// otherwise acknowledge whatever row the pointer last touched. This is the
+    /// settings overlay's rule (`settings_hover_does_not_change_selection`),
+    /// applied to a panel whose selection is an irreversible action's target.
+    #[test]
+    fn hovering_a_notification_row_does_not_move_the_cursor() {
+        let mut app = app_with_notification_panel(&[("a", false), ("b", false)]);
+        let body = app.state.notifications_panel_body_rect();
+        assert!(
+            body.height >= 2,
+            "the panel must have room to hover two rows"
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, body.x + 2, body.y + 1));
+
+        assert_eq!(app.state.notifications_panel.selected, 0);
+        assert_eq!(
+            app.state.notifications.unread(),
+            2,
+            "hovering is reading, and reading is not acknowledging"
+        );
+    }
+
+    #[test]
+    fn clicking_a_notification_row_selects_it_without_acknowledging() {
+        let mut app = app_with_notification_panel(&[("a", false), ("b", false)]);
+        let body = app.state.notifications_panel_body_rect();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+
+        assert_eq!(app.state.notifications_panel.selected, 1);
+        assert_eq!(
+            app.state.notifications.unread(),
+            2,
+            "a click must not be the ack: `seen` is the one bit retention acts \
+             on, and a mis-click while reading cannot be undone"
+        );
+    }
+
+    #[test]
+    fn clicking_the_ack_button_acknowledges_the_selected_record() {
+        let mut app = app_with_notification_panel(&[("a", false), ("b", false)]);
+        app.state.select_notification_panel_row(1);
+        let inner = app.state.notifications_panel_inner_rect();
+        let (ack, _, _) = crate::ui::notifications_panel_button_rects(inner);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), ack.x, ack.y));
+
+        assert_eq!(app.state.notifications.unread(), 1);
+        assert_eq!(
+            app.state.notifications.unread(),
+            app.state
+                .notification_panel_entries()
+                .filter(|entry| !entry.seen)
+                .count(),
+            "the list and the log agree on what is left unread"
+        );
+    }
+
+    /// The bulk button arms first, like the key and like flock's other bulk
+    /// destructive action. One click must not walk every unanswered record.
+    #[test]
+    fn clicking_the_ack_unread_button_arms_before_it_acknowledges_everything() {
+        let mut app = app_with_notification_panel(&[("a", false), ("b", true), ("c", false)]);
+        let inner = app.state.notifications_panel_inner_rect();
+        let (_, ack_unread, _) = crate::ui::notifications_panel_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ack_unread.x,
+            ack_unread.y,
+        ));
+
+        assert!(app.state.notification_panel_ack_all_armed());
+        assert_eq!(
+            app.state.notifications.unread(),
+            2,
+            "the first click arms; it does not acknowledge"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ack_unread.x,
+            ack_unread.y,
+        ));
+
+        assert_eq!(app.state.notifications.unread(), 0);
+        assert!(!app.state.notification_panel_ack_all_armed());
+    }
+
+    /// Closing must not leave a bulk acknowledgement armed behind it, or the
+    /// next panel to open would be one `enter` from acknowledging everything.
+    #[test]
+    fn closing_the_panel_disarms_a_pending_bulk_acknowledgement() {
+        let mut app = app_with_notification_panel(&[("a", false)]);
+        let inner = app.state.notifications_panel_inner_rect();
+        let (_, ack_unread, close) = crate::ui::notifications_panel_button_rects(inner);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ack_unread.x,
+            ack_unread.y,
+        ));
+        assert!(app.state.notification_panel_ack_all_armed());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            close.x,
+            close.y,
+        ));
+
+        assert!(!app.state.notification_panel_ack_all_armed());
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn clicking_the_panel_close_button_leaves_the_panel() {
+        let mut app = app_with_notification_panel(&[("a", false)]);
+        let inner = app.state.notifications_panel_inner_rect();
+        let (_, _, close) = crate::ui::notifications_panel_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            close.x,
+            close.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn clicking_outside_the_panel_closes_it() {
+        let mut app = app_with_notification_panel(&[("a", false)]);
+        let popup = app.state.notifications_panel_popup_rect();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            popup.x,
+            popup.y.saturating_sub(1),
+        ));
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_notification_list_and_stops_at_the_end() {
+        let records: Vec<(String, bool)> =
+            (0..24).map(|index| (format!("n{index}"), false)).collect();
+        let borrowed: Vec<(&str, bool)> = records
+            .iter()
+            .map(|(id, seen)| (id.as_str(), *seen))
+            .collect();
+        let mut app = app_with_notification_panel(&borrowed);
+        let body = app.state.notifications_panel_body_rect();
+        let max_scroll = app.state.notification_panel_scroll_max(body.height) as u16;
+        assert!(max_scroll > 0, "24 records must overflow this viewport");
+
+        for _ in 0..40 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, body.x, body.y));
+        }
+        assert_eq!(
+            app.state.notifications_panel.scroll, max_scroll as usize,
+            "scrolling past the last record stops there"
+        );
+
+        for _ in 0..80 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollUp, body.x, body.y));
+        }
+        assert_eq!(app.state.notifications_panel.scroll, 0);
+    }
 
     #[test]
     fn clicking_keybind_help_close_button_closes_overlay() {

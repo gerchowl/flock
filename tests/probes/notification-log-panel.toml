@@ -1,0 +1,186 @@
+# #516 end-to-end: the operator's notification log, read in the TUI.
+#
+# Discriminating by construction: every assertion below is about a string a
+# build without the panel cannot put on the screen. Measured against
+# origin/main (46 steps): 13 fail — the unread dot, the `notifications` menu
+# item, the panel and both of its acknowledge paths, the armed label, and the
+# CLI agreement at the end. Note what does NOT happen: removing the menu row
+# makes the menu one row shorter (`menu_h = labels.len() + 3`), so the click
+# below lands on `reload config` rather than on `detach`, and the run does not
+# die by detaching. The harness counts steps, not assertions; every failing step
+# above is an assertion, and none is satisfiable by the unfixed build (the #514
+# lesson). No step uses a keybinding the default config does not bind: the panel
+# is opened by mouse, and the `prefix+i` unit test drives the config's own
+# resolved `KeyCombo` rather than a hand-written keystroke.
+#
+# The notifications are filed through the REAL socket API (`notification show`
+# against the running server, exactly what an agent's outcome goes through) by
+# a background shell inside the sandbox, and the log the panel renders is those
+# records — not fixtures this runbook wrote into state.
+#
+# Sockets live in a SHORT dir: unix sun_path caps at ~104 bytes.
+#
+# `FLOCK_CONFIG_PATH` points the seed config at a file the wrapper writes, so
+# the runbook does not have to know whether this binary is a debug build (whose
+# app dir is `flock-dev`) or a release one. `onboarding = false` is what keeps
+# the welcome dialog off the screen.
+[session]
+command = [
+  "/bin/sh",
+  "-c",
+  "mkdir -p \"$XDG_CONFIG_HOME\" && printf 'onboarding = false\\n' > \"$FLOCK_CONFIG_PATH\" && ( sleep 14; \"$1\" notification show 'PROBE-the-api-workspace-build-failed' --body 'flk pane run failed in api' >/dev/null 2>&1; \"$1\" notification show 'PROBE-the-web-workspace-needs-input' --body 'a question is waiting' >/dev/null 2>&1 ) & exec \"$1\"",
+  "flockprobe",
+  "${bin}",
+]
+cols = 120
+rows = 34
+startup_wait = 10
+timeout = 240
+env = { HOME = "${home}", XDG_CONFIG_HOME = "${xdg}", XDG_STATE_HOME = "${state}", SHELL = "/bin/sh", FLOCK_CONFIG_PATH = "${xdg}/probe-config.toml" }
+env_unset = ["FLOCK_ENV", "FLOCK_PANE_ID", "FLOCK_SOCKET_PATH", "FLOCK_BIN"]
+
+[[step]]
+wait_for = "No workspaces yet"
+
+# The record reaches the log through the socket API, and the sidebar's
+# launcher row wears the unread dot — the mouse-first way in, which a
+# keybind-only surface could not produce.
+[[step]]
+wait_for = "● menu"
+timeout = 40
+
+# Click the pinned `menu` row (the sidebar's last row) to open the launcher.
+# SGR mouse bytes are what the terminal would send; flock has mouse capture
+# on, so this is a real click, not a synthetic call into the handler.
+[[step]]
+type = "\u001b[<0;3;34M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;3;34m"
+[[step]]
+wait_for = "reload config"
+
+# The reading surface is on the menu, where a click can reach it.
+[[step]]
+assert_text = "notifications"
+capture = "menu"
+
+# Click the `notifications` row (4th of five: settings, keybinds, reload
+# config, notifications, detach).
+[[step]]
+type = "\u001b[<0;10;30M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;10;30m"
+[[step]]
+wait_for = "2 kept · 2 unread"
+timeout = 20
+[[step]]
+capture = "panel"
+
+# Both records the socket API filed are rows on screen, newest first.
+[[step]]
+assert_text = "PROBE-the-web-workspace-needs-input"
+[[step]]
+assert_text = "PROBE-the-api-workspace-build-failed"
+
+# The line under the list is the SELECTED record's body, so it is the cursor's
+# row's body and no other: that is what makes a row worth selecting.
+[[step]]
+assert_text = "a question is waiting"
+
+# The honesty line: the panel states the cap and dates the window's oldest
+# surviving record, so it never implies it is showing everything.
+[[step]]
+assert_text = "cap 512 · oldest kept"
+
+# Click `↵ ack` on the button row. Asserting the count drop is the point:
+# `2 kept · 1 unread` can only appear if the click reached the shipped
+# `AppState::acknowledge_notification` seam, and the acknowledged row's dot
+# flips from `●` to `○`.
+[[step]]
+type = "\u001b[<0;47;27M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;47;27m"
+[[step]]
+wait_for = "2 kept · 1 unread"
+timeout = 20
+[[step]]
+capture = "acked-one"
+
+# The bulk button ARMS, and says so on screen. This is the irreversible
+# action, so the first click must change what the button will do and
+# acknowledge nothing: `ack them all` and `cancel` appear, and the unread
+# count stands still. One click on `ack unread` must never be the whole job.
+[[step]]
+type = "\u001b[<0;57;27M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;57;27m"
+[[step]]
+sleep = 1
+[[step]]
+assert_text = "ack them all"
+[[step]]
+assert_text = "cancel"
+[[step]]
+assert_text = "2 kept · 1 unread"
+[[step]]
+capture = "armed"
+
+# The second click commits it. Same column: the button row re-centres around
+# the longer armed label, and this one still lands on the bulk button.
+[[step]]
+type = "\u001b[<0;57;27M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;57;27m"
+[[step]]
+wait_for = "2 kept · 0 unread"
+timeout = 20
+[[step]]
+capture = "acked-all"
+
+# Close, then open a workspace so the CLI can be asked the same question from
+# a real pane. `flk notification list --unread` returning nothing is what
+# "no second counter" looks like from the outside.
+[[step]]
+keys = "Escape"
+[[step]]
+sleep = 1
+[[step]]
+keys = "C-b"
+[[step]]
+sleep = 1
+[[step]]
+keys = "N"
+[[step]]
+wait_for = "\\$"
+timeout = 40
+[[step]]
+sleep = 3
+[[step]]
+type = "$FLOCK_BIN notification list --unread"
+[[step]]
+keys = "Enter"
+# `notification_list` appears only in the JSON reply, never in the command
+# line above it, so this cannot match the echo of what was typed.
+[[step]]
+wait_for = "notification_list"
+timeout = 40
+[[step]]
+capture = "cli-agrees"
+
+# The panel's ack is the ack the socket API sees: same predicate, same
+# count. An empty `notifications` array IS the CLI saying nothing is unread;
+# the sibling `unread` field is not asserted because the reply is wider than
+# the pane and wraps mid-token, which would make that assertion about the
+# pane's width rather than about the log.
+[[step]]
+assert_text = "\"notifications\":\\[\\]"

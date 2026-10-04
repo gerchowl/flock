@@ -1318,6 +1318,10 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// The operator's notification log (#516) — the reading surface ADR-0016
+    /// §6 promised. A reader only: it renders the projection and
+    /// acknowledges through the same seam `notification.ack` uses.
+    Notifications,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2306,6 +2310,9 @@ pub struct AppState {
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
     pub navigator: NavigatorState,
+    /// Panel-only cursor and filter for the notification log (#516). Not part
+    /// of the log: closing the panel loses nothing.
+    pub notifications_panel: crate::app::notification_panel::NotificationPanelState,
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
@@ -3112,13 +3119,39 @@ impl AppState {
             .any(|item| item.state == crate::integration::IntegrationStatusKind::Outdated)
     }
 
+    /// Whether the *collapsed sidebar's* toggle chevron is worth accenting.
+    ///
+    /// Updates and integration work only. #534's review caught this sharing a
+    /// predicate with the `menu` row's dot, which lit the chevron for anything
+    /// unread — and since the log files every agent outcome and keeps 512, that
+    /// is nearly always. The chevron means "there is an update", so only
+    /// updates may set it.
     pub(crate) fn global_menu_attention_badge_visible(&self) -> bool {
         self.update_available.is_some() || self.integration_updates_available()
+    }
+
+    /// Whether the notification log holds something only the log knows about —
+    /// the question the window-title badge already asks.
+    ///
+    /// Deliberately **not** `notifications.unread()`. That raw count includes
+    /// records a live blocked pane is already speaking for, which is exactly
+    /// what #367's badge subtracts so one fact is not counted twice; using it
+    /// here gave the repo two ambient indicators answering "do I have unread
+    /// notifications" with different predicates, which could disagree (title
+    /// `0`, menu `●`). One question, one predicate: the ambient dot and the
+    /// title badge now read
+    /// [`Self::unread_notifications_beyond_live_states`].
+    ///
+    /// The panel's own header still reports the raw `kept` / `unread` counts,
+    /// so nothing is hidden from an operator who has opened it deliberately.
+    pub(crate) fn notification_log_wants_the_operator(&self) -> bool {
+        self.unread_notifications_beyond_live_states() > 0
     }
 
     pub(crate) fn global_menu_item_has_badge(&self, item: &str) -> bool {
         (item == "update ready" && self.update_available.is_some())
             || (item == "settings" && self.integration_updates_available())
+            || (item == "notifications" && self.notification_log_wants_the_operator())
     }
 
     pub(crate) fn settings_section_has_badge(&self, section: SettingsSection) -> bool {
@@ -3331,6 +3364,7 @@ impl AppState {
             product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
             navigator: NavigatorState::default(),
+            notifications_panel: crate::app::notification_panel::NotificationPanelState::default(),
             copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,

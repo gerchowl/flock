@@ -24,6 +24,7 @@ mod input;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
+pub(crate) mod notification_panel;
 pub(crate) mod notifications;
 mod peer_checkout;
 mod runtime;
@@ -655,6 +656,7 @@ impl App {
             }),
             keybind_help: state::KeybindHelpState { scroll: 0 },
             navigator: state::NavigatorState::default(),
+            notifications_panel: notification_panel::NotificationPanelState::default(),
             copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
@@ -1899,6 +1901,9 @@ impl App {
             }
             Mode::Navigator => {
                 input::handle_navigator_key(&mut self.state, key_event);
+            }
+            Mode::Notifications => {
+                input::handle_notifications_key(&mut self.state, key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.

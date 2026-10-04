@@ -24,7 +24,9 @@
 
 use std::collections::VecDeque;
 
-use crate::api::schema::{EventData, EventEnvelope, NotificationRecordKind, NotificationSource};
+use crate::api::schema::{
+    EventData, EventEnvelope, NotificationRecordKind, NotificationSource, NotificationSummary,
+};
 
 /// How many records the projection keeps. Sized so a fortnight of a busy
 /// fleet's outcomes fits, since the operator's question is "what happened
@@ -168,9 +170,64 @@ impl NotificationLog {
         self.entries.iter().rev()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// How many records the projection holds — the panel's "kept" count.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The one predicate every reader shares: newest first, and — when
+    /// `unread_only` — only what has not been acknowledged.
+    ///
+    /// `flk notification list --unread`, `notification.list { unread_only }`
+    /// and the TUI panel's filter (#516) are this filter. Three surfaces, one
+    /// definition, so a panel that disagreed with the CLI about what is unread
+    /// would have to be a different filter rather than a different reading of
+    /// the same one.
+    pub(crate) fn filtered(
+        &self,
+        unread_only: bool,
+    ) -> impl Iterator<Item = &NotificationEntry> + '_ {
+        self.newest_first()
+            .filter(move |entry| !unread_only || !entry.seen)
+    }
+
+    /// [`Self::filtered`] as `notification.list` rows, capped by `limit`.
+    pub(crate) fn list(&self, unread_only: bool, limit: Option<usize>) -> Vec<NotificationSummary> {
+        let limit = limit.unwrap_or(usize::MAX);
+        self.filtered(unread_only)
+            .take(limit)
+            .map(|entry| NotificationSummary {
+                notification_id: entry.id.clone(),
+                title: entry.title.clone(),
+                body: entry.body.clone(),
+                kind: entry.kind,
+                source: entry.source,
+                workspace_id: entry.workspace_id.clone(),
+                pane_id: entry.pane_id.clone(),
+                origin_host: entry.origin_host.clone(),
+                filed_at_ms: entry.filed_at_ms,
+                seen: entry.seen,
+            })
+            .collect()
+    }
+
+    /// Whether the projection is full, so `trim` has already given something
+    /// up or is about to.
+    ///
+    /// Derived, never stored: `len() == MAX_NOTIFICATIONS` *is* the condition
+    /// under which the very next filed record evicts one, and the evictions
+    /// themselves emit nothing (see [`AppState::file_notification`]). The TUI
+    /// panel (#516) reads this so it can say the list it is showing is a
+    /// window rather than the whole history, instead of implying completeness
+    /// it cannot know about.
+    pub(crate) fn at_cap(&self) -> bool {
+        self.entries.len() >= MAX_NOTIFICATIONS
+    }
+
+    /// When the oldest surviving record was filed — the other edge of the
+    /// window `at_cap` describes.
+    pub(crate) fn oldest_filed_at_ms(&self) -> Option<u64> {
+        self.entries.front().map(|entry| entry.filed_at_ms)
     }
 
     /// Enforce the cap, read records first. Returns what was dropped.
@@ -496,6 +553,143 @@ mod tests {
         state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Working;
 
         assert_eq!(state.unread_notifications_beyond_live_states(), 1);
+    }
+
+    /// #516: the TUI panel and `flk notification list` must not be able to
+    /// disagree about what is unread. Both call `list`, so this is the one
+    /// place that decides — and the filter is `!seen`, exactly as the CLI's
+    /// `--unread` reads it.
+    #[test]
+    fn the_list_the_panel_reads_is_the_list_the_cli_prints() {
+        let mut log = NotificationLog::default();
+        log.file(entry("newest", false));
+        log.file(entry("read", true));
+        log.file(entry("oldest", false));
+
+        let listed = log.list(false, None);
+        let all: Vec<&str> = listed
+            .iter()
+            .map(|row| row.notification_id.as_str())
+            .collect();
+        assert_eq!(all, vec!["oldest", "read", "newest"], "newest first");
+
+        let listed = log.list(true, None);
+        let unread: Vec<&str> = listed
+            .iter()
+            .map(|row| row.notification_id.as_str())
+            .collect();
+        assert_eq!(unread, vec!["oldest", "newest"]);
+
+        let listed = log.list(false, Some(1));
+        let limited: Vec<&str> = listed
+            .iter()
+            .map(|row| row.notification_id.as_str())
+            .collect();
+        assert_eq!(limited, vec!["oldest"], "the limit takes from the newest");
+    }
+
+    /// The sidebar's `menu` dot and the window-title badge both answer "is
+    /// there something only the log knows about". #534's review caught them
+    /// answering it differently — the dot counting raw `unread()` — which let
+    /// the two disagree on screen. One predicate, so they cannot.
+    #[test]
+    fn the_menu_dot_and_the_title_badge_answer_the_same_question() {
+        let mut state = crate::app::state::AppState::test_new();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("background"));
+        state.ensure_test_terminals();
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Blocked;
+        let public_pane_id = state.public_pane_id(0, pane).expect("public pane id");
+
+        // A record about the pane that is still blocked: unread, but the live
+        // blocked state already speaks for it.
+        let mut about_that_pane = entry("blocked", false);
+        about_that_pane.pane_id = Some(public_pane_id);
+        state.file_notification(about_that_pane);
+
+        assert_eq!(state.notifications.unread(), 1);
+        assert!(
+            !state.notification_log_wants_the_operator(),
+            "the raw count is 1, but nothing here is only the log's to say"
+        );
+
+        // Once the pane moves on, the same record becomes the log's to say —
+        // and both indicators move together.
+        state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Working;
+        assert_eq!(state.notifications.unread(), 1, "still unread");
+        assert!(state.notification_log_wants_the_operator());
+    }
+
+    /// #534's review finding 5: the `menu` row's dot and the collapsed
+    /// sidebar's chevron shared one predicate, so a nearly-always-true log lit
+    /// the chevron too. The chevron is about updates, and only updates.
+    #[test]
+    fn the_collapse_chevron_ignores_the_notification_log() {
+        let mut state = crate::app::state::AppState::test_new();
+        assert!(!state.global_menu_attention_badge_visible());
+
+        for index in 0..3 {
+            state.file_notification(entry(&format!("n-{index}"), false));
+        }
+
+        assert!(
+            !state.global_menu_attention_badge_visible(),
+            "an unread log must not recolour the sidebar-collapse chevron"
+        );
+        state.update_available = Some("0.3.2".into());
+        assert!(
+            state.global_menu_attention_badge_visible(),
+            "an update still does"
+        );
+    }
+
+    /// The panel's honesty line reads this, so it has to be derived rather
+    /// than tracked. And it is a one-way door: once the projection is full
+    /// every later record costs an eviction, so the panel's warning is not a
+    /// transient state it can stop advertising.
+    #[test]
+    fn at_cap_is_the_condition_under_which_the_next_record_costs_an_eviction() {
+        let mut log = NotificationLog::default();
+        assert!(!log.at_cap());
+        for index in 0..MAX_NOTIFICATIONS {
+            log.file(entry(&format!("n-{index}"), false));
+        }
+
+        assert!(log.at_cap());
+        assert!(log.file(entry("one-more", false)).is_some());
+
+        assert!(
+            log.at_cap(),
+            "still full: the eviction only made room for the record that \
+             caused it, so nothing about the projection got safer"
+        );
+    }
+
+    #[test]
+    fn the_oldest_surviving_record_dates_the_window() {
+        let mut log = NotificationLog::default();
+        assert_eq!(log.oldest_filed_at_ms(), None);
+
+        for index in 0..=MAX_NOTIFICATIONS {
+            let mut filed = entry(&format!("n-{index}"), false);
+            filed.filed_at_ms = 1_700_000_000_000 + index as u64;
+            log.file(filed);
+        }
+
+        assert_eq!(
+            log.oldest_filed_at_ms(),
+            Some(1_700_000_000_001),
+            "the first record went, so the window's edge is the next one — which \
+             is why the panel dates it rather than implying it reaches back \
+             forever"
+        );
     }
 
     /// The acknowledgement is later in the stream than the record it

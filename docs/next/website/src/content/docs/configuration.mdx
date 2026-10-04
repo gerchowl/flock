@@ -354,6 +354,22 @@ delay_seconds = 1
 
 Popup notifications are for background attention. Flock suppresses popups for the active tab.
 
+### The notification log
+
+A toast is a field on the session that a timer clears: an outcome you did not see never happened. The notification log is the durable record behind it, and the panel is where you read it.
+
+Open it with `prefix+i` (`keys.notifications`), or by clicking the sidebar's `menu` row and then `notifications`. The `menu` row wears a dot while the log holds something only the log knows about — the same question the window-title badge asks, answered by the same count, so the two can never disagree. It deliberately ignores records a still-blocked pane is already showing you, which is why an agent that is mid-escalation does not light it twice.
+
+- `enter` (or the `ack` button) acknowledges the selected record.
+- `a` (or `ack unread`) **arms** acknowledging everything unread; `enter` then commits it, and `esc` calls it off. Nothing is acknowledged until that second press.
+- `u` filters to unread only — the same records `flk notification list --unread` returns.
+- `j`/`k` or the arrows move, `home`/`end` jump to the newest and oldest, the wheel scrolls, `esc` closes. `ctrl+n`/`ctrl+p` move without leaving home row, and `pageup`/`pagedown` move half a screen.
+- Clicking a row selects it. Moving the pointer across the list does not: `enter` acts on the selected record, and the pointer is not allowed to decide what that is.
+
+Acknowledging is the same verb `flk notification read` uses, so the panel and the CLI can never disagree about what is unread. It is also the one thing here with no undo, which is why the bulk action is armed rather than immediate and why a modified key (`ctrl+a`) never reaches it. Acknowledging is what makes a record evictable: the log keeps at most 512 records, giving up the ones you have read first.
+
+That cap is why the panel states it. The line above the buttons names the cap and dates the oldest record still present, and once the log is full it says older records may already have been evicted. An eviction leaves nothing behind, so a decision that was never answered and has fallen off the bottom of the list is otherwise indistinguishable from one that was never filed. Read that line as the boundary of what you are looking at, not as a bug.
+
 `delay_seconds` is how long an agent has to stay in a state before Flock says anything about it. The default is 1 second, which is enough to swallow the brief pauses agents make while they are still working. An agent that leaves the state inside the window never notifies at all, and neither does one whose pane you walked over to in the meantime — the decision is re-taken when the delay expires, not when it started. Set `delay_seconds = 0` to notify on the transition itself, or raise it if you only want to hear about work that has genuinely stopped. The maximum is 3600. This applies to agent state changes only; `flock notification show` is an explicit request and is never held.
 
 ## Window title

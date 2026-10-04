@@ -1578,28 +1578,14 @@ impl App {
         id: String,
         params: crate::api::schema::NotificationListParams,
     ) -> String {
-        use crate::api::schema::{NotificationSummary, ResponseResult};
+        use crate::api::schema::ResponseResult;
 
-        let limit = params.limit.unwrap_or(usize::MAX);
-        let notifications: Vec<NotificationSummary> = self
+        // `NotificationLog::list` is shared with the TUI panel (#516), so the
+        // socket API and the panel cannot disagree about what is unread.
+        let notifications = self
             .state
             .notifications
-            .newest_first()
-            .filter(|entry| !params.unread_only || !entry.seen)
-            .take(limit)
-            .map(|entry| NotificationSummary {
-                notification_id: entry.id.clone(),
-                title: entry.title.clone(),
-                body: entry.body.clone(),
-                kind: entry.kind,
-                source: entry.source,
-                workspace_id: entry.workspace_id.clone(),
-                pane_id: entry.pane_id.clone(),
-                origin_host: entry.origin_host.clone(),
-                filed_at_ms: entry.filed_at_ms,
-                seen: entry.seen,
-            })
-            .collect();
+            .list(params.unread_only, params.limit);
 
         responses::encode_success(
             id,
@@ -2153,6 +2139,116 @@ mod tests {
         assert_eq!(
             rebuilt.newest_first().next().map(|e| e.id.clone()),
             Some(id)
+        );
+    }
+
+    /// #516: the TUI panel is a third reader of one projection, and "two
+    /// surfaces agree" is a claim, not a fact — so this asserts it against a
+    /// log the real verb produced.
+    ///
+    /// It starts at `notification.show` over the socket API (not a fixture
+    /// this test filed into state), reads the log back through
+    /// `notification.list`, then opens the panel and compares. Then it
+    /// acknowledges through `notification.ack` and compares again under the
+    /// unread filter, which is the comparison that matters: two readers that
+    /// disagree about what is unread are the bug #516's scope was written to
+    /// prevent.
+    #[tokio::test]
+    async fn the_panel_and_the_socket_api_read_one_log() {
+        let mut app = notification_test_app();
+        for title in ["check failed", "pr opened"] {
+            app.handle_api_request(notification_request(
+                "show",
+                crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: title.into(),
+                        body: Some("a body".into()),
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            ));
+        }
+        app.state.open_notification_panel();
+
+        let api_titles = |app: &mut App, unread_only: bool| -> Vec<String> {
+            let listed = app.handle_api_request(notification_request(
+                "list",
+                crate::api::schema::Method::NotificationList(
+                    crate::api::schema::NotificationListParams {
+                        unread_only,
+                        limit: None,
+                    },
+                ),
+            ));
+            let value: serde_json::Value = serde_json::from_str(&listed).expect("valid reply");
+            value["result"]["notifications"]
+                .as_array()
+                .expect("an array of rows")
+                .iter()
+                .map(|row| row["title"].as_str().expect("a title").to_string())
+                .collect()
+        };
+        // The filter is set directly rather than through
+        // `toggle_notification_panel_unread_only`, so a toggle that moved the
+        // cursor cannot make these two comparisons disagree about the wrong
+        // thing.
+        let panel_titles = |app: &mut App, unread_only: bool| -> Vec<String> {
+            app.state.notifications_panel.unread_only = unread_only;
+            app.state
+                .notification_panel_entries()
+                .map(|entry| entry.title.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            api_titles(&mut app, false),
+            vec!["pr opened", "check failed"]
+        );
+        assert_eq!(
+            panel_titles(&mut app, false),
+            api_titles(&mut app, false),
+            "the panel lists what notification.list lists, in the same order"
+        );
+        assert_eq!(panel_titles(&mut app, true), api_titles(&mut app, true));
+        assert_eq!(
+            api_titles(&mut app, true).len(),
+            2,
+            "listing never acknowledges, so nothing is unread-free yet"
+        );
+
+        // Acknowledge through the socket API, the way `flk notification read`
+        // does, and read both surfaces again.
+        let acknowledged = app
+            .state
+            .notification_panel_entries()
+            .nth(1)
+            .map(|e| e.id.clone());
+        let acknowledged = acknowledged.expect("two records were filed");
+        app.handle_api_request(notification_request(
+            "ack",
+            crate::api::schema::Method::NotificationAck(
+                crate::api::schema::NotificationAckParams {
+                    notification_id: Some(acknowledged),
+                    all: false,
+                },
+            ),
+        ));
+
+        assert_eq!(
+            panel_titles(&mut app, true),
+            api_titles(&mut app, true),
+            "an ack taken through the socket API is the ack the panel sees"
+        );
+        assert_eq!(
+            api_titles(&mut app, true),
+            vec!["pr opened"],
+            "the acknowledged record left the unread set on the API side"
+        );
+        assert_eq!(
+            app.state.notifications.unread(),
+            api_titles(&mut app, true).len(),
+            "and the count the panel renders is the count the API reports"
         );
     }
 

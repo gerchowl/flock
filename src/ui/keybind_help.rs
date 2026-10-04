@@ -71,6 +71,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
                 keybind_label(&kb.open_notification_target),
                 "open notification target",
             ),
+            help_entry(keybind_label(&kb.notifications), "notification log"),
         ],
     ));
 

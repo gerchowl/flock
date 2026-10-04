@@ -152,6 +152,7 @@ fn agent_panel_current_workspace_idx(app: &AppState) -> Option<usize> {
             | Mode::GlobalMenu
             | Mode::KeybindHelp
             | Mode::ProductAnnouncement
+            | Mode::Notifications
     ) {
         Some(app.selected)
     } else {
@@ -3231,7 +3232,7 @@ fn render_menu_row(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     }
     let mut spans = vec![Span::styled(" ", Style::default())];
-    if app.global_menu_attention_badge_visible() {
+    if app.global_menu_attention_badge_visible() || app.notification_log_wants_the_operator() {
         spans.push(Span::styled(
             "● ",
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
