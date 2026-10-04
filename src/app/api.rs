@@ -2196,8 +2196,7 @@ mod tests {
         let panel_titles = |app: &mut App, unread_only: bool| -> Vec<String> {
             app.state.notifications_panel.unread_only = unread_only;
             app.state
-                .notification_panel_rows()
-                .iter()
+                .notification_panel_entries()
                 .map(|entry| entry.title.clone())
                 .collect()
         };
@@ -2220,7 +2219,12 @@ mod tests {
 
         // Acknowledge through the socket API, the way `flk notification read`
         // does, and read both surfaces again.
-        let acknowledged = app.state.notification_panel_rows()[1].id.clone();
+        let acknowledged = app
+            .state
+            .notification_panel_entries()
+            .nth(1)
+            .map(|e| e.id.clone());
+        let acknowledged = acknowledged.expect("two records were filed");
         app.handle_api_request(notification_request(
             "ack",
             crate::api::schema::Method::NotificationAck(

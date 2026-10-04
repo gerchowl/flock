@@ -588,6 +588,68 @@ mod tests {
         assert_eq!(limited, vec!["oldest"], "the limit takes from the newest");
     }
 
+    /// The sidebar's `menu` dot and the window-title badge both answer "is
+    /// there something only the log knows about". #534's review caught them
+    /// answering it differently — the dot counting raw `unread()` — which let
+    /// the two disagree on screen. One predicate, so they cannot.
+    #[test]
+    fn the_menu_dot_and_the_title_badge_answer_the_same_question() {
+        let mut state = crate::app::state::AppState::test_new();
+        state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("background"));
+        state.ensure_test_terminals();
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Blocked;
+        let public_pane_id = state.public_pane_id(0, pane).expect("public pane id");
+
+        // A record about the pane that is still blocked: unread, but the live
+        // blocked state already speaks for it.
+        let mut about_that_pane = entry("blocked", false);
+        about_that_pane.pane_id = Some(public_pane_id);
+        state.file_notification(about_that_pane);
+
+        assert_eq!(state.notifications.unread(), 1);
+        assert!(
+            !state.notification_log_wants_the_operator(),
+            "the raw count is 1, but nothing here is only the log's to say"
+        );
+
+        // Once the pane moves on, the same record becomes the log's to say —
+        // and both indicators move together.
+        state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Working;
+        assert_eq!(state.notifications.unread(), 1, "still unread");
+        assert!(state.notification_log_wants_the_operator());
+    }
+
+    /// #534's review finding 5: the `menu` row's dot and the collapsed
+    /// sidebar's chevron shared one predicate, so a nearly-always-true log lit
+    /// the chevron too. The chevron is about updates, and only updates.
+    #[test]
+    fn the_collapse_chevron_ignores_the_notification_log() {
+        let mut state = crate::app::state::AppState::test_new();
+        assert!(!state.global_menu_attention_badge_visible());
+
+        for index in 0..3 {
+            state.file_notification(entry(&format!("n-{index}"), false));
+        }
+
+        assert!(
+            !state.global_menu_attention_badge_visible(),
+            "an unread log must not recolour the sidebar-collapse chevron"
+        );
+        state.update_available = Some("0.3.2".into());
+        assert!(
+            state.global_menu_attention_badge_visible(),
+            "an update still does"
+        );
+    }
+
     /// The panel's honesty line reads this, so it has to be derived rather
     /// than tracked. And it is a one-way door: once the projection is full
     /// every later record costs an eviction, so the panel's warning is not a

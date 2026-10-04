@@ -1,16 +1,22 @@
 # #516 end-to-end: the operator's notification log, read in the TUI.
 #
-# Discriminating by construction: every assertion below is about a string the
-# unfixed build cannot put on the screen. Without the panel there is no
-# `notifications` row in the launcher menu, so the click at step 5 lands on
-# `detach` and the client leaves — `wait_for` at step 7 fails. There is no
-# assertion here that passes with the feature reverted (the #514 lesson), and
-# no assertion on a keybinding the default config does not actually bind.
+# Discriminating by construction: every assertion below is about a string a
+# build without the panel cannot put on the screen. Measured against
+# origin/main (46 steps): 13 fail — the unread dot, the `notifications` menu
+# item, the panel and both of its acknowledge paths, the armed label, and the
+# CLI agreement at the end. Note what does NOT happen: removing the menu row
+# makes the menu one row shorter (`menu_h = labels.len() + 3`), so the click
+# below lands on `reload config` rather than on `detach`, and the run does not
+# die by detaching. The harness counts steps, not assertions; every failing step
+# above is an assertion, and none is satisfiable by the unfixed build (the #514
+# lesson). No step uses a keybinding the default config does not bind: the panel
+# is opened by mouse, and the `prefix+i` unit test drives the config's own
+# resolved `KeyCombo` rather than a hand-written keystroke.
 #
-# The notification is filed through the REAL socket API (`notification show`
+# The notifications are filed through the REAL socket API (`notification show`
 # against the running server, exactly what an agent's outcome goes through) by
-# a background shell inside the sandbox, and the log the panel renders is that
-# record — not a fixture this runbook wrote into state.
+# a background shell inside the sandbox, and the log the panel renders is those
+# records — not fixtures this runbook wrote into state.
 #
 # Sockets live in a SHORT dir: unix sun_path caps at ~104 bytes.
 #
@@ -22,7 +28,7 @@
 command = [
   "/bin/sh",
   "-c",
-  "mkdir -p \"$XDG_CONFIG_HOME\" && printf 'onboarding = false\\n' > \"$FLOCK_CONFIG_PATH\" && ( sleep 14; \"$1\" notification show 'PROBE-the-api-workspace-build-failed' --body 'flk pane run failed in api' >/dev/null 2>&1 ) & exec \"$1\"",
+  "mkdir -p \"$XDG_CONFIG_HOME\" && printf 'onboarding = false\\n' > \"$FLOCK_CONFIG_PATH\" && ( sleep 14; \"$1\" notification show 'PROBE-the-api-workspace-build-failed' --body 'flk pane run failed in api' >/dev/null 2>&1; \"$1\" notification show 'PROBE-the-web-workspace-needs-input' --body 'a question is waiting' >/dev/null 2>&1 ) & exec \"$1\"",
   "flockprobe",
   "${bin}",
 ]
@@ -69,25 +75,31 @@ sleep = 1
 [[step]]
 type = "\u001b[<0;10;30m"
 [[step]]
-wait_for = "kept · 1 unread"
+wait_for = "2 kept · 2 unread"
 timeout = 20
 [[step]]
 capture = "panel"
 
-# The record the socket API filed is the record on screen.
+# Both records the socket API filed are rows on screen, newest first.
+[[step]]
+assert_text = "PROBE-the-web-workspace-needs-input"
 [[step]]
 assert_text = "PROBE-the-api-workspace-build-failed"
+
+# The line under the list is the SELECTED record's body, so it is the cursor's
+# row's body and no other: that is what makes a row worth selecting.
 [[step]]
-assert_text = "flk pane run failed in api"
+assert_text = "a question is waiting"
 
 # The honesty line: the panel states the cap and dates the window's oldest
 # surviving record, so it never implies it is showing everything.
 [[step]]
 assert_text = "cap 512 · oldest kept"
 
-# Click `↵ ack` on the button row. Asserting the marker flip is the point:
-# `1 kept · 0 unread` can only appear if the click reached the shipped
-# `AppState::acknowledge_notification` seam.
+# Click `↵ ack` on the button row. Asserting the count drop is the point:
+# `2 kept · 1 unread` can only appear if the click reached the shipped
+# `AppState::acknowledge_notification` seam, and the acknowledged row's dot
+# flips from `●` to `○`.
 [[step]]
 type = "\u001b[<0;47;27M"
 [[step]]
@@ -95,10 +107,45 @@ sleep = 1
 [[step]]
 type = "\u001b[<0;47;27m"
 [[step]]
-wait_for = "kept · 0 unread"
+wait_for = "2 kept · 1 unread"
 timeout = 20
 [[step]]
-capture = "acked"
+capture = "acked-one"
+
+# The bulk button ARMS, and says so on screen. This is the irreversible
+# action, so the first click must change what the button will do and
+# acknowledge nothing: `ack them all` and `cancel` appear, and the unread
+# count stands still. One click on `ack unread` must never be the whole job.
+[[step]]
+type = "\u001b[<0;57;27M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;57;27m"
+[[step]]
+sleep = 1
+[[step]]
+assert_text = "ack them all"
+[[step]]
+assert_text = "cancel"
+[[step]]
+assert_text = "2 kept · 1 unread"
+[[step]]
+capture = "armed"
+
+# The second click commits it. Same column: the button row re-centres around
+# the longer armed label, and this one still lands on the bulk button.
+[[step]]
+type = "\u001b[<0;57;27M"
+[[step]]
+sleep = 1
+[[step]]
+type = "\u001b[<0;57;27m"
+[[step]]
+wait_for = "2 kept · 0 unread"
+timeout = 20
+[[step]]
+capture = "acked-all"
 
 # Close, then open a workspace so the CLI can be asked the same question from
 # a real pane. `flk notification list --unread` returning nothing is what

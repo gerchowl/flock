@@ -397,6 +397,7 @@ impl AppState {
                 | Mode::Settings
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
+                | Mode::Notifications
         ) {
             Some(self.selected)
         } else {

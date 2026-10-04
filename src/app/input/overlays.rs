@@ -179,15 +179,14 @@ impl App {
         }
 
         if self.state.mode == Mode::Notifications {
+            // Deliberately no hover-to-select. The navigator selects on
+            // `Moved` because the next thing that happens is a deliberate
+            // `Down` on a row; here selection feeds `enter`, so sweeping the
+            // pointer across the list would arm an acknowledgement of whatever
+            // row it last touched. The settings overlay is the precedent for a
+            // mutating panel that leaves the cursor alone on hover
+            // (`settings_hover_does_not_change_selection`).
             match mouse.kind {
-                MouseEventKind::Moved => {
-                    if let Some(index) = self
-                        .state
-                        .notifications_panel_row_index_at(mouse.column, mouse.row)
-                    {
-                        self.state.select_notification_panel_row(index);
-                    }
-                }
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(index) = self
                         .state
@@ -207,6 +206,7 @@ impl App {
                         .state
                         .notifications_panel_contains(mouse.column, mouse.row)
                     {
+                        self.state.disarm_notification_panel_ack_all();
                         leave_modal(&mut self.state);
                     }
                 }
@@ -728,10 +728,21 @@ fn apply_notification_panel_action(state: &mut AppState, action: NotificationPan
         NotificationPanelAction::Acknowledge => {
             state.acknowledge_selected_notification();
         }
+        // Armed on the first press, fired on the second — the same two steps
+        // the key takes, and for the same reason: this is the only action here
+        // with no undo, and `trim()` treats every record it marks read as
+        // eviction material.
         NotificationPanelAction::AcknowledgeAll => {
-            state.acknowledge_all_notifications_from_panel();
+            if state.notification_panel_ack_all_armed() {
+                state.commit_acknowledgement_of_every_unread_record();
+            } else {
+                state.toggle_notification_panel_ack_all();
+            }
         }
-        NotificationPanelAction::Close => leave_modal(state),
+        NotificationPanelAction::Close => {
+            state.disarm_notification_panel_ack_all();
+            leave_modal(state);
+        }
     }
 }
 
@@ -870,8 +881,13 @@ mod tests {
         app
     }
 
+    /// Selection feeds `enter`, which acknowledges. So the pointer must not be
+    /// able to move it: sweeping across the list and pressing `enter` would
+    /// otherwise acknowledge whatever row the pointer last touched. This is the
+    /// settings overlay's rule (`settings_hover_does_not_change_selection`),
+    /// applied to a panel whose selection is an irreversible action's target.
     #[test]
-    fn hovering_a_notification_row_selects_it_without_acknowledging() {
+    fn hovering_a_notification_row_does_not_move_the_cursor() {
         let mut app = app_with_notification_panel(&[("a", false), ("b", false)]);
         let body = app.state.notifications_panel_body_rect();
         assert!(
@@ -881,7 +897,7 @@ mod tests {
 
         app.handle_mouse(mouse(MouseEventKind::Moved, body.x + 2, body.y + 1));
 
-        assert_eq!(app.state.notifications_panel.selected, 1);
+        assert_eq!(app.state.notifications_panel.selected, 0);
         assert_eq!(
             app.state.notifications.unread(),
             2,
@@ -912,7 +928,7 @@ mod tests {
     #[test]
     fn clicking_the_ack_button_acknowledges_the_selected_record() {
         let mut app = app_with_notification_panel(&[("a", false), ("b", false)]);
-        app.state.notifications_panel.selected = 1;
+        app.state.select_notification_panel_row(1);
         let inner = app.state.notifications_panel_inner_rect();
         let (ack, _, _) = crate::ui::notifications_panel_button_rects(inner);
 
@@ -922,16 +938,17 @@ mod tests {
         assert_eq!(
             app.state.notifications.unread(),
             app.state
-                .notification_panel_rows()
-                .iter()
+                .notification_panel_entries()
                 .filter(|entry| !entry.seen)
                 .count(),
             "the list and the log agree on what is left unread"
         );
     }
 
+    /// The bulk button arms first, like the key and like flock's other bulk
+    /// destructive action. One click must not walk every unanswered record.
     #[test]
-    fn clicking_the_ack_unread_button_acknowledges_everything() {
+    fn clicking_the_ack_unread_button_arms_before_it_acknowledges_everything() {
         let mut app = app_with_notification_panel(&[("a", false), ("b", true), ("c", false)]);
         let inner = app.state.notifications_panel_inner_rect();
         let (_, ack_unread, _) = crate::ui::notifications_panel_button_rects(inner);
@@ -942,7 +959,45 @@ mod tests {
             ack_unread.y,
         ));
 
+        assert!(app.state.notification_panel_ack_all_armed());
+        assert_eq!(
+            app.state.notifications.unread(),
+            2,
+            "the first click arms; it does not acknowledge"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ack_unread.x,
+            ack_unread.y,
+        ));
+
         assert_eq!(app.state.notifications.unread(), 0);
+        assert!(!app.state.notification_panel_ack_all_armed());
+    }
+
+    /// Closing must not leave a bulk acknowledgement armed behind it, or the
+    /// next panel to open would be one `enter` from acknowledging everything.
+    #[test]
+    fn closing_the_panel_disarms_a_pending_bulk_acknowledgement() {
+        let mut app = app_with_notification_panel(&[("a", false)]);
+        let inner = app.state.notifications_panel_inner_rect();
+        let (_, ack_unread, close) = crate::ui::notifications_panel_button_rects(inner);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ack_unread.x,
+            ack_unread.y,
+        ));
+        assert!(app.state.notification_panel_ack_all_armed());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            close.x,
+            close.y,
+        ));
+
+        assert!(!app.state.notification_panel_ack_all_armed());
+        assert_eq!(app.state.mode, Mode::Navigate);
     }
 
     #[test]

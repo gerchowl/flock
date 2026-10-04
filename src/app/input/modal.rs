@@ -144,26 +144,62 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
     }
 }
 
-/// The notification panel's keys (#516). Enter acknowledges the selected
-/// record, `a` acknowledges every unread one, `u` toggles the same
-/// `--unread` filter the CLI takes, and Esc leaves — the same four actions the
-/// panel's buttons and the menu entry reach.
+/// The notification panel's keys (#516).
+///
+/// Two rules, both from the hazards of this particular surface:
+///
+/// - **Every letter binding requires an unmodified key**, exactly as
+///   `handle_navigator_key` does. Matching on `key.code` alone would make
+///   `ctrl+a` — a chord people press without thinking — the bulk
+///   acknowledgement of every unread record, and acknowledgement is the one bit
+///   retention acts on with no undo.
+/// - **The bulk acknowledgement is armed, then committed.** `a` arms it and
+///   `enter` fires it, which is the shape `handle_worktree_kill_all_key` uses
+///   for the other bulk destructive action in flock (`f` arms the force
+///   escalation, `enter` executes). One keystroke does not walk every
+///   unanswered record.
+///
+/// `enter` acknowledges the *selected* record, which is the panel's primary
+/// action and scoped to one row.
 pub(crate) fn handle_notifications_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => leave_modal(state),
+        KeyCode::Esc => {
+            state.disarm_notification_panel_ack_all();
+            leave_modal(state);
+        }
         KeyCode::Enter => {
-            state.acknowledge_selected_notification();
+            if state.notification_panel_ack_all_armed() {
+                state.commit_acknowledgement_of_every_unread_record();
+            } else {
+                state.acknowledge_selected_notification();
+            }
         }
-        KeyCode::Char('a') => {
-            state.acknowledge_all_notifications_from_panel();
+        KeyCode::Char('a') if key.modifiers.is_empty() => state.toggle_notification_panel_ack_all(),
+        KeyCode::Char('u') if key.modifiers.is_empty() => {
+            state.toggle_notification_panel_unread_only()
         }
-        KeyCode::Up | KeyCode::Char('k') => state.move_notification_panel_selection(-1),
-        KeyCode::Down | KeyCode::Char('j') => state.move_notification_panel_selection(1),
-        KeyCode::PageUp => state.move_notification_panel_selection(-10),
-        KeyCode::PageDown => state.move_notification_panel_selection(10),
-        KeyCode::Home => state.select_notification_panel_row(0),
-        KeyCode::End => state.select_notification_panel_row(usize::MAX),
-        KeyCode::Char('u') => state.toggle_notification_panel_unread_only(),
+        KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
+            state.move_notification_panel_selection(1)
+        }
+        KeyCode::Char('k') | KeyCode::Up if key.modifiers.is_empty() => {
+            state.move_notification_panel_selection(-1)
+        }
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            state.move_notification_panel_selection(1)
+        }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            state.move_notification_panel_selection(-1)
+        }
+        // Half a viewport, like the navigator's ctrl-d / ctrl-u — a hardcoded
+        // page size would be wrong on every terminal but one.
+        KeyCode::PageUp => {
+            state.move_notification_panel_selection(-state.notification_panel_page_delta())
+        }
+        KeyCode::PageDown => {
+            state.move_notification_panel_selection(state.notification_panel_page_delta())
+        }
+        KeyCode::Home => state.select_first_notification_panel_row(),
+        KeyCode::End => state.select_last_notification_panel_row(),
         _ => {}
     }
 }
@@ -985,6 +1021,188 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("config.toml")
+    }
+
+    /// The notification panel's keys, driven through `AppState` rather than
+    /// the renderer, so a modifier regression fails as a test rather than as a
+    /// chord nobody meant to press.
+    fn notification_panel_state(records: &[(&str, bool)]) -> AppState {
+        use crate::api::schema::{NotificationRecordKind, NotificationSource};
+
+        let mut state = AppState::test_new();
+        for (id, seen) in records {
+            state.file_notification(crate::app::notifications::NotificationEntry {
+                id: (*id).to_string(),
+                title: format!("{id} finished"),
+                body: None,
+                kind: NotificationRecordKind::Outcome,
+                source: NotificationSource::AgentState,
+                workspace_id: None,
+                pane_id: None,
+                origin_host: "host.invalid".into(),
+                filed_at_ms: 0,
+                seen: *seen,
+            });
+        }
+        state.open_notification_panel();
+        state
+    }
+
+    /// #534's review finding 1: the handler matched on `key.code` alone, so
+    /// `ctrl+a` — a chord people press without thinking — acknowledged every
+    /// unread record, irreversibly, and `trim()` treats each one it marks read
+    /// as eviction material. Every letter binding now requires an unmodified
+    /// key, as the navigator's do.
+    #[test]
+    fn a_modified_letter_never_reaches_a_letter_binding() {
+        for (code, label) in [
+            (KeyCode::Char('a'), "ctrl+a must not ack everything"),
+            (KeyCode::Char('u'), "ctrl+u must not toggle the filter"),
+            (KeyCode::Char('j'), "ctrl+j must not move the cursor"),
+            (KeyCode::Char('k'), "ctrl+k must not move the cursor"),
+        ] {
+            let mut state = notification_panel_state(&[("a", false), ("b", false)]);
+            let before = (
+                state.notifications.unread(),
+                state.notifications_panel.selected,
+                state.notifications_panel.unread_only,
+            );
+
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                handle_notifications_key(&mut state, KeyEvent::new(code, modifiers));
+            }
+
+            assert_eq!(
+                (
+                    state.notifications.unread(),
+                    state.notifications_panel.selected,
+                    state.notifications_panel.unread_only,
+                ),
+                before,
+                "{label}"
+            );
+        }
+    }
+
+    /// The one modified chord that is bound, so the guard above is a real
+    /// boundary and not "modified keys are ignored".
+    #[test]
+    fn ctrl_n_and_ctrl_p_move_the_cursor() {
+        let mut state = notification_panel_state(&[("a", false), ("b", false)]);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.notifications_panel.selected, 1);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.notifications_panel.selected, 0);
+    }
+
+    /// The bulk acknowledgement takes two deliberate steps — the shape
+    /// `handle_worktree_kill_all_key` uses for flock's other bulk destructive
+    /// action. `a` arms, `enter` fires, `esc` disarms.
+    #[test]
+    fn the_bulk_acknowledgement_needs_a_second_deliberate_press() {
+        let mut state = notification_panel_state(&[("a", false), ("b", false), ("read", true)]);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        );
+        assert!(state.notification_panel_ack_all_armed());
+        assert_eq!(
+            state.notifications.unread(),
+            2,
+            "arming acknowledges nothing"
+        );
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.notifications.unread(), 0);
+        assert!(!state.notification_panel_ack_all_armed());
+    }
+
+    #[test]
+    fn escape_disarms_a_pending_bulk_acknowledgement() {
+        let mut state = notification_panel_state(&[("a", false)]);
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        );
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+
+        assert!(!state.notification_panel_ack_all_armed());
+        assert_eq!(
+            state.notifications.unread(),
+            1,
+            "disarming acknowledges nothing"
+        );
+    }
+
+    /// `enter` without the arming is the single-record primary action.
+    #[test]
+    fn enter_acknowledges_only_the_selected_record() {
+        let mut state = notification_panel_state(&[("a", false), ("b", false)]);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.notifications.unread(), 1);
+    }
+
+    /// #534's review finding 2: `End` asked for row `usize::MAX`, which the
+    /// range guard rejected, so it was a silent no-op and the oldest record was
+    /// unreachable by key.
+    #[test]
+    fn home_and_end_keys_reach_the_first_and_last_rows() {
+        let mut state = notification_panel_state(&[("a", false), ("b", false), ("c", false)]);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        );
+        assert_eq!(state.notifications_panel.selected, 2);
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::empty()),
+        );
+        assert_eq!(state.notifications_panel.selected, 0);
+    }
+
+    /// Paging is half a viewport, not a hardcoded ten, so it is the same
+    /// gesture on any terminal — the navigator's ctrl-d / ctrl-u rule.
+    #[test]
+    fn paging_moves_half_a_viewport() {
+        let mut state = notification_panel_state(&[("a", false), ("b", false), ("c", false)]);
+        let half = state.notification_panel_page_delta();
+        assert!(
+            half >= 1,
+            "a panel with no body still pages by one row rather than none"
+        );
+
+        handle_notifications_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+        );
+        assert_eq!(state.notifications_panel.selected, half as usize);
     }
 
     #[test]

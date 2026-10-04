@@ -24,7 +24,7 @@
 //! misleading one.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
@@ -34,8 +34,8 @@ use ratatui::{
 use super::scrollbar::should_show_scrollbar;
 use super::widgets::{
     action_button_row_rects, display_width, modal_stack_areas, panel_contrast_fg,
-    render_action_button, render_modal_header, render_panel_shell, ActionButtonSpec,
-    ModalStackAreas,
+    render_action_button, render_action_button_focused, render_modal_header, render_panel_shell,
+    ActionButtonSpec, ModalStackAreas,
 };
 use crate::api::schema::NotificationRecordKind;
 use crate::app::notifications::{now_ms, NotificationEntry, MAX_NOTIFICATIONS};
@@ -149,6 +149,15 @@ pub(super) fn render_notifications_panel(app: &AppState, frame: &mut Frame, area
         return;
     };
     if inner.height < 8 || inner.width < 20 {
+        // Too small to lay out, and the click hit-test refuses at the same
+        // size — so say so rather than leaving a dim screen with an empty box
+        // whose buttons do nothing. `esc` still closes.
+        frame.render_widget(
+            Paragraph::new(" panel too small ")
+                .style(Style::default().fg(p.overlay1))
+                .alignment(Alignment::Center),
+            inner,
+        );
         return;
     }
     let stack = notifications_panel_stack(inner);
@@ -157,13 +166,21 @@ pub(super) fn render_notifications_panel(app: &AppState, frame: &mut Frame, area
 
     let body = notifications_panel_body_rect(&stack);
     if body.height > 0 {
-        let rows = app.notification_panel_rows();
-        let start = app.notifications_panel.scroll.min(rows.len());
-        let end = rows.len().min(start.saturating_add(body.height as usize));
-        for (visible, entry) in rows[start..end].iter().enumerate() {
-            render_row(app, frame, body, visible as u16, entry, start + visible);
+        // Borrowed window: a frame draws a viewport, not the log, so the rows
+        // are `skip`/`take`n out of the projection rather than cloned out of
+        // it. `notification_panel_entries` is derived, so nothing goes stale.
+        let count = app.notification_panel_row_count();
+        let start = app.notifications_panel.scroll.min(count);
+        let visible = (count - start).min(body.height as usize);
+        for (offset, entry) in app
+            .notification_panel_entries()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            render_row(app, frame, body, offset as u16, entry, start + offset);
         }
-        render_panel_scrollbar(app, frame, body, rows.len());
+        render_panel_scrollbar(app, frame, body, count);
     }
 
     render_detail(app, frame, notifications_panel_detail_rect(&stack));
@@ -188,7 +205,22 @@ pub(super) fn render_notifications_panel(app: &AppState, frame: &mut Frame, area
         .bg(p.surface0)
         .add_modifier(Modifier::BOLD);
     render_action_button(frame, ack, Some("↵"), "ack", primary);
-    render_action_button(frame, ack_unread, Some("a"), "ack unread", secondary);
+    // Armed reads as armed: the label says what the next press will do and the
+    // reversed ring is the one flock uses for a focused control (#326), so the
+    // bulk acknowledgement never looks like it is one click away.
+    let (label, hint) = if app.notification_panel_ack_all_armed() {
+        ("ack them all", "↵")
+    } else {
+        ("ack unread", "a")
+    };
+    render_action_button_focused(
+        frame,
+        ack_unread,
+        Some(hint),
+        label,
+        secondary,
+        app.notification_panel_ack_all_armed(),
+    );
     render_action_button(frame, close, Some("esc"), "close", secondary);
 }
 
@@ -413,42 +445,68 @@ fn render_retention_line(app: &AppState, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(format!(" {text}")).style(style), area);
 }
 
+/// The key hints, which say what the next press will do rather than what the
+/// keys are: armed, the bulk line names the commit and gives the way out.
 fn render_hints(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
     }
     let p = &app.palette;
     let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+    let armed = Style::default().fg(p.yellow).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(p.overlay0);
-    let line = Line::from(vec![
-        Span::styled("↵", key),
-        Span::styled(" ack  ", dim),
-        Span::styled("a", key),
-        Span::styled(" ack unread  ", dim),
+    let mut spans = vec![Span::styled("↵", key), Span::styled(" ack  ", dim)];
+    if app.notification_panel_ack_all_armed() {
+        // Armed: name the commit and the way out, and do not repeat `esc
+        // close` — `esc cancel` is the same key saying the more urgent thing.
+        spans.extend([
+            Span::styled("↵", armed),
+            Span::styled(" ack them all  ", armed),
+            Span::styled("esc", key),
+            Span::styled(" cancel  ", dim),
+        ]);
+    } else {
+        spans.push(Span::styled("a", key));
+        spans.push(Span::styled(" ack unread  ", dim));
+        spans.push(Span::styled("esc", key));
+        spans.push(Span::styled(" close  ", dim));
+    }
+    spans.extend([
         Span::styled("u", key),
         Span::styled(" unread only  ", dim),
         Span::styled("j/k/↑↓", key),
         Span::styled(" move  ", dim),
         Span::styled("wheel", key),
-        Span::styled(" scroll  ", dim),
-        Span::styled("esc", key),
-        Span::styled(" close", dim),
+        Span::styled(" scroll", dim),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Truncate to `max_width` **columns**, not characters.
+///
+/// Every budget this is handed is a `display_width`, so a title with wide
+/// glyphs — a CJK branch name, an emoji — would overflow its row if the budget
+/// were spent per `char`. (The navigator's `truncate_text` and the sidebar's
+/// `clamp_line` both still count characters; this one does not have to inherit
+/// that.)
 fn truncate_text(text: &str, max_width: usize) -> String {
-    let len = text.chars().count();
-    if len <= max_width {
+    if display_width(text) as usize <= max_width {
         return text.to_string();
     }
     if max_width == 0 {
         return String::new();
     }
-    if max_width == 1 {
-        return "…".to_string();
+    let budget = max_width - 1;
+    let mut prefix = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = display_width(ch.encode_utf8(&mut [0u8; 4])) as usize;
+        if used + width > budget {
+            break;
+        }
+        prefix.push(ch);
+        used += width;
     }
-    let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
 }
 
@@ -630,6 +688,49 @@ mod tests {
         );
     }
 
+    /// The armed bulk acknowledgement must look armed. A button labelled
+    /// `ack unread` that silently meant "everything" is the same class of lie
+    /// as a short list presented as the whole history.
+    #[test]
+    fn an_armed_bulk_acknowledgement_says_so_on_screen() {
+        let mut app = AppState::test_new();
+        app.file_notification(entry("a", false, now_ms()));
+        app.open_notification_panel();
+
+        let disarmed = render_panel_to_string(&mut app, 110, 30);
+        assert!(disarmed.contains("ack unread"), "{disarmed}");
+        assert!(
+            !disarmed.contains("ack them all"),
+            "nothing is armed yet: {disarmed}"
+        );
+
+        app.toggle_notification_panel_ack_all();
+
+        let armed = render_panel_to_string(&mut app, 110, 30);
+        assert!(armed.contains("ack them all"), "{armed}");
+        assert!(armed.contains("cancel"), "{armed}");
+        assert_eq!(
+            app.notifications.unread(),
+            1,
+            "and arming acknowledged nothing"
+        );
+    }
+
+    /// A terminal too small for the panel says so, rather than leaving a dim
+    /// screen with an empty box whose buttons silently do nothing.
+    #[test]
+    fn a_panel_too_small_to_lay_out_says_so() {
+        let mut app = AppState::test_new();
+        app.file_notification(entry("a", false, now_ms()));
+        app.open_notification_panel();
+
+        // 9 rows: the popup shrinks to 7, so its inner is 5 tall — below the
+        // 8 the hit-test needs for a click to land on anything.
+        let rendered = render_panel_to_string(&mut app, 40, 9);
+
+        assert!(rendered.contains("panel too small"), "{rendered}");
+    }
+
     /// The renderer derives its rows from `inner`; the hit-test derives them
     /// from `AppState`'s copy of the geometry. Both go through
     /// `notifications_panel_stack`, so a change to one that moved a row would
@@ -702,5 +803,21 @@ mod tests {
         assert_eq!(truncate_text("truncate me", 5), "trun…");
         assert_eq!(truncate_text("truncate me", 1), "…");
         assert_eq!(truncate_text("truncate me", 0), "");
+    }
+
+    /// The budgets are columns, so the truncation has to be too: a wide-glyph
+    /// title truncated per character runs past the row it was budgeted for.
+    #[test]
+    fn truncation_spends_columns_not_characters() {
+        // Each of these is two columns wide.
+        let wide = " Wide Wide Wide Wide";
+        assert_eq!(display_width(wide), 20);
+        let truncated = truncate_text(wide, 9);
+        assert!(
+            display_width(&truncated) <= 9,
+            "{truncated:?} is {} columns",
+            display_width(&truncated)
+        );
+        assert!(truncated.ends_with('…'));
     }
 }
