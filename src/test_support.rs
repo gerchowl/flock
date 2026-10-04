@@ -250,22 +250,66 @@ pub(crate) fn create_submodule_worktree(name: &str, branch: &str) -> (PathBuf, P
 /// socket share the gate event/worker, and a fixture that primes real git
 /// generates events for work the test did not ask about. A first-event-wins
 /// helper races that; the sweep's rows are the slowest here (a recovered
-/// removal is two `git worktree remove` calls), so the deadline is generous
-/// rather than tight.
+/// removal is two `git worktree remove` calls), so they wait
+/// [`DEFAULT_EVENT_WAIT`] rather than a tight bound.
+///
+/// `timeout` is a bound, checked before every poll: a deadline that only
+/// applied while the queue was empty could be beaten by an event arriving
+/// late, and an endless stream of unrelated events would never end the wait
+/// at all (#539). Callers that need the *patient* bound ask for it by name;
+/// callers that need a tight one say so and get it.
+///
+/// A timeout names what actually arrived, because "timed out waiting for an
+/// event" and "the event never came" are different bugs and only one of them
+/// is what a bare timeout says.
 pub(crate) fn wait_for_event(
     app: &mut crate::app::App,
     want: fn(&crate::events::AppEvent) -> bool,
+    timeout: std::time::Duration,
 ) -> crate::events::AppEvent {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
+    const MAX_NAMED: usize = 8;
+    let mut named: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let arrived = if skipped == 0 {
+                "nothing arrived at all".to_string()
+            } else {
+                format!(
+                    "{skipped} event(s) arrived but none matched, first: {}",
+                    named.join(", ")
+                )
+            };
+            panic!("timed out waiting for a matching event; {arrived}");
+        }
         if let Ok(event) = app.event_rx.try_recv() {
             if want(&event) {
                 return event;
             }
+            skipped += 1;
+            if named.len() < MAX_NAMED {
+                named.push(describe_event(&event));
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    panic!("timed out waiting for worktree event");
+}
+
+/// The patient bound: a recovered worktree removal is two `git worktree
+/// remove` calls, and the sweep's rows are the slowest workers in the suite.
+pub(crate) const DEFAULT_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One-line identity of a discarded event, for the timeout diagnostic.
+/// Truncated because a `SystemStats` or a pane snapshot in `Debug` is a
+/// paragraph, and a diagnostic nobody can read is no diagnostic.
+fn describe_event(event: &crate::events::AppEvent) -> String {
+    const MAX_CHARS: usize = 96;
+    let mut text = format!("{event:?}");
+    if text.chars().count() > MAX_CHARS {
+        text = text.chars().take(MAX_CHARS).collect::<String>() + "...";
+    }
+    text
 }
 
 #[cfg(test)]

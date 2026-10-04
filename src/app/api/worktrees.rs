@@ -1610,7 +1610,7 @@ mod tests {
     // quietly stops covering the others (#402).
     use crate::test_support::{
         create_committed_repo, create_submodule_worktree, run_git, run_git_over_file_protocol,
-        unique_temp_path, wait_for_event,
+        unique_temp_path, wait_for_event, DEFAULT_EVENT_WAIT,
     };
     use crate::{config::Config, workspace::Workspace};
 
@@ -3333,9 +3333,11 @@ mod tests {
         });
         app.state.mode = crate::app::state::Mode::ConfirmRemoveWorktree;
         app.start_worktree_remove();
-        match wait_for_event(&mut app, |event| {
-            matches!(event, crate::events::AppEvent::WorktreeRemoveFinished(_))
-        }) {
+        match wait_for_event(
+            &mut app,
+            |event| matches!(event, crate::events::AppEvent::WorktreeRemoveFinished(_)),
+            DEFAULT_EVENT_WAIT,
+        ) {
             crate::events::AppEvent::WorktreeRemoveFinished(result) => {
                 assert!(result.result.is_err(), "git refused, as seam 1 saw");
                 app.handle_worktree_remove_finished(result);
@@ -3381,9 +3383,11 @@ mod tests {
             force_dirty: false,
         });
         app.start_kill_all_worktrees();
-        let sweep = match wait_for_event(&mut app, |event| {
-            matches!(event, crate::events::AppEvent::WorktreeKillAllFinished(_))
-        }) {
+        let sweep = match wait_for_event(
+            &mut app,
+            |event| matches!(event, crate::events::AppEvent::WorktreeKillAllFinished(_)),
+            DEFAULT_EVENT_WAIT,
+        ) {
             crate::events::AppEvent::WorktreeKillAllFinished(result) => result,
             other => panic!("unexpected event: {other:?}"),
         };
