@@ -1,7 +1,10 @@
 # ADR 0015 — The operator may file an issue from flock, over the API, into any repo their own token can reach
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-27
+- Implemented: all seven decisions. `flk issue drop --file-it`
+  (`src/cli/issue.rs:157`), template detection, `Forbidden` handling, and the
+  new-pane `$EDITOR` hand-off.
 - Issues: #371 (the spike and the implementation). **Amends ADR-0010 decision
   6**, which is otherwise unchanged. Constrained by ADR-0014 (agent-initiated
   spawn — deliberately not in play here) and ADR-0002 (config layers).

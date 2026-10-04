@@ -1,7 +1,16 @@
 # ADR 0019 — Agent mail may also arrive as a Claude Code channel push, as a first knock over the pull that stays the source of truth
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-30
+- Scope of acceptance: **accepting this ADR is the go decision, and the go
+  decision is scoped to opt-in.** All five decisions below shipped behind the
+  **default-off** `[msg] channel_push` flag, so the code and the go/no-go were
+  inverted: the recommendation below was never taken, only implemented. What is
+  accepted is the push as an additional first knock for a host that turns the
+  flag on. **It is not accepted as a decision to make the push the default, nor
+  to remove either existing knock** — that stays no-go until the launch gate has
+  an unattended answer the operator accepts and channels leave research preview.
+  Nobody may read this status as the default having flipped; it has not.
 - Issues: #438 (the spike this records). Related: #412 (idle wake), #413
   (Stop-hook nudge), #415 (the nudge's race), #416/#417 (sender attestation).
 - Amends: ADR-0018 §2 (how an idle agent is reached) and, for sessions that
@@ -89,7 +98,7 @@ Each row is median (min–max). Other findings:
    skip these checks entirely". For a custom server on a Max account, only the
    development flag works.
 
-## Decision (proposed)
+## Decision
 
 ### 1. The push is an additional first knock, never a replacement
 
@@ -237,10 +246,15 @@ failing is visible. With the flag off it still logs nothing.
 - **Push the body for every sender.** Rejected. Relayed identity is a claim,
   and the channels docs name an ungated channel a prompt-injection vector.
 
-## Recommendation
+## The go decision, and the line it does not cross
 
-**Go, as an opt-in, per host, additive layer.** The prototype keeps every
-existing guarantee, and the latency wins are real, largest for busy agents.
-**No-go on making it the default, or on removing either existing knock**,
-until the launch gate has an unattended answer that the operator accepts and
-channels leave research preview.
+**Go, as an opt-in, per host, additive layer** — and this is the decision, taken.
+The prototype keeps every existing guarantee, and the latency wins are real,
+largest for busy agents.
+
+**No-go on making it the default, or on removing either existing knock**, until
+the launch gate has an unattended answer that the operator accepts and channels
+leave research preview. That no-go is **still in force**, and it is the reason
+`[msg] channel_push` ships default-off. Nothing in this ADR's `Accepted` status
+touches it: acceptance settled *whether to build the opt-in layer*, not *whether
+to turn it on for everyone*.

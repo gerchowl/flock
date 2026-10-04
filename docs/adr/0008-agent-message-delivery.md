@@ -1,7 +1,12 @@
 # ADR 0008 — Agent-to-agent messages ride the tool surface, not the keyboard
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-03
+- Implemented: all of it. `flock_msg_send` / `flock_msg_reply` /
+  `flock_msg_list` are on the MCP tool surface (`src/mcp/tools.rs:113,160,172`),
+  and the deliver-by-keystroke path this ADR replaced is gone
+  (`src/app/api/messages.rs:1756-1762`). Its **transport** half was later
+  superseded by ADR-0009; this ADR's delivery model stands unchanged.
 - Issues: #213 (the delivered-message shape spike); supersedes ADR-0006's
   addressing where it assumes a server-local pane id is an address; builds on
   ADR-0005 (durable event log as the audit substrate) and #175 M1/M2.

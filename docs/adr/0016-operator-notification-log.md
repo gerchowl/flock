@@ -1,7 +1,14 @@
 # ADR 0016 — Outcomes are filed as durable events; unread is a projection, not a second store
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-27
+- Implemented: §1–4 and §6, in #381, plus the TUI panel in #534. **§5 (who may
+  file) and §3's retention premise were answered by
+  `docs/adr/0023-decisions-and-agent-filing.md`**, which is why this status moved
+  after ADR-0022 §1 said it should not: ADR-0022 withheld acceptance to avoid
+  keying a gate toward a design "whose §1, §3, §5 and §6 are all still open", and
+  ADR-0023 closed the last two of those. ADR-0023's own implementation is **not**
+  yet in the tree — this status records a decision, not its code.
 - Issues: #372 (the gap and this design); builds on #36 (the delivery gate that
   decides *when* an outcome is worth saying, landed as the drainer this files
   behind), ADR-0005 (durable event log — the substrate, and the P5 that forbids
@@ -11,8 +18,9 @@
   writes), #367 (the ambient title badge these counts feed), #316 (the
   measurement this gap defeated).
 - Decision owner: operator. Decision 5 in particular — whether an agent may
-  file into the operator's list at all — is deliberately left as a
-  recommendation with its alternative stated, not resolved here.
+  file into the operator's list at all — was left as a recommendation with its
+  alternative stated; **ADR-0023 §3 has since answered it "yes"**, through a
+  narrowed `flock_notification_ask` kept off the MCP surface.
 
 ## Context
 

@@ -1,7 +1,13 @@
 # ADR 0017 — Handed-over files are MCP resources with a durable identity; tools stay for parameterised calls
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-28
+- Implemented: §1–4 and §6. `handoff.list` / `handoff.read` are on the MCP
+  surface, `FileHandedOver` and `MAX_HANDOFFS` back the record, and the server
+  advertises the `resources` capability. **§5's real question is named, not
+  taken:** whether to suppress the injected `read this file:` paste when the
+  target pane is known to have flock's MCP is still the operator's call, and
+  the paste stays exactly as #80 shipped it (§5 says why it cannot be inferred).
 - Issues: #286 (this design), #79 / #80 (the P0 file transport this replaces the
   read side of), #276 / #379 (`flock_agent_history` — the other consumer the
   issue asked to design against), ADR-0005 (durable event log — the substrate,
@@ -9,7 +15,8 @@
   ADR-0016 (the notification log this shares a substrate with), ADR-0009 (fleet
   transport — why cross-host content is pulled, not replicated).
 - Decision owner: operator. Decision 5 — whether the paste survives now that the
-  resource exists — is deliberately left as a recommendation, not resolved here.
+  resource exists — was left as a recommendation, not resolved here; it remains
+  open at acceptance.
 
 ## Context
 

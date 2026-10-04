@@ -1,7 +1,11 @@
 # ADR 0013 — Thermal health is a host-declared ordinal, rendered as colour on glyphs that already exist
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-19
+- Implemented: all of it. `ThermalReport { severity: u8 0..=3 }` and
+  `ThermalComponent` on the wire, boundary sanitization, a host reporter with a
+  timeout, a stride and backoff, and the glyph tint with its leading-thermometer
+  fallback.
 - Issues: #291 (gossip + render), #298 (the host reporter), #299 (the column
   budget that forced the rendering shape). Follows the self-declared-value
   pattern established by #164 (fleet icons) and #50 (per-node disk mount).

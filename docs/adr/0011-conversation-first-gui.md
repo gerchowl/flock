@@ -1,7 +1,13 @@
 # ADR 0011 — A conversation-first GUI: surfaces, transports, and the write model
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-11
+- Implemented: **nothing.** This is a design of record for work that has not
+  started. At acceptance there is no `src/usecase/`, no `src/gui/`, and no
+  `RpcTransport`, `tauri` or `AskUserQuestion` anywhere in the tree, and
+  #128/#129/#130 remain unblocked rather than unblocked-then-built. Accepting it
+  records the architecture as *decided*, not as *delivered*; the FEATURE-MATRIX
+  row says so in the row. The companion ADR-0012 is in the same position.
 - Issues: #150 (native client bridge, deferred by ADR-0001); #128/#129/#130
   (structured features it unblocks). New work: GUI client, use-case layer,
   agent-authored artifacts.

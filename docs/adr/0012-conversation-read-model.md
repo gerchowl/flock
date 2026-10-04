@@ -1,7 +1,14 @@
 # ADR 0012 — The conversation read model: canonical entries and a derived index
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-11
+- Implemented: **nothing.** At acceptance there is no `TranscriptEntry`, no
+  `SessionEvent`, no FTS or SQLite index in the tree. `src/agent_transcript.rs`
+  is the **pre-existing** Claude-only reader that this ADR and the MCP history
+  tool both describe as already existing — it is *not* this ADR's canonical
+  entry type or its derived index, and should not be read as an early version of
+  them. Accepting it records the read model as *decided*; the FEATURE-MATRIX row
+  says so in the row. The companion ADR-0011 is in the same position.
 - Issues: split out of ADR-0011 after three review rounds concentrated here.
   Depends on #150 only for remote serving.
 - Decision owner: operator; data-model round performed the Codex mapping and the
