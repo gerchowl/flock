@@ -3505,6 +3505,8 @@ impl HeadlessServer {
         self.app.expire_uplink();
         // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_idle_wakes(now);
+        // #540: mirrored in the TUI runtime loop (#25).
+        self.app.tick_self_compacts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }

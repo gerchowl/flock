@@ -188,6 +188,49 @@ the newline gets inserted and nothing is submitted. the pause is a heuristic,
 not a guarantee: a tui that has not started reading stdin yet misses the text
 as well as the enter. wait for the pane to be ready first (see below).
 
+## compact your own context and carry on
+
+use this when your context is filling up **and you already know what the next
+stretch of work is**. it is the difference between finishing unattended and
+handing a human a chore.
+
+```bash
+flock pane arm-self-compact "pick up at step 3: the refactor is done, \
+run just check, then open the PR and watch CI"
+```
+
+what happens, in order:
+
+1. the call **stores** that prompt and returns. nothing is typed. you are
+   mid-turn right now, and your harness cannot compact inside a turn.
+2. you finish the turn normally.
+3. once your pane is idle and settled and nobody has touched the keyboard,
+   flock types `/compact` and submits it.
+4. when your harness reports the compaction back, flock types your handoff
+   prompt in and submits it — and that is your next turn.
+
+write the prompt as instructions to your own next self. assume nothing
+survives but the compaction: name what to check first, what not to redo, and
+where you left off. if the detail is long, put it in a file and name the file.
+
+important:
+
+- you are arming, not compacting. the call returning `armed` means nothing has
+  happened yet.
+- flock never types over a human. if someone is at the keyboard when your turn
+  ends, it waits.
+- if a compaction is already armed, yours is **refused**, not merged. the
+  prompt already stored is untouched. to replace it:
+  `flock pane arm-self-compact --abort`.
+- claude code only. other harnesses are refused by name, because `/compact` is
+  a claude code affordance and typing it anywhere else would just leave a
+  stray line in your prompt box.
+- if the harness never reports the compaction back, the arming is dropped
+  rather than left to fire later. nothing was resumed.
+
+over mcp the same thing is the `flock_self_compact` tool, if your harness has
+flock's mcp server.
+
 ## workspace management
 
 create a new workspace:

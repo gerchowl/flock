@@ -162,6 +162,8 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "pane.arm_self_compact")]
+    PaneArmSelfCompact(PaneArmSelfCompactParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.report_agent")]
@@ -914,6 +916,25 @@ pub struct LineageNode {
 /// | `fyi` | no | no | no |
 /// | `needs_reply` | yes | no | no |
 /// | `blocking` | yes | yes | when the recipient is muted |
+/// What `pane.arm_self_compact` did. The three states exist so a caller can
+/// branch on the outcome without parsing `detail` — and, more importantly, so
+/// `Armed` is honest about its own timing: it means "stored", never "done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfCompactState {
+    /// A continuation prompt is stored against the pane. Nothing has been
+    /// typed yet: flock waits for this agent's turn to end before it asks the
+    /// harness to compact, and waits again for the compaction to report back
+    /// before it delivers the continuation.
+    Armed,
+    /// There was nothing armed, so an abort had nothing to drop.
+    Aborted,
+    /// A self-compaction was already armed. The stored continuation is
+    /// untouched — arming twice must not silently discard a handoff prompt the
+    /// agent wrote.
+    Pending,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MsgIntent {
@@ -1352,6 +1373,35 @@ pub struct PaneSendTextParams {
 pub struct PaneSendKeysParams {
     pub pane_id: String,
     pub keys: Vec<String>,
+}
+
+/// `pane.arm_self_compact` params.
+///
+/// Arming is deliberately a *different verb* from the two writes it causes.
+/// The MCP surface keeps `pane.send_*` closed (an agent may not drive its own
+/// pane with arbitrary bytes), but an agent asking to shorten its own context
+/// and carry on is the opposite of a hazard — so it gets exactly one
+/// allowlisted verb, and it can only name its own continuation. The two
+/// keystrokes it eventually causes are still flock's own, written by the
+/// server from a stored prompt, never anything the caller types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneArmSelfCompactParams {
+    /// Whose session to compact. Omitted means the calling agent's own pane,
+    /// resolved by socket-peer process ancestry exactly like `msg.mute`. There
+    /// is no way to arm a *different* pane: a self-compaction is only
+    /// meaningful for the session whose context is full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    /// The agent's own handoff prompt, in its own words — what it wants to be
+    /// doing once it is on the other side of the compaction. This is the text
+    /// a human otherwise copy-pastes out of the transcript and back in. Required
+    /// and non-empty unless `abort` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+    /// Drop an armed self-compaction instead of arming one, for an agent that
+    /// armed by mistake. Answers what it dropped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub abort: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2185,6 +2235,18 @@ pub enum ResponseResult {
         #[serde(default)]
         deferred: usize,
     },
+    PaneSelfCompact {
+        /// Whose session, as a public pane id (#438).
+        pane: String,
+        /// `armed` — a continuation is stored and will fire at this pane's next
+        /// turn boundary. `aborted` — nothing was armed. `pending` — refused
+        /// because one was already armed (the existing one is untouched).
+        state: SelfCompactState,
+        /// One line for the agent to act on: what will happen, and when. Never
+        /// claims the compaction happened — it has not, at the moment the tool
+        /// returns.
+        detail: String,
+    },
     PaneInfo {
         pane: PaneInfo,
     },
@@ -2609,6 +2671,12 @@ pub struct HistoryTurnInfo {
     /// from when the read happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_ms: Option<u64>,
+    /// This turn is the first after a compaction, so every turn before it is
+    /// superseded (ADR-0012). Absent on the common path where no compaction
+    /// has happened, and always absent on the first turn of a session — there
+    /// is nothing older that could have been superseded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_compaction: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4036,6 +4104,7 @@ mod tests {
                         role: crate::agent_transcript::Role::Assistant,
                         text: "on it".into(),
                         at_ms: Some(1_754_000_000_000),
+                        after_compaction: false,
                     }],
                     cursor: 4096,
                     next_cursor: 8192,

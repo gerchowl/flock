@@ -233,6 +233,7 @@ impl App {
                             role: turn.role,
                             text: turn.text,
                             at_ms: turn.at.and_then(unix_ms),
+                            after_compaction: turn.after_compaction,
                         })
                         .collect(),
                     cursor: page.cursor,

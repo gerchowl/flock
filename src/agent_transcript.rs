@@ -475,6 +475,17 @@ pub struct HistoryTurn {
     pub text: String,
     /// When the writer stamped the entry, if it stamped one.
     pub at: Option<SystemTime>,
+    /// This turn is the first one after a compaction, so everything older in
+    /// the transcript is superseded (ADR-0012: "compaction is an epoch, not a
+    /// turn").
+    ///
+    /// A flag on the following turn rather than a pseudo-turn of its own,
+    /// because a boundary is not something an agent read: it is a fact ABOUT
+    /// the turn after it. A page that opens mid-epoch says so on its first
+    /// entry rather than emitting a divider the caller has to interpret, and
+    /// `turns_at_level` — which every other consumer shares — keeps its
+    /// `(Role, String, Option<SystemTime>)` shape.
+    pub after_compaction: bool,
 }
 
 /// One page of an agent's history plus the cursor that resumes after it.
@@ -576,14 +587,27 @@ pub fn read_history(
 
     let read = read_lines(&buf[..])?;
     let mut turns: Vec<(HistoryTurn, std::ops::Range<u64>)> = Vec::new();
+    // Latched by a `Compacted` entry and consumed by the next turn, so a
+    // boundary marks the epoch that follows it rather than becoming a turn of
+    // its own. It survives the `limit` cut below on purpose: a page that starts
+    // right after a compaction must still say so.
+    let mut compaction_pending = false;
     for (event, span) in read.events.iter().zip(read.line_spans.iter()) {
         // One event yields at most one turn, so a turn's byte span IS its
         // event's line span — that is what makes the cursor exact.
         for (role, text, at) in turns_at_level(std::slice::from_ref(event), detail) {
             turns.push((
-                HistoryTurn { role, text, at },
+                HistoryTurn {
+                    role,
+                    text,
+                    at,
+                    after_compaction: std::mem::take(&mut compaction_pending),
+                },
                 window_start + span.start..window_start + span.end,
             ));
+        }
+        if matches!(event, TranscriptEvent::Compacted) {
+            compaction_pending = true;
         }
     }
 
@@ -1132,6 +1156,17 @@ mod tests {
         )
     }
 
+    fn compact_summary() -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "isCompactSummary": true,
+                "message": {"role": "user", "content": "a summary of everything so far"}
+            })
+        )
+    }
+
     fn assistant_with_tool(text: &str, tool: &str) -> String {
         format!(
             "{}\n",
@@ -1162,6 +1197,76 @@ mod tests {
             "seven older turns were dropped; saying otherwise would read as `that is all there is`"
         );
         assert_eq!(page.next_cursor, page.len, "the tail read reaches the end");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ADR-0012: "compaction is an epoch, not a turn". An agent told to
+    /// compact and carry on needs to be able to see where its context was cut,
+    /// or "continue" has nothing to anchor to.
+    #[test]
+    fn a_compaction_boundary_marks_the_turn_after_it() {
+        let body: String = [user("before"), compact_summary(), user("after")].concat();
+        let path = history_fixture("compaction", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+
+        assert_eq!(
+            texts(&page),
+            vec!["before", "after"],
+            "the summary is not content"
+        );
+        assert!(
+            !page.turns[0].after_compaction,
+            "nothing older existed to supersede"
+        );
+        assert!(
+            page.turns[1].after_compaction,
+            "the turn after the boundary is where the new epoch starts"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The flag has to survive the page being cut, or a caller tailing a
+    /// transcript learns about a compaction only if it happened to be reading
+    /// before the cut.
+    #[test]
+    fn a_compaction_boundary_survives_the_page_being_cut() {
+        let body: String = [user("before"), compact_summary(), user("after")].concat();
+        let path = history_fixture("compaction-cut", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 1).expect("history");
+
+        assert_eq!(texts(&page), vec!["after"], "the newest turn is kept");
+        assert!(
+            page.turns[0].after_compaction,
+            "the epoch this turn belongs to is the whole point of the flag"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two compactions in one transcript are two epochs, not one.
+    #[test]
+    fn each_compaction_marks_its_own_epoch() {
+        let body: String = [
+            user("a"),
+            compact_summary(),
+            user("b"),
+            compact_summary(),
+            user("c"),
+        ]
+        .concat();
+        let path = history_fixture("compaction-twice", &body);
+
+        let page = read_history(&path, TranscriptDetail::Reply, None, 20).expect("history");
+
+        assert_eq!(
+            page.turns
+                .iter()
+                .map(|turn| turn.after_compaction)
+                .collect::<Vec<_>>(),
+            vec![false, true, true],
+            "b starts an epoch after the first compaction, c after the second"
+        );
         let _ = std::fs::remove_file(path);
     }
 

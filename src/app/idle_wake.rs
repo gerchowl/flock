@@ -418,7 +418,10 @@ impl App {
         Decision::Submitted
     }
 
-    fn terminal_for_pane(
+    /// `pub(crate)` rather than private because `app::self_compact` walks the
+    /// same pane tree to the same terminal, and a second copy of this lookup
+    /// would be a second thing to keep correct.
+    pub(crate) fn terminal_for_pane(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,

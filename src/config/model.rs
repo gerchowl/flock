@@ -334,6 +334,42 @@ pub struct SessionConfig {
     /// How often that wait re-reads the transcript, in milliseconds.
     /// Default: 50.
     pub stop_transcript_poll_ms: u64,
+    /// Let an agent compact its own context and carry on, unattended
+    /// (`pane.arm_self_compact`, #540). Default: true.
+    ///
+    /// Off means the verb refuses: no `/compact` is typed, no continuation is
+    /// delivered. Nothing else changes — arming is per-pane and ephemeral, so
+    /// there is no queue to drain when this is turned back on. Set it false to
+    /// forbid self-compaction outright on a machine where an agent restarting
+    /// its own session is not acceptable.
+    pub self_compact: bool,
+    /// How long the compaction's first keystroke waits for the agent to be
+    /// freshly idle and settled, in milliseconds. Default: 2000.
+    ///
+    /// The same question `[msg] idle_wake_settle_ms` asks, and deliberately
+    /// the same default: flock never types into a pane the agent might still be
+    /// using. An agent arms mid-turn, so nothing happens until its turn has
+    /// ended and this much time has passed.
+    pub self_compact_settle_ms: u64,
+    /// How long the compaction waits for a human to stop touching the pane
+    /// before typing `/compact` into it, in milliseconds. Default: 15000.
+    ///
+    /// Flock does not type over an operator. A human at the keyboard at the
+    /// moment the turn ends keeps the keyboard, and the armed compaction waits.
+    pub self_compact_operator_quiet_ms: u64,
+    /// How long an armed compaction may wait for the harness to report the
+    /// compaction back, in milliseconds. Default: 120000.
+    ///
+    /// This is the bound on the half of the sequence flock cannot see into:
+    /// after it types `/compact`, the only proof the compaction happened is the
+    /// session hook reporting `session_start_source: compact`. A harness that
+    /// cannot compact itself, or an operator who cancels the slash command,
+    /// never reports it — and without this bound the continuation would sit
+    /// armed forever, refusing every later arming. On expiry the arming is
+    /// dropped and logged, and the agent is told nothing was typed into its
+    /// prompt box, so its own handoff prompt is still readable in the
+    /// transcript.
+    pub self_compact_timeout_ms: u64,
 }
 
 impl Default for SessionConfig {
@@ -342,6 +378,10 @@ impl Default for SessionConfig {
             resume_agents_on_restore: true,
             stop_transcript_wait_ms: 1_000,
             stop_transcript_poll_ms: 50,
+            self_compact: true,
+            self_compact_settle_ms: 2_000,
+            self_compact_operator_quiet_ms: 15_000,
+            self_compact_timeout_ms: 120_000,
         }
     }
 }

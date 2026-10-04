@@ -218,6 +218,32 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_msg_mute,
         },
         Tool {
+            name: "flock_self_compact",
+            description: "Compact YOUR OWN context and carry on, unattended. \
+                          Call this when your context is filling up and you \
+                          already know what the next stretch of work is — then \
+                          hand this session a handoff prompt instead of \
+                          letting it end and waiting for a human to compact you \
+                          and paste your own continuation back in. You are \
+                          running mid-turn when you call it, so NOTHING happens \
+                          yet: the call stores your prompt and returns. Finish \
+                          the turn normally, and flock then asks the harness to \
+                          compact, waits for the harness to report the \
+                          compaction back, and types your handoff prompt in as \
+                          your next turn. So write the prompt as instructions \
+                          to your own next self — what to pick up, what to \
+                          check first, anything you must not redo — and assume \
+                          nothing but the compaction survives. This is the only \
+                          way to type into your own pane: you cannot send \
+                          yourself a keystroke, and you should not be able to. \
+                          If a compaction is already armed, yours is refused \
+                          rather than replacing it — abort first if you meant \
+                          to rewrite it. Claude Code only; other harnesses are \
+                          refused by name.",
+            input_schema: schema_self_compact,
+            build: build_self_compact,
+        },
+        Tool {
             name: "flock_pane_read",
             description: "Read a pane's recent output. Read-only, like \
                           `flock_agent_read`: it changes no pane state.",
@@ -263,7 +289,11 @@ pub(super) fn table() -> &'static [Tool] {
                           given to get only what has been written since — \
                           that is what keeps a poll cheap. `more: true` means \
                           page again now rather than wait; `truncated: true` \
-                          means older turns exist above `cursor`. Claude \
+                          means older turns exist above `cursor`. A turn with \
+                          `after_compaction: true` is the first of a new \
+                          epoch: everything older in the transcript was \
+                          superseded by a compaction, so it is history rather \
+                          than context. Claude \
                           only. Refusals: `unsupported_for_agent`, \
                           `no_agent_session`, `transcript_not_found`, \
                           `transcript_unreadable`.",
@@ -737,6 +767,52 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn schema_self_compact() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "continuation": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Your own handoff prompt, in your own words: what you want to be doing once you are on the other side of the compaction. This is the text a human would otherwise copy out of your transcript and paste back into you, so write it as instructions to your next self. Required, and it must not be empty — a compaction with no prompt leaves you with no thread to hold. Capped at 16 KiB; put anything longer in a file and name the file.",
+            },
+            "abort": {
+                "type": "boolean",
+                "description": "Drop an armed self-compaction instead of arming one, for a compaction you armed by mistake. Tells you whether there was anything to drop.",
+            },
+            "pane": {
+                "type": "string",
+                "description": "Which pane to arm. Omit for your own. There is no useful reason to name another: a self-compaction is only meaningful for the session whose context is full.",
+            },
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn build_self_compact(args: Value) -> Result<Method, McpError> {
+    let abort = args.get("abort").and_then(Value::as_bool).unwrap_or(false);
+    let continuation = optional_string(&args, "continuation")?;
+    if !abort
+        && continuation
+            .as_ref()
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        return Err(McpError::invalid_params(
+            "`continuation` is required and must not be empty: it is the handoff \
+             prompt you want to be given once the compaction lands, and without \
+             it you would come back with no thread to hold. Pass `abort: true` \
+             to drop an armed self-compaction instead.",
+        ));
+    }
+    Ok(Method::PaneArmSelfCompact(
+        crate::api::schema::PaneArmSelfCompactParams {
+            pane: optional_string(&args, "pane")?,
+            continuation,
+            abort,
+        },
+    ))
+}
+
 fn schema_msg_mute() -> Value {
     json!({
         "type": "object",
@@ -875,6 +951,7 @@ mod tests {
                 "flock_msg_list",
                 "flock_msg_read",
                 "flock_msg_mute",
+                "flock_self_compact",
                 "flock_pane_read",
                 "flock_worktree_list",
                 "flock_agent_start",
@@ -1035,6 +1112,83 @@ mod tests {
         assert!(
             matches!(method, Method::AgentHistory(_)),
             "history must never resolve to a pane buffer read"
+        );
+    }
+
+    #[test]
+    fn flock_self_compact_carries_the_handoff_prompt_to_the_arming_verb() {
+        let method = build_self_compact(json!({"continuation": "open the PR"})).expect("arms");
+        let Method::PaneArmSelfCompact(params) = method else {
+            panic!("self-compact must not resolve to a pane write");
+        };
+        assert_eq!(params.continuation.as_deref(), Some("open the PR"));
+        assert!(params.pane.is_none(), "omitting `pane` means my own");
+        assert!(!params.abort);
+    }
+
+    /// A compaction with no prompt behind it would shorten the context and
+    /// then hand back no thread to hold, which is strictly worse than not
+    /// compacting at all.
+    #[test]
+    fn flock_self_compact_refuses_an_empty_handoff_prompt() {
+        for args in [
+            json!({}),
+            json!({"continuation": ""}),
+            json!({"continuation": "   "}),
+        ] {
+            let err = build_self_compact(args.clone())
+                .expect_err("an arming with nothing to resume with is refused");
+            assert_eq!(err.code, -32602, "{args}");
+            assert!(
+                err.message.contains("no thread to hold"),
+                "the refusal must say what goes wrong: {}",
+                err.message
+            );
+        }
+    }
+
+    /// Abort is the one call that legitimately has no continuation, so it must
+    /// not be caught by the refusal above.
+    #[test]
+    fn flock_self_compact_abort_needs_no_handoff_prompt() {
+        let method = build_self_compact(json!({"abort": true})).expect("aborts");
+        let Method::PaneArmSelfCompact(params) = method else {
+            panic!("abort must resolve to the same verb");
+        };
+        assert!(params.abort);
+        assert_eq!(params.continuation, None);
+    }
+
+    /// The closed table keeps `pane.send_text` off MCP, and this is the one
+    /// allowlisted way an agent affects its own pane. It must stay an arming:
+    /// anything that let a caller name arbitrary text to type would reopen the
+    /// hole the refusal exists to close.
+    #[test]
+    fn flock_self_compact_cannot_become_a_way_to_type_into_a_pane() {
+        assert!(
+            table()
+                .iter()
+                .all(|tool| !tool.name.contains("pane_send") && !tool.name.contains("pane_write")),
+            "no pane-writing tool may exist on MCP — `flock_msg_send` is a \
+             queue, not a keystroke"
+        );
+        // The schema declares `additionalProperties: false`, and the builder
+        // reads only the fields it knows — so a smuggled `text` reaches
+        // nothing. That is the `flock_agent_start`/`argv` precedent: the wire
+        // shape is the boundary, not a hand-maintained deny-list.
+        let method = build_self_compact(json!({
+            "continuation": "carry on",
+            "text": "/compact",
+            "keys": ["Enter"],
+        }))
+        .expect("the known field still builds");
+        let Method::PaneArmSelfCompact(params) = method else {
+            panic!("self-compact must not resolve to a pane write");
+        };
+        assert_eq!(params.continuation.as_deref(), Some("carry on"));
+        assert!(
+            schema_self_compact()["additionalProperties"] == json!(false),
+            "the schema is what stops the smuggled fields at a compliant client"
         );
     }
 
