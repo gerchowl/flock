@@ -2055,15 +2055,72 @@ mod tests {
         unique_temp_path, wait_for_event,
     };
 
+    /// Wait for the next *worktree* event, skipping everything else.
+    ///
+    /// `App::new` starts the 2s system-stats sampler onto the same queue these
+    /// tests read, so a worktree test's window can be crossed by a
+    /// `SystemStatsUpdated` that has nothing to do with it. Returning the
+    /// first event of *any* kind made a test about branch deletion fail on
+    /// whether the sampler happened to tick inside its window — correctness
+    /// depending on *when* it ran rather than on what it returned (#539, the
+    /// shape #444 closed from the other direction). Unrelated events are
+    /// dropped, and named on timeout so a caller waiting for something that
+    /// never arrives is told what actually showed up.
+    ///
+    /// The guard admits EVERY worktree variant in `src/events.rs`, not the
+    /// three today's callers await. Specificity stays with the caller: its
+    /// `match` still panics loudly on a worktree event it did not ask for,
+    /// which is a far better failure than the bare timeout a narrower guard
+    /// would hand the next caller that waits for, say,
+    /// `WorktreeKillGateFinished`. A new `Worktree*` variant belongs in the
+    /// match below.
     fn wait_for_worktree_event(app: &mut App) -> AppEvent {
+        const MAX_NAMED: usize = 8;
+        let mut named: Vec<String> = Vec::new();
+        let mut skipped = 0usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if let Ok(event) = app.event_rx.try_recv() {
-                return event;
+        loop {
+            match app.event_rx.try_recv() {
+                Ok(event) => {
+                    if matches!(
+                        event,
+                        AppEvent::WorktreeAddFinished(_)
+                            | AppEvent::WorktreeRemoveFinished(_)
+                            | AppEvent::WorktreeBranchDeleteFinished(_)
+                            | AppEvent::WorktreeKillGateFinished(_)
+                            | AppEvent::WorktreeKillAllFinished(_)
+                    ) {
+                        return event;
+                    }
+                    skipped += 1;
+                    if named.len() < MAX_NAMED {
+                        named.push(describe_event(&event));
+                    }
+                }
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    let arrived = if skipped == 0 {
+                        "nothing arrived at all".to_string()
+                    } else {
+                        format!("{skipped} unrelated event(s), first: {}", named.join(", "))
+                    };
+                    panic!("timed out waiting for a worktree event; {arrived}");
+                }
+                Err(_) => {}
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("timed out waiting for worktree event");
+    }
+
+    /// One-line identity of a skipped event, for the timeout diagnostic.
+    /// Truncated because a `SystemStats` or pane snapshot in `Debug` is a
+    /// paragraph, and a diagnostic nobody can read is no diagnostic.
+    fn describe_event(event: &AppEvent) -> String {
+        const MAX_CHARS: usize = 96;
+        let mut text = format!("{event:?}");
+        if text.chars().count() > MAX_CHARS {
+            text = text.chars().take(MAX_CHARS).collect::<String>() + "...";
+        }
+        text
     }
 
     fn app_for_worktree_tests() -> App {
@@ -2074,6 +2131,135 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    fn queue(app: &App, event: AppEvent) {
+        app.event_tx
+            .try_send(event)
+            .expect("test event queue should have room");
+    }
+
+    /// #539: the queue these tests read is the whole runtime's queue —
+    /// `App::new` starts the 2s system-stats sampler onto it — and the helper
+    /// used to hand back whatever arrived first. A worktree test therefore
+    /// passed or failed on sampler timing rather than on the branch delete it
+    /// was asserting. The tick is injected ahead of the awaited event here,
+    /// which is what the real sampler does whenever it fires inside the window.
+    #[test]
+    fn wait_for_worktree_event_skips_the_sampler_tick() {
+        let mut app = app_for_worktree_tests();
+        queue(
+            &app,
+            AppEvent::SystemStatsUpdated(crate::system_stats::SystemStats {
+                cpu_percent: Some(26.25),
+                ..Default::default()
+            }),
+        );
+        queue(
+            &app,
+            AppEvent::WorktreeBranchDeleteFinished(crate::events::WorktreeBranchDeleteResult {
+                branch: "worktree/submodule-remove".into(),
+                result: Ok(()),
+            }),
+        );
+
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeBranchDeleteFinished(result) => {
+                assert_eq!(result.branch, "worktree/submodule-remove");
+                assert_eq!(result.result, Ok(()));
+            }
+            other => panic!("a sampler tick is not the awaited event: {other:?}"),
+        }
+    }
+
+    /// The guard must not be narrower than the worktree variants
+    /// `src/events.rs` defines. Today's callers await three of the five; a
+    /// guard built from those three would hand the next caller that waits for
+    /// `WorktreeKillGateFinished` a bare 2s timeout, which reads as a hang
+    /// rather than as the wrong event. Each variant is queued behind a stray
+    /// sampler tick, so this also pins "skips noise" and "admits every
+    /// worktree event" as one behaviour.
+    #[test]
+    fn wait_for_worktree_event_admits_every_worktree_variant() {
+        let cases = vec![
+            AppEvent::WorktreeAddFinished(crate::events::WorktreeAddResult {
+                path: "/w/flock/add".into(),
+                result: Ok(()),
+            }),
+            AppEvent::WorktreeRemoveFinished(crate::events::WorktreeRemoveResult {
+                workspace_id: "ws".into(),
+                path: "/w/flock/remove".into(),
+                result: Ok(()),
+                standing: Vec::new(),
+            }),
+            AppEvent::WorktreeBranchDeleteFinished(crate::events::WorktreeBranchDeleteResult {
+                branch: "worktree/deleted".into(),
+                result: Ok(()),
+            }),
+            AppEvent::WorktreeKillGateFinished(crate::events::WorktreeKillGateResult {
+                workspace_id: "ws".into(),
+                path: "/w/flock/gate".into(),
+                branch: None,
+                gate: crate::worktree::WorktreeMergeGate::Merged {
+                    evidence: "PR #1 merged".into(),
+                },
+                protected: false,
+                timed_out: false,
+                probe: None,
+            }),
+            AppEvent::WorktreeKillAllFinished(crate::events::WorktreeKillAllResult {
+                outcomes: Vec::new(),
+                force_recovered: Vec::new(),
+            }),
+        ];
+
+        let mut app = app_for_worktree_tests();
+        for case in cases {
+            queue(
+                &app,
+                AppEvent::SystemStatsUpdated(crate::system_stats::SystemStats::default()),
+            );
+            let queued = std::mem::discriminant(&case);
+            queue(&app, case);
+            let event = wait_for_worktree_event(&mut app);
+            assert_eq!(
+                std::mem::discriminant(&event),
+                queued,
+                "a worktree variant was skipped instead of returned: {event:?}"
+            );
+        }
+    }
+
+    /// The diagnostic the timeout carries is the difference between "this test
+    /// hung" and "this test waited for something that never arrives, and here
+    /// is what did". Without it, dropping the noise turns every future
+    /// mismatch into a bare 2s timeout, which reads as a different bug.
+    #[test]
+    fn the_timeout_names_the_events_that_actually_arrived() {
+        let mut app = app_for_worktree_tests();
+        queue(
+            &app,
+            AppEvent::SystemStatsUpdated(crate::system_stats::SystemStats {
+                cpu_percent: Some(26.25),
+                ..Default::default()
+            }),
+        );
+        let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_worktree_event(&mut app)
+        }))
+        .expect_err("no worktree event was queued, so the wait must time out");
+        let message = timed_out
+            .downcast_ref::<String>()
+            .expect("panic carries a formatted message")
+            .clone();
+        assert!(
+            message.contains("timed out waiting for a worktree event"),
+            "timeout should say what it was waiting for: {message}"
+        );
+        assert!(
+            message.contains("SystemStatsUpdated"),
+            "timeout should name what arrived instead: {message}"
+        );
     }
 
     #[test]
