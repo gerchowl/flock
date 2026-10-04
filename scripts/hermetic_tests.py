@@ -2,7 +2,7 @@
 """Gate: test code must not assert against ambient machine state.
 
 A test that reads the process working directory, the machine's hostname, or a
-hardcoded FHS path is asserting about the developer's hopper rather than about
+hardcoded FHS path is asserting about the developer's own machine rather than about
 flock. It passes for whoever wrote it and fails, confusingly, for everyone else
 — long after the change that exposed it.
 

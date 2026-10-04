@@ -567,7 +567,7 @@ fn origin_allowed(
         return true;
     };
     // Hostnames are case-insensitive (DNS); compare accordingly so e.g.
-    // `https://Studio.tailnet.ts.net` matches Host `atlas.tailnet.ts.net`.
+    // `https://Atlas.tailnet.ts.net` matches Host `atlas.tailnet.ts.net`.
     let origin_lower = origin.to_ascii_lowercase();
     let origin_authority = origin_lower
         .split_once("://")
@@ -891,8 +891,23 @@ mod tests {
 
     #[test]
     fn same_origin_is_case_insensitive() {
+        // ONE host, two spellings. A previous version of this test paired two
+        // *different* hosts, so it asserted that a cross-origin request was
+        // allowed while claiming to check case-insensitivity (#535).
         assert!(origin_allowed(
-            Some("https://Studio.Tailnet.ts.net"),
+            Some("https://Atlas.Tailnet.ts.net"),
+            Some("atlas.tailnet.ts.net"),
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn a_host_differing_only_in_its_label_is_rejected() {
+        // The other half of the case-insensitivity contract: tolerating case
+        // must not become tolerating neighbours. `atlas2` is a different machine.
+        assert!(!origin_allowed(
+            Some("https://atlas2.tailnet.ts.net"),
             Some("atlas.tailnet.ts.net"),
             &[],
             false

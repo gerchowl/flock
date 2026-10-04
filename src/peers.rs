@@ -2210,7 +2210,7 @@ mod tests {
         assert_eq!(health.persistent_reason(), None);
     }
 
-    /// The budget the rate limit buys, in the hopper numbers: five days of a
+    /// The budget the rate limit buys, in one node's own numbers: five days of a
     /// 15s poll failing the same way.
     #[test]
     fn a_five_day_outage_is_hundreds_of_warns_not_tens_of_thousands() {
