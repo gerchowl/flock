@@ -412,7 +412,7 @@ fn spawn_basic_detection_task(
         let mut last_activity: Option<String> = None;
         // #309: this task (the live-handoff adoption path) published
         // `detection.state` raw, so an adopted pane lost the Working->Idle
-        // hold entirely — and `flock server live-handoff` is a documented
+        // hold entirely — and `flk server live-handoff` is a documented
         // deploy step, so it is not a rare path.
         let mut last_claude_working_at = None;
         let mut last_visible_blocker = false;

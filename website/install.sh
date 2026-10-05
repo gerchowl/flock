@@ -1,7 +1,16 @@
 #!/bin/sh
 set -eu
 
-BIN="flock"
+# The executable is `flk`, never the product name (ADR-0003). Installing it under
+# the product name instead would shadow util-linux flock(1) on every Linux box
+# with ~/.local/bin ahead of /usr/bin — the collision #86 was opened to end. The
+# product/namespace is untouched: flock.dev, ~/.config/flock, FLOCK_* and the log
+# filenames all keep the long name.
+#
+# scripts/exec_name_gate.py fails the build if the product name reappears here in
+# command position, and asserts this literal against Cargo.toml's [[bin]] name so
+# the installer and the binary it ships cannot drift apart again.
+BIN="flk"
 MANIFEST_URL="https://flock.dev/latest.json"
 INSTALL_DIR="${FLOCK_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -34,7 +43,7 @@ main() {
     need curl
     need awk
 
-    # use the same manifest as `flock update` so installs and updates agree
+    # use the same manifest as `flk update` so installs and updates agree
     # on the public latest release.
     TARGET="${os}-${arch}"
     log "fetching latest release manifest..."
@@ -91,7 +100,7 @@ main() {
     # verify
     if command -v "$BIN" >/dev/null 2>&1; then
         echo ""
-        log "ready. run 'flock' to get started."
+        log "ready. run '$BIN' to get started."
     fi
 
     echo ""

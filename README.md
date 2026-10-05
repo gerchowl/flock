@@ -63,22 +63,22 @@ or download the binary from [releases](https://github.com/gerchowl/flock/release
 Start Flock in the directory where the work lives:
 
 ```bash
-flock
+flk
 ```
 
 Flock starts or attaches to one background session server. Press `ctrl+b`, then `shift+n` to create a workspace. Run an agent in the root pane. Press `ctrl+b`, then `v` or `minus` to split panes, `ctrl+b`, then `c` to create a tab, and `ctrl+b`, then `w` to switch workspaces.
 
-Press `ctrl+b q` to detach the client. The server and pane processes keep running. Open another terminal and run `flock` again to reattach.
+Press `ctrl+b q` to detach the client. The server and pane processes keep running. Open another terminal and run `flk` again to reattach.
 
 ## core concepts
 
-**Server and client.** By default, `flock` attaches to a background server. Detaching closes only the client. `flock server stop` stops the default server and kills its panes. Named sessions are separate server namespaces: use `flock session attach work`, `flock session stop work`, and `flock session list` when you want fully separate runtime state.
+**Server and client.** By default, `flk` attaches to a background server. Detaching closes only the client. `flk server stop` stops the default server and kills its panes. Named sessions are separate server namespaces: use `flk session attach work`, `flk session stop work`, and `flk session list` when you want fully separate runtime state.
 
 **Workspaces, tabs, panes.** A workspace is the project-level container. Tabs group panes inside a workspace. Panes are real terminal processes, not rewritten agent views.
 
 **Copy.** Flock copies pane text, not the sidebar. Drag-select inside a pane, double-click a word or token, or press `prefix+[` for keyboard copy mode. In copy mode, move with `h/j/k/l`, `w/b/e`, and `{`/`}`, start selection with `v` or Space, copy with `y` or Enter, and leave with `q` or Esc. In PuTTY and some SSH terminals, hold `Shift` while dragging to use the terminal's own selection, and `Shift` + right click to paste.
 
-**Update and restore.** `flock update` installs a new binary, but a running server keeps using the old process until it is stopped or handed off. Stop the old server to use the new version. Stopping exits pane processes. Run `flock server stop`, then run `flock` again for the default session. For a named session, run `flock session stop <name>`, then run `flock session attach <name>` again. `flock update --handoff` is experimental and tries to move live panes, including foreground processes such as dev servers, from the old server to the new one. With current official integrations installed, supported agent panes can restart from their native agent sessions after a server restart or update.
+**Update and restore.** `flk update` installs a new binary, but a running server keeps using the old process until it is stopped or handed off. Stop the old server to use the new version. Stopping exits pane processes. Run `flk server stop`, then run `flk` again for the default session. For a named session, run `flk session stop <name>`, then run `flk session attach <name>` again. `flk update --handoff` is experimental and tries to move live panes, including foreground processes such as dev servers, from the old server to the new one. With current official integrations installed, supported agent panes can restart from their native agent sessions after a server restart or update.
 
 **Keybindings.** Flock uses explicit keybinding strings. `prefix+n` means press the configured prefix, then `n`. `ctrl+alt+n`, `cmd+k`, `alt+1`, and function-key chords are direct terminal-mode shortcuts and do not need the prefix. Plain direct printable keys such as `n` steal normal typing, so use `prefix+n` unless you intentionally want a modifier-gated direct binding.
 
@@ -89,24 +89,24 @@ Press `ctrl+b q` to detach the client. The server and pane processes keep runnin
 Flock notifies you when a new version is available. Run manually:
 
 ```bash
-flock update
+flk update
 ```
 
-`flock update` is for installs managed by Flock's own installer. Homebrew, mise, and Nix installs update through `brew upgrade flock`, `mise upgrade flock`, or your Nix workflow, then use the same stop-and-run-again flow if a session is still running the old server. Direct installs can opt into development preview builds with `flock channel set preview` and return to stable with `flock channel set stable`. See [install docs](https://flock.dev/docs/install/) and [session state docs](https://flock.dev/docs/session-state/) for the full update, restart, restore, and handoff matrix.
+`flk update` is for installs managed by Flock's own installer. Homebrew, mise, and Nix installs update through `brew upgrade flock`, `mise upgrade flock`, or your Nix workflow, then use the same stop-and-run-again flow if a session is still running the old server. Direct installs can opt into development preview builds with `flk channel set preview` and return to stable with `flk channel set stable`. See [install docs](https://flock.dev/docs/install/) and [session state docs](https://flock.dev/docs/session-state/) for the full update, restart, restore, and handoff matrix.
 
 Flock uses the stable update channel by default. To test preview builds from `main` before the next stable release:
 
 ```bash
-flock channel set preview
+flk channel set preview
 ```
 
 To return to stable:
 
 ```bash
-flock channel set stable
+flk channel set stable
 ```
 
-For direct installs, changing channels also checks that channel and installs its latest binary. If that update fails, run `flock update` to retry from the configured channel.
+For direct installs, changing channels also checks that channel and installs its latest binary. If that update fails, run `flk update` to retry from the configured channel.
 
 Preview is only for direct installs managed by Flock's updater. Homebrew, mise, and Nix stay on stable and update through their package managers.
 
@@ -132,14 +132,14 @@ Flock works over normal SSH. Run it on the remote host, detach, and reattach lat
 
 ```
 ssh you@yourserver
-flock
+flk
 ```
 
 You can also attach from your local terminal without opening a shell first:
 
 ```bash
-flock --remote workbox
-flock --remote ssh://you@yourserver:2222
+flk --remote workbox
+flk --remote ssh://you@yourserver:2222
 ```
 
 Remote attach adds fallback SSH keepalives by default while preserving your own SSH config. Set `[remote].manage_ssh_config = false` to use plain `ssh`.
@@ -147,8 +147,8 @@ Remote attach adds fallback SSH keepalives by default while preserving your own 
 Direct attach connects your current terminal to one server-owned terminal:
 
 ```bash
-flock agent attach <target>
-flock terminal attach <terminal_id>
+flk agent attach <target>
+flk terminal attach <terminal_id>
 ```
 
 See [persistence and remote docs](https://flock.dev/docs/persistence-remote/) for remote keybinding, named-session, and handoff details.
@@ -214,14 +214,14 @@ for agents outside the built-in list, flock still works as a terminal multiplexe
 official integrations have two roles. claude code, codex, and opencode report session identity for native restore, while their state still comes from screen detection. pi, github copilot cli, and hermes report both semantic state and session identity. omp and qodercli report semantic state without native session restore. install with:
 
 ```bash
-flock integration install pi
-flock integration install omp
-flock integration install claude
-flock integration install codex
-flock integration install copilot
-flock integration install opencode
-flock integration install hermes
-flock integration install qodercli
+flk integration install pi
+flk integration install omp
+flk integration install claude
+flk integration install codex
+flk integration install copilot
+flk integration install opencode
+flk integration install hermes
+flk integration install qodercli
 ```
 
 see the [integrations docs](https://flock.dev/docs/integrations/) for setup details.
@@ -256,7 +256,7 @@ Mouse is supported throughout. Resize mode uses `h`/`l` for width, `j`/`k` for h
 config file: `~/.config/flock/config.toml`
 
 ```bash
-flock --default-config   # print full default config
+flk --default-config   # print full default config
 ```
 
 In-app settings cover theme, sound, and toast preferences. Flock writes logs under `~/.config/flock/`; in persistent session mode, `flock-client.log` and `flock-server.log` are usually the useful files. Full configuration and logging details live in the [configuration docs](https://flock.dev/docs/configuration/).

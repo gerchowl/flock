@@ -9,7 +9,7 @@ Install that file into any coding agent that supports reusable skills or custom 
 
 ## What the skill does
 
-The skill tells an agent to use the `flock` CLI when `FLOCK_ENV=1` is set. That means the agent is running inside a Flock-managed pane and can safely talk to the local Flock socket.
+The skill tells an agent to use the `flk` CLI when `FLOCK_ENV=1` is set. That means the agent is running inside a Flock-managed pane and can safely talk to the local Flock socket.
 
 With the skill installed, an agent can:
 
@@ -29,7 +29,7 @@ Use the repository copy as the source of truth:
 https://github.com/gerchowl/flock/blob/main/SKILL.md
 ```
 
-For agents with a skill system, install that file as a skill named `flock`. For agents without a skill system, paste the file into the agent's project or user instructions.
+For agents with a skill system, install that file as a skill named `flock`. For agents without a skill system, paste the file into the agent's project or user instructions. <!-- guardrails-ok(exec-name): that is the skill's `name:` in SKILL.md's frontmatter, an identifier — not the command, which is `flk` -->
 
 After installation, start the agent inside Flock:
 
