@@ -56,41 +56,6 @@ You can also open the global menu in Flock and choose `reload config`.
 
 Reload applies most UI settings without restarting panes. Startup-only settings still need a restart.
 
-## Edit config from inside Flock
-
-Bind `keys.edit_config` to a key and Flock will open the live config in `$EDITOR` in a temporary overlay pane.
-
-```toml
-[keys]
-edit_config = "prefix+shift+e"
-```
-
-When the editor exits, Flock copies the temp back over the target and reloads. If the new config fails to parse or validate, Flock rolls the file back to its pre-edit contents and shows the diagnostics in a toast — the running config is never broken by a bad edit.
-
-From the CLI:
-
-```bash
-flk config edit
-```
-
-The CLI opens `$EDITOR` directly (it's already in a terminal) and prints a reminder to run `flk server reload-config` afterwards.
-
-### Where edits land: the `config.local.toml` overlay
-
-Flock resolves the editable target by inspecting `config.toml`:
-
-- If it is a real, writable file, edits land there.
-- If it is a symlink (typical nix/Home Manager setup) or missing, edits land in `config.local.toml` next to it, which Flock loads as an overlay on top of the base config.
-
-The overlay is concatenated AFTER the base text before TOML parse, so:
-
-- It can introduce `[section]` blocks the base does not declare.
-- It can extend a base section with brand-new keys.
-- It cannot override a scalar the base already sets in the same `[section]` — TOML rejects re-declaring a table with a duplicate key. Remove the key from the base if you need to override it.
-- `[[peers]]` arrays APPEND; the overlay cannot remove a peer.
-
-If the overlay is malformed, Flock keeps the base config loaded and surfaces a diagnostic — it never drops the running config.
-
 ## Terminal defaults
 
 Set the executable Flock uses for newly created interactive panes:
@@ -133,13 +98,7 @@ Flock creates checkouts under `<directory>/<repo>/<branch-slug>`. For sibling-st
 
 Worktree actions are available from Git workspace rows. `New worktree` creates a branch and checkout, opens it as a new Flock workspace, and groups it under the source workspace. `Open worktree...` lists existing Git worktree checkouts for that repo; choosing an already-open checkout focuses it, and choosing a closed checkout opens it in the same group.
 
-Grouped worktrees still behave like normal Flock workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The section header row is the project's main checkout when it's open, otherwise the first remaining member.
-
-Closing a workspace closes **only that workspace**. Closing the main checkout no longer tears down the project group — its worktree members (and any remote rows) stay grouped and functional; the group simply re-anchors on a surviving member. To close the whole group at once, use `Close group` in the section row's right-click context menu. Neither close deletes checkout folders or branches. A session whose main checkout was closed restores from its remaining members alone, with the group intact.
-
-External worktrees are adopted automatically: when a workspace sits in a linked checkout that Flock didn't create (an agent ran `git worktree add`, you made one by hand, another tool did), it gains the managed worktree actions and groups under its parent repo workspace when that is open — membership is inferred from git, not from where the checkout lives. Set `adopt_external = false` under `[worktrees]` to keep the old explicit-adoption-only behavior.
-
-`branch_pivot_message` under `[worktrees]` is a one-shot prompt injected as the first user turn of a Claude session forked by `branch_session` (#106), so the fork knows it was branched and should pivot rather than repeat the parent. The `<branch>` placeholder is replaced with the new branch name; an empty string disables injection. Claude only (the only agent whose resume takes a positional opening prompt).
+Grouped worktrees still behave like normal Flock workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Flock group, but it does not delete checkout folders or branches.
 
 Deleting a worktree checkout is explicit. Use `Delete worktree checkout...` on a grouped child workspace to run `git worktree remove`. Flock first asks Git to remove safely. If Git refuses because the checkout has modified or untracked files, Flock asks again before running the forced remove. Branches are not deleted.
 
@@ -150,9 +109,20 @@ Remote attach manages its SSH bridge with a temporary keepalive fallback by defa
 ```toml
 [remote]
 manage_ssh_config = true
+reconnect = true
+reconnect_backoff_initial_ms = 500   # wait before the first redial
+reconnect_backoff_max_ms = 5000      # the wait doubles per redial, up to this
+reconnect_deadline_secs = 120        # give up this long after the drop
+reattach_grace_ms = 1500             # on the remote: wait this long for its server before calling it gone
+reattach_poll_ms = 100               # ... rechecking this often
+bridge_stderr_settle_ms = 200        # wait this long for ssh's last stderr on a failed connection
 ```
 
 When enabled, `flk --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Flock's generated config.
+
+When the connection to a remote server drops — the hopper slept, the network changed — Flock keeps your last screen up under a `reconnecting to <host>…` bar and redials. Once the server answers it re-attaches to the same session. Press Esc to stop waiting; Flock also stops at `reconnect_deadline_secs`. Either way you land back on the server you switched from, told that the connection was lost, or at your shell if there is none. Quitting, detaching and switching never reconnect. If the remote server itself exited meanwhile, Flock says the session state is lost instead of attaching you to a new, empty server. Clients with `[slots] enabled` do not redial; they fall back to home as before. Set `reconnect = false` to end the session on the first drop instead.
+
+When a switch to a server fails for good, the servers band shows why on that server's row (for example `auth refused`), and the failure is kept in the notification log. ssh's own messages go to the session log (`flock-client.log`), never over your screen.
 
 ## Keybindings
 
@@ -221,29 +191,29 @@ next_workspace = "prefix+shift+right"
 last_pane = "prefix+tab"
 open_worktree = "prefix+shift+o"
 remove_worktree = "prefix+alt+d"
-branch_session = "prefix+shift+b"
-kill_worktree = "prefix+alt+k"
-focus_attention = "prefix+a"
-focus_attention_previous = "prefix+shift+a"
-toggle_float = "prefix+f"
 next_tab = ["prefix+n", "ctrl+alt+]"]
 ```
-
-`focus_attention` jumps to the agent most in need of attention: blocked agents first (oldest state change first), then agents that finished while you were elsewhere (oldest first). Repeated presses walk the queue; focusing a done agent marks it seen and drains it. When nothing needs attention the press chimes once (the all-clear sound, customizable via `[ui.sound] all_clear_path`) and falls back to cycling agents like `next_agent`. `focus_attention_previous` walks the same queue (or cycle) backwards. `focus_attention_project` (and `_previous`) restrict the queue to the active workspace's repo family — the main checkout plus every worktree workspace of the same git repo — falling back to cycling the family's agent panes. These never chime, since a scoped all-clear says nothing about other projects.
-
-`focus_attention_defer` (default `ctrl+shift+a`) cycles to the next attention item like `focus_attention`, but first flips the CURRENT pane back to `seen=false` — so it stays on the queue after you move on. Use it to triage the queue without silently draining items: walk forward, deferring each, and nothing falls off until you actually deal with it. `mark_workspace_unread` (default `prefix+shift+u`) toggles the sidebar-selected workspace's `●` attention marker by flipping every pane's `seen` flag — the reverse of "I visited this and it's dealt with", useful for deliberately re-arming a workspace to revisit later.
-
-`kill_worktree` deletes a linked worktree checkout **and its local branch** — but the branch only when a merge gate passes: Flock asks `gh pr view <branch>` for a merged PR (also pinned to the origin remote's repo, so multi-remote fork checkouts resolve correctly), falling back to `git branch --merged <default-branch>`, then to remote containment — the branch tip being reachable from another pushed remote ref (e.g. merged into an integration branch) also counts as evidence. The confirm dialog shows the evidence ("PR #12 merged" / "merged into main") or, when there is none, downgrades to a checkout-only delete with the branch kept. This is the one deliberate exception to Flock's "branches are never deleted" rule, and it never fires without positive evidence. Also available as `Kill worktree & branch...` in the workspace context menu.
-
-`branch_session` branches the focused pane's agent session into a new worktree: it opens the same dialog as `new_worktree`, but the created workspace's root pane resumes a fork of the agent conversation in the new checkout instead of starting a shell (Claude Code uses `--fork-session` so the original session is untouched; other supported agents resume the same session). The focused pane must have a resumable agent session reported through a Flock integration, and the workspace must be a Git repo parent (same rule as `new_worktree`).
-
-`toggle_float` toggles a per-workspace ephemeral floating pane: a centered overlay (about 80% x 70% of the pane area) running your shell in the workspace's directory, for quick throwaway commands. The first press spawns and shows it; pressing the same binding while it is visible hides it without killing the shell, and the next press brings the same float back. The float closes when its process exits (`exit` or Ctrl-D), is never saved to the session, and does not survive a restart. While the float is visible all terminal input goes to it; `esc` is forwarded into the float's shell rather than dismissing it, so vi-mode and fzf keep working. Mouse clicks and scrolling inside the overlay go to the float (events outside it still reach the layout panes), `shift+pageup`/`pagedown`/`home`/`end` page the float's own scrollback, and the border title tracks the live working directory of whatever runs inside.
 
 `last_pane` switches back to the last focused pane across workspaces and tabs. It is unset by default because the tmux-style pane binding `prefix+l` is already used for pane-right focus.
 
 Key strings accept plain keys, modifier combinations such as `ctrl+a`, `shift+n`, `alt+1`, `cmd+k`, and special keys such as `enter`, `tab`, `esc`, `left`, `right`, `up`, and `down`. Named punctuation such as `minus`, `comma`, `ampersand`, `plus`, and `backtick` is also accepted. Plain direct printable keys such as `n` are unsafe because they intercept typing; use `prefix+n` unless you intentionally want a direct binding. The `navigate_workspace_*` and `navigate_pane_*` fields are navigate-mode-only and may use plain keys such as `j` or `k`; they must not use `prefix+`, `esc`, `enter`, `tab`, `shift+tab`, `left`, `right`, or unmodified `1` through `9`. Left and right arrows are permanent aliases for pane-left and pane-right navigation. These navigate-mode shortcuts are independent from general action bindings such as `focus_pane_down = "prefix+j"`; when both use the same key, the navigate-mode shortcut wins while navigate mode is open. Alt, Cmd/Super, and punctuation with modifiers depend on your terminal and tmux settings.
 
 If you have old custom keybindings and want the new defaults, run `flk config reset-keys`. Flock backs up `config.toml`, removes `[keys]` and `[[keys.command]]`, and uses built-in v2 defaults after restart or `flk server reload-config`.
+
+## Checking a config
+
+Flock shows config problems as a yellow warning banner in the session, which only helps once you are looking at it. To ask instead, run `flk config check`:
+
+```bash
+$ flk config check
+~/.config/flock/config.toml: 2 warnings
+  ctrl+shift+a: kept keys.focus_attention, disabled keys.focus_attention_defer
+  deprecated keybinding: keys.switch_workspace was renamed to keys.switch_space; ...
+```
+
+It exits `0` when clean, `1` when the config loaded with warnings, and `2` when it did not load at all. If you manage config centrally across several machines, gate the deploy on it with `--path` so a bad key fails on one host instead of reaching all of them. See the [CLI reference](/docs/cli-reference/#config) for details.
+
+A warning worth knowing about: if you bind a key that a Flock default also uses, your binding wins and the default is disabled — but the conflict is still reported. Silence it by unbinding the default explicitly, for example `focus_attention_defer = ""`.
 
 ## Indexed jumps
 
@@ -256,11 +226,7 @@ switch_space = "prefix+shift+1..9"
 focus_agent = "prefix+alt+1..9"
 ```
 
-`switch_tab` jumps to the Nth tab of the active workspace, `switch_space` to the Nth project section of the spaces list, and `focus_agent` to the Nth agent in the agents panel.
-
-`switch_space` jumps to the Nth **project section** of the spaces list — a project's main checkout grouped with its worktree workspaces counts as one section, regardless of how many rows it spans. Selecting a section focuses the member you last had active there; otherwise it lands on the section's primary row (the local main checkout when present, else its first member). It is unset by default. When bound, each section row shows its 1-based index for discoverability. This pairs naturally with `switch_tab` as a two-level quick-jump: space, then tab.
-
-The former `switch_workspace` key (a flat jump to the Nth *visible row* of the spaces list) was renamed to `switch_space`. Configs that still set `switch_workspace` keep working — they fold into `switch_space`, with a deprecation notice, and now jump by **section** rather than by flat row — but should migrate to the new name.
+`switch_space` jumps to the Nth project section of the spaces list (and lights up the section jump-ordinals). The former `switch_workspace` key (a flat jump to the Nth visible row) was renamed to `switch_space`; old configs that still set `switch_workspace` keep working — they fold into `switch_space` with a deprecation notice — but should migrate to the new name.
 
 The legacy `[keys.indexed]` table is still parsed for compatibility, but new configs should prefer the explicit action fields.
 
@@ -295,9 +261,7 @@ name = "catppuccin"
 
 Built-in themes:
 
-`catppuccin`, `catppuccin-latte`, `terminal`, `tokyo-night`, `tokyo-night-day`, `dracula`, `nord`, `gruvbox`, `gruvbox-light`, `one-dark`, `one-light`, `solarized`, `solarized-light`, `kanagawa`, `kanagawa-lotus`, `rose-pine`, `rose-pine-dawn`, `vesper`, `dalton`, `dalton-light`.
-
-`dalton` and `dalton-light` are colorblind-friendly palettes built on a blue-yellow primary axis (sourced from the dalton-colorscheme project). `dalton-dark` and `dalton-bright` are accepted aliases.
+`catppuccin`, `catppuccin-latte`, `terminal`, `tokyo-night`, `tokyo-night-day`, `dracula`, `nord`, `gruvbox`, `gruvbox-light`, `one-dark`, `one-light`, `solarized`, `solarized-light`, `kanagawa`, `kanagawa-lotus`, `rose-pine`, `rose-pine-dawn`, `vesper`.
 
 Use `terminal` when you want Flock UI colors to follow your host terminal's ANSI palette.
 
@@ -315,6 +279,8 @@ yellow = "#f9e2af"
 
 Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `reset`, `default`, `none`, and `transparent`.
 
+`divider` colors the sidebar's divider and separator lines (the vertical hairline next to the pane area and the horizontal section separators). It defaults to `surface_dim`; set it explicitly if your theme's `surface_dim` is too close to the terminal background to see.
+
 ## UI and sidebar
 
 The sidebar is the main Flock dashboard. It shows workspaces, tabs, panes, and agent state.
@@ -325,7 +291,8 @@ Common options:
 [ui]
 sidebar_width = 32
 sidebar_min_width = 18
-sidebar_max_width = 80
+sidebar_max_width = 36
+sidebar_row_gap = 1
 mobile_width_threshold = 64
 mouse_capture = true
 right_click_passthrough_modifier = ""
@@ -335,36 +302,25 @@ confirm_close = true
 prompt_new_tab_name = true
 show_agent_labels_on_pane_borders = false
 agent_panel_scope = "all"
+servers_panel_scope = "all"
+spaces_panel_scope = "all"
+server_state_mark = "counts"
 accent = "cyan"
-sidebar_row_gap = 1
-sidebar_pane_gap = 0
 ```
 
-`sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 80. The ceiling is deliberately generous: the servers band's metric line runs to roughly 32 columns on its own, so a narrower sidebar truncates it. `sidebar_width` (the width you actually start at) is unchanged — widen by dragging.
+`sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
 
-## Fleet thermal health
-
-Each node can declare its own thermal health, which gossips to the fleet and tints the matching metric glyph in the servers band — green stays untouched, a stressed node turns its glyph amber, a critical one red. Nothing is added to the row: the colour *is* the signal.
-
-```toml
-thermal_command = "/etc/flock/thermal-report"
-```
-
-Flock deliberately reads no sensors. What runs hot and what counts as hot differ per machine — 90 °C is normal on Apple silicon under load, an RTX 5090 is fine at 80 °C, and a VM guest can read nothing at all — so the host owns the calibration and Flock only transports and renders the verdict.
-
-The command runs about every 30 seconds with a hard 5-second timeout and must print one JSON object:
-
-```json
-{"severity": 2, "component": "gpu", "label": "GPU 84°"}
-```
-
-`severity` is `0` nominal, `1` fair, `2` serious, `3` critical — only `2` and `3` tint. `component` is `cpu`, `gpu`, or `node` and picks which glyph to colour; if that metric is missing, the severity gets its own thermometer glyph at the head of the row so an alarm is never silently dropped. `label` is a short free-text detail.
-
-Anything else — no such command, a non-zero exit, unparseable output, a timeout — means the node declares **nothing**, rather than a made-up healthy reading. A repeatedly failing reporter is slowed down and logged, never disabled permanently. Reporters must not read stdin.
+`sidebar_row_gap` controls the blank rows between entries in the sidebar's workspace and agent lists. The default is 1; set 0 for a denser sidebar. Values above 3 are clamped.
 
 `mobile_width_threshold` controls the terminal width at or below which Flock uses the mobile single-column layout. The default is 64 columns; increase it for foldables, tablets, or wide phone terminals.
 
-`agent_panel_scope` can be `all` or `current`. Use `current` if you only want the agent panel to show agents in the active workspace.
+`agent_panel_scope` can be `all`, `current`, `blocked`, `done`, or `blocked&done`. Use `current` if you only want the agent panel to show agents in the active workspace. The last three are attention filters applied fleet-wide (local and peer agents alike): `blocked` keeps only agents waiting on you, `done` only idle agents whose output you have not seen yet, and `blocked&done` both. Clicking the `agents` header cycles through all five in that order and saves the setting.
+
+`servers_panel_scope` can be `all` or `current`. With `current`, the servers section shows only the machine you are attached to (plus the way-home row when you are attached to a remote server). `spaces_panel_scope` can be `all` or `current`. With `current`, the spaces list shows only the focused workspace's space group. Both default to `all`, and clicking the `all`/`current` label in each section header toggles and saves the setting — exactly like the agents panel.
+
+`server_state_mark` controls the leading state mark on each server row. The default `counts` renders fixed red/yellow/green agent-count columns (`0 2 1 hopper` — blocked, working, calm), zeros muted, with a band-global digit width so one busy server aligns every row. `medallion_sextant` / `medallion_quadrant` render the rectangular state medallion instead (nested bands of the worst three states; quadrant for fonts without Symbols for Legacy Computing). Unreachable servers ghost their row: greyed italic name (struck through), a broken-link icon with the outage age, and the last-known stats greyed in place.
+
+`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
 
@@ -378,20 +334,6 @@ Set `mouse_scroll_lines` to change how many pane scrollback lines each mouse whe
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
 
-The agent panel shows rows as `<agent> · <status>` using built-in short codes (`claude` → `cc`, `codex` → `cd`, `gemini` → `gm`, …). Override or extend them with `agent_aliases = { claude = "CC" }` under `[ui]`. While a Claude Code pane is working, the status text is replaced by the live activity from its own status line (e.g. `cc · Implementing the parser…`), scraped from the terminal in real time.
-
-`sidebar_row_gap` controls the blank rows between sidebar list entries (workspaces and agents). The default is 1; set 0 for a packed list. The maximum is 3.
-
-`pane_header` (default `true`) reserves a header strip at the top of agent panes — the pane's terminal shrinks so nothing is ever covered. Row 1 shows context: `project · worktree ·  branch`, unpushed/unpulled counts (`↑n`/`↓n`), and the branch's GitHub PR state (`#N ⊙` open, `◐` draft, `✓` merged, `✗` closed — polled via `gh` every two minutes, omitted when `gh` or a PR is absent). The remaining rows show the **last submitted prompt**; when it is collapsed or truncated a `▾` marker appears — **click the prompt rows** to expand the full text over the pane (click again to collapse). The prompt and header survive live-handoffs and restarts. The reservation latches the first time an agent is seen in a pane and stays stable from then on. Panes too small to give up rows skip the header.
-
-`status_line` (default `true`) shows a one-line machine HUD above the tab bar: cpu, memory, disk space, battery, network throughput, and best-effort GPU utilization (omitted where unreadable). Utilization colors shift to yellow at 60% and red at 85%.
-
-`prompt_float_lines` controls the prompt section of the pane header: prompts taller than the limit are collapsed in the **middle** — the start and the end survive, with a `⋯ +N lines ⋯` marker between them; overlong single lines are middle-truncated the same way. The default is 3 rows, the float never covers more than the top half of a pane, and `0` disables it. The prompt is reported by the Claude Code integration's `UserPromptSubmit` hook (reinstall the integration from the settings panel if it shows "update available"); other agents will gain support as their hooks expose the prompt.
-
-`sidebar_pane_gap` adds symmetric breathing room around the sidebar/pane divider: the configured number of blank columns appears on each side of the vertical divider line. The default is 0 (content and panes touch the divider); the maximum is 4.
-
-Both gaps can also be cycled live from the `sidebar` tab in the settings panel (`prefix+s`); changes are written back to `config.toml`.
-
 ## Notifications
 
 Flock can show popup notifications when agents finish or need input.
@@ -399,6 +341,7 @@ Flock can show popup notifications when agents finish or need input.
 ```toml
 [ui.toast]
 delivery = "off"
+delay_seconds = 1
 ```
 
 `delivery = "off"` disables popup notifications. This is the default.
@@ -410,6 +353,65 @@ delivery = "off"
 `delivery = "system"` asks the local operating system directly. On macOS, Flock uses `terminal-notifier` when available, then falls back to `/usr/bin/osascript`. `terminal-notifier` can activate the hosting terminal when you click the notification. On Linux, Flock uses `notify-send` and requires `DISPLAY` or `WAYLAND_DISPLAY`.
 
 Popup notifications are for background attention. Flock suppresses popups for the active tab.
+
+### The notification log
+
+A toast is a field on the session that a timer clears: an outcome you did not see never happened. The notification log is the durable record behind it, and the panel is where you read it.
+
+Open it with `prefix+i` (`keys.notifications`), or by clicking the sidebar's `menu` row and then `notifications`. The `menu` row wears a dot while the log holds something only the log knows about — the same question the window-title badge asks, answered by the same count, so the two can never disagree. It deliberately ignores records a still-blocked pane is already showing you, which is why an agent that is mid-escalation does not light it twice.
+
+- `enter` (or the `ack` button) acknowledges the selected record.
+- `a` (or `ack unread`) **arms** acknowledging everything unread; `enter` then commits it, and `esc` calls it off. Nothing is acknowledged until that second press.
+- `u` filters to unread only — the same records `flk notification list --unread` returns.
+- `j`/`k` or the arrows move, `home`/`end` jump to the newest and oldest, the wheel scrolls, `esc` closes. `ctrl+n`/`ctrl+p` move without leaving home row, and `pageup`/`pagedown` move half a screen.
+- Clicking a row selects it. Moving the pointer across the list does not: `enter` acts on the selected record, and the pointer is not allowed to decide what that is.
+
+Acknowledging is the same verb `flk notification read` uses, so the panel and the CLI can never disagree about what is unread. It is also the one thing here with no undo, which is why the bulk action is armed rather than immediate and why a modified key (`ctrl+a`) never reaches it. Acknowledging is what makes a record evictable: the log keeps at most 512 records, giving up the ones you have read first.
+
+That cap is why the panel states it. The line above the buttons names the cap and dates the oldest record still present, and once the log is full it says older records may already have been evicted. An eviction leaves nothing behind, so a decision that was never answered and has fallen off the bottom of the list is otherwise indistinguishable from one that was never filed. Read that line as the boundary of what you are looking at, not as a bug.
+
+`delay_seconds` is how long an agent has to stay in a state before Flock says anything about it. The default is 1 second, which is enough to swallow the brief pauses agents make while they are still working. An agent that leaves the state inside the window never notifies at all, and neither does one whose pane you walked over to in the meantime — the decision is re-taken when the delay expires, not when it started. Set `delay_seconds = 0` to notify on the transition itself, or raise it if you only want to hear about work that has genuinely stopped. The maximum is 3600. This applies to agent state changes only; `flk notification show` is an explicit request and is never held.
+
+## Window title
+
+Flock labels the host terminal's window so you can tell, from a window switcher
+or a row of tabs, which terminal is Flock, which server it is attached to, and
+whether something is blocked and waiting on you.
+
+```
+● 2B  feat/foo · hopper — flk
+```
+
+The badge leads because it is the only part that changes, and titles are
+truncated from the right. It carries the states that want your attention —
+`B` blocked, `D` finished-but-unseen — and disappears entirely when none of them
+apply, so a calm fleet reads `main · hopper — flk`. An empty Flock reads `flk`.
+
+Flock sets the window title only (OSC 2), never the icon name, and hands the
+title back when it exits.
+
+The title carries your focused branch and your server name. On a shared screen,
+a recording, or a streamed terminal, that is information leaving the room — turn
+it off with:
+
+```toml
+[title]
+enabled = false
+```
+
+Disabled, Flock writes nothing at all: the window title stays whatever your
+shell last set it to.
+
+Inside tmux, the title only reaches the outer terminal if tmux is allowed to
+pass the sequence through:
+
+```
+set -g allow-passthrough on
+```
+
+Without it tmux swallows the sequence and the window title is unchanged — the
+same as not publishing at all. The setting is read from the server you are
+attached to, so a remote attach follows the remote host's `[title]` section.
 
 ## Sound
 
@@ -508,6 +510,18 @@ Session references are stored in the local Flock session snapshot. They are not 
 
 For how native agent session restore differs from pane screen history and live handoff, see [Session state and restore](/docs/session-state/).
 
+### Claude Stop hook recap check
+
+Flock's Claude Stop hook asks an agent for a `※ recap:` line when its turn ended without one. It judges this from the reply that Claude Code passes to the hook. An older Claude Code does not pass the reply, and there the hook reads the transcript instead. That transcript can lag one message behind the turn, so the hook waits a bounded time for the reply to land:
+
+```toml
+[session]
+stop_transcript_wait_ms = 1000
+stop_transcript_poll_ms = 50
+```
+
+If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. The wait is capped at Claude's 10-second hook timeout, and a poll interval below 1 ms is treated as 1 ms. Current Claude Code never uses these keys.
+
 ## IME cursor tracking
 
 When the focused pane hides its cursor and paints its own — common in AI-agent TUIs like Claude Code, pi, and codex — macOS native input methods stop tracking the candidate window position because the outer terminal stops reporting the cursor.
@@ -545,6 +559,170 @@ switch_ascii_input_source_in_prefix = false
 When enabled, Flock switches input sources only after prefix mode is entered, then restores the previous input source when prefix mode exits. The setting is macOS-only and is a no-op on other platforms or when the system input-source switch fails.
 
 You can also toggle it from Settings > Experiments > switch to ascii input source in prefix (macOS).
+
+## Checks
+
+The `[checks]` section configures the per-host check runner (#175). Every knob has a sane default, so an unset section still runs the built-ins the way most operators expect.
+
+```toml
+[checks]
+enable = true            # master switch — off disables ALL check work
+max_concurrent = 4       # cap on in-flight script check runs
+min_tick_secs = 10       # minimum scheduler wake; refuses smaller per-script intervals
+heartbeat_secs = 60      # cadence for the durable ChecksHeartbeat event
+
+[checks.blocked_alert]
+enable = true
+threshold_secs = 1800    # 30m before a Blocked pane triggers a notification
+
+[checks.hibernation]
+enable = false           # opt-in — off by default
+idle_threshold_secs = 3600
+done_threshold_secs = 21600
+min_secs_since_last_stop = 60
+
+[checks.issue_guard]
+enable = true
+owner = "gerchowl"       # only bodies from this GitHub login can trigger
+repos = ["gerchowl/flock"]
+gh_bin = "gh"
+poll_secs = 60
+max_issues = 50          # open issues fetched per poll; older ones are not evaluated
+
+# One or more user-declared script checks.
+# [[checks.script]]
+# name = "disk-space"
+# program = "/usr/local/bin/free-disk.sh"   # absolute or under ~/.flock/checks/
+# args = ["--min", "10G"]
+# interval_secs = 300
+# timeout_secs = 20
+# debounce = 3
+# [checks.script.on_fire.notify]
+# title = "disk low"
+# sound = "request"
+```
+
+Hibernation is per-host policy: `enable = false` is the right default on a
+big machine and `true` on a hopper. A hibernated pane's resume plan lives in
+memory only — after a server restart the pane comes back as a normal
+restorable agent rather than a hibernated one, so nothing is lost, but the
+memory saving ends with the restart. Only `idle` panes the operator has
+already seen, and long-finished `done` panes, are ever hibernated; `working`
+and `blocked` panes are never touched.
+
+Only issue bodies authored by `owner` can trigger anything, and the check
+refuses to act on any other body — the repository is public, so every other
+issue is untrusted input.
+
+Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
+
+## Agent messages
+
+The `[msg]` section governs agent-to-agent messages arriving at this node.
+
+```toml
+[msg]
+enabled = true            # accept agent messages at all
+allow_from = ["*"]        # hosts whose agents may message this node's agents
+blocking_per_hour = 6     # `blocking` messages one sender may send per rolling hour
+```
+
+`blocking` is the top message tier (ADR-0018): on top of what `needs_reply` does, it puts the recipient in the operator's attention cycle and, when the recipient has muted itself, files an operator notification. Because the sender declares it, every sender would like to use it, so it carries a budget of its own on top of the general 20 messages a minute. Past the budget a `blocking` message is not refused: it is delivered as `needs_reply` — still read, still waking its recipient — and the send result's `warnings` say it was downgraded. `0` downgrades every `blocking` message. The budget is counted on the receiving node, per agent that node attested itself; every unattested sender, which includes every message relayed from another host, shares one bucket, since their identities are claims. That is safe because spending the budget only ever downgrades.
+
+## Spawn environment
+
+The `[spawn.env]` section declares **which environment variables each agent CLI needs carried into a child flock launches for an agent** (#397). It is keyed by the agent name flock detects, and each value is a list of exact variable names.
+
+```toml
+[spawn.env]
+claude = ["CLAUDE_CONFIG_DIR"]   # the shipped default
+# codex = ["CODEX_HOME"]         # a fleet whose Codex installs need their own key
+# claude = []                    # a fleet that pins one account per host
+```
+
+An agent-initiated spawn execs its child from argv with no shell in between — that is what keeps a hostile prompt inert — and the cost of that property is that the child never runs shell init. Anything a login shell would have exported is therefore missing, and for a variable that selects *which account a CLI runs as* the result is worse than a clean failure: the child falls back to the CLI's own default home, starts, looks healthy in the pane, bills the wrong account, and writes its history somewhere nobody is watching. `CLAUDE_CONFIG_DIR` is the case flock ships a default for, because on a fleet that picks a profile with a shell function it is shell-session state rather than process-tree state — an interactive pane inherits it, an argv-spawned pane does not.
+
+Three things are worth knowing before you write an entry.
+
+**A declaration replaces the compiled default for that agent; it does not extend it.** Writing `claude = ["MY_PROFILE_VAR"]` means the child carries that variable and *not* `CLAUDE_CONFIG_DIR`. This is what lets a fleet that needs nothing carried write `claude = []` and mean it — a table that could only grow would make the default permanent. Declaring one agent leaves every other agent on its default, so `codex = [...]` alone does not un-declare `claude`.
+
+**The same table feeds both halves of the child's environment.** A declared key is carried down from the requesting process *and* allowlisted through the `env_clear()` scrub that agent-spawned children start from. Because there is one declaration rather than two lists, a variable cannot be resolved by one half and then cleared by the other.
+
+**A declared key that cannot be resolved refuses the spawn.** If flock cannot read the requester's environment, or the value names a directory that is not there, the spawn stops with `agent_profile_unresolved` instead of starting a child on the default profile. That refusal is the point of declaring a key, so the bar for an entry is narrow: variables whose absence silently changes *which account* the child runs as — not everything the child might find useful. A variable that is simply unset on the requester is not an error; it means the requester is on the CLI's own default and so is the child.
+
+Credential variables an agent CLI reads directly (`ANTHROPIC_API_KEY` and its siblings) are **not** configured here and stay on flock's built-in allowlist. They carry no refusal: a missing API key means this deployment does not use one, not that the spawn should stop.
+
+Entries are validated at startup. An agent name this flock does not detect, a wildcard such as `ANTHROPIC_*` (only exact names are matched), and a name containing `=` or whitespace are each reported as a config diagnostic and skipped — never a parse failure, so one config shared across a fleet does not cost a node running an older flock the rest of its table.
+
+There is no `FLOCK_SPAWN_ENV_*` environment override. This section is file-only by design: which variables cross into a child's environment is not a decision a per-invocation env poke should be able to rewrite.
+
+:::caution
+`config.local.toml` merges over `config.toml` with **arrays appended**. An empty list in the overlay therefore cannot clear a list the base file set — write the removal in the file that declared it. Replacement applies to the compiled default; between the two file layers, lists add.
+:::
+
+## Agent messages
+
+The `[msg]` section governs agent-to-agent messages delivered on this node (ADR-0008, ADR-0018).
+
+```toml
+[msg]
+enabled = true                   # accept agent messages at all
+allow_from = ["*"]               # hosts whose agents may message this node's agents
+mute_reason_max_chars = 200      # longest `reason` a mute may carry
+deferral_relay_concurrency = 4   # mute deferrals to other hosts in flight at once
+```
+
+`enabled` and `allow_from` are enforced by the receiver, which is the only party that cannot be bypassed. A node with `enabled = false` still sends. `allow_from` is open by default because a flock fleet is already one trust domain. Narrow it with host names, for example `allow_from = ["hopper"]`.
+
+A mute answers (`flock_msg_mute`, `flk msg mute`). Every `needs_reply` sender it defers gets one automatic reply with the mute's `reason` and the time it lifts. `mute_reason_max_chars` bounds that reason: a longer one is truncated, never refused, so a mute cannot fail over its own explanation. A deferral to a sender on another host is an ssh hop, and one mute over a full inbox can owe many of them. `deferral_relay_concurrency` caps how many run at once, and the rest wait their turn.
+## Waking idle agents
+
+An agent that has already stopped cannot be told about new mail by its own stop hook — the hook only fires at the end of a turn. So when a message that wants an answer (any intent but `fyi`) is queued for an **idle Claude pane**, flock types one fixed sentence into that pane and presses Enter (ADR-0018):
+
+```text
+You have N unread message(s) from other agents. Read them with the `flock_msg_read` tool.
+```
+
+The count is the only thing that varies. The sender's name, the subject and the body never appear in it — the agent still reads the message itself through the tool. The keys live in the `[msg]` section:
+
+```toml
+[msg]
+idle_wake = true                     # the kill switch
+idle_wake_settle_ms = 2000           # idle this long, continuously, before flock types
+idle_wake_operator_quiet_ms = 15000  # no input from you in the pane for this long
+idle_wake_fresh_ms = 2500            # the screen must have shown the idle prompt this recently
+```
+
+Flock types only when **all** of the following hold, and checks them again at the moment it types:
+
+- The agent has been idle for the settle window, and that is current. The screen must be showing Claude's idle prompt and have been read recently. A pane whose screen cannot be read is not treated as idle, and neither is a hook report that has gone quiet.
+- Nobody typed into the pane within the quiet window. Keystrokes from an attached client, pastes, and `agent.send` / `pane.send-text` / `pane.send-keys` calls all count, but flock's own wake sentence does not. If you type in the moment between the sentence and its Enter, the Enter is not sent, and the sentence stays in the prompt for you to keep or delete. Flock does not try to erase it, and it types nothing more into that pane until the agent reads its inbox or starts working.
+- The fleet is not paused and the recipient has not muted itself with `msg.mute`. These are the same checks that apply to the stop hook's wake.
+- Claude's input box on screen is empty. A draft you left there is never typed next to or submitted, however long ago you typed it.
+- The agent is Claude. Other agents do not have the inbox tool the sentence names, so they are never typed into and find their mail at their next turn boundary.
+- Flock has not already typed a wake for these messages. It types once per batch of mail. Once the agent reads its inbox or starts working, a *new* message can wake it again. Mail it was already told about is re-announced by the stop hook at the end of its next turn, not by more typing.
+
+Which messages have already been announced is held in memory, so after a server restart any still-unread mail can earn one more wake. Set `idle_wake = false` to turn it off. Agents then find mail only at a turn boundary, as before. Each wake is logged as `msg.idle_wake.fired` at INFO, and each Enter that was held back as `msg.idle_wake.abandoned`. Suppressions are logged at DEBUG, once per change of reason.
+
+## Pushing mail into a Claude session (experimental)
+
+Off by default, and a research-preview feature of Claude Code (#438, ADR-0019, Proposed). With it on, `flk mcp serve` declares itself a Claude Code **channel**. When mail lands in its pane's inbox, it pushes the message into the session, and an idle agent starts a turn at once. A busy agent receives the message at its next tool boundary instead of at the end of its turn.
+
+```toml
+[msg]
+channel_push = false                  # the switch
+channel_push_body_max_bytes = 4096    # larger bodies arrive as a count-only doorbell
+channel_push_reconnect_secs = 5       # re-attach after a server restart or live handoff (minimum 1)
+channel_push_idle_wake_grace_ms = 2000  # the idle wake waits this long for the push to land
+```
+
+The session has to load the channel. On a personal account that means starting Claude with `--dangerously-load-development-channels server:flock`, which shows a warning dialog on every launch. The dialog needs one Enter.
+
+The body is pushed only for a sender this server attested (an agent in one of its own panes) and only under the size cap. Every other message, including all mail relayed from another host, arrives as the same count-only sentence the idle wake types. `fyi` mail is never pushed, and a mute or a paused fleet holds the push exactly as it holds the other wakes.
+
+The inbox stays the source of truth. A push is not a read, so the message stays unread until the agent calls `flock_msg_read` or answers it with `flock_msg_reply`. The stop-hook nudge and the idle wake keep running underneath for any session that did not load the channel, since flock cannot tell which sessions did. The idle wake then fires `channel_push_idle_wake_grace_ms` later than it would otherwise.
+
+Turning `channel_push` off with a config reload stops pushes at once, because each push first asks the server whether the flag is still on. Turning it on reaches only Claude sessions started afterwards, because a session fixes its capabilities when it starts. A pushing `flk mcp serve` logs to its own `flock-mcp-<pid>.log`, next to the other flock logs. Files left by finished sessions are removed when the next one starts.
 
 ## Environment variables
 
