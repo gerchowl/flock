@@ -351,6 +351,20 @@ pub struct SessionConfig {
     /// using. An agent arms mid-turn, so nothing happens until its turn has
     /// ended and this much time has passed.
     pub self_compact_settle_ms: u64,
+    /// How recently the pane's screen must have been read before flock will
+    /// type the compact command into it, in milliseconds. Default: 2500.
+    ///
+    /// Separate from `self_compact_settle_ms` on purpose, and for the same
+    /// reason `[msg] idle_wake_fresh_ms` is separate from
+    /// `idle_wake_settle_ms`. The two clocks answer different questions — "how
+    /// long has this pane been idle" and "how stale is what we can read off
+    /// its screen" — and only the first one moves the wake. Tying them
+    /// together puts the loop's wake exactly on the freshness boundary: the
+    /// screen was observed when the turn ended, the settle expires 2 s later,
+    /// and the loop is asked to type at the instant that screen is 2 s old.
+    /// A wake one millisecond late then reads as `stale_screen` and the
+    /// compaction never fires, which is a heisenbug rather than a refusal.
+    pub self_compact_fresh_ms: u64,
     /// How long the compaction waits for a human to stop touching the pane
     /// before typing `/compact` into it, in milliseconds. Default: 15000.
     ///
@@ -380,6 +394,7 @@ impl Default for SessionConfig {
             stop_transcript_poll_ms: 50,
             self_compact: true,
             self_compact_settle_ms: 2_000,
+            self_compact_fresh_ms: 2_500,
             self_compact_operator_quiet_ms: 15_000,
             self_compact_timeout_ms: 120_000,
         }

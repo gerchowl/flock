@@ -248,6 +248,37 @@ async fn the_enter_is_a_second_write_a_gap_later() {
     assert_ne!(after_text, after_enter);
 }
 
+/// The loop wakes a compaction at `state_changed_at + settle`, and the screen
+/// was observed when the turn ended. So at the moment flock is asked to type,
+/// the screen is exactly `settle` old. Reusing `settle` as the freshness bound
+/// therefore puts the wake ON the boundary, and one millisecond of jitter
+/// reads as `stale_screen` — a compaction that silently never fires.
+#[tokio::test]
+async fn the_wake_is_not_scheduled_exactly_on_the_freshness_boundary() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let config = &app.state.config.session;
+    assert!(
+        config.self_compact_fresh_ms > config.self_compact_settle_ms,
+        "the screen is observed when the turn ends and read when the settle \
+         expires, so freshness needs slack the settle does not — the same \
+         split `[msg] idle_wake_fresh_ms` makes"
+    );
+
+    // And a settled pane with a freshly read screen actually fires, rather
+    // than being refused as stale at the moment the loop wakes for it.
+    claude_idle_for(&mut app, SETTLED);
+    arm(&mut app, &pane, "carry on");
+    app.tick_self_compacts(Instant::now());
+    assert!(
+        written(&mut pty).contains("/compact"),
+        "settled and freshly read is exactly the state the wake exists for"
+    );
+}
+
 #[tokio::test]
 async fn a_human_at_the_keyboard_keeps_it() {
     let Rig {

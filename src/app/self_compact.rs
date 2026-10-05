@@ -203,6 +203,14 @@ impl App {
         Duration::from_millis(self.state.config.session.self_compact_operator_quiet_ms)
     }
 
+    /// How stale the screen may be before flock refuses to type into it.
+    /// Deliberately a separate knob from [`Self::self_compact_settle`] — see
+    /// `SessionConfig::self_compact_fresh_ms` for why tying them puts the
+    /// loop's wake exactly on the freshness boundary.
+    fn self_compact_fresh(&self) -> Duration {
+        Duration::from_millis(self.state.config.session.self_compact_fresh_ms)
+    }
+
     fn self_compact_timeout(&self) -> Duration {
         Duration::from_millis(self.state.config.session.self_compact_timeout_ms)
     }
@@ -274,7 +282,7 @@ impl App {
         if !crate::agent_self_compact::agent_can_self_compact(terminal.effective_known_agent()) {
             return SelfCompactDecision::Suppressed("cannot_self_compact");
         }
-        if let Some(blocker) = terminal.idle_wake_blocker(now, settle, settle) {
+        if let Some(blocker) = terminal.idle_wake_blocker(now, settle, self.self_compact_fresh()) {
             if blocker == "not_settled" {
                 if let Some(settles_at) = terminal.state_settles_at(settle) {
                     self.note_self_compact_deadline(settles_at);
@@ -340,7 +348,7 @@ impl App {
         // stale inside the gap is not evidence either. The settle is already
         // proven for the command itself, so it is not asked again.
         if terminal
-            .idle_wake_blocker(now, Duration::ZERO, self.self_compact_settle())
+            .idle_wake_blocker(now, Duration::ZERO, self.self_compact_fresh())
             .is_some()
         {
             return SelfCompactDecision::Abandoned(SelfCompactAbort::LeftIdle);
