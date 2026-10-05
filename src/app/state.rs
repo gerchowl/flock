@@ -3124,10 +3124,20 @@ impl AppState {
         match mode {
             AgentLabelConfig::Symbol => {
                 if let Some(alias) = aliased {
-                    return aliased_harness.map_or_else(
-                        || alias.clone(),
-                        |harness| crate::agent_symbols::symbol(harness).to_string(),
-                    );
+                    if let Some(harness) = aliased_harness {
+                        return crate::agent_symbols::symbol(harness).to_string();
+                    }
+                    // An alias that does not name a harness is shown verbatim —
+                    // but only if it FITS. The agent field is a one-cell slot,
+                    // and `agent_aliases` takes free text, so an emoji or a
+                    // multi-glyph mark used to land here unvalidated and reflowed
+                    // every column to its right. Falling through to the label
+                    // rather than drawing something too wide is the same choice
+                    // `server_icons` makes for an unusable raw icon: a blank or a
+                    // name beats a broken row (#551).
+                    if crate::agent_symbols::is_renderable_override(alias) {
+                        return alias.clone();
+                    }
                 }
                 let harness = harness.or_else(|| label.and_then(crate::detect::parse_agent_label));
                 if let Some(harness) = harness {
@@ -4506,38 +4516,71 @@ mod tests {
     /// resolves to that harness's glyph. That is what makes the alias map the
     /// supported way to re-attribute a mislabelled agent.
     #[test]
-    fn an_explicit_alias_beats_the_built_in_answer_in_every_mode() {
+    fn an_explicit_alias_wins_in_the_modes_that_have_room_for_it() {
         use crate::config::AgentLabelConfig;
         use crate::detect::Agent;
         let mut app = agent_field_app();
         app.agent_aliases
             .insert("researcher".to_string(), "CC".to_string());
+
+        // `shortcut` and `name` are TEXT modes and have no width budget, so the
+        // operator's instruction is simply what is drawn. This is the documented
+        // `agent_aliases = { claude = "CC" }` case and it must keep working.
+        for mode in [AgentLabelConfig::Shortcut, AgentLabelConfig::Name] {
+            assert_eq!(
+                app.agent_field_label(mode, Some(Agent::Claude), Some("researcher")),
+                "CC",
+                "{mode:?} must honour the alias"
+            );
+        }
+
+        // `symbol` is different: the field is a ONE-cell slot, and "CC" is two.
+        // Drawing it would reflow every column to the right, so the built-in
+        // symbol wins instead. #550 documented the alias as overriding "any of
+        // the three" — that was true only because nothing checked the width, and
+        // the width is the whole constraint the mode rests on.
         assert_eq!(
             app.agent_field_label(
                 AgentLabelConfig::Symbol,
                 Some(Agent::Claude),
                 Some("researcher")
             ),
-            "CC",
-            "an alias that is not a harness name is shown verbatim"
+            crate::agent_symbols::symbol(Agent::Claude),
+            "a two-cell alias cannot be drawn in a one-cell slot"
         );
+    }
+
+    /// A one-cell alias — the case that actually makes the override useful — is
+    /// honoured in `symbol` mode too, which is what lets a viewer point at a
+    /// font THEY installed without the registry carrying artwork (#551).
+    #[test]
+    fn a_one_cell_alias_is_drawn_as_the_symbol() {
+        use crate::config::AgentLabelConfig;
+        use crate::detect::Agent;
+        let mut app = agent_field_app();
+        // nf-cod-claude, a PUA glyph: only a Nerd Font renders it, and that is
+        // the operator's choice to make.
+        app.agent_aliases
+            .insert("researcher".to_string(), "\u{ec82}".to_string());
         assert_eq!(
             app.agent_field_label(
-                AgentLabelConfig::Shortcut,
+                AgentLabelConfig::Symbol,
                 Some(Agent::Claude),
                 Some("researcher")
             ),
-            "CC"
+            "\u{ec82}"
         );
-        assert_eq!(
-            app.agent_field_label(
-                AgentLabelConfig::Name,
-                Some(Agent::Claude),
-                Some("researcher")
-            ),
-            "CC"
-        );
-        // An alias that DOES name a harness resolves to that harness's symbol.
+    }
+
+    /// An alias that NAMES a harness resolves to that harness's symbol, so
+    /// `agent_aliases = { researcher = "codex" }` re-attributes a mislabelled
+    /// agent with no schema change. This is width-independent and so works in
+    /// `symbol` mode whatever the glyph is.
+    #[test]
+    fn an_alias_naming_a_harness_resolves_to_that_harness_symbol() {
+        use crate::config::AgentLabelConfig;
+        use crate::detect::Agent;
+        let mut app = agent_field_app();
         app.agent_aliases
             .insert("researcher".to_string(), "codex".to_string());
         assert_eq!(

@@ -52,6 +52,27 @@ pub fn symbol(agent: Agent) -> &'static str {
     }
 }
 
+/// Whether a caller-supplied override is usable as an agent symbol directly.
+///
+/// The same shape as [`crate::server_icons`]'s raw-glyph hatch, for the same
+/// reason: the agent field sits in a fixed one-cell slot, and a value that is
+/// two cells wide (an emoji), a multi-glyph run, or a control/escape payload
+/// either reflows every column to its right or injects into the row. This is the
+/// only way a value reaches the field without passing through [`symbol`] —
+/// `agent_aliases` names free text, and `symbol` mode shows a non-harness alias
+/// verbatim — so it needed the same gate rather than a hopeful doc comment.
+///
+/// Note what this is NOT: a way to smuggle in a multi-cell brand mark. A mark
+/// that does not fit one cell does not fit the sidebar, whatever it is.
+pub fn is_renderable_override(value: &str) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.width() == 1
+        && trimmed.chars().count() <= 4
+        && !trimmed.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +167,40 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Mirrors `server_icons::resolve_rejects_unsafe_or_oversized_raw_values`
+    /// for the same reasons, and because the two registries share a slot on the
+    /// same row: whatever rule keeps a server icon in one cell has to keep an
+    /// agent override in one cell, or a row can be broken from either side.
+    #[test]
+    fn an_override_must_be_one_cell_and_clean() {
+        assert!(
+            is_renderable_override("\u{f092b}"),
+            "a PUA glyph is one cell"
+        );
+        assert!(is_renderable_override("\u{2726}"), "so is a sign");
+        assert!(
+            is_renderable_override("  \u{2726}  "),
+            "trimming is allowed"
+        );
+
+        for bad in [
+            "\u{1f916}",        // emoji: two cells
+            "\u{264a}",         // East Asian Wide: two cells
+            "\u{26a1}",         // also two cells — the trap #550's own table hit
+            "ab",               // more than one cell
+            "\u{2726}\u{2726}", // two glyphs
+            "",                 // empty
+            "   ",              // whitespace only
+            "\u{1b}",           // ESC: would inject into the row
+            "\u{200b}",         // zero-width: measures 0
+        ] {
+            assert!(
+                !is_renderable_override(bad),
+                "{bad:?} must not reach the agent field"
+            );
         }
     }
 
