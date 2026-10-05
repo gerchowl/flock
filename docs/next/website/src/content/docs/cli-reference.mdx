@@ -214,6 +214,10 @@ Two writes and a signal, and the signal is a hook report rather than a timer —
 
 If a compaction is already armed, a second arming is **refused** with `state: "pending"` rather than replacing the stored prompt — two written handoffs, and silently keeping one discards work the agent believed it had saved. `--abort` drops one. Claude Code only: `/compact` is a harness affordance, and another agent is refused by name instead of being armed into a no-op. Off `[session] self_compact` forbids it outright.
 
+The continuation is checked before anything is typed. A prompt carrying a control or escape byte, an embedded line break, or a leading `/` or `!` is **refused with a reason** rather than scrubbed: the encoder wraps text between the bracketed-paste markers without escaping, so a prompt containing the closing marker would end the paste early and be read as keystrokes, and a leading `/` or `!` is a command the harness runs instead of instructions it reads. A scrub would report success for a plan that is silently missing part of itself.
+
+Both writes go through the same gates. Claude Code auto-compacts mid-turn, so a confirmation can arrive with the agent still working and a human part-way into a prompt; an occupied prompt box is never typed into, because submitting it would submit the human's draft too.
+
 Over MCP the same thing is `flock_self_compact`, which is the only way an agent can affect its own pane — `pane.send_*` stays off the closed MCP table, and this is an allowlisted exception rather than an unlock.
 
 Report agent state from custom hooks:

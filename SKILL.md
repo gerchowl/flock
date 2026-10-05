@@ -195,7 +195,7 @@ stretch of work is**. it is the difference between finishing unattended and
 handing a human a chore.
 
 ```bash
-flock pane arm-self-compact "pick up at step 3: the refactor is done, \
+flk pane arm-self-compact "pick up at step 3: the refactor is done, \
 run just check, then open the PR and watch CI"
 ```
 
@@ -221,7 +221,7 @@ important:
   ends, it waits.
 - if a compaction is already armed, yours is **refused**, not merged. the
   prompt already stored is untouched. to replace it:
-  `flock pane arm-self-compact --abort`.
+  `flk pane arm-self-compact --abort`.
 - claude code only. other harnesses are refused by name, because `/compact` is
   a claude code affordance and typing it anywhere else would just leave a
   stray line in your prompt box.

@@ -544,6 +544,21 @@ pub(crate) fn self_compact_continued(pane: &str, bytes: usize) {
     );
 }
 
+/// The agent resumed on a compacted context: the continuation's Enter went out,
+/// so the sequence is over. INFO for the same reason as `continued` — the pane
+/// is now on a different context than it was, and this is the last line that
+/// says so.
+pub(crate) fn self_compact_completed(pane: &str, bytes: usize) {
+    tracing::info!(
+        event = "agent.self_compact.completed",
+        subsystem = "agent",
+        outcome = "ok",
+        pane,
+        bytes,
+        "self-compaction finished"
+    );
+}
+
 /// An armed self-compaction was dropped without completing. `reason` is a
 /// [`crate::agent_self_compact::SelfCompactAbort`] name. INFO: whatever flock
 /// may have typed is now sitting in that pane's prompt box, and the operator

@@ -804,6 +804,31 @@ fn build_self_compact(args: Value) -> Result<Method, McpError> {
              to drop an armed self-compaction instead.",
         ));
     }
+    // Refused here as well as server-side: the agent gets the reason without a
+    // round trip, and `additionalProperties: false` already stops a compliant
+    // client from sending anything else.
+    if let Some(text) = continuation.as_deref() {
+        if let Err(problem) = crate::agent_self_compact::check_continuation(text) {
+            use crate::agent_self_compact::ContinuationProblem as Problem;
+            return Err(McpError::invalid_params(match problem {
+                Problem::Control => {
+                    "`continuation` must be plain text — a control byte \
+                    or escape sequence would end the paste early and be read as \
+                    keystrokes rather than as your handoff prompt."
+                }
+                Problem::LineBreak => {
+                    "`continuation` must be a single line. An embedded \
+                    newline submits the prompt early; put the long version in a file \
+                    and name the file."
+                }
+                Problem::HarnessCommand => {
+                    "`continuation` must not start with `/` or `!` — \
+                    the harness runs those as a command instead of reading them. \
+                    Rephrase it as a sentence."
+                }
+            }));
+        }
+    }
     Ok(Method::PaneArmSelfCompact(
         crate::api::schema::PaneArmSelfCompactParams {
             pane: optional_string(&args, "pane")?,

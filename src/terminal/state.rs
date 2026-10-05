@@ -257,6 +257,11 @@ pub struct TerminalState {
     /// consequence is that a restart mid-sequence drops the arming, which is
     /// the safe direction — nothing is typed into a pane nobody is watching.
     pub armed_self_compact: Option<crate::agent_self_compact::ArmedSelfCompact>,
+    /// When this pane last COMPLETED a self-compaction, kept after the arming
+    /// is dropped. Ephemeral like the arming itself, for the same reason: a rate
+    /// limit that outlives the session would refuse a legitimate compaction on a
+    /// pane an operator reopened days later.
+    pub last_self_compact_completed: Option<std::time::Instant>,
 }
 
 impl TerminalState {
@@ -312,6 +317,7 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             hibernated_resume_plan: None,
             armed_self_compact: None,
+            last_self_compact_completed: None,
         }
     }
 

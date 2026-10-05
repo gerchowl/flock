@@ -28,6 +28,22 @@
 
 use std::time::{Duration, Instant};
 
+/// Why a handoff prompt was refused. Every case is a way the prompt could stop
+/// being a prompt and become something the HARNESS acts on, which is the whole
+/// risk in typing text an agent wrote into that agent's own input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationProblem {
+    /// A control byte or an escape sequence survived.
+    Control,
+    /// An embedded line break. With bracketed paste off this submits the prompt
+    /// early, and a submit nobody gated is exactly what the empty-box gate
+    /// exists to prevent.
+    LineBreak,
+    /// The prompt opens with a slash command or Claude Code's `!` bash mode,
+    /// either of which the harness executes rather than reads.
+    HarnessCommand,
+}
+
 /// Largest continuation prompt accepted, in bytes. The prompt is typed into a
 /// pane, so it has to survive a paste, and a handoff prompt longer than this
 /// is a document, not a handoff: the agent can put the document in a file and
@@ -35,6 +51,40 @@ use std::time::{Duration, Instant};
 /// same reason — text that crosses into a session is capped, not trusted to be
 /// short.
 pub const MAX_CONTINUATION_BYTES: usize = 16 * 1024;
+
+/// Make a handoff prompt safe to type, or say why not.
+///
+/// This is a REFUSAL, not a scrub, and the difference matters. The alternative —
+/// strip the dangerous bytes and send the remainder — hands the caller a
+/// success it did not get: the agent believes it handed over its plan and has
+/// silently lost the part that was rejected, which is worse than being told.
+/// So anything that cannot survive intact is refused, and the agent can
+/// rewrite it.
+///
+/// The threat is concrete rather than theoretical. A continuation reaches a
+/// real PTY, and `encode_api_text` wraps it between `\x1b[200~` and `\x1b[201~`
+/// WITHOUT escaping — so a continuation containing `\x1b[201~` closes the paste
+/// early and everything after it is read as keystrokes. And with bracketed
+/// paste off it is raw bytes, so a control byte is a control byte. Either way
+/// the caller, who may be an agent on another pane rather than this one, could
+/// otherwise make flock type and submit anything a human could.
+pub fn check_continuation(text: &str) -> Result<(), ContinuationProblem> {
+    // LineBreak BEFORE Control: `control_bytes::strip` removes newlines too,
+    // so checking Control first would answer a prompt that submits early with
+    // the less useful of the two reasons.
+    if text.contains('\n') || text.contains('\r') {
+        return Err(ContinuationProblem::LineBreak);
+    }
+    if crate::control_bytes::strip(text) != text {
+        return Err(ContinuationProblem::Control);
+    }
+    let cleaned = text;
+    let trimmed = cleaned.trim_start();
+    if trimmed.starts_with('/') || trimmed.starts_with('!') {
+        return Err(ContinuationProblem::HarnessCommand);
+    }
+    Ok(())
+}
 
 /// The slash command that asks the harness to compact. Claude Code's, and
 /// currently the only one: compaction is a harness affordance, so the text is a
@@ -51,15 +101,17 @@ pub enum SelfCompactPhase {
     /// `/compact` has been typed and submitted. Waiting for the harness to
     /// report `session_start_source: compact` back.
     CompactRequested,
+    /// The harness confirmed the compaction and the continuation prompt is owed.
+    /// The tick types it once the pane is genuinely ready — which is a separate
+    /// wait, and a long one, because Claude Code auto-compacts MID-TURN.
+    CompactDone,
     /// The continuation prompt has been typed; its Enter is not due yet.
     ContinueTyped,
 }
 
 impl SelfCompactPhase {
     /// Whether the compaction has reached the point where the harness is doing
-    /// something we cannot see. Only [`SelfCompactPhase::CompactRequested`]
-    /// and [`SelfCompactPhase::ContinueTyped`] have written into the pane, so
-    /// only these need the timeout.
+    /// something we cannot see.
     pub fn has_written(self) -> bool {
         !matches!(self, SelfCompactPhase::Armed)
     }
@@ -73,8 +125,17 @@ pub struct ArmedSelfCompact {
     /// agent's words rather than a human's transcription of them.
     pub continuation: String,
     pub phase: SelfCompactPhase,
-    /// When the verb was called.
-    pub armed_at: Instant,
+    /// When flock started waiting on something it cannot see or cannot force:
+    /// set when a write is submitted, cleared while nothing is outstanding.
+    ///
+    /// This is the timeout baseline, and the distinction is the whole point of
+    /// #540's second pass. Measuring from `armed_at` looked equivalent and was
+    /// not: an agent arms mid-turn, so a turn that runs longer than the timeout
+    /// would have flock type `/compact` and *then*, on the very next tick, find
+    /// the clock already expired — dropping the arming with `/compact` left
+    /// unsubmitted in the prompt box. Measuring from the moment flock actually
+    /// began waiting cannot expire before the wait did.
+    pub waiting_since: Option<Instant>,
     /// When the most recent keystroke went out. The submit gap for the *next*
     /// Enter is measured from this, so the two writes of one submission are
     /// always a gap apart and never one read.
@@ -84,11 +145,11 @@ pub struct ArmedSelfCompact {
 }
 
 impl ArmedSelfCompact {
-    pub fn new(continuation: String, now: Instant) -> Self {
+    pub fn new(continuation: String) -> Self {
         Self {
             continuation,
             phase: SelfCompactPhase::Armed,
-            armed_at: now,
+            waiting_since: None,
             typed_at: None,
             submit_at: None,
         }
@@ -103,6 +164,26 @@ impl ArmedSelfCompact {
         self.submit_at = Some(now + submit_gap);
     }
 
+    /// The Enter for `/compact` went out, so from here flock is waiting on the
+    /// harness. This is where the timeout clock starts.
+    pub fn compact_submitted(&mut self, now: Instant) {
+        self.phase = SelfCompactPhase::CompactRequested;
+        self.submit_at = None;
+        self.waiting_since = Some(now);
+    }
+
+    /// The harness confirmed the compaction. The continuation is owed but not
+    /// yet typed: Claude Code auto-compacts mid-turn, so the pane may be busy,
+    /// and flock waits for it to be genuinely ready rather than typing into a
+    /// working agent.
+    pub fn compaction_confirmed(&mut self, now: Instant) {
+        self.phase = SelfCompactPhase::CompactDone;
+        self.submit_at = None;
+        self.typed_at = None;
+        // A fresh window: the harness's answer ended the previous wait.
+        self.waiting_since = Some(now);
+    }
+
     /// Record that the continuation prompt went out. The compaction has
     /// already happened, so the gap here is what keeps the paste from
     /// swallowing its own Enter.
@@ -110,6 +191,7 @@ impl ArmedSelfCompact {
         self.phase = SelfCompactPhase::ContinueTyped;
         self.typed_at = Some(now);
         self.submit_at = Some(now + submit_gap);
+        self.waiting_since = Some(now);
     }
 
     /// The pending Enter is due. The *same* last-typed timestamp is the
@@ -128,16 +210,23 @@ impl ArmedSelfCompact {
     /// may have left that command sitting in the box, which is why the caller
     /// is told which of the two happened.
     pub fn timeout_reason(&self, now: Instant, timeout: Duration) -> Option<&'static str> {
-        // Matched on the phase rather than on `has_written`, because the two
-        // halves have to be told apart to say which one was lost — and only
-        // one of the two written phases is still waiting on the harness.
-        if now.saturating_duration_since(self.armed_at) < timeout {
+        // Measured from `waiting_since`, never from `armed_at`. Nothing is being
+        // waited on before flock submits its first write, so nothing can time
+        // out then — which is what makes a long turn safe.
+        let since = self.waiting_since?;
+        if now.saturating_duration_since(since) < timeout {
             return None;
         }
+        // Named by which half was outstanding, because an operator finding
+        // `/compact` sitting unsubmitted needs to know whether the compaction or
+        // the resumption died.
         match self.phase {
-            SelfCompactPhase::Armed => None,
-            SelfCompactPhase::CompactRequested => Some("compact_timeout"),
-            SelfCompactPhase::ContinueTyped => Some("continuation_timeout"),
+            SelfCompactPhase::Armed | SelfCompactPhase::ContinueTyped => {
+                Some("continuation_timeout")
+            }
+            SelfCompactPhase::CompactRequested | SelfCompactPhase::CompactDone => {
+                Some("compact_timeout")
+            }
         }
     }
 }
@@ -195,7 +284,7 @@ mod tests {
     use super::*;
 
     fn armed() -> ArmedSelfCompact {
-        ArmedSelfCompact::new("carry on".to_string(), Instant::now())
+        ArmedSelfCompact::new("carry on".to_string())
     }
 
     #[test]
@@ -210,7 +299,7 @@ mod tests {
     #[test]
     fn submit_is_never_due_before_the_gap_elapses() {
         let now = Instant::now();
-        let mut armed = ArmedSelfCompact::new("x".to_string(), now);
+        let mut armed = ArmedSelfCompact::new("x".to_string());
         armed.compact_requested(now, Duration::from_millis(50));
         assert!(!armed.submit_due(now + Duration::from_millis(49)));
         assert!(armed.submit_due(now + Duration::from_millis(50)));
@@ -219,7 +308,7 @@ mod tests {
     #[test]
     fn a_sent_enter_is_not_due_again() {
         let now = Instant::now();
-        let mut armed = ArmedSelfCompact::new("x".to_string(), now);
+        let mut armed = ArmedSelfCompact::new("x".to_string());
         armed.compact_requested(now, Duration::from_millis(10));
         assert!(armed.submit_due(now + Duration::from_millis(10)));
         armed.submit_at = None;
@@ -229,7 +318,7 @@ mod tests {
     #[test]
     fn an_arming_that_wrote_nothing_never_times_out() {
         let now = Instant::now();
-        let armed = ArmedSelfCompact::new("x".to_string(), now);
+        let armed = ArmedSelfCompact::new("x".to_string());
         assert_eq!(armed.timeout_reason(now, Duration::from_secs(1)), None);
         assert_eq!(
             armed.timeout_reason(now + Duration::from_secs(3_600), Duration::from_secs(1)),
@@ -239,22 +328,73 @@ mod tests {
         );
     }
 
+    /// The baseline is `waiting_since`, not `armed_at`, so an arming cannot
+    /// time out before flock has submitted anything and begun waiting.
     #[test]
-    fn the_timeout_names_which_half_was_lost() {
-        let now = Instant::now();
-        let mut armed = ArmedSelfCompact::new("x".to_string(), now);
-        armed.compact_requested(now, Duration::from_millis(1));
+    fn the_timeout_starts_when_flock_begins_waiting_not_when_it_arms() {
+        let start = Instant::now();
+        let mut armed = ArmedSelfCompact::new("x".to_string());
+        // A turn that runs far longer than the timeout. Nothing has been
+        // submitted, so there is nothing to time out.
+        let long_turn = start + Duration::from_secs(600);
         assert_eq!(
-            armed.timeout_reason(now + Duration::from_secs(2), Duration::from_secs(1)),
+            armed.timeout_reason(long_turn, Duration::from_secs(120)),
+            None
+        );
+
+        // The `/compact` Enter goes out, and only NOW is there a wait.
+        armed.compact_requested(long_turn, Duration::from_millis(1));
+        assert_eq!(
+            armed.timeout_reason(long_turn, Duration::from_secs(120)),
+            None,
+            "the moment of submitting is the moment the clock starts, so it \
+             cannot already be expired"
+        );
+        armed.compact_submitted(long_turn + Duration::from_millis(1));
+        assert_eq!(
+            armed.timeout_reason(long_turn, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            armed.timeout_reason(
+                long_turn + Duration::from_secs(121),
+                Duration::from_secs(120)
+            ),
             Some("compact_timeout")
         );
-        armed.continuation_typed(now, Duration::from_millis(1));
+
+        // A confirmation restarts the clock for the continuation half.
+        armed.compaction_confirmed(long_turn + Duration::from_secs(121));
         assert_eq!(
-            armed.timeout_reason(now + Duration::from_secs(2), Duration::from_secs(1)),
+            armed.timeout_reason(
+                long_turn + Duration::from_secs(121),
+                Duration::from_secs(120)
+            ),
+            None,
+            "the harness answering is progress, not a fresh failure"
+        );
+    }
+
+    #[test]
+    fn the_timeout_names_which_half_was_lost() {
+        let start = Instant::now();
+        let mut armed = ArmedSelfCompact::new("x".to_string());
+        armed.compact_submitted(start);
+        assert_eq!(
+            armed.timeout_reason(start + Duration::from_secs(2), Duration::from_secs(1)),
+            Some("compact_timeout")
+        );
+
+        let mut armed = ArmedSelfCompact::new("x".to_string());
+        armed.continuation_typed(start, Duration::from_millis(1));
+        assert_eq!(
+            armed.timeout_reason(start + Duration::from_secs(2), Duration::from_secs(1)),
             Some("continuation_timeout")
         );
     }
 
+    /// A finished sequence must not leave an arming behind: it would log the
+    /// success as a timeout later and refuse the next arming until it fired.
     #[test]
     fn only_claude_can_self_compact() {
         assert!(agent_can_self_compact(Some(crate::detect::Agent::Claude)));

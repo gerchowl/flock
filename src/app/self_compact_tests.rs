@@ -74,7 +74,15 @@ fn terminal(app: &mut App) -> &mut crate::terminal::TerminalState {
 /// Claude, showing its idle prompt box, idle since `idle_for` ago and seen
 /// just now — the state a self-compaction is allowed to type into.
 fn claude_idle_for(app: &mut App, idle_for: Duration) {
-    let now = Instant::now();
+    claude_idle_at(app, idle_for, Instant::now());
+}
+
+/// As [`claude_idle_for`], but observed at `observed_at` rather than now. A
+/// test that drives the clock forward has to move the observation with it: the
+/// freshness gate would otherwise (correctly) refuse a screen read six minutes
+/// ago, and the test would be measuring the wrong thing.
+fn claude_idle_at(app: &mut App, idle_for: Duration, observed_at: Instant) {
+    let now = observed_at;
     for at in [now - idle_for, now] {
         terminal(app).set_detected_state_with_screen_signals_at(
             Some(Agent::Claude),
@@ -136,6 +144,16 @@ fn request_compaction(app: &mut App, pty: &mut mpsc::Receiver<Bytes>) {
     app.tick_self_compacts(now);
     app.tick_self_compacts(now + GAP);
     drain(pty);
+}
+
+/// Type the continuation and press Enter on it, as two ticks. Separate from
+/// [`request_compaction`] because they are separated by the harness reporting
+/// the compaction back, and because the continuation's gates are re-evaluated
+/// from scratch — which is the whole point of routing it through the tick.
+fn deliver_continuation(app: &mut App, _pty: &mut mpsc::Receiver<Bytes>) {
+    let now = Instant::now();
+    app.tick_self_compacts(now);
+    app.tick_self_compacts(now + GAP);
 }
 
 fn armed_continuation(app: &App) -> Option<String> {
@@ -201,20 +219,31 @@ async fn the_whole_sequence_runs_unattended() {
     app.tick_self_compacts(now + GAP);
     assert!(!written(&mut pty).is_empty(), "the Enter is its own write");
 
-    // The harness reports the compaction back.
+    // The harness reports the compaction back. That advances the phase and
+    // types NOTHING: the continuation is owed to a prompt box, so it waits for
+    // the tick and the gates rather than going in while the agent may be busy.
     session_started_with(&mut app, &pane, "compact");
+    assert!(
+        written(&mut pty).is_empty(),
+        "a confirmation must not type into the pane; Claude Code auto-compacts \
+         MID-TURN, and a human may be in this box"
+    );
+
+    deliver_continuation(&mut app, &mut pty);
     let continuation = written(&mut pty);
     assert!(
         continuation.contains("Next: run just check, then open the PR."),
         "the agent's own handoff prompt must be typed back, got {continuation:?}"
     );
 
-    // And its Enter, one gap later. The clock is read fresh here: the
-    // continuation was typed when the hook landed, not at `now`.
-    app.tick_self_compacts(Instant::now() + GAP + Duration::from_millis(1));
-    assert!(
-        !written(&mut pty).is_empty(),
-        "the continuation needs its Enter"
+    // `deliver_continuation` typed the prompt and pressed Enter, and that Enter
+    // is the end of the sequence: the arming is gone. Left behind it would log
+    // this success as a `continuation_timeout` when its clock ran out, and
+    // refuse the next arming as `pending` until then.
+    assert_eq!(
+        armed_continuation(&app),
+        None,
+        "a finished sequence must not leave an arming behind"
     );
 }
 
@@ -422,18 +451,35 @@ async fn a_compaction_the_harness_started_itself_still_delivers() {
     claude_idle_for(&mut app, SETTLED);
     arm(&mut app, &pane, "carry on");
 
-    // The harness got there first, before flock typed anything.
+    // The harness got there first — and it did so MID-TURN, which is the only
+    // way this happens in practice.
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Claude),
+        AgentState::Working,
+        false,
+        false,
+        false,
+        false,
+        Instant::now(),
+    );
     session_started_with(&mut app, &pane, "compact");
+    deliver_continuation(&mut app, &mut pty);
+    assert!(
+        written(&mut pty).is_empty(),
+        "the agent is mid-turn: the handoff prompt waits for it to stop, \
+         rather than landing in a box the agent is still using"
+    );
+
+    // The turn ends, and the prompt is delivered then.
+    claude_idle_for(&mut app, SETTLED);
+    deliver_continuation(&mut app, &mut pty);
     assert!(
         written(&mut pty).contains("carry on"),
         "an unrequested compaction is still a compaction; the handoff prompt \
          is what the agent armed for"
     );
 
-    // And flock must not now compact a pane that already compacted. The Enter
-    // for the continuation is still owed, so assert on the command rather than
-    // on silence.
-    app.tick_self_compacts(Instant::now() + GAP);
+    // And flock must not compact a context that was just compacted.
     assert!(
         !written(&mut pty).contains("/compact"),
         "a second /compact would compact a context that was just compacted"
@@ -592,6 +638,7 @@ async fn the_continuation_lands_in_the_panes_prompt_history() {
     arm(&mut app, &pane, "Next: open the PR");
     request_compaction(&mut app, &mut pty);
     session_started_with(&mut app, &pane, "compact");
+    deliver_continuation(&mut app, &mut pty);
 
     let history: Vec<&str> = terminal_const(&app)
         .prompt_history
@@ -603,5 +650,182 @@ async fn the_continuation_lands_in_the_panes_prompt_history() {
         "the agent's own prompt is now a prompt in its session, and that panel \
          is where an operator looks to see what it told itself to do next: \
          {history:?}"
+    );
+}
+
+/// B1: the timeout clock must not be able to expire during the very tick that
+/// submits the command. An agent arms mid-turn, so a turn longer than the
+/// timeout used to leave `/compact` typed and then dropped before its Enter.
+///
+/// Driven in real time with a tiny timeout rather than by moving the clock
+/// forward: a synthetic future collides with the hook's own real clock, and a
+/// test that has to reconcile two clocks is testing the harness, not the rule.
+#[tokio::test]
+async fn a_turn_longer_than_the_timeout_still_completes() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    app.state.config.session.self_compact_timeout_ms = 1;
+    // Working, so the turn outlasts the timeout.
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Claude),
+        AgentState::Working,
+        false,
+        false,
+        false,
+        false,
+        Instant::now(),
+    );
+    arm(&mut app, &pane, "carry on");
+    std::thread::sleep(Duration::from_millis(40));
+    app.tick_self_compacts(Instant::now());
+    assert!(
+        written(&mut pty).is_empty(),
+        "still mid-turn: nothing may be typed"
+    );
+
+    // The turn ends, far later than the timeout measured from arming would
+    // allow.
+    claude_idle_for(&mut app, SETTLED);
+    app.tick_self_compacts(Instant::now());
+    assert!(
+        written(&mut pty).contains("/compact"),
+        "a long turn must not eat the timeout: nothing was waiting on the \
+         harness until now, so nothing could time out"
+    );
+    app.tick_self_compacts(Instant::now() + GAP);
+    session_started_with(&mut app, &pane, "compact");
+    deliver_continuation(&mut app, &mut pty);
+    assert!(
+        written(&mut pty).contains("carry on"),
+        "and the sequence still completes"
+    );
+}
+
+/// B2: every success used to be logged as a `continuation_timeout` once its
+/// clock ran out, because the arming outlived the sequence it belonged to.
+#[tokio::test]
+async fn a_successful_run_does_not_wedge_the_pane() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    arm(&mut app, &pane, "carry on");
+    request_compaction(&mut app, &mut pty);
+    session_started_with(&mut app, &pane, "compact");
+    deliver_continuation(&mut app, &mut pty);
+
+    assert_eq!(armed_continuation(&app), None, "the arming is gone");
+
+    // Long past when the old clock would have fired.
+    let timeout = Duration::from_millis(app.state.config.session.self_compact_timeout_ms);
+    app.tick_self_compacts(Instant::now() + timeout * 2);
+    assert_eq!(armed_continuation(&app), None);
+
+    // And the next arming is answered on its own merits, not refused as
+    // `pending` by a sequence that already finished.
+    let floor = Duration::from_secs(app.state.config.session.self_compact_min_interval_secs);
+    app.state.config.session.self_compact_min_interval_secs = 0;
+    app.terminal_mut_for_test(WS, app.state.workspaces[WS].focused_pane_id().unwrap())
+        .last_self_compact_completed = Some(Instant::now() - floor);
+    let reply = arm(&mut app, &pane, "and then the docs");
+    assert!(
+        reply.contains("\"state\":\"armed\""),
+        "a finished sequence must not refuse the next arming: {reply}"
+    );
+}
+
+/// B3: a draft a human typed while the compaction ran must never be submitted
+/// together with the agent's own handoff prompt.
+#[tokio::test]
+async fn a_draft_typed_during_compaction_is_not_submitted_with_the_continuation() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    arm(&mut app, &pane, "carry on");
+    request_compaction(&mut app, &mut pty);
+    session_started_with(&mut app, &pane, "compact");
+
+    // A human starts typing while the compaction is in flight.
+    runtime(&app).test_process_pty_bytes(&claude_screen("half a thought"));
+    deliver_continuation(&mut app, &mut pty);
+    assert!(
+        written(&mut pty).is_empty(),
+        "an occupied prompt box is never typed into — submitting it would \
+         submit the human's draft too"
+    );
+    assert_eq!(
+        armed_continuation(&app).as_deref(),
+        Some("carry on"),
+        "the prompt is kept, not discarded: the human clears the box and it \
+         goes on a later tick"
+    );
+
+    // The human clears it, and the prompt is delivered.
+    claude_idle_for(&mut app, SETTLED);
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
+    app.terminal_mut_for_test(WS, app.state.workspaces[WS].focused_pane_id().unwrap())
+        .state_changed_at = Some(Instant::now() - SETTLED);
+    runtime(&app).test_stamp_operator_input_at(Instant::now() - Duration::from_secs(60));
+    deliver_continuation(&mut app, &mut pty);
+    assert!(written(&mut pty).contains("carry on"));
+}
+
+/// The idle wake and a self-compaction both type flock-authored text and press
+/// Enter one `pane run` gap later. A gap is the same length for both, so two
+/// writes in the same window are two submissions the pane cannot tell apart.
+#[tokio::test]
+async fn the_idle_wake_in_flight_defers_the_compaction_rather_than_interleaving() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    arm(&mut app, &pane, "carry on");
+
+    // Something the idle wake already typed is still waiting for its Enter.
+    app.test_arm_idle_wake_in_flight(&pane);
+    app.tick_self_compacts(Instant::now());
+    assert!(
+        written(&mut pty).is_empty(),
+        "two flock submissions in one gap go in as one line"
+    );
+    assert_eq!(armed_continuation(&app).as_deref(), Some("carry on"));
+}
+
+/// B4: the continuation reaches a real PTY and `encode_api_text` does not
+/// escape what it wraps, so these are the difference between an arming and a
+/// send-text-to-your-own-pane.
+#[test]
+fn a_continuation_cannot_break_out_of_the_paste_or_run_as_a_command() {
+    use crate::agent_self_compact::{check_continuation, ContinuationProblem as P};
+    // The paste terminator, then raw keys.
+    assert_eq!(check_continuation("ok\x1b[201~\u{1b}"), Err(P::Control));
+    // A bare CSI, a bare ESC, and an OSC.
+    assert_eq!(check_continuation("ok\x1b[2J"), Err(P::Control));
+    assert_eq!(check_continuation("ok\x1b"), Err(P::Control));
+    assert_eq!(check_continuation("ok\x1b]0;title\x07"), Err(P::Control));
+    // A control byte with no escape at all — the bracketed-paste-off case,
+    // where the text is sent as raw bytes.
+    assert_eq!(check_continuation("ok\u{7}"), Err(P::Control));
+    // A newline submits the prompt early, and a submit nobody gated is the one
+    // outcome the empty-box gate exists to prevent.
+    assert_eq!(check_continuation("ok\nrm -rf /"), Err(P::LineBreak));
+    assert_eq!(check_continuation("ok\r"), Err(P::LineBreak));
+    // Claude Code executes these rather than reading them.
+    assert_eq!(check_continuation("/compact"), Err(P::HarnessCommand));
+    assert_eq!(check_continuation("  !rm -rf /"), Err(P::HarnessCommand));
+    // Ordinary prose, and a slash or bang that is NOT leading, is fine.
+    assert_eq!(
+        check_continuation("run just check, then a/b and c!"),
+        Ok(())
     );
 }

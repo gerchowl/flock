@@ -62,13 +62,20 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
             return false;
         };
+        let floor = Duration::from_secs(self.state.config.session.self_compact_min_interval_secs);
         let Some(terminal) = self.terminal_mut_for_pane(ws_idx, pane_id) else {
             return false;
         };
         if terminal.armed_self_compact.is_some() {
             return false;
         }
-        terminal.armed_self_compact = Some(ArmedSelfCompact::new(continuation, now));
+        if terminal
+            .last_self_compact_completed
+            .is_some_and(|last| now.saturating_duration_since(last) < floor)
+        {
+            return false;
+        }
+        terminal.armed_self_compact = Some(ArmedSelfCompact::new(continuation));
         crate::logging::self_compact_armed(pane, terminal_continuation_len(terminal));
         true
     }
@@ -143,7 +150,16 @@ impl App {
                 }
             }
         }
-        self.type_self_compact_continuation(pane, ws_idx, pane_id, now);
+        // Advance the phase only. Typing happens on a later tick, behind the
+        // gates: Claude Code auto-compacts MID-TURN, so a confirmation can
+        // arrive with the agent still working, and the prompt box may hold a
+        // draft. Typing from here would append a handoff prompt to whatever
+        // the agent is part-way through typing.
+        if let Some(terminal) = self.terminal_mut_for_pane(ws_idx, pane_id) {
+            if let Some(armed) = terminal.armed_self_compact.as_mut() {
+                armed.compaction_confirmed(now);
+            }
+        }
     }
 
     /// The loop tick — mirrored in both loops (#25). An arming waiting for its
@@ -155,14 +171,14 @@ impl App {
             return;
         }
         for (pane, ws_idx, pane_id) in self.armed_self_compact_panes() {
-            match self.decide_self_compact(ws_idx, pane_id, now) {
+            match self.decide_self_compact(&pane, ws_idx, pane_id, now) {
                 SelfCompactDecision::Suppressed(reason) => {
                     crate::logging::self_compact_suppressed(&pane, reason);
                 }
                 SelfCompactDecision::CompactTyped => {
                     crate::logging::self_compact_typed(&pane);
                 }
-                SelfCompactDecision::Submitted => {}
+                SelfCompactDecision::Submitted | SelfCompactDecision::ContinuationTyped => {}
                 SelfCompactDecision::Abandoned(reason) => self.abort_self_compact(&pane, reason),
             }
         }
@@ -224,6 +240,7 @@ impl App {
 
     fn decide_self_compact(
         &mut self,
+        pane: &str,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         now: Instant,
@@ -252,24 +269,52 @@ impl App {
                     }
                     return SelfCompactDecision::Suppressed("submit_pending");
                 }
-                self.submit_self_compact(ws_idx, pane_id, &armed, now)
+                self.submit_self_compact(pane, ws_idx, pane_id, &armed, now)
             }
-            SelfCompactPhase::Armed => self.type_self_compact_command(ws_idx, pane_id, now),
+            // Both of these WRITE into the pane, so both go through the same
+            // gates: idle, settled, operator-quiet, empty prompt box. That is
+            // what makes the auto-compact path safe — Claude Code compacts
+            // itself mid-turn, so a confirmation can arrive with the agent
+            // working, and typing then would be typing at a working agent.
+            SelfCompactPhase::Armed => {
+                self.type_when_ready(pane, ws_idx, pane_id, now, Write::CompactCommand)
+            }
+            SelfCompactPhase::CompactDone => {
+                self.type_when_ready(pane, ws_idx, pane_id, now, Write::Continuation)
+            }
         }
     }
 
-    /// Type `/compact` into a pane that has genuinely stopped.
+    /// Type one of the sequence's two writes into a pane that has genuinely
+    /// stopped, behind every gate, and nothing if any of them says no.
     ///
-    /// The gates are the idle wake's, deliberately: the agent armed this
-    /// mid-turn, so the only safe moment to type is the one the wake already
-    /// knows how to recognise — freshly `Idle`, settled, a quiet window since
-    /// any operator keystroke, and an empty prompt box so the command cannot be
-    /// appended to a half-typed human prompt.
-    fn type_self_compact_command(
+    /// The gates are the idle wake's, deliberately. Both writes land in a
+    /// prompt box a human may be sitting at, and both are text nobody can take
+    /// back once submitted:
+    ///
+    /// - the agent has been idle for a settle window, and the screen positively
+    ///   shows its idle prompt, read recently — an unreadable screen or a hook
+    ///   that went quiet (#309) is not idle;
+    /// - no operator keystroke reached the pane inside a quiet window;
+    /// - the prompt box on screen is empty. A draft left sitting there would be
+    ///   submitted together with what flock types, which is the one outcome
+    ///   that cannot be undone. Claude Code auto-compacting MID-TURN is exactly
+    ///   how this gate earns its keep: the confirmation arrives while the agent
+    ///   is working, and without the box check flock would append a handoff
+    ///   prompt to whatever the agent is part-way through typing.
+    /// - the idle wake (ADR-0018 §2) has nothing in flight for this pane, so two
+    ///   flock-authored submissions cannot land in the same gap and be
+    ///   submitted as one line.
+    ///
+    /// Every gate is re-checked in the same call that types, with nothing
+    /// between the last check and the write.
+    fn type_when_ready(
         &mut self,
+        pane: &str,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         now: Instant,
+        write: Write,
     ) -> SelfCompactDecision {
         let settle = self.self_compact_settle();
         let Some(terminal) = self.terminal_for_pane(ws_idx, pane_id) else {
@@ -277,10 +322,13 @@ impl App {
         };
         // The verb refuses an agent that cannot compact itself, so this should
         // be unreachable. It is a safety net rather than a gate because
-        // dropping a whole arming — an agent's written handoff prompt — is not
-        // a consequence a detection change should be able to cause.
+        // dropping a whole arming — an agent's written handoff prompt — is not a
+        // consequence a detection change should be able to cause.
         if !crate::agent_self_compact::agent_can_self_compact(terminal.effective_known_agent()) {
             return SelfCompactDecision::Suppressed("cannot_self_compact");
+        }
+        if self.idle_wake.in_flight(pane) {
+            return SelfCompactDecision::Suppressed("idle_wake_in_flight");
         }
         if let Some(blocker) = terminal.idle_wake_blocker(now, settle, self.self_compact_fresh()) {
             if blocker == "not_settled" {
@@ -300,9 +348,8 @@ impl App {
                 return SelfCompactDecision::Suppressed("operator_active");
             }
         }
-        // Quiet is not empty: a draft left sitting in the box would be
-        // submitted together with the command. Read the screen here, at the
-        // keystroke, never on an earlier tick.
+        // Quiet is not empty: a draft left in the box would be submitted with
+        // this. Read the screen here, at the keystroke, never on an earlier tick.
         let agent = terminal.effective_known_agent();
         match agent
             .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
@@ -312,7 +359,23 @@ impl App {
             None => return SelfCompactDecision::Suppressed("no_prompt_box"),
         }
 
-        let bytes = super::api_helpers::encode_api_text(runtime, COMPACT_COMMAND);
+        let Some(terminal) = self.terminal_for_pane(ws_idx, pane_id) else {
+            return SelfCompactDecision::Abandoned(SelfCompactAbort::PaneGone);
+        };
+        let text = match write {
+            Write::CompactCommand => COMPACT_COMMAND.to_string(),
+            Write::Continuation => {
+                let Some(continuation) = terminal
+                    .armed_self_compact
+                    .as_ref()
+                    .map(|armed| armed.continuation.clone())
+                else {
+                    return SelfCompactDecision::Suppressed("not_armed");
+                };
+                continuation
+            }
+        };
+        let bytes = super::api_helpers::encode_api_text(runtime, &text);
         if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
             return SelfCompactDecision::Abandoned(SelfCompactAbort::WriteFailed);
         }
@@ -323,18 +386,36 @@ impl App {
         let Some(armed) = terminal.armed_self_compact.as_mut() else {
             return SelfCompactDecision::Suppressed("not_armed");
         };
-        // Not submitted by the write above: text and a carriage return in one
-        // read are a paste with a newline in it, not a submitted command
-        // (#362). The Enter is its own write, one gap later.
-        armed.compact_requested(now, gap);
+        let typed_bytes = text.len();
+        match write {
+            Write::CompactCommand => armed.compact_requested(now, gap),
+            Write::Continuation => armed.continuation_typed(now, gap),
+        }
+        if write == Write::Continuation {
+            // The agent's prompt is now a prompt in its own session, so it
+            // belongs in the pane's prompt history: that panel is where an
+            // operator looks to answer "what did it tell itself to do next",
+            // which is the whole reason this feature exists.
+            terminal.record_prompt_at(text, now);
+        }
         self.note_self_compact_deadline(now + gap);
-        SelfCompactDecision::CompactTyped
+        match write {
+            Write::CompactCommand => {
+                crate::logging::self_compact_typed(pane);
+                SelfCompactDecision::CompactTyped
+            }
+            Write::Continuation => {
+                crate::logging::self_compact_continued(pane, typed_bytes);
+                SelfCompactDecision::ContinuationTyped
+            }
+        }
     }
 
     /// Press Enter on a write typed one gap ago — after checking, once more,
     /// that nothing changed underneath it.
     fn submit_self_compact(
         &mut self,
+        pane: &str,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         armed: &ArmedSelfCompact,
@@ -368,59 +449,26 @@ impl App {
         let Some(terminal) = self.terminal_mut_for_pane(ws_idx, pane_id) else {
             return SelfCompactDecision::Abandoned(SelfCompactAbort::PaneGone);
         };
-        if let Some(armed) = terminal.armed_self_compact.as_mut() {
-            armed.submit_at = None;
+        let completing = terminal
+            .armed_self_compact
+            .as_ref()
+            .is_some_and(|armed| armed.phase == SelfCompactPhase::ContinueTyped);
+        if completing {
+            // The last thing the sequence does, and the arming is DROPPED rather
+            // than reset. Left in place it logs every SUCCESS as a
+            // `continuation_timeout` once its clock runs out, and refuses the
+            // next arming as `pending` until then — so a feature meant to let an
+            // agent keep working would wedge its own pane after one compaction.
+            let bytes = terminal
+                .armed_self_compact
+                .take()
+                .map_or(0, |armed| armed.continuation.len());
+            terminal.last_self_compact_completed = Some(now);
+            crate::logging::self_compact_completed(pane, bytes);
+        } else if let Some(armed) = terminal.armed_self_compact.as_mut() {
+            armed.compact_submitted(now);
         }
         SelfCompactDecision::Submitted
-    }
-
-    /// Type the agent's own handoff prompt as its next turn.
-    ///
-    /// Reached only from the harness's own `session_start_source: compact`
-    /// report, so unlike the `/compact` above this write is not racing a turn
-    /// boundary: the compaction is already done and the session is fresh.
-    fn type_self_compact_continuation(
-        &mut self,
-        pane: &str,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        now: Instant,
-    ) {
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            self.abort_self_compact(pane, SelfCompactAbort::PaneGone);
-            return;
-        };
-        let Some(continuation) = self
-            .terminal_for_pane(ws_idx, pane_id)
-            .and_then(|terminal| terminal.armed_self_compact.as_ref())
-            .map(|armed| armed.continuation.clone())
-        else {
-            return;
-        };
-        let bytes = continuation.len();
-        let encoded = super::api_helpers::encode_api_text(runtime, &continuation);
-        if runtime
-            .try_send_flock_authored(Bytes::from(encoded))
-            .is_err()
-        {
-            self.abort_self_compact(pane, SelfCompactAbort::WriteFailed);
-            return;
-        }
-        let gap = crate::cli::pane::PANE_RUN_SUBMIT_GAP;
-        // The agent's prompt is now a prompt in its own session, so it belongs
-        // in the pane's prompt history: that panel is where an operator looks
-        // to answer "what did it tell itself to do next", which is the whole
-        // reason this feature exists.
-        let Some(terminal) = self.terminal_mut_for_pane(ws_idx, pane_id) else {
-            self.abort_self_compact(pane, SelfCompactAbort::PaneGone);
-            return;
-        };
-        if let Some(armed) = terminal.armed_self_compact.as_mut() {
-            armed.continuation_typed(now, gap);
-        }
-        terminal.record_prompt_at(continuation, now);
-        crate::logging::self_compact_continued(pane, bytes);
-        self.note_self_compact_deadline(now + gap);
     }
 
     /// Drop an arming, and say why.
@@ -479,6 +527,30 @@ impl App {
     }
 }
 
+impl App {
+    /// Test-only: reach a pane's terminal for assertions the App-level tests
+    /// need to make directly. Kept beside the production lookups rather than
+    /// reimplemented per test, so a test cannot drift onto a different path
+    /// than the one it is testing.
+    #[cfg(test)]
+    pub(crate) fn terminal_mut_for_test(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> &mut crate::terminal::TerminalState {
+        self.terminal_mut_for_pane(ws_idx, pane_id)
+            .expect("test pane has a terminal")
+    }
+
+    /// Test-only: pretend the idle wake has a sentence typed and waiting for
+    /// its Enter, so the mutual exclusion can be exercised without sending a
+    /// real message through the mailbox.
+    #[cfg(test)]
+    pub(crate) fn test_arm_idle_wake_in_flight(&mut self, pane: &str) {
+        crate::app::idle_wake::test_arm_in_flight(&mut self.idle_wake, pane);
+    }
+}
+
 fn terminal_continuation_len(terminal: &crate::terminal::TerminalState) -> usize {
     terminal
         .armed_self_compact
@@ -502,8 +574,16 @@ fn press_enter(runtime: &crate::terminal::TerminalRuntime) -> bool {
 enum SelfCompactDecision {
     Suppressed(&'static str),
     CompactTyped,
+    ContinuationTyped,
     Submitted,
     Abandoned(SelfCompactAbort),
+}
+
+/// Which of the sequence's two writes the gated writer is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Write {
+    CompactCommand,
+    Continuation,
 }
 
 /// Re-exported so the verb's handler and its tests agree on the cap.

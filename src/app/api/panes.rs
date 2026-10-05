@@ -1067,6 +1067,35 @@ impl App {
                  Pass `abort: true` to drop an armed self-compaction instead.",
             );
         };
+        // B4: the prompt reaches a real PTY, and `encode_api_text` does not
+        // escape what it wraps — so this is the boundary that decides whether
+        // the verb is an arming or a send-text. Refused, not scrubbed: a
+        // scrubbed success would tell the agent it saved a plan it silently
+        // lost part of.
+        if let Err(problem) = crate::agent_self_compact::check_continuation(&continuation) {
+            return encode_error(
+                id,
+                "invalid_params",
+                match problem {
+                    crate::agent_self_compact::ContinuationProblem::Control => {
+                        "`continuation` must be plain text: a control byte or escape \
+                         sequence would either end the paste early and be read as \
+                         keystrokes, or be sent raw. Write what you mean instead."
+                    }
+                    crate::agent_self_compact::ContinuationProblem::LineBreak => {
+                        "`continuation` must be one line. An embedded newline submits \
+                         the prompt early, and a submit nobody gated is exactly what \
+                         the empty-prompt-box gate exists to prevent. Put the long \
+                         version in a file and name the file."
+                    }
+                    crate::agent_self_compact::ContinuationProblem::HarnessCommand => {
+                        "`continuation` must not start with `/` or `!`: the harness \
+                         executes those as a command rather than reading them as \
+                         your instructions. Rephrase it as a sentence."
+                    }
+                },
+            );
+        }
         if continuation.len() > super::super::self_compact::CONTINUATION_CAP {
             return encode_error(
                 id,

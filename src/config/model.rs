@@ -384,6 +384,18 @@ pub struct SessionConfig {
     /// prompt box, so its own handoff prompt is still readable in the
     /// transcript.
     pub self_compact_timeout_ms: u64,
+    /// How long after a finished self-compaction the same pane may not arm
+    /// another, in seconds. Default: 300.
+    ///
+    /// The sequence is compact, resume, and an agent that resumes by arming
+    /// again can loop: compact → continue → compact, with nobody present. On
+    /// its own that is the agent's choice, and an agent short of context is
+    /// entitled to compact twice. What it must not do is do so in a tight cycle
+    /// with no work in between — and a harness whose Stop hook keeps pushing
+    /// gives it no natural gap, so the bound has to come from flock. Five
+    /// minutes is not a limit on how often a session may compact; it is a floor
+    /// on how fast, which is what separates "context filled again" from a loop.
+    pub self_compact_min_interval_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -397,6 +409,7 @@ impl Default for SessionConfig {
             self_compact_fresh_ms: 2_500,
             self_compact_operator_quiet_ms: 15_000,
             self_compact_timeout_ms: 120_000,
+            self_compact_min_interval_secs: 300,
         }
     }
 }

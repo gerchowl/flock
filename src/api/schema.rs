@@ -1387,9 +1387,17 @@ pub struct PaneSendKeysParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneArmSelfCompactParams {
     /// Whose session to compact. Omitted means the calling agent's own pane,
-    /// resolved by socket-peer process ancestry exactly like `msg.mute`. There
-    /// is no way to arm a *different* pane: a self-compaction is only
-    /// meaningful for the session whose context is full.
+    /// resolved by socket-peer process ancestry exactly like `msg.mute`.
+    ///
+    /// Naming another pane is not the escape hatch it looks like: for a caller
+    /// that IS inside a pane — which is every agent — an id that is not its own
+    /// resolves back to its own pane by ancestry, so `pane` cannot be used to
+    /// reach a neighbour. A caller with no ancestry evidence at all keeps the
+    /// claim it named, which is what lets an operator or a test arm a pane from
+    /// outside one. Either way the continuation is checked by
+    /// [`crate::agent_self_compact::check_continuation`] before anything is
+    /// typed, so this verb is an arming and not a way to put arbitrary bytes
+    /// into another session's prompt box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
     /// The agent's own handoff prompt, in its own words — what it wants to be
