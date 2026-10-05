@@ -579,7 +579,7 @@ fn render_mobile_switcher_content(
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
-        let detail = mobile_agent_detail(entry);
+        let detail = mobile_agent_detail(app, entry);
         render_two_line_item(
             frame,
             viewport,
@@ -616,7 +616,15 @@ fn render_mobile_switcher_content(
     }
 }
 
-fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
+/// The mobile switcher's second line.
+///
+/// The agent field goes through [`AppState::agent_field_label`] like the desktop
+/// panel's does (#542). This function used to push `entry.agent_label` raw,
+/// which made the narrow-screen list a THIRD answer to the same question: it
+/// showed `pi` where the sidebar showed the symbol, and it showed a caller's
+/// invented name — the reported bug — in every mode. An `AppState` argument is
+/// the cost of not having a fourth surface that disagrees.
+fn mobile_agent_detail(app: &crate::app::AppState, entry: &AgentPanelEntry) -> String {
     let mut parts = Vec::new();
     if let Some(tab_label) = entry.primary_tab_label.as_deref() {
         parts.push(tab_label.to_string());
@@ -630,8 +638,13 @@ fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
         .cloned()
         .unwrap_or_else(|| super::status::state_label(entry.state, entry.seen).to_string());
     parts.push(status);
-    if let Some(agent_label) = entry.agent_label.as_deref() {
-        parts.push(agent_label.to_string());
+    let agent_field = app.agent_field_label(
+        app.agents_agent_label(),
+        entry.agent,
+        entry.agent_label.as_deref(),
+    );
+    if !agent_field.is_empty() {
+        parts.push(agent_field);
     }
     if let Some(custom_status) = entry.custom_status.as_deref() {
         parts.push(custom_status.to_string());
@@ -944,6 +957,10 @@ fn truncate(text: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn app_for_mobile_test() -> crate::app::state::AppState {
+        crate::app::state::AppState::test_new()
+    }
+
     fn agent_entry(primary_tab_label: Option<&str>, agent_label: Option<&str>) -> AgentPanelEntry {
         AgentPanelEntry {
             ws_idx: 0,
@@ -967,22 +984,48 @@ mod tests {
         }
     }
 
+    /// `pi` resolves to the symbol in the default mode, so the narrow-screen
+    /// list agrees with the sidebar instead of showing a third spelling. This
+    /// test MOVED when the field was routed through the resolver; leaving it on
+    /// `pi` would have pinned the disagreement in place.
     #[test]
-    fn mobile_agent_detail_includes_tab_context_when_available() {
+    fn mobile_agent_detail_uses_the_harness_symbol_like_the_sidebar() {
+        let mut app = app_for_mobile_test();
         let entry = agent_entry(Some("mobile-state"), Some("pi"));
 
-        assert_eq!(mobile_agent_detail(&entry), "  mobile-state · idle · pi");
+        assert_eq!(
+            mobile_agent_detail(&app, &entry),
+            format!(
+                "  mobile-state · idle · {}",
+                crate::agent_symbols::symbol(crate::detect::Agent::Pi)
+            )
+        );
+
+        // And the mode is the viewer's, so `name` mode still says `pi`.
+        app.config.ui.agents_agent_label = crate::config::AgentLabelConfig::Name;
+        assert_eq!(
+            mobile_agent_detail(&app, &entry),
+            "  mobile-state · idle · pi"
+        );
     }
 
     #[test]
     fn mobile_agent_detail_keeps_existing_compact_detail_without_tab_context() {
+        let app = app_for_mobile_test();
         let entry = agent_entry(None, Some("pi"));
 
-        assert_eq!(mobile_agent_detail(&entry), "  idle · pi");
+        assert_eq!(
+            mobile_agent_detail(&app, &entry),
+            format!(
+                "  idle · {}",
+                crate::agent_symbols::symbol(crate::detect::Agent::Pi)
+            )
+        );
     }
 
     #[test]
     fn mobile_agent_detail_appends_promoted_header_fields() {
+        let app = app_for_mobile_test();
         let mut entry = agent_entry(None, Some("pi"));
         entry.header_fields = vec![
             ("build".to_string(), "73%".to_string()),
@@ -990,8 +1033,11 @@ mod tests {
         ];
 
         assert_eq!(
-            mobile_agent_detail(&entry),
-            "  idle · pi · build 73% · pg up"
+            mobile_agent_detail(&app, &entry),
+            format!(
+                "  idle · {} · build 73% · pg up",
+                crate::agent_symbols::symbol(crate::detect::Agent::Pi)
+            )
         );
     }
 

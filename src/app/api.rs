@@ -2033,6 +2033,89 @@ mod tests {
         assert!(summary["status_age_secs"].as_u64().unwrap() >= 90);
     }
 
+    /// The peer half of #542, and the half the first round got wrong.
+    ///
+    /// `PaneDetail.agent_label` is a DISPLAY string, so for an agent named by an
+    /// MCP caller it is `"researcher"` — and sending that verbatim meant the
+    /// viewer could not parse a harness out of it and its default `symbol` mode
+    /// printed `researcher`. The wire has to carry the HARNESS, which the sender
+    /// already holds on the same `PaneDetail`.
+    ///
+    /// This starts where the value really starts: a terminal with a
+    /// caller-supplied name AND a detected harness, read back off the wire the
+    /// viewer actually consumes.
+    #[tokio::test]
+    async fn a_peers_summary_carries_the_harness_not_a_callers_name() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("flock");
+        workspace.cached_git_branch = Some("main".into());
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Claude);
+        // Exactly what `flock_agent_start` does when the calling model supplies
+        // one: `agent_name` outranks the detected harness in `pane_details`.
+        terminal.set_agent_name("researcher".into());
+        terminal.state = AgentState::Working;
+
+        let response = app.handle_peers_summary("req_peers".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let agent = &value["result"]["workspaces"][0]["agent"];
+        assert_eq!(
+            agent, "claude",
+            "the wire must carry the harness; a viewer cannot recover it from \
+             the caller's name"
+        );
+
+        // And the viewer resolves it to a glyph rather than printing the name.
+        let harness = crate::detect::parse_agent_label(agent.as_str().unwrap())
+            .or_else(|| crate::detect::harness_for_short_code(agent.as_str().unwrap()));
+        assert_eq!(harness, Some(Agent::Claude));
+    }
+
+    /// A pane with NO identifiable harness still has to say something — the
+    /// free-text label is the only thing there is, and dropping it would make a
+    /// remote row's agent field blank where it used to read.
+    #[tokio::test]
+    async fn a_peers_summary_falls_back_to_the_label_with_no_harness() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("flock")];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        // A named agent whose harness the detector has not identified — before
+        // detection, or from a source flock cannot parse.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("researcher".into());
+
+        let response = app.handle_peers_summary("req_peers".into());
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["workspaces"][0]["agent"], "researcher");
+    }
+
     fn notification_test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(

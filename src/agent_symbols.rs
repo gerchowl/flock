@@ -78,34 +78,21 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
-    /// Every glyph the registry can return, straight off the enum, so a new
-    /// variant cannot be added without this list noticing.
-    const ALL_AGENTS: &[Agent] = &[
-        Agent::Pi,
-        Agent::Claude,
-        Agent::Codex,
-        Agent::Gemini,
-        Agent::Cursor,
-        Agent::Antigravity,
-        Agent::Cline,
-        Agent::OpenCode,
-        Agent::GithubCopilot,
-        Agent::Kimi,
-        Agent::Kiro,
-        Agent::Droid,
-        Agent::Amp,
-        Agent::Grok,
-        Agent::Hermes,
-        Agent::Kilo,
-        Agent::Qodercli,
-    ];
-
+    /// Every glyph the registry can return, straight off the enum.
+    ///
+    /// Derived from [`Agent::ALL`] rather than hand-listed. This list used to
+    /// be spelled out here, and `the_tested_agent_list_covers_every_harness`
+    /// claimed to catch a variant missing from it — but it iterated the list
+    /// rather than the enum, so it could not. Add a variant, give `symbol()`
+    /// and `agent_label()` arms (both compile errors), leave it out of a
+    /// hand-written list, and every gate below would still pass over the other
+    /// sixteen. Deriving from the enum's own `ALL` removes the possibility.
     #[test]
     fn every_harness_symbol_is_one_cell_distinct_and_disjoint() {
         use std::collections::HashMap;
         let mut seen: HashMap<&str, &str> = HashMap::new();
-        for agent in ALL_AGENTS {
-            let glyph = symbol(*agent);
+        for agent in Agent::ALL {
+            let glyph = symbol(agent);
             assert_eq!(
                 glyph.width(),
                 1,
@@ -121,10 +108,10 @@ mod tests {
                 !glyph.chars().any(char::is_control),
                 "{glyph:?} for {agent:?} carries a control character"
             );
-            if let Some(other) = seen.insert(glyph, crate::detect::agent_label(*agent)) {
+            if let Some(other) = seen.insert(glyph, crate::detect::agent_label(agent)) {
                 panic!(
                     "{glyph:?} is claimed by both {other} and {}",
-                    crate::detect::agent_label(*agent)
+                    crate::detect::agent_label(agent)
                 );
             }
         }
@@ -139,13 +126,13 @@ mod tests {
         const STATE_GLYPHS: &[&str] = &["◉", "●", "✓", "○"];
         for glyph in STATE_GLYPHS {
             assert!(
-                !ALL_AGENTS.iter().any(|agent| symbol(*agent) == *glyph),
+                !Agent::ALL.iter().any(|agent| symbol(*agent) == *glyph),
                 "{glyph:?} is already the agents panel's STATE glyph"
             );
         }
         for frame in crate::ui::SPINNERS {
             assert!(
-                !ALL_AGENTS.iter().any(|agent| symbol(*agent) == *frame),
+                !Agent::ALL.iter().any(|agent| symbol(*agent) == *frame),
                 "{frame:?} is a spinner frame"
             );
         }
@@ -156,9 +143,9 @@ mod tests {
     /// renders twice and reads as one fact stated twice.
     #[test]
     fn agent_symbols_are_disjoint_from_the_server_icon_registry() {
-        for agent in ALL_AGENTS {
-            let label = crate::detect::agent_label(*agent);
-            let glyph = symbol(*agent);
+        for agent in Agent::ALL {
+            let label = crate::detect::agent_label(agent);
+            let glyph = symbol(agent);
             for name in crate::server_icons::known_names() {
                 if let Some(server_glyph) = crate::server_icons::glyph(name) {
                     assert_ne!(
@@ -204,16 +191,19 @@ mod tests {
         }
     }
 
-    /// The enum is the registry's key, so a new variant with no arm is a
-    /// compile error — good — but a variant dropped from this list would
-    /// silently go untested. Pin the list against the enum.
+    /// Every harness's LABEL round-trips through the parser back to itself.
+    ///
+    /// This is the load-bearing property for the two paths that recover a
+    /// harness from text — a remote row whose peer summary carried a label,
+    /// and an alias naming a harness. `Agent::ALL` is the source, so this
+    /// cannot pass while skipping a variant.
     #[test]
-    fn the_tested_agent_list_covers_every_harness() {
-        for agent in ALL_AGENTS {
-            let label = crate::detect::agent_label(*agent);
+    fn every_harness_label_round_trips_through_the_parser() {
+        for agent in Agent::ALL {
+            let label = crate::detect::agent_label(agent);
             assert_eq!(
                 crate::detect::parse_agent_label(label),
-                Some(*agent),
+                Some(agent),
                 "{label:?} does not parse back to its own variant"
             );
         }

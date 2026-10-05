@@ -40,7 +40,7 @@ pub(crate) use self::{
         handle_resize_key,
     },
     navigate::terminal_direct_navigation_action,
-    settings::{open_settings_at, SidebarRow, SIDEBAR_ROWS},
+    settings::open_settings_at,
 };
 use super::state::{AppState, Mode};
 use super::App;

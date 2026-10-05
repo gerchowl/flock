@@ -12,8 +12,7 @@ use super::widgets::{
 };
 use crate::{
     app::{
-        input::{SidebarRow, SIDEBAR_ROWS},
-        state::{ExperimentSetting, IdleSetting, Palette},
+        state::{ExperimentSetting, IdleSetting, Palette, SidebarRow, SIDEBAR_ROWS},
         AppState,
     },
     config::ToastDelivery,

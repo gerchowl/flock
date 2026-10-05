@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::detect::{Agent, AgentState};
@@ -7,6 +8,31 @@ use crate::terminal::{TerminalId, TerminalState};
 use super::{Tab, Workspace};
 
 /// Detail info for a single pane, used by the agent detail panel.
+/// One pane's attention signals: enough to decide which pane a row speaks FOR,
+/// and what that pane's agent field should say (#542).
+///
+/// A named struct rather than a four-tuple because a tuple of
+/// `(AgentState, bool, Option<Agent>, Option<&str>)` is where the two halves get
+/// swapped by accident, and a swapped pair reads as a plausible answer rather
+/// than as a type error. See [`Tab::pane_signals`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneSignal<'a> {
+    pub state: AgentState,
+    pub seen: bool,
+    /// The harness, structurally — `None` before detection or for a
+    /// non-agent terminal.
+    pub harness: Option<Agent>,
+    /// The agent's DISPLAY label. Free text: for an agent spawned through the
+    /// MCP server this is whatever the calling model called it.
+    ///
+    /// A `Cow` rather than `&str` because the chain's first arm is
+    /// `effective_display_agent()`, which hands back an owned `String` from a
+    /// TTL'd metadata store. The overwhelmingly common arms borrow off
+    /// `terminal`, so the owned case costs nothing until an integration
+    /// actually reports a display agent.
+    pub label: Option<Cow<'a, str>>,
+}
+
 pub struct PaneDetail {
     pub pane_id: PaneId,
     pub tab_idx: usize,
@@ -58,17 +84,30 @@ impl Tab {
     /// As [`Tab::pane_states`], plus each pane's HARNESS (#542).
     ///
     /// The spaces list draws a row's state and its agent identity from ONE
-    /// leading pane, and it can only do that if it can see the harness beside
-    /// the state — the same pairing this iterator provides. Allocation-free,
-    /// unlike [`Tab::pane_details`], because a space row is redrawn every frame.
+    /// leading pane, and both must come from that pane or the row names two
+    /// different agents. So the tuple carries the DISPLAY LABEL as well as the
+    /// enum — passing the harness alone made the spaces section resolve with
+    /// `label: None`, which silently disabled both the `agent_aliases` lookup
+    /// and every label fallback, so the same pane read `claude` in the agents
+    /// band and nothing at all in the spaces list.
+    ///
+    /// Both are borrows off `terminal` and cost no allocation, unlike
+    /// [`Tab::pane_details`] which is what the label is otherwise read from —
+    /// a space row is redrawn every frame, and an owned `String` per pane per
+    /// frame is a cost the display does not need to pay.
     pub fn pane_signals<'a>(
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
-    ) -> impl Iterator<Item = (AgentState, bool, Option<Agent>)> + 'a {
+    ) -> impl Iterator<Item = PaneSignal<'a>> + 'a {
         self.panes.values().filter_map(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .map(|terminal| (terminal.state, pane.seen, terminal.effective_known_agent()))
+                .map(|terminal| PaneSignal {
+                    state: terminal.state,
+                    seen: pane.seen,
+                    harness: terminal.effective_known_agent(),
+                    label: terminal.display_agent_label(),
+                })
         })
     }
 
@@ -129,12 +168,12 @@ impl Workspace {
         self.tabs.iter().flat_map(|tab| tab.pane_states(terminals))
     }
 
-    /// As [`Workspace::pane_states`], plus each pane's harness (#542) — see
-    /// [`Tab::pane_signals`].
+    /// As [`Workspace::pane_states`], plus each pane's harness and display
+    /// label (#542) — see [`Tab::pane_signals`].
     pub fn pane_signals<'a>(
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
-    ) -> impl Iterator<Item = (AgentState, bool, Option<Agent>)> + 'a {
+    ) -> impl Iterator<Item = PaneSignal<'a>> + 'a {
         self.tabs.iter().flat_map(|tab| tab.pane_signals(terminals))
     }
 

@@ -64,6 +64,36 @@ pub enum Agent {
     Qodercli,
 }
 
+impl Agent {
+    /// Every harness, in declaration order (#542).
+    ///
+    /// The vocabulary is a closed enum, so "all of them" is knowable at compile
+    /// time — and three places need it: the short-code inverse, the symbol
+    /// registry's gate, and its coverage test. Each used to hand-write its own
+    /// 17-element list, which meant a variant added to the enum could be left
+    /// out of a list and a test would still pass over the other sixteen. There
+    /// is one list, and it lives next to the type it enumerates.
+    pub const ALL: [Agent; 17] = [
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Codex,
+        Agent::Gemini,
+        Agent::Cursor,
+        Agent::Antigravity,
+        Agent::Cline,
+        Agent::OpenCode,
+        Agent::GithubCopilot,
+        Agent::Kimi,
+        Agent::Kiro,
+        Agent::Droid,
+        Agent::Amp,
+        Agent::Grok,
+        Agent::Hermes,
+        Agent::Kilo,
+        Agent::Qodercli,
+    ];
+}
+
 pub fn agent_label(agent: Agent) -> &'static str {
     match agent {
         Agent::Pi => "pi",
@@ -121,27 +151,31 @@ pub fn short_agent_label(label: &str) -> &str {
 /// "no code" from "this IS the code". Keying on the enum separates those two
 /// cases, which is what lets the sidebar fall back to the harness's code
 /// instead of printing an arbitrary string in a code's place.
+///
+/// DERIVED, not a second copy: [`agent_label`] and [`short_agent_label`] are
+/// both already total over the harness vocabulary, so the enum-keyed answer is
+/// `short_agent_label(agent_label(agent))` and cannot drift from the text-keyed
+/// one. Writing this out as a 17-arm `match` is how the two fell out of step in
+/// the first place. `agent_label` returns `&'static str`, so the borrow is
+/// `'static` too and the signature stays allocation-free.
 pub fn short_agent_label_for(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Claude => "cc",
-        Agent::Codex => "cd",
-        Agent::GithubCopilot => "cp",
-        Agent::Gemini => "gm",
-        Agent::Cursor => "cu",
-        Agent::Antigravity => "ag",
-        Agent::Cline => "cl",
-        Agent::OpenCode => "oc",
-        Agent::Kimi => "km",
-        Agent::Kiro => "kr",
-        Agent::Droid => "dr",
-        Agent::Grok => "gk",
-        Agent::Hermes => "hm",
-        Agent::Kilo => "kl",
-        Agent::Amp => "am",
-        Agent::Qodercli => "qd",
-        // `pi` is its own code — two letters would read as a typo of another.
-        Agent::Pi => "pi",
-    }
+    short_agent_label(agent_label(agent))
+}
+
+/// The harness a SHORT CODE stands for — the inverse of
+/// [`short_agent_label_for`] (#551).
+///
+/// This exists for version skew, not for lookups: a peer running a build from
+/// before the peer summary carried a full label sends the two-letter code
+/// instead, and the viewer has to recognise it or the default `symbol` mode
+/// prints a literal `cc` where a glyph belongs. Keyed on the enum rather than
+/// derived, because `short_agent_label` maps a name to a code many-to-one in
+/// general and there is no inverse to compose.
+pub fn harness_for_short_code(code: &str) -> Option<Agent> {
+    Agent::ALL
+        .iter()
+        .copied()
+        .find(|agent| short_agent_label_for(*agent) == code.trim())
 }
 
 pub fn parse_agent_label(agent: &str) -> Option<Agent> {
@@ -2920,51 +2954,54 @@ Which framework should we use?\n\
         assert_eq!(short_agent_label("my-custom-name"), "my-custom-name");
     }
 
-    /// Two tables, one vocabulary (#542): the text lookup and the enum lookup
-    /// must answer the same question the same way, or a row whose label happens
-    /// to be a harness's own label would render differently from the same row
-    /// reached through its harness. Pinned over every variant, so a harness
-    /// added to one and not the other fails here rather than in a screenshot.
+    /// `amp` is the one harness that had NO code, and it is called out by name
+    /// because deriving `short_agent_label_for` does not fix that class of bug:
+    /// the derivation is faithful, so a harness missing from the text table
+    /// faithfully hands back its own label, and a renamed Amp agent then has
+    /// nothing for the resolver to fall back to and prints the caller's name
+    /// where a code belongs. `pi` is the same shape DELIBERATELY — `pi` is its
+    /// own code, pinned above — so the check cannot be "the code differs from
+    /// the label"; it has to be per-harness.
     #[test]
-    fn the_two_short_label_tables_never_drift() {
-        const ALL: &[Agent] = &[
-            Agent::Pi,
-            Agent::Claude,
-            Agent::Codex,
-            Agent::Gemini,
-            Agent::Cursor,
-            Agent::Antigravity,
-            Agent::Cline,
-            Agent::OpenCode,
-            Agent::GithubCopilot,
-            Agent::Kimi,
-            Agent::Kiro,
-            Agent::Droid,
-            Agent::Amp,
-            Agent::Grok,
-            Agent::Hermes,
-            Agent::Kilo,
-            Agent::Qodercli,
-        ];
-        for agent in ALL {
-            let label = agent_label(*agent);
-            assert_eq!(
-                short_agent_label(label),
-                short_agent_label_for(*agent),
-                "{label:?} resolves to two different codes"
-            );
-        }
-        // And no two harnesses may share a code, or the sidebar's whole
-        // point — telling rows apart at a glance — is lost.
-        let mut codes: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for agent in ALL {
-            let code = short_agent_label_for(*agent);
-            if let Some(other) = codes.insert(code, agent_label(*agent)) {
-                panic!(
-                    "code {code:?} is shared by {other:?} and {:?}",
-                    agent_label(*agent)
-                );
+    fn every_harness_has_a_short_code() {
+        assert_eq!(
+            short_agent_label("amp"),
+            "am",
+            "regression: amp had no code"
+        );
+        assert_eq!(short_agent_label_for(Agent::Amp), "am");
+        assert_eq!(short_agent_label("claude"), "cc");
+        assert_eq!(short_agent_label_for(Agent::Claude), "cc");
+        assert_eq!(short_agent_label_for(Agent::Pi), "pi", "pi is its own code");
+    }
+
+    /// Two harnesses sharing a code would make the sidebar's whole purpose —
+    /// telling rows apart at a glance — impossible.
+    #[test]
+    fn no_two_harnesses_share_a_short_code() {
+        let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for agent in Agent::ALL {
+            let label = agent_label(agent);
+            let code = short_agent_label_for(agent);
+            if let Some(other) = seen.insert(code, label) {
+                panic!("code {code:?} is shared by {other:?} and {label:?}");
             }
         }
+    }
+
+    /// The inverse really is an inverse, over the whole vocabulary — otherwise
+    /// an older peer's `cc` renders as a literal `cc` in `symbol` mode.
+    #[test]
+    fn the_short_code_inverse_covers_every_harness() {
+        for agent in Agent::ALL {
+            assert_eq!(
+                harness_for_short_code(short_agent_label_for(agent)),
+                Some(agent),
+                "{} has no inverse",
+                agent_label(agent)
+            );
+        }
+        assert_eq!(harness_for_short_code("nonsense"), None);
+        assert_eq!(harness_for_short_code(""), None);
     }
 }

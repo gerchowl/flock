@@ -20,7 +20,7 @@ pub(crate) mod directory;
 pub(crate) mod float;
 pub(crate) mod handoffs;
 mod ids;
-pub(crate) mod input;
+mod input;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;

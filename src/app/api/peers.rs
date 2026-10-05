@@ -935,14 +935,7 @@ fn workspace_peer_summary(
     let (agent, status_age_secs, activity) = leading
         .map(|detail| {
             (
-                // The full label, not the short code (#542). This used to bake
-                // the code in HERE, on the sending side, which made the peer's
-                // display mode the sender's choice: a viewer asking for `name`
-                // or `symbol` could not be served, because the label it needed
-                // had already been collapsed to two characters in transit. Same
-                // argument as `server_icons`: the VIEWER resolves the display
-                // form, so the wire carries the label and nothing else.
-                Some(detail.agent_label.clone()),
+                Some(agent_label_on_the_wire(&detail)),
                 detail
                     .state_changed_at
                     .map(|changed| changed.elapsed().as_secs()),
@@ -1002,14 +995,39 @@ fn workspace_peer_summary(
                 Some(crate::api::schema::PeerAgentSummary {
                     agent_id: terminal.agent_id.to_string(),
                     pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
-                    // Full label, not the short code — see the workspace
-                    // summary above and #542.
-                    agent: Some(detail.agent_label.clone()),
+                    agent: Some(agent_label_on_the_wire(&detail)),
                     status: super::super::api_helpers::pane_agent_status(detail.state, detail.seen),
                 })
             })
             .collect(),
     }
+}
+
+/// What a peer summary says the agent IS, rather than what it is called (#542).
+///
+/// `PaneDetail.agent_label` is a *display* string: `effective_display_agent()`
+/// first, then `terminal.agent_name`, then the canonical label. For an agent
+/// spawned through `flock_agent_start` with a caller-supplied name, that is the
+/// calling model's invention — so sending it verbatim means the viewer receives
+/// `"researcher"`, cannot parse a harness out of it, and its default `symbol`
+/// mode prints `researcher`. That is #542 again, on every remote row.
+///
+/// The sender holds the fact the viewer needs: `detail.agent` is the harness the
+/// detector or hook identified. So the wire carries the harness's label, and the
+/// free-text label is the fallback for a pane with no identifiable harness —
+/// which is all the viewer could have done with it anyway.
+///
+/// The cost, stated rather than hidden: a remote agent's CUSTOM name is not
+/// carried for display, so a viewer in `name` mode sees the harness where the
+/// server itself shows the name. The name still resolves for addressing
+/// (`agent get`, `agent send`) — it just is not what a neighbour draws. That is
+/// the bargain `server_icons` makes too, where only a name crosses the wire and
+/// the glyph is the receiver's to choose.
+fn agent_label_on_the_wire(detail: &crate::workspace::PaneDetail) -> String {
+    detail
+        .agent
+        .map(|agent| crate::detect::agent_label(agent).to_string())
+        .unwrap_or_else(|| detail.agent_label.clone())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::{
     app::{
         state::{
             AgentLabelSetting, AppState, ExperimentSetting, IdleSetting, SettingsSection,
-            SidebarGapSetting, THEME_NAMES,
+            SidebarGapSetting, SIDEBAR_ROWS, THEME_NAMES,
         },
         App, Mode,
     },
@@ -39,34 +39,10 @@ fn idle_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
     ))
 }
 
-/// One row of the Sidebar settings section. The two gap steppers and the two
-/// agent-field modes (#542) are different kinds of setting, so the row index
-/// has to resolve to a KIND before it can resolve to a value — a single
-/// `SidebarGapSetting`-shaped index would silently type `agents_agent_label`
-/// as a row gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SidebarRow {
-    Gap(SidebarGapSetting),
-    AgentLabel(AgentLabelSetting),
-}
-
-/// Every Sidebar row, in render order — the single list the renderer draws, the
-/// key handler cycles and the mouse hit-test resolves. One list, so a row cannot
-/// exist in one of the three and not the others.
-pub(crate) const SIDEBAR_ROWS: [SidebarRow; 4] = [
-    SidebarRow::Gap(SidebarGapSetting::RowGap),
-    SidebarRow::Gap(SidebarGapSetting::PaneGap),
-    SidebarRow::AgentLabel(AgentLabelSetting::Spaces),
-    SidebarRow::AgentLabel(AgentLabelSetting::Agents),
-];
-
-fn sidebar_row(idx: usize) -> Option<SidebarRow> {
-    SIDEBAR_ROWS.get(idx).copied()
-}
-
 /// Map a Sidebar row index to the cycle action that steps its value.
 fn sidebar_cycle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
-    Some(match sidebar_row(idx)? {
+    use crate::app::state::{SidebarRow, SIDEBAR_ROWS};
+    Some(match SIDEBAR_ROWS.get(idx).copied()? {
         SidebarRow::Gap(setting) => {
             let next = setting.next_value(state);
             match setting {

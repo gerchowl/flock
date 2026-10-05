@@ -18,7 +18,7 @@ mod aggregate;
 pub(crate) mod git;
 mod tab;
 
-pub(crate) use self::aggregate::pane_attention_priority;
+pub(crate) use self::aggregate::{pane_attention_priority, PaneDetail, PaneSignal};
 #[cfg(test)]
 use self::git::git_ahead_behind;
 pub(crate) use self::tab::MovedPane;
