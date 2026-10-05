@@ -304,6 +304,39 @@ pub enum FileDropMode {
     Auto,
 }
 
+/// How the sidebar names the agent in a row's agent field (#542). Set per
+/// SECTION — `[ui] spaces_agent_label` and `[ui] agents_agent_label` are
+/// independent — because the two sections answer different questions: a space
+/// row answers *which project*, an agents row answers *which pane*.
+///
+/// - `symbol` (default): one cell from the [`crate::agent_symbols`] registry,
+///   keyed on the harness the detector or the hook identified.
+/// - `shortcut`: the two/three-letter code (`cc`, `oc`, `gm`).
+/// - `name`: the full label the agent is known by (`claude`).
+///
+/// `symbol` is the default because it is the only one of the three that stays
+/// honest when the label is not trustworthy: an agent started through the MCP
+/// server carries whatever name the calling model invented, and the symbol comes
+/// from the harness instead of from that text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLabelConfig {
+    #[default]
+    Symbol,
+    Shortcut,
+    Name,
+}
+
+impl AgentLabelConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Symbol => "symbol",
+            Self::Shortcut => "shortcut",
+            Self::Name => "name",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TerminalConfig {
@@ -1057,6 +1090,14 @@ pub struct UiConfig {
     /// `agent_aliases = { claude = "CC" }`. Built-in short codes apply
     /// when no override is set (claude -> cc, codex -> cd, ...).
     pub agent_aliases: std::collections::HashMap<String, String>,
+    /// How the AGENTS section names the agent in its agent field: "symbol"
+    /// (default), "shortcut", or "name". See [`AgentLabelConfig`].
+    pub agents_agent_label: AgentLabelConfig,
+    /// How the SPACES section names the agent in its agent field: "symbol"
+    /// (default), "shortcut", or "name". Independent of
+    /// [`agents_agent_label`]; both default to `symbol`. See
+    /// [`AgentLabelConfig`].
+    pub spaces_agent_label: AgentLabelConfig,
     /// Accent color for highlights, borders, and navigation UI.
     /// Accepts hex (#89b4fa), named colors (cyan, blue), or RGB (rgb(137,180,250)).
     pub accent: String,
@@ -1581,6 +1622,8 @@ impl Default for UiConfig {
             server_label: ServerLabelConfig::default(),
             file_drop: FileDropMode::default(),
             agent_aliases: std::collections::HashMap::new(),
+            agents_agent_label: AgentLabelConfig::default(),
+            spaces_agent_label: AgentLabelConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
@@ -1995,6 +2038,73 @@ show_agent_labels_on_pane_borders = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.show_agent_labels_on_pane_borders);
+    }
+
+    /// Both sidebar sections default to `symbol`, and each parses its own three
+    /// values independently (#542). Pinned on the DEFAULT rather than only on
+    /// parsing, because the default is the behaviour every existing user gets
+    /// the moment they upgrade — the one thing a parse test cannot see.
+    #[test]
+    fn both_agent_label_sections_default_to_symbol_and_parse_independently() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.agents_agent_label,
+            AgentLabelConfig::Symbol
+        );
+        assert_eq!(
+            default_config.ui.spaces_agent_label,
+            AgentLabelConfig::Symbol
+        );
+
+        let both_shortcut: Config = toml::from_str(
+            r#"
+[ui]
+agents_agent_label = "shortcut"
+spaces_agent_label = "name"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            both_shortcut.ui.agents_agent_label,
+            AgentLabelConfig::Shortcut
+        );
+        assert_eq!(both_shortcut.ui.spaces_agent_label, AgentLabelConfig::Name);
+
+        // An absent key keeps its default rather than becoming an error, which
+        // is what makes adding this setting a non-event for existing configs.
+        let partial: Config = toml::from_str(
+            r#"
+[ui]
+agents_agent_label = "name"
+"#,
+        )
+        .unwrap();
+        assert_eq!(partial.ui.agents_agent_label, AgentLabelConfig::Name);
+        assert_eq!(partial.ui.spaces_agent_label, AgentLabelConfig::Symbol);
+
+        assert!(toml::from_str::<Config>(
+            r#"
+[ui]
+agents_agent_label = "emoji"
+"#
+        )
+        .is_err());
+    }
+
+    /// `as_str` is what the settings overlay writes into the config file, so a
+    /// mode whose writer spelling differs from its reader spelling would save a
+    /// value that fails to load. Round-tripped over all three.
+    #[test]
+    fn every_agent_label_mode_round_trips_through_its_writer_spelling() {
+        for mode in [
+            AgentLabelConfig::Symbol,
+            AgentLabelConfig::Shortcut,
+            AgentLabelConfig::Name,
+        ] {
+            let written = format!("[ui]\nagents_agent_label = \"{}\"\n", mode.as_str());
+            let parsed: Config = toml::from_str(&written).unwrap();
+            assert_eq!(parsed.ui.agents_agent_label, mode);
+        }
     }
 
     #[test]

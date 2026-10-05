@@ -104,8 +104,43 @@ pub fn short_agent_label(label: &str) -> &str {
         "grok" => "gk",
         "hermes" => "hm",
         "kilo" => "kl",
+        // `amp` was the one harness with no code, so it rendered as itself —
+        // and, worse, had nothing for a renamed Amp agent to fall back to in
+        // `short_agent_label_for` (#542).
+        "amp" => "am",
         "qodercli" => "qd",
         other => other,
+    }
+}
+
+/// The short code for a harness the caller already knows structurally (#542).
+///
+/// [`short_agent_label`] is the same table keyed by text, and a text key cannot
+/// answer "what is this agent's code" for a row whose label is a name the
+/// caller invented — it returns that name unchanged and the caller cannot tell
+/// "no code" from "this IS the code". Keying on the enum separates those two
+/// cases, which is what lets the sidebar fall back to the harness's code
+/// instead of printing an arbitrary string in a code's place.
+pub fn short_agent_label_for(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "cc",
+        Agent::Codex => "cd",
+        Agent::GithubCopilot => "cp",
+        Agent::Gemini => "gm",
+        Agent::Cursor => "cu",
+        Agent::Antigravity => "ag",
+        Agent::Cline => "cl",
+        Agent::OpenCode => "oc",
+        Agent::Kimi => "km",
+        Agent::Kiro => "kr",
+        Agent::Droid => "dr",
+        Agent::Grok => "gk",
+        Agent::Hermes => "hm",
+        Agent::Kilo => "kl",
+        Agent::Amp => "am",
+        Agent::Qodercli => "qd",
+        // `pi` is its own code — two letters would read as a typo of another.
+        Agent::Pi => "pi",
     }
 }
 
@@ -2883,5 +2918,53 @@ Which framework should we use?\n\
         assert_eq!(short_agent_label("gemini"), "gm");
         assert_eq!(short_agent_label("pi"), "pi");
         assert_eq!(short_agent_label("my-custom-name"), "my-custom-name");
+    }
+
+    /// Two tables, one vocabulary (#542): the text lookup and the enum lookup
+    /// must answer the same question the same way, or a row whose label happens
+    /// to be a harness's own label would render differently from the same row
+    /// reached through its harness. Pinned over every variant, so a harness
+    /// added to one and not the other fails here rather than in a screenshot.
+    #[test]
+    fn the_two_short_label_tables_never_drift() {
+        const ALL: &[Agent] = &[
+            Agent::Pi,
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Gemini,
+            Agent::Cursor,
+            Agent::Antigravity,
+            Agent::Cline,
+            Agent::OpenCode,
+            Agent::GithubCopilot,
+            Agent::Kimi,
+            Agent::Kiro,
+            Agent::Droid,
+            Agent::Amp,
+            Agent::Grok,
+            Agent::Hermes,
+            Agent::Kilo,
+            Agent::Qodercli,
+        ];
+        for agent in ALL {
+            let label = agent_label(*agent);
+            assert_eq!(
+                short_agent_label(label),
+                short_agent_label_for(*agent),
+                "{label:?} resolves to two different codes"
+            );
+        }
+        // And no two harnesses may share a code, or the sidebar's whole
+        // point — telling rows apart at a glance — is lost.
+        let mut codes: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for agent in ALL {
+            let code = short_agent_label_for(*agent);
+            if let Some(other) = codes.insert(code, agent_label(*agent)) {
+                panic!(
+                    "code {code:?} is shared by {other:?} and {:?}",
+                    agent_label(*agent)
+                );
+            }
+        }
     }
 }

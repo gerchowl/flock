@@ -13,7 +13,10 @@ pub struct PaneDetail {
     pub tab_label: String,
     pub label: String,
     pub agent_label: String,
-    #[allow(dead_code)]
+    /// The HARNESS, structurally, as opposed to `agent_label` which is a name.
+    /// Read by the sidebar's agent field (#542) — it was carried here and
+    /// marked dead until then, which is why a row could not resolve a symbol
+    /// and why a mislabelled agent had nothing to fall back to.
     pub agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
@@ -49,6 +52,23 @@ impl Tab {
             terminals
                 .get(&pane.attached_terminal_id)
                 .map(|terminal| (terminal.state, pane.seen))
+        })
+    }
+
+    /// As [`Tab::pane_states`], plus each pane's HARNESS (#542).
+    ///
+    /// The spaces list draws a row's state and its agent identity from ONE
+    /// leading pane, and it can only do that if it can see the harness beside
+    /// the state — the same pairing this iterator provides. Allocation-free,
+    /// unlike [`Tab::pane_details`], because a space row is redrawn every frame.
+    pub fn pane_signals<'a>(
+        &'a self,
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+    ) -> impl Iterator<Item = (AgentState, bool, Option<Agent>)> + 'a {
+        self.panes.values().filter_map(|pane| {
+            terminals
+                .get(&pane.attached_terminal_id)
+                .map(|terminal| (terminal.state, pane.seen, terminal.effective_known_agent()))
         })
     }
 
@@ -93,7 +113,10 @@ impl Tab {
 /// Attention priority of a pane state: the shared severity ladder
 /// ([`crate::ui::state_signal::StateClass`]) — blocked > done-unseen >
 /// working > settled idle > none.
-fn pane_attention_priority(state: AgentState, seen: bool) -> crate::ui::state_signal::StateClass {
+pub(crate) fn pane_attention_priority(
+    state: AgentState,
+    seen: bool,
+) -> crate::ui::state_signal::StateClass {
     crate::ui::state_signal::StateClass::of(state, seen)
 }
 
@@ -104,6 +127,15 @@ impl Workspace {
         terminals: &'a HashMap<TerminalId, TerminalState>,
     ) -> impl Iterator<Item = (AgentState, bool)> + 'a {
         self.tabs.iter().flat_map(|tab| tab.pane_states(terminals))
+    }
+
+    /// As [`Workspace::pane_states`], plus each pane's harness (#542) — see
+    /// [`Tab::pane_signals`].
+    pub fn pane_signals<'a>(
+        &'a self,
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+    ) -> impl Iterator<Item = (AgentState, bool, Option<Agent>)> + 'a {
+        self.tabs.iter().flat_map(|tab| tab.pane_signals(terminals))
     }
 
     pub fn aggregate_state(

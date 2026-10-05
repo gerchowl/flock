@@ -122,7 +122,7 @@ use crate::terminal::TerminalRuntimeRegistry;
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
 // Braille spinner frames — smooth rotation
-const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Map spinner_tick (incremented every frame at ~60fps) to a spinner frame.
 /// We want ~8 updates/sec so divide by 8.

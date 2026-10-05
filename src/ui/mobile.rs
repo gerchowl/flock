@@ -952,6 +952,7 @@ mod tests {
             primary_label: "flock".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             agent_label: agent_label.map(str::to_string),
+            agent: agent_label.and_then(crate::detect::parse_agent_label),
             state: AgentState::Idle,
             seen: true,
             custom_status: None,

@@ -12,7 +12,8 @@ use super::widgets::{
 };
 use crate::{
     app::{
-        state::{ExperimentSetting, IdleSetting, Palette, SidebarGapSetting},
+        input::{SidebarRow, SIDEBAR_ROWS},
+        state::{ExperimentSetting, IdleSetting, Palette},
         AppState,
     },
     config::ToastDelivery,
@@ -411,11 +412,13 @@ fn render_settings_sidebar(app: &AppState, frame: &mut Frame, area: Rect) {
     super::widgets::render_modal_description(
         frame,
         desc_area,
-        "sidebar spacing — enter or click cycles a value, changes apply immediately",
+        "sidebar spacing and agent names — enter or click cycles a value, changes apply immediately",
         Style::default().fg(p.overlay1),
     );
 
-    for (idx, setting) in SidebarGapSetting::ALL.iter().copied().enumerate() {
+    // Draws exactly `SIDEBAR_ROWS` — the same list the key handler cycles and
+    // the mouse hit-test resolves, so a row cannot be drawable but unclickable.
+    for (idx, row) in SIDEBAR_ROWS.iter().copied().enumerate() {
         let style = if app.settings.list.selected == idx {
             Style::default()
                 .bg(p.surface0)
@@ -424,17 +427,19 @@ fn render_settings_sidebar(app: &AppState, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().fg(p.subtext0)
         };
-        let row = Rect::new(list_area.x, list_area.y + idx as u16, list_area.width, 1);
-        frame.render_widget(
-            Paragraph::new(format!(
+        let text = match row {
+            SidebarRow::Gap(setting) => format!(
                 " {} [{}/{}]",
                 setting.label(),
                 setting.value(app),
                 setting.max()
-            ))
-            .style(style),
-            row,
-        );
+            ),
+            SidebarRow::AgentLabel(setting) => {
+                format!(" {} [{}]", setting.label(), setting.value(app).as_str())
+            }
+        };
+        let rect = Rect::new(list_area.x, list_area.y + idx as u16, list_area.width, 1);
+        frame.render_widget(Paragraph::new(text).style(style), rect);
     }
 }
 

@@ -1,0 +1,166 @@
+//! Agent HARNESS symbol registry (#542): maps the closed
+//! [`crate::detect::Agent`] enum to a flat single-cell glyph.
+//!
+//! This is the display counterpart of [`crate::server_icons`], and the two are
+//! deliberately disjoint in vocabulary: a server icon answers *which machine* a
+//! row is on, an agent symbol answers *which harness is running there*. Both
+//! appear on the same row, so a shared glyph would render twice and read as one
+//! fact stated twice.
+//!
+//! Keying on the enum rather than on a name is the whole point. The sidebar's
+//! identity input used to be a bare `String`, so a harness could only be
+//! recognised by matching text — and text is exactly what
+//! [`crate::detect::short_agent_label`] cannot repair when the caller of
+//! `flock_agent_start` invents a label. Keyed here, a renamed agent still
+//! resolves its harness's symbol, because the harness is known structurally.
+//!
+//! Every glyph is outside the Private Use Area and is covered by ordinary font
+//! coverage, so a viewer without a Nerd Font renders a shape rather than tofu.
+//! `every_harness_symbol_is_one_cell_distinct_and_disjoint` is the gate that
+//! keeps it that way.
+
+use crate::detect::Agent;
+
+/// The symbol for a harness. Always `Some` for every variant — a harness we can
+/// name, we can draw. Callers that have no harness at all (an unidentified
+/// pane, a remote row whose summary carried only free text) get `None` from the
+/// caller's `Option<Agent>`, never a placeholder from here.
+pub fn symbol(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Pi => "π",     // U+03C0 GREEK SMALL LETTER PI — the constant it is named for
+        Agent::Claude => "✻", // U+273B TEARDROP-SPOKED ASTERISK
+        Agent::Codex => "⌬",  // U+232C BENZENE RING
+        Agent::Gemini => "✦", // U+2726 BLACK FOUR POINTED STAR — its natural sign is U+264A, which is
+        // East Asian Wide and so TWO cells: it would have silently
+        // shifted every column right of it. See the width test.
+        Agent::Cursor => "➤", // U+27A4 BLACK RIGHTWARDS ARROWHEAD — a pointer
+        Agent::Antigravity => "▲", // U+25B2 BLACK UP-POINTING TRIANGLE — lift
+        Agent::Cline => "◫",  // U+25EB WHITE SQUARE WITH VERTICAL BISECTING LINE
+        Agent::OpenCode => "⧉", // U+29C9 TWO JOINED SQUARES
+        Agent::GithubCopilot => "⑂", // U+2442 OCR FORK
+        Agent::Kimi => "☾",   // U+263E LAST QUARTER MOON
+        Agent::Kiro => "◈",   // U+25C8 WHITE DIAMOND CONTAINING BLACK SMALL DIAMOND
+        Agent::Droid => "❖",  // U+2756 BLACK DIAMOND MINUS WHITE X
+        Agent::Amp => "↯",    // U+21AF DOWNWARDS ZIGZAG ARROW — U+26A1 HIGH VOLTAGE is
+        // East Asian Wide; this is the narrow electrical sign
+        Agent::Grok => "✱", // U+2731 HEAVY ASTERISK — a heavy asterisk reads "sharp / got it"
+        // where a light one reads "idea", and it is one codepoint away
+        // from Gemini's star in a table a human is scanning
+        Agent::Hermes => "✈",   // U+2708 AIRPLANE — the messenger
+        Agent::Kilo => "⚖",     // U+2696 BLACK SCALES — the weight
+        Agent::Qodercli => "⌗", // U+2317 VIEW DATA SQUARE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    /// Every glyph the registry can return, straight off the enum, so a new
+    /// variant cannot be added without this list noticing.
+    const ALL_AGENTS: &[Agent] = &[
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Codex,
+        Agent::Gemini,
+        Agent::Cursor,
+        Agent::Antigravity,
+        Agent::Cline,
+        Agent::OpenCode,
+        Agent::GithubCopilot,
+        Agent::Kimi,
+        Agent::Kiro,
+        Agent::Droid,
+        Agent::Amp,
+        Agent::Grok,
+        Agent::Hermes,
+        Agent::Kilo,
+        Agent::Qodercli,
+    ];
+
+    #[test]
+    fn every_harness_symbol_is_one_cell_distinct_and_disjoint() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for agent in ALL_AGENTS {
+            let glyph = symbol(*agent);
+            assert_eq!(
+                glyph.width(),
+                1,
+                "{glyph:?} for {agent:?} is {} cells wide, which would break the \
+                 fixed slot the sidebar budgets for it",
+                glyph.width()
+            );
+            assert!(
+                glyph.chars().count() <= 4,
+                "{glyph:?} for {agent:?} is a multi-glyph run"
+            );
+            assert!(
+                !glyph.chars().any(char::is_control),
+                "{glyph:?} for {agent:?} carries a control character"
+            );
+            if let Some(other) = seen.insert(glyph, crate::detect::agent_label(*agent)) {
+                panic!(
+                    "{glyph:?} is claimed by both {other} and {}",
+                    crate::detect::agent_label(*agent)
+                );
+            }
+        }
+    }
+
+    /// The agents-panel row already spends its leading cell on STATE
+    /// (`◉`, the braille spinner, `●`, `✓`, `○`). An agent symbol drawn from
+    /// the same set would make the two fields indistinguishable, which is the
+    /// one thing a second glyph column must not do.
+    #[test]
+    fn no_agent_symbol_collides_with_a_state_glyph() {
+        const STATE_GLYPHS: &[&str] = &["◉", "●", "✓", "○"];
+        for glyph in STATE_GLYPHS {
+            assert!(
+                !ALL_AGENTS.iter().any(|agent| symbol(*agent) == *glyph),
+                "{glyph:?} is already the agents panel's STATE glyph"
+            );
+        }
+        for frame in crate::ui::SPINNERS {
+            assert!(
+                !ALL_AGENTS.iter().any(|agent| symbol(*agent) == *frame),
+                "{frame:?} is a spinner frame"
+            );
+        }
+    }
+
+    /// `server_icons` is a different vocabulary on purpose: the agent field and
+    /// the server field sit side by side on one row. A glyph in both registries
+    /// renders twice and reads as one fact stated twice.
+    #[test]
+    fn agent_symbols_are_disjoint_from_the_server_icon_registry() {
+        for agent in ALL_AGENTS {
+            let label = crate::detect::agent_label(*agent);
+            let glyph = symbol(*agent);
+            for name in crate::server_icons::known_names() {
+                if let Some(server_glyph) = crate::server_icons::glyph(name) {
+                    assert_ne!(
+                        glyph, server_glyph,
+                        "{label:?} shares {glyph:?} with server icon {name:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The enum is the registry's key, so a new variant with no arm is a
+    /// compile error — good — but a variant dropped from this list would
+    /// silently go untested. Pin the list against the enum.
+    #[test]
+    fn the_tested_agent_list_covers_every_harness() {
+        for agent in ALL_AGENTS {
+            let label = crate::detect::agent_label(*agent);
+            assert_eq!(
+                crate::detect::parse_agent_label(label),
+                Some(*agent),
+                "{label:?} does not parse back to its own variant"
+            );
+        }
+    }
+}

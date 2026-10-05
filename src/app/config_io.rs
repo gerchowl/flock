@@ -201,6 +201,27 @@ impl App {
         }
     }
 
+    /// Persist one section's agent-field mode (#542). Writes the row's OWN
+    /// `[ui]` key — the two sections are independent settings, so writing the
+    /// shared one would reconfigure the section the operator did not touch.
+    pub(super) fn save_agent_label(
+        &mut self,
+        setting: crate::app::state::AgentLabelSetting,
+        mode: crate::config::AgentLabelConfig,
+    ) {
+        let value = mode.as_str();
+        if self.update_config_file(setting.label(), |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                setting.config_key(),
+                &format!("\"{value}\""),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
     pub(super) fn save_sidebar_row_gap(&mut self, gap: u16) {
         if self.update_config_file("sidebar row gap", |content| {
             crate::config::upsert_section_value(content, "ui", "sidebar_row_gap", &gap.to_string())

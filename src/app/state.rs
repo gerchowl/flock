@@ -1620,6 +1620,53 @@ impl ExperimentSetting {
     }
 }
 
+/// The two sidebar rows that choose how the agent field is drawn (#542).
+///
+/// One enum for both sections, because they are the same three-way question and
+/// two copies of the cycle would drift. Which section a row edits is carried by
+/// the caller's variant, not by this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentLabelSetting {
+    Spaces,
+    Agents,
+}
+
+impl AgentLabelSetting {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Spaces => "agent name in spaces",
+            Self::Agents => "agent name in agents",
+        }
+    }
+
+    pub(crate) fn value(self, state: &AppState) -> crate::config::AgentLabelConfig {
+        match self {
+            Self::Spaces => state.spaces_agent_label(),
+            Self::Agents => state.agents_agent_label(),
+        }
+    }
+
+    /// The `[ui]` key this row writes — the two settings are independent, so
+    /// the key differs, and writing the wrong one would silently reconfigure the
+    /// other section.
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            Self::Spaces => "spaces_agent_label",
+            Self::Agents => "agents_agent_label",
+        }
+    }
+
+    /// Next value in the enter/click cycle: `symbol` → `shortcut` → `name`.
+    pub(crate) fn next_value(self, state: &AppState) -> crate::config::AgentLabelConfig {
+        use crate::config::AgentLabelConfig;
+        match self.value(state) {
+            AgentLabelConfig::Symbol => AgentLabelConfig::Shortcut,
+            AgentLabelConfig::Shortcut => AgentLabelConfig::Name,
+            AgentLabelConfig::Name => AgentLabelConfig::Symbol,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarGapSetting {
     RowGap,
@@ -1627,8 +1674,6 @@ pub(crate) enum SidebarGapSetting {
 }
 
 impl SidebarGapSetting {
-    pub(crate) const ALL: [Self; 2] = [Self::RowGap, Self::PaneGap];
-
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::RowGap => "blank rows between sidebar entries",
@@ -3024,13 +3069,113 @@ impl AppState {
         &self.config.ui.sound
     }
 
-    /// Sidebar display alias for an agent label: config override first,
-    /// then the built-in short code, then the label unchanged.
-    pub(crate) fn agent_alias<'a>(&'a self, label: &'a str) -> &'a str {
-        self.agent_aliases
-            .get(label)
-            .map(String::as_str)
-            .unwrap_or_else(|| crate::detect::short_agent_label(label))
+    /// How the agents section names the agent in its agent field (#542).
+    pub fn agents_agent_label(&self) -> crate::config::AgentLabelConfig {
+        self.config.ui.agents_agent_label
+    }
+
+    /// How the spaces section names the agent in its agent field (#542).
+    pub fn spaces_agent_label(&self) -> crate::config::AgentLabelConfig {
+        self.config.ui.spaces_agent_label
+    }
+
+    /// The text to draw in a sidebar row's agent field (#542).
+    ///
+    /// Takes the row's **structured** harness alongside its label, because the
+    /// label alone cannot answer this. `flock_agent_start` lets the calling
+    /// model invent a label for the child it spawns, and that label outranks the
+    /// detected harness in [`crate::workspace::Workspace::pane_details`] — so a
+    /// string-keyed lookup renders the model's invention where the harness
+    /// belongs, with no way back. Resolving against the harness fixes it in
+    /// every mode, and the `symbol` mode is only expressible at all because the
+    /// harness arrives structurally.
+    ///
+    /// Precedence, and why each step is there:
+    ///
+    /// 1. **An explicit `agent_aliases` entry for the row's own label.** The
+    ///    user wrote it, so it is an instruction and it wins — in every mode,
+    ///    including `symbol`, where an alias naming a harness resolves to that
+    ///    harness's glyph. That makes the alias map the supported way to
+    ///    re-attribute a mislabelled agent without touching the config schema.
+    /// 2. **The structured harness.** What the detector or the hook identified.
+    /// 3. **The label**, parsed as a harness. Remote rows arrive as free text
+    ///    over the wire with no enum, so this is the only harness they have.
+    /// 4. **The label, verbatim** — for a row with no identifiable harness. A
+    ///    name is still more use than a blank cell.
+    pub fn agent_field_label(
+        &self,
+        mode: crate::config::AgentLabelConfig,
+        harness: Option<crate::detect::Agent>,
+        label: Option<&str>,
+    ) -> String {
+        use crate::config::AgentLabelConfig;
+
+        let aliased = label.and_then(|label| self.agent_aliases.get(label));
+        // An alias either NAMES a harness — in which case `symbol` mode draws
+        // that harness's glyph, which is what makes
+        // `agent_aliases = { researcher = "codex" }` a supported way to
+        // re-attribute a mislabelled agent — or it is free text, which is then
+        // simply what the operator asked to see. It never falls back to the
+        // row's own harness in the second case: an alias of "CC" resolving to
+        // whatever symbol the detector happened to find would ignore the
+        // instruction it was given.
+        let aliased_harness = aliased.and_then(|alias| crate::detect::parse_agent_label(alias));
+
+        match mode {
+            AgentLabelConfig::Symbol => {
+                if let Some(alias) = aliased {
+                    return aliased_harness.map_or_else(
+                        || alias.clone(),
+                        |harness| crate::agent_symbols::symbol(harness).to_string(),
+                    );
+                }
+                let harness = harness.or_else(|| label.and_then(crate::detect::parse_agent_label));
+                if let Some(harness) = harness {
+                    return crate::agent_symbols::symbol(harness).to_string();
+                }
+                // Nothing resolved to a harness: the label is still a name
+                // somebody chose, and a name beats a blank cell.
+                label.map(str::to_string).unwrap_or_default()
+            }
+            // `alias` -> the label's own code -> the HARNESS's code -> the
+            // label. The harness sits above the label because a label with no
+            // code of its own is exactly the MCP case #542 is about; and the
+            // label still sits at the bottom because all three modes end the
+            // same way. Symbol and Name both do, and a mode that resolved to a
+            // blank cell where its siblings showed a name would read as "this
+            // row has no agent" rather than "this row's agent has no code".
+            AgentLabelConfig::Shortcut => self
+                .short_agent_field_label(aliased, label)
+                .or_else(|| {
+                    harness.map(|agent| crate::detect::short_agent_label_for(agent).to_string())
+                })
+                .or_else(|| label.map(str::to_string))
+                .unwrap_or_default(),
+            AgentLabelConfig::Name => aliased
+                .cloned()
+                .or_else(|| label.map(str::to_string))
+                .or_else(|| harness.map(|agent| crate::detect::agent_label(agent).to_string()))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The shortcut-mode text, or `None` when the label has no short form of its
+    /// own — which is the signal to fall back to the harness's code rather than
+    /// print an arbitrary caller-supplied name at full length where a code
+    /// belongs.
+    fn short_agent_field_label<'a>(
+        &'a self,
+        aliased: Option<&'a String>,
+        label: Option<&'a str>,
+    ) -> Option<String> {
+        if let Some(alias) = aliased {
+            return Some(alias.clone());
+        }
+        let label = label?;
+        let short = crate::detect::short_agent_label(label);
+        // `short_agent_label` returns its argument unchanged for anything it
+        // does not know, so "has a code" and "is the code" are the same test.
+        (short != label).then(|| short.to_string())
     }
 
     pub fn toast_delivery(&self) -> ToastDelivery {
@@ -4296,5 +4441,176 @@ mod tests {
         assert!(app
             .system_stats_fresh_at(std::time::Instant::now())
             .is_none());
+    }
+
+    // — #542: the agent field the sidebar draws —
+
+    fn agent_field_app() -> AppState {
+        let mut app = AppState::test_new();
+        app.agent_aliases = std::collections::HashMap::new();
+        app
+    }
+
+    /// The reported bug: `flock_agent_start` lets the calling model name the
+    /// child, and that name outranks the detected harness. With a name of
+    /// "researcher", every mode used to print "researcher" — a string-keyed
+    /// lookup cannot recover from it, because the harness is not in the string.
+    #[test]
+    fn an_mcp_supplied_name_does_not_displace_the_harness() {
+        use crate::config::AgentLabelConfig;
+        use crate::detect::Agent;
+        let app = agent_field_app();
+        let field = |mode| app.agent_field_label(mode, Some(Agent::Claude), Some("researcher"));
+        assert_eq!(
+            field(AgentLabelConfig::Symbol),
+            crate::agent_symbols::symbol(Agent::Claude)
+        );
+        assert_eq!(field(AgentLabelConfig::Shortcut), "cc");
+        // `name` mode is the one place the label is the POINT, so it still wins
+        // there — but it is the operator's explicit choice of mode, not the
+        // default doing it silently.
+        assert_eq!(field(AgentLabelConfig::Name), "researcher");
+    }
+
+    /// Every mode answers for a row whose label IS a harness's own label — the
+    /// ordinary case, and the one that must not regress while fixing the above.
+    #[test]
+    fn a_row_whose_label_is_the_harness_resolves_in_every_mode() {
+        use crate::config::AgentLabelConfig;
+        use crate::detect::Agent;
+        let app = agent_field_app();
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Symbol,
+                Some(Agent::Claude),
+                Some("claude")
+            ),
+            crate::agent_symbols::symbol(Agent::Claude)
+        );
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Shortcut,
+                Some(Agent::Claude),
+                Some("claude")
+            ),
+            "cc"
+        );
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Name, Some(Agent::Claude), Some("claude")),
+            "claude"
+        );
+    }
+
+    /// `agent_aliases` is a user instruction, so it beats the built-in answer in
+    /// EVERY mode — including `symbol`, where an alias that names a harness
+    /// resolves to that harness's glyph. That is what makes the alias map the
+    /// supported way to re-attribute a mislabelled agent.
+    #[test]
+    fn an_explicit_alias_beats_the_built_in_answer_in_every_mode() {
+        use crate::config::AgentLabelConfig;
+        use crate::detect::Agent;
+        let mut app = agent_field_app();
+        app.agent_aliases
+            .insert("researcher".to_string(), "CC".to_string());
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Symbol,
+                Some(Agent::Claude),
+                Some("researcher")
+            ),
+            "CC",
+            "an alias that is not a harness name is shown verbatim"
+        );
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Shortcut,
+                Some(Agent::Claude),
+                Some("researcher")
+            ),
+            "CC"
+        );
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Name,
+                Some(Agent::Claude),
+                Some("researcher")
+            ),
+            "CC"
+        );
+        // An alias that DOES name a harness resolves to that harness's symbol.
+        app.agent_aliases
+            .insert("researcher".to_string(), "codex".to_string());
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Symbol,
+                Some(Agent::Claude),
+                Some("researcher")
+            ),
+            crate::agent_symbols::symbol(Agent::Codex)
+        );
+    }
+
+    /// A row with no harness at all still shows something. This is the remote
+    /// case whose summary carried text the viewer could not parse, and a blank
+    /// cell there would say "no agent" rather than "agent we cannot name".
+    #[test]
+    fn a_row_with_no_harness_falls_back_to_its_label() {
+        use crate::config::AgentLabelConfig;
+        let app = agent_field_app();
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Symbol, None, Some("mystery")),
+            "mystery"
+        );
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Shortcut, None, Some("mystery")),
+            "mystery"
+        );
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Name, None, Some("mystery")),
+            "mystery"
+        );
+        // And a remote row whose summary DID parse: no `Agent` in hand, but the
+        // label names a harness, so the symbol is still reachable.
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Symbol, None, Some("claude")),
+            crate::agent_symbols::symbol(crate::detect::Agent::Claude)
+        );
+        assert_eq!(
+            app.agent_field_label(AgentLabelConfig::Shortcut, None, Some("claude")),
+            "cc"
+        );
+    }
+
+    /// Nothing to draw at all must render as nothing, so the row can omit the
+    /// cell instead of reserving blank columns.
+    #[test]
+    fn an_unidentifiable_row_resolves_to_the_empty_string() {
+        use crate::config::AgentLabelConfig;
+        let app = agent_field_app();
+        for mode in [
+            AgentLabelConfig::Symbol,
+            AgentLabelConfig::Shortcut,
+            AgentLabelConfig::Name,
+        ] {
+            assert_eq!(app.agent_field_label(mode, None, None), "");
+        }
+    }
+
+    /// The two sections are independent settings, both defaulting to `symbol`
+    /// (#542). If this ever reads equal-by-accident rather than by-default, the
+    /// independence the issue asked for is gone.
+    #[test]
+    fn both_sections_default_to_symbol_and_are_set_independently() {
+        use crate::config::AgentLabelConfig;
+        let mut app = agent_field_app();
+        assert_eq!(app.spaces_agent_label(), AgentLabelConfig::Symbol);
+        assert_eq!(app.agents_agent_label(), AgentLabelConfig::Symbol);
+        app.config.ui.spaces_agent_label = AgentLabelConfig::Name;
+        assert_eq!(app.spaces_agent_label(), AgentLabelConfig::Name);
+        assert_eq!(
+            app.agents_agent_label(),
+            AgentLabelConfig::Symbol,
+            "setting one section must not move the other"
+        );
     }
 }

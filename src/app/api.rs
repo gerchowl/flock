@@ -2026,7 +2026,10 @@ mod tests {
         assert_eq!(summary["project_label"], "flock");
         assert_eq!(summary["branch"], "feat/peer-federation");
         assert_eq!(summary["status"], "blocked");
-        assert_eq!(summary["agent"], "cc");
+        // The full label, not the sender's short code (#542): the viewer picks
+        // the display form, so baking `cc` in here made a `name`-mode peer show
+        // a code and a `symbol`-mode peer unable to resolve a glyph at all.
+        assert_eq!(summary["agent"], "claude");
         assert!(summary["status_age_secs"].as_u64().unwrap() >= 90);
     }
 

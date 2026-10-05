@@ -935,7 +935,14 @@ fn workspace_peer_summary(
     let (agent, status_age_secs, activity) = leading
         .map(|detail| {
             (
-                Some(crate::detect::short_agent_label(&detail.agent_label).to_string()),
+                // The full label, not the short code (#542). This used to bake
+                // the code in HERE, on the sending side, which made the peer's
+                // display mode the sender's choice: a viewer asking for `name`
+                // or `symbol` could not be served, because the label it needed
+                // had already been collapsed to two characters in transit. Same
+                // argument as `server_icons`: the VIEWER resolves the display
+                // form, so the wire carries the label and nothing else.
+                Some(detail.agent_label.clone()),
                 detail
                     .state_changed_at
                     .map(|changed| changed.elapsed().as_secs()),
@@ -995,7 +1002,9 @@ fn workspace_peer_summary(
                 Some(crate::api::schema::PeerAgentSummary {
                     agent_id: terminal.agent_id.to_string(),
                     pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
-                    agent: Some(crate::detect::short_agent_label(&detail.agent_label).to_string()),
+                    // Full label, not the short code — see the workspace
+                    // summary above and #542.
+                    agent: Some(detail.agent_label.clone()),
                     status: super::super::api_helpers::pane_agent_status(detail.state, detail.seen),
                 })
             })
