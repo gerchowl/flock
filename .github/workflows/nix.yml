@@ -29,6 +29,12 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
+      # The released website docs are a SECOND docs tree, and a promotion onto it
+      # is a docs change that docs/** does not match. So the PR that finalizes the
+      # release docs -- the one that has to pass this gate before anything can be
+      # cut -- could not run it. Same class as the ci.yml omission above: a
+      # required gate that cannot run.
+      - "website/**"
       - ".pre-commit-config.yaml"
   push:
     branches: [main]
@@ -58,6 +64,12 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
+      # The released website docs are a SECOND docs tree, and a promotion onto it
+      # is a docs change that docs/** does not match. So the PR that finalizes the
+      # release docs -- the one that has to pass this gate before anything can be
+      # cut -- could not run it. Same class as the ci.yml omission above: a
+      # required gate that cannot run.
+      - "website/**"
       - ".pre-commit-config.yaml"
 
 permissions:
