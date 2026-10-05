@@ -19,7 +19,7 @@ this means you can:
 - wait for another agent to finish
 - spawn more agent instances
 
-the `flock` binary is available in your PATH. its workspace, tab, pane, and wait commands talk to the running flock instance over a local unix socket.
+the `flk` binary is available in your PATH. its workspace, tab, pane, and wait commands talk to the running flock instance over a local unix socket.
 
 if you need the raw protocol or full api reference, read the [socket api docs](https://flock.dev/docs/socket-api/).
 
@@ -48,7 +48,7 @@ important: ids can compact when tabs, panes, or workspaces are closed. do not tr
 see what panes exist and which one is focused:
 
 ```bash
-flock pane list
+flk pane list
 ```
 
 the focused pane is yours. other panes are your neighbors.
@@ -56,7 +56,7 @@ the focused pane is yours. other panes are your neighbors.
 list workspaces:
 
 ```bash
-flock workspace list
+flk workspace list
 ```
 
 ## tab management
@@ -64,13 +64,13 @@ flock workspace list
 list tabs in the current workspace:
 
 ```bash
-flock tab list --workspace 1
+flk tab list --workspace 1
 ```
 
 create a new tab:
 
 ```bash
-flock tab create --workspace 1
+flk tab create --workspace 1
 ```
 
 without `--label`, the new tab keeps the default numbered tab name.
@@ -78,25 +78,25 @@ without `--label`, the new tab keeps the default numbered tab name.
 create and name it in one step:
 
 ```bash
-flock tab create --workspace 1 --label "logs"
+flk tab create --workspace 1 --label "logs"
 ```
 
 rename it:
 
 ```bash
-flock tab rename 1:2 "logs"
+flk tab rename 1:2 "logs"
 ```
 
 focus it:
 
 ```bash
-flock tab focus 1:2
+flk tab focus 1:2
 ```
 
 close it:
 
 ```bash
-flock tab close 1:2
+flk tab close 1:2
 ```
 
 ## read another pane
@@ -104,7 +104,7 @@ flock tab close 1:2
 see what is on another pane's screen:
 
 ```bash
-flock pane read 1-1 --source recent --lines 50
+flk pane read 1-1 --source recent --lines 50
 ```
 
 - `--source visible` = current viewport
@@ -116,20 +116,20 @@ flock pane read 1-1 --source recent --lines 50
 split your pane to the right and keep focus on your current pane:
 
 ```bash
-flock pane split 1-2 --direction right --no-focus
+flk pane split 1-2 --direction right --no-focus
 ```
 
 that prints json with the new pane nested at `result.pane.pane_id`. parse that value, then run a command in that pane:
 
 ```bash
-NEW_PANE=$(flock pane split 1-2 --direction right --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-flock pane run "$NEW_PANE" "npm run dev"
+NEW_PANE=$(flk pane split 1-2 --direction right --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+flk pane run "$NEW_PANE" "npm run dev"
 ```
 
 split downward instead:
 
 ```bash
-flock pane split 1-2 --direction down --no-focus
+flk pane split 1-2 --direction down --no-focus
 ```
 
 ## wait for output
@@ -139,13 +139,13 @@ block until specific text appears in a pane. useful for waiting on servers, buil
 for `--source recent`, matching uses unwrapped recent terminal text, so pane width and soft wrapping do not break matches. `pane read --source recent` still shows the pane as rendered. if you want to inspect the same transcript that the waiter matches, use `pane read --source recent-unwrapped`.
 
 ```bash
-flock wait output 1-3 --match "ready on port 3000" --timeout 30000
+flk wait output 1-3 --match "ready on port 3000" --timeout 30000
 ```
 
 with regex:
 
 ```bash
-flock wait output 1-3 --match "server.*ready" --regex --timeout 30000
+flk wait output 1-3 --match "server.*ready" --regex --timeout 30000
 ```
 
 if it times out, exit code is `1`.
@@ -155,7 +155,7 @@ if it times out, exit code is `1`.
 block until another agent reaches a specific status:
 
 ```bash
-flock wait agent-status 1-1 --status done --timeout 60000
+flk wait agent-status 1-1 --status done --timeout 60000
 ```
 
 use this when you want the same `done` / `idle` distinction the UI shows.
@@ -165,19 +165,19 @@ use this when you want the same `done` / `idle` distinction the UI shows.
 send text without pressing Enter:
 
 ```bash
-flock pane send-text 1-1 "hello from claude"
+flk pane send-text 1-1 "hello from claude"
 ```
 
 press Enter or other keys:
 
 ```bash
-flock pane send-keys 1-1 Enter
+flk pane send-keys 1-1 Enter
 ```
 
 `pane run` types the text and then presses a real `Enter`:
 
 ```bash
-flock pane run 1-1 "echo hello"
+flk pane run 1-1 "echo hello"
 ```
 
 the two are deliberately separate writes with a short pause between them. a
@@ -193,7 +193,7 @@ as well as the enter. wait for the pane to be ready first (see below).
 create a new workspace:
 
 ```bash
-flock workspace create --cwd /path/to/project
+flk workspace create --cwd /path/to/project
 ```
 
 without `--label`, the new workspace keeps the default cwd-based name.
@@ -201,37 +201,37 @@ without `--label`, the new workspace keeps the default cwd-based name.
 create and name one in one step:
 
 ```bash
-flock workspace create --cwd /path/to/project --label "api server"
+flk workspace create --cwd /path/to/project --label "api server"
 ```
 
 create one without focusing it:
 
 ```bash
-flock workspace create --no-focus
+flk workspace create --no-focus
 ```
 
 focus a workspace:
 
 ```bash
-flock workspace focus 2
+flk workspace focus 2
 ```
 
 rename:
 
 ```bash
-flock workspace rename 1 "api server"
+flk workspace rename 1 "api server"
 ```
 
 close:
 
 ```bash
-flock workspace close 2
+flk workspace close 2
 ```
 
 ## close a pane
 
 ```bash
-flock pane close 1-3
+flk pane close 1-3
 ```
 
 ## recipes
@@ -239,26 +239,26 @@ flock pane close 1-3
 ### run a server and wait until it is ready
 
 ```bash
-NEW_PANE=$(flock pane split 1-2 --direction right --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-flock pane run "$NEW_PANE" "npm run dev"
-flock wait output "$NEW_PANE" --match "ready" --timeout 30000
-flock pane read "$NEW_PANE" --source recent --lines 20
+NEW_PANE=$(flk pane split 1-2 --direction right --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+flk pane run "$NEW_PANE" "npm run dev"
+flk wait output "$NEW_PANE" --match "ready" --timeout 30000
+flk pane read "$NEW_PANE" --source recent --lines 20
 ```
 
 ### run tests in a separate pane and inspect the result
 
 ```bash
-flock pane split 1-2 --direction down --no-focus
-flock pane run 1-3 "cargo test"
-flock wait output 1-3 --match "test result" --timeout 60000
-flock pane read 1-3 --source recent --lines 30
+flk pane split 1-2 --direction down --no-focus
+flk pane run 1-3 "cargo test"
+flk wait output 1-3 --match "test result" --timeout 60000
+flk pane read 1-3 --source recent --lines 30
 ```
 
 ### check what another agent is working on
 
 ```bash
-flock pane list
-flock pane read 1-1 --source recent --lines 80
+flk pane list
+flk pane read 1-1 --source recent --lines 80
 ```
 
 ### watch another pane robustly
@@ -267,22 +267,22 @@ use this pattern when you need to coordinate with a sibling pane:
 
 ```bash
 # inspect what is already there
-flock pane read 1-3 --source recent --lines 40
+flk pane read 1-3 --source recent --lines 40
 
 # wait only for the next output you expect
-flock wait output 1-3 --match "ready" --timeout 30000
+flk wait output 1-3 --match "ready" --timeout 30000
 
 # if you need to inspect the same transcript the waiter matched,
 # read the unwrapped recent text directly
-flock pane read 1-3 --source recent-unwrapped --lines 40
+flk pane read 1-3 --source recent-unwrapped --lines 40
 ```
 
 ### spawn a new agent and give it a task
 
 ```bash
 # prints the agent as json once it is up; read result.agent.pane_id from it
-flock agent start reviewer --cwd /path/to/project --wait-ready -- claude
-flock pane run 1-3 "review the test coverage in src/api/"
+flk agent start reviewer --cwd /path/to/project --wait-ready -- claude
+flk pane run 1-3 "review the test coverage in src/api/"
 ```
 
 `--wait-ready` returns once the pane reports an agent status other than
@@ -295,8 +295,8 @@ that has not arrived is indistinguishable from a crash.
 ### coordinate with another agent
 
 ```bash
-flock wait agent-status 1-1 --status done --timeout 120000
-flock pane read 1-1 --source recent --lines 100
+flk wait agent-status 1-1 --status done --timeout 120000
+flk pane read 1-1 --source recent --lines 100
 ```
 
 ## notes

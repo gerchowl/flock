@@ -90,7 +90,7 @@ Then attach with:
 flk --remote workbox
 ```
 
-Remote attach supports Linux and macOS hosts on x86_64 and aarch64. Flock checks the remote platform, prefers a matching `flock` already on the remote `PATH`, then checks `~/.local/bin/flock`. If no matching binary exists, interactive runs prompt to install one to `~/.local/bin/flock`; non-interactive runs fail instead of modifying the host. If `~/.local/bin` is not on the remote `PATH`, Flock warns after install.
+Remote attach supports Linux and macOS hosts on x86_64 and aarch64. Flock checks the remote platform, prefers a matching `flk` already on the remote `PATH`, then checks `~/.local/bin/flock`. If no matching binary exists, interactive runs prompt to install one to `~/.local/bin/flock`; non-interactive runs fail instead of modifying the host. If `~/.local/bin` is not on the remote `PATH`, Flock warns after install.
 
 By default, `flk --remote` runs the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings. Existing user keepalive settings win. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Flock's generated bridge config.
 
@@ -100,7 +100,7 @@ By default, remote attach uses the normal restart/stop flow if it needs to repla
 flk --remote workbox --handoff
 ```
 
-If you SSH into the server first and run `flock` there, Flock runs entirely on the server. That mode is useful and simple, but it cannot access your local desktop clipboard beyond normal terminal text paste.
+If you SSH into the server first and run `flk` there, Flock runs entirely on the server. That mode is useful and simple, but it cannot access your local desktop clipboard beyond normal terminal text paste.
 
 When your local and remote platforms match, Flock can copy the current local binary for direct installs. For Homebrew, mise, and Nix installs, or when the platforms differ, it downloads the matching release asset for the current client version from `https://flock.dev/latest.json`.
 

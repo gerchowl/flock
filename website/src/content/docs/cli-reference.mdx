@@ -11,45 +11,45 @@ Most commands print JSON responses. Use them from scripts when you want determin
 
 ```bash
 flock                         # launch or attach to the default session
-flock --session work          # launch or attach to a named session
-flock --remote workbox        # attach through SSH, using local keybindings
-flock --remote workbox --remote-keybindings server
-flock --remote workbox --handoff
-flock --no-session            # single-process escape hatch
-flock --default-config        # print default config
-flock update                  # download and install from the configured channel
-flock update --handoff        # opt into live handoff for supported running servers
-flock channel show            # print stable or preview
-flock channel set preview     # opt into preview builds
-flock channel set stable      # return to stable releases
-flock --version               # print version
+flk --session work          # launch or attach to a named session
+flk --remote workbox        # attach through SSH, using local keybindings
+flk --remote workbox --remote-keybindings server
+flk --remote workbox --handoff
+flk --no-session            # single-process escape hatch
+flk --default-config        # print default config
+flk update                  # download and install from the configured channel
+flk update --handoff        # opt into live handoff for supported running servers
+flk channel show            # print stable or preview
+flk channel set preview     # opt into preview builds
+flk channel set stable      # return to stable releases
+flk --version               # print version
 ```
 
 Status commands:
 
 ```bash
-flock status
-flock status server
-flock status client
+flk status
+flk status server
+flk status client
 ```
 
 ## Server
 
 ```bash
-flock server
-flock server stop
-flock server reload-config
+flk server
+flk server stop
+flk server reload-config
 ```
 
-`flock server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
+`flk server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
 ## Sessions
 
 ```bash
-flock session list [--json]
-flock session attach <name>
-flock session stop <name> [--json]
-flock session delete <name> [--json]
+flk session list [--json]
+flk session attach <name>
+flk session stop <name> [--json]
+flk session delete <name> [--json]
 ```
 
 Use `default` as the session name when you need to stop the default session explicitly.
@@ -57,28 +57,28 @@ Use `default` as the session name when you need to stop the default session expl
 ## Workspaces
 
 ```bash
-flock workspace list
-flock workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
-flock workspace get <workspace_id>
-flock workspace focus <workspace_id>
-flock workspace rename <workspace_id> <label>
-flock workspace close <workspace_id>
+flk workspace list
+flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flk workspace get <workspace_id>
+flk workspace focus <workspace_id>
+flk workspace rename <workspace_id> <label>
+flk workspace close <workspace_id>
 ```
 
 Create a workspace without stealing focus:
 
 ```bash
-flock workspace create --cwd ~/project --label api --no-focus
+flk workspace create --cwd ~/project --label api --no-focus
 ```
 
 ## Worktrees
 
 ```bash
-flock worktree list [--workspace ID | --cwd PATH] [--scan] [--json]
-flock worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
-flock worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
-flock worktree remove --workspace ID [--force] [--json]
-flock worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]
+flk worktree list [--workspace ID | --cwd PATH] [--scan] [--json]
+flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
+flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
+flk worktree remove --workspace ID [--force] [--json]
+flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]
 ```
 
 Worktrees are normal Flock workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Flock creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
@@ -94,38 +94,38 @@ A kill also sweeps the processes left in the checkout. Removing a worktree unlin
 ## Tabs
 
 ```bash
-flock tab list [--workspace <workspace_id>]
-flock tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
-flock tab get <tab_id>
-flock tab focus <tab_id>
-flock tab rename <tab_id> <label>
-flock tab close <tab_id>
+flk tab list [--workspace <workspace_id>]
+flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flk tab get <tab_id>
+flk tab focus <tab_id>
+flk tab rename <tab_id> <label>
+flk tab close <tab_id>
 ```
 
 ## Panes
 
 ```bash
-flock pane list [--workspace <workspace_id>]
-flock pane get <pane_id>
-flock pane rename <pane_id> <label>|--clear
-flock pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]
-flock pane close <pane_id>
+flk pane list [--workspace <workspace_id>]
+flk pane get <pane_id>
+flk pane rename <pane_id> <label>|--clear
+flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]
+flk pane close <pane_id>
 ```
 
 Read output:
 
 ```bash
-flock pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N]
-flock pane read <pane_id> --source visible --ansi
-flock pane read <pane_id> --source recent-unwrapped --lines 120
+flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N]
+flk pane read <pane_id> --source visible --ansi
+flk pane read <pane_id> --source recent-unwrapped --lines 120
 ```
 
 Send input:
 
 ```bash
-flock pane send-text <pane_id> <text>
-flock pane send-keys <pane_id> <key> [key ...]
-flock pane run <pane_id> <command>
+flk pane send-text <pane_id> <text>
+flk pane send-keys <pane_id> <key> [key ...]
+flk pane run <pane_id> <command>
 ```
 
 `pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
@@ -133,7 +133,7 @@ flock pane run <pane_id> <command>
 Report agent state from custom hooks:
 
 ```bash
-flock pane report-agent <pane_id> \
+flk pane report-agent <pane_id> \
   --source ID \
   --agent LABEL \
   --state idle|working|blocked|unknown \
@@ -151,7 +151,7 @@ Those commands include `foreground_cwd` when Flock can resolve the cwd of the fo
 Report display-only pane metadata without taking over semantic state:
 
 ```bash
-flock pane report-metadata <pane_id> \
+flk pane report-metadata <pane_id> \
   --source ID \
   [--agent LABEL] \
   [--applies-to-source ID] \
@@ -169,18 +169,18 @@ flock pane report-metadata <pane_id> \
 Promote session-specific fields (containers, progress, custom KV) into the calling pane's header:
 
 ```bash
-flock pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]
-flock pane clear-field <key> [--pane <pane_id>]
+flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]
+flk pane clear-field <key> [--pane <pane_id>]
 ```
 
 Fields render as compact `key value` chips on the pane header context line (after the branch/PR segments) and on the navigation surfaces — sidebar agent panel rows, navigator pane lists, mobile pane lists. The pane defaults to the calling pane (`$FLOCK_PANE_ID`, healed by process ancestry), so hooks and wrapper scripts inside a pane need no bookkeeping:
 
 ```bash
 # a podman wrapper registering a dev container
-flock pane set-field pg "● up"
+flk pane set-field pg "● up"
 # a build script publishing progress that auto-expires if it stalls
-flock pane set-field build 73% --ttl 120
-flock pane clear-field build
+flk pane set-field build 73% --ttl 120
+flk pane clear-field build
 ```
 
 Fields are display-only and ephemeral — never persisted into session snapshots. Caps: 6 fields per pane, key up to 16 characters, value up to 48 characters; over-cap requests fail. Setting an existing key updates it in place.
@@ -188,15 +188,15 @@ Fields are display-only and ephemeral — never persisted into session snapshots
 ## Agents
 
 ```bash
-flock agent list
-flock agent get <target>
-flock agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
-flock agent send <target> <text>
-flock agent rename <target> <name>|--clear
-flock agent focus <target>
-flock agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
-flock agent attach <target> [--takeover]
-flock agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+flk agent list
+flk agent get <target>
+flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
+flk agent send <target> <text>
+flk agent rename <target> <name>|--clear
+flk agent focus <target>
+flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
+flk agent attach <target> [--takeover]
+flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
 ```
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
@@ -208,7 +208,7 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 ## Direct terminal attach
 
 ```bash
-flock terminal attach <terminal_id> [--takeover]
+flk terminal attach <terminal_id> [--takeover]
 ```
 
 Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
@@ -218,13 +218,13 @@ Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ct
 Wait for output in a pane:
 
 ```bash
-flock wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]
+flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]
 ```
 
 Wait for pane agent state:
 
 ```bash
-flock wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]
+flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]
 ```
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
@@ -232,23 +232,23 @@ Use `wait output` for normal commands and servers. Use `wait agent-status` for c
 ## Integrations
 
 ```bash
-flock integration install pi
-flock integration install omp
-flock integration install claude
-flock integration install codex
-flock integration install copilot
-flock integration install opencode
-flock integration install hermes
-flock integration install qodercli
-flock integration uninstall pi
-flock integration uninstall omp
-flock integration uninstall claude
-flock integration uninstall codex
-flock integration uninstall copilot
-flock integration uninstall opencode
-flock integration uninstall hermes
-flock integration uninstall qodercli
-flock integration status [--outdated-only]
+flk integration install pi
+flk integration install omp
+flk integration install claude
+flk integration install codex
+flk integration install copilot
+flk integration install opencode
+flk integration install hermes
+flk integration install qodercli
+flk integration uninstall pi
+flk integration uninstall omp
+flk integration uninstall claude
+flk integration uninstall codex
+flk integration uninstall copilot
+flk integration uninstall opencode
+flk integration uninstall hermes
+flk integration uninstall qodercli
+flk integration status [--outdated-only]
 ```
 
 ## Read sources

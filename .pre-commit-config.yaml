@@ -78,6 +78,21 @@ repos:
         files: (\.rs$|\.md$|\.mdx$|\.toml$|\.json$|\.ya?ml$|\.py$|\.sh$)
         pass_filenames: true
 
+      # `flock` is the product, `flk` is the command (ADR-0003), and the two were
+      # freely mixed: `website/install.sh` installed BIN="flock", which would have
+      # shadowed util-linux flock(1) on any Linux box with ~/.local/bin ahead of
+      # /usr/bin, and the released docs carried 189 invocations of a command that
+      # does not exist. The token set is DERIVED from the dispatchers, so a new CLI
+      # group needs no entry here. Scope is Markdown, shell and the installer —
+      # Rust is excluded on purpose (in a doc comment the long name is the product
+      # noun), which is stated in the script rather than left as a silent hole.
+      - id: exec-name
+        name: "`flock` is the product, `flk` is the command — no mixing in command position"
+        entry: python3 scripts/exec_name_gate.py
+        language: system
+        files: (\.md$|\.mdx$|\.sh$)
+        pass_filenames: false
+
       # Deterministic, no escape hatch by design: a conflicted merge CAN be
       # committed (git records it and `git status` is clean afterwards).
       - id: no-conflict-markers
