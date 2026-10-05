@@ -68,7 +68,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Serializing the heavy multi-process PTY suites (see .config/nextest.toml)
     # adds wall-clock; give the job headroom over the previous 10-minute cap.
-    timeout-minutes: 15
+    #
+    # 15 was then reached and the job CANCELLED at 15m1s, twice in a row on a
+    # docs-only change that touches no Rust -- so the budget, not the change, was
+    # the variable. A cancelled job is worse than a red one: nextest fail-fasts,
+    # so the tail of the suite never runs and the run reads as inconclusive
+    # (#462, #539 both lost coverage this way). 25 leaves room for the mac leg's
+    # zig build of the vendored libghostty-vt, which has no cache entry, plus
+    # the serialized suites, on a loaded runner.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v7
