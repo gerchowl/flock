@@ -3082,13 +3082,11 @@ fn render_workspace_list(
         // group as the one row with no agent identity on it.
         if show_workspace_icon {
             line1.push(Span::styled(icon, icon_style));
+            line1.push(Span::styled(" ", Style::default()));
         }
-        match agent_field_cell(workspace_agent_field(app, ws)) {
-            Some(cell) => {
-                line1.push(Span::styled(cell, agent_field_style(highlighted, p)));
-                line1.push(Span::styled(" ", Style::default()));
-            }
-            None => line1.push(Span::styled(" ", Style::default())),
+        if let Some(cell) = agent_field_cell(workspace_agent_field(app, ws)) {
+            line1.push(Span::styled(cell, agent_field_style(highlighted, p)));
+            line1.push(Span::styled(" ", Style::default()));
         }
         // A section LEADER (`group_key` is set: the selectable main checkout that
         // heads a multi-member project section) renders the PROJECT IDENTITY, not
@@ -3297,15 +3295,16 @@ fn render_workspace_list(
         // grammar rather than as two panels that happen to sit together.
         // `clamp_line` below is what keeps the project label inside the row, so
         // the field claims its columns first and the label absorbs the loss.
-        match agent_field_cell(space_agent_field(app, key)) {
-            Some(cell) => {
-                spans.push(Span::styled(cell, agent_field_style(is_active_section, p)));
-                spans.push(Span::styled(" ", Style::default()));
-            }
-            // The bare separator, so this header's glyph-to-label gap matches a
-            // workspace row that has no identifiable agent either.
-            None => spans.push(Span::styled(" ", Style::default())),
+        // Space, then the field, then space — the agents band's own
+        // `<glyph> <agent> <rest>` grammar, byte for byte. The field goes AFTER
+        // the separator rather than before it: drawn flush, a space section read
+        // `○✻ flock` where the agents band read `○ cc flock`, which is the exact
+        // inconsistency this row is supposed to remove.
+        spans.push(Span::styled(" ", Style::default()));
+        if let Some(cell) = agent_field_cell(space_agent_field(app, key)) {
+            spans.push(Span::styled(cell, agent_field_style(is_active_section, p)));
         }
+        spans.push(Span::styled(" ", Style::default()));
         let label = space_head_idx(app, key)
             .and_then(|idx| app.workspaces.get(idx))
             .map(|ws| super::grammar::leader_label(app, ws, terminal_runtimes))
@@ -9144,21 +9143,63 @@ mod tests {
         );
     }
 
-    /// A workspace with no identifiable agent draws NO field, rather than a
-    /// placeholder or two blank columns — that is what keeps spaces rows and
-    /// agents rows aligned against each other.
+    /// A workspace with no identifiable agent draws NO field — the cell
+    /// collapses to NOTHING rather than to a placeholder or a reserved pair of
+    /// blank columns.
+    ///
+    /// The previous version of this test asserted only that the glyph was
+    /// absent, which `agent_field_cell` returning `None` and a two-column blank
+    /// both satisfy, so it could not tell the two apart while its comment claimed
+    /// it could. It can be told apart, because `buffer_row_text` reads the row's
+    /// full width without trimming: a collapsed cell leaves one space between
+    /// the state glyph and the label, and a reserved blank pair leaves two. So
+    /// this asserts the DIFFERENCE between the same row with and without a
+    /// harness, which is exactly the glyph plus its one separating space and
+    /// nothing else.
     #[test]
-    fn a_space_with_no_identifiable_agent_draws_no_agent_field() {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("flock")];
-        app.ensure_test_terminals();
-        app.active = Some(0);
-        let area = Rect::new(0, 0, 44, 40);
-        let rows = space_and_member_rows(&mut app, area);
-        for row in &rows {
+    fn a_space_with_no_identifiable_agent_collapses_the_field_entirely() {
+        let bare = |agent: Option<Agent>| {
+            let mut app = crate::app::state::AppState::test_new();
+            app.workspaces = vec![Workspace::test_new("flock")];
+            app.ensure_test_terminals();
+            if let Some(agent) = agent {
+                let pane = app.workspaces[0].tabs[0].root_pane;
+                let tid = app.workspaces[0].tabs[0].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                app.terminals.get_mut(&tid).unwrap().detected_agent = Some(agent);
+            }
+            app.active = Some(0);
+            let rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
+            assert!(!rows.is_empty(), "the fixture must render a row");
+            rows
+        };
+        let without = bare(None);
+        let with = bare(Some(Agent::Claude));
+        let symbol = crate::agent_symbols::symbol(Agent::Claude);
+
+        for (bare_row, with_row) in without.iter().zip(with.iter()) {
             assert!(
-                !row.contains(crate::agent_symbols::symbol(Agent::Claude)),
-                "no harness means no symbol, got {row:?}"
+                !bare_row.contains(symbol),
+                "no harness means no glyph, got {bare_row:?}"
+            );
+            // The agents band's own grammar: `<glyph> <agent> <rest>`, so the
+            // symbol sits between two SINGLE spaces. Drawn flush it read
+            // `○✻ flock` against the agents band's `○ cc flock` — the exact
+            // inconsistency this row exists to remove.
+            assert!(
+                with_row.contains(&format!(" {symbol} ")),
+                "the symbol must be separated from the state glyph and the label \
+                 by one space each, got {with_row:?}"
+            );
+            // And the whole cost of the field is the symbol plus ONE space: strip
+            // those and the row is byte-identical to the bare one, which is what
+            // rules out a reserved blank pair.
+            assert_eq!(
+                with_row.trim_end().replacen(&format!("{symbol} "), "", 1),
+                bare_row.trim_end(),
+                "the field must cost exactly the glyph and one space; \
+                 bare={bare_row:?} with={with_row:?}"
             );
         }
     }
