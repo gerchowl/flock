@@ -36,16 +36,48 @@ TYPE_ORDER = ("Added", "Fixed", "Performance", "Maintenance", "Other")
 COMMIT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+(?P<body>.+)$")
 
 
-def run_git(args: list[str]) -> str:
-    return subprocess.check_output(["git", *args], text=True).strip()
+def run_git(args: list[str], cwd: Path | None = None) -> str:
+    # stderr is captured, not inherited: a git refusal carries the explanation a
+    # reader needs, and it belongs on the exception the caller handles.
+    return subprocess.check_output(
+        ["git", *args], text=True, cwd=cwd, stderr=subprocess.PIPE
+    ).strip()
+
+
+def optional_git(args: list[str], cwd: Path | None = None) -> str | None:
+    """git's answer, or None when it has none — as opposed to a failure."""
+    result = subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False, cwd=cwd
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def normalize_version(version: str) -> str:
     return version.strip().removeprefix("v")
 
 
-def latest_stable_tag() -> str:
-    return run_git(["describe", "--tags", "--match", "v[0-9]*", "--abbrev=0"])
+def latest_stable_tag(cwd: Path | None = None) -> str | None:
+    """The most recent `v*` tag, or None — which is this repository's state.
+
+    `git describe` exits 128 with "No names found" when no tag matches, and
+    `check_output` turns that into an exception. A repository that has not cut
+    its first release is in exactly that state, so the answer is None rather
+    than a crash on the path that is looking for one.
+    """
+    return optional_git(["describe", "--tags", "--match", "v[0-9]*", "--abbrev=0"], cwd)
+
+
+def first_commit(cwd: Path | None = None) -> str | None:
+    return optional_git(["rev-list", "--max-parents=0", "HEAD"], cwd)
+
+
+def commit_exists(commit: str, cwd: Path | None = None) -> bool:
+    return (
+        optional_git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], cwd)
+        is not None
+    )
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -54,12 +86,30 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def previous_preview_commit(path: Path) -> str | None:
+def previous_preview_commit(path: Path, cwd: Path | None = None) -> str | None:
+    """The commit the current preview build came from, if this repository has it.
+
+    The manifest's recorded sha is the one thing the next preview's notes are
+    diffed from, and `git log <sha>..<commit>` fails outright on a sha this
+    repository cannot resolve. That is not hypothetical input: the manifest is
+    generated data whose recorded commit can become unreachable (a rebase, a
+    squashed import, a file carried in from another lineage), and the failure
+    mode is a preview run that dies before it publishes rather than one that
+    notes something. A commit that does not resolve here is not a previous
+    preview, so it is treated as absent and the caller falls back.
+    """
     data = read_json(path)
     if not data:
         return None
     commit = data.get("commit")
-    return commit if isinstance(commit, str) and commit.strip() else None
+    if not isinstance(commit, str) or not commit.strip():
+        return None
+    return commit if commit_exists(commit, cwd) else None
+
+
+def preview_base_ref(manifest: Path, cwd: Path | None = None) -> str | None:
+    """What the next preview's notes are diffed against, or None for all of it."""
+    return previous_preview_commit(manifest, cwd) or latest_stable_tag(cwd) or first_commit(cwd)
 
 
 def hidden_subject(subject: str) -> bool:
@@ -76,8 +126,9 @@ def latest_publishable_commit(ref: str) -> str:
     raise SystemExit(f"no publishable commit found in {ref}")
 
 
-def commit_subjects(previous: str, commit: str) -> list[str]:
-    output = run_git(["log", "--pretty=format:%s", f"{previous}..{commit}"])
+def commit_subjects(previous: str | None, commit: str, cwd: Path | None = None) -> list[str]:
+    rev_range = commit if previous is None else f"{previous}..{commit}"
+    output = run_git(["log", "--pretty=format:%s", rev_range], cwd)
     if not output:
         return []
     subjects = []
@@ -105,9 +156,19 @@ def humanize_subject(subject: str) -> tuple[str, str]:
     return heading, body
 
 
-def build_notes(previous: str, commit: str, build_id: str, base_version: str, repo: str) -> str:
+def build_notes(
+    previous: str | None,
+    commit: str,
+    build_id: str,
+    base_version: str,
+    repo: str,
+    cwd: Path | None = None,
+) -> str:
     short = commit[:12]
-    compare = f"https://github.com/{repo}/compare/{previous}...{commit}"
+    # With nothing to diff from, the compare link is the whole history rather
+    # than a range — a URL naming `None` would 404 for every reader.
+    compare_base = previous or first_commit(cwd) or commit
+    compare = f"https://github.com/{repo}/compare/{compare_base}...{commit}"
     lines = [
         f"Preview build {build_id}",
         "",
@@ -117,7 +178,7 @@ def build_notes(previous: str, commit: str, build_id: str, base_version: str, re
         "",
     ]
     grouped: dict[str, list[str]] = {heading: [] for heading in TYPE_ORDER}
-    for subject in commit_subjects(previous, commit):
+    for subject in commit_subjects(previous, commit, cwd):
         heading, body = humanize_subject(subject)
         grouped.setdefault(heading, []).append(body)
 
@@ -166,6 +227,40 @@ def asset_objects(urls: dict[str, str], shas: dict[str, str]) -> dict[str, dict[
     return assets
 
 
+def asset_url(entry: Any) -> str:
+    """The download URL of an asset entry, which may be a bare string or an object."""
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        return str(entry.get("url") or "").strip()
+    return ""
+
+
+def foreign_build_entries(builds: Any, repo: str) -> list[str]:
+    """Archived preview builds whose assets are not this repository's releases.
+
+    The mirror image of `scripts/changelog.py`'s check on the stable archive, and
+    for the same reason: `build_manifest` carries the previous builds forward,
+    so an entry left in the file is an entry re-published on every preview run,
+    forever. A preview manifest pointing at another repository's builds hands a
+    preview-channel user that repository's binary.
+    """
+    if not isinstance(builds, dict):
+        return []
+
+    foreign: list[str] = []
+    for build_id, build in builds.items():
+        if not isinstance(build, dict):
+            continue
+        assets = build.get("assets")
+        if not isinstance(assets, dict):
+            continue
+        expected = default_asset_urls(repo, str(build.get("tag", "")))
+        if any(asset_url(assets.get(target)) != expected[target] for target in ASSET_TARGETS):
+            foreign.append(str(build_id))
+    return sorted(foreign)
+
+
 def build_manifest(
     output: Path,
     repo: str,
@@ -184,6 +279,9 @@ def build_manifest(
     current = read_json(output) or {}
     builds = current.get("builds") if isinstance(current.get("builds"), dict) else {}
     builds = dict(builds)
+    dropped = foreign_build_entries(builds, repo)
+    for stale_build_id in dropped:
+        del builds[stale_build_id]
     builds[build_id] = {
         "base_version": normalize_version(base_version),
         "commit": commit,
@@ -216,7 +314,7 @@ def build_manifest(
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
-    previous = args.previous or previous_preview_commit(Path(args.manifest)) or latest_stable_tag()
+    previous = args.previous or preview_base_ref(Path(args.manifest))
     notes = build_notes(previous, args.commit, args.build_id, args.base_version, args.repo)
     Path(args.output).write_text(notes, encoding="utf-8")
     return 0
@@ -225,6 +323,11 @@ def cmd_notes(args: argparse.Namespace) -> int:
 def cmd_manifest(args: argparse.Namespace) -> int:
     notes = Path(args.notes).read_text(encoding="utf-8")
     shas = read_sha_file(Path(args.sha_file) if args.sha_file else None)
+    existing = read_json(Path(args.output)) or {}
+    dropped = foreign_build_entries(
+        existing.get("builds") if isinstance(existing.get("builds"), dict) else {},
+        args.repo,
+    )
     content = build_manifest(
         output=Path(args.output),
         repo=args.repo,
@@ -239,6 +342,11 @@ def cmd_manifest(args: argparse.Namespace) -> int:
         retain=args.retain,
     )
     Path(args.output).write_text(content, encoding="utf-8")
+    if dropped:
+        print(
+            f"dropped {len(dropped)} archived preview build(s) not published by "
+            f"{args.repo}: {', '.join(dropped)}"
+        )
     return 0
 
 

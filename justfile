@@ -108,10 +108,14 @@ release-docs-check:
         fi; \
     done
 
-# Prepare the release commit without tagging or pushing (usage: just release-prepare 0.1.1)
-release-prepare version:
+# Report what landed since the last release and the bump it calls for (#509) — a recommendation, not an instruction
+release-plan *since:
+    python3 scripts/changelog.py plan{{if since != "" { " --since " + since } else { "" }}}
+
+# Prepare the release commit without tagging or pushing; extra flags go to check-version (usage: just release-prepare 0.1.1 --allow-below-recommended)
+release-prepare version *flags:
     @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
-        echo "error: version must look like 0.6.6 without a v prefix"; \
+        echo "error: version must look like 1.0.0 without a v prefix"; \
         exit 1; \
     }
     @if [ -n "$(git status --porcelain)" ]; then \
@@ -124,10 +128,11 @@ release-prepare version:
         exit 1; \
     fi
     just release-docs-check
+    python3 scripts/changelog.py check-version --version {{version}} {{flags}}
     python3 scripts/changelog.py prepare --version {{version}}
     cp CHANGELOG.md docs/next/CHANGELOG.md
     sed -i.bak 's/^version = ".*"/version = "{{version}}"/' Cargo.toml && rm -f Cargo.toml.bak
-    cargo update -p flock --offline
+    cargo update -p flock-ai --offline
     just check
     git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
@@ -136,7 +141,7 @@ release-prepare version:
 # Tag and push an already-prepared release commit (usage: just release-publish 0.1.1)
 release-publish version:
     @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
-        echo "error: version must look like 0.6.6 without a v prefix"; \
+        echo "error: version must look like 1.0.0 without a v prefix"; \
         exit 1; \
     }
     @if [ -n "$(git status --porcelain)" ]; then \
