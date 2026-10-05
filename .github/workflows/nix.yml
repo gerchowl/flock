@@ -5,6 +5,14 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - ".github/workflows/nix.yml"
+      # ci.yml produces two required contexts (`check (macos-15)`,
+      # `check (ubuntu-latest)`), and a required context that cannot run leaves a
+      # PR BLOCKED forever with every reported check green. That is not
+      # hypothetical: a ci.yml-only PR cannot trigger this workflow at all,
+      # because the filter named nix.yml and not ci.yml -- so the very PR that
+      # raises the job budget is the one that can never be verified, and the
+      # gate is silently dropped from the review of the next one.
+      - ".github/workflows/ci.yml"
       - "assets/**"
       - "build.rs"
       - "Cargo.lock"
@@ -26,6 +34,14 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/nix.yml"
+      # ci.yml produces two required contexts (`check (macos-15)`,
+      # `check (ubuntu-latest)`), and a required context that cannot run leaves a
+      # PR BLOCKED forever with every reported check green. That is not
+      # hypothetical: a ci.yml-only PR cannot trigger this workflow at all,
+      # because the filter named nix.yml and not ci.yml -- so the very PR that
+      # raises the job budget is the one that can never be verified, and the
+      # gate is silently dropped from the review of the next one.
+      - ".github/workflows/ci.yml"
       - "assets/**"
       - "build.rs"
       - "Cargo.lock"
