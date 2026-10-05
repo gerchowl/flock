@@ -221,10 +221,15 @@ Stable releases use:
 
 ```bash
 just check
+just release-plan          # what landed since the last release, and the bump it calls for
 just release 0.x.y
 ```
 
+The version number is a human's decision, and `just release-plan` is the input to it rather than a replacement for it: it reports the commits since the last `v*` tag grouped by conventional type and recommends major (`!` or a `BREAKING CHANGE` footer), minor (a `feat`) or patch (anything else that ships). `just release-prepare` refuses a version that is not greater than the last release, or that is below the recommended bump; pass `--allow-not-greater` or `--allow-below-recommended` when you mean it. With no `v*` tag the plan reads the whole history and reports the first release as yours to number — the version line is a product decision, recorded in [ADR-0025](docs/adr/0025-version-identity-and-release-automation.md).
+
 Before stable release, run `/pre-release-audit`, finalize `docs/next`, copy approved docs into the stable docs/root files, and let `just release-docs-check` verify the sync. `just release` prepares the release commit, tags it, pushes the tag, and GitHub Actions builds binaries, creates the GitHub release, closes released issues, and updates `website/latest.json`.
+
+A release manifest is a promise about what a user can install, so it may only advertise assets this repository published. `scripts/changelog.py` refuses to write or verify a manifest whose assets are not `DEFAULT_RELEASE_REPO`'s, and drops foreign archived entries on the way past — an entry left in the archive is an entry re-published on every release. Before this repository has published a release, `website/latest.json` is a sentinel that advertises no installable version; regenerate it with `python3 scripts/changelog.py neutralize-latest-json` rather than by hand.
 
 The release workflows must publish these four assets:
 

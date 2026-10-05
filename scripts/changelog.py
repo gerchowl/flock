@@ -6,10 +6,25 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+try:  # imported as part of the `scripts` package by the maintenance tests
+    from scripts.conventional_commits import (
+        Commit,
+        classify_commits,
+        git_commits,
+        recommended_bump,
+    )
+except ImportError:  # executed directly as scripts/changelog.py
+    from conventional_commits import (  # type: ignore[no-redef]
+        Commit,
+        classify_commits,
+        git_commits,
+        recommended_bump,
+    )
 
 DEFAULT_LIVE_MANIFEST_URL = "https://flock.dev/latest.json"
 
@@ -26,6 +41,21 @@ ASSET_TARGETS = (
     "macos-aarch64",
 )
 EXPECTED_ASSET_NAMES = {target: f"flock-{target}" for target in ASSET_TARGETS}
+
+# The manifest a repository publishes before it has published a release. It is a
+# sentinel, not a version: `0.0.0` is below every real build of this binary, so
+# `flk update` reports "already up to date" instead of fetching a binary, and
+# remote bootstrap fails with "the release manifest does not include flock
+# <your version>" instead of installing one. Both failure modes are loud; the
+# alternative — advertising another project's number — is not. See ADR-0025.
+NO_STABLE_RELEASE_VERSION = "0.0.0"
+NO_STABLE_RELEASE_NOTES = (
+    "### Maintenance\n"
+    "- No stable Flock release has been published from this repository yet. This "
+    "manifest advertises no installable version on purpose: `flk update` has "
+    "nothing to install, and remote bootstrap asks you to build Flock on the "
+    "remote host. See ADR-0025 for the version line."
+)
 
 
 @dataclass(frozen=True)
@@ -291,6 +321,263 @@ def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> di
         target: f"https://github.com/{repo}/releases/download/{tag}/{EXPECTED_ASSET_NAMES[target]}"
         for target in ASSET_TARGETS
     }
+
+
+# ---------------------------------------------------------------------------
+# Manifest ownership
+# ---------------------------------------------------------------------------
+#
+# A release manifest is a promise: every URL in it is a binary this project
+# published, and `flk update` downloads it without asking again. The repository
+# shipped a manifest that broke that promise — 45 archived releases, 180 asset
+# URLs, every one of them another project's release download — so the check that
+# would have caught it is now part of writing the file rather than something a
+# reader has to remember.
+
+
+def foreign_release_entries(releases: Any, repo: str = DEFAULT_RELEASE_REPO) -> list[str]:
+    """Archived versions whose assets are not this repository's release assets.
+
+    Deliberately reads the raw manifest value instead of the normalized one:
+    `normalize_release_metadata` manufactures this repository's URLs for an
+    entry that has none, which would launder a foreign entry into looking local.
+    An entry with no `assets` of its own is left alone — it already carries the
+    local default wherever it is read.
+    """
+    if not isinstance(releases, dict):
+        return []
+
+    foreign: list[str] = []
+    for raw_version, metadata in releases.items():
+        if not isinstance(metadata, dict):
+            continue
+        assets = metadata.get("assets")
+        if not isinstance(assets, dict):
+            continue
+        try:
+            expected = default_release_assets(str(raw_version), repo)
+        except ChangelogError:
+            foreign.append(str(raw_version))
+            continue
+        if any(str(assets.get(target, "")).strip() != expected[target] for target in ASSET_TARGETS):
+            foreign.append(str(raw_version))
+    return sorted(foreign)
+
+
+def ensure_manifest_assets_belong_to_repo(
+    manifest: dict[str, Any], repo: str = DEFAULT_RELEASE_REPO, label: str = "manifest"
+) -> None:
+    """Refuse a manifest that advertises a version this repository did not publish."""
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ChangelogError(f"{label} is missing a string version")
+
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        raise ChangelogError(f"{label} is missing an assets object")
+
+    expected = default_release_assets(version, repo)
+    for target in ASSET_TARGETS:
+        url = str(assets.get(target, "")).strip()
+        if url != expected[target]:
+            raise ChangelogError(
+                f"{label} advertises {target} for v{normalize_version(version)} as {url or '<missing>'}, "
+                f"which is not this repository's release asset ({expected[target]})"
+            )
+
+    foreign = foreign_release_entries(manifest.get("releases"), repo)
+    if foreign:
+        raise ChangelogError(
+            f"{label} archives {len(foreign)} version(s) published by another repository: "
+            f"{', '.join(foreign)}"
+        )
+
+
+def build_no_release_manifest(
+    repo: str = DEFAULT_RELEASE_REPO, protocol: int | None = None
+) -> str:
+    """The manifest for a repository that has published no release yet."""
+    return build_latest_json(
+        NO_STABLE_RELEASE_VERSION,
+        NO_STABLE_RELEASE_NOTES,
+        default_release_assets(NO_STABLE_RELEASE_VERSION, repo),
+        protocol=protocol,
+        releases={},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release plan (#509)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReleasePlan:
+    """What landed since the last release, and what that calls for.
+
+    A recommendation, never an instruction: the number stays a human's decision
+    and `check-version` can be overridden. What did not exist before #509 is any
+    of this — the recipe asked for a number and took whatever it was given.
+    """
+
+    rev_range: str
+    since_label: str
+    last_version: str | None
+    is_first_release: bool
+    commits: list[Commit] = field(default_factory=list)
+    groups: dict[str, list[str]] = field(default_factory=dict)
+    unclassified: list[str] = field(default_factory=list)
+    breaking: list[str] = field(default_factory=list)
+    bump: str | None = None
+    recommended_version: str | None = None
+
+    @property
+    def commit_count(self) -> int:
+        return len(self.commits)
+
+    @property
+    def bump_reason(self) -> str | None:
+        if self.bump is None:
+            return None
+        if self.bump == "major":
+            return "a BREAKING CHANGE is in the range"
+        if self.bump == "minor":
+            return "a feat is in the range"
+        return "changes that are neither a feat nor a break are in the range"
+
+
+def run_git(args: list[str], cwd: Path | None = None) -> str | None:
+    """git's answer, or None when it has none — as opposed to a failure."""
+    result = subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False, cwd=cwd
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def latest_stable_tag(cwd: Path | None = None) -> str | None:
+    """The most recent `v*` tag, or None when this repository has never released.
+
+    `git describe` fails rather than answering when no tag matches, which is the
+    state every repository is in before its first release. That is an answer,
+    not an error: this project's own first release is in that state.
+    """
+    return run_git(["describe", "--tags", "--match", "v[0-9]*", "--abbrev=0"], cwd)
+
+
+def root_commit(cwd: Path | None = None) -> str | None:
+    return run_git(["rev-list", "--max-parents=0", "HEAD"], cwd)
+
+
+def bump_version(version: str, bump: str) -> str:
+    major, minor, patch = parse_version(version)
+    if bump == "major":
+        return f"{major + 1}.0.0"
+    if bump == "minor":
+        return f"{major}.{minor + 1}.0"
+    if bump == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    raise ChangelogError(f"unknown bump: {bump}")
+
+
+def resolve_release_base(
+    since: str | None = None, cwd: Path | None = None
+) -> tuple[str, str, str | None, bool]:
+    """The commit range a release would cover, and the version before it.
+
+    Returns `(rev_range, since_label, last_version, is_first_release)`. With no
+    `v*` tag the range is the whole history and `is_first_release` is True, which
+    is the defined answer to "since the last tag" for a repository that has never
+    tagged a release — a state this repository is in.
+    """
+    if since:
+        # Exclusive, like the `tag..HEAD` range below: "since" a commit means
+        # after it, so the ref itself is not part of what the release would cover.
+        return f"{since}..HEAD", f"since {since}", None, False
+
+    tag = latest_stable_tag(cwd)
+    if tag:
+        return (
+            f"{tag}..HEAD",
+            f"since {tag}",
+            normalize_version(tag),
+            False,
+        )
+
+    first = root_commit(cwd)
+    if first is None:
+        raise ChangelogError(
+            "could not read git history; run this inside the flock repository"
+        )
+    # `HEAD`, not the root commit: `git log <root>` is one commit, and
+    # `<root>..HEAD` drops the root. The whole history is `HEAD`.
+    return (
+        "HEAD",
+        f"the whole history — no v* tag yet, first commit {first[:12]}",
+        None,
+        True,
+    )
+
+
+def build_release_plan(since: str | None = None, cwd: Path | None = None) -> ReleasePlan:
+    rev_range, since_label, last_version, is_first_release = resolve_release_base(since, cwd)
+    try:
+        commits = git_commits(rev_range, cwd)
+    except subprocess.CalledProcessError as exc:
+        # A ref that does not resolve is the caller's typo, not a stack trace.
+        stderr = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
+        raise ChangelogError(
+            f"could not read git log for {rev_range}: {stderr.splitlines()[0] if stderr else exc}"
+        ) from exc
+    plan = ReleasePlan(
+        rev_range=rev_range,
+        since_label=since_label,
+        last_version=last_version,
+        is_first_release=is_first_release,
+        commits=commits,
+    )
+
+    for classified in classify_commits(commits):
+        subject = classified.commit.subject
+        if classified.kind is None:
+            plan.unclassified.append(subject)
+            continue
+        plan.groups.setdefault(classified.kind, []).append(subject)
+        if classified.breaking:
+            plan.breaking.append(subject)
+
+    plan.bump = recommended_bump(commits)
+    if last_version is not None and plan.bump is not None:
+        plan.recommended_version = bump_version(last_version, plan.bump)
+    return plan
+
+
+def ensure_version_is_releasable(plan: ReleasePlan, version: str, overrides: set[str]) -> None:
+    """Refuse a version the plan says is wrong, unless the operator overrode it.
+
+    Two separate questions, so two overrides. Holding a release back is a normal
+    thing to want and only needs `--allow-below-recommended`; shipping a number
+    that is not greater than the last release can only be the first release or a
+    mistake, and needs `--allow-not-greater`.
+    """
+    requested = parse_version(version)
+    normalized = normalize_version(version)
+
+    if plan.last_version is not None and "allow-not-greater" not in overrides:
+        if requested <= parse_version(plan.last_version):
+            raise ChangelogError(
+                f"v{normalized} is not greater than the last release v{plan.last_version}; "
+                f"pass --allow-not-greater if this is deliberate"
+            )
+
+    if plan.recommended_version is not None and "allow-below-recommended" not in overrides:
+        if requested < parse_version(plan.recommended_version):
+            raise ChangelogError(
+                f"v{normalized} is below the recommended v{plan.recommended_version} "
+                f"({plan.bump}: {plan.bump_reason}); pass --allow-below-recommended to hold "
+                f"the release back"
+            )
 
 
 def manifest_from_release_payload(
@@ -588,19 +875,39 @@ def cmd_sync_latest_json(args: argparse.Namespace) -> int:
     new_manifest = manifest_from_release_payload(release_payload, version, args.protocol)
     announcement_path = Path(args.announcement)
     announcement = load_product_announcement(announcement_path)
+
+    # The archive is carried forward, not rebuilt: a release is additive to its
+    # own history. That is only safe while the archive holds this repository's
+    # releases, so anything else is dropped here, by name, on the way past —
+    # otherwise the next release re-publishes it and the file never heals.
+    archived = archived_releases_from_current_manifest(current_manifest)
+    foreign = foreign_release_entries(archived, args.repo)
+    for stale in foreign:
+        del archived[stale]
+
     output = build_latest_json(
         version,
         str(new_manifest["notes"]),
         dict(new_manifest["assets"]),
         protocol=int(new_manifest["protocol"]),
         announcement=announcement,
-        releases=archived_releases_from_current_manifest(current_manifest),
+        releases=archived,
     )
     write_text(manifest_path, output)
     if announcement is not None:
         write_text(announcement_path, "null\n")
 
     print(f"updated {manifest_path} from GitHub release v{version}")
+    if foreign:
+        print(
+            f"dropped {len(foreign)} archived version(s) not published by {args.repo}: "
+            f"{', '.join(foreign)}"
+        )
+    # The file is written before this runs, so a manifest that still advertises a
+    # foreign repository is now on disk and has to be reported as the failure it
+    # is rather than discovered by a user running `flk update`.
+    ensure_manifest_assets_belong_to_repo(load_json(manifest_path), args.repo, str(manifest_path))
+    print(f"every advertised asset is a {args.repo} release asset")
     if announcement is not None:
         print(f"included product announcement from {announcement_path}")
         print(f"cleared {announcement_path}")
@@ -615,8 +922,86 @@ def cmd_sync_latest_json(args: argparse.Namespace) -> int:
     print("next:")
     print(f"  git diff -- {manifest_path}")
     print(f"  git add {manifest_path}")
-    print(f"  git commit -m \"docs: update website manifest for v{version}\"")
+    print(f'  git commit -m "docs: update website manifest for v{version}"')
     print("  git push")
+    return 0
+
+
+def cmd_neutralize_latest_json(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.output)
+    write_text(manifest_path, build_no_release_manifest(args.repo, args.protocol))
+    ensure_manifest_assets_belong_to_repo(load_json(manifest_path), args.repo, str(manifest_path))
+    print(
+        f"wrote {manifest_path}: no installable version is advertised "
+        f"(v{NO_STABLE_RELEASE_VERSION} sentinel, {args.repo} asset URLs, "
+        f"protocol {args.protocol if args.protocol is not None else read_protocol_version()})"
+    )
+    return 0
+
+
+def print_release_plan(plan: ReleasePlan) -> None:
+    print("release plan")
+    if plan.last_version is None:
+        print("  last release:  none — this is the first release from this repository")
+    else:
+        print(f"  last release:  v{plan.last_version}")
+    print(f"  commits since: {plan.commit_count} ({plan.since_label})")
+    if plan.bump is None:
+        print("  recommended:   nothing to release — no conventional commits in the range")
+    else:
+        print(f"  recommended:   {plan.bump} — {plan.bump_reason}")
+    if plan.recommended_version is not None:
+        print(f"  next version:  {plan.recommended_version}")
+    elif plan.bump is not None:
+        print(
+            "  next version:  yours to choose — there is no v* tag to bump from, and the "
+            "version line is a product decision (ADR-0025)"
+        )
+
+    for label, subjects in (
+        ("breaking", plan.breaking),
+        *[(kind, plan.groups.get(kind, [])) for kind in sorted(plan.groups)],
+        ("unclassified", plan.unclassified),
+    ):
+        if not subjects:
+            continue
+        print()
+        print(f"  {label} ({len(subjects)})")
+        for subject in subjects:
+            print(f"    {subject}")
+
+    if plan.unclassified:
+        print()
+        print(
+            "  unclassified subjects are not conventional commits; CI rejects them and "
+            "they contribute no bump"
+        )
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    plan = build_release_plan(args.since, Path(args.cwd) if args.cwd else None)
+    print_release_plan(plan)
+    return 0
+
+
+def cmd_check_version(args: argparse.Namespace) -> int:
+    version = normalize_version(args.version)
+    parse_version(version)  # format, before anything reads git
+    overrides = set(args.override or ())
+    plan = build_release_plan(args.since, Path(args.cwd) if args.cwd else None)
+
+    if plan.last_version is None:
+        print(
+            f"v{version}: first release from this repository, so there is no earlier "
+            f"version to be greater than ({plan.commit_count} commits in the range)"
+        )
+    else:
+        print(f"v{version}: last release v{plan.last_version}, plan recommends {plan.bump}")
+
+    ensure_version_is_releasable(plan, version, overrides)
+    for override in sorted(overrides):
+        print(f"override accepted: --{override}")
+    print(f"v{version} is releasable")
     return 0
 
 
@@ -637,6 +1022,7 @@ def cmd_verify_release_state(args: argparse.Namespace) -> int:
     expected_manifest = manifest_from_release_payload(release_payload, version, args.protocol)
 
     local_raw_manifest = load_json(Path(args.output))
+    ensure_manifest_assets_belong_to_repo(local_raw_manifest, args.repo, str(args.output))
     local_manifest = ensure_manifest_matches_expected(
         local_raw_manifest,
         expected_manifest,
@@ -690,6 +1076,46 @@ def build_parser() -> argparse.ArgumentParser:
     sync_latest_json.add_argument("--announcement", default=str(DEFAULT_PRODUCT_ANNOUNCEMENT_PATH))
     sync_latest_json.add_argument("--protocol", type=int)
     sync_latest_json.set_defaults(func=cmd_sync_latest_json)
+
+    neutralize_latest_json = subparsers.add_parser(
+        "neutralize-latest-json",
+        help="Write a manifest that advertises no installable version",
+    )
+    neutralize_latest_json.add_argument("--repo", default=DEFAULT_RELEASE_REPO)
+    neutralize_latest_json.add_argument("--output", default=str(DEFAULT_LATEST_JSON_PATH))
+    neutralize_latest_json.add_argument("--protocol", type=int)
+    neutralize_latest_json.set_defaults(func=cmd_neutralize_latest_json)
+
+    plan = subparsers.add_parser(
+        "plan",
+        help="Report commits since the last release and the bump they call for",
+    )
+    plan.add_argument("--since", help="Diff from this ref instead of the last v* tag")
+    plan.add_argument("--cwd", help="Read git history from this directory")
+    plan.set_defaults(func=cmd_plan)
+
+    check_version = subparsers.add_parser(
+        "check-version",
+        help="Check a release version against the last release and the recommended bump",
+    )
+    check_version.add_argument("--version", required=True)
+    check_version.add_argument("--since")
+    check_version.add_argument("--cwd")
+    check_version.add_argument(
+        "--allow-not-greater",
+        dest="override",
+        action="append_const",
+        const="allow-not-greater",
+        help="Accept a version that is not greater than the last release",
+    )
+    check_version.add_argument(
+        "--allow-below-recommended",
+        dest="override",
+        action="append_const",
+        const="allow-below-recommended",
+        help="Accept a version below the bump the commit range recommends",
+    )
+    check_version.set_defaults(func=cmd_check_version)
 
     validate_product_announcement = subparsers.add_parser(
         "validate-product-announcement",
