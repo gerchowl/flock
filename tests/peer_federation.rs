@@ -119,6 +119,15 @@ fn init_repo_with_origin(path: &Path, origin: &str) {
 
 /// Create a workspace over the JSON API socket (fresh servers have none).
 fn create_workspace(api_socket: &Path, cwd: &Path) {
+    create_workspace_reporting_pane(api_socket, cwd);
+}
+
+/// `workspace.create` already returns the new pane's public id, so this variant
+/// hands it back rather than making the caller go and find it (#542). `pane 1`
+/// is the DISPLAY number and is not a valid target — `pane.report_agent`
+/// correctly refuses it with `pane_not_found` — so the id has to come from the
+/// API rather than be composed.
+fn create_workspace_reporting_pane(api_socket: &Path, cwd: &Path) -> String {
     let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
     let request = format!(
         "{{\"id\":\"test:ws\",\"method\":\"workspace.create\",\"params\":{{\"cwd\":\"{}\",\"focus\":true}}}}\n",
@@ -136,6 +145,16 @@ fn create_workspace(api_socket: &Path, cwd: &Path) {
         response.contains("\"result\""),
         "workspace.create failed: {response}"
     );
+    let key = "\"pane_id\":\"";
+    let start = response
+        .find(key)
+        .unwrap_or_else(|| panic!("no pane_id in workspace.create reply: {response}"))
+        + key.len();
+    let end = start
+        + response[start..]
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated pane_id: {response}"));
+    response[start..end].to_string()
 }
 
 fn write_config(config_home: &Path, contents: &str) {
@@ -771,4 +790,127 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     drop(server_a);
     drop(server_b);
     cleanup_test_base(&base);
+}
+
+/// E2E for #542: the sidebar's agent field, read off a REAL rendered frame.
+///
+/// Every other test of this feature reads a `ratatui::buffer::Buffer` the
+/// renderer produced in-process. That catches what the code draws and nothing
+/// about what a server actually sends a client — which is where two of #542's
+/// three blockers lived, both of them invisible to a buffer: the peer summary
+/// that reaches a viewer over the wire, and the two sidebar sections disagreeing
+/// about one pane.
+///
+/// So: a real sandboxed server, a real workspace, the agent's identity set
+/// through the real `pane.report_agent` verb (the same path a hook takes — no
+/// agent process and no terminal heuristics involved), a real protocol client
+/// attached over a socket, and assertions on the decoded frame text. The
+/// sidebar is 90 columns wide here so nothing truncates.
+///
+/// `pane.report_agent` rather than a spawned `claude` on purpose. Detection is
+/// evidence-based on a live screen, and a real harness in a sandbox needs its
+/// first-run modal dismissed and its keys routed through flock's own modes
+/// before it is recognisable — which is exactly the choreography that makes a
+/// runbook brittle. The verb under test here is the DISPLAY path, and this
+/// reaches it deterministically.
+#[test]
+fn the_agent_field_reaches_a_real_frame_in_both_sections_and_all_three_modes() {
+    let base = unique_test_dir();
+    let repo = base.join("proj");
+    init_repo_with_origin(&repo, "git@github.com:agent-field-test/proj.git");
+    let config_home = base.join("config");
+    let runtime = base.join("runtime");
+    let api_socket = base.join("flock-a.sock");
+    // `symbol` for both sections, so the assertion below is about the DEFAULT
+    // an operator gets rather than a mode chosen to make the test pass.
+    write_config(
+        &config_home,
+        "onboarding = false\n\n[ui]\nsidebar_width = 44\n",
+    );
+    let server = spawn_server(&config_home, &runtime, &api_socket, &repo, None);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let pane_id = create_workspace_reporting_pane(&api_socket, &repo);
+
+    // The agent's identity, through the real verb.
+    report_agent(&api_socket, &pane_id, "claude");
+
+    let client_socket = base.join("flock-a-client.sock");
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let mut stream = UnixStream::connect(&client_socket).expect("client socket should connect");
+    let (_, error) = client_handshake(&mut stream, support::PROTOCOL_VERSION, 90, 30)
+        .expect("handshake should complete");
+    assert!(error.is_none(), "handshake rejected: {error:?}");
+
+    // Wait for ONE frame containing every needle. Sequential single-needle
+    // waits would consume frames between checks and can stall when the server
+    // has no reason to re-render.
+    let rows = wait_for_frame_matching(
+        &mut stream,
+        &["spaces", "agents", "agent-field-test/proj"],
+        Duration::from_secs(45),
+    )
+    .expect("the sidebar should render both sections and the project row");
+
+    // The symbol Claude's registry entry resolves to. Written as a codepoint
+    // escape because the whole point of the width gate is that these are
+    // characters a diff and a log handle badly.
+    let claude_symbol = "\u{273b}";
+
+    // The agents band leads with `<state glyph> <agent field>`, so the symbol
+    // appears on its own row — find the row that is NOT a section header.
+    let agent_rows: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains(claude_symbol))
+        .collect();
+    assert!(
+        !agent_rows.is_empty(),
+        "no row carries Claude's symbol {claude_symbol:?}; screen:\n{}",
+        rows.join("\n")
+    );
+
+    // And the project row in the SPACES section carries it too. This is the
+    // assertion the in-process buffer tests could not make honestly: it is a
+    // different render pass, and for one release it drew no agent field at all.
+    let project_row = rows
+        .iter()
+        .find(|row| row.contains("agent-field-test/proj"))
+        .expect("the project row should be present");
+    assert!(
+        project_row.contains(claude_symbol),
+        "the spaces row must name the agent as well as the agents band; \
+         project row was {project_row:?}"
+    );
+
+    drop(stream);
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+/// Tell a sandboxed server that `pane_id` is running `agent`, through the same
+/// socket verb a hook integration uses.
+fn report_agent(api_socket: &Path, pane_id: &str, agent: &str) {
+    let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
+    // The source is DELIBERATELY not `flock:claude`. That spelling is a RESERVED
+    // native source — `is_reserved_native_state_source` matches it — and a
+    // report under a reserved source is routed to the session-reference store,
+    // not to hook authority, so it never becomes the pane's agent identity. A
+    // non-reserved source is what an integration or a test harness actually
+    // uses, and it is the path that sets the identity this test is about.
+    let request = format!(
+        "{{\"id\":\"test:agent\",\"method\":\"pane.report_agent\",\"params\":{{\
+         \"pane_id\":\"{pane_id}\",\"source\":\"test:agent-field\",\"agent\":\"{agent}\",\
+         \"state\":\"working\"}}}}\n"
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+    assert!(
+        response.contains("\"result\""),
+        "pane.report_agent failed: {response}"
+    );
 }
