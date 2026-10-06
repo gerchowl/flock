@@ -5,6 +5,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::medallion::{ring_medallion, MedallionStyle};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
@@ -17,6 +18,7 @@ use crate::app::state::{AgentPanelScope, Palette, PanelScope};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
+use crate::workspace::{pane_attention_priority, PaneSignal};
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
@@ -32,6 +34,15 @@ pub(crate) struct AgentPanelEntry {
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub agent_label: Option<String>,
+    /// The HARNESS behind `agent_label`, structurally (#542).
+    ///
+    /// `agent_label` is a name and names are not trustworthy: `flock_agent_start`
+    /// lets the calling model label the child it spawns, and that label wins over
+    /// detection. Keeping the enum alongside the string is what lets the row
+    /// still resolve a symbol or a short code when the string says something
+    /// else. `None` for a remote row whose peer summary carried free text the
+    /// viewer could not parse — the resolver falls back to the label there.
+    pub agent: Option<crate::detect::Agent>,
     pub state: AgentState,
     pub seen: bool,
     pub custom_status: Option<String>,
@@ -290,6 +301,7 @@ fn agent_panel_entries_with_runtimes(
                     primary_label: detail.label,
                     primary_tab_label: multi_tab.then_some(detail.tab_label),
                     agent_label: Some(detail.agent_label),
+                    agent: detail.agent,
                     state: detail.state,
                     seen: detail.seen,
                     custom_status: detail.custom_status,
@@ -341,6 +353,7 @@ fn agent_panel_entries_with_runtimes(
                             primary_label: workspace_label.clone(),
                             primary_tab_label: multi_tab.then_some(detail.tab_label),
                             agent_label: Some(detail.agent_label),
+                            agent: detail.agent,
                             state: detail.state,
                             seen: detail.seen,
                             custom_status: detail.custom_status,
@@ -437,6 +450,18 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                 primary_label: summary.workspace.clone(),
                 primary_tab_label: None,
                 agent_label: Some(agent.to_string()),
+                // A peer summary carries TEXT, never an enum (#542) — the
+                // harness's label on a current build, or a two-letter short
+                // code on one from before #542 moved the label onto the wire.
+                // Both have to resolve, or a mixed-version fleet renders a
+                // literal `cc` as the agent field in the default `symbol` mode
+                // and the feature is simply off against older peers.
+                //
+                // So: label first, then short code. Not the other way round, or
+                // a harness whose canonical label happens to equal another
+                // harness's code would resolve to the wrong one.
+                agent: crate::detect::parse_agent_label(agent)
+                    .or_else(|| crate::detect::harness_for_short_code(agent)),
                 state,
                 seen,
                 custom_status: None,
@@ -487,13 +512,102 @@ fn section_member_indices(app: &AppState, key: &str) -> Vec<usize> {
         .collect()
 }
 
+/// THE leading pane, over any iterator of [`PaneSignal`]s (#542).
+///
+/// One selection for every surface that draws a row's agent identity, because a
+/// row that showed the attention-winning pane's state beside a *different*
+/// pane's agent would be two answers to one question — and because this
+/// function used to be spelled out twice, once per call site, so the two copies
+/// could drift into naming two different panes for the same row.
+///
+/// Ordering, and each key's reason:
+///
+/// 1. [`pane_attention_priority`] — the same severity ladder
+///    [`crate::workspace::Workspace::aggregate_state`] uses, so the agent
+///    field names the pane the STATE glyph is already reporting.
+/// 2. `!seen` — an unseen pane outranks a seen one of the same class, as in
+///    #137. Deterministic rather than resolved by map iteration order.
+/// 3. `harness.is_some()` — a pane with an identifiable harness outranks one
+///    without, so a section containing any known agent says which.
+///
+/// The third key cannot move the state glyph: `StateClass::of` maps each class
+/// from a single `AgentState`, so an equal `(class, !seen)` already pins
+/// `(state, seen)`. It only chooses among panes that would render identically
+/// anyway.
+fn leading_pane<'a>(signals: impl Iterator<Item = PaneSignal<'a>>) -> Option<PaneSignal<'a>> {
+    signals.max_by_key(|signal| {
+        (
+            pane_attention_priority(signal.state, signal.seen),
+            !signal.seen,
+            signal.harness.is_some(),
+        )
+    })
+}
+
+/// A project section's leading pane across ALL its member workspaces.
+fn space_leading_pane<'a>(app: &'a AppState, key: &str) -> Option<PaneSignal<'a>> {
+    leading_pane(
+        section_member_indices(app, key)
+            .into_iter()
+            .filter_map(|ws_idx| app.workspaces.get(ws_idx))
+            .flat_map(|ws| ws.pane_signals(&app.terminals)),
+    )
+}
+
 fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
-    section_member_indices(app, key)
-        .into_iter()
-        .filter_map(|ws_idx| app.workspaces.get(ws_idx))
-        .map(|ws| ws.aggregate_state(&app.terminals))
-        .max_by_key(|(state, seen)| StateClass::of(*state, *seen))
-        .unwrap_or((AgentState::Unknown, true))
+    space_leading_pane(app, key).map_or((AgentState::Unknown, true), |signal| {
+        (signal.state, signal.seen)
+    })
+}
+
+/// The agent field a project section's HEADER row draws (#542).
+///
+/// Takes the leading pane's harness AND its label. Passing only the harness
+/// forced `label: None` into the resolver, which switched off both the
+/// `agent_aliases` lookup and every label fallback — so a project whose agent
+/// had not been detected yet rendered no agent field at all in the spaces list
+/// while the agents band rendered its name, for the same pane.
+fn space_agent_field(app: &AppState, key: &str) -> String {
+    space_leading_pane(app, key).map_or_else(String::new, |signal| {
+        app.agent_field_label(
+            app.spaces_agent_label(),
+            signal.harness,
+            signal.label.as_deref(),
+        )
+    })
+}
+
+/// The same, for one workspace's own row — leader, member and solo rows all
+/// call this, so the three shapes cannot drift into three answers.
+fn workspace_agent_field(app: &AppState, ws: &crate::workspace::Workspace) -> String {
+    leading_pane(ws.pane_signals(&app.terminals)).map_or_else(String::new, |signal| {
+        app.agent_field_label(
+            app.spaces_agent_label(),
+            signal.harness,
+            signal.label.as_deref(),
+        )
+    })
+}
+
+/// A resolved agent field, or nothing at all.
+///
+/// `None` when the viewer's mode resolved no identity for the row. The row then
+/// draws the bare separator space instead of the cell, so a spaces row and an
+/// agents row keep the same gap between the state glyph and the label whether or
+/// not either of them has an agent to name — a field that came and went with the
+/// project's contents would otherwise reflow the label under it.
+fn agent_field_cell(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
+}
+
+/// The agent field's colour: the same two-step ramp as the agent rows in the
+/// agents section, so the field reads as the same kind of thing in both places.
+fn agent_field_style(is_active: bool, p: &Palette) -> Style {
+    if is_active {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+    }
 }
 
 /// The join (severity-sorted top-3 state multiset) of one workspace's panes.
@@ -2958,8 +3072,20 @@ fn render_workspace_list(
         } else {
             line1.push(Span::styled(" ", Style::default()));
         }
+        // #542: the agent field, in the same slot the agents section and a
+        // project header use — after the state glyph, before the label.
+        //
+        // Drawn whether or not this row drew its OWN glyph, because a collapsed
+        // group leader sets `show_workspace_icon = false` and substitutes the
+        // GROUP's state glyph one branch earlier. Nesting the field inside that
+        // `if` left the one row in the spaces list that speaks for the whole
+        // group as the one row with no agent identity on it.
         if show_workspace_icon {
             line1.push(Span::styled(icon, icon_style));
+            line1.push(Span::styled(" ", Style::default()));
+        }
+        if let Some(cell) = agent_field_cell(workspace_agent_field(app, ws)) {
+            line1.push(Span::styled(cell, agent_field_style(highlighted, p)));
             line1.push(Span::styled(" ", Style::default()));
         }
         // A section LEADER (`group_key` is set: the selectable main checkout that
@@ -3164,6 +3290,20 @@ fn render_workspace_list(
         let (state, seen) = space_aggregate_state(app, key);
         let (group_icon, group_style) = agent_icon(state, seen, app.spinner_tick, p);
         spans.push(Span::styled(group_icon, group_style));
+        // #542: the same agent field the agents section draws, in the same slot
+        // — right after the state glyph, so the two sections read as one
+        // grammar rather than as two panels that happen to sit together.
+        // `clamp_line` below is what keeps the project label inside the row, so
+        // the field claims its columns first and the label absorbs the loss.
+        // Space, then the field, then space — the agents band's own
+        // `<glyph> <agent> <rest>` grammar, byte for byte. The field goes AFTER
+        // the separator rather than before it: drawn flush, a space section read
+        // `○✻ flock` where the agents band read `○ cc flock`, which is the exact
+        // inconsistency this row is supposed to remove.
+        spans.push(Span::styled(" ", Style::default()));
+        if let Some(cell) = agent_field_cell(space_agent_field(app, key)) {
+            spans.push(Span::styled(cell, agent_field_style(is_active_section, p)));
+        }
         spans.push(Span::styled(" ", Style::default()));
         let label = space_head_idx(app, key)
             .and_then(|idx| app.workspaces.get(idx))
@@ -3347,11 +3487,13 @@ fn render_agent_detail(
 
         // Leading "  <icon> " consumes 4 columns (space, icon, space). The
         // agent code then leads the location, which gets the remaining budget.
-        let agent_code = detail
-            .agent_label
-            .as_deref()
-            .map(|a| app.agent_alias(a).to_string())
-            .unwrap_or_default();
+        // #542: the row's harness travels with its label, so the mode can be
+        // honoured even where the label is a name the MCP caller invented.
+        let agent_code = app.agent_field_label(
+            app.agents_agent_label(),
+            detail.agent,
+            detail.agent_label.as_deref(),
+        );
         // When the jump binding is live, every row reserves a 2-col ordinal
         // gutter so icons stay aligned: numbered rows show `N `, the rest ` `.
         let jump_prefix = agents_jump_bound
@@ -3370,11 +3512,13 @@ fn render_agent_detail(
         let mail_cols = mail_label
             .as_ref()
             .map_or(0, |label| label.chars().count() + 1);
-        let prefix_cols = jump_cols
-            + 4
-            + agent_code.chars().count()
-            + usize::from(!agent_code.is_empty())
-            + mail_cols;
+        // CELLS, not characters: the agent field is caller-supplied text in
+        // `name` mode, so a wide or combining one would miscount and let the
+        // location run past the row's edge. #550 hit exactly this from the other
+        // direction — two of its own symbols were East Asian Wide — and the
+        // `symbol` mode budget is only safe because the registry is width-gated.
+        let prefix_cols =
+            jump_cols + 4 + agent_code.width() + usize::from(!agent_code.is_empty()) + mail_cols;
         let location_budget = (body.width as usize).saturating_sub(prefix_cols);
         // #303: the server segment follows the viewer's `server_label` mode,
         // so the panel names a server exactly as the band and the spaces list
@@ -6174,6 +6318,25 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Every rendered SPACES row — project headers and workspace rows — as text.
+    ///
+    /// The spaces section is a different render pass from the agents band
+    /// (`render_workspace_list` vs `render_agent_detail`) with its own geometry
+    /// and its own label grammar, so a test of "the sidebar shows an agent
+    /// field" that only reads the agents band would pass while spaces stayed
+    /// exactly as it was.
+    fn space_and_member_rows(app: &mut crate::app::state::AppState, area: Rect) -> Vec<String> {
+        let buffer = render_sidebar_to_buffer(app, area);
+        let mut rows = Vec::new();
+        for header in &app.view.space_header_areas {
+            rows.push(buffer_row_text(&buffer, header.rect, header.rect.y));
+        }
+        for card in &app.view.workspace_card_areas {
+            rows.push(buffer_row_text(&buffer, card.rect, card.rect.y));
+        }
+        rows
+    }
+
     /// A remote-only project leader row labels as `owner/repo · host:branch`,
     /// which carries the multibyte `·` separator. In a narrow sidebar that
     /// label truncates — the truncation MUST land on a char boundary, never
@@ -8871,5 +9034,378 @@ mod tests {
             !top.contains('\u{23f8}'),
             "no pause glyph when unpaused: {top:?}"
         );
+    }
+
+    // — #542: the agent field in both sidebar sections —
+
+    /// One workspace running Claude, so both sections have a row to draw.
+    fn agent_field_app() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let ws = Workspace::test_new("flock");
+        let pane = ws.tabs[0].root_pane;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Claude);
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        app
+    }
+
+    /// The bug as the operator sees it: an agent started through `flock_agent_start`
+    /// carries whatever name the calling model invented, and that name used to be
+    /// all the sidebar had. These assert the rendered ROW — not the resolver — so
+    /// they fail if the field stops being drawn at all, which is the half of the
+    /// fix that a resolver test cannot see.
+    #[test]
+    fn the_agents_row_draws_the_harness_not_a_caller_supplied_name() {
+        let mut app = agent_field_app();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_agent_name("researcher".to_string());
+
+        let (_, row) = agents_band_rows(&app);
+        assert!(
+            row.contains(crate::agent_symbols::symbol(Agent::Claude)),
+            "agents row should draw Claude's symbol, got {row:?}"
+        );
+        assert!(
+            !row.contains("researcher"),
+            "the caller's invented name must not be what the row leads with, got {row:?}"
+        );
+    }
+
+    /// All three modes, on the same row, so a mode cannot be added to the
+    /// config enum and never reach the renderer.
+    #[test]
+    fn each_agent_label_mode_reaches_the_agents_row() {
+        use crate::config::AgentLabelConfig;
+        let expected = [
+            (
+                AgentLabelConfig::Symbol,
+                crate::agent_symbols::symbol(Agent::Claude),
+            ),
+            (AgentLabelConfig::Shortcut, "cc"),
+            (AgentLabelConfig::Name, "claude"),
+        ];
+        for (mode, want) in expected {
+            let mut app = agent_field_app();
+            app.config.ui.agents_agent_label = mode;
+            let (_, row) = agents_band_rows(&app);
+            assert!(
+                row.contains(want),
+                "{mode:?} should draw {want:?}, got {row:?}"
+            );
+        }
+    }
+
+    /// The second half of the report: the SPACES section had no agent field at
+    /// all, so it now draws one — and draws it in the viewer's spaces mode, not
+    /// in the agents mode. Asserted on the spaces rows, which are a different
+    /// render pass from the agents band.
+    #[test]
+    fn the_spaces_section_draws_an_agent_field_in_its_own_mode() {
+        use crate::config::AgentLabelConfig;
+        let mut app = agent_field_app();
+        let area = Rect::new(0, 0, 44, 40);
+        app.config.ui.spaces_agent_label = AgentLabelConfig::Shortcut;
+        app.config.ui.agents_agent_label = AgentLabelConfig::Name;
+        let shortcut_rows = space_and_member_rows(&mut app, area);
+        assert!(
+            shortcut_rows.iter().any(|row| row.contains("cc")),
+            "spaces should draw the code under its own mode, got {shortcut_rows:?}"
+        );
+        assert!(
+            !shortcut_rows.iter().any(|row| row.contains("claude")),
+            "the spaces mode must not follow the agents mode, got {shortcut_rows:?}"
+        );
+
+        app.config.ui.spaces_agent_label = AgentLabelConfig::Symbol;
+        let symbol_rows = space_and_member_rows(&mut app, area);
+        assert!(
+            symbol_rows
+                .iter()
+                .any(|row| row.contains(crate::agent_symbols::symbol(Agent::Claude))),
+            "spaces should default to the symbol, got {symbol_rows:?}"
+        );
+        assert!(
+            !symbol_rows.iter().any(|row| row.contains("cc")),
+            "the default is a symbol, not the code, got {symbol_rows:?}"
+        );
+    }
+
+    /// A workspace with no identifiable agent draws NO field — the cell
+    /// collapses to NOTHING rather than to a placeholder or a reserved pair of
+    /// blank columns.
+    ///
+    /// The previous version of this test asserted only that the glyph was
+    /// absent, which `agent_field_cell` returning `None` and a two-column blank
+    /// both satisfy, so it could not tell the two apart while its comment claimed
+    /// it could. It can be told apart, because `buffer_row_text` reads the row's
+    /// full width without trimming: a collapsed cell leaves one space between
+    /// the state glyph and the label, and a reserved blank pair leaves two. So
+    /// this asserts the DIFFERENCE between the same row with and without a
+    /// harness, which is exactly the glyph plus its one separating space and
+    /// nothing else.
+    #[test]
+    fn a_space_with_no_identifiable_agent_collapses_the_field_entirely() {
+        let bare = |agent: Option<Agent>| {
+            let mut app = crate::app::state::AppState::test_new();
+            app.workspaces = vec![Workspace::test_new("flock")];
+            app.ensure_test_terminals();
+            if let Some(agent) = agent {
+                let pane = app.workspaces[0].tabs[0].root_pane;
+                let tid = app.workspaces[0].tabs[0].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                app.terminals.get_mut(&tid).unwrap().detected_agent = Some(agent);
+            }
+            app.active = Some(0);
+            let rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
+            assert!(!rows.is_empty(), "the fixture must render a row");
+            rows
+        };
+        let without = bare(None);
+        let with = bare(Some(Agent::Claude));
+        let symbol = crate::agent_symbols::symbol(Agent::Claude);
+
+        for (bare_row, with_row) in without.iter().zip(with.iter()) {
+            assert!(
+                !bare_row.contains(symbol),
+                "no harness means no glyph, got {bare_row:?}"
+            );
+            // The agents band's own grammar: `<glyph> <agent> <rest>`, so the
+            // symbol sits between two SINGLE spaces. Drawn flush it read
+            // `○✻ flock` against the agents band's `○ cc flock` — the exact
+            // inconsistency this row exists to remove.
+            assert!(
+                with_row.contains(&format!(" {symbol} ")),
+                "the symbol must be separated from the state glyph and the label \
+                 by one space each, got {with_row:?}"
+            );
+            // And the whole cost of the field is the symbol plus ONE space: strip
+            // those and the row is byte-identical to the bare one, which is what
+            // rules out a reserved blank pair.
+            assert_eq!(
+                with_row.trim_end().replacen(&format!("{symbol} "), "", 1),
+                bare_row.trim_end(),
+                "the field must cost exactly the glyph and one space; \
+                 bare={bare_row:?} with={with_row:?}"
+            );
+        }
+    }
+
+    // — review round 2: the findings that were real, not style —
+
+    /// Blocker 1: the two sections resolved the SAME pane differently because
+    /// the spaces path passed `label: None`, which switched off both the
+    /// `agent_aliases` lookup and every label fallback. In the default mode a
+    /// not-yet-detected agent rendered its caller's name in the agents band and
+    /// NOTHING in the spaces list.
+    #[test]
+    fn both_sections_answer_the_same_for_the_same_pane() {
+        let mut app = agent_field_app();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        // A caller-supplied name and a detected harness: the exact combination
+        // that produced two answers.
+        app.terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_agent_name("researcher".into());
+
+        let (_, agent_row) = agents_band_rows(&app);
+        let space_rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
+        for (mode, spelling) in [
+            (crate::config::AgentLabelConfig::Symbol, "✻"),
+            (crate::config::AgentLabelConfig::Shortcut, "cc"),
+            (crate::config::AgentLabelConfig::Name, "researcher"),
+        ] {
+            app.config.ui.agents_agent_label = mode;
+            app.config.ui.spaces_agent_label = mode;
+            let (_, agent_row) = agents_band_rows(&app);
+            let space_rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
+            assert!(
+                agent_row.contains(spelling),
+                "agents band in {mode:?} should say {spelling:?}, got {agent_row:?}"
+            );
+            assert!(
+                space_rows.iter().any(|row| row.contains(spelling)),
+                "spaces list in {mode:?} must say the same {spelling:?}, got \
+                 {space_rows:?} — the two sections cannot disagree about a pane"
+            );
+        }
+        let _ = (agent_row, space_rows);
+    }
+
+    /// The `agent_aliases` re-attribution the docs promise has to work in BOTH
+    /// sections. With `label: None` in the spaces path it silently did nothing
+    /// there, so an operator who set it and watched the agents panel change had
+    /// every reason to conclude the spaces list was broken.
+    #[test]
+    fn an_alias_that_names_a_harness_re_attributes_both_sections() {
+        use crate::config::AgentLabelConfig;
+        let mut app = agent_field_app();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&tid)
+            .unwrap()
+            .set_agent_name("researcher".into());
+        app.agent_aliases
+            .insert("researcher".to_string(), "codex".to_string());
+        app.config.ui.agents_agent_label = AgentLabelConfig::Symbol;
+        app.config.ui.spaces_agent_label = AgentLabelConfig::Symbol;
+
+        let (_, agent_row) = agents_band_rows(&app);
+        let space_rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
+        let codex = crate::agent_symbols::symbol(crate::detect::Agent::Codex);
+        assert!(agent_row.contains(codex), "agents band: {agent_row:?}");
+        assert!(
+            space_rows.iter().any(|row| row.contains(codex)),
+            "spaces list must honour the same alias: {space_rows:?}"
+        );
+    }
+
+    /// Blocker 3: a peer running a build from before the label moved onto the
+    /// wire sends the two-letter code. Without an inverse the viewer printed a
+    /// literal `cc` as the agent field, i.e. the feature was simply off against
+    /// older peers.
+    #[test]
+    fn a_remote_row_from_an_older_peer_resolves_its_short_code() {
+        use crate::config::AgentLabelConfig;
+        let app = crate::app::state::AppState::test_new();
+        let mut entries = remote_agent_panel_entries(&app);
+        // Stand in for an older peer's summary: a bare short code, not a label.
+        let peer_summary_agent = "cc";
+        assert_eq!(
+            crate::detect::parse_agent_label(peer_summary_agent)
+                .or_else(|| crate::detect::harness_for_short_code(peer_summary_agent)),
+            Some(crate::detect::Agent::Claude),
+            "an old peer's `cc` must resolve to Claude, or symbol mode prints it"
+        );
+        assert_eq!(
+            app.agent_field_label(
+                AgentLabelConfig::Symbol,
+                Some(crate::detect::Agent::Claude),
+                Some(peer_summary_agent)
+            ),
+            crate::agent_symbols::symbol(crate::detect::Agent::Claude)
+        );
+        entries.clear();
+    }
+
+    /// Finding 7: a collapsed group leader substitutes the GROUP's state glyph
+    /// in an earlier branch and sets `show_workspace_icon = false`. The field
+    /// used to be nested inside that `if`, so the one row speaking for the whole
+    /// group was the one row with no agent identity.
+    #[test]
+    fn a_collapsed_group_leader_still_draws_an_agent_field() {
+        use crate::workspace::WorktreeSpaceMembership;
+        let space = |linked: bool| WorktreeSpaceMembership {
+            key: "grp".into(),
+            label: "flock".into(),
+            repo_root: "/repo/flock".into(),
+            checkout_path: if linked {
+                "/repo/ws-1".into()
+            } else {
+                "/repo/ws-0".into()
+            },
+            is_linked_worktree: linked,
+        };
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("parent"), Workspace::test_new("child")];
+        app.workspaces[0].worktree_space = Some(space(false));
+        app.workspaces[1].worktree_space = Some(space(true));
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let tid = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&tid).unwrap().detected_agent = Some(Agent::Claude);
+        app.active = Some(0);
+        app.mode = crate::app::Mode::Terminal;
+        app.collapsed_space_keys.insert("grp".to_string());
+
+        let buffer = render_sidebar_to_buffer(&mut app, Rect::new(0, 0, 44, 40));
+        let leader = app
+            .view
+            .workspace_card_areas
+            .first()
+            .expect("a group leader still renders a card");
+        let row = buffer_row_text(&buffer, leader.rect, leader.rect.y);
+        assert!(
+            row.contains(crate::agent_symbols::symbol(Agent::Claude)),
+            "a collapsed group leader must still name its agent, got {row:?}"
+        );
+    }
+
+    /// Finding 5: the ordering used to be spelled out at each of its two call
+    /// sites, so they could drift into naming two different panes for one row —
+    /// a row showing the attention-winning pane's state beside a different
+    /// pane's agent. One helper now, and this pins all three keys of it
+    /// directly, including both tie-breaks, which no test covered before.
+    #[test]
+    fn leading_pane_orders_on_attention_then_unseen_then_identified() {
+        let signal = |state, seen, harness| PaneSignal {
+            state,
+            seen,
+            harness,
+            label: None,
+        };
+        use crate::detect::Agent;
+        use crate::detect::AgentState::*;
+
+        // Attention wins over everything: a blocked pane that has been seen
+        // outranks an unseen idle one, because that is the ladder the STATE
+        // glyph is already drawn from.
+        assert_eq!(
+            leading_pane(
+                [
+                    signal(Idle, false, None),
+                    signal(Blocked, true, Some(Agent::Claude)),
+                ]
+                .into_iter()
+            )
+            .map(|s| s.state),
+            Some(Blocked)
+        );
+
+        // Within a class, UNSEEN wins (#137) — deterministically, not by map
+        // iteration order, which is what #137 was about.
+        assert_eq!(
+            leading_pane([signal(Idle, true, None), signal(Idle, false, None),].into_iter())
+                .map(|s| s.seen),
+            Some(false)
+        );
+
+        // Within class AND seen-ness, an identifiable harness wins, so a
+        // section containing any known agent says which.
+        assert_eq!(
+            leading_pane(
+                [
+                    signal(Idle, true, None),
+                    signal(Idle, true, Some(Agent::Codex)),
+                ]
+                .into_iter()
+            )
+            .map(|s| s.harness),
+            Some(Some(Agent::Codex))
+        );
+
+        assert_eq!(leading_pane([].into_iter()), None);
     }
 }

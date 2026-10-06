@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -974,6 +975,25 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session.is_some(),
             applied_session_ref: None,
+        })
+    }
+
+    /// The label a sidebar row would show for this agent — the SAME chain
+    /// [`crate::workspace::Workspace::pane_details`] uses, borrowed rather than
+    /// owned (#542).
+    ///
+    /// It has to be the same chain, not a lookalike: `pane_details` resolves
+    /// `effective_display_agent()` → `agent_name` → the canonical label, and a
+    /// spaces row that resolved a different order would name a different agent
+    /// than the agents band does for the very same pane. This is the borrowed
+    /// form the per-frame path needs; `pane_details` keeps the owned one
+    /// because it hands the value to a `String` field.
+    pub fn display_agent_label(&self) -> Option<Cow<'_, str>> {
+        self.effective_display_agent().map(Cow::Owned).or_else(|| {
+            self.agent_name
+                .as_deref()
+                .or_else(|| self.effective_agent_label())
+                .map(Cow::Borrowed)
         })
     }
 

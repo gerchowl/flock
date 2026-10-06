@@ -4,8 +4,8 @@ use ratatui::layout::Rect;
 use crate::{
     app::{
         state::{
-            AppState, ExperimentSetting, IdleSetting, SettingsSection, SidebarGapSetting,
-            THEME_NAMES,
+            AgentLabelSetting, AppState, ExperimentSetting, IdleSetting, SettingsSection,
+            SidebarGapSetting, SIDEBAR_ROWS, THEME_NAMES,
         },
         App, Mode,
     },
@@ -15,13 +15,14 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The shared `Save` verb is semantic: these actions persist settings.
 #[allow(clippy::enum_variant_names)]
-pub(super) enum SettingsAction {
+pub(crate) enum SettingsAction {
     SaveTheme(String),
     SaveSound(bool),
     SaveToastDelivery(ToastDelivery),
     SaveAgentBorderLabels(bool),
     SaveSidebarRowGap(u16),
     SaveSidebarPaneGap(u16),
+    SaveAgentLabel(AgentLabelSetting, crate::config::AgentLabelConfig),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
     SaveIdleSetting(IdleSetting, bool),
@@ -39,12 +40,19 @@ fn idle_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
 }
 
 /// Map a Sidebar row index to the cycle action that steps its value.
-fn sidebar_gap_cycle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
-    let setting = SidebarGapSetting::ALL.get(idx).copied()?;
-    let next = setting.next_value(state);
-    Some(match setting {
-        SidebarGapSetting::RowGap => SettingsAction::SaveSidebarRowGap(next),
-        SidebarGapSetting::PaneGap => SettingsAction::SaveSidebarPaneGap(next),
+fn sidebar_cycle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
+    use crate::app::state::{SidebarRow, SIDEBAR_ROWS};
+    Some(match SIDEBAR_ROWS.get(idx).copied()? {
+        SidebarRow::Gap(setting) => {
+            let next = setting.next_value(state);
+            match setting {
+                SidebarGapSetting::RowGap => SettingsAction::SaveSidebarRowGap(next),
+                SidebarGapSetting::PaneGap => SettingsAction::SaveSidebarPaneGap(next),
+            }
+        }
+        SidebarRow::AgentLabel(setting) => {
+            SettingsAction::SaveAgentLabel(setting, setting.next_value(state))
+        }
     })
 }
 
@@ -66,34 +74,45 @@ impl App {
     pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
         let previous_section = self.state.settings.section;
         if let Some(action) = update_settings_state(&mut self.state, key) {
-            match action {
-                SettingsAction::SaveTheme(name) => self.save_theme(&name),
-                SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
-                SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
-                SettingsAction::SaveAgentBorderLabels(enabled) => {
-                    self.save_agent_border_labels(enabled)
-                }
-                SettingsAction::SaveSidebarRowGap(gap) => self.save_sidebar_row_gap(gap),
-                SettingsAction::SaveSidebarPaneGap(gap) => self.save_sidebar_pane_gap(gap),
-                SettingsAction::SavePaneHistory(enabled) => {
-                    self.save_pane_history_persistence(enabled)
-                }
-                SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
-                    self.save_switch_ascii_input_source_in_prefix(enabled)
-                }
-                SettingsAction::SaveIdleSetting(setting, enabled) => {
-                    self.save_idle_setting(setting, enabled)
-                }
-                SettingsAction::SaveFileDrop(enabled) => self.save_file_drop(enabled),
-                SettingsAction::InstallRecommendedIntegrations => {
-                    self.install_recommended_integrations()
-                }
-            }
+            self.apply_settings_action(action);
         }
         if previous_section != SettingsSection::Integrations
             && self.state.settings.section == SettingsSection::Integrations
         {
             self.refresh_integration_recommendations();
+        }
+    }
+
+    /// Persist a settings action. ONE function for both the key path and the
+    /// mouse path.
+    ///
+    /// These were two copies of the same `match`, which is how `SaveAgentLabel`
+    /// (#542) arrived with a key handler and no mouse handler: the arm had to be
+    /// added twice and the compiler only reported the copy that was missing.
+    /// An exhaustive `match` cannot enforce that two copies agree; one function
+    /// can.
+    pub(crate) fn apply_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::SaveTheme(name) => self.save_theme(&name),
+            SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
+            SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
+            SettingsAction::SaveAgentBorderLabels(enabled) => {
+                self.save_agent_border_labels(enabled)
+            }
+            SettingsAction::SaveSidebarRowGap(gap) => self.save_sidebar_row_gap(gap),
+            SettingsAction::SaveSidebarPaneGap(gap) => self.save_sidebar_pane_gap(gap),
+            SettingsAction::SaveAgentLabel(setting, mode) => self.save_agent_label(setting, mode),
+            SettingsAction::SavePaneHistory(enabled) => self.save_pane_history_persistence(enabled),
+            SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
+                self.save_switch_ascii_input_source_in_prefix(enabled)
+            }
+            SettingsAction::SaveIdleSetting(setting, enabled) => {
+                self.save_idle_setting(setting, enabled)
+            }
+            SettingsAction::SaveFileDrop(enabled) => self.save_file_drop(enabled),
+            SettingsAction::InstallRecommendedIntegrations => {
+                self.install_recommended_integrations()
+            }
         }
     }
 }
@@ -279,11 +298,9 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
         },
         SettingsSection::Sidebar => match key.code {
             KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
-            KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.move_next(SidebarGapSetting::ALL.len())
-            }
+            KeyCode::Down | KeyCode::Char('j') => state.settings.list.move_next(SIDEBAR_ROWS.len()),
             KeyCode::Enter | KeyCode::Char(' ') => {
-                return sidebar_gap_cycle_action(state, state.settings.list.selected);
+                return sidebar_cycle_action(state, state.settings.list.selected);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 state.settings.section = SettingsSection::PaneLabels;
@@ -504,7 +521,7 @@ impl AppState {
             }
             SettingsSection::Sidebar => {
                 let list_y = area.y + 3;
-                if row >= list_y && row < list_y + SidebarGapSetting::ALL.len() as u16 {
+                if row >= list_y && row < list_y + SIDEBAR_ROWS.len() as u16 {
                     Some((row - list_y) as usize)
                 } else {
                     None
@@ -577,7 +594,7 @@ impl AppState {
                             let enabled = idx == 0;
                             Some(SettingsAction::SaveAgentBorderLabels(enabled))
                         }
-                        SettingsSection::Sidebar => sidebar_gap_cycle_action(self, idx),
+                        SettingsSection::Sidebar => sidebar_cycle_action(self, idx),
                         SettingsSection::Idle => idle_toggle_action(self, idx),
                         SettingsSection::FileDrop => {
                             let enabled = idx == 0;
@@ -887,6 +904,105 @@ mod tests {
         assert_eq!(action, Some(SettingsAction::SaveSidebarPaneGap(0)));
     }
 
+    /// The two agent rows cycle their own section's setting and no other's
+    /// (#542). Row indices 2 and 3 of the Sidebar section; `name` is the last
+    /// step of the cycle, so one more returns each to `symbol`.
+    #[test]
+    fn settings_sidebar_agent_rows_cycle_their_own_section_only() {
+        use crate::app::state::AgentLabelSetting;
+        use crate::config::AgentLabelConfig;
+        let mut state = state_with_workspaces(&["test"]);
+        state.config.ui.spaces_agent_label = AgentLabelConfig::Name;
+        state.config.ui.agents_agent_label = AgentLabelConfig::Name;
+        open_settings_at(&mut state, SettingsSection::Sidebar);
+
+        for _ in 0..2 {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(state.settings.list.selected, 2);
+        let spaces = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            spaces,
+            Some(SettingsAction::SaveAgentLabel(
+                AgentLabelSetting::Spaces,
+                AgentLabelConfig::Symbol
+            ))
+        );
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.list.selected, 3);
+        let agents = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            agents,
+            Some(SettingsAction::SaveAgentLabel(
+                AgentLabelSetting::Agents,
+                AgentLabelConfig::Symbol
+            ))
+        );
+    }
+
+    /// Every mode, and the cycle order `symbol -> shortcut -> name -> symbol`,
+    /// pinned on the setting type itself. The renderer test proves each mode
+    /// reaches the screen; this proves the cycle visits all three rather than
+    /// getting stuck on two.
+    #[test]
+    fn the_agent_label_cycle_visits_every_mode_and_returns() {
+        use crate::app::state::AgentLabelSetting;
+        use crate::config::AgentLabelConfig;
+        let mut state = state_with_workspaces(&["test"]);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(AgentLabelSetting::Agents.value(&state));
+            state.config.ui.agents_agent_label = AgentLabelSetting::Agents.next_value(&state);
+        }
+        assert_eq!(
+            seen,
+            [
+                AgentLabelConfig::Symbol,
+                AgentLabelConfig::Shortcut,
+                AgentLabelConfig::Name,
+                AgentLabelConfig::Symbol,
+            ]
+        );
+        // And the cycle is per-setting: cycling agents must not move spaces.
+        state.config.ui.spaces_agent_label = AgentLabelConfig::Name;
+        state.config.ui.agents_agent_label = AgentLabelConfig::Symbol;
+        let _ = AgentLabelSetting::Agents.next_value(&state);
+        assert_eq!(
+            state.config.ui.spaces_agent_label,
+            AgentLabelConfig::Name,
+            "next_value is a pure read and must not mutate anything"
+        );
+    }
+
+    /// The two sections must write two DIFFERENT `[ui]` keys. They are separate
+    /// settings that happen to share a shape, so a row whose `config_key`
+    /// returned the shared one would silently reconfigure the section the
+    /// operator did not touch — and the rendered test for the other section
+    /// would still pass.
+    #[test]
+    fn the_two_agent_rows_name_different_config_keys() {
+        use crate::app::state::AgentLabelSetting;
+        assert_ne!(
+            AgentLabelSetting::Spaces.config_key(),
+            AgentLabelSetting::Agents.config_key()
+        );
+        assert_eq!(AgentLabelSetting::Spaces.config_key(), "spaces_agent_label");
+        assert_eq!(AgentLabelSetting::Agents.config_key(), "agents_agent_label");
+    }
+
     #[test]
     fn settings_mouse_click_cycles_sidebar_pane_gap_row() {
         let mut app = app_for_mouse_test();
@@ -901,6 +1017,40 @@ mod tests {
 
         assert_eq!(action, Some(SettingsAction::SaveSidebarPaneGap(1)));
         assert_eq!(app.state.settings.list.selected, 1);
+    }
+
+    /// A click reaches the agent rows too. The renderer draws
+    /// `SIDEBAR_ROWS` and the hit-test resolves the same list; this is what
+    /// proves the two agree on the row the new entries occupy, which is the
+    /// half a key test cannot see.
+    #[test]
+    fn settings_mouse_click_cycles_the_agent_rows() {
+        use crate::app::state::AgentLabelSetting;
+        use crate::config::AgentLabelConfig;
+        for (row_offset, expected) in [
+            (
+                2u16,
+                SettingsAction::SaveAgentLabel(AgentLabelSetting::Spaces, AgentLabelConfig::Symbol),
+            ),
+            (
+                3,
+                SettingsAction::SaveAgentLabel(AgentLabelSetting::Agents, AgentLabelConfig::Symbol),
+            ),
+        ] {
+            let mut app = app_for_mouse_test();
+            app.state.config.ui.spaces_agent_label = AgentLabelConfig::Name;
+            app.state.config.ui.agents_agent_label = AgentLabelConfig::Name;
+            open_settings_at(&mut app.state, SettingsSection::Sidebar);
+
+            let area = app.state.settings_content_rect();
+            let action = app.state.handle_settings_mouse(mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                area.x + 2,
+                area.y + 3 + row_offset,
+            ));
+            assert_eq!(action, Some(expected), "clicking sidebar row {row_offset}");
+            assert_eq!(app.state.settings.list.selected, row_offset as usize);
+        }
     }
 
     #[test]

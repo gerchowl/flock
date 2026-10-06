@@ -598,21 +598,34 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     frame_text(frame).contains(needle)
 }
 
-/// The agent panel renders an agent's STATE as a glyph next to its label, not
-/// as a word (see `ui::agent_icon` / `ui::SPINNERS`): Working is a braille
-/// spinner, Idle a `●` (unseen) or `✓` (seen). So a reattached frame proves it
-/// surfaced the persisted status by showing `<state glyph> <agent>`, never the
-/// literal "working" / "idle".
+/// The agent panel renders an agent's STATE as a glyph next to its HARNESS
+/// symbol, not as a word (see `ui::agent_icon` / `ui::SPINNERS`): Working is a
+/// braille spinner, Idle a `●` (unseen) or `✓` (seen). So a reattached frame
+/// proves it surfaced the persisted status by showing `<state glyph> <agent>`,
+/// never the literal "working" / "idle".
+///
+/// The agent field is the harness SYMBOL rather than the label, because that is
+/// what `[ui] agents_agent_label = "symbol"` — the default since #542 — draws.
+/// The label it replaced was `pi`, whose symbol is `π`. Both spellings are
+/// accepted so this assertion keeps testing what it was written to test (the
+/// STATE glyph reached the screen) rather than quietly becoming a test of the
+/// display mode.
 const WORKING_SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const IDLE_GLYPHS: &[&str] = &["●", "✓"];
+/// `pi` and its symbol `π`, in symbol mode and in the pre-#542 label modes.
+const PI_SPELLINGS: &[&str] = &["π", "pi"];
 
-/// Whether the frame's agents panel surfaces `agent` with one of `glyphs`
-/// immediately preceding its label.
-fn frame_shows_agent_state(frame: &FrameWire, agent: &str, glyphs: &[&str]) -> bool {
+/// Whether the frame's agents panel shows one of `glyphs` immediately before the
+/// agent's own field. The agent is `pi` in both callers, so the accepted
+/// spellings are [`PI_SPELLINGS`] rather than a parameter — a parameter here
+/// would invite a caller to assert on a spelling that no longer exists.
+fn frame_shows_agent_state(frame: &FrameWire, glyphs: &[&str]) -> bool {
     let text = frame_text(frame);
-    glyphs
-        .iter()
-        .any(|glyph| text.contains(&format!("{glyph} {agent}")))
+    glyphs.iter().any(|glyph| {
+        PI_SPELLINGS
+            .iter()
+            .any(|spelling| text.contains(&format!("{glyph} {spelling}")))
+    })
 }
 
 /// Both readers below used to be private `read_exact` copies, and
@@ -856,7 +869,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     client_handshake(&mut client_b, support::PROTOCOL_VERSION, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_shows_agent_state(frame, "pi", WORKING_SPINNERS)
+            frame_shows_agent_state(frame, WORKING_SPINNERS)
         })
         .expect("frame decoding should succeed");
     assert!(
@@ -873,7 +886,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     let saw_idle_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_shows_agent_state(frame, "pi", IDLE_GLYPHS)
+            frame_shows_agent_state(frame, IDLE_GLYPHS)
         })
         .expect("frame decoding should succeed");
     assert!(
