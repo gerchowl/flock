@@ -125,6 +125,72 @@ const READY_POLL: Duration = Duration::from_millis(200);
 /// rather than the whole command. The same cap the settled core uses.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Result of a deadline-bounded request.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum Bounded {
+    /// The deadline was exceeded before or during the request.
+    TimedOut,
+    /// A transport error occurred.
+    Transport(io::Error),
+    /// The server returned an error.
+    Server(ServerError),
+}
+
+/// Make a socket request bounded by a deadline.
+///
+/// The request timeout is the minimum of the given cap and the time remaining
+/// until the deadline. After the response, if the deadline has passed, the
+/// result is `TimedOut` regardless of the response content.
+#[allow(dead_code)]
+fn bounded<T: serde::de::DeserializeOwned>(
+    method: Method,
+    deadline: Option<Instant>,
+    cap: Duration,
+) -> Result<T, Bounded> {
+    // Check if deadline has already passed.
+    if let Some(deadline) = deadline {
+        if Instant::now() >= deadline {
+            return Err(Bounded::TimedOut);
+        }
+    }
+
+    let timeout = match deadline {
+        None => cap,
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Bounded::TimedOut);
+            }
+            left.min(cap)
+        }
+    };
+
+    let response = ApiClient::local()
+        .request_value_with_timeout(
+            &Request {
+                id: "cli:delegate".into(),
+                method,
+            },
+            timeout,
+        )
+        .map_err(|e| Bounded::Transport(super::api_client_error_to_io(e)))?;
+
+    // Check if deadline passed after the response.
+    if let Some(deadline) = deadline {
+        if Instant::now() >= deadline {
+            return Err(Bounded::TimedOut);
+        }
+    }
+
+    if let Some(error) = response.get("error") {
+        return Err(Bounded::Server(parse_server_error(error)));
+    }
+
+    serde_json::from_value(response)
+        .map_err(|e| Bounded::Transport(io::Error::other(e.to_string())))
+}
+
 /// `delegate`'s own exit codes.
 ///
 /// `0`/`3`/`4`/`124` are `settled::exit`, shared with the two wait verbs so a
@@ -263,6 +329,7 @@ struct Entry {
     /// Recorded rather than re-derived, because the alternative is a list diff
     /// across a window in which the operator may open a workspace of their own —
     /// and a rollback that closes a list diff closes whatever appeared in it.
+    /// See #595 for the server-side change that provides this value.
     #[serde(default)]
     parent_workspace_id: Option<String>,
     #[serde(default)]
@@ -687,6 +754,9 @@ fn validate_worktree_flags(flags: &StartFlags) -> Result<(), String> {
             }
         }
     }
+    if flags.worktree && flags.branch.is_none() {
+        return Err("--worktree needs --branch".to_string());
+    }
     Ok(())
 }
 
@@ -757,7 +827,7 @@ fn request(method: Method, deadline: Option<Instant>) -> io::Result<serde_json::
             left.min(base_timeout)
         }
     };
-    ApiClient::local()
+    let response = match ApiClient::local()
         .request_value_with_timeout(
             &Request {
                 id: "cli:delegate".into(),
@@ -766,6 +836,28 @@ fn request(method: Method, deadline: Option<Instant>) -> io::Result<serde_json::
             timeout,
         )
         .map_err(super::api_client_error_to_io)
+    {
+        Ok(response) => response,
+        Err(err) => {
+            // If the deadline has passed, treat transport errors as timeout (Z4).
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    // Check if deadline passed after the response. A reply that lands after
+    // the deadline is a timeout whichever way it went (Z4).
+    if let Some(deadline) = deadline {
+        if Instant::now() >= deadline {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+    }
+
+    Ok(response)
 }
 
 /// Has the caller's deadline passed?
@@ -870,6 +962,7 @@ impl Placement {
             repo_root: self.repo_root.clone(),
             repo_key: self.repo_key.clone(),
             name: name.to_string(),
+            in_process: true,
         }
     }
 }
@@ -888,66 +981,6 @@ fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-#[allow(dead_code)]
-fn workspace_ids(deadline: Option<Instant>) -> Vec<String> {
-    workspace_records(deadline)
-        .iter()
-        .filter_map(|workspace| field(workspace, "workspace_id").map(str::to_string))
-        .collect()
-}
-
-/// The repository-root workspace `worktree.create` opened, identified exactly.
-///
-/// Three conditions, all of them necessary:
-/// - it is new compared with the list taken immediately before the call, so a
-///   repository root that was already open is never adopted as a parent;
-/// - it is not itself a linked worktree, which is what separates the repository
-///   root from the checkout the delegate asked for;
-/// - its checkout path is the repo root the new checkout reported, so a
-///   workspace opened for some other repository in the same window is not it.
-///
-/// Exactly one match, or nothing is recorded: an ambiguous parent is a parent this
-/// code cannot close safely, and "cannot" has to mean "does not".
-fn identify_parent(
-    worktrees_before: &[serde_json::Value],
-    repo_root: &str,
-    _deadline: Option<Instant>,
-) -> Option<String> {
-    let mut found: Option<String> = None;
-    for record in workspace_records(None) {
-        let Some(id) = field(&record, "workspace_id") else {
-            continue;
-        };
-        if worktrees_before
-            .iter()
-            .any(|before| field(before, "workspace_id") == Some(id))
-        {
-            continue;
-        }
-        if record
-            .pointer("/worktree/is_linked_worktree")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false)
-        {
-            continue;
-        }
-        let Some(checkout) = record
-            .pointer("/worktree/checkout_path")
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        if !same_path(checkout, repo_root) {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(id.to_string());
-    }
-    found
-}
-
 /// Create the delegate's workspace, and say what it created.
 ///
 /// On any failure after the create request has gone out, this cleans up through
@@ -955,8 +988,7 @@ fn identify_parent(
 /// on stderr — so there is no path where a start has asked the server to create
 /// something and then walked away from the answer.
 fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
-    let worktrees_before = worktree_list_full(None);
-    let response = match mode {
+    let (repo, worktrees_before) = match mode {
         Mode::Worktree => {
             let repo = match &flags.repo {
                 Some(repo) => repo.clone(),
@@ -969,17 +1001,22 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                     }
                 },
             };
-            request(
-                Method::WorktreeCreate(WorktreeCreateParams {
-                    cwd: Some(repo),
-                    branch: flags.branch.clone(),
-                    base: flags.base.clone(),
-                    focus: false,
-                    ..WorktreeCreateParams::default()
-                }),
-                None,
-            )
+            let worktrees_before = worktree_list_plain(&repo, None).unwrap_or_default();
+            (repo, worktrees_before)
         }
+        Mode::Cwd => (String::new(), Vec::new()),
+    };
+    let response = match mode {
+        Mode::Worktree => request(
+            Method::WorktreeCreate(WorktreeCreateParams {
+                cwd: Some(repo),
+                branch: flags.branch.clone(),
+                base: flags.base.clone(),
+                focus: false,
+                ..WorktreeCreateParams::default()
+            }),
+            None,
+        ),
         Mode::Cwd => {
             let cwd = flags
                 .cwd
@@ -1028,9 +1065,9 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     let branch = at(&response, "/result/worktree/branch").map(str::to_string);
     let repo_root = at(&response, "/result/workspace/worktree/repo_root").map(str::to_string);
     let repo_key = at(&response, "/result/workspace/worktree/repo_key").map(str::to_string);
-    let parent_workspace_id = repo_root
-        .as_deref()
-        .and_then(|root| identify_parent(&worktrees_before, root, None));
+    // The server tells us which parent workspace it created (if any). We record
+    // exactly what the server says — no list diffs, no heuristics.
+    let parent_workspace_id = at(&response, "/result/parent_workspace_id").map(str::to_string);
 
     let (Some(workspace_id), Some(root_pane)) = (workspace_id, root_pane) else {
         let reason = "the server created the workspace but named no workspace id or root pane";
@@ -1060,16 +1097,11 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
 
 /// Undo a create whose answer could not be used, and hand back the exit code.
 ///
-/// The parent is re-identified here even though the placement never completed: a
-/// `worktree.create` that opened a repository root and then failed to answer is
-/// exactly the case where leaving the parent behind is most visible.
-/// Undo a create whose answer could not be used, and hand back the exit code.
-///
 /// For worktree mode, if the create failed after the request was sent, we may have
 /// a checkout on disk that the server created but couldn't report. We find it by
 /// comparing the worktree list before and after the call, matching on --branch if
-/// given, and kill it with force. The parent workspace is no longer closed here
-/// (without a repo root we can't identify it reliably); see #595.
+/// given, and kill it with force. The parent workspace (if any) is recorded from the
+/// server's response and cleaned up through the shared `tear_down` routine; see #595.
 fn teardown_after_place_failure(
     name: &str,
     worktrees_before: &[serde_json::Value],
@@ -1080,7 +1112,21 @@ fn teardown_after_place_failure(
     // For worktree mode, the create may have left a checkout behind. We find it
     // by diffing the worktree list before and after, matching on --branch if given.
     if mode == Mode::Worktree {
-        let worktrees_after = worktree_list_full(None);
+        let repo = flags.repo.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|c| c.display().to_string())
+                .unwrap_or_default()
+        });
+        let worktrees_after = match worktree_list_plain(&repo, None) {
+            Ok(list) => list,
+            Err(err) => {
+                eprintln!(
+                    "delegate {name}: could not check for a leftover checkout of {}: {err}",
+                    flags.branch.as_deref().unwrap_or("<unknown>")
+                );
+                return fail(reason);
+            }
+        };
         let branch = flags.branch.as_deref();
         let new_checkout = find_new_checkout(worktrees_before, &worktrees_after, branch);
         if let Some(checkout) = new_checkout {
@@ -1103,10 +1149,8 @@ fn teardown_after_place_failure(
             eprintln!("delegate {name}: rollback found no new checkout to remove (branch filter: {branch:?})");
         }
     }
-    // Parent workspace cleanup is handled by the rollback function using the
-    // recorded parent_workspace_id, not by this function. The identify_unlinked_parent
-    // approach is removed because without a repo root from the failed response we
-    // cannot reliably identify the parent workspace; see #595.
+    // The parent workspace (if any) was recorded from the server's response and
+    // will be cleaned up through the shared `tear_down` routine.
     fail(reason)
 }
 
@@ -1122,24 +1166,18 @@ fn find_new_checkout(
 ) -> Option<String> {
     let before_paths: std::collections::HashSet<String> = worktrees_before
         .iter()
-        .filter_map(|w| {
-            w.pointer("/worktree/path")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
+        .filter_map(|w| w.get("path").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
 
     for worktree in worktrees_after {
-        let Some(path) = worktree.pointer("/worktree/path").and_then(|v| v.as_str()) else {
+        let Some(path) = worktree.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
         if before_paths.contains(path) {
             continue;
         }
         if let Some(branch_name) = branch {
-            let wt_branch = worktree
-                .pointer("/worktree/branch")
-                .and_then(|v| v.as_str());
+            let wt_branch = worktree.get("branch").and_then(|v| v.as_str());
             if wt_branch != Some(branch_name) {
                 continue;
             }
@@ -1150,6 +1188,7 @@ fn find_new_checkout(
 }
 
 /// Full worktree list with all fields (used for diffing checkouts).
+#[allow(dead_code)]
 fn worktree_list_full(deadline: Option<Instant>) -> Vec<serde_json::Value> {
     request(
         Method::WorktreeList(WorktreeListParams {
@@ -1167,6 +1206,32 @@ fn worktree_list_full(deadline: Option<Instant>) -> Vec<serde_json::Value> {
             .cloned()
     })
     .unwrap_or_default()
+}
+
+/// Plain worktree list (scan: false) for a given repo cwd.
+fn worktree_list_plain(
+    repo: &str,
+    deadline: Option<Instant>,
+) -> Result<Vec<serde_json::Value>, String> {
+    request(
+        Method::WorktreeList(WorktreeListParams {
+            workspace_id: None,
+            cwd: Some(repo.to_string()),
+            scan: false,
+        }),
+        deadline,
+    )
+    .map_err(|err| err.to_string())
+    .and_then(|response| {
+        if let Some(error) = response.get("error") {
+            return Err(server_error(error));
+        }
+        response
+            .pointer("/result/worktrees")
+            .and_then(|worktrees| worktrees.as_array())
+            .cloned()
+            .ok_or_else(|| "server returned no worktrees".to_string())
+    })
 }
 
 // ---------------------------------------------------------------- teardown
@@ -1238,6 +1303,10 @@ struct Cleanup {
     parent_workspace_id: Option<String>,
     repo_root: Option<String>,
     repo_key: Option<String>,
+    /// True for an in-process rollback of a start whose agent never launched.
+    /// False for a Cleanup derived from a registry entry read from disk.
+    /// Controls the empty-terminal-id exception in `workspace_is_ours` (Z5).
+    in_process: bool,
 }
 
 impl Cleanup {
@@ -1253,6 +1322,7 @@ impl Cleanup {
             parent_workspace_id: entry.parent_workspace_id.clone(),
             repo_root: entry.repo_root.clone(),
             repo_key: entry.repo_key.clone(),
+            in_process: false,
         })
     }
 }
@@ -1381,12 +1451,17 @@ fn workspace_is_ours(target: &Cleanup) -> bool {
             // are reused. If the agent's terminal is gone, the cwd workspace is
             // not ours to close: the agent's exit already closed it.
             //
-            // Exception: if we never recorded a terminal_id (the agent died at
-            // launch), we still own the workspace and should clean it up.
+            // Exception (Z5): if we never recorded a terminal_id (the agent died at
+            // launch) AND this is an in-process rollback, we still own the workspace
+            // and should clean it up. A registry entry read from disk with an empty
+            // terminal_id is NEVER "ours" in cwd mode.
             if target.terminal_id.is_empty() {
-                // No terminal_id recorded — the agent died at launch.
-                // The workspace is still ours to clean up.
-                return workspace_record(&target.workspace_id).is_some();
+                if target.in_process {
+                    // In-process rollback: the agent died at launch, we still own it.
+                    return workspace_record(&target.workspace_id).is_some();
+                }
+                // Registry entry with empty terminal_id: not ours.
+                return false;
             }
             let terminal_id = &target.terminal_id;
             workspace_has_terminal(&target.workspace_id, terminal_id)
@@ -1406,26 +1481,6 @@ fn workspace_record(workspace_id: &str) -> Option<serde_json::Value> {
         .pointer("/result/workspace")
         .filter(|record| record.is_object())
         .cloned()
-}
-
-#[allow(dead_code)]
-fn workspace_has_pane(workspace_id: &str, pane_id: &str) -> bool {
-    let Ok(response) = request(
-        Method::PaneList(PaneListParams {
-            workspace_id: Some(workspace_id.to_string()),
-        }),
-        None,
-    ) else {
-        return false;
-    };
-    response
-        .pointer("/result/panes")
-        .and_then(|panes| panes.as_array())
-        .is_some_and(|panes| {
-            panes
-                .iter()
-                .any(|pane| field(pane, "pane_id") == Some(pane_id))
-        })
 }
 
 /// Check if a workspace holds a pane with the given terminal_id.
@@ -2543,7 +2598,17 @@ impl Await<'_> {
             self.deadline,
         ) {
             Ok(response) => response,
-            Err(err) => return ResultPoll::Refused(err.to_string()),
+            Err(_err) => {
+                // If the deadline has passed, treat as timeout (Z4).
+                // Otherwise, treat transport errors as "not yet" and retry.
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return ResultPoll::Refused("deadline passed".to_string());
+                }
+                return ResultPoll::NotYet;
+            }
         };
         if let Some(error) = response.get("error") {
             let code = error

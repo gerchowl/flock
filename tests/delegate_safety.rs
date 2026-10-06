@@ -693,7 +693,7 @@ fn s1_rollback_leaves_a_foreign_workspace_alone() {
 /// injected: the entry is rewritten to name the operator's workspace, which is
 /// exactly what a reassigned id looks like from here. The operator's workspace
 /// and its pane must survive; in worktree mode the checkout is still removed,
-/// because that is the recorded path and nothing else is.
+/// because that is the recorded path and nothing else.
 #[test]
 fn s2_reap_leaves_a_reused_id_alone() {
     let server = start_server();
@@ -708,9 +708,10 @@ fn s2_reap_leaves_a_reused_id_alone() {
         Some(0)
     );
     let started = stdout_json(&finish(child));
+    let delegate_ws = started["workspace_id"].as_str().unwrap().to_string();
     assert_ne!(
-        started["workspace_id"].as_str(),
-        Some(operator.as_str()),
+        delegate_ws.as_str(),
+        operator.as_str(),
         "the delegate got its own workspace"
     );
 
@@ -719,11 +720,13 @@ fn s2_reap_leaves_a_reused_id_alone() {
     let closed = request(
         &server,
         &format!(
-            r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{}"}}}}"#,
-            started["workspace_id"].as_str().unwrap()
+            r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{delegate_ws}"}}}}"#
         ),
     );
-    assert!(closed.get("error").is_none(), "{closed}");
+    assert!(
+        closed.get("error").is_none(),
+        "workspace.close failed: {closed}"
+    );
     rewrite_entry_workspace(&server, "d1", &operator);
 
     let reaped = cli(&server, &["delegate", "reap", "d1", "--json"]);
@@ -738,6 +741,13 @@ fn s2_reap_leaves_a_reused_id_alone() {
         workspace_pane_count(&server, &operator),
         operator_panes,
         "and so did its pane"
+    );
+    // The delegate's own recorded workspace must be gone.
+    assert!(
+        workspaces(&server)
+            .iter()
+            .all(|ws| ws["workspace_id"] != delegate_ws.as_str()),
+        "the delegate's own workspace was removed"
     );
     assert!(
         !registry_entry_path(&server, "d1").exists(),
@@ -778,6 +788,7 @@ fn s2_reap_removes_the_checkout_but_not_a_reused_workspace() {
         Some(0)
     );
     let json = stdout_json(&finish(child));
+    let delegate_ws = json["workspace_id"].as_str().unwrap().to_string();
     let worktree = PathBuf::from(json["worktree"].as_str().expect("worktree path"));
     assert!(worktree.is_dir(), "{json}");
 
@@ -796,6 +807,13 @@ fn s2_reap_removes_the_checkout_but_not_a_reused_workspace() {
         workspace_pane_count(&server, &operator),
         operator_panes,
         "and so did its pane"
+    );
+    // The delegate's own recorded workspace must be gone.
+    assert!(
+        workspaces(&server)
+            .iter()
+            .all(|ws| ws["workspace_id"] != delegate_ws.as_str()),
+        "the delegate's own workspace was removed"
     );
     assert!(
         !worktree.exists(),
