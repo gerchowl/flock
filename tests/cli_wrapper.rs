@@ -3187,3 +3187,230 @@ fn wait_agent_status_exits_when_done_status_matches() {
 
     cleanup_spawned_flock(flock, base);
 }
+
+/// #576 fixture: an isolated server with one workspace whose pane `1-1` is
+/// the recipient. The test process itself is outside every pane, so it sends
+/// as an unattested sender — the ssh-shell case the issue was filed for.
+fn spawn_recipient() -> (SpawnedFlock, PathBuf, PathBuf) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_576_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert!(
+        created["result"]["workspace"]["workspace_id"].is_string(),
+        "{created}"
+    );
+    (flock, base, socket_path)
+}
+
+fn needs_reply(socket_path: &Path, correlation_id: &str, body: &str) {
+    let sent = run_cli_json(
+        socket_path,
+        &[
+            "msg",
+            "send",
+            "1-1",
+            body,
+            "--intent",
+            "needs-reply",
+            "--correlation-id",
+            correlation_id,
+        ],
+    );
+    assert_eq!(sent["result"]["correlation_id"], correlation_id, "{sent}");
+}
+
+/// #576: the recipient read a question from a sender with no inbox and
+/// answered it. The answer used to be refused (`no_reply_address`) and went
+/// nowhere; now it is held, and `flk wait reply` hands it to the waiter.
+#[test]
+fn wait_reply_returns_a_reply_held_for_a_sender_without_an_inbox() {
+    let (flock, base, socket_path) = spawn_recipient();
+    needs_reply(&socket_path, "q576-held", "which branch?");
+    run_cli_json(&socket_path, &["msg", "read", "--pane", "1-1"]);
+
+    let replied = run_cli(&socket_path, &["msg", "reply", "q576-held", "feat/576"]);
+    assert!(
+        replied.status.success(),
+        "the reply must not be refused: {}",
+        String::from_utf8_lossy(&replied.stderr)
+    );
+
+    let waited = run_cli(
+        &socket_path,
+        &["wait", "reply", "q576-held", "--timeout", "2000"],
+    );
+    assert_eq!(
+        waited.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&waited.stdout), "feat/576\n");
+
+    let status = run_cli_json(&socket_path, &["msg", "status", "q576-held"]);
+    assert_eq!(status["result"]["reply"]["body"], "feat/576", "{status}");
+    assert_eq!(status["result"]["reply"]["held"], true, "{status}");
+    cleanup_spawned_flock(flock, base);
+}
+
+/// #576: the waiter is woken by the answer itself, not by its own timeout.
+#[test]
+fn wait_reply_wakes_when_the_answer_lands() {
+    let (flock, base, socket_path) = spawn_recipient();
+    needs_reply(&socket_path, "q576-wake", "ready?");
+    let waiter = Command::new(env!("CARGO_BIN_EXE_flk"))
+        .args(["wait", "reply", "q576-wake", "--timeout", "20000", "--json"])
+        .env("FLOCK_SOCKET_PATH", &socket_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    run_cli_json(&socket_path, &["msg", "read", "--pane", "1-1"]);
+    let replied = run_cli(&socket_path, &["msg", "reply", "q576-wake", "yes"]);
+    assert!(
+        replied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replied.stderr)
+    );
+    let output = waiter.wait_with_output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "woken by the reply, not by the 20 s timeout"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["result"]["outcome"], "replied", "{json}");
+    assert_eq!(json["result"]["reply"]["body"], "yes", "{json}");
+    cleanup_spawned_flock(flock, base);
+}
+
+/// #576: read but unanswered times out with 124, and says it was read.
+#[test]
+fn wait_reply_times_out_with_124_and_the_last_state() {
+    let (flock, base, socket_path) = spawn_recipient();
+    needs_reply(&socket_path, "q576-quiet", "anyone?");
+    run_cli_json(&socket_path, &["msg", "read", "--pane", "1-1"]);
+    let waited = run_cli(
+        &socket_path,
+        &["wait", "reply", "q576-quiet", "--timeout", "300", "--json"],
+    );
+    assert_eq!(
+        waited.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(json["result"]["outcome"], "timeout", "{json}");
+    assert_eq!(json["result"]["state"], "read", "{json}");
+
+    let unknown = run_cli(
+        &socket_path,
+        &["wait", "reply", "no-such-message", "--timeout", "300"],
+    );
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("message_not_found"));
+    cleanup_spawned_flock(flock, base);
+}
+
+/// #576: a muted recipient's automatic deferral ends the wait with 3 and
+/// says why, even for a sender with no inbox (ADR-0018 §3).
+#[test]
+fn wait_reply_on_a_muted_recipient_exits_3_with_the_deferral() {
+    let (flock, base, socket_path) = spawn_recipient();
+    let muted = run_cli(
+        &socket_path,
+        &[
+            "msg",
+            "mute",
+            "600",
+            "--pane",
+            "1-1",
+            "--reason",
+            "deep work",
+        ],
+    );
+    assert!(
+        muted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&muted.stderr)
+    );
+    needs_reply(&socket_path, "q576-muted", "got a minute?");
+    let waited = run_cli(
+        &socket_path,
+        &["wait", "reply", "q576-muted", "--timeout", "2000"],
+    );
+    assert_eq!(
+        waited.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("deep work"));
+    cleanup_spawned_flock(flock, base);
+}
+
+/// #576: `msg send --await` sends, then waits; stdout is the answer alone,
+/// so a harness running it as a background task is handed exactly that.
+#[test]
+fn msg_send_await_prints_only_the_answer() {
+    let (flock, base, socket_path) = spawn_recipient();
+    let sender = Command::new(env!("CARGO_BIN_EXE_flk"))
+        .args([
+            "msg",
+            "send",
+            "1-1",
+            "status?",
+            "--intent",
+            "needs-reply",
+            "--correlation-id",
+            "q576-await",
+            "--await",
+            "--timeout",
+            "20000",
+        ])
+        .env("FLOCK_SOCKET_PATH", &socket_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let delivered = wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+        run_cli_json(&socket_path, &["msg", "list", "--pane", "1-1"])["result"]["messages"]
+            .as_array()
+            .is_some_and(|messages| !messages.is_empty())
+    });
+    assert!(delivered, "the send never arrived");
+    run_cli_json(&socket_path, &["msg", "read", "--pane", "1-1"]);
+    let replied = run_cli(&socket_path, &["msg", "reply", "q576-await", "all green"]);
+    assert!(
+        replied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replied.stderr)
+    );
+    let output = sender.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "all green\n");
+    cleanup_spawned_flock(flock, base);
+}

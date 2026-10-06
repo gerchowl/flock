@@ -152,7 +152,11 @@ pub(super) fn table() -> &'static [Tool] {
                           `msg_not_allowed` (the receiver declines), \
                           `sender_unresolved` (a cross-host send needs an \
                           attestable sender, so it must come from inside a \
-                          pane).",
+                          pane). With `await: true` the result also carries \
+                          `await`: the correlation id to block on, as the \
+                          `flock_msg_wait_reply` call and as the `flk wait \
+                          reply` command a harness can run in the background \
+                          to be woken by the answer.",
             input_schema: schema_msg_send,
             build: build_msg_send,
         },
@@ -216,6 +220,24 @@ pub(super) fn table() -> &'static [Tool] {
                           Omit `pane` to mute yourself.",
             input_schema: schema_msg_mute,
             build: build_msg_mute,
+        },
+        Tool {
+            name: "flock_msg_wait_reply",
+            description: "Wait for the answer to a message you sent with \
+                          `needs_reply` or `blocking`, by its correlation id. \
+                          Returns `outcome`: `replied` (the reply is in \
+                          `reply`), `deferred` (the recipient is muted; its \
+                          automatic answer is in `reply`), `expired` (dropped \
+                          unread — no answer is coming) or `timeout` (with \
+                          the message's last `state`, e.g. `read`). BLOCKS \
+                          this MCP session for up to `timeout_ms` (default \
+                          60 s, at most 10 min): to wait longer without \
+                          stalling, run `flk wait reply <id>` as a \
+                          background task instead. Works for a sender with \
+                          no inbox too: a reply to it is held under the \
+                          correlation id. Refusal: `message_not_found`.",
+            input_schema: schema_msg_wait_reply,
+            build: build_msg_wait_reply,
         },
         Tool {
             name: "flock_self_compact",
@@ -493,6 +515,10 @@ fn schema_msg_send() -> Value {
                 "type": "string",
                 "description": "Correlation id of a prior message this one answers.",
             },
+            "await": {
+                "type": "boolean",
+                "description": "With `needs_reply` or `blocking`: return the correlation id to wait on, plus the exact `flk wait reply` command, so you can be woken by the answer. The send itself does not block.",
+            },
             "intent": {
                 "type": "string",
                 "enum": intent_enum(),
@@ -500,6 +526,25 @@ fn schema_msg_send() -> Value {
             },
         },
         "required": ["to", "body", "intent"],
+        "additionalProperties": false,
+    })
+}
+
+fn schema_msg_wait_reply() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "correlation_id": {
+                "type": "string",
+                "description": "The correlation id `flock_msg_send` returned for the message you are waiting on.",
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How long to wait, in ms (default 60000, capped at 600000). This call blocks the MCP session for that long.",
+            },
+        },
+        "required": ["correlation_id"],
         "additionalProperties": false,
     })
 }
@@ -688,6 +733,81 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         intent: required_intent(&args, "intent")?,
         intent_unrecognised: None,
     }))
+    .and_then(|method| {
+        // #576: waiting on an `fyi` waits for an answer nobody was asked for.
+        match &method {
+            Method::MsgSend(params)
+                if optional_bool(&args, "await")?
+                    && params.intent == crate::api::schema::MsgIntent::Fyi =>
+            {
+                Err(McpError::invalid_params(
+                    "`await` waits for an answer: send with intent \"needs_reply\" or \"blocking\"",
+                ))
+            }
+            _ => Ok(method),
+        }
+    })
+}
+
+/// Default and ceiling of `flock_msg_wait_reply`'s wait. An MCP session
+/// serves one call at a time, so this call holds the whole session; a longer
+/// wait belongs in `flk wait reply`, run as a background task.
+const MCP_WAIT_REPLY_DEFAULT_MS: u64 = 60_000;
+const MCP_WAIT_REPLY_MAX_MS: u64 = 600_000;
+
+fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
+    Ok(Method::MsgWaitReply(
+        crate::api::schema::MsgWaitReplyParams {
+            correlation_id: required_string(&args, "correlation_id")?,
+            timeout_ms: Some(
+                optional_u64(&args, "timeout_ms")?
+                    .unwrap_or(MCP_WAIT_REPLY_DEFAULT_MS)
+                    .min(MCP_WAIT_REPLY_MAX_MS),
+            ),
+        },
+    ))
+}
+
+/// `word` as one POSIX shell word: as-is when it is plainly safe, single-quoted
+/// otherwise. A caller may choose its own correlation id, and the command is
+/// meant to be pasted into a shell.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@%+=,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// A tool's chance to add to flock's result before it is handed back (#576).
+/// Only `flock_msg_send` with `await: true` uses it: the wait itself is a
+/// separate call, so the send says how to make it.
+pub(super) fn annotate(name: &str, args: &Value, mut result: Value) -> Value {
+    if name != "flock_msg_send" || !matches!(optional_bool(args, "await"), Ok(true)) {
+        return result;
+    }
+    let Some(id) = result
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return result;
+    };
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "await".into(),
+            json!({
+                "correlation_id": id,
+                "tool": "flock_msg_wait_reply",
+                "command": format!("flk wait reply {}", shell_word(&id)),
+            }),
+        );
+    }
+    result
 }
 
 /// Parse a required `intent` argument (#280).
@@ -935,6 +1055,17 @@ fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>, McpError> {
     }
 }
 
+/// An optional boolean: absent means `false`.
+fn optional_bool(args: &Value, field: &str) -> Result<bool, McpError> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(McpError::invalid_params(format!(
+            "`{field}` must be a boolean"
+        ))),
+    }
+}
+
 fn optional_lines(args: &Value, field: &str) -> Result<Option<u32>, McpError> {
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -976,6 +1107,7 @@ mod tests {
                 "flock_msg_list",
                 "flock_msg_read",
                 "flock_msg_mute",
+                "flock_msg_wait_reply",
                 "flock_self_compact",
                 "flock_pane_read",
                 "flock_worktree_list",
@@ -1361,6 +1493,64 @@ mod tests {
             panic!("expected MsgReply");
         };
         assert!(params.reply_correlation_id.is_none());
+    }
+
+    /// #576: the wait is its own call, bounded because it holds the session.
+    #[test]
+    fn msg_wait_reply_is_bounded_and_send_await_says_how_to_wait() {
+        let Method::MsgWaitReply(params) =
+            build_msg_wait_reply(json!({"correlation_id": "c-1"})).unwrap()
+        else {
+            panic!("expected msg.wait_reply");
+        };
+        assert_eq!(params.timeout_ms, Some(MCP_WAIT_REPLY_DEFAULT_MS));
+        let Method::MsgWaitReply(params) =
+            build_msg_wait_reply(json!({"correlation_id": "c-1", "timeout_ms": 86_400_000}))
+                .unwrap()
+        else {
+            panic!("expected msg.wait_reply");
+        };
+        assert_eq!(params.timeout_ms, Some(MCP_WAIT_REPLY_MAX_MS), "capped");
+        assert!(build_msg_wait_reply(json!({})).is_err());
+
+        let fyi_await = build_msg_send(json!({
+            "to": {"type": "pane", "pane": "w1:p2"},
+            "body": "x",
+            "intent": "fyi",
+            "await": true,
+        }))
+        .expect_err("awaiting an fyi waits for an answer nobody was asked for");
+        assert!(
+            fyi_await.message.contains("needs_reply"),
+            "{}",
+            fyi_await.message
+        );
+        let args = json!({
+            "to": {"type": "pane", "pane": "w1:p2"},
+            "body": "x",
+            "intent": "needs_reply",
+            "await": true,
+        });
+        assert!(build_msg_send(args.clone()).is_ok());
+
+        let sent = json!({"type": "msg_queued", "correlation_id": "c-9", "state": "queued"});
+        let annotated = annotate("flock_msg_send", &args, sent.clone());
+        assert_eq!(annotated["await"]["correlation_id"], "c-9");
+        assert_eq!(annotated["await"]["command"], "flk wait reply c-9");
+        assert_eq!(annotated["await"]["tool"], "flock_msg_wait_reply");
+        let odd = annotate(
+            "flock_msg_send",
+            &json!({"await": true}),
+            json!({"correlation_id": "it's $(here)"}),
+        );
+        assert_eq!(odd["await"]["command"], r"flk wait reply 'it'\''s $(here)'");
+        let mut no_await = args;
+        no_await["await"] = json!(false);
+        assert_eq!(annotate("flock_msg_send", &no_await, sent.clone()), sent);
+        assert_eq!(
+            annotate("flock_msg_reply", &json!({"await": true}), sent.clone()),
+            sent
+        );
     }
 
     #[test]

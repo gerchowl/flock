@@ -372,6 +372,33 @@ pub(crate) fn api_wait_timed_out(request_id: &str, pane_id: &str) {
     );
 }
 
+pub(crate) fn msg_wait_reply_started(request_id: &str, correlation_id: &str, timeout_ms: u64) {
+    tracing::info!(
+        event = "api.msg_wait_reply.start",
+        subsystem = "api",
+        outcome = "started",
+        request_id,
+        correlation_id,
+        timeout_ms,
+        "msg reply wait started"
+    );
+}
+
+pub(crate) fn msg_wait_reply_completed(
+    request_id: &str,
+    correlation_id: &str,
+    outcome: &'static str,
+) {
+    tracing::info!(
+        event = "api.msg_wait_reply.complete",
+        subsystem = "api",
+        outcome,
+        request_id,
+        correlation_id,
+        "msg reply wait finished"
+    );
+}
+
 pub(crate) fn pane_spawn_started(
     pane_id: u32,
     rows: u16,

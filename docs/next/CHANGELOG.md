@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+- **A sender can wait for the answer to its own message** (#576). `flk wait reply <correlation_id> [--timeout MS] [--json]` blocks until the message is answered and prints the reply's body (exit 0), or ends on a mute's deferral or the message being dropped unread (exit 3) or the timeout (exit 124, with whether it was at least `read`). `flk msg send --intent needs-reply --await` sends and waits in one command, with the send's own result on stderr so a harness running it as a background task is handed the answer alone. Socket method `msg.wait_reply`; MCP `flock_msg_wait_reply` (bounded to 10 minutes, since it holds the session) and `await: true` on `flock_msg_send`, which returns the id and the exact command. The wait is event-driven, woken by the event hub like the channel feed (ADR-0019 §5), not a poll over `msg.status`.
+- **A message from a sender with no inbox can be answered.** A send from an ssh shell or a script carries no sender pane, so `msg.reply` refused with `no_reply_address` and the answer went nowhere — observed live, on a `needs_reply` message whose recipient read it and tried to answer. The reply is now **held** under the original's correlation id (`state: "held"`, warning `reply_held_for_waiter`), on its durable `message_replied` event, for `msg.wait_reply` and `msg.status` to hand back; a muted recipient answers such a sender with a held deferral the same way. `msg.status` now carries the answer as `reply`, and a real reply outranks a deferral there and in the wait.
+
 ## [0.8.0] - 2026-10-06
 
 ### Added

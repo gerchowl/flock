@@ -142,6 +142,17 @@ impl ReplyOutcome {
     }
 }
 
+/// What a caller of the API is, as far as this server can attest.
+struct ApiCaller {
+    from_pane: Option<String>,
+    from_repo: Option<String>,
+    attested_agent: Option<String>,
+}
+
+/// Reply-result warning: the original sender had no inbox, so the reply is
+/// held for `msg.wait_reply` / `msg.status` under the original's id (#576).
+const REPLY_HELD_FOR_WAITER: &str = "reply_held_for_waiter";
+
 /// The one budget every unattested `blocking` sender shares.
 const UNATTESTED_BLOCKING_BUCKET: &str = "unattested";
 
@@ -433,11 +444,17 @@ impl App {
             },
             None => match &original_sender {
                 Some(pane) => MessageTarget::Pane { pane: pane.clone() },
+                // #576: a sender with no inbox (an ssh shell, a script) can
+                // still be waiting on the correlation id. Refusing the reply
+                // left the answer nowhere; hold it for the waiter instead.
                 None => {
-                    return encode_error(
+                    return self.hold_reply(
                         id,
-                        "no_reply_address",
-                        "the original message carried no sender to reply to",
+                        &params.correlation_id,
+                        params.reply_correlation_id.clone(),
+                        body,
+                        original_enqueued_ms,
+                        &root,
                     )
                 }
             },
@@ -488,17 +505,11 @@ impl App {
             return encode_error(id, "internal_error", "reply pane has no public id");
         };
 
-        let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
-        let from_pane = sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
-        let from_repo = sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx));
-        let attested_agent = sender.and_then(|(ws_idx, pane_id)| {
-            let ws = self.state.workspaces.get(ws_idx)?;
-            let terminal = self
-                .state
-                .terminals
-                .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
-            Some(terminal.agent_id.to_string())
-        });
+        let ApiCaller {
+            from_pane,
+            from_repo,
+            attested_agent,
+        } = self.api_caller();
         let to_repo = self.workspace_repo_label(to_ws_idx);
 
         let now = now_ms();
@@ -550,10 +561,85 @@ impl App {
                     reply_correlation_id,
                     reply_latency_ms: now.saturating_sub(original_enqueued_ms),
                     round_trips,
+                    body: None,
+                    from_pane: None,
+                    from_agent: None,
+                    held: false,
                 },
             });
         }
         response
+    }
+
+    /// Who is calling the API, as far as this server can attest: the pane
+    /// the caller's process runs in, its repo, and the agent in that pane.
+    /// All `None` for a caller outside any pane (an ssh shell, a script).
+    fn api_caller(&mut self) -> ApiCaller {
+        let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
+        ApiCaller {
+            from_pane: sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
+            from_repo: sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx)),
+            attested_agent: sender.and_then(|(ws_idx, pane_id)| {
+                let ws = self.state.workspaces.get(ws_idx)?;
+                let terminal = self
+                    .state
+                    .terminals
+                    .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
+                Some(terminal.agent_id.to_string())
+            }),
+        }
+    }
+
+    /// #576: record a reply to a message whose sender had no inbox, so the
+    /// one who waits on the correlation id (`msg.wait_reply`) — or asks
+    /// `msg.status` — gets it. The `MessageReplied` event is where it lives:
+    /// durable like every message body, keyed by the original's id.
+    fn hold_reply(
+        &mut self,
+        id: String,
+        original_correlation_id: &str,
+        reply_correlation_id: Option<String>,
+        body: String,
+        original_enqueued_ms: u64,
+        root: &str,
+    ) -> String {
+        let caller = self.api_caller();
+        let now = now_ms();
+        let sender_key = caller.from_pane.clone().unwrap_or_else(|| "unknown".into());
+        if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
+            return encode_error(
+                id,
+                "msg_rate_limited",
+                format!("rate limit exceeded; retry in {retry_after_ms} ms"),
+            );
+        }
+        let reply_correlation_id = reply_correlation_id
+            .filter(|explicit| !explicit.trim().is_empty())
+            .unwrap_or_else(mint_correlation_id);
+        let round_trips = self.mailboxes.bump_round_trips(root);
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageReplied,
+            data: EventData::MessageReplied {
+                correlation_id: original_correlation_id.to_string(),
+                reply_correlation_id: reply_correlation_id.clone(),
+                reply_latency_ms: now.saturating_sub(original_enqueued_ms),
+                round_trips,
+                body: Some(body),
+                from_pane: caller.from_pane,
+                from_agent: caller.attested_agent,
+                held: true,
+            },
+        });
+        encode_success(
+            id,
+            ResponseResult::MsgQueued {
+                correlation_id: reply_correlation_id,
+                state: "held".into(),
+                warnings: vec![REPLY_HELD_FOR_WAITER.to_string()],
+                to_host: None,
+                path: None,
+            },
+        )
     }
 
     pub(super) fn handle_msg_list(&mut self, id: String, params: MsgListParams) -> String {
@@ -601,6 +687,7 @@ impl App {
                         route: None,
                         path: None,
                         detail: Some("waiting in a local inbox, not yet read".into()),
+                        reply: None,
                     });
                 }
                 EventData::MessageRelayed {
@@ -633,6 +720,7 @@ impl App {
                         detail: Some(format!(
                             "{how}; whether it was read is recorded there, not here"
                         )),
+                        reply: None,
                     });
                 }
                 EventData::MessageDelivered {
@@ -649,10 +737,26 @@ impl App {
                         route: None,
                         path: None,
                         detail: Some(outcome.clone()),
+                        reply: None,
                     });
                 }
                 _ => {}
             }
+        }
+        // #576: and what came back. A held reply (the sender had no inbox)
+        // can be the only trace of the exchange on this server.
+        let answer = crate::api::best_answer(
+            self.event_hub
+                .events_after(0)
+                .iter()
+                .map(|(_, event)| event),
+            &params.correlation_id,
+        )
+        .and_then(crate::api::Answer::into_reply);
+        if let (Some(ResponseResult::MsgStatus { reply, .. }), Some(answer)) =
+            (found.as_mut(), answer)
+        {
+            *reply = Some(answer);
         }
         match found {
             Some(result) => encode_success(id, result),
@@ -857,9 +961,36 @@ impl App {
                 agent: agent.clone(),
             },
             (None, Some(pane)) => MessageTarget::Pane { pane: pane.clone() },
-            // An anonymous sender has no address. Nothing can reach it, so
-            // there is nothing to claim.
-            (None, None) => return false,
+            // An anonymous sender has no address, but it may be waiting on
+            // the correlation id (#576): hold the deferral for it, the way a
+            // reply to it is held.
+            (None, None) => {
+                let deferral_correlation_id =
+                    crate::app::mailboxes::deferral_id(&message.correlation_id);
+                self.emit_event(EventEnvelope {
+                    event: EventKind::MessageReplied,
+                    data: EventData::MessageReplied {
+                        correlation_id: message.correlation_id.clone(),
+                        reply_correlation_id: deferral_correlation_id.clone(),
+                        reply_latency_ms: now_ms().saturating_sub(message.enqueued_at_ms),
+                        round_trips: 0,
+                        body: Some(deferral_body(muted_until_ms, reason.as_deref())),
+                        from_pane: Some(message.to_pane.clone()),
+                        from_agent: None,
+                        held: true,
+                    },
+                });
+                self.mailboxes.mark_deferred(&message.correlation_id);
+                self.emit_message_deferred(
+                    &message.correlation_id,
+                    deferral_correlation_id,
+                    &message.to_pane,
+                    muted_until_ms,
+                    reason,
+                    None,
+                );
+                return true;
+            }
         };
         // The muted pane is the deferral's sender. Resolved from the
         // message's own recipient, not from the API caller.
@@ -2016,20 +2147,156 @@ mod tests {
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "message_not_found");
+    }
 
-        // A queued message with no sender stamp cannot be replied to.
-        basic_send(&mut app, "c-orig", "question");
-        let response = app.handle_api_request(Request {
+    fn reply_to(app: &mut crate::app::App, correlation: &str, body: &str) -> String {
+        app.handle_api_request(Request {
             id: "req".into(),
             method: Method::MsgReply(MsgReplyParams {
-                correlation_id: "c-orig".into(),
-                body: "answer".into(),
+                correlation_id: correlation.into(),
+                body: body.into(),
                 reply_correlation_id: None,
                 intent: MsgIntent::Fyi,
             }),
+        })
+    }
+
+    fn status_of(app: &mut crate::app::App, correlation: &str) -> ResponseResult {
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgStatus(MsgStatusParams {
+                correlation_id: correlation.into(),
+            }),
         });
-        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "no_reply_address");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        success.result
+    }
+
+    /// #576. A message from a sender with no inbox (an ssh shell, a script)
+    /// used to be unanswerable: `no_reply_address`, and the answer went
+    /// nowhere. It is held under the original's id for `msg.wait_reply`.
+    #[tokio::test]
+    async fn a_reply_to_a_sender_without_an_inbox_is_held_for_the_waiter() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        waking_send(&mut app, "c-orig", "question");
+        let response = reply_to(&mut app, "c-orig", "the answer");
+        let success: SuccessResponse = serde_json::from_str(&response).expect(&response);
+        let ResponseResult::MsgQueued {
+            state, warnings, ..
+        } = success.result
+        else {
+            panic!("expected msg_queued: {response}");
+        };
+        assert_eq!(state, "held");
+        assert_eq!(warnings, vec![super::REPLY_HELD_FOR_WAITER.to_string()]);
+
+        let events: Vec<EventEnvelope> = hub.events_after(0).into_iter().map(|(_, e)| e).collect();
+        let answer = crate::api::best_answer(&events, "c-orig").expect("an answer");
+        assert_eq!(answer.outcome(), "replied");
+        let reply = answer.into_reply().expect("a reply");
+        assert_eq!((reply.body.as_str(), reply.held), ("the answer", true));
+    }
+
+    /// #576: `msg.status` carries the answer, whether it went to an inbox or
+    /// was held.
+    #[tokio::test]
+    async fn msg_status_carries_the_reply() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        waking_send(&mut app, "c-held", "question");
+        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "c-held") else {
+            panic!("expected msg_status");
+        };
+        assert_eq!(reply, None, "no answer yet");
+        reply_to(&mut app, "c-held", "held answer");
+        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "c-held") else {
+            panic!("expected msg_status");
+        };
+        assert_eq!(reply.map(|r| r.body), Some("held answer".into()));
+
+        // A pane-to-pane exchange: the reply's own delivery holds the body.
+        let asker = pane_target(&app, 0);
+        send_from(&mut app, 0, 1, "c-q", MsgIntent::NeedsReply);
+        let answerer = app.state.workspaces[1].focused_pane_id().unwrap();
+        app.test_pane_child_pids
+            .insert(answerer, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        reply_to(&mut app, "c-q", "inbox answer");
+        app.current_api_peer_pid = None;
+        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "c-q") else {
+            panic!("expected msg_status");
+        };
+        let reply = reply.expect("a reply");
+        assert_eq!((reply.body.as_str(), reply.held), ("inbox answer", false));
+        assert_eq!(
+            read_inbox(&mut app, &asker).len(),
+            1,
+            "and it still went to the inbox"
+        );
+    }
+
+    /// #576 with ADR-0018 §3: a muted recipient answers an anonymous
+    /// `needs_reply` sender too — with a held deferral, so a waiter learns
+    /// "muted" instead of timing out.
+    #[tokio::test]
+    async fn a_mute_defers_an_anonymous_question_into_a_held_answer() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        let muted_pane = pane_target(&app, 1);
+        waking_send(&mut app, "c-anon", "question");
+        assert_eq!(
+            mute_answering(&mut app, &muted_pane, 600, Some("deep work")).1,
+            1
+        );
+        let events: Vec<EventEnvelope> = hub.events_after(0).into_iter().map(|(_, e)| e).collect();
+        let answer = crate::api::best_answer(&events, "c-anon").expect("an answer");
+        assert_eq!(answer.outcome(), "deferred");
+        assert!(answer.into_reply().unwrap().body.contains("deep work"));
+        assert_eq!(deferred_events(&hub).len(), 1, "recorded like any deferral");
+        assert_eq!(
+            mute_answering(&mut app, &muted_pane, 900, None).1,
+            0,
+            "and, like any deferral, only once"
+        );
+    }
+
+    /// Review finding on #576: the deferral is answered at once, the real
+    /// reply later. From then on the reply is what the sender is shown.
+    #[tokio::test]
+    async fn a_reply_after_a_held_deferral_is_what_status_shows() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let muted_pane = pane_target(&app, 1);
+        waking_send(&mut app, "c-later", "question");
+        assert_eq!(mute_answering(&mut app, &muted_pane, 600, None).1, 1);
+        mute_answering(&mut app, &muted_pane, 0, None);
+        reply_to(&mut app, "c-later", "answered after all");
+        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "c-later") else {
+            panic!("expected msg_status");
+        };
+        let reply = reply.expect("a reply");
+        assert_eq!(
+            (reply.kind.as_str(), reply.body.as_str()),
+            ("reply", "answered after all")
+        );
+    }
+
+    /// #576 with #438: under channel push a held reply is the acknowledgement
+    /// the original gets, so it settles the original like any reply that
+    /// went out.
+    #[tokio::test]
+    async fn under_channel_push_a_held_reply_settles_the_original() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.channel_push = true;
+        let answerer = pane_target(&app, 1);
+        waking_send(&mut app, "c-anon", "question");
+        // Answered from the recipient's own pane: only that settles (#446).
+        let answerer_pane = app.state.workspaces[1].focused_pane_id().unwrap();
+        app.test_pane_child_pids
+            .insert(answerer_pane, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        reply_to(&mut app, "c-anon", "answer");
+        app.current_api_peer_pid = None;
+        assert_eq!(app.mailboxes.queued_len(&answerer), 0, "settled");
     }
 
     #[tokio::test]
@@ -2852,13 +3119,14 @@ mod tests {
         let mut app = test_app_with_hub(hub.clone());
         app.state.config.msg.channel_push = true;
         let answerer = pane_target(&app, 1);
-        // No sender at all: `msg.reply` has nowhere to route and refuses
-        // with `no_reply_address` — after the original was looked up.
+        // The sender's pane is gone: `msg.reply` looks the original up and
+        // then cannot place its sender. (A sender with NO pane used to be the
+        // vehicle here, but since #576 that reply is held, not refused.)
         app.mailboxes
             .enqueue(crate::app::mailboxes::PendingMessage {
                 correlation_id: "c-anon".into(),
                 body: "who sent this?".into(),
-                from_pane: None,
+                from_pane: Some("w404:p9".into()),
                 from_agent: None,
                 from_host: None,
                 from_repo: None,
@@ -2879,7 +3147,10 @@ mod tests {
             "params": { "correlation_id": "c-anon", "body": "hello?" },
         })));
         app.current_api_peer_pid = None;
-        assert!(response.contains("no_reply_address"), "{response}");
+        assert!(
+            response.contains("\"code\":\"msg_target_not_found\""),
+            "{response}"
+        );
         assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");
         assert!(
             !hub.events_after(0).into_iter().any(|(_, e)| matches!(
