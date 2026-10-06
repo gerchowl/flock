@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- A node can now declare its own **GPU utilization** via a new top-level `gpu_command`, the dynamic sibling of `thermal_command` (#291). The sampler reads a GPU percent on macOS via `IOAccelerator`, but on every other platform — including a Linux microVM guest with no GPU of its own — the self row's GPU column was blank even when the host machine was busy. With `gpu_command` set, flock runs the configured shell command on every ~2s sampler tick (not the thermal slow stride: utilization moves as fast as cpu/memory, so a 30s refresh would be visibly stale next to the two-second CPU column), parses stdout as one integer 0..=100, trims trailing whitespace, and feeds the result into the same `gpu_percent` field the macOS path uses — so it rides the existing fleet-gossip wire (#291) with no protocol change and shows up on peer rows exactly like a native reading. The command runs under the same hard timeout as the other periodic samplers and inherits the "declare nothing on any failure" rule from the thermal reporter: non-zero exit, timeout, unparseable output, or an out-of-range value all leave `gpu_percent` as `None` rather than synthesising a believable number, and a persistently failing reporter is slowed down with the same capped backoff — never disabled, so a reporter that recovers (a file reappears, a driver restarts) lights the column back up without a flock restart. When set, the command's reading **overrides** the local macOS sample: a mac host that configures it is explicitly preferring the host-authored value, and the local sampler is not a fallback. Prompted by a vm-dev guest on an RTX 5090 host that publishes its load to a file every two seconds — the guest can read the file, the host owns the sensor, and now the servers band can show the number instead of a blank column.
+
 ## [0.8.0] - 2026-10-06
 
 ### Added
