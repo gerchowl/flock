@@ -1,13 +1,17 @@
 # ADR 0025 — Version identity: this project restarts its version line, and the deterministic `just release` path stays
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-05
 - Issues: #506 (the user-visible defect), #507 (this record), #509 (the plan command)
 - Decision owner: operator.
 
-**This ADR is a proposal.** Version identity is the operator's decision and
-nothing below has been acted on beyond the manifest neutralization in §3, which
-is #506's bug fix and does not depend on this being accepted.
+**This ADR is accepted.** Version identity is the operator's decision, and §1
+records the one they made: the first release is **`0.7.0`**, not the `1.0.0` the
+argument below originally recommended. §1 also keeps the reasoning that excluded
+`0.6.9` and `0.6.8-fork.1`, because that part was never a matter of taste.
+
+The manifest neutralization in §3 was landed before acceptance (#506's bug fix);
+it did not depend on the rest of this being decided.
 
 ## Context
 
@@ -34,7 +38,47 @@ happens to be at, inherited with the tree.
 
 ## Decision (proposed)
 
-### 1. The version line restarts at `1.0.0`
+### 1. The version line restarts — at `0.7.0`, decided
+
+**Recorded decision (2026-10-05, operator): the first release is `0.7.0`.**
+
+The argument below was written first and recommended `1.0.0`, on the reasoning
+that `0.6.9` is a string upstream may publish next. That reasoning still holds
+about `0.6.9` and was rejected on a different ground: **a restart does not have
+to clear the 0.6.x line to be distinguishable.** `0.7.0` cannot be published by
+the project this tree separated from, which stopped at `0.6.8`, and the
+distinguishing property the operator needs is that a version string names
+*this* product — not that it implies maturity.
+
+`0.7.0` also satisfies what `just release-plan` independently recommends for this
+range: **minor**, across 1302 commits with no prior `v*` tag. So the number is
+both greater than the `0.6.8` in `Cargo.toml` and at least the recommended bump,
+which means `release-prepare` accepts it **with no override flag** — the check
+agrees with the choice rather than being argued past.
+
+What this ADR's argument still rules out, and it is the part that was never a
+matter of taste:
+
+- **`0.6.9`** — a version string upstream is entitled to publish next. A user
+  seeing it could not tell which product names it.
+- **`0.6.8-fork.1`** — unparseable by `Version::parse` (`src/update.rs:74`
+  splits on `.` and requires three numeric parts, so `flk update` would fail with
+  `invalid version in update manifest`), and SemVer orders it **below** `0.6.8`,
+  so every build from this tree would outrank the first release and never offer
+  it. A marker belongs at runtime (`build_info.rs` prints `0.6.8-fork.<sha>`),
+  not in a download URL.
+
+The cost of `0.7.0` over `1.0.0` is that it reads as a continuation rather than a
+restart. That is a product statement about how this project presents itself, and
+it is the operator's to make rather than a fact this ADR can establish.
+
+### 1a. Why the original recommendation was `1.0.0`
+
+Retained because the reasoning is still what excludes `0.6.9` and
+`0.6.8-fork.1`, and because a record that quietly deleted its own argument
+would not be worth reading.
+
+#### The version line restarts at `1.0.0`
 
 Not `0.6.9`, and not `0.6.8-fork.1`.
 

@@ -10,7 +10,7 @@ Most commands print JSON responses. Use them from scripts when you want determin
 ## Launch and status
 
 ```bash
-flock                         # launch or attach to the default session
+flk                         # launch or attach to the default session
 flk --session work          # launch or attach to a named session
 flk --remote workbox        # attach through SSH, using local keybindings
 flk --remote workbox --remote-keybindings server
@@ -42,6 +42,74 @@ flk server reload-config
 ```
 
 `flk server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
+
+## Config
+
+```bash
+flk config check [--path PATH]
+flk config edit
+flk config reset-keys
+```
+
+`config check` validates a config without starting or touching a server, and exits on a three-way code so it can gate a deploy:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | clean |
+| `1` | loaded, with advisory warnings (deprecated keys, keybinding conflicts) |
+| `2` | did not load — a session would fall back to built-in defaults |
+
+Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
+
+`--path` checks a file that is not the live config, which is what a build-time gate wants:
+
+```bash
+flk config check --path ./config.toml || exit 1
+```
+
+Base and `config.local.toml` layering resolves exactly as it does at runtime. This is unrelated to `flk checks`, which runs the health-check runner.
+
+## Preflight
+
+```bash
+flk preflight [--require TARGET]...
+```
+
+Answers one question: **is flock functional on THIS host right now?** `config check` proves the config parses; preflight also asks whether the things that config switches on are actually wired here. It exits on the same three-way code, so an activation or deploy can gate on it:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | ready |
+| `1` | works, but something wants attention |
+| `2` | a configured feature is broken here |
+
+It checks the config (by running `config check`), each agent integration, that the worktree directory is writable, and that `git` / `ssh` / `gh` are on `PATH`. Failures name the fix rather than the symptom.
+
+**It never touches the network.** Preflight is built to run inside a Home Manager activation, so it cannot be allowed to hang one — peer reachability belongs to `flk status`, on a different clock.
+
+### Why `--require`
+
+An integration that is missing might be a deliberate opt-out, so flock will not fail your deploy over it on its own judgement:
+
+| Hook state | Agent on this host | Result |
+| --- | --- | --- |
+| current | — | `0` |
+| stale | — | `2` — it was wired and is now broken |
+| missing | yes | `1` — might be intentional |
+| missing | no | silent — not this host's business |
+
+`--require TARGET` (repeatable) says *this deployment meant to have that one*, turning a missing hook into a `2`. flock cannot infer intent; the thing that deploys it can. A required target whose agent has vanished entirely still fails — passing quietly there would hide exactly the breakage this catches.
+
+```bash
+# In an activation: fail loudly if the Claude hook did not install.
+flk preflight --require claude || exit 1
+```
+
+This matters because a half-wired host is silent by nature. Before the prompt-history panel read session transcripts it was fed purely by lifecycle hooks, so a host whose integration never installed showed an *empty panel* — indistinguishable from having no history yet.
+
+:::note
+A debug build reads `~/.config/flock-dev/config.toml`, so a debug-built preflight checks a different file than an installed one.
+:::
 
 ## Sessions
 
@@ -87,7 +155,7 @@ Worktrees are normal Flock workspaces with Git checkout provenance. `worktree cr
 
 `worktree list` prints a table ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. `AGE` is the last commit on the branch — deliberately not the directory's mtime, which a build that rewrites `target/` makes meaningless. `--scan` adds a `VERDICT` column resolved through the same gate `worktree kill` runs, so a squash-merged branch reads `merged` here exactly as it does there; it is opt-in because it costs local Git plus a `gh` call per checkout. Absence of a verdict means "not scanned", never "not merged". `--json` prints the raw response, where the fields are `last_commit_at` and `kill_verdict`.
 
-`worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into the default branch, remote containment, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The repo's default branch and any `[worktrees] protected_branches` entry are kept under every path. Agents can use this as the single entry point for post-merge cleanup.
+`worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into the default branch, remote containment, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The repo's default branch and any `[worktrees] protected_branches` entry are kept under every path.
 
 A kill also sweeps the processes left in the checkout. Removing a worktree unlinks a directory but does not touch the processes whose working directory it was, and a `setsid` child is out of reach of the pane teardown — those keep running against a path that no longer exists. Once the checkout is removed and the workspace is closed, anything still alive from inside it gets `SIGTERM`, a grace period, then `SIGKILL`. Matching is against the leaf checkout exactly, never the parent directory worktrees of a repo share, and the calling process and the shell it was typed into are never signalled. The result JSON carries `processes` (what was standing there when the kill began), `orphans` (what outlived the teardown) and `orphans_surviving` (what outlived `SIGKILL`), each as `pid` plus command name; the same is summarised on stderr. `--keep-procs` reports without signalling anything, and `--dry-run` names what is standing in the checkout without touching it.
 
@@ -120,6 +188,8 @@ flk pane read <pane_id> --source visible --ansi
 flk pane read <pane_id> --source recent-unwrapped --lines 120
 ```
 
+`pane read` scrapes what is drawn on the terminal. `recent` returns the bottom `--lines` rows of the screen, reaching further up when those rows are blank; `visible` is the user-visible viewport and follows the operator's scroll, so it is not a stable source for a script. For an agent TUI both give you that TUI's own chrome rather than its conversation — use `flk agent history <target>` for what the agent said.
+
 Send input:
 
 ```bash
@@ -128,21 +198,24 @@ flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <pane_id> <command>
 ```
 
-`pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
+`pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
 Report agent state from custom hooks:
 
 ```bash
-flk pane report-agent <pane_id> \
+flk pane report-agent [<pane_id>] \
   --source ID \
   --agent LABEL \
   --state idle|working|blocked|unknown \
+  [--pane <pane_id>] \
   [--message TEXT] \
   [--custom-status TEXT] \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH]
 ```
+
+The pane id is optional, as it is for `report-recap` and `report-reply`: name it as the leading argument or with `--pane`, and with neither the report lands on the calling pane — the one your hook is running in, resolved from `$FLOCK_PANE_ID` or from process ancestry. A pane that cannot be resolved is refused with `pane_not_found` and a non-zero exit, so a hook that only checks the exit status cannot mistake a discarded report for a delivered one.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
@@ -166,25 +239,6 @@ flk pane report-metadata <pane_id> \
 
 `STATUS` is one of `idle`, `working`, `blocked`, `done`, or `unknown`. `--agent` is a guard for the authoritative agent label. `--applies-to-source` is a guard for the active lifecycle authority source. Use `--display-agent` to change the visible name.
 
-Promote session-specific fields (containers, progress, custom KV) into the calling pane's header:
-
-```bash
-flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]
-flk pane clear-field <key> [--pane <pane_id>]
-```
-
-Fields render as compact `key value` chips on the pane header context line (after the branch/PR segments) and on the navigation surfaces — sidebar agent panel rows, navigator pane lists, mobile pane lists. The pane defaults to the calling pane (`$FLOCK_PANE_ID`, healed by process ancestry), so hooks and wrapper scripts inside a pane need no bookkeeping:
-
-```bash
-# a podman wrapper registering a dev container
-flk pane set-field pg "● up"
-# a build script publishing progress that auto-expires if it stalls
-flk pane set-field build 73% --ttl 120
-flk pane clear-field build
-```
-
-Fields are display-only and ephemeral — never persisted into session snapshots. Caps: 6 fields per pane, key up to 16 characters, value up to 48 characters; over-cap requests fail. Setting an existing key updates it in place.
-
 ## Agents
 
 ```bash
@@ -194,9 +248,20 @@ flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [
 flk agent send <target> <text>
 flk agent rename <target> <name>|--clear
 flk agent focus <target>
-flk agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
+flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
-flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
+flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
+flk agent hibernate <target>
+flk agent resume <target>
+flk lineage <target> [--json]
+flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [-- <text starting with dashes>]
+flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
+flk msg list [--pane TARGET]
+flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
+flk checks list
+flk checks ack <name>
+flk checks run <name>
 ```
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
@@ -204,6 +269,20 @@ Agent targets can be terminal IDs, unique agent names, detected or reported agen
 `agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
+
+`agent start --wait-ready` and `agent wait --ready` block until the pane reports an agent status other than `unknown`, then print the agent exactly as `agent get` would. `unknown` is the only status Flock reports when its detector has not recognised the agent's own chrome, so it is what a booting TUI looks like — for a Claude pane, for 30-60 seconds during which "still booting", "crashed on launch" and "blocked on a first-run dialog" are the same observation. Ready is the first moment the question is answerable, and the status it lands on is the answer: `blocked` returns immediately rather than waiting a dialog out, which `--status idle` cannot do. A wait that fails says what it saw — the last status and the last line the pane printed — and an agent whose pane exits during the wait ends it straight away with `agent_exited_before_ready` instead of running out the clock. A pane running something Flock does not detect never becomes ready; that is reported at the timeout rather than being papered over. The default timeout is 60s.
+
+`--wait-ready` is opt-in and off unless passed. Because readiness is a detector verdict rather than a liveness check, **a headless agent never becomes ready**: `opencode run "…"`, a CI step, or anything that paints nothing while it works will sit at `unknown` for the whole window and then time out, however healthy it is. Do not pass `--wait-ready` to those; the start itself already refuses a child that dies in its first moments, and `pane_exited` reports the rest.
+
+`agent start` with no placement is refused (`agent_placement_required`) unless the caller is running inside a pane of that server's session, because "the workspace you are looking at" is only an answer to a caller that has one — an `ssh` dispatch or a resume script is told to pass `--workspace`, `--tab`, `--cwd`, or `--active` instead of being placed wherever a human last focused. `--active` names the workspace being looked at; `--here` names the workspace the caller's own pane is in, read from its process ancestry, and is refused (`agent_here_unavailable`) when the server cannot place the caller in a pane. Naming two placements at once is refused (`agent_placement_conflict`). A `--cwd` naming a real directory that matches no open space still gets a space of its own, except under `--split`, which refuses there because there is no space yet to split.
+
+`agent start` registers the name it returns itself, before the child has printed anything and independently of any hook the agent runs. The `name` in the `agent_started` result resolves with `agent get`, `agent read`, `agent send` and `agent wait` straight away, so `agent_not_found` for a just-started name is a real failure rather than a race. An agent name cannot look like a pane ID: targets resolve as a pane ID first, so a name written `1:p1` or `p_1_2` is read as that pane.
+
+`msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `--intent` says how much you need from the recipient, and it rides the envelope, so the recipient sees it before reading the body and `msg list` shows it on the queued row: `fyi` never wakes the recipient (it is read whenever the inbox next is), `needs-reply` marks the message as one you are owed an answer to and nudges the recipient at its next turn boundary, and `blocking` says you cannot proceed without one — it also puts the recipient in the operator's attention list and, if the recipient has muted itself, files an operator notification naming sender, recipient and count. `blocking` has its own per-sender budget, `[msg] blocking_per_hour`; past it the message is still delivered, as `needs-reply`, and the send result's `warnings` say it was downgraded. It defaults to `fyi` on the CLI — the MCP tool requires the choice instead, since an agent that never has to look at the field will not. Both verbs **refuse an option they do not recognise** rather than treating it as body text, and `--` ends flag parsing so a message may legitimately begin with dashes. This matters most where you cannot see it: the cross-host relay is `flk msg send` run over ssh on the peer that owns the recipient, so on a version-skewed fleet a flag the peer's build predates used to arrive welded to the front of the message — silently, with a success reported to the sender. It now fails on the sending side with `peer_refused_message` and the peer's own words. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
+
+`agent hibernate` parks a pane cleanly: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. The next focus (or an explicit `agent resume`) respawns it. Panes without a resumable session refuse with `hibernate_unsupported` (data-loss guard).
+
+`checks list` enumerates the runner's script checks together with the built-in state (blocked-alert / hibernation / issue-guard). `checks ack <name>` silences the next fire — for script checks the debounce window; for the built-in blocked-alert, the current in-flight episodes. `checks run <name>` forces a script check due right now.
 
 ## Direct terminal attach
 
@@ -229,6 +308,22 @@ flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
 
+## Notifications
+
+```bash
+flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]
+flk notification list [--unread] [--limit N]
+flk notification read <notification-id> | --all
+```
+
+`show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
+
+The notification log panel inside the TUI (`prefix+i`, or the sidebar `menu` row → `notifications`) lists and acknowledges the same records: all three surfaces read one filter over one projection, so `--unread` and the panel's `u` filter can never disagree about what is unread.
+
+Each row carries a `kind`, which is what makes the log readable rather than a stream: `attention` is something waiting on you — an agent that went blocked, or `blocking` mail for a recipient that muted itself — `outcome` is something that finished and produced a result, and `notice` is everything else worth keeping, which is every `show` call and every fleet failure. An escalation of that kind also names the pane that is waiting, so the title badge does not count a blocked pane twice.
+
+Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks for no popups, not for Flock to forget: the outcome is still recorded and still readable here. Records survive a server restart, and reading the list is not the same as acknowledging it, because acknowledging is what lets an old record be dropped.
+
 ## Integrations
 
 ```bash
@@ -237,6 +332,7 @@ flk integration install omp
 flk integration install claude
 flk integration install codex
 flk integration install copilot
+flk integration install kimi
 flk integration install opencode
 flk integration install hermes
 flk integration install qodercli
@@ -245,11 +341,114 @@ flk integration uninstall omp
 flk integration uninstall claude
 flk integration uninstall codex
 flk integration uninstall copilot
+flk integration uninstall kimi
 flk integration uninstall opencode
 flk integration uninstall hermes
 flk integration uninstall qodercli
 flk integration status [--outdated-only]
 ```
+
+## MCP server
+
+```bash
+flk mcp serve
+```
+
+Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on stdin/stdout. Wire it into an MCP client (Claude Desktop, `mcp` CLI, agent runners) to give an agent a read-mostly view of the flock — list agents, read panes, fork Claude conversations, send/reply pane-to-pane messages, walk fork lineage, and read the files a human has handed over. `FLOCK_SOCKET_PATH` selects the flock server socket; the default is the current session's.
+
+The server advertises two capabilities: `tools` (the closed table below) and `resources` (handed-over files). It claims no `subscribe`/`listChanged` sub-capability, because it pushes no resource notifications.
+
+### Addressing across hosts
+
+A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
+
+The two-step is the whole story:
+
+```jsonc
+// 1. flock_agent_list  →  find the agent, wherever it is
+{ "fleet": [
+  { "agent_id": "agent_atlas_6f21c4", "host": "atlas",  "local": false, "route": "atlas" },
+  { "agent_id": "agent_hopper_9d0e17", "host": "hopper", "local": true,  "pane_id": "w1:p2" }
+]}
+
+// 2. flock_msg_send  →  address it by identity
+{ "to": { "type": "agent", "agent": "agent_atlas_6f21c4" }, "body": "…" }
+```
+
+Replies need no addressing at all: `flock_msg_reply` carries the incoming `correlation_id` and the server routes it home by identity.
+
+**Spokes reach each other through the hub.** A fleet is hub-and-spoke: only the hub carries `[[peers]]`, and a spoke holds no key to any other machine. A spoke's message for an agent it cannot reach itself goes *up* the `flk peers relay --push` connection the hub holds into it, the hub delivers it with its ordinary `msg.send`, and the outcome comes back down — so the send result says `"path": "via hopper"` (or `"direct"` when this server dialled the recipient's host itself), and `msg.status` says the same afterwards. Replies take the same way back. The originating agent and host stay the sender; the hub only vouches for which spoke handed the message up, and refuses a spoke that claims to speak for another host. A message crosses at most one hub. Do **not** give spokes `[[peers]]` to make this work — that is the N×N trust the topology exists to avoid.
+
+A cross-host send is refused, never dropped, and a refusal names the hop that failed: `msg_target_not_found` (no such agent anywhere in the fleet — on a spoke with no hub attached, the message says so), `peer_not_configured` (found it, but this server has no edge to its host and no hub holds a relay to hand it up to), `peer_unreachable` (a hop's ssh dial failed — the message reads `hopper cannot reach node-b (auth refused): …`, and `data.hop` / `data.reason` carry the same as `connect_refused`, `auth_refused`, `host_key`, `timeout`, `jump_hop_refused`, …), `uplink_timeout` (handed up, but the hub never answered within `[msg] uplink_timeout_secs`; `data.taken_by_hub` says whether a hub ever took it, and a retry with the same `correlation_id` cannot deliver twice), `msg_not_allowed` (the receiver's `[msg] allow_from` declines), `sender_unresolved` (the caller has no attestable identity — a cross-host send must come from inside a pane, which is where an MCP client normally runs).
+
+The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
+
+Exposed tools:
+
+| Tool | Wraps | Notes |
+| --- | --- | --- |
+| `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
+| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
+| `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
+| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. Claude only. |
+| `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
+| `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
+| `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
+| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. |
+| `flock_msg_list` | `msg.list` | Undelivered messages. |
+| `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
+| `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
+| `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
+| `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
+
+### Resources: files handed over to an agent
+
+Tools are not the whole surface. A file dropped on a pane used to reach its agent only as a pasted path, deleted when the operator's client disconnected. It is now also an **MCP resource** — content the server holds and can name — so an agent lists and reads it natively instead of scraping it out of its own input surface.
+
+```jsonc
+// resources/list
+{ "resources": [{
+  "uri": "flock://handoff/file:1a04ff2c3b:0",
+  "name": "client-1-clipboard-1756-0.pdf",
+  "description": "file handed to agent_atlas_6f21c4; staged at /tmp/… on this host",
+  "mimeType": "application/pdf",
+  "size": 184320
+}]}
+
+// resources/read
+{ "contents": [{ "uri": "flock://handoff/file:1a04ff2c3b:0", "mimeType": "application/pdf", "blob": "JVBERi0…" }] }
+```
+
+Text comes back in `text`, everything else base64 in `blob`. `resources/read` takes a URI carrying a flock-minted id and nothing else — there is no path parameter anywhere on this surface. Files over 4 MiB refuse with `handoff_too_large`; read them from the `path` in the listing instead. The list is not filtered by which agent is asking, because a filtered list that comes back empty cannot be told apart from a server that was handed nothing.
+
+The paste still happens as well: flock cannot tell from outside a pane whether the agent in it has this MCP server wired up.
+
+## Reporting a bug
+
+```bash
+flk report template [bug] > bug.md
+flk report bug --file bug.md [--print|--open|--body-only] [--repo owner/name] [--last N] [--all-levels] [--no-diagnostics]
+flk report bug --current TEXT --expected TEXT --repro TEXT --impact TEXT
+```
+
+`flk report` composes a bug report from what you wrote plus what the binary already knows: version, update channel, build commit, OS and architecture, terminal, shell, client protocol, and the running server's version and protocol compatibility. Logs come from the same directory with the server dead — which is exactly when you file one — filtered to WARN and ERROR by default (`--all-levels` includes routine activity, `--last N` changes the count, `--no-diagnostics` attaches none). Every record goes through the allowlist and scrubber first, so paths, hostnames, tokens and usernames are stripped before anything is shown. `--repo owner/name` files against some other repository; nothing else can redirect a report, not even the environment.
+
+Getting the report off your machine takes a human, and there are two ways to do it.
+
+`--open` prints a preview, copies the log tail to your clipboard, and opens GitHub's real bug form, prefilled. This is the route that runs the template's own required-field validation and gives you the reproducibility confirmation to tick.
+
+`--body-only` writes **just the issue body to stdout** — no `destination:` header, no prefilled link, no footer — so it pipes straight into a filing command you run yourself:
+
+```bash
+flk report bug --file bug.md --body-only > "$HOME/flock-bug.md"
+gh issue create --repo gerchowl/flock --title "pane read never returns" --body-file "$HOME/flock-bug.md"
+```
+
+The preview, any advisories and the exact command to run go to **stderr**, so what you reviewed is what gets piped and the preview never lands inside the body. The body has no URL length cap, so on this route the redacted log tail rides inside it rather than going to the clipboard: a headless report carries more evidence than a browser one, not less. `gh` posts a raw body and bypasses the issue form, so nothing validates it and the reproducibility confirmation is not one `gh` can set — use `--open` when you want GitHub's own form to run the checks.
+
+Where you redirect that body is your call and worth choosing deliberately: unlike `--open`, this route writes a file, and the file holds paths, versions and the log tail. Keep it out of a checkout you might commit from, and delete it once the issue is filed.
+
+Flock never files the report itself (ADR-0010 decision 6). The one write path it has is `flk issue drop --file-it`, which is yours to confirm.
 
 ## Read sources
 
@@ -267,6 +466,5 @@ flk integration status [--outdated-only]
 | `FLOCK_SESSION` | Select a named session for CLI commands. |
 | `FLOCK_SOCKET_PATH` | Low-level socket path override. |
 | `FLOCK_LOG` | Set log filter, for example `FLOCK_LOG=flock=debug`. |
-| `FLOCK_PANE_ID` | Baked into every pane's environment; the default pane for `pane set-field`/`clear-field`. Stale values are healed by process ancestry. |
 | `FLOCK_<UPPER_SNAKE_PATH>` | Generic override for any scalar config field (ADR-0002); sits BELOW the config file. |
 | `FLOCK_DISABLE_SOUND` | Deprecated alias for `FLOCK_UI_SOUND_ENABLED=false`. Sits below the file (removal after one release). |

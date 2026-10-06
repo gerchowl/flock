@@ -39,7 +39,7 @@ Flock combines three signals:
 2. terminal output heuristics
 3. integration session identity or state reports
 
-Process detection tells Flock which pane owns an agent. Heuristics infer native agent state from terminal screen snapshots. Claude Code, Codex, and OpenCode integrations provide session identity for restore; Pi, OMP, GitHub Copilot CLI, Hermes Agent, Qoder CLI, and custom socket integrations can report state when they define state outside the native terminal UI.
+Process detection tells Flock which pane owns an agent. Heuristics infer native agent state from terminal screen snapshots. Claude Code, Codex, and OpenCode integrations provide session identity for restore; Pi, OMP, GitHub Copilot CLI, Kimi Code CLI, Hermes Agent, Qoder CLI, and custom socket integrations can report state when they define state outside the native terminal UI.
 
 Flock can run inside tmux as the outer terminal environment. Agent detection does not inspect tmux sessions launched inside a Flock pane. If a shell framework auto-enters tmux inside Flock, Flock sees `tmux` as the pane process instead of the agent behind it.
 
@@ -49,7 +49,27 @@ The sidebar rolls state upward.
 
 A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
 
+An unselected tab in the tab strip wears the tint of its own panes, so a blocked agent waiting in a background tab is visible in the strip rather than hidden behind a tab number. The selected tab stays accent — the tint speaks for tabs you are not looking at, and is drawn dimmed so it never shouts over the one you are in. The strip is only drawn for the active workspace, so this tells you about that workspace's tabs and nothing about another workspace's.
+
 This is the main Flock workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.
+
+## Telling agents apart in a multi-tab workspace
+
+A workspace with more than one tab shows one agents-panel row per pane, and each row names the tab its agent is in: `<server> <tab> <project> <branch>`, for example `hopper logs flock keyboard-shorcuts`. Two agents in different tabs of one project are told apart by that segment rather than by their alias. A tab you have not renamed shows its number, written `#2` so it is not confused with the row's own quick-jump number.
+
+Under a narrow sidebar the row gives segments up rather than widening: the branch shrinks first, then the tab, then the project, and the server name always stays. A single-tab workspace shows no tab segment at all, so there is no empty column to read past.
+
+If the server name alone is too long for the row, it is shortened in place and the project is dropped rather than partly shown.
+
+## Jumping to the agent that needs you
+
+`focus_attention` (and `focus_attention_defer`, `ctrl+shift+a`) steps through the agents that want something: blocked ones first, oldest first, then the ones that finished while you were away.
+
+The queue is over **agents, not machines**. If another server in your fleet has a blocked agent, the cycle reaches it and switches you there — landing on that server *and* on that agent's space.
+
+What the cycle can reach is exactly what the sidebar shows, because server visibility is one narrowing applied top-down: **servers → spaces → agents**. Right-click a server row to narrow to that server, and the spaces list, the agents panel (in either scope), the navigator and the attention cycle all follow it together. Showing everything cycles the whole fleet. The cycle never jumps past a filter you set.
+
+The servers band itself keeps showing the whole fleet while a filter is active — it is how you get back.
 
 ## Direct integrations
 
@@ -61,6 +81,7 @@ flk integration install omp
 flk integration install claude
 flk integration install codex
 flk integration install copilot
+flk integration install kimi
 flk integration install opencode
 flk integration install hermes
 flk integration install qodercli
@@ -89,12 +110,17 @@ flk agent rename reviewer --clear
 
 Targets accept terminal IDs, unique agent names, detected or reported agent labels, and legacy pane IDs.
 
+An agent name cannot look like a pane ID. Targets are resolved as a pane ID
+before they are resolved as a name, so a name written `1:p1` or `p_1_2` is read
+as that pane and never as the agent you named. Pick a name that is not
+pane-shaped.
+
 ## Custom status labels
 
 Integrations can report a visual status label without changing semantic state.
 
 ```bash
-flk pane report-agent 1-1 \
+flk pane report-agent \
   --source custom:indexer \
   --agent docs-bot \
   --state working \
@@ -103,6 +129,8 @@ flk pane report-agent 1-1 \
 
 `state` controls waits, notifications, and rollups. `custom-status` is only display text.
 
+Run from inside the pane's agent and you can leave the pane id out entirely: `report-agent` defaults to the calling pane, the same as `report-recap` and `report-reply`. Name it explicitly as `flk pane report-agent <pane_id> …` or with `--pane <pane_id>` when the reporter runs somewhere else.
+
 ## Start agents from the CLI
 
 Use `flk agent ...` commands when you want a terminal to be treated as an agent target. Agent targets show up in `agent list`, can be read or sent input by agent name, can be waited on by agent state, and can be directly attached.
@@ -110,16 +138,168 @@ Use `flk agent ...` commands when you want a terminal to be treated as an agent 
 Spawn an agent into Flock from a script:
 
 ```bash
-flk agent start reviewer --cwd ~/project --split right -- pi
+flk agent start reviewer --cwd ~/project -- pi
 ```
 
-You can place that agent in a specific workspace or tab:
+`--cwd` decides **where the agent lives as well as where its process starts**. If
+`~/project` is a checkout Flock already has open, the agent joins that space as a
+new tab rather than getting a space of its own. If nothing matches — an unopened
+checkout, a plain directory, a path that is not there — it gets its own space, as
+before. Either way the agent is the only pane of a tab nobody else is in.
+
+Under `tab_mode = "workspace"`, where a "tab" is a sibling workspace, the agent
+gets a sibling space grouped with the matched one instead of an inner tab.
+
+`--split` follows the same rule. With a `--cwd` that matches an open checkout it
+splits **that** workspace; with no `--cwd` it splits whatever is focused, which
+is the "put this beside what I am looking at" gesture:
+
+```bash
+flk agent start reviewer --split right -- pi     # beside what you are looking at
+flk agent start reviewer --cwd ~/project --split right -- pi   # beside ~/project
+```
+
+Naming a placement explicitly always wins over the `--cwd` default, and starts
+the agent in that target's checkout:
 
 ```bash
 flk agent start docs --workspace 1 --tab 1-1 -- claude
 ```
 
+## Where a start lands when you named nothing
+
+"The workspace you are looking at" is an answer for a person in front of the
+TUI. For anything else it is arbitrary — a launchd resume job, an `ssh` dispatch,
+an MCP client — and it races every other start in flight, which is how four
+agents with four different `--cwd` all ended up in one space. So the active
+workspace is now something you ask for:
+
+```bash
+flk agent start reviewer --active --split right -- pi   # beside the focused space, on purpose
+flk agent start reviewer --here -- pi                   # beside the space YOUR pane is in
+```
+
+`--active` and `--here` are two different questions, not two spellings of one.
+`--active` is the workspace you are **looking at** — what the server remembers
+about its own focus, which is why it needs asking for. `--here` is the workspace
+**your own pane** is in, which the server reads from your process's ancestry. For
+a person at the TUI the two coincide; for a script run from a pane of a space
+nobody is watching they are not, and `--here` is the honest answer. `--here` is
+refused, naming `--active`, when the server cannot place your process in a pane.
+
+A start that names **no** place — no `--workspace`, no `--tab`, no `--cwd`, no
+`--active` — is refused with `agent_placement_required` unless the caller is
+running inside a pane of that Flock session. The refusal names the flags that
+would have worked. `--active` is the one to reach for if what you meant really
+was "wherever I'm looking"; `--workspace`/`--tab`/`--cwd` are better if you know.
+
+Two placements at once is refused (`--active` or `--here` together with
+`--workspace`/`--tab`, or with each other). A placement *plus* `--cwd` is not:
+`--cwd` says where the process starts and only implies a space, so the placement
+you named wins, as it always has.
+
+Two things that narrowing does **not** mean. A `--cwd` naming a real directory
+still gets a space of its own, even when no space matches it — that is how you
+start an agent in a checkout Flock has not got open — *unless* you also passed
+`--split`, which still refuses there because there is no space to split yet. And
+under `tab_mode = "workspace"`, where a tab is never drawn, `--active`/`--here`
+without `--split` place the agent in a **sibling space** grouped with the named
+one rather than in a tab of it.
+
+Flock decides all of this from the calling process's ancestry, not from anything
+the caller says about itself, and it can therefore tell an operator sitting in a
+pane from a dispatch arriving over `ssh` — but not a human from a script, which
+is why a start from a terminal window *outside* the session is treated as
+headless and needs `--active` too.
+
+A start returns as soon as the child has exec'd and outlived a short liveness
+window. That is a statement about the process, not about the agent: a TUI takes
+another 30-60 seconds to paint anything Flock's detector recognises, and until
+it does, a booting agent, one that crashed on launch, and one stuck on a
+first-run permission dialog all look the same. `--wait-ready` waits out that
+window and prints the agent when it is over:
+
+```bash
+flk agent start docs --cwd ~/project --wait-ready --ready-timeout 90000 -- claude
+```
+
+It returns when the pane reports an agent status other than `unknown`, and the
+status it returns is the answer — `idle` or `done` for an agent sitting at its
+prompt, `blocked` for one that needs you before it will do anything. If the
+agent exits during the wait, that ends the wait immediately rather than after
+the timeout; if the timeout is reached, the refusal names the status Flock last
+saw and quotes the last line the pane printed. `flk agent wait <target> --ready`
+asks the same question about an agent that is already running.
+
+`--wait-ready` is opt-in and off unless you pass it. Waiting on readiness is not
+a liveness check: "ready" means Flock's detector has recognised the agent's own
+chrome on screen, which is a question only a TUI can answer. **A headless agent
+never becomes ready.** `opencode run "…"`, a CI step, anything that writes its
+result at the end and paints nothing while it works will sit at `unknown` for the
+whole window and then time out, however healthy it is. For those, drop
+`--wait-ready` and watch for the pane's process instead — the start itself
+already refuses a child that dies inside its first moments, and
+`pane_exited` events report the rest.
+
+### The name a start returns is registered immediately
+
+The `name` in the `agent_started` result is the agent's name at the moment the
+response is written, and it is registered by `agent start` itself — not by the
+agent, and not by its hooks. Nothing has to run inside the child before the name
+resolves.
+
+```bash
+name=$(flk agent start reviewer --cwd ~/project -- pi | jq -r '.result.agent.name')
+flk agent get "$name"    # resolves now, before the agent has printed anything
+```
+
+If `agent get <name>` ever answers `agent_not_found` for a name a start just
+returned, that is a real failure and worth reporting — not a race to wait out.
+
+A name stops resolving in two situations, and only the first is obvious:
+
+- **The pane goes away** — closed, or taken with an agent that exited.
+- **The pane's agent runtime is rebuilt and the rebuild fails.** Flock clears
+  the agent identity when it cannot spawn the replacement shell for a resumed
+  agent, so `agent resume` on a pane whose shell will not start leaves the pane
+  in place with the name gone. The server log carries the spawn error; the pane
+  itself looks fine. A successful `agent resume` keeps the name.
+
+So if a name you just started stops resolving while its pane is still on
+screen, the pane is still there and the answer is in the log, not in a race.
+
 Use `flk pane ...` commands for ordinary terminals, servers, tests, shells, and low-level terminal input. For example, use `pane split` and `pane run` for `cargo test`, not `agent start`, unless that terminal is intentionally being treated as an agent target.
+
+## Read what an agent did
+
+`flk pane read` and `flk agent read` read the **pane**: they scrape what is drawn
+on the terminal, wrapped at the width it was drawn at. That is the right tool for
+a shell, a build, a test run, anything whose output *is* its result.
+
+For an agent TUI it is a different thing, and a weaker one. What a TUI draws is
+its own chrome — a header, a message area, an input box — and that is what a
+scrape returns: not the conversation, and not a stable shape to parse. It also
+tracks whatever the agent last repainted, so two reads a second apart are two
+different documents.
+
+**To read what an agent actually said, read the conversation:**
+
+```bash
+flk agent history reviewer --limit 20
+flk agent history reviewer --detail full --cursor "$next"
+```
+
+`agent history` reads the agent's own session transcript, one entry per turn,
+unwrapped, with a cursor so a poll reads only what was appended. It touches no
+pane state, so polling it is safe. It is Claude-only today, because Claude's is
+the transcript format Flock parses; for any other agent it refuses with
+`unsupported_for_agent` rather than inventing an answer.
+
+One more difference between the sources: `pane read --source visible` follows the
+operator's scroll position, so a human who has scrolled a pane back changes what
+a script sees. `--source recent` does not — it reads the bottom of the screen,
+reaching further up past blank rows so a pane whose last rows are empty still
+answers with its content rather than an empty string.
 
 ## Attach directly to an agent
 
@@ -140,3 +320,7 @@ flk agent attach reviewer --takeover
 ```
 
 Use `flk terminal attach <terminal_id>` when you want the same direct attach behavior for a non-agent terminal.
+
+## Give an agent read-mostly access to the flock
+
+Point an MCP-capable agent at `flk mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, and — for Claude — fork a conversation or send/reply pane-to-pane messages. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table. The same server exposes files a human has dropped on a pane as MCP **resources**, so an agent can list and read what it was handed instead of scraping the path out of its own input surface.

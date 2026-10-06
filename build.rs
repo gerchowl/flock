@@ -94,6 +94,12 @@ fn main() {
             for cache in [".zig-cache", "zig-cache", "zig-out"] {
                 let _ = fs::remove_dir_all(vendored_dir.join(cache));
             }
+            // mlugg/setup-zig points ZIG_LOCAL_CACHE_DIR at the repo root, so
+            // on CI the objects live there, not under vendored_dir; without
+            // this the retries replay the cached failure in milliseconds.
+            if let Some(dir) = env::var_os("ZIG_LOCAL_CACHE_DIR") {
+                let _ = fs::remove_dir_all(dir);
+            }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
 
