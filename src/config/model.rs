@@ -583,6 +583,25 @@ pub struct Config {
     /// load; an RTX 5090 is fine at 80 °C), so calibration lives with the
     /// host. Reporters must not read stdin — it is nulled.
     pub thermal_command: Option<String>,
+    /// Command THIS node runs to declare its own GPU utilization 0..=100 for
+    /// the servers band (#291). The dynamic sibling of
+    /// [`thermal_command`](Self::thermal_command): same subprocess runner,
+    /// same hard timeout, same "declare nothing on any failure" rule — but
+    /// run on EVERY sampler tick (≈2s) rather than the thermal slow stride,
+    /// because utilization is a fast-moving numeric metric like cpu/memory,
+    /// not a slow-moving ordinal like heat. Stdout must be one integer
+    /// 0..=100 (trailing whitespace is trimmed); non-zero exit, timeout,
+    /// unparseable output or out-of-range all declare `None` rather than a
+    /// synthesized value.
+    ///
+    /// When set, this value OVERRIDES the macOS IOAccelerator reading — a
+    /// microVM guest has no GPU of its own but can read its host's published
+    /// stats off a file, and the fleet-wide servers band is the whole point.
+    /// A persistently failing reporter is slowed down and logged but never
+    /// disabled, so a reporter that recovers (file reappears, driver
+    /// restarts) lights the column back up without a flock restart.
+    /// Reporters must not read stdin — it is nulled.
+    pub gpu_command: Option<String>,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,

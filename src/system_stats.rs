@@ -66,6 +66,21 @@ const THERMAL_FAILURES_BEFORE_WARN: u32 = 5;
 /// up without a flock restart.
 const THERMAL_MAX_BACKOFF_TICKS: u32 = 150;
 
+/// Wall-clock bound on one `gpu_command` run. The same budget pmset/ioreg get
+/// — a reporter at this cadence must be a cheap read (a file published by the
+/// host, a one-shot NVML query), not a tool that re-initialises its library
+/// each call.
+const GPU_COMMAND_TIMEOUT: Duration = SAMPLER_EXEC_TIMEOUT;
+
+/// Consecutive `gpu_command` failures before the WARN fires. Matches thermal:
+/// a lone failure is usually a device wake or fork contention, not news.
+const GPU_COMMAND_FAILURES_BEFORE_WARN: u32 = 5;
+
+/// Ceiling on the backoff a failing `gpu_command` is pushed to, in sampler
+/// ticks. Same floor as thermal: a reporter that recovers (file reappears,
+/// driver restarts) must light the column back up without a flock restart.
+const GPU_COMMAND_MAX_BACKOFF_TICKS: u32 = 150;
+
 /// Resolve which path's volume the disk stat reports (#50): the configured
 /// `ui.disk_path` when set (any path — its containing mount is matched), else
 /// `$HOME`'s volume (the historical default). Empty/whitespace is treated as
@@ -85,6 +100,7 @@ pub fn spawn_sampler(
     event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     disk_path: Option<String>,
     thermal_command: Option<String>,
+    gpu_command: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("system-stats".into())
@@ -99,6 +115,7 @@ pub fn spawn_sampler(
 
             let mut disks = disks;
             let mut thermal = ThermalSampler::new(thermal_command);
+            let mut gpu_cmd = GpuCommandSampler::new(gpu_command);
             let mut tick: u32 = 0;
             loop {
                 system.refresh_cpu_usage();
@@ -128,7 +145,17 @@ pub fn spawn_sampler(
                 let net_tx_per_sec = Some((tx as f64 / elapsed) as u64);
 
                 let (battery_percent, battery_charging) = read_battery();
-                let gpu_percent = read_gpu_percent();
+                // A configured `gpu_command` is the whole GPU reading on this
+                // node: #291's reason to add this field is a microVM guest
+                // publishing its host's number, and a macOS host that sets it
+                // deliberately prefers the host-authored value over its own
+                // IOAccelerator sample. The local sampler is NOT a fallback —
+                // a failed command declares `None`, not a synthesized reading.
+                let gpu_percent = if gpu_cmd.is_set() {
+                    gpu_cmd.sample()
+                } else {
+                    read_gpu_percent()
+                };
                 let thermal_report = thermal.sample(tick);
                 tick = tick.wrapping_add(1);
 
@@ -252,6 +279,103 @@ impl ThermalSampler {
         }
         parse_thermal_report(&output.stdout)
     }
+}
+
+/// Runs the node's configured `gpu_command` on every sampler tick and turns
+/// its stdout into a 0..=100 utilization reading (#291 companion to #298).
+///
+/// The thermal reporter uses a slow stride because its command is slow
+/// (`nvidia-smi` re-initialises NVML at ~200-800ms) and the value it reads
+/// moves slowly. Utilization moves as fast as CPU and memory; a 30s refresh
+/// would be visibly stale next to the two-second CPU column. The expected
+/// reporter is a cheap read of a host-published file (one `read` + `trim`),
+/// so running it on every tick is in budget — and a reporter that is slow or
+/// starts failing is slowed down by the same backoff thermal uses.
+struct GpuCommandSampler {
+    command: Option<String>,
+    /// Consecutive failures, for the WARN threshold and the backoff.
+    failures: u32,
+    /// Sampler ticks to skip before trying again — a failing reporter is
+    /// slowed down, never disabled.
+    backoff_ticks: u32,
+}
+
+impl GpuCommandSampler {
+    fn new(command: Option<String>) -> Self {
+        let command = command
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty());
+        Self {
+            command,
+            failures: 0,
+            backoff_ticks: 0,
+        }
+    }
+
+    /// `true` iff the node declared a `gpu_command`. When true, this sampler
+    /// is the ONLY source of `gpu_percent` — the local IOAccelerator read is
+    /// not a fallback (see call site).
+    fn is_set(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// The utilization to publish on this tick. `None` for an unset command,
+    /// a backed-off reporter, or any run that fails parse/exit/timeout — the
+    /// same "declare nothing on any failure" rule the thermal reporter uses.
+    fn sample(&mut self) -> Option<u8> {
+        let command = self.command.as_deref()?;
+        if self.backoff_ticks > 0 {
+            self.backoff_ticks = self.backoff_ticks.saturating_sub(1);
+            return None;
+        }
+        match self.run(command) {
+            Some(value) => {
+                self.failures = 0;
+                self.backoff_ticks = 0;
+                Some(value)
+            }
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures == GPU_COMMAND_FAILURES_BEFORE_WARN {
+                    tracing::warn!(
+                        failures = self.failures,
+                        "gpu_command keeps failing; backing off (node declares no GPU utilization)"
+                    );
+                }
+                if self.failures >= GPU_COMMAND_FAILURES_BEFORE_WARN {
+                    let grown = self.backoff_ticks.saturating_mul(2).max(2);
+                    self.backoff_ticks = grown.min(GPU_COMMAND_MAX_BACKOFF_TICKS);
+                }
+                None
+            }
+        }
+    }
+
+    /// One bounded run. Every failure mode collapses to `None` so a node that
+    /// cannot measure declares nothing instead of a synthesized number.
+    fn run(&self, command: &str) -> Option<u8> {
+        let output = crate::process::TracedCommand::new("sh", "stats")
+            .args(["-c", command])
+            .periodic()
+            .output_traced_with_timeout(GPU_COMMAND_TIMEOUT)
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_gpu_command_output(&output.stdout)
+    }
+}
+
+/// Parse a `gpu_command` reporter's stdout: a single integer 0..=100 with
+/// surrounding whitespace trimmed. Anything else — a float, a trailing unit,
+/// a value past 100 — is a reporter bug on this contract and declares
+/// `None`, matching `parse_thermal_report` sanitation.
+fn parse_gpu_command_output(stdout: &[u8]) -> Option<u8> {
+    let text = std::str::from_utf8(stdout).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    text.parse::<u8>().ok().filter(|value| *value <= 100)
 }
 
 /// Parse a reporter's stdout: exactly one JSON object, nothing else.
@@ -503,5 +627,107 @@ mod tests {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(1500), "1.5K");
         assert_eq!(human_bytes(18 * 1024 * 1024 * 1024), "18G");
+    }
+
+    fn gpu_value(stdout: &str) -> Option<u8> {
+        parse_gpu_command_output(stdout.as_bytes())
+    }
+
+    #[test]
+    fn parses_a_gpu_reporter_integer_and_trims_whitespace() {
+        assert_eq!(gpu_value("0"), Some(0));
+        assert_eq!(gpu_value("37"), Some(37));
+        assert_eq!(gpu_value("100"), Some(100));
+        // Trailing newline is what `printf '%d\n'`/`echo` actually emit.
+        assert_eq!(gpu_value("42\n"), Some(42));
+        // Leading whitespace is tolerated too — a file written with a BOM-less
+        // utility often has a leading space.
+        assert_eq!(gpu_value("  12  \n"), Some(12));
+    }
+
+    #[test]
+    fn garbage_gpu_reporter_output_declares_nothing() {
+        // Fail closed on every shape of nonsense. The servers band would
+        // rather show no number than a confident lie.
+        assert!(gpu_value("").is_none());
+        assert!(gpu_value("   \n").is_none());
+        assert!(gpu_value("gpu-busy").is_none());
+        assert!(
+            gpu_value("42%").is_none(),
+            "trailing unit is a reporter bug"
+        );
+        assert!(
+            gpu_value("37.5").is_none(),
+            "float is not an integer 0..=100"
+        );
+        assert!(gpu_value("-1").is_none(), "u8 rejects negatives");
+        assert!(gpu_value("101").is_none(), "out of range");
+        assert!(gpu_value("256").is_none(), "overflow");
+        assert!(
+            parse_gpu_command_output(&[0xff, 0xfe]).is_none(),
+            "invalid utf-8"
+        );
+    }
+
+    #[test]
+    fn no_configured_gpu_command_never_declares_anything() {
+        // Mirrors the thermal case: an unset node must not run anything and
+        // must not pretend to.
+        let mut sampler = GpuCommandSampler::new(None);
+        assert!(!sampler.is_set());
+        for _ in 0..40 {
+            assert!(sampler.sample().is_none());
+        }
+        // Whitespace-only is treated as unset, like `ui.disk_path`.
+        let blank = GpuCommandSampler::new(Some("   ".into()));
+        assert!(!blank.is_set());
+        assert!(blank.command.is_none());
+    }
+
+    #[test]
+    fn a_working_gpu_reporter_reports_each_tick() {
+        // The whole point of putting this on the fast tick instead of the
+        // thermal stride is that utilization refreshes at the CPU cadence.
+        let mut sampler = GpuCommandSampler::new(Some("printf 73".into()));
+        assert!(sampler.is_set());
+        for _ in 0..5 {
+            assert_eq!(sampler.sample(), Some(73));
+        }
+        assert_eq!(sampler.failures, 0);
+        assert_eq!(sampler.backoff_ticks, 0);
+    }
+
+    #[test]
+    fn a_failing_gpu_reporter_declares_nothing_and_eventually_backs_off() {
+        let mut sampler = GpuCommandSampler::new(Some("exit 1".into()));
+        for _ in 0..GPU_COMMAND_FAILURES_BEFORE_WARN {
+            assert!(sampler.sample().is_none());
+        }
+        assert!(
+            sampler.backoff_ticks > 0,
+            "a persistently failing reporter must be slowed down"
+        );
+        assert!(
+            sampler.backoff_ticks <= GPU_COMMAND_MAX_BACKOFF_TICKS,
+            "backoff is capped so a recovered reporter lights up again without a restart"
+        );
+
+        // A reporter that starts working again clears the backoff — files
+        // reappear, drivers restart.
+        sampler.command = Some("printf 10".into());
+        sampler.backoff_ticks = 0;
+        assert_eq!(sampler.sample(), Some(10));
+        assert_eq!(sampler.failures, 0);
+        assert_eq!(sampler.backoff_ticks, 0);
+    }
+
+    #[test]
+    fn an_out_of_range_gpu_reporter_declares_nothing_not_a_clamp() {
+        // Clamping would mask a reporter bug AND prefix a believable number
+        // onto garbage; `parse_thermal_report` does the same thing by
+        // sanitising rather than clamping free-form values.
+        let mut sampler = GpuCommandSampler::new(Some("printf 999".into()));
+        assert!(sampler.sample().is_none());
+        assert_eq!(sampler.failures, 1);
     }
 }

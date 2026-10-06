@@ -398,6 +398,7 @@ impl App {
             event_tx.clone(),
             config.ui.disk_path.clone(),
             config.thermal_command.clone(),
+            config.gpu_command.clone(),
         );
         {
             // Slow PR-state poll tick: the shared event handler collects the

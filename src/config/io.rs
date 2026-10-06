@@ -362,6 +362,18 @@ fn load_live_config_from_table(
         }
     }
 
+    // Companion to #298: a top-level scalar whose model-only presence would
+    // silently feed the sampler None forever. Parsed here so the live-config
+    // path matches the file-load path.
+    if let Some(value) = table.get("gpu_command") {
+        match value.clone().try_into::<String>() {
+            Ok(command) => config.gpu_command = Some(command),
+            Err(err) => diagnostics.push(format!(
+                "invalid gpu_command setting: {err}; keeping current gpu command"
+            )),
+        }
+    }
+
     load_live_section(
         &table,
         "theme",
