@@ -7,7 +7,8 @@
 //! agent enter `working` (or the cursor was captured while it was working), and
 //! then saw its reported status hold `idle`/`done` with **no state transition at
 //! all** for the settle window. It is a statement about what flock observed, not
-//! about what the agent did. The result of a turn is `flk agent result` (#575).
+//! about what the agent did. The result of a turn is `flk agent result`
+//! (once #575 lands), which this package does not ship.
 //!
 //! ## Why one module
 //!
@@ -470,8 +471,14 @@ impl SettledWait {
                 }
             }
             AgentStatus::Blocked => Class::Blocked,
-            // `observe` returned above for every hibernated record.
-            AgentStatus::Working | AgentStatus::Unknown | AgentStatus::Hibernated => Class::Waiting,
+            // Defence in depth. `sample_from_record` answers hibernation from the
+            // status alone, before it ever asks for a cursor, so a hibernated
+            // agent arrives as `Sample::Hibernated` and never reaches here. If a
+            // future caller ever hands `observe` a full record that says
+            // `hibernated`, it must still not become `Waiting`: that is how an
+            // agent with no process behind it would settle.
+            AgentStatus::Hibernated => return Step::Gone(GoneReason::Hibernated),
+            AgentStatus::Working | AgentStatus::Unknown => Class::Waiting,
         };
 
         match class {
@@ -517,6 +524,8 @@ pub(super) fn run_settled_wait(
     timeout_ms: Option<u64>,
 ) -> std::io::Result<i32> {
     let client = ApiClient::local();
+    let mut requests = SocketRequests { client: &client };
+    let mut interrupted = Interrupted { said: false };
     let now = Instant::now();
     let timeout = timeout_ms.map(Duration::from_millis);
     let deadline = timeout.and_then(|timeout| now.checked_add(timeout));
@@ -532,7 +541,7 @@ pub(super) fn run_settled_wait(
         None => None,
     };
 
-    let rec0 = match resolve_initial(&client, target, deadline, verb) {
+    let rec0 = match resolve_initial(&mut requests, target, deadline, verb, &mut interrupted) {
         Ok(rec) => rec,
         Err(InitialFailure::TimedOut) => {
             eprintln!("timed out waiting for the agent to settle");
@@ -591,8 +600,6 @@ pub(super) fn run_settled_wait(
         return Ok(code);
     }
 
-    let mut requests = SocketRequests { client: &client };
-    let mut reported_unreachable = false;
     loop {
         match sample_pinned(&mut requests, &wait, deadline) {
             Ok(sample) => {
@@ -601,16 +608,12 @@ pub(super) fn run_settled_wait(
                     return Ok(code);
                 }
             }
-            // Retried rather than reported: the same live handoff that replaces
-            // the socket mid-wait can land between two polls. Said ONCE, though
-            // — a wait that cannot reach the server is otherwise silent for as
-            // long as its timeout, which reads as a hang.
-            Err(PinnedFailure::Retry) => {
-                if !reported_unreachable {
-                    reported_unreachable = true;
-                    eprintln!("{verb}: server unreachable, retrying until the deadline");
-                }
-            }
+            // Retried rather than reported: a live handoff that replaces the
+            // socket mid-wait can land between two polls. Said once per
+            // invocation, though — a wait that cannot reach the server is
+            // otherwise silent for as long as its timeout, which reads as a
+            // hang.
+            Err(PinnedFailure::Retry) => interrupted.note(verb),
             Err(PinnedFailure::TimedOut) => {
                 eprintln!("timed out waiting for the agent to settle");
                 return Ok(exit::TIMEOUT);
@@ -657,10 +660,11 @@ fn finish(verb: &str, wait: &SettledWait, step: Step) -> Option<i32> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum InitialFailure {
-    /// The server could not be reached before the deadline: a handoff in
-    /// progress, most often. Reported as a timeout rather than an error,
-    /// because nothing has been established as wrong.
+    /// The deadline arrived before a usable answer. Reported as a timeout rather
+    /// than as an error, because nothing has been established as wrong: the
+    /// server may have been mid-handoff the whole time.
     TimedOut,
     /// The server answered with an error (not found, ambiguous).
     Refused(String),
@@ -668,56 +672,67 @@ enum InitialFailure {
     Unusable(String),
 }
 
-fn resolve_initial(
-    client: &ApiClient,
-    target: InitialTarget<'_>,
-    deadline: Option<Instant>,
-    verb: &str,
-) -> Result<serde_json::Value, InitialFailure> {
-    let request = initial_request(target);
-    let mut reported_unreachable = false;
-    loop {
-        let Some(timeout) = request_timeout(deadline) else {
-            return Err(InitialFailure::TimedOut);
-        };
-        match client.request_value_with_timeout(&request, timeout) {
-            Ok(value) if value.get("error").is_some() => {
-                return Err(InitialFailure::Refused(value.to_string()))
-            }
-            Ok(value) => {
-                return initial_record(&value, target).ok_or_else(|| {
-                    InitialFailure::Unusable("response did not include the record".into())
-                })
-            }
-            // A transport failure at the initial resolve is retried rather than
-            // reported: the same live handoff that interrupts a wait can land in
-            // the window between this process starting and its first request.
-            // Said once, so a wait against a dead socket says so.
-            Err(_) => {
-                if !reported_unreachable {
-                    reported_unreachable = true;
-                    eprintln!("{verb}: server unreachable, retrying until the deadline");
-                }
-                sleep_bounded(deadline)
-            }
+/// Says the connection is interrupted, once per invocation.
+///
+/// One latch for the whole wait rather than one per phase: a live handoff that
+/// interrupts the initial resolve is very often the same one that interrupts the
+/// polls after it, and a caller who sees the line twice learns nothing the first
+/// line did not say. Worded as an interruption rather than a fault because the
+/// overwhelmingly common cause recovers on its own.
+struct Interrupted {
+    said: bool,
+}
+
+impl Interrupted {
+    fn note(&mut self, verb: &str) {
+        if !self.said {
+            self.said = true;
+            eprintln!("{verb}: connection to the server interrupted, retrying until the deadline");
         }
     }
 }
 
-fn initial_request(target: InitialTarget<'_>) -> Request {
-    match target {
-        InitialTarget::Agent(target) => Request {
-            id: "cli:settled:resolve".into(),
-            method: Method::AgentGet(AgentTarget {
-                target: target.to_string(),
-            }),
-        },
-        InitialTarget::Pane(pane_id) => Request {
-            id: "cli:settled:resolve".into(),
-            method: Method::PaneGet(PaneTarget {
-                pane_id: pane_id.to_string(),
-            }),
-        },
+/// Resolve the target to the record the wait will pin itself to.
+///
+/// Same two requests, and the same deadline rule, as every sample after it: a
+/// reply that lands after the deadline is a timeout whether it is a record or an
+/// error. The initial resolve used to skip that check, so a `--timeout` spent
+/// entirely inside one slow first request came back as whatever that request
+/// happened to return — a fault, or a settle with no time left to hold it.
+fn resolve_initial(
+    requests: &mut dyn PinnedRequests,
+    target: InitialTarget<'_>,
+    deadline: Option<Instant>,
+    verb: &str,
+    interrupted: &mut Interrupted,
+) -> Result<serde_json::Value, InitialFailure> {
+    loop {
+        let Some(timeout) = request_timeout(deadline) else {
+            return Err(InitialFailure::TimedOut);
+        };
+        let reply = match target {
+            InitialTarget::Agent(name) => requests.agent_get(name, timeout),
+            InitialTarget::Pane(pane_id) => requests.pane_get(pane_id, timeout),
+        };
+        let value = match reply {
+            Err(()) => {
+                // Retried rather than reported: the same live handoff that
+                // interrupts a wait can land between this process starting and
+                // its first request.
+                interrupted.note(verb);
+                sleep_bounded(deadline);
+                continue;
+            }
+            Ok(value) => value,
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(InitialFailure::TimedOut);
+        }
+        if value.get("error").is_some() {
+            return Err(InitialFailure::Refused(value.to_string()));
+        }
+        return initial_record(&value, target)
+            .ok_or_else(|| InitialFailure::Unusable("response did not include the record".into()));
     }
 }
 
@@ -768,7 +783,7 @@ impl PinnedRequests for SocketRequests<'_> {
         self.client
             .request_value_with_timeout(
                 &Request {
-                    id: "cli:settled:sample".into(),
+                    id: "cli:settled:agent-get".into(),
                     method: Method::AgentGet(AgentTarget {
                         target: terminal_id.to_string(),
                     }),
@@ -782,7 +797,7 @@ impl PinnedRequests for SocketRequests<'_> {
         self.client
             .request_value_with_timeout(
                 &Request {
-                    id: "cli:settled:sample:pane".into(),
+                    id: "cli:settled:pane-get".into(),
                     method: Method::PaneGet(PaneTarget {
                         pane_id: pane_id.to_string(),
                     }),
@@ -1424,8 +1439,12 @@ mod tests {
     /// The remembered epoch must not fire on a LOWER one, and an unchanged epoch
     /// must keep the dwell running — otherwise the check above would replace a
     /// timeout with a false `restarted`.
+    /// The remembered epoch must fire ONLY on a higher one. A `!=` where this
+    /// wants a `>` would report a restart the moment a server's counters read
+    /// lower than the first sample saw them, so both directions are pinned:
+    /// unchanged continues the dwell, and strictly lower continues it too.
     #[test]
-    fn an_unchanged_epoch_leaves_the_dwell_alone() {
+    fn only_a_higher_epoch_leaves_the_dwell_alone() {
         let mut settle = wait(None, 500, Some(30_000));
         let start = Instant::now();
         assert_eq!(
@@ -1441,12 +1460,21 @@ mod tests {
         );
         assert_eq!(
             settle.observe(
+                sample(AgentStatus::Idle, cursor(3, 0, 1, false)),
+                start + Duration::from_millis(400)
+            ),
+            Step::Continue,
+            "a LOWER epoch is not a restart either; only `>` is"
+        );
+        assert_eq!(
+            settle.observe(
                 sample(AgentStatus::Idle, cursor(4, 0, 1, false)),
                 start + Duration::from_millis(500)
             ),
             Step::Settled {
                 held: Duration::from_millis(500)
-            }
+            },
+            "and the dwell is measured from the first sample, across both"
         );
     }
 
@@ -1585,14 +1613,19 @@ mod tests {
         serde_json::from_str(record).expect("fixture json")
     }
 
-    /// The respawn path, end to end through the decision the fetch makes: a
-    /// respawn clears the pane's agent identity, so `agent.get` answers
-    /// `agent_not_found` — and the wait must read the PANE record (same
-    /// terminal id, moved epoch) rather than call the pane closed. This is the
-    /// only reason the pane fallback exists, and it is why the cursor carries
-    /// an execution epoch at all.
+    /// The classifier's JSON mapping, and nothing else: given these two
+    /// responses, `classify_pinned` returns a record rather than a `gone` line,
+    /// and the epoch in that record is what later says `restarted`.
+    ///
+    /// It is NOT the respawn proof — it calls the classifier with canned JSON, so
+    /// it cannot fail if the fallback REQUEST stops being issued, or is issued
+    /// with the wrong target or the wrong budget. That is
+    /// `a_respawn_is_restarted_through_the_pinned_fetch_itself`, which drives
+    /// `sample_pinned` through a scripted client and asserts both requests were
+    /// made. Kept because the two fail differently: this one pins the mapping,
+    /// that one pins the sequence.
     #[test]
-    fn a_respawn_reports_restarted_through_the_pinned_fallback() {
+    fn the_classifier_maps_a_miss_plus_matching_pane_to_a_record() {
         let before = Cursor::parse("term_1f2e3:0:1:4:i").unwrap();
         let mut settle = wait(Some(before), 500, Some(30_000));
         let agent = response(r#"{"error":{"code":"agent_not_found","message":"gone"}}"#);
@@ -1729,6 +1762,133 @@ mod tests {
         assert_eq!(
             classify_pinned(TERM, &other, None).expect("a positive mismatch is a restart"),
             Sample::Gone(GoneReason::Restarted)
+        );
+    }
+
+    /// #553 round 2: the deadline rule applies to the INITIAL resolve too.
+    ///
+    /// It used to skip it, so a `--timeout` spent entirely inside one slow first
+    /// request came back as whatever that request happened to return — a fault,
+    /// or a record with no clock left to hold it in. Three directions, because
+    /// each is a different mistake: a record, an error, and the case where the
+    /// budget is gone before the request is even sent.
+    #[test]
+    fn a_reply_after_the_deadline_is_a_timeout_at_the_initial_resolve_too() {
+        // A record that arrives late.
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                    "agent_status":"idle","turn_cursor":"term_1f2e3:0:0:1:i"}}}"#,
+            ))],
+            Duration::from_millis(80),
+        );
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let mut interrupted = Interrupted { said: false };
+        assert!(matches!(
+            resolve_initial(
+                &mut requests,
+                InitialTarget::Agent("worker"),
+                Some(deadline),
+                "agent wait",
+                &mut interrupted
+            ),
+            Err(InitialFailure::TimedOut)
+        ));
+        assert!(!interrupted.said, "the server answered; it did not drop us");
+
+        // An error that arrives late is the same answer: at that point nothing
+        // has been established about the agent.
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"error":{"code":"agent_not_found","message":"nope"}}"#,
+            ))],
+            Duration::from_millis(80),
+        );
+        assert!(matches!(
+            resolve_initial(
+                &mut requests,
+                InitialTarget::Agent("worker"),
+                Some(deadline),
+                "agent wait",
+                &mut interrupted
+            ),
+            Err(InitialFailure::TimedOut)
+        ));
+
+        // No budget at all: nothing is sent.
+        let mut requests = Scripted::new(
+            vec![Ok(response(r#"{"result":{"agent":{}}}"#))],
+            Duration::ZERO,
+        );
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            resolve_initial(
+                &mut requests,
+                InitialTarget::Agent("worker"),
+                Some(past),
+                "agent wait",
+                &mut interrupted
+            ),
+            Err(InitialFailure::TimedOut)
+        ));
+        assert!(requests.granted.is_empty());
+    }
+
+    /// The same resolve, inside its budget: an error is still the server's own
+    /// refusal, reported with its words, and the latch has NOT been tripped —
+    /// so a later interruption still gets to say so once.
+    #[test]
+    fn an_early_error_at_the_initial_resolve_is_the_servers_refusal() {
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"error":{"code":"agent_not_found","message":"no such agent"}}"#,
+            ))],
+            Duration::ZERO,
+        );
+        let mut interrupted = Interrupted { said: false };
+        match resolve_initial(
+            &mut requests,
+            InitialTarget::Agent("ghost"),
+            Some(Instant::now() + Duration::from_secs(5)),
+            "agent wait",
+            &mut interrupted,
+        ) {
+            Err(InitialFailure::Refused(reason)) => {
+                assert!(reason.contains("no such agent"), "{reason}")
+            }
+            other => panic!("a refusal is not a timeout: {other:?}"),
+        }
+        assert!(!interrupted.said);
+    }
+
+    /// #553 round 2: the interruption line is said ONCE per invocation, across
+    /// BOTH phases. A handoff that breaks the first request usually breaks the
+    /// polls after it too, and a caller who sees the line twice learns nothing
+    /// the first one did not say.
+    #[test]
+    fn the_interruption_line_is_said_once_per_invocation() {
+        let mut interrupted = Interrupted { said: false };
+        interrupted.note("agent wait");
+        interrupted.note("agent wait");
+        interrupted.note("agent wait");
+        assert!(interrupted.said);
+    }
+
+    /// #553 round 2: defence in depth. `sample_from_record` already answers
+    /// hibernation before it asks for a cursor, so this state is unreachable
+    /// from the wire — but `observe` is handed samples by callers, and the one
+    /// wrong answer available for an agent with no process behind it is
+    /// `Waiting`, which settles. Pinned so a future `Sample::Record` producer
+    /// cannot reintroduce it.
+    #[test]
+    fn a_record_that_says_hibernated_is_gone_not_waiting() {
+        let mut settle = wait(None, 500, Some(30_000));
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Hibernated, cursor(0, 1, 7, false)),
+                Instant::now()
+            ),
+            Step::Gone(GoneReason::Hibernated)
         );
     }
 

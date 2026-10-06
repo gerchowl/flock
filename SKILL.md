@@ -383,7 +383,7 @@ that has not arrived is indistinguishable from a crash.
 
 ```bash
 flk agent wait worker --status settled --after "$c" --timeout 120000
-flk agent result worker
+flk agent result worker          # once #575 lands
 ```
 
 ## notes
