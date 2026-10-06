@@ -518,9 +518,10 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// Where the registry keeps this server's delegates.
 ///
 /// The test needs it for one thing only: rewriting an entry so its
-/// `workspace_id` names a workspace that is not the delegate's, which is what a
-/// restarted server can leave behind. The key is FNV-1a 64 over the socket path
-/// string, exactly as `cli::delegate::server_key` computes it.
+/// `workspace_id`, `pane_id`, and `root_pane` name a workspace that is not the
+/// delegate's, which is what a restarted server can leave behind. The key is
+/// FNV-1a 64 over the socket path string, exactly as `cli::delegate::server_key`
+/// computes it.
 fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in server.socket.to_string_lossy().as_bytes() {
@@ -536,11 +537,29 @@ fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+/// Rewrite the entry's `workspace_id`, `pane_id`, and `root_pane` to point at the
+/// given workspace, using its actual pane ids. The `terminal_id` is left alone
+/// to simulate a server restart where ids are reused but terminal ids are not.
 fn rewrite_entry_workspace(server: &Server, name: &str, workspace_id: &str) {
     let path = registry_entry_path(server, name);
     let body = fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
     let mut entry: serde_json::Value = serde_json::from_str(&body).expect("the entry is JSON");
     entry["workspace_id"] = serde_json::Value::String(workspace_id.to_string());
+    // Get the target workspace's actual pane ids to simulate a restart.
+    let listed = request(
+        server,
+        &format!(
+            r#"{{"id":"pl","method":"pane.list","params":{{"workspace_id":"{workspace_id}"}}}}"#
+        ),
+    );
+    if let Some(panes) = listed.pointer("/result/panes").and_then(|p| p.as_array()) {
+        if let Some(first_pane) = panes.first() {
+            if let Some(pane_id) = first_pane.get("pane_id").and_then(|v| v.as_str()) {
+                entry["pane_id"] = serde_json::Value::String(pane_id.to_string());
+                entry["root_pane"] = serde_json::Value::String(pane_id.to_string());
+            }
+        }
+    }
     fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
 }
 

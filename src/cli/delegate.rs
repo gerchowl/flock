@@ -63,7 +63,7 @@ use crate::api::client::ApiClient;
 use crate::api::schema::{
     AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, Method, PaneListParams,
     PaneTarget, Request, WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams,
-    WorktreeKillParams,
+    WorktreeKillParams, WorktreeListParams,
 };
 
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
@@ -735,18 +735,26 @@ fn prepare_brief(path: &str) -> Result<(String, String), String> {
 
 /// One socket request, bounded by whatever clock the caller has.
 ///
-/// `min(REQUEST_TIMEOUT, time left)`, and nothing at all is sent once the deadline
-/// has passed — a delegate handed an expired clock reports the timeout rather than
-/// blocking on a socket it can no longer afford to read.
+/// For write operations (worktree.create, worktree.kill, workspace.create,
+/// workspace.close) the base timeout is 60 s; for polls it is 2 s. The actual
+/// timeout is the minimum of that base and the time left on the caller's
+/// deadline. Once the deadline has passed, nothing is sent.
 fn request(method: Method, deadline: Option<Instant>) -> io::Result<serde_json::Value> {
+    let base_timeout = match &method {
+        Method::WorktreeCreate(_)
+        | Method::WorktreeKill(_)
+        | Method::WorkspaceCreate(_)
+        | Method::WorkspaceClose(_) => Duration::from_secs(60),
+        _ => REQUEST_TIMEOUT,
+    };
     let timeout = match deadline {
-        None => REQUEST_TIMEOUT,
+        None => base_timeout,
         Some(deadline) => {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
-            left.min(REQUEST_TIMEOUT)
+            left.min(base_timeout)
         }
     };
     ApiClient::local()
@@ -867,6 +875,7 @@ impl Placement {
 }
 
 /// Every workspace the server lists, as records.
+#[allow(dead_code)]
 fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
     request(Method::WorkspaceList(EmptyParams::default()), deadline)
         .ok()
@@ -879,6 +888,7 @@ fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn workspace_ids(deadline: Option<Instant>) -> Vec<String> {
     workspace_records(deadline)
         .iter()
@@ -899,16 +909,19 @@ fn workspace_ids(deadline: Option<Instant>) -> Vec<String> {
 /// Exactly one match, or nothing is recorded: an ambiguous parent is a parent this
 /// code cannot close safely, and "cannot" has to mean "does not".
 fn identify_parent(
-    ids_before: &[String],
+    worktrees_before: &[serde_json::Value],
     repo_root: &str,
-    deadline: Option<Instant>,
+    _deadline: Option<Instant>,
 ) -> Option<String> {
     let mut found: Option<String> = None;
-    for record in workspace_records(deadline) {
+    for record in workspace_records(None) {
         let Some(id) = field(&record, "workspace_id") else {
             continue;
         };
-        if ids_before.iter().any(|before| before == id) {
+        if worktrees_before
+            .iter()
+            .any(|before| field(before, "workspace_id") == Some(id))
+        {
             continue;
         }
         if record
@@ -942,7 +955,7 @@ fn identify_parent(
 /// on stderr — so there is no path where a start has asked the server to create
 /// something and then walked away from the answer.
 fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
-    let ids_before = workspace_ids(None);
+    let worktrees_before = worktree_list_full(None);
     let response = match mode {
         Mode::Worktree => {
             let repo = match &flags.repo {
@@ -985,14 +998,23 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
 
     let response = match response {
         Ok(response) => response,
-        Err(err) => return Err(teardown_after_place_failure(name, &ids_before, mode, err)),
+        Err(err) => {
+            return Err(teardown_after_place_failure(
+                name,
+                &worktrees_before,
+                mode,
+                flags,
+                err.to_string(),
+            ))
+        }
     };
     if let Some(error) = response.get("error") {
         let reason = server_error(error);
         return Err(teardown_after_place_failure(
             name,
-            &ids_before,
+            &worktrees_before,
             mode,
+            flags,
             reason,
         ));
     }
@@ -1008,14 +1030,15 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     let repo_key = at(&response, "/result/workspace/worktree/repo_key").map(str::to_string);
     let parent_workspace_id = repo_root
         .as_deref()
-        .and_then(|root| identify_parent(&ids_before, root, None));
+        .and_then(|root| identify_parent(&worktrees_before, root, None));
 
     let (Some(workspace_id), Some(root_pane)) = (workspace_id, root_pane) else {
         let reason = "the server created the workspace but named no workspace id or root pane";
         return Err(teardown_after_place_failure(
             name,
-            &ids_before,
+            &worktrees_before,
             mode,
+            flags,
             reason.to_string(),
         ));
     };
@@ -1040,63 +1063,110 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
 /// The parent is re-identified here even though the placement never completed: a
 /// `worktree.create` that opened a repository root and then failed to answer is
 /// exactly the case where leaving the parent behind is most visible.
+/// Undo a create whose answer could not be used, and hand back the exit code.
+///
+/// For worktree mode, if the create failed after the request was sent, we may have
+/// a checkout on disk that the server created but couldn't report. We find it by
+/// comparing the worktree list before and after the call, matching on --branch if
+/// given, and kill it with force. The parent workspace is no longer closed here
+/// (without a repo root we can't identify it reliably); see #595.
 fn teardown_after_place_failure(
     name: &str,
-    ids_before: &[String],
+    worktrees_before: &[serde_json::Value],
     mode: Mode,
+    flags: &StartFlags,
     reason: impl fmt::Display,
 ) -> i32 {
-    let parent_workspace_id = if mode == Mode::Worktree {
-        // No repo root is known from a failed create, so the parent is found by
-        // shape alone: new, and not a linked worktree. Recorded only if that is
-        // unambiguous, which is the same rule the successful path uses.
-        identify_unlinked_parent(ids_before)
-    } else {
-        None
-    };
-    let cleanup = Cleanup {
-        workspace_id: String::new(),
-        pane_id: String::new(),
-        root_pane: String::new(),
-        terminal_id: String::new(),
-        mode,
-        worktree: None,
-        parent_workspace_id,
-        repo_root: None,
-        repo_key: None,
-        name: name.to_string(),
-    };
-    // The delegate's own workspace id is unknown, so only the parent can be
-    // closed. Anything the create made beyond that is not addressable, which the
-    // reason on stderr already says.
-    if let Err(err) = tear_down(&cleanup, true) {
-        eprintln!("delegate {name}: rollback also failed: {err}");
+    // For worktree mode, the create may have left a checkout behind. We find it
+    // by diffing the worktree list before and after, matching on --branch if given.
+    if mode == Mode::Worktree {
+        let worktrees_after = worktree_list_full(None);
+        let branch = flags.branch.as_deref();
+        let new_checkout = find_new_checkout(worktrees_before, &worktrees_after, branch);
+        if let Some(checkout) = new_checkout {
+            let response = kill(None, Some(&checkout), true);
+            let response = match response {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("delegate {name}: rollback also failed: {err}");
+                    return fail(reason);
+                }
+            };
+            if let Some(err) = refusal(&response) {
+                if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
+                    eprintln!("delegate {name}: rollback also failed: {err}");
+                }
+            } else {
+                eprintln!("delegate {name}: rollback removed stray checkout at {checkout}");
+            }
+        } else {
+            eprintln!("delegate {name}: rollback found no new checkout to remove (branch filter: {branch:?})");
+        }
     }
+    // Parent workspace cleanup is handled by the rollback function using the
+    // recorded parent_workspace_id, not by this function. The identify_unlinked_parent
+    // approach is removed because without a repo root from the failed response we
+    // cannot reliably identify the parent workspace; see #595.
     fail(reason)
 }
 
-fn identify_unlinked_parent(ids_before: &[String]) -> Option<String> {
-    let mut found: Option<String> = None;
-    for record in workspace_records(None) {
-        let Some(id) = field(&record, "workspace_id") else {
+/// Find a checkout that appeared after the create call, matching on --branch if given.
+///
+/// The checkout is identified by its path, which must not have been present in
+/// the `worktree.list` taken before the create. We use `worktree.list` to find
+/// checkouts, filtering by branch if given.
+fn find_new_checkout(
+    worktrees_before: &[serde_json::Value],
+    worktrees_after: &[serde_json::Value],
+    branch: Option<&str>,
+) -> Option<String> {
+    let before_paths: std::collections::HashSet<String> = worktrees_before
+        .iter()
+        .filter_map(|w| {
+            w.pointer("/worktree/path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+
+    for worktree in worktrees_after {
+        let Some(path) = worktree.pointer("/worktree/path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if ids_before.iter().any(|before| before == id) {
+        if before_paths.contains(path) {
             continue;
         }
-        if record
-            .pointer("/worktree/is_linked_worktree")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false)
-        {
-            continue;
+        if let Some(branch_name) = branch {
+            let wt_branch = worktree
+                .pointer("/worktree/branch")
+                .and_then(|v| v.as_str());
+            if wt_branch != Some(branch_name) {
+                continue;
+            }
         }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(id.to_string());
+        return Some(path.to_string());
     }
-    found
+    None
+}
+
+/// Full worktree list with all fields (used for diffing checkouts).
+fn worktree_list_full(deadline: Option<Instant>) -> Vec<serde_json::Value> {
+    request(
+        Method::WorktreeList(WorktreeListParams {
+            workspace_id: None,
+            cwd: None,
+            scan: true,
+        }),
+        deadline,
+    )
+    .ok()
+    .and_then(|response| {
+        response
+            .pointer("/result/worktrees")
+            .and_then(|worktrees| worktrees.as_array())
+            .cloned()
+    })
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- teardown
@@ -1305,13 +1375,21 @@ fn workspace_is_ours(target: &Cleanup) -> bool {
             !current.is_empty() && same_path(current, checkout)
         }
         Mode::Cwd => {
-            // Either pane counts: the agent's own, or the root pane the
-            // workspace was created with. The root one is what is left when a
-            // start dies at launch and there is no agent to have a pane.
-            [target.pane_id.as_str(), target.root_pane.as_str()]
-                .into_iter()
-                .filter(|pane_id| !pane_id.is_empty())
-                .any(|pane_id| workspace_has_pane(&target.workspace_id, pane_id))
+            // A cwd-mode workspace is ours only if it still holds a pane whose
+            // terminal_id matches the one we recorded. Terminal ids are unique
+            // across restarts (term_<micros><counter>), unlike pane ids which
+            // are reused. If the agent's terminal is gone, the cwd workspace is
+            // not ours to close: the agent's exit already closed it.
+            //
+            // Exception: if we never recorded a terminal_id (the agent died at
+            // launch), we still own the workspace and should clean it up.
+            if target.terminal_id.is_empty() {
+                // No terminal_id recorded — the agent died at launch.
+                // The workspace is still ours to clean up.
+                return workspace_record(&target.workspace_id).is_some();
+            }
+            let terminal_id = &target.terminal_id;
+            workspace_has_terminal(&target.workspace_id, terminal_id)
         }
     }
 }
@@ -1330,6 +1408,7 @@ fn workspace_record(workspace_id: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+#[allow(dead_code)]
 fn workspace_has_pane(workspace_id: &str, pane_id: &str) -> bool {
     let Ok(response) = request(
         Method::PaneList(PaneListParams {
@@ -1346,6 +1425,26 @@ fn workspace_has_pane(workspace_id: &str, pane_id: &str) -> bool {
             panes
                 .iter()
                 .any(|pane| field(pane, "pane_id") == Some(pane_id))
+        })
+}
+
+/// Check if a workspace holds a pane with the given terminal_id.
+fn workspace_has_terminal(workspace_id: &str, terminal_id: &str) -> bool {
+    let Ok(response) = request(
+        Method::PaneList(PaneListParams {
+            workspace_id: Some(workspace_id.to_string()),
+        }),
+        None,
+    ) else {
+        return false;
+    };
+    response
+        .pointer("/result/panes")
+        .and_then(|panes| panes.as_array())
+        .is_some_and(|panes| {
+            panes
+                .iter()
+                .any(|pane| field(pane, "terminal_id") == Some(terminal_id))
         })
 }
 
