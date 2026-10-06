@@ -272,7 +272,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "wait",
         "agent-status",
-        "flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]",
+        super::WAIT_AGENT_STATUS_USAGE,
     ),
     (
         "wait",

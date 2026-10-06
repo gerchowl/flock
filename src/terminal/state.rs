@@ -263,6 +263,34 @@ pub struct TerminalState {
     /// limit that outlives the session would refuse a legitimate compaction on a
     /// pane an operator reopened days later.
     pub last_self_compact_completed: Option<std::time::Instant>,
+    /// Monotonic counter of every change of the terminal's effective state, plus
+    /// hibernation entry and exit (#553).
+    ///
+    /// The three bumps are the arbitration block in
+    /// [`Self::recompute_effective_state`], `clear_agent_runtime_identity_after_respawn`,
+    /// and `set_hibernated_resume_plan` — the only paths that move what
+    /// `pane_agent_status_from_terminal` derives. All three matter: the
+    /// arbitration block is the normal route, while respawn and hibernate
+    /// change the reported status without going through it, so a counter that
+    /// only watched the block would let a caller believe a pane was unchanged
+    /// across either.
+    ///
+    /// `idle` and `done` are ONE state here and do not move this counter: they
+    /// are the same effective idle, told apart by the pane's `seen` flag, which
+    /// lives beside the terminal rather than in it. A counter that moved on
+    /// `seen` would be counting operator attention, not agent transitions —
+    /// and it would reset a settle window every time somebody glanced at a pane.
+    state_seq: u64,
+    /// How many times this terminal has been observed entering `working`
+    /// (#553). Not "turns submitted" — a working phase shorter than one
+    /// detection sample is never observed at all, which is a documented
+    /// limitation of screen detection rather than something this counter
+    /// pretends to close.
+    working_entries: u64,
+    /// Bumped when the pane's child is replaced (#553): the terminal id is
+    /// REUSED on shell respawn, so the id alone cannot tell a continuing agent
+    /// from a fresh one that happens to sit where the old one did.
+    execution_epoch: u64,
 }
 
 impl TerminalState {
@@ -319,6 +347,9 @@ impl TerminalState {
             hibernated_resume_plan: None,
             armed_self_compact: None,
             last_self_compact_completed: None,
+            state_seq: 0,
+            working_entries: 0,
+            execution_epoch: 0,
         }
     }
 
@@ -1217,8 +1248,64 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.pending_agent_resume_plan = None;
+        // Direct assignment rather than `set_hibernated_resume_plan`: this
+        // method already bumps both counters for the respawn itself, and
+        // routing through the setter would charge a hibernation transition that
+        // the caller is not making — `state_seq` must move ONCE for a respawn,
+        // not once for the respawn and again for the unpark.
         self.hibernated_resume_plan = None;
         self.clear_agent_name();
+        // A respawn replaces the pane's child without going through the
+        // arbitration block, so it moves the reported status twice over: the
+        // state itself, and the execution behind the terminal id. Both
+        // counters move here or a turn cursor would read as still describing
+        // this terminal's agent (#553).
+        self.execution_epoch = self.execution_epoch.saturating_add(1);
+        self.state_seq = self.state_seq.saturating_add(1);
+    }
+
+    /// Park or unpark a resume plan (#553).
+    ///
+    /// The API derives `hibernated` from `hibernated_resume_plan`, so writing
+    /// the field directly changes what every agent record reports — and would
+    /// do it silently, past the arbitration block that owns `state_changed_at`.
+    /// Routing every write through here is what keeps `turn_cursor` an honest
+    /// record of the reported status.
+    pub fn set_hibernated_resume_plan(
+        &mut self,
+        plan: Option<crate::agent_resume::AgentResumePlan>,
+    ) {
+        let flips = self.hibernated_resume_plan.is_some() != plan.is_some();
+        self.hibernated_resume_plan = plan;
+        if flips {
+            // Entering hibernation starts a new execution the moment the child
+            // goes away, so the epoch moves with it: a caller waiting on the
+            // pre-hibernation agent must not be told it settled.
+            if self.hibernated_resume_plan.is_some() {
+                self.execution_epoch = self.execution_epoch.saturating_add(1);
+            }
+            self.state_seq = self.state_seq.saturating_add(1);
+        }
+    }
+
+    /// The opaque turn cursor for this terminal (#553).
+    ///
+    /// `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"` —
+    /// opaque to callers, who hand it back through `--after`. The trailing
+    /// `w`/`i` is the one field a caller cannot derive from the others: it
+    /// distinguishes "captured while working" (a follow-up may still be queued
+    /// into the running turn, so the next quiescence is the answer) from
+    /// "captured while idle" (which waits for a working entry to appear).
+    pub(crate) fn turn_cursor(&self) -> String {
+        let working = if self.state == AgentState::Working {
+            "w"
+        } else {
+            "i"
+        };
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.id, self.execution_epoch, self.working_entries, self.state_seq, working
+        )
     }
 
     pub fn is_agent_terminal(&self) -> bool {
@@ -1283,6 +1370,13 @@ impl TerminalState {
 
         if previous_state != state {
             self.state_changed_at = Some(now);
+            // #553: the same transition the attention queue orders by is also
+            // the reported status changing, and a caller holding a turn cursor
+            // needs to see it even for a change it does not act on.
+            self.state_seq = self.state_seq.saturating_add(1);
+            if state == AgentState::Working {
+                self.working_entries = self.working_entries.saturating_add(1);
+            }
         }
         self.state = state;
         Some(EffectiveStateChange {
@@ -1637,6 +1731,173 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    /// A cursor is `<terminal>:<epoch>:<entries>:<seq>:<w|i>` — five fields,
+    /// with the terminal id first and `w`/`i` last. The CLI parses it from the
+    /// right, so both ends matter: a fourth field or a trailing word would make
+    /// every caller parse it wrong rather than refuse it.
+    #[test]
+    fn turn_cursor_has_the_documented_five_fields() {
+        let mut terminal = test_terminal();
+        let id = terminal.id.to_string();
+        assert_eq!(
+            terminal.turn_cursor(),
+            format!("{id}:0:0:0:i"),
+            "a fresh terminal has run nothing and reports idle"
+        );
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert_eq!(terminal.turn_cursor(), format!("{id}:0:1:1:w"));
+    }
+
+    /// #553: `state_seq` is the counter a settled wait anchors its dwell on, so
+    /// it has to move on EVERY reported transition — including one nobody is
+    /// waiting for — and on no transition at all when the state holds.
+    #[test]
+    fn state_seq_moves_on_each_transition_and_not_while_the_state_holds() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let idle_seq = terminal.state_seq;
+        assert_eq!(terminal.working_entries, 0, "idle is not a working entry");
+
+        // The detector samples every few hundred milliseconds and re-publishes
+        // the same state constantly. A dwell anchored on `state_seq` must
+        // survive that, or nothing would ever settle.
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert_eq!(
+            terminal.state_seq, idle_seq,
+            "an unchanged state must not reset anybody's dwell"
+        );
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+        assert_eq!(
+            terminal.state_seq,
+            idle_seq + 1,
+            "idle -> blocked moves the reported status too"
+        );
+        assert_eq!(terminal.working_entries, 0);
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert_eq!(terminal.state_seq, idle_seq + 2);
+        assert_eq!(
+            terminal.working_entries, 1,
+            "entering working is what a --after cursor waits for"
+        );
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert_eq!(terminal.state_seq, idle_seq + 3);
+        assert_eq!(
+            terminal.working_entries, 1,
+            "leaving working is not a second entry"
+        );
+    }
+
+    /// A respawn reuses the terminal id for a different child (#553), so the
+    /// epoch has to move: a cursor captured before it must not be readable as
+    /// "this terminal's agent has been busy since", and a waiter on it must end
+    /// `gone` rather than settle.
+    #[test]
+    fn a_respawn_bumps_the_epoch_and_the_sequence() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let before = terminal.turn_cursor();
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        let after = terminal.turn_cursor();
+        assert_ne!(after, before);
+        assert_eq!(
+            terminal.execution_epoch, 1,
+            "a new child behind the same terminal id is a new execution"
+        );
+        assert_eq!(
+            terminal.state_seq, 2,
+            "the respawn clears the reported status to unknown"
+        );
+        assert_eq!(
+            terminal.working_entries, 1,
+            "history before the respawn is still counted; the epoch separates it"
+        );
+    }
+
+    /// #553: a respawn of a terminal that was *parked* must still move
+    /// `state_seq` exactly once. It is the one place where the two rules meet —
+    /// the respawn clears the stashed plan, which is a reported-status change in
+    /// its own right — and charging both would move the counter twice for one
+    /// event, so a settle wait anchored on it would reset its dwell for a
+    /// transition the server only made once.
+    #[test]
+    fn respawning_a_parked_terminal_costs_exactly_one_state_seq() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let plan = crate::agent_resume::plan(
+            "flock:pi",
+            "pi",
+            &crate::agent_resume::AgentSessionRef::id("s-1").expect("valid id"),
+        )
+        .expect("pi has a resume plan");
+        terminal.set_hibernated_resume_plan(Some(plan));
+        let parked_epoch = terminal.execution_epoch;
+        let parked_seq = terminal.state_seq;
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert_eq!(
+            terminal.execution_epoch,
+            parked_epoch + 1,
+            "the respawn is one new execution"
+        );
+        assert_eq!(
+            terminal.state_seq,
+            parked_seq + 1,
+            "and ONE transition: the unpark rides the respawn, it is not a second event"
+        );
+        assert!(terminal.hibernated_resume_plan.is_none());
+    }
+
+    /// Hibernation is the same shape of hazard (#553): the API reports
+    /// `hibernated` from the stashed plan rather than from `state`, so it
+    /// bypasses the arbitration block. Parking starts a new execution; unparking
+    /// does not, because the resume spawns into the same execution the caller
+    /// was already watching.
+    #[test]
+    fn parking_and_unparking_a_resume_plan_move_the_right_counters() {
+        let mut terminal = test_terminal();
+        // Idle, so the only later movement is the park: unknown -> idle already
+        // spent one state_seq and the assertions below are about the park alone.
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let idle_seq = terminal.state_seq;
+        let plan = crate::agent_resume::plan(
+            "flock:pi",
+            "pi",
+            &crate::agent_resume::AgentSessionRef::id("s-1").expect("valid id"),
+        )
+        .expect("pi has a resume plan");
+
+        terminal.set_hibernated_resume_plan(Some(plan.clone()));
+        assert_eq!(terminal.execution_epoch, 1, "the child is going away");
+        assert_eq!(
+            terminal.state_seq,
+            idle_seq + 1,
+            "and the reported status changes from idle to hibernated"
+        );
+
+        // Writing the same park again is not a second transition.
+        terminal.set_hibernated_resume_plan(Some(plan));
+        assert_eq!(
+            (terminal.execution_epoch, terminal.state_seq),
+            (1, idle_seq + 1),
+            "re-parking an already-parked pane must not move the cursor"
+        );
+
+        terminal.set_hibernated_resume_plan(None);
+        assert_eq!(
+            terminal.execution_epoch, 1,
+            "a resume lands in the same execution the epoch already named"
+        );
+        assert_eq!(terminal.state_seq, idle_seq + 2);
     }
 
     /// #246: the transcript is complete and authoritative, so it replaces the

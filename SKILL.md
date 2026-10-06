@@ -33,9 +33,13 @@ if you need the raw protocol or full api reference, read the [socket api docs](h
 
 **agent status** is detected automatically by flock. the api exposes one public field for it:
 
-- `agent_status` — `idle`, `working`, `blocked`, `done`, `unknown`
+- `agent_status` — `idle`, `working`, `blocked`, `done`, `unknown`, `hibernated`
 
 `done` means the agent finished, but you have not looked at that finished pane yet.
+
+`idle` is "ready for input", and it means `done` too — an agent nobody is
+watching goes quiet as `done`. `hibernated` means the agent process is gone and
+a resume plan is stashed on the pane.
 
 plain shells still exist as panes, but flock's sidebar agent section intentionally focuses on detected agents rather than listing every shell.
 
@@ -155,10 +159,50 @@ if it times out, exit code is `1`.
 block until another agent reaches a specific status:
 
 ```bash
-flk wait agent-status 1-1 --status done --timeout 60000
+flk wait agent-status 1-1 --status idle --timeout 60000
 ```
 
-use this when you want the same `done` / `idle` distinction the UI shows.
+`--status idle` means ready for input and matches `done` as well, so it is the
+one to use for an agent nobody is watching. `--status done` means exactly `done`.
+`flk agent wait <target> --status <status>` takes the same seven statuses with
+the same meanings.
+
+## wait for an agent to go quiet
+
+`--status settled` is the one for coordinating with an agent you prompted.
+`settled` is **observed quiescence**: after a turn cursor, the agent entered
+`working` and then held `idle`/`done` with no state transition at all for the
+settle window (5000 ms by default). it is not proof the turn produced a result —
+for the turn's output use `flk agent result` (once #575 lands).
+
+capture the cursor **before** you prompt. without it any quiet counts, so an
+agent that is already idle settles after one settle window:
+
+```bash
+c=$(flk agent get worker | jq -r .result.agent.turn_cursor)
+flk agent send worker "review the auth module"
+flk pane send-keys 1-2 Enter
+flk agent wait worker --status settled --after "$c" --timeout 3600000
+```
+
+`--settle MS` sets the window (default 5000; `--settle 0` settles on the sample after the first qualifying one) and `--after CURSOR` comes from `flk agent get`,
+`flk agent list` or `flk pane get` (all the same string). `flk wait agent-status
+1-1 --status settled` is the same signal if that is the verb you already have.
+
+exit codes: `0` settled · `3` blocked (a human has to look) · `4` pane gone
+(the line says whether it was closed, hibernated or restarted) · `124` timeout ·
+`2` a usage error or a refused cursor. on `0`, `3` and `4` it prints one json
+object:
+
+```bash
+flk agent wait worker --status settled --after "$c"   # {"status":"settled","pane_id":"1-2",...}
+```
+
+two limits worth knowing: flock samples a native agent's screen every 300-500 ms,
+so a turn whose working phase is shorter than one sample is never seen working,
+and a cursor taken before one waits for the *next* turn. and a cursor never
+satisfies a wait on another terminal or another agent that was restarted in the
+same pane — those are refused or reported as gone, never as settled.
 
 ## wait for the answer to a message you sent
 
@@ -360,8 +404,8 @@ that has not arrived is indistinguishable from a crash.
 ### coordinate with another agent
 
 ```bash
-flk wait agent-status 1-1 --status done --timeout 120000
-flk pane read 1-1 --source recent --lines 100
+flk agent wait worker --status settled --after "$c" --timeout 120000
+flk agent result worker          # once #575 lands
 ```
 
 ## notes
