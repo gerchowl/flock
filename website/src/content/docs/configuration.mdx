@@ -305,6 +305,8 @@ agent_panel_scope = "all"
 servers_panel_scope = "all"
 spaces_panel_scope = "all"
 server_state_mark = "counts"
+agents_agent_label = "symbol"
+spaces_agent_label = "symbol"
 accent = "cyan"
 ```
 
@@ -319,6 +321,14 @@ accent = "cyan"
 `servers_panel_scope` can be `all` or `current`. With `current`, the servers section shows only the machine you are attached to (plus the way-home row when you are attached to a remote server). `spaces_panel_scope` can be `all` or `current`. With `current`, the spaces list shows only the focused workspace's space group. Both default to `all`, and clicking the `all`/`current` label in each section header toggles and saves the setting — exactly like the agents panel.
 
 `server_state_mark` controls the leading state mark on each server row. The default `counts` renders fixed red/yellow/green agent-count columns (`0 2 1 hopper` — blocked, working, calm), zeros muted, with a band-global digit width so one busy server aligns every row. `medallion_sextant` / `medallion_quadrant` render the rectangular state medallion instead (nested bands of the worst three states; quadrant for fonts without Symbols for Legacy Computing). Unreachable servers ghost their row: greyed italic name (struck through), a broken-link icon with the outage age, and the last-known stats greyed in place.
+
+`agents_agent_label` and `spaces_agent_label` control how the sidebar names the agent in a row's agent field, independently of each other. Each is `symbol` (the default for both), `shortcut`, or `name`: `symbol` draws one cell from flock's harness table — `✻` claude, `π` pi, `✦` gemini, `⌬` codex, `⧉` opencode and so on, one per harness — `shortcut` draws the two-letter code (`cc`, `pi`, `gm`, `cd`), and `name` draws the full label. Both sections default to `symbol`, and `enter` on a row in **Settings → sidebar** cycles it and saves the change. They are separate settings because the two sections answer different questions — a spaces row is about a project, an agents row is about a pane — so you can read the projects by harness and the panes by code.
+
+`symbol` is the default because it is the only one of the three that stays right when the agent's *label* is not trustworthy.
+
+A consequence worth stating: a name you gave an agent yourself — `flk agent start <name>`, `flk agent rename` — keeps working for everything that *addresses* the agent (`agent get`, `agent send`, `flock_agent_list`), but the sidebar draws the harness's glyph by default, because that is the mode that survives a label being invented for you. Pick `name` on either section to read labels instead. Across federation the custom name is not carried for display at all: a peer's summary carries the harness, so a remote agent reads as its harness even in `name` mode. An agent started through `flock_agent_start` carries whatever name the calling model invented for it, and that name wins over the detected harness; the symbol and the shortcut are derived from the harness the detector identified, so a renamed agent still shows the right glyph. `name` is the mode where the label is the point, so it shows the label — and it is your explicit choice of mode rather than the default quietly doing it. A row whose agent flock cannot identify at all shows its label in every mode rather than a blank cell.
+
+`[ui] agent_aliases` overrides the agent field, with one rule that differs by mode. An alias that **names a harness** (`agent_aliases = { researcher = "codex" }`) re-attributes the row to that harness, so a mislabelled agent can be corrected without editing anything else — that works in all three modes. An alias that is **anything else** is drawn as written in `shortcut` and `name`. In `symbol` the field is a single cell, so the alias has to fit one: a one-cell glyph (including a Nerd Font codepoint from a font you installed yourself) is drawn, and anything wider is ignored in favour of the built-in symbol, because a value that does not fit would push every column to the right of it out of alignment.
 
 `server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
 
@@ -521,6 +531,26 @@ stop_transcript_poll_ms = 50
 ```
 
 If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. The wait is capped at Claude's 10-second hook timeout, and a poll interval below 1 ms is treated as 1 ms. Current Claude Code never uses these keys.
+
+### Agent self-compaction
+
+An agent can compact its own context and carry on unattended with `flk pane arm-self-compact` or the `flock_self_compact` MCP tool (see the [CLI reference](/docs/cli-reference/)). It is on by default, and these keys bound how it waits:
+
+```toml
+[session]
+self_compact = true
+self_compact_settle_ms = 2000
+self_compact_fresh_ms = 2500
+self_compact_operator_quiet_ms = 15000
+self_compact_timeout_ms = 120000
+self_compact_min_interval_secs = 300
+```
+
+`self_compact = false` makes the verb refuse: nothing is typed and no continuation is delivered. Arming is per-pane and not persisted, so turning it back on has no queue to drain.
+
+Before typing `/compact`, flock waits for the agent's turn to end and the pane to stay idle for `self_compact_settle_ms`, and requires a screen read no older than `self_compact_fresh_ms`. A human typing in the pane holds it off until they have been quiet for `self_compact_operator_quiet_ms`. Flock never types over an operator.
+
+`self_compact_timeout_ms` bounds the wait for the harness to report the compaction (`session_start_source: compact`). On expiry the arming is dropped and the agent is told nothing was typed, so its handoff prompt is still in the transcript. `self_compact_min_interval_secs` is the minimum gap between one finished self-compaction and the next arming on the same pane. It stops a compact-and-resume loop that has no work in between, not a session that fills its context twice.
 
 ## IME cursor tracking
 

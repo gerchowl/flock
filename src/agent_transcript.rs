@@ -457,6 +457,169 @@ pub fn turns_at_level(
     turns
 }
 
+/// One line with the markdown agents dress a sentinel in peeled off: leading
+/// `**`, `- ` and `> ` (repeatedly), and a closing `**`. Shared by the Stop
+/// hook's `※ recap:` and the result verb's `DONE:` / `BLOCKED:` /
+/// `VERDICT:` (#575), so the two agree on what counts as "the line".
+pub(crate) fn undecorated_line(line: &str) -> &str {
+    let mut line = line.trim();
+    while let Some(rest) = ["**", "- ", "> "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+    {
+        line = rest.trim_start();
+    }
+    let line = line.trim_end();
+    line.strip_suffix("**").map_or(line, str::trim_end)
+}
+
+/// The reply an agent's newest turn ended on (#575): what a supervisor reads
+/// to learn how a delegated task went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalReply {
+    pub text: String,
+    pub at: Option<SystemTime>,
+}
+
+/// The text of the newest assistant message that has any, extended back over
+/// the assistant messages just before it that hold only text: Claude writes
+/// one transcript entry per content block, so one reply can span several.
+/// A tool call or a user message ends the run — what came before it is an
+/// earlier step, not this reply.
+pub fn final_reply(events: &[TranscriptEvent]) -> Option<FinalReply> {
+    let messages: Vec<(&Role, &Vec<Block>, &Option<SystemTime>)> = events
+        .iter()
+        .filter_map(|event| match event {
+            TranscriptEvent::Message { role, blocks, at } => Some((role, blocks, at)),
+            _ => None,
+        })
+        .collect();
+    // Text before a message's last tool call narrated a step; only what
+    // follows it can be a reply.
+    let after_tools = |blocks: &[Block]| -> Vec<String> {
+        let start = blocks
+            .iter()
+            .rposition(|b| matches!(b, Block::ToolCall { .. } | Block::ToolResult { .. }))
+            .map_or(0, |at| at + 1);
+        blocks[start..]
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let newest = messages.iter().rposition(|(role, blocks, _)| {
+        **role == Role::Assistant && !after_tools(blocks).is_empty()
+    })?;
+    let mut first = newest;
+    while first > 0 {
+        let (role, blocks, _) = messages[first - 1];
+        let text_only = blocks
+            .iter()
+            .all(|b| matches!(b, Block::Text(_) | Block::Thinking));
+        if *role != Role::Assistant || !text_only {
+            break;
+        }
+        first -= 1;
+    }
+    let pieces: Vec<String> = messages[first..=newest]
+        .iter()
+        .flat_map(|(_, blocks, _)| after_tools(blocks))
+        .collect();
+    Some(FinalReply {
+        text: pieces.join("\n\n"),
+        at: *messages[newest].2,
+    })
+}
+
+/// Whether a Claude transcript's newest entry is assistant text — the Stop
+/// hook's "settled" rule (`cli/hook.rs`). NECESSARY for a finished turn, not
+/// sufficient: Claude writes one entry per content block, so between a
+/// narration entry and the tool call after it this is briefly true mid-turn.
+/// The hook only relies on it after Stop has fired; `agent.result` pairs it
+/// with the pane's hook-reported state.
+pub fn finished(events: &[TranscriptEvent]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            TranscriptEvent::Message { role, blocks, .. } => Some((role, blocks)),
+            _ => None,
+        })
+        .is_some_and(|(role, blocks)| {
+            *role == Role::Assistant
+                && matches!(blocks.last(), Some(Block::Text(t)) if !t.trim().is_empty())
+        })
+}
+
+/// Index of the newest prompt a person (or a supervisor) gave: a user message
+/// with text. A user entry carrying only tool results is the harness handing
+/// output back mid-turn, not a new turn.
+fn last_prompt(events: &[TranscriptEvent]) -> Option<usize> {
+    events.iter().rposition(|event| {
+        matches!(event, TranscriptEvent::Message { role: Role::User, blocks, .. }
+            if blocks.iter().any(|b| matches!(b, Block::Text(t) if !t.trim().is_empty())))
+    })
+}
+
+/// The result of an agent's work (#575): the reply its newest turn ended on
+/// when that turn is over, else the reply of the turn before — never the
+/// narration of a turn still running.
+pub fn turn_result(events: &[TranscriptEvent], newest_turn_over: bool) -> Option<FinalReply> {
+    match (last_prompt(events), newest_turn_over) {
+        (Some(prompt), true) => final_reply(&events[prompt..]),
+        (Some(prompt), false) => final_reply(&events[..prompt]),
+        (None, true) => final_reply(events),
+        (None, false) => None,
+    }
+}
+
+/// The sentinels a reply may end on (#575), lower-cased as reported.
+pub const RESULT_SENTINELS: &[&str] = &["DONE", "BLOCKED", "VERDICT"];
+
+/// `(status, text)` from a reply's final `DONE: …` / `BLOCKED: …` /
+/// `VERDICT: …` line. The last non-empty line decides, after skipping a
+/// trailing `※ recap:` line (the recap convention ends a turn after the
+/// verdict). Markdown dressing is peeled first, as for the recap.
+pub fn sentinel(text: &str) -> Option<(String, String)> {
+    let line = text
+        .lines()
+        .rev()
+        .map(undecorated_line)
+        .find(|line| !line.is_empty() && !line.starts_with("\u{203b} recap:"))?;
+    RESULT_SENTINELS.iter().find_map(|key| {
+        // `**DONE**: x` bolds just the keyword; the leading `**` is already gone.
+        let rest = line.strip_prefix(key)?;
+        let rest = rest.strip_prefix("**").unwrap_or(rest).strip_prefix(':')?;
+        Some((key.to_ascii_lowercase(), rest.trim().to_string()))
+    })
+}
+
+/// The newest entries of a transcript, at most [`HISTORY_WINDOW_BYTES`] of
+/// them (#575): what `agent.result` needs, read without parsing the whole
+/// file on the task that also draws the UI. Starts at a line boundary and
+/// never parses a half-written trailing line.
+pub fn read_tail(path: &Path) -> Result<TranscriptRead, TranscriptError> {
+    let mut file = File::open(path).map_err(|_| TranscriptError::Unreadable)?;
+    let len = file
+        .metadata()
+        .map_err(|_| TranscriptError::Unreadable)?
+        .len();
+    let start = align_back_to_line_start(&mut file, len.saturating_sub(HISTORY_WINDOW_BYTES))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| TranscriptError::Unreadable)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|_| TranscriptError::Unreadable)?;
+    let complete = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1);
+    buf.truncate(complete);
+    read_lines(&buf[..])
+}
+
 /// Largest slice of a transcript one [`read_history`] call parses (#276).
 ///
 /// `agent.history` exists to be polled, and a poll that re-reads a 15 MB file
@@ -740,7 +903,7 @@ pub fn spawn_load<F>(
 }
 
 /// Truncate on a char boundary so a multi-MB body can never reach a renderer.
-fn cap(text: &str) -> String {
+pub(crate) fn cap(text: &str) -> String {
     if text.len() <= MAX_BLOCK_BYTES {
         return text.to_string();
     }
@@ -1182,6 +1345,186 @@ mod tests {
 
     fn texts(page: &HistoryPage) -> Vec<&str> {
         page.turns.iter().map(|turn| turn.text.as_str()).collect()
+    }
+
+    fn assistant(text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+            })
+        )
+    }
+
+    fn tool_result() -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "ok"}
+                ]}
+            })
+        )
+    }
+
+    fn events_of(body: &str) -> Vec<TranscriptEvent> {
+        read_lines(body.as_bytes()).expect("parse").events
+    }
+
+    // ── #575: the result of a turn ──
+
+    #[test]
+    fn the_final_reply_is_the_text_after_the_last_tool_call() {
+        // Claude writes one entry per content block, so a reply that ends a
+        // tool-using turn arrives as its own entries after the tool result.
+        let body = [
+            user("fix it"),
+            assistant_with_tool("Looking at the parser.", "Bash"),
+            tool_result(),
+            assistant("Fixed the off-by-one."),
+            assistant("DONE: parser green"),
+        ]
+        .concat();
+        let events = events_of(&body);
+        let reply = final_reply(&events).expect("a reply");
+        assert_eq!(reply.text, "Fixed the off-by-one.\n\nDONE: parser green");
+        assert!(finished(&events));
+    }
+
+    #[test]
+    fn a_turn_ending_on_a_tool_call_or_a_new_prompt_is_not_finished() {
+        let mid_tool = [
+            user("go"),
+            assistant("Earlier answer."),
+            user("next"),
+            assistant_with_tool("Running.", "Bash"),
+        ]
+        .concat();
+        let events = events_of(&mid_tool);
+        assert!(!finished(&events));
+        // Narration before the tool call is not the reply; the last complete
+        // one is the earlier answer.
+        assert_eq!(
+            final_reply(&events).map(|r| r.text),
+            Some("Earlier answer.".into())
+        );
+
+        let pending = [user("go"), assistant("Answer."), user("and now?")].concat();
+        assert!(!finished(&events_of(&pending)));
+        assert!(final_reply(&events_of(&user("only a prompt"))).is_none());
+    }
+
+    /// Review finding: Claude writes ONE ENTRY PER CONTENT BLOCK, so mid-turn
+    /// the newest entry can be narration with its tool call not yet written.
+    /// The result of a running turn is the previous turn's reply.
+    #[test]
+    fn a_running_turn_never_yields_its_own_narration() {
+        let tool_use = format!(
+            "{}\n",
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "tool_use", "name": "Bash"}]}})
+        );
+        let earlier = [user("first task"), assistant("DONE: first task shipped")].concat();
+        let mid_stream = [
+            earlier.clone(),
+            user("second task"),
+            assistant("Running the tests."),
+        ]
+        .concat();
+        let events = events_of(&mid_stream);
+        assert!(finished(&events), "the transcript alone looks settled here");
+        assert_eq!(
+            turn_result(&events, false).map(|r| r.text),
+            Some("DONE: first task shipped".into()),
+            "with the pane still working, the result is the previous turn's"
+        );
+        let after_tool = [mid_stream, tool_use].concat();
+        let events = events_of(&after_tool);
+        assert!(!finished(&events));
+        assert_eq!(
+            turn_result(&events, false).map(|r| r.text),
+            Some("DONE: first task shipped".into())
+        );
+        let done = [
+            after_tool,
+            tool_result(),
+            assistant("All green.\nDONE: second task"),
+        ]
+        .concat();
+        assert_eq!(
+            turn_result(&events_of(&done), true).map(|r| r.text),
+            Some("All green.\nDONE: second task".into())
+        );
+        assert_eq!(turn_result(&events_of(&user("only")), false), None);
+    }
+
+    #[test]
+    fn the_sentinel_is_the_last_line_dressed_or_not() {
+        assert_eq!(
+            sentinel("Merged.\nDONE: PR #12 merged"),
+            Some(("done".into(), "PR #12 merged".into()))
+        );
+        assert_eq!(
+            sentinel("…\n**BLOCKED: needs a token**\n\n※ recap: blocked. Next: ask."),
+            Some(("blocked".into(), "needs a token".into())),
+            "markdown is peeled and a trailing recap line is skipped"
+        );
+        assert_eq!(
+            sentinel("- VERDICT: approve"),
+            Some(("verdict".into(), "approve".into()))
+        );
+        assert_eq!(
+            sentinel("DONE: early\nthen more prose"),
+            None,
+            "only the last line decides"
+        );
+        assert_eq!(sentinel("Done: lower-case is prose"), None);
+        assert_eq!(
+            sentinel("**DONE**: bold keyword"),
+            Some(("done".into(), "bold keyword".into()))
+        );
+        assert_eq!(
+            sentinel("BLOCKED: x\n\u{203b} note"),
+            None,
+            "only a recap line is skipped"
+        );
+        assert_eq!(sentinel(""), None);
+    }
+
+    #[test]
+    fn undecorated_line_is_the_recap_hooks_rule() {
+        assert_eq!(undecorated_line("  > - **※ recap: x**  "), "※ recap: x");
+        assert_eq!(undecorated_line("plain"), "plain");
+    }
+
+    #[test]
+    fn read_tail_parses_only_whole_lines_from_the_end() {
+        // Separate turns: a prompt between replies. (Consecutive assistant
+        // entries with nothing between them are ONE reply split per content
+        // block, and are joined — see the test above.)
+        let body: String = (0..5)
+            .map(|i| {
+                format!(
+                    "{}{}",
+                    user(&format!("q {i}")),
+                    assistant(&format!("reply {i}"))
+                )
+            })
+            .collect();
+        let torn = format!("{body}{{\"type\":\"assistant\",\"mess");
+        let path = history_fixture("tail-result", &torn);
+        let read = read_tail(&path).expect("tail");
+        assert_eq!(
+            final_reply(&read.events).map(|r| r.text),
+            Some("reply 4".into()),
+            "the torn trailing line is not parsed"
+        );
+        assert!(matches!(
+            read_tail(std::path::Path::new("/nonexistent/flock/t.jsonl")),
+            Err(TranscriptError::Unreadable)
+        ));
     }
 
     #[test]

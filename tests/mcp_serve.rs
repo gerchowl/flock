@@ -289,11 +289,13 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_msg_list",
             "flock_msg_read",
             "flock_msg_mute",
+            "flock_msg_wait_reply",
             "flock_self_compact",
             "flock_pane_read",
             "flock_worktree_list",
             "flock_agent_start",
             "flock_agent_history",
+            "flock_agent_result",
         ]
     );
     for tool in tools {

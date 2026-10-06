@@ -1,0 +1,4 @@
+#!/bin/sh
+# Archiver paired with cc-aarch64-linux-musl (#575): one executable path, so
+# cc-rs never has to split a command line out of AR.
+exec zig ar "$@"

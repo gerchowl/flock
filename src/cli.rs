@@ -515,6 +515,7 @@ fn run_wait_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "output" => wait_output(&args[1..]),
         "agent-status" => wait_agent_status(&args[1..]),
+        "reply" => msg::wait_reply(&args[1..]),
         "help" | "--help" | "-h" => {
             print_wait_help();
             Ok(0)
@@ -1063,6 +1064,11 @@ fn print_wait_help() {
     eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
     eprintln!(
         "  flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]"
+    );
+    eprintln!("  flk wait reply <correlation_id> [--timeout MS] [--json]");
+    eprintln!(
+        "    waits for the answer to a message you sent (msg send --intent needs-reply): \
+         prints its body; exit 0 replied, 3 deferred or expired, 124 timed out"
     );
 }
 
