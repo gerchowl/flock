@@ -315,12 +315,31 @@ pub(super) fn table() -> &'static [Tool] {
                           `after_compaction: true` is the first of a new \
                           epoch: everything older in the transcript was \
                           superseded by a compaction, so it is history rather \
-                          than context. Claude \
-                          only. Refusals: `unsupported_for_agent`, \
+                          than context. Claude and opencode agents (#575); \
+                          other agents refuse. Refusals: `unsupported_for_agent`, \
                           `no_agent_session`, `transcript_not_found`, \
                           `transcript_unreadable`.",
             input_schema: schema_agent_history,
             build: build_agent_history,
+        },
+        Tool {
+            name: "flock_agent_result",
+            description: "Return the reply another agent's newest turn ended on \
+                          — how a delegated task went — for Claude and \
+                          opencode agents alike. `status`/`status_text` come \
+                          from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` \
+                          line (lower-cased: `done`/`blocked`/`verdict`), \
+                          absent when it ends on none. `finished: false` means \
+                          the agent is still working and `text` is an EARLIER \
+                          turn's reply. Paged by characters: pass \
+                          `next_offset` back as `offset` for the rest of a long \
+                          report. Read-only, like `flock_agent_history`: it \
+                          touches no pane state, so it is safe to poll. \
+                          Refusals: `unsupported_for_agent`, \
+                          `no_agent_session`, `transcript_not_found`, \
+                          `transcript_unreadable`, `no_result` (no reply yet).",
+            input_schema: schema_agent_result,
+            build: build_agent_result,
         },
     ]
 }
@@ -704,6 +723,46 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
         label: optional_string(&args, "label")?,
         pivot: optional_string(&args, "pivot")?,
         focus: false,
+    }))
+}
+
+fn schema_agent_result() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Pane id, terminal id, or unique agent name, as for flock_agent_history.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Characters of the reply to return (default 4000, at most 65536).",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Character offset to start at: a previous call's `next_offset`.",
+            },
+        },
+        "required": ["target"],
+        "additionalProperties": false,
+    })
+}
+
+fn build_agent_result(args: Value) -> Result<Method, McpError> {
+    let to_u32 = |field: &str| -> Result<Option<u32>, McpError> {
+        optional_u64(&args, field)?
+            .map(|n| {
+                u32::try_from(n)
+                    .map_err(|_| McpError::invalid_params(format!("`{field}` out of range")))
+            })
+            .transpose()
+    };
+    Ok(Method::AgentResult(crate::api::schema::AgentResultParams {
+        target: required_string(&args, "target")?,
+        max_chars: to_u32("max_chars")?,
+        offset: to_u32("offset")?,
     }))
 }
 
@@ -1113,6 +1172,7 @@ mod tests {
                 "flock_worktree_list",
                 "flock_agent_start",
                 "flock_agent_history",
+                "flock_agent_result",
             ]
         );
     }

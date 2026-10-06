@@ -1,13 +1,118 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentHistoryParams, AgentHistoryResult, AgentRenameParams, AgentSendParams, AgentStartParams,
-    AgentTarget, ErrorBody, HistoryTurnInfo, PaneReadResult, ReadFormat, ReadSource,
-    ResponseResult, AGENT_HISTORY_DEFAULT_TURNS, AGENT_HISTORY_MAX_TURNS,
+    AgentHistoryParams, AgentHistoryResult, AgentRenameParams, AgentResultInfo, AgentResultParams,
+    AgentSendParams, AgentStartParams, AgentTarget, ErrorBody, HistoryTurnInfo, PaneReadResult,
+    ReadFormat, ReadSource, ResponseResult, AGENT_HISTORY_DEFAULT_TURNS, AGENT_HISTORY_MAX_TURNS,
+    AGENT_RESULT_DEFAULT_CHARS, AGENT_RESULT_MAX_CHARS,
 };
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
+
+/// opencode messages `agent.result` reads to find the newest reply: a turn
+/// is a user message plus one assistant message per step, so this reaches
+/// back past a long tool-using turn without reading the session.
+const RESULT_OPENCODE_MESSAGES: usize = 64;
+
+/// Where a pane's conversation lives (#575).
+enum ConversationStore {
+    Claude {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
+    Opencode {
+        session_id: String,
+        db: std::path::PathBuf,
+    },
+}
+
+impl ConversationStore {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Claude { session_id, .. } | Self::Opencode { session_id, .. } => session_id,
+        }
+    }
+
+    fn agent(&self) -> &'static str {
+        match self {
+            Self::Claude { .. } => "claude",
+            Self::Opencode { .. } => "opencode",
+        }
+    }
+
+    /// The refusal for a store that exists and could not be read. The error
+    /// never carries CONTENT: these hold everything the agent read and was told.
+    fn unreadable(&self, id: String, err: &crate::agent_transcript::TranscriptError) -> String {
+        crate::logging::transcript_unreadable(self.session_id(), &format!("{err:?}"));
+        encode_error(
+            id,
+            "transcript_unreadable",
+            format!(
+                "conversation for session {} could not be read",
+                self.session_id()
+            ),
+        )
+    }
+}
+
+/// An `agent.history` page over an opencode session (#575). The cursor is a
+/// message's creation time in ms where a Claude cursor is a byte offset;
+/// both are opaque to the caller, and both mean "strictly after this".
+fn opencode_history(
+    db: &std::path::Path,
+    session_id: &str,
+    detail: crate::agent_transcript::TranscriptDetail,
+    cursor: Option<u64>,
+    limit: usize,
+) -> Result<crate::agent_transcript::HistoryPage, crate::agent_transcript::TranscriptError> {
+    use crate::opencode_transcript::{events, read_session, Window};
+    let mut read = match cursor {
+        Some(ms) => read_session(db, session_id, Window::After { ms, n: limit })?,
+        None => read_session(db, session_id, Window::Last(limit))?,
+    };
+    // A cursor past the newest message means the session was replaced under
+    // the caller; restart from the tail, as a Claude cursor past EOF does.
+    if cursor.is_some_and(|ms| ms > read.newest_ms) {
+        read = read_session(db, session_id, Window::Last(limit))?;
+    }
+    let mut turns = Vec::new();
+    let mut compaction_pending = false;
+    for message in &read.messages {
+        for event in events(std::slice::from_ref(message)) {
+            if matches!(event, crate::agent_transcript::TranscriptEvent::Compacted) {
+                compaction_pending = !turns.is_empty() || read.oldest_ms < message.created_ms;
+                continue;
+            }
+            for (role, text, at) in
+                crate::agent_transcript::turns_at_level(std::slice::from_ref(&event), detail)
+            {
+                turns.push(crate::agent_transcript::HistoryTurn {
+                    role,
+                    text,
+                    at,
+                    after_compaction: std::mem::take(&mut compaction_pending),
+                });
+            }
+        }
+    }
+    let first = read.messages.first().map(|m| m.created_ms);
+    let cursor = first.map_or(cursor.unwrap_or(read.newest_ms), |ms| ms.saturating_sub(1));
+    Ok(crate::agent_transcript::HistoryPage {
+        turns,
+        cursor,
+        next_cursor: read.resume_after().unwrap_or(cursor),
+        // `more` (next_cursor < len) means "page again NOW". A message still
+        // being written is re-sent from behind the cursor, but waiting for it
+        // is a poll, not a page — so only rows past the page count.
+        len: if read.has_more {
+            read.newest_ms
+        } else {
+            read.resume_after().unwrap_or(cursor)
+        },
+        truncated: first.is_some_and(|ms| ms > read.oldest_ms),
+    })
+}
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
@@ -136,83 +241,26 @@ impl App {
         id: String,
         params: AgentHistoryParams,
     ) -> String {
-        let resolved = match self.resolve_terminal_target(&params.target) {
-            Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        let (resolved, store) = match self.conversation_store(&params.target) {
+            Ok(found) => found,
+            Err(body) => return encode_error_body(id, body),
         };
-        // Resolved from the workspace rather than through `lookup_runtime`:
-        // a hibernated agent has no live runtime and still has a transcript,
-        // and its history is exactly what an operator wants to read before
-        // deciding whether to wake it.
-        let workspace_id = self.public_workspace_id(resolved.ws_idx);
-        let terminal = self
-            .state
-            .workspaces
-            .get(resolved.ws_idx)
-            .and_then(|ws| ws.pane_state(resolved.pane_id))
-            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id));
-        let session_info = terminal.and_then(super::super::creation::terminal_agent_session_info);
-        let session_id = terminal.and_then(crate::terminal::TerminalState::claude_session_id);
-
-        let Some(session_id) = session_id else {
-            // A pane with a session flock cannot read is a different answer
-            // from a pane with no session at all: only Claude has a
-            // transcript parser today, and telling a codex operator to check
-            // their hooks would send them after the wrong thing.
-            if let Some(info) = session_info {
-                return encode_error(
-                    id,
-                    "unsupported_for_agent",
-                    format!(
-                        "{} ({}) has no transcript flock can read: only claude writes a \
-                         session transcript flock parses",
-                        info.agent, info.source
-                    ),
-                );
-            }
-            return encode_error(
-                id,
-                "no_agent_session",
-                format!(
-                    "agent target {} has no known session — check `flk integration status`",
-                    params.target
-                ),
-            );
-        };
-
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let path =
-            home.and_then(|home| crate::agent_resume::claude_transcript_path(&home, &session_id));
-        let Some(path) = path else {
-            return encode_error(
-                id,
-                "transcript_not_found",
-                format!(
-                    "no transcript on disk for session {session_id} — transcript saving may \
-                     be disabled, or the agent has not written its first turn yet"
-                ),
-            );
-        };
-
         let limit = params
             .limit
             .unwrap_or(AGENT_HISTORY_DEFAULT_TURNS)
             .clamp(1, AGENT_HISTORY_MAX_TURNS) as usize;
-        let page =
-            match crate::agent_transcript::read_history(&path, params.detail, params.cursor, limit)
-            {
-                Ok(page) => page,
-                Err(err) => {
-                    // The error never carries transcript CONTENT — these files
-                    // hold everything the agent read and everything it was told.
-                    crate::logging::transcript_unreadable(&session_id, &format!("{err:?}"));
-                    return encode_error(
-                        id,
-                        "transcript_unreadable",
-                        format!("transcript for session {session_id} could not be read"),
-                    );
-                }
-            };
+        let page = match &store {
+            ConversationStore::Claude { path, .. } => {
+                crate::agent_transcript::read_history(path, params.detail, params.cursor, limit)
+            }
+            ConversationStore::Opencode { db, session_id } => {
+                opencode_history(db, session_id, params.detail, params.cursor, limit)
+            }
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(err) => return store.unreadable(id, &err),
+        };
 
         // Read before `turns` is moved out of the page below.
         let more = page.more();
@@ -223,8 +271,8 @@ impl App {
                     pane_id: self
                         .public_pane_id(resolved.ws_idx, resolved.pane_id)
                         .unwrap_or_else(|| params.target.clone()),
-                    workspace_id,
-                    session_id,
+                    workspace_id: self.public_workspace_id(resolved.ws_idx),
+                    session_id: store.session_id().to_string(),
                     detail: params.detail,
                     turns: page
                         .turns
@@ -243,6 +291,187 @@ impl App {
                 },
             },
         )
+    }
+
+    /// `agent.result` (#575): the reply an agent's newest turn ended on, and
+    /// the `DONE:` / `BLOCKED:` / `VERDICT:` line it ends with — the most
+    /// common supervision step, which supervisors were doing with `sqlite3`
+    /// against opencode's private schema and a `substr` offset.
+    ///
+    /// Same properties as `agent.history`: no pane state touched (absent from
+    /// `request_changes_ui`), bounded reads (a 1 MiB transcript tail, a
+    /// handful of opencode rows), and nothing logged but the failure kind.
+    pub(super) fn handle_agent_result(&mut self, id: String, params: AgentResultParams) -> String {
+        let (resolved, store) = match self.conversation_store(&params.target) {
+            Ok(found) => found,
+            Err(body) => return encode_error_body(id, body),
+        };
+        // The harness's own records say whether the newest turn LOOKS over, and
+        // flock's hook-reported pane state says whether it IS. Claude writes
+        // one transcript entry per content block, so its record alone looks
+        // settled for a moment between a narration and the tool call after
+        // it. Unknown (no hook yet, hibernated) defers to the record.
+        let pane_says_running = matches!(
+            self.state
+                .workspaces
+                .get(resolved.ws_idx)
+                .and_then(|ws| ws.pane_state(resolved.pane_id))
+                .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                .map(|terminal| terminal.state),
+            Some(crate::detect::AgentState::Working | crate::detect::AgentState::Blocked)
+        );
+        let read = match &store {
+            ConversationStore::Claude { path, .. } => {
+                crate::agent_transcript::read_tail(path).map(|read| {
+                    let over = crate::agent_transcript::finished(&read.events);
+                    (read.events, over)
+                })
+            }
+            ConversationStore::Opencode { db, session_id } => {
+                crate::opencode_transcript::read_session(
+                    db,
+                    session_id,
+                    crate::opencode_transcript::Window::Last(RESULT_OPENCODE_MESSAGES),
+                )
+                .map(|read| {
+                    (
+                        crate::opencode_transcript::events(&read.messages),
+                        crate::opencode_transcript::finished(&read.messages),
+                    )
+                })
+            }
+        };
+        let read = read.map(|(events, recorded_over)| {
+            let finished = recorded_over && !pane_says_running;
+            (
+                crate::agent_transcript::turn_result(&events, finished),
+                finished,
+            )
+        });
+        let (reply, finished) = match read {
+            Ok(found) => found,
+            Err(err) => return store.unreadable(id, &err),
+        };
+        let Some(reply) = reply else {
+            return encode_error(
+                id,
+                "no_result",
+                format!("session {} has no assistant reply yet", store.session_id()),
+            );
+        };
+        let (status, status_text) = crate::agent_transcript::sentinel(&reply.text).unzip();
+        let max_chars = params
+            .max_chars
+            .unwrap_or(AGENT_RESULT_DEFAULT_CHARS)
+            .clamp(1, AGENT_RESULT_MAX_CHARS) as usize;
+        let total = reply.text.chars().count();
+        let offset = (params.offset.unwrap_or(0) as usize).min(total);
+        let text: String = reply.text.chars().skip(offset).take(max_chars).collect();
+        let end = offset + text.chars().count();
+        encode_success(
+            id,
+            ResponseResult::AgentResult {
+                result: AgentResultInfo {
+                    pane_id: self
+                        .public_pane_id(resolved.ws_idx, resolved.pane_id)
+                        .unwrap_or_else(|| params.target.clone()),
+                    workspace_id: self.public_workspace_id(resolved.ws_idx),
+                    agent: store.agent().to_string(),
+                    session_id: store.session_id().to_string(),
+                    finished,
+                    status,
+                    status_text,
+                    text,
+                    offset: u32::try_from(offset).unwrap_or(u32::MAX),
+                    total_chars: u32::try_from(total).unwrap_or(u32::MAX),
+                    next_offset: (end < total).then(|| u32::try_from(end).unwrap_or(u32::MAX)),
+                    at_ms: reply.at.and_then(unix_ms),
+                },
+            },
+        )
+    }
+
+    /// Where a pane's conversation can be read (#276, #575), or the refusal
+    /// that says why not.
+    ///
+    /// Resolved from the workspace rather than through `lookup_runtime`: a
+    /// hibernated agent has no live runtime and still has a transcript, and
+    /// its history is exactly what an operator wants before waking it.
+    fn conversation_store(
+        &self,
+        target: &str,
+    ) -> Result<
+        (
+            crate::app::terminal_targets::TerminalTarget,
+            ConversationStore,
+        ),
+        ErrorBody,
+    > {
+        let resolved = self
+            .resolve_terminal_target(target)
+            .map_err(|err| self.agent_target_error_body(err))?;
+        let refuse = |code: &str, message: String| ErrorBody {
+            code: code.into(),
+            message,
+        };
+        let terminal = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|ws| ws.pane_state(resolved.pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id));
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+        if let Some(session_id) =
+            terminal.and_then(crate::terminal::TerminalState::claude_session_id)
+        {
+            let path = home
+                .and_then(|home| crate::agent_resume::claude_transcript_path(&home, &session_id));
+            let Some(path) = path else {
+                return Err(refuse(
+                    "transcript_not_found",
+                    format!(
+                        "no transcript on disk for session {session_id} — transcript saving \
+                         may be disabled, or the agent has not written its first turn yet"
+                    ),
+                ));
+            };
+            return Ok((resolved, ConversationStore::Claude { session_id, path }));
+        }
+        if let Some(session_id) =
+            terminal.and_then(crate::terminal::TerminalState::opencode_session_id)
+        {
+            let xdg = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+            let db =
+                home.and_then(|home| crate::opencode_transcript::db_path(&home, xdg.as_deref()));
+            let Some(db) = db else {
+                return Err(refuse(
+                    "transcript_not_found",
+                    format!(
+                        "no opencode database found for session {session_id} \
+                         (looked under $XDG_DATA_HOME/opencode and ~/.local/share/opencode)"
+                    ),
+                ));
+            };
+            return Ok((resolved, ConversationStore::Opencode { session_id, db }));
+        }
+        // A pane with a session flock cannot read is a different answer from
+        // a pane with no session at all: telling a codex operator to check
+        // their hooks would send them after the wrong thing.
+        if let Some(info) = terminal.and_then(super::super::creation::terminal_agent_session_info) {
+            return Err(refuse(
+                "unsupported_for_agent",
+                format!(
+                    "{} ({}) has no conversation flock can read: only claude's transcript \
+                     and opencode's session database are read",
+                    info.agent, info.source
+                ),
+            ));
+        }
+        Err(refuse(
+            "no_agent_session",
+            format!("agent target {target} has no known session — check `flk integration status`"),
+        ))
     }
 
     /// `agent.hibernate` (#175 C3): park a pane. Refuses with a typed code
@@ -604,6 +833,246 @@ mod tests {
             error.error.message.contains("sess-absent"),
             "{}",
             error.error.message
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    // ── #575: agent.result, and opencode sessions ──
+
+    fn result(app: &mut App, target: &str, max_chars: Option<u32>, offset: Option<u32>) -> String {
+        app.handle_api_request_after_internal_events_drained(Request {
+            id: "req".into(),
+            method: Method::AgentResult(crate::api::schema::AgentResultParams {
+                target: target.into(),
+                max_chars,
+                offset,
+            }),
+        })
+    }
+
+    fn result_info(response: &str) -> crate::api::schema::AgentResultInfo {
+        let success: crate::api::schema::SuccessResponse =
+            serde_json::from_str(response).expect(response);
+        let ResponseResult::AgentResult { result } = success.result else {
+            panic!("expected agent_result: {response}");
+        };
+        result
+    }
+
+    fn assistant_line(text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+            })
+        )
+    }
+
+    #[test]
+    fn agent_result_reads_a_claude_reply_and_its_sentinel() {
+        let body = user_line("merge it")
+            + &assistant_line("Merged after CI went green.\nDONE: PR #12 merged");
+        let home = claude_home_with("result", "sess-result", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-result");
+
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert_eq!(info.agent, "claude");
+        assert!(info.finished);
+        assert_eq!(info.status.as_deref(), Some("done"));
+        assert_eq!(info.status_text.as_deref(), Some("PR #12 merged"));
+        assert!(info.text.ends_with("DONE: PR #12 merged"));
+        assert_eq!(info.next_offset, None);
+
+        // Paged by characters, and the status comes from the WHOLE reply.
+        let first = result_info(&result(&mut app, &target, Some(6), None));
+        assert_eq!(
+            (first.text.as_str(), first.next_offset),
+            ("Merged", Some(6))
+        );
+        assert_eq!(first.status.as_deref(), Some("done"));
+        let rest = result_info(&result(&mut app, &target, Some(10_000), first.next_offset));
+        assert_eq!(format!("{}{}", first.text, rest.text), info.text);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Review finding: mid-turn, Claude's transcript can END on this turn's
+    /// narration (one entry per content block) and look settled. The pane's
+    /// hook-reported state says the turn is running, so the result is the
+    /// previous turn's reply and `finished` is false.
+    #[test]
+    fn a_working_claude_pane_reports_the_previous_turn() {
+        let body = user_line("first")
+            + &assistant_line("DONE: first shipped")
+            + &user_line("second")
+            + &assistant_line("Running the tests.");
+        let home = claude_home_with("working", "sess-working", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-working");
+        let terminal_id = focused_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .state = crate::detect::AgentState::Working;
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(!info.finished);
+        assert_eq!(info.text, "DONE: first shipped");
+        assert_eq!(info.status.as_deref(), Some("done"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn agent_result_with_no_reply_yet_is_refused_as_no_result() {
+        let home = claude_home_with("no-result", "sess-empty", &user_line("hello?"));
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-empty");
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&result(&mut app, &target, None, None)).unwrap();
+        assert_eq!(error.error.code, "no_result");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An opencode session database in a fixture HOME, in opencode's own
+    /// schema: a finished turn ending on a verdict, then one still running.
+    fn opencode_home_with(name: &str, session_id: &str, running: bool) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("flock-opencode-home-{}-{name}", std::process::id()));
+        let dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("fixture data dir");
+        let conn = rusqlite::Connection::open(dir.join("opencode-stable.db")).expect("fixture db");
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, \
+             session_id TEXT NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .expect("fixture schema");
+        let mut rows = vec![
+            (
+                "m1",
+                1_000,
+                r#"{"role":"user"}"#,
+                r#"{"type":"text","text":"review PR 12"}"#,
+            ),
+            (
+                "m2",
+                2_000,
+                r#"{"role":"assistant","finish":"stop","time":{"created":2000,"completed":2500}}"#,
+                r#"{"type":"text","text":"Read the diff; tests cover it.\nVERDICT: approve"}"#,
+            ),
+        ];
+        if running {
+            rows.push((
+                "m3",
+                3_000,
+                r#"{"role":"user"}"#,
+                r#"{"type":"text","text":"now PR 13"}"#,
+            ));
+            rows.push((
+                "m4",
+                4_000,
+                r#"{"role":"assistant","time":{"created":4000}}"#,
+                r#"{"type":"tool","tool":"bash","state":{"status":"running"}}"#,
+            ));
+        }
+        for (id, at, data, part) in rows {
+            conn.execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![id, session_id, at, data],
+            )
+            .expect("message row");
+            conn.execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                rusqlite::params![format!("{id}-p0"), id, session_id, at, part],
+            )
+            .expect("part row");
+        }
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("XDG_DATA_HOME");
+        home
+    }
+
+    #[test]
+    fn agent_result_reads_an_opencode_session() {
+        let home = opencode_home_with("result", "ses_fixture", false);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:opencode", "opencode", "ses_fixture");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert_eq!(
+            (info.agent.as_str(), info.session_id.as_str()),
+            ("opencode", "ses_fixture")
+        );
+        assert!(info.finished);
+        assert_eq!(info.status.as_deref(), Some("verdict"));
+        assert_eq!(info.status_text.as_deref(), Some("approve"));
+        assert_eq!(info.at_ms, Some(2_000));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_running_opencode_turn_reports_the_last_finished_reply_as_unfinished() {
+        let home = opencode_home_with("running", "ses_running", true);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:opencode", "opencode", "ses_running");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(!info.finished, "a tool is still running");
+        assert_eq!(
+            info.status.as_deref(),
+            Some("verdict"),
+            "the earlier turn's reply"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn agent_history_reads_an_opencode_session_and_its_cursor_resumes() {
+        let home = opencode_home_with("history", "ses_history", true);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:opencode", "opencode", "ses_history");
+
+        let mut first = params(&target);
+        first.limit = Some(2);
+        let success: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&history(&mut app, first)).unwrap();
+        let ResponseResult::AgentHistory { history: page } = success.result else {
+            panic!("expected agent_history");
+        };
+        let texts: Vec<&str> = page.turns.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["now PR 13"],
+            "the newest two messages; a running tool call has no reply text"
+        );
+        assert!(page.truncated, "older messages exist");
+        assert!(!page.more);
+
+        let mut from_start = params(&target);
+        from_start.cursor = Some(0);
+        let success: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&history(&mut app, from_start)).unwrap();
+        let ResponseResult::AgentHistory { history: page } = success.result else {
+            panic!("expected agent_history");
+        };
+        assert_eq!(page.turns.len(), 3);
+        assert_eq!(page.turns[1].at_ms, Some(2_000));
+        assert_eq!(
+            page.next_cursor, 3_999,
+            "never past m4, which is still being written"
+        );
+
+        let mut caught_up = params(&target);
+        caught_up.cursor = Some(page.next_cursor);
+        let success: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&history(&mut app, caught_up)).unwrap();
+        let ResponseResult::AgentHistory { history: page } = success.result else {
+            panic!("expected agent_history");
+        };
+        assert!(
+            page.turns.iter().all(|t| t.at_ms == Some(4_000)),
+            "only the still-running m4 again, until it completes"
         );
         let _ = std::fs::remove_dir_all(home);
     }

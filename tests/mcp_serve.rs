@@ -295,6 +295,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_worktree_list",
             "flock_agent_start",
             "flock_agent_history",
+            "flock_agent_result",
         ]
     );
     for tool in tools {

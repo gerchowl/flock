@@ -162,6 +162,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("agent", "fork", super::agent::AGENT_FORK_USAGE),
     ("agent", "hibernate", "flk agent hibernate <target>"),
     ("agent", "resume", "flk agent resume <target>"),
+    ("agent", "result", super::agent::AGENT_RESULT_USAGE),
     (
         "msg",
         "send",

@@ -19,6 +19,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
+        "result" => agent_result(&args[1..]),
         "send" => agent_send(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
@@ -42,6 +43,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
+pub(super) const AGENT_RESULT_USAGE: &str =
+    "flk agent result <target> [--max-chars N] [--offset N]";
 pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
 
 pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
@@ -659,6 +662,49 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// `flk agent result` (#575): the reply an agent's newest turn ended on, and
+/// the `DONE:` / `BLOCKED:` / `VERDICT:` line it ends with — Claude and
+/// opencode alike. `--offset` pages a long report by characters.
+fn agent_result(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first().filter(|arg| !arg.starts_with("--")) else {
+        eprintln!("usage: {AGENT_RESULT_USAGE}");
+        return Ok(2);
+    };
+    let mut max_chars = None;
+    let mut offset = None;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--max-chars" | "--offset" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for {flag}");
+                    return Ok(2);
+                };
+                let parsed = Some(super::parse_u32_flag(flag, value)?);
+                if flag == "--offset" {
+                    offset = parsed;
+                } else {
+                    max_chars = parsed;
+                }
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:result".into(),
+        method: Method::AgentResult(crate::api::schema::AgentResultParams {
+            target: target.clone(),
+            max_chars,
+            offset,
+        }),
+    })?)
+}
+
 fn agent_wait_status_satisfied(desired: AgentStatus, current: &str) -> bool {
     match desired {
         AgentStatus::Idle => matches!(current, "idle" | "done"),
@@ -692,6 +738,13 @@ fn print_agent_help() {
     eprintln!("  flk agent list");
     eprintln!("  flk agent get <target>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  {AGENT_RESULT_USAGE}");
+    eprintln!(
+        "    the reply the agent's newest turn ended on (claude or opencode), with the status of"
+    );
+    eprintln!(
+        "    a final DONE: / BLOCKED: / VERDICT: line; `finished` says whether that turn is over"
+    );
     eprintln!("  flk agent send <target> <text>");
     eprintln!("  flk agent rename <target> <name>|--clear");
     eprintln!("  flk agent focus <target>");

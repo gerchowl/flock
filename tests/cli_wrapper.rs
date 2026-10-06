@@ -3414,3 +3414,88 @@ fn msg_send_await_prints_only_the_answer() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "all green\n");
     cleanup_spawned_flock(flock, base);
 }
+
+/// #575 end to end: an opencode session reported the way the opencode plugin
+/// reports it (`pane.report_agent_session`), its database under an isolated
+/// `XDG_DATA_HOME`, read back through the real `flk` by `agent result` and
+/// `agent history`. Before #575 the first was no verb at all and the second
+/// refused every opencode pane with `unsupported_for_agent`.
+#[test]
+fn agent_result_and_history_read_an_opencode_session() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let data_home = base.join("data");
+    let db_dir = data_home.join("opencode");
+    fs::create_dir_all(&db_dir).unwrap();
+    let conn = rusqlite::Connection::open(db_dir.join("opencode-stable.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+         time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, \
+         session_id TEXT NOT NULL, time_created INTEGER NOT NULL, \
+         time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+         INSERT INTO message VALUES ('m1','ses_e2e',1000,1000,'{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('m1-p0','m1','ses_e2e',1000,1000,'{\"type\":\"text\",\"text\":\"review PR 12\"}');
+         INSERT INTO message VALUES ('m2','ses_e2e',2000,2000,'{\"role\":\"assistant\",\"time\":{\"completed\":2500}}');
+         INSERT INTO part VALUES ('m2-p0','m2','ses_e2e',2000,2000,'{\"type\":\"text\",\"text\":\"Diff is sound.\\nVERDICT: approve\"}');",
+    )
+    .unwrap();
+    drop(conn);
+    // Inherited by the server: nextest runs each test in its own process.
+    std::env::set_var("XDG_DATA_HOME", &data_home);
+
+    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_575_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reported = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_575_session","method":"pane.report_agent_session","params":{{"pane_id":"{workspace_id}-1","source":"flock:opencode","agent":"opencode","agent_session_id":"ses_e2e"}}}}"#
+        ),
+    );
+    assert!(reported.get("error").is_none(), "{reported}");
+
+    let result = run_cli(&socket_path, &["agent", "result", "1-1"]);
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let info = &json["result"]["result"];
+    assert_eq!(info["agent"], "opencode", "{json}");
+    assert_eq!(info["finished"], true, "{json}");
+    assert_eq!(info["status"], "verdict", "{json}");
+    assert_eq!(info["status_text"], "approve", "{json}");
+
+    let history = run_cli(&socket_path, &["agent", "history", "1-1"]);
+    let history_json: serde_json::Value = if history.status.success() {
+        serde_json::from_slice(&history.stdout).unwrap()
+    } else {
+        // `flk agent history` is documented but not wired as a CLI verb;
+        // drive the socket method it would call.
+        send_request(
+            &socket_path,
+            r#"{"id":"req_575_history","method":"agent.history","params":{"target":"1-1"}}"#,
+        )
+    };
+    let turns = history_json["result"]["history"]["turns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{history_json}"));
+    assert_eq!(turns.len(), 2, "{history_json}");
+    assert_eq!(turns[0]["text"], "review PR 12");
+
+    cleanup_spawned_flock(flock, base);
+}

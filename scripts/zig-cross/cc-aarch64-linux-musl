@@ -1,0 +1,18 @@
+#!/bin/sh
+# C compiler for the aarch64-unknown-linux-musl release build (#575).
+#
+# The bundled SQLite (rusqlite) is C, and cc-rs has no default compiler for
+# this target; the gnu cross gcc would compile against glibc headers. zig is
+# a real musl cross compiler and is already installed in the release jobs.
+#
+# A wrapper rather than `CC="zig cc -target ..."`: cc-rs appends its own
+# `--target=aarch64-unknown-linux-musl`, a Rust triple zig cannot parse
+# ("UnknownOperatingSystem"), so that one argument is dropped here.
+for arg do
+  shift
+  case "$arg" in
+    --target=*) ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+exec zig cc -target aarch64-linux-musl "$@"
