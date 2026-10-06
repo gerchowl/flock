@@ -30,6 +30,9 @@ mod settings;
 mod sidebar;
 mod terminal;
 
+use self::modal::{
+    modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
+};
 pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
@@ -38,12 +41,6 @@ pub(crate) use self::{
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
-};
-use self::{
-    modal::{
-        modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
-    },
-    settings::SettingsAction,
 };
 use super::state::{AppState, Mode};
 use super::App;
@@ -306,31 +303,7 @@ impl App {
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
-                match action {
-                    SettingsAction::SaveTheme(name) => self.save_theme(&name),
-                    SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
-                    SettingsAction::SaveToastDelivery(delivery) => {
-                        self.save_toast_delivery(delivery)
-                    }
-                    SettingsAction::SaveAgentBorderLabels(enabled) => {
-                        self.save_agent_border_labels(enabled)
-                    }
-                    SettingsAction::SaveSidebarRowGap(gap) => self.save_sidebar_row_gap(gap),
-                    SettingsAction::SaveSidebarPaneGap(gap) => self.save_sidebar_pane_gap(gap),
-                    SettingsAction::SavePaneHistory(enabled) => {
-                        self.save_pane_history_persistence(enabled)
-                    }
-                    SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
-                        self.save_switch_ascii_input_source_in_prefix(enabled)
-                    }
-                    SettingsAction::SaveIdleSetting(setting, enabled) => {
-                        self.save_idle_setting(setting, enabled)
-                    }
-                    SettingsAction::SaveFileDrop(enabled) => self.save_file_drop(enabled),
-                    SettingsAction::InstallRecommendedIntegrations => {
-                        self.install_recommended_integrations()
-                    }
-                }
+                self.apply_settings_action(action);
             }
         }
         if previous_settings_section != crate::app::state::SettingsSection::Integrations

@@ -3083,6 +3083,85 @@ sidebar_pane_gap = 99
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// The overlay writes the TOML and the live config picks it up in ONE call
+    /// (#542). Both halves asserted together, because the setting rides on live
+    /// reload: a writer that saved without reloading would render correctly for
+    /// the rest of the session and silently revert on restart, and a reloader
+    /// without a writer would render for this session only.
+    #[test]
+    fn saving_an_agent_label_persists_then_applies_live_config() {
+        use crate::app::state::AgentLabelSetting;
+        use crate::config::AgentLabelConfig;
+        let _guard = config_env_guard();
+        let path = temp_config_path("settings-save-agent-label");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(app.state.spaces_agent_label(), AgentLabelConfig::Symbol);
+        assert_eq!(app.state.agents_agent_label(), AgentLabelConfig::Symbol);
+
+        // Through the REAL entry point — overlay open, section navigated, key
+        // pressed — rather than by calling the writer or the shared applier
+        // directly. Each of those would skip a hop this test exists to cover:
+        // the row the overlay puts the cursor on, the cycle, the dispatch, and
+        // the write.
+        app.state.settings.section = crate::app::state::SettingsSection::Sidebar;
+        app.state.settings.list.selected = 3;
+        assert_eq!(
+            AgentLabelSetting::Agents.value(&app.state),
+            AgentLabelConfig::Symbol,
+            "row 3 of the sidebar section is the agents agent-label row"
+        );
+        app.handle_settings_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.agents_agent_label(), AgentLabelConfig::Shortcut);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("agents_agent_label = \"shortcut\""));
+        assert!(
+            !content.contains("spaces_agent_label"),
+            "writing one section must not touch the other: {content}"
+        );
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The other direction: a value already in the file is what the overlay
+    /// reports as current, before anything is written. Otherwise a hand-edited
+    /// config would show the default in the settings panel and the first click
+    /// would overwrite the operator's own value.
+    #[test]
+    fn a_configured_agent_label_is_what_the_settings_overlay_reports() {
+        use crate::config::AgentLabelConfig;
+        let _guard = config_env_guard();
+        let path = temp_config_path("settings-agent-label-loaded");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "onboarding = false\n[ui]\nspaces_agent_label = \"shortcut\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.apply_config_from_disk(false);
+        assert_eq!(app.state.spaces_agent_label(), AgentLabelConfig::Shortcut);
+        assert_eq!(
+            app.state.agents_agent_label(),
+            AgentLabelConfig::Symbol,
+            "a key that was never written keeps its default"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_guard();

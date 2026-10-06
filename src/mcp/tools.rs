@@ -1078,12 +1078,72 @@ mod tests {
                 assert_eq!(params.agent, "claude");
                 assert_eq!(params.prompt, "review #42");
                 assert!(!params.focus, "an MCP spawn never steals operator focus");
+                assert_eq!(
+                    params.name, None,
+                    "an omitted name must stay omitted rather than becoming an empty label"
+                );
             }
             Method::AgentStart(_) => {
                 panic!("flock_agent_start must NOT build the raw-argv agent.start verb")
             }
             other => panic!("unexpected method: {other:?}"),
         }
+    }
+
+    /// The optional `name` used to be the one field of this tool no test
+    /// touched, which is exactly how a name could reach the child's
+    /// `agent_name` — where it outranks the detected harness — without anything
+    /// noticing. It is the value #542 is about, so it is pinned here at the
+    /// boundary it crosses (#542).
+    #[test]
+    fn flock_agent_start_carries_a_supplied_name_through_to_the_verb() {
+        let method = build_agent_start(json!({
+            "agent": "claude",
+            "prompt": "review #42",
+            "location": { "kind": "worktree_path", "path": "/w/flock/feature" },
+            "name": "researcher"
+        }))
+        .expect("valid args");
+
+        let Method::AgentSpawn(params) = method else {
+            panic!("expected AgentSpawn");
+        };
+        assert_eq!(
+            params.name.as_deref(),
+            Some("researcher"),
+            "the caller's label must survive the narrowing, or the child falls back to \
+             the harness and the label the model chose is silently dropped"
+        );
+    }
+
+    /// Absent and `null` are the same thing here; a wrong TYPE is a refusal.
+    /// Pinned because `name` is where a model's sloppiness would otherwise land:
+    /// silently coercing a number to a label would put `7` on the sidebar next
+    /// to an agent, and coercing silently is what makes the next step hard to
+    /// explain.
+    #[test]
+    fn flock_agent_start_reads_a_null_name_as_absent_and_refuses_a_wrong_type() {
+        let method = build_agent_start(json!({
+            "agent": "claude",
+            "prompt": "review #42",
+            "location": { "kind": "worktree_path", "path": "/w/flock/feature" },
+            "name": null
+        }))
+        .expect("a null optional name is absent, not a refusal");
+        let Method::AgentSpawn(params) = method else {
+            panic!("expected AgentSpawn");
+        };
+        assert_eq!(params.name, None);
+
+        let err = build_agent_start(json!({
+            "agent": "claude",
+            "prompt": "review #42",
+            "location": { "kind": "worktree_path", "path": "/w/flock/feature" },
+            "name": 7
+        }))
+        .expect_err("a non-string name must not be coerced into a label");
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("name"), "{}", err.message);
     }
 
     #[test]
