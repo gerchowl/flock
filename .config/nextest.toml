@@ -21,6 +21,12 @@
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# DIAGNOSTIC ONLY (#587 macOS hang): name and kill a hung settled-wait test.
+filter = 'binary(agent_settled) | binary(cli_wait_flags)'
+slow-timeout = { period = "20s", terminate-after = 3 }
+retries = 0
+
+[[profile.default.overrides]]
 # The federation hub/spoke and detach/reattach suites stand up multiple servers
 # + clients per test and race hardest under contention — serialize them.
 # live_handoff belongs here too: its live-handoff cases spawn a REPLACEMENT
