@@ -1,4 +1,4 @@
-//! Acceptance tests for package P578 r1 (#578): `flk delegate`, the plain
+//! Acceptance tests for package P578 r2 (#578): `flk delegate`, the plain
 //! wrapper over worktree/workspace + agent start + brief submit + settled
 //! wait + agent result + reap.
 //!
@@ -58,7 +58,21 @@ impl Drop for Server {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Bounded reap, as `tests/cli_wrapper.rs` does: a blocking
+        // `child.wait()` here never returns on macOS, and every test in the
+        // binary then hangs at teardown until CI cancels the job.
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let mut status = 0;
+                let result =
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if result == pid as libc::pid_t || result == -1 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
     }
@@ -147,9 +161,13 @@ fn start_server() -> Server {
     fs::create_dir_all(base.join("briefs")).unwrap();
     fs::create_dir_all(base.join("state")).unwrap();
     register_runtime_dir(&runtime_dir);
+    fs::create_dir_all(base.join("home")).unwrap();
     fs::write(
         config_home.join(app_dir_name()).join("config.toml"),
-        "onboarding = false\n",
+        format!(
+            "onboarding = false\n\n[worktrees]\ndirectory = \"{}\"\n",
+            base.join("wt").display()
+        ),
     )
     .unwrap();
     write_fake_opencode(&base);
@@ -170,6 +188,9 @@ fn start_server() -> Server {
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
     cmd.env("XDG_DATA_HOME", base.join("data"));
     cmd.env("XDG_STATE_HOME", base.join("state"));
+    cmd.env("HOME", base.join("home"));
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("PATH", search_path(&base));
     cmd.env("FLOCK_SOCKET_PATH", &socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
@@ -206,6 +227,10 @@ fn command(server: &Server, args: &[&str]) -> Command {
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env("XDG_STATE_HOME", server.base.join("state"))
         .env("XDG_DATA_HOME", server.base.join("data"))
+        .env("XDG_CONFIG_HOME", server.base.join("config"))
+        .env("HOME", server.base.join("home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("PATH", search_path(&server.base));
     cmd
 }
@@ -368,7 +393,8 @@ fn report_session(server: &Server, pane_id: &str) {
 
 /// Write one user message and one finished assistant reply, timed now.
 fn write_reply(server: &Server, turn: &str, text: &str) {
-    let conn = rusqlite::Connection::open(db_path(&server.base)).unwrap();
+    let mut conn = rusqlite::Connection::open(db_path(&server.base)).unwrap();
+    let tx = conn.transaction().unwrap();
     let at = now_ms() as i64;
     let user = format!("{turn}-u");
     let assistant = format!("{turn}-a");
@@ -377,26 +403,27 @@ fn write_reply(server: &Server, turn: &str, text: &str) {
     let reply_data =
         serde_json::json!({"role": "assistant", "time": {"completed": at + 1}}).to_string();
     let reply_part = serde_json::json!({"type": "text", "text": text}).to_string();
-    conn.execute(
+    tx.execute(
         "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
         rusqlite::params![user, SES, at, user_data],
     )
     .unwrap();
-    conn.execute(
+    tx.execute(
         "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
         rusqlite::params![format!("{user}-p"), user, SES, at, user_part],
     )
     .unwrap();
-    conn.execute(
+    tx.execute(
         "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
         rusqlite::params![assistant, SES, at + 1, reply_data],
     )
     .unwrap();
-    conn.execute(
+    tx.execute(
         "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
         rusqlite::params![format!("{assistant}-p"), assistant, SES, at + 1, reply_part],
     )
     .unwrap();
+    tx.commit().unwrap();
 }
 
 /// Play the plugin through readiness: the agent exists, names its session,
@@ -465,8 +492,12 @@ fn start_cwd(server: &Server, name: &str, brief_path: &str, extra: &[&str]) -> C
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(dir)
+        .env("HOME", dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
         .env("GIT_COMMITTER_NAME", "t")
@@ -571,6 +602,11 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
     let dollar_s = dollar.to_string_lossy().into_owned();
     let missing_s = missing.to_string_lossy().into_owned();
     let briefs_dir = server.base.join("briefs").to_string_lossy().into_owned();
+    let spaced_dir = server.base.join("briefs").join("two words");
+    fs::create_dir_all(&spaced_dir).unwrap();
+    let spaced = spaced_dir.join("b.md");
+    fs::write(&spaced, "x\n").unwrap();
+    let spaced_s = spaced.to_string_lossy().into_owned();
 
     let cases: Vec<Vec<&str>> = vec![
         vec!["delegate", "start", "u1", "--cwd", &work],
@@ -620,6 +656,15 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
         ],
         vec!["delegate", "send", "u1"],
         vec!["delegate"],
+        vec![
+            "delegate", "start", "u1", "--brief", &spaced_s, "--cwd", &work,
+        ],
+        vec![
+            "delegate", "start", "u1", "--brief", &good, "--cwd", &work, "--branch", "b",
+        ],
+        vec![
+            "delegate", "start", "u1", "--brief", &good, "--cwd", &work, "--after", "x",
+        ],
     ];
     for args in &cases {
         let out = cli(&server, args);
@@ -650,6 +695,17 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
         "harness refusal names the reason: {}",
         stderr(&harness)
     );
+    assert!(
+        stdout(&harness).is_empty(),
+        "a usage error prints nothing on stdout, even with --json"
+    );
+    for args in [
+        vec!["delegate", "--help"],
+        vec!["delegate", "start", "--help"],
+    ] {
+        let out = cli(&server, &args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+    }
     assert_eq!(
         workspaces(&server).len(),
         before,
@@ -731,6 +787,14 @@ fn a2_cwd_await_done_in_its_own_workspace() {
     assert!(
         state_files.iter().any(|p| p.ends_with("d1.json")),
         "a registry entry was written: {state_files:?}"
+    );
+    let delegate_ws = after
+        .iter()
+        .find(|ws| ws["workspace_id"] == json["workspace_id"])
+        .expect("the delegate's workspace is listed");
+    assert_eq!(
+        delegate_ws["pane_count"], 1,
+        "the workspace holds the agent alone, no leftover shell: {delegate_ws}"
     );
 }
 
@@ -1096,6 +1160,7 @@ fn a9_non_delegates_are_refused() {
         vec!["delegate", "send", "mine", "--brief", b.as_str()],
         vec!["delegate", "wait", "mine", "--timeout", "500"],
         vec!["delegate", "status", "mine"],
+        vec!["delegate", "result", "mine"],
     ] {
         let out = cli(&server, &args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
@@ -1282,4 +1347,137 @@ fn a13_closed_pane_is_gone() {
     let out = finish(child);
     assert_eq!(status.code(), Some(4), "stderr {}", stderr(&out));
     assert_eq!(stdout_json(&out)["outcome"], "gone");
+}
+
+/// E14: a delegate name must be a safe file name: letters, digits, `.`, `_`,
+/// `-`, starting with a letter or digit, at most 64 characters.
+#[test]
+fn a14_unsafe_names_are_usage_errors() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let work = work_dir(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let long = "n".repeat(65);
+    for name in ["../x", "a/b", ".hidden", "-dash", "sp ace", long.as_str()] {
+        let out = cli(
+            &server,
+            &["delegate", "start", name, "--brief", &b, "--cwd", &work],
+        );
+        assert_eq!(out.status.code(), Some(2), "{name:?}: {}", stderr(&out));
+    }
+    assert_eq!(workspaces(&server).len(), before);
+    assert!(walk(&server.base.join("state")).is_empty());
+}
+
+/// E15: one round at a time: a `send` while a round is being awaited is
+/// refused as busy and types nothing.
+#[test]
+fn a15_send_while_a_round_is_awaited_is_busy() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(
+        &server,
+        "d1",
+        &b,
+        &["--await", "--timeout", "30000", "--json"],
+    );
+    let pane = make_ready(&server, "d1");
+    wait_typed(&server, 1);
+    let r1 = brief(&server, "r1.md", "y\n");
+    let busy = cli(&server, &["delegate", "send", "d1", "--brief", &r1]);
+    assert_eq!(busy.status.code(), Some(1), "{}", stderr(&busy));
+    assert!(stderr(&busy).contains("busy"), "{}", stderr(&busy));
+    play_turn(&server, &pane, "t1", "DONE: one");
+    let status = exited_within(&mut child, WITHIN).expect("round 1 returns");
+    assert_eq!(status.code(), Some(0));
+    finish(child);
+    assert_eq!(typed(&server).len(), 1, "the busy send typed nothing");
+}
+
+/// E16: the screen goes idle before opencode has written the reply (the
+/// normal plugin order): `no_result` inside the grace is "not yet".
+#[test]
+fn a16_reply_written_after_idle_is_still_reported() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(
+        &server,
+        "d1",
+        &b,
+        &["--await", "--timeout", "30000", "--json"],
+    );
+    let pane = make_ready(&server, "d1");
+    wait_typed(&server, 1);
+    report(&server, &pane, "working");
+    thread::sleep(Duration::from_millis(100));
+    report(&server, &pane, "idle");
+    thread::sleep(Duration::from_millis(4 * SETTLE_MS));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "no reply yet: the await keeps polling"
+    );
+    write_reply(&server, "t1", "DONE: late reply");
+    let status = exited_within(&mut child, WITHIN).expect("the await returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    assert_eq!(stdout_json(&out)["status_text"], "late reply");
+}
+
+/// E17: reap in worktree mode still removes the checkout when the
+/// delegate's workspace was already closed by hand.
+#[test]
+fn a17_reap_after_the_workspace_was_closed_removes_the_checkout() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w1",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/p578-w2",
+            "--json",
+        ],
+    );
+    make_ready(&server, "w1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    let json = stdout_json(&finish(child));
+    let worktree = PathBuf::from(json["worktree"].as_str().expect("worktree path"));
+    let workspace_id = json["workspace_id"].as_str().unwrap().to_string();
+    let closed = request(
+        &server,
+        &format!(
+            r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{workspace_id}"}}}}"#
+        ),
+    );
+    assert!(closed.get("error").is_none(), "{closed}");
+    assert!(
+        worktree.exists(),
+        "closing the workspace leaves the checkout"
+    );
+
+    let reaped = cli(&server, &["delegate", "reap", "w1", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    assert!(!worktree.exists(), "the checkout is removed by path");
+    assert!(
+        !walk(&server.base.join("state"))
+            .iter()
+            .any(|p| p.ends_with("w1.json")),
+        "the registry entry is removed"
+    );
 }
