@@ -88,9 +88,9 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           # The bundled SQLite (rusqlite, #575) is C: cc-rs has no default
           # aarch64-musl compiler, and the gnu one would compile against glibc
-          # headers. zig is already installed above and is a real musl cross cc.
-          echo "CC_aarch64_unknown_linux_musl=zig cc -target aarch64-linux-musl" >> $GITHUB_ENV
-          echo "AR_aarch64_unknown_linux_musl=zig ar" >> $GITHUB_ENV
+          # headers. zig is installed above; scripts/zig-cross says why it is wrapped.
+          echo "CC_aarch64_unknown_linux_musl=$GITHUB_WORKSPACE/scripts/zig-cross/cc-aarch64-linux-musl" >> $GITHUB_ENV
+          echo "AR_aarch64_unknown_linux_musl=$GITHUB_WORKSPACE/scripts/zig-cross/ar" >> $GITHUB_ENV
 
       - name: Remove Zig caches
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
