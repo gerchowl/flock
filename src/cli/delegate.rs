@@ -1,0 +1,2187 @@
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+)]
+//! #578 — `flk delegate`, a whole task handed to an agent, in one command.
+//!
+//! ## What this is
+//!
+//! The commands an operator runs to put an agent to work, in the order they run
+//! them: make a checkout, make a space for it, start the harness in it, wait
+//! until it is actually up, type the task, wait for it to settle, read the
+//! answer, and eventually throw the checkout away. Six socket verbs and a
+//! remembered cursor between each pair. That is a script, and the script was
+//! living in somebody's shell history.
+//!
+//! `flk delegate` is that script, composed client-side out of the socket methods
+//! that already exist. No new socket method, no server change, no new
+//! dependency: every claim in the docs is checkable against a method `flk agent
+//! wait` or `flk worktree kill` already used. What the composition adds is the
+//! part that was never written down anywhere — which cursor belongs to which
+//! round, which errors mean "not yet", what a bare `idle` does and does not say,
+//! and what has to be cleaned up if the start fails halfway.
+//!
+//! ## Why `delegate start`, not `delegate <name>`
+//!
+//! The issue sketched `flk delegate <name>`. A verb that is both a group and an
+//! action makes the six action verbs unreachable by name, and `flk delegate
+//! wait` has to mean something specific. `start` is what `flk agent start` does,
+//! and the subverb keeps the six verbs in the help table where a reader is
+//! already looking.
+//!
+//! ## The two things that are easy to get wrong
+//!
+//! **Focus.** A delegate never asks for focus, and never runs in the workspace
+//! the operator is looking at. `workspace.create` and `worktree.create` are both
+//! sent with `focus: false`, so a delegate lands beside the operator rather than
+//! under their cursor. Creating the first workspace on an empty server, and
+//! reaping a workspace somebody focused by hand, follow the server's own rules —
+//! the delegate does not override them.
+//!
+//! **A bare `idle` is not an answer.** Settling is not finishing: an agent goes
+//! quiet between its tool calls. So an await settles, then waits a further grace
+//! for a reply whose recorded time is at or after this round's submit, and only
+//! then reports one. A round is therefore reported only when the agent actually
+//! entered `working` after that round's cursor AND a reply exists from after the
+//! submit — which is what `settled` alone would have let it get wrong.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use std::os::unix::fs::PermissionsExt;
+
+use crate::api::client::ApiClient;
+use crate::api::schema::{
+    AgentResultParams, AgentStartParams, AgentTarget, Method, PaneTarget, Request,
+    WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
+};
+
+use super::settled::{Cursor, PinnedTarget, SettleTarget};
+
+/// `delegate start`'s usage. A `pub(super) const` rather than a literal in the
+/// help table so `flk delegate start --help` and `flk delegate --help` cannot
+/// answer two different things.
+pub(super) const START_USAGE: &str = concat!(
+    "flk delegate start <name> --brief FILE (--cwd PATH | --worktree [--repo PATH] [--branch B] [--base REF])\n",
+    "                     [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]\n",
+    "                     [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
+    "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
+    "  --worktree          run in a fresh linked worktree: --repo, --branch, --base\n",
+    "  --await             stay and report the round's outcome instead of returning after the submit\n",
+    "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
+    "  --settle MS         how long the agent's quiet must hold, default 5000\n",
+    "  --ready-timeout MS  how long the agent may take to become ready and reach its prompt, default 60000\n",
+    "  --max-chars N       characters of the reply to print, default 4000\n",
+    "  the delegate runs in a workspace it created, never in the focused one, and never asks for focus",
+);
+
+pub(super) const SEND_USAGE: &str = concat!(
+    "flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS]\n",
+    "                    [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "  one round at a time: a send while another round is being awaited is refused as busy\n",
+    "  --ready-timeout MS  how long the agent may take to reach its prompt, default 60000",
+);
+
+pub(super) const WAIT_USAGE: &str = concat!(
+    "flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]\n",
+    "  without --after it waits from the cursor the delegate recorded with its latest submit\n",
+    "  --timeout MS        counted from this command, not from the submit that started the round",
+);
+
+pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
+pub(super) const STATUS_USAGE: &str = "flk delegate status <name> [--json]";
+pub(super) const REAP_USAGE: &str = concat!(
+    "flk delegate reap <name> [--force] [--json]\n",
+    "  removes only the workspace and checkout recorded at start; needs no live agent",
+);
+
+/// How long after a settle the delegate keeps looking for the reply.
+///
+/// The gap between "the agent went quiet" and "opencode has written the reply":
+/// the TUI clears its spinner first and the plugin commits the transcript after.
+const RESULT_GRACE: Duration = Duration::from_secs(10);
+
+/// How often the grace asks for the reply.
+const RESULT_POLL: Duration = Duration::from_millis(250);
+
+/// How often the readiness gate asks whether the agent is at its prompt.
+const READY_POLL: Duration = Duration::from_millis(200);
+
+/// `delegate`'s own exit codes.
+///
+/// `0`/`3`/`4`/`124` are `settled::exit`, shared with the two wait verbs so a
+/// supervisor reading one exit code reads it the same way. `5` and `6` are the
+/// delegate's own and live here rather than in `settled`, because nothing else
+/// means them.
+mod exit {
+    /// A finished reply, `no_result`, or an unfinished one under `result`.
+    pub(super) const OK: i32 = 0;
+    /// A usage error, a refused cursor, or something that is not a delegate.
+    pub(super) const USAGE: i32 = 2;
+    /// A held `blocked` — the agent is sitting on a prompt a human must answer.
+    pub(super) const AGENT_BLOCKED: i32 = 6;
+    /// A finished reply with no `DONE:` / `BLOCKED:` / `VERDICT:` line, or a
+    /// settle with no reply at all inside the grace.
+    pub(super) const NO_SENTINEL: i32 = 5;
+}
+
+/// Characters a brief path may not contain.
+///
+/// The brief sentence is TYPED into a terminal, so the path travels through two
+/// shells' worth of interpretation on its way to the agent's input box: the one
+/// that runs the agent, and whatever the agent itself runs. A path containing
+/// any of these is refused rather than escaped, because a quote that survives one
+/// of those two hops is a different string by the time the agent reads it (#566).
+const UNSAFE_PATH_CHARS: [char; 6] = ['!', '$', '`', '\u{22}', '\'', '\\'];
+
+/// `agent.result` errors that mean "the reply is not written yet".
+///
+/// Every one of these is a statement about the store rather than about the
+/// turn, and all of them are ordinary in the seconds between the agent going
+/// quiet and its plugin committing the transcript. Treating any of them as a
+/// failure would make a normal turn a `result` error; treating a real refusal as
+/// "not yet" would make the grace hang until the deadline and then report
+/// `no_result`, which is a lie about a server that answered.
+///
+/// `no_agent_session` is the no-session refusal: the pane has not reported a
+/// session yet, so there is no store to read.
+const NOT_YET_CODES: [&str; 4] = [
+    "no_result",
+    "transcript_not_found",
+    "transcript_unreadable",
+    "no_agent_session",
+];
+
+pub(super) fn run_delegate_command(args: &[String]) -> io::Result<i32> {
+    let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
+        print_delegate_help();
+        return Ok(exit::USAGE);
+    };
+
+    match subcommand {
+        "start" => delegate_start(&args[1..]),
+        "send" => delegate_send(&args[1..]),
+        "wait" => delegate_wait(&args[1..]),
+        "result" => delegate_result(&args[1..]),
+        "status" => delegate_status(&args[1..]),
+        "reap" => delegate_reap(&args[1..]),
+        "help" | "--help" | "-h" => {
+            print_delegate_help();
+            Ok(0)
+        }
+        _ => {
+            print_delegate_help();
+            Ok(exit::USAGE)
+        }
+    }
+}
+
+fn print_delegate_help() {
+    eprintln!("flk delegate commands:");
+    eprintln!("  {START_USAGE}");
+    eprintln!("  {SEND_USAGE}");
+    eprintln!("  {WAIT_USAGE}");
+    eprintln!("  {RESULT_USAGE}");
+    eprintln!("  {STATUS_USAGE}");
+    eprintln!("  {REAP_USAGE}");
+}
+
+/// A usage error: the line on stderr, exit 2, and nothing created.
+///
+/// Every refusal in this module goes through here so that no parse failure can
+/// print on stdout — with or without `--json`, a caller piping stdout gets either
+/// the object it asked for or nothing at all, never a diagnostic.
+fn usage(reason: impl std::fmt::Display) -> i32 {
+    eprintln!("{reason}");
+    exit::USAGE
+}
+
+fn fail(reason: impl std::fmt::Display) -> i32 {
+    eprintln!("{reason}");
+    1
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------- registry
+
+/// What a delegate recorded at start and updated with every round.
+///
+/// The file is the only thing that makes a name a delegate (P13): without it,
+/// `flk delegate send` would type into anything the server happens to call that.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Entry {
+    name: String,
+    terminal_id: String,
+    pane_id: String,
+    workspace_id: String,
+    mode: String,
+    worktree: Option<String>,
+    branch: Option<String>,
+    harness: String,
+    model: Option<String>,
+    round: u64,
+    brief: String,
+    submitted_at_ms: u64,
+    /// Captured BEFORE the latest submit, so a caller that times out can resume
+    /// from it and cannot double-count the turn it already waited for.
+    cursor: String,
+    created_at_ms: u64,
+}
+
+/// The directory holding this server's delegates: one file per name, under the
+/// process's own state dir.
+///
+/// Keyed by the socket path rather than a server name because the socket path is
+/// the thing a client actually connects to — two sessions, two sockets, two
+/// delegates with the same name, and a shared registry would have them closing
+/// each other's workspaces.
+fn registry_dir() -> PathBuf {
+    crate::config::state_dir()
+        .join("delegates")
+        .join(server_key())
+}
+
+/// FNV-1a 64 over the socket path string, as 16 lowercase hex digits.
+///
+/// Not canonicalized on purpose: the socket is addressed by the string the CLI
+/// was given, and two spellings of the same file are two connections for this
+/// purpose. Sixteen hex digits keeps the directory name a safe file name on
+/// every platform without a lossy short form.
+fn server_key() -> String {
+    let path = ApiClient::local().socket_path();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn entry_path(name: &str) -> PathBuf {
+    registry_dir().join(format!("{name}.json"))
+}
+
+fn lock_path(name: &str) -> PathBuf {
+    registry_dir().join(format!("{name}.lock"))
+}
+
+fn read_entry(name: &str) -> Option<Entry> {
+    let body = std::fs::read_to_string(entry_path(name)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Write the entry atomically at mode 0600.
+///
+/// The mode is set before the rename, so the file is never briefly world-readable
+/// — a registry entry names a checkout and a session. The rename is what makes
+/// the update atomic: a `delegate status` running against a half-written file
+/// reads the previous round, not a prefix of the next one.
+fn write_entry(entry: &Entry) -> io::Result<()> {
+    let path = entry_path(&entry.name);
+    let dir = path.parent().expect("the entry path always has a parent");
+    std::fs::create_dir_all(dir)?;
+    let temp = dir.join(format!(".{}.json.tmp", entry.name));
+    let body = serde_json::to_vec(entry).map_err(|err| {
+        io::Error::other(format!("could not serialize the registry entry: {err}"))
+    })?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temp, &path)
+}
+
+/// The exclusive lock one round at a time is enforced with.
+///
+/// Held by an open `File` for the whole command, through the await: the two
+/// ways a second round could start are a second `start`/`send` and a second
+/// process, and only an OS lock catches the second. `try_lock` rather than
+/// `lock` because a busy delegate is an answer, not a queue: blocking here would
+/// turn `delegate send` into an unbounded wait nobody asked for.
+struct Lock {
+    /// Held open and never dropped early: the lock exists for exactly as long as
+    /// the `File` does, so closing it early would hand a second round the
+    /// delegate while this one is still typing into it.
+    _file: std::fs::File,
+}
+
+fn take_lock(name: &str) -> Result<Lock, &'static str> {
+    let path = lock_path(name);
+    let Some(dir) = path.parent() else {
+        return Err("the lock path has no parent");
+    };
+    std::fs::create_dir_all(dir).map_err(|_| "could not create the delegate registry directory")?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| "could not open the delegate lock")?;
+    match file.try_lock() {
+        Ok(()) => Ok(Lock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err("busy"),
+        Err(std::fs::TryLockError::Error(_)) => Err("could not lock"),
+    }
+}
+
+// ------------------------------------------------------------------ flags
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StartFlags {
+    brief: Option<String>,
+    cwd: Option<String>,
+    worktree: bool,
+    repo: Option<String>,
+    branch: Option<String>,
+    base: Option<String>,
+    harness: Option<String>,
+    model: Option<String>,
+    await_result: bool,
+    timeout_ms: Option<u64>,
+    settle_ms: Option<u64>,
+    ready_timeout_ms: Option<u64>,
+    max_chars: Option<u32>,
+    json: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SendFlags {
+    brief: Option<String>,
+    await_result: bool,
+    timeout_ms: Option<u64>,
+    settle_ms: Option<u64>,
+    ready_timeout_ms: Option<u64>,
+    max_chars: Option<u32>,
+    json: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WaitFlags {
+    after: Option<String>,
+    timeout_ms: Option<u64>,
+    settle_ms: Option<u64>,
+    max_chars: Option<u32>,
+    json: bool,
+}
+
+/// What one verb accepts, and what each of its flags means.
+///
+/// One table rather than six parse loops, because every verb accepts a subset of
+/// the same set and a hand-copied parser is how `--ready-timeout` ends up
+/// documented on `start` and unknown to `send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Start,
+    Send,
+    Wait,
+    Result,
+    Status,
+    Reap,
+}
+
+impl Verb {
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Start => START_USAGE,
+            Self::Send => SEND_USAGE,
+            Self::Wait => WAIT_USAGE,
+            Self::Result => RESULT_USAGE,
+            Self::Status => STATUS_USAGE,
+            Self::Reap => REAP_USAGE,
+        }
+    }
+
+    fn accepts(self, flag: &str) -> bool {
+        match flag {
+            "--json" => true,
+            "--max-chars" => !matches!(self, Self::Status | Self::Reap),
+            "--await" => matches!(self, Self::Start | Self::Send),
+            "--timeout" => matches!(self, Self::Start | Self::Send | Self::Wait),
+            "--settle" => matches!(self, Self::Start | Self::Send | Self::Wait),
+            "--ready-timeout" => matches!(self, Self::Start | Self::Send),
+            "--brief" => matches!(self, Self::Start | Self::Send),
+            "--cwd" | "--worktree" | "--repo" | "--branch" | "--base" | "--harness" | "--model" => {
+                self == Self::Start
+            }
+            "--after" => self == Self::Wait,
+            "--force" => self == Self::Reap,
+            _ => false,
+        }
+    }
+}
+
+/// Parse one verb's flags, after the name.
+///
+/// A flag the verb does not accept is a usage error rather than a value, so
+/// `--after` on `start` cannot be silently read as something else.
+fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
+    let mut flags = Parsed::default();
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !verb.accepts(flag) {
+            return Err(format!(
+                "unknown option for `flk delegate {}`: {flag}\nusage: {}",
+                verb_word(verb),
+                verb.usage()
+            ));
+        }
+        let value = |index: &mut usize| -> Result<String, String> {
+            let next = args
+                .get(*index + 1)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {flag}"))?;
+            *index += 2;
+            Ok(next)
+        };
+        match flag {
+            "--json" => {
+                flags.json = true;
+                index += 1;
+            }
+            "--await" => {
+                flags.await_result = true;
+                index += 1;
+            }
+            "--worktree" => {
+                flags.worktree = true;
+                index += 1;
+            }
+            "--force" => {
+                flags.force = true;
+                index += 1;
+            }
+            "--timeout" => flags.timeout_ms = Some(number(flag, &value(&mut index)?)?),
+            "--settle" => flags.settle_ms = Some(number(flag, &value(&mut index)?)?),
+            "--ready-timeout" => flags.ready_timeout_ms = Some(number(flag, &value(&mut index)?)?),
+            "--max-chars" => flags.max_chars = Some(number(flag, &value(&mut index)?)?),
+            "--brief" => flags.brief = Some(value(&mut index)?),
+            "--cwd" => flags.cwd = Some(value(&mut index)?),
+            "--repo" => flags.repo = Some(value(&mut index)?),
+            "--branch" => flags.branch = Some(value(&mut index)?),
+            "--base" => flags.base = Some(value(&mut index)?),
+            "--harness" => flags.harness = Some(value(&mut index)?),
+            "--model" => flags.model = Some(value(&mut index)?),
+            "--after" => flags.after = Some(value(&mut index)?),
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    Ok(flags)
+}
+
+fn verb_word(verb: Verb) -> &'static str {
+    match verb {
+        Verb::Start => "start",
+        Verb::Send => "send",
+        Verb::Wait => "wait",
+        Verb::Result => "result",
+        Verb::Status => "status",
+        Verb::Reap => "reap",
+    }
+}
+
+fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
+    value
+        .parse::<T>()
+        .map_err(|_| format!("invalid value for {flag}: {value}"))
+}
+
+/// Every flag, in one flat struct. Six verbs over one flag set: a struct per
+/// verb would be six types to keep in step for no gain, since each verb's parser
+/// already rejects the flags it does not take.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Parsed {
+    brief: Option<String>,
+    cwd: Option<String>,
+    worktree: bool,
+    repo: Option<String>,
+    branch: Option<String>,
+    base: Option<String>,
+    harness: Option<String>,
+    model: Option<String>,
+    after: Option<String>,
+    await_result: bool,
+    timeout_ms: Option<u64>,
+    settle_ms: Option<u64>,
+    ready_timeout_ms: Option<u64>,
+    max_chars: Option<u32>,
+    force: bool,
+    json: bool,
+}
+
+fn as_start(flags: &Parsed) -> StartFlags {
+    StartFlags {
+        brief: flags.brief.clone(),
+        cwd: flags.cwd.clone(),
+        worktree: flags.worktree,
+        repo: flags.repo.clone(),
+        branch: flags.branch.clone(),
+        base: flags.base.clone(),
+        harness: flags.harness.clone(),
+        model: flags.model.clone(),
+        await_result: flags.await_result,
+        timeout_ms: flags.timeout_ms,
+        settle_ms: flags.settle_ms,
+        ready_timeout_ms: flags.ready_timeout_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+}
+
+fn as_send(flags: &Parsed) -> SendFlags {
+    SendFlags {
+        brief: flags.brief.clone(),
+        await_result: flags.await_result,
+        timeout_ms: flags.timeout_ms,
+        settle_ms: flags.settle_ms,
+        ready_timeout_ms: flags.ready_timeout_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+}
+
+fn as_wait(flags: &Parsed) -> WaitFlags {
+    WaitFlags {
+        after: flags.after.clone(),
+        timeout_ms: flags.timeout_ms,
+        settle_ms: flags.settle_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+}
+
+// -------------------------------------------------------------- validation
+
+/// A delegate name has to be safe as a file name and safe to type.
+///
+/// The registry stores one `<name>.json` per delegate and one lock beside it, so
+/// a name carrying a separator or a dot would either escape the directory or name
+/// a hidden file. Both are refused rather than escaped.
+fn validate_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err("a delegate needs a name".to_string());
+    };
+    let head_ok = first.is_ascii_alphanumeric();
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if head_ok && rest_ok && name.len() <= 64 {
+        return Ok(());
+    }
+    Err(format!(
+        "delegate name {name:?} must be 1-64 characters of letters, digits, dot, underscore or \
+         dash, starting with a letter or digit"
+    ))
+}
+
+/// The only harness this build drives.
+fn validate_harness(harness: Option<&str>) -> Result<&'static str, String> {
+    match harness {
+        None | Some("opencode") => Ok("opencode"),
+        Some(other) => Err(format!("harness {other} is not supported yet")),
+    }
+}
+
+/// Check the placement flags say exactly one thing.
+fn validate_placement(flags: &StartFlags) -> Result<Mode, String> {
+    let named = flags.cwd.is_some() as usize + flags.worktree as usize;
+    if named != 1 {
+        return Err("pass exactly one of --cwd PATH or --worktree".to_string());
+    }
+    if flags.worktree {
+        Ok(Mode::Worktree)
+    } else {
+        Ok(Mode::Cwd)
+    }
+}
+
+/// `--repo`, `--branch` and `--base` only mean something with `--worktree`.
+///
+/// With `--cwd` there is no checkout to branch, so accepting them would be
+/// accepting a flag that cannot be honoured — the same reason
+/// `--ready-timeout` needs `--wait-ready` on `agent start`.
+fn validate_worktree_flags(flags: &StartFlags) -> Result<(), String> {
+    if flags.cwd.is_some() {
+        for (flag, value) in [
+            ("--repo", &flags.repo),
+            ("--branch", &flags.branch),
+            ("--base", &flags.base),
+        ] {
+            if value.is_some() {
+                return Err(format!("{flag} only means something with --worktree"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The brief path, made absolute, checked, and returned as the one sentence to
+/// type.
+///
+/// Absolute without resolving symlinks: the sentence names the path the caller
+/// wrote, and canonicalizing it would type a path nobody asked for on a machine
+/// where the two differ.
+fn prepare_brief(path: &str) -> Result<(String, String), String> {
+    let absolute = std::path::absolute(Path::new(path))
+        .map_err(|err| format!("brief path {path:?} could not be made absolute: {err}"))?;
+    let text = absolute
+        .to_str()
+        .ok_or_else(|| format!("brief path {path:?} is not valid UTF-8"))?
+        .to_string();
+    for character in text.chars() {
+        if character.is_whitespace()
+            || character.is_control()
+            || UNSAFE_PATH_CHARS.contains(&character)
+        {
+            return Err(format!(
+                "brief path contains a character that is unsafe to type: {text}"
+            ));
+        }
+    }
+    let metadata = std::fs::metadata(&absolute)
+        .map_err(|err| format!("brief {text} cannot be read: {err}"))?;
+    if !metadata.is_file() {
+        return Err(format!("brief {text} is not a regular file"));
+    }
+    let sentence = format!("Read {text} and execute it exactly.");
+    Ok((text, sentence))
+}
+
+// --------------------------------------------------------------- requests
+
+fn request(method: Method) -> io::Result<serde_json::Value> {
+    let id = "cli:delegate";
+    super::send_request(&Request {
+        id: id.into(),
+        method,
+    })
+}
+
+fn agent_record(target: &str) -> Option<serde_json::Value> {
+    let response = request(Method::AgentGet(AgentTarget {
+        target: target.to_string(),
+    }))
+    .ok()?;
+    response
+        .pointer("/result/agent")
+        .filter(|record| record.is_object())
+        .cloned()
+}
+
+fn field<'a>(record: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    record.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// A field at a JSON pointer, for the places the answer is nested inside a
+/// result object rather than sitting beside the other agent fields.
+fn at<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    value.pointer(pointer).and_then(serde_json::Value::as_str)
+}
+
+fn workspace_exists(workspace_id: &str) -> bool {
+    request(Method::WorkspaceGet(WorkspaceTarget {
+        workspace_id: workspace_id.to_string(),
+    }))
+    .map(|response| response.get("error").is_none())
+    .unwrap_or(false)
+}
+
+// ------------------------------------------------------------------ start
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Worktree,
+    Cwd,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Worktree => "worktree",
+            Self::Cwd => "cwd",
+        }
+    }
+}
+
+/// The workspace a delegate start created, before any agent is in it.
+struct Placement {
+    workspace_id: String,
+    /// The checkout the agent runs in: the new worktree, or the `--cwd` path.
+    cwd: String,
+    worktree: Option<String>,
+    branch: Option<String>,
+    root_pane: String,
+}
+
+fn place(flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
+    let response = match mode {
+        Mode::Worktree => {
+            let repo = match &flags.repo {
+                Some(repo) => repo.clone(),
+                None => std::env::current_dir()
+                    .map(|cwd| cwd.display().to_string())
+                    .map_err(|err| fail(format!("could not read the current directory: {err}")))?,
+            };
+            request(Method::WorktreeCreate(WorktreeCreateParams {
+                cwd: Some(repo),
+                branch: flags.branch.clone(),
+                base: flags.base.clone(),
+                focus: false,
+                ..WorktreeCreateParams::default()
+            }))
+        }
+        Mode::Cwd => {
+            let cwd = flags
+                .cwd
+                .clone()
+                .expect("placement was validated before anything was created");
+            request(Method::WorkspaceCreate(WorkspaceCreateParams {
+                cwd: Some(cwd),
+                focus: false,
+                label: None,
+            }))
+        }
+    };
+    let response = response.map_err(fail)?;
+    if let Some(error) = response.get("error") {
+        return Err(fail(server_error(error)));
+    }
+    let Some(workspace_id) = at(&response, "/result/workspace/workspace_id").map(str::to_string)
+    else {
+        return Err(fail(
+            "the server created the workspace but named no workspace_id",
+        ));
+    };
+    let Some(root_pane) = at(&response, "/result/root_pane/pane_id").map(str::to_string) else {
+        return Err(fail(
+            "the server created the workspace but named no root pane",
+        ));
+    };
+    let worktree = at(&response, "/result/worktree/path").map(str::to_string);
+    let branch = flags.branch.clone();
+    let cwd = worktree.clone().unwrap_or_else(|| {
+        flags
+            .cwd
+            .clone()
+            .expect("cwd mode always carries the path it was given")
+    });
+    Ok(Placement {
+        workspace_id,
+        cwd,
+        worktree,
+        branch,
+        root_pane,
+    })
+}
+
+/// Every workspace the server currently lists, by id.
+fn workspace_ids() -> Vec<String> {
+    request(Method::WorkspaceList(
+        crate::api::schema::EmptyParams::default(),
+    ))
+    .ok()
+    .and_then(|response| {
+        response
+            .pointer("/result/workspaces")
+            .and_then(|workspaces| workspaces.as_array())
+            .cloned()
+    })
+    .map(|workspaces| {
+        workspaces
+            .iter()
+            .filter_map(|workspace| field(workspace, "workspace_id").map(str::to_string))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Undo a start, and put the workspace list back the way it was.
+///
+/// Two steps, because `worktree.create` may open a workspace besides the one the
+/// delegate asked for: it creates a workspace for the repository root when no
+/// workspace has that repository open, so that the new checkout has a parent to
+/// belong to. Killing the delegate's own workspace leaves that parent behind, and
+/// a failed start that leaves a workspace behind is a start that half happened.
+///
+/// Closing is restricted to workspaces that appeared AFTER the delegate's
+/// placement call and are not the one it created — so it can only ever close
+/// something its own start brought into being, never a workspace the operator
+/// opened while the delegate was starting.
+fn rollback(name: &str, placement: &Placement, before: &[String]) {
+    if let Err(err) = tear_down(placement, true) {
+        eprintln!("delegate {name}: rollback also failed: {err}");
+    }
+    let own = &placement.workspace_id;
+    let extra: Vec<String> = workspace_ids()
+        .into_iter()
+        .filter(|id| id != own && !before.contains(id))
+        .collect();
+    for workspace_id in extra {
+        let _ = request(Method::WorkspaceClose(WorkspaceTarget { workspace_id }));
+    }
+}
+
+/// Everything a failed start created, torn down through one routine.
+///
+/// The same routine `delegate reap` runs, deliberately (D1): a rollback and a
+/// reap ask the same question — remove the workspace this delegate owns, and its
+/// checkout if it made one — so two copies of it would be two answers to it, and
+/// the one that mattered is the one nobody ran by hand.
+fn tear_down(placement: &Placement, force: bool) -> io::Result<()> {
+    match placement.worktree.clone() {
+        Some(path) => {
+            let kill = |workspace_id: Option<&str>, path: Option<&str>| {
+                request(Method::WorktreeKill(WorktreeKillParams {
+                    workspace_id: workspace_id.map(str::to_string),
+                    path: path.map(str::to_string),
+                    force,
+                    caller_pid: Some(std::process::id()),
+                    ..WorktreeKillParams::default()
+                }))
+            };
+            let response = kill(Some(&placement.workspace_id), None)?;
+            // The workspace may already be gone — the harness died and took it,
+            // or the operator closed it. The checkout is still ours to remove,
+            // and `worktree.kill` reaches it by path.
+            if is_error_code(&response, "workspace_not_found") {
+                let _ = kill(None, Some(&path));
+            }
+        }
+        None => {
+            let _ = request(Method::WorkspaceClose(WorkspaceTarget {
+                workspace_id: placement.workspace_id.clone(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn is_error_code(response: &serde_json::Value, code: &str) -> bool {
+    response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        == Some(code)
+}
+
+fn server_error(error: &serde_json::Value) -> String {
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("error");
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("the server refused the request");
+    format!("{code}: {message}")
+}
+
+fn delegate_start(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", START_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Start, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let flags = as_start(&flags);
+
+    // Every refusal below this line happens before a single request that could
+    // create anything — including before the registry directory exists, so a
+    // typo leaves the state directory byte-for-byte as it found it.
+    if let Err(reason) = validate_name(name) {
+        return Ok(usage(reason));
+    }
+    let mode = match validate_placement(&flags) {
+        Ok(mode) => mode,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    if let Err(reason) = validate_worktree_flags(&flags) {
+        return Ok(usage(reason));
+    }
+    let harness = match validate_harness(flags.harness.as_deref()) {
+        Ok(harness) => harness,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let Some(brief_path) = flags.brief.clone() else {
+        return Ok(usage(format!(
+            "--brief is required\nusage: {}",
+            START_USAGE
+        )));
+    };
+    let (brief, sentence) = match prepare_brief(&brief_path) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(usage(reason)),
+    };
+
+    let _lock = match take_lock(name) {
+        Ok(lock) => lock,
+        Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
+        Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
+    };
+
+    if agent_record(name).is_some() {
+        return Ok(fail(format!("agent_name_taken: {name}")));
+    }
+    if let Some(existing) = read_entry(name) {
+        if workspace_exists(&existing.workspace_id) {
+            return Ok(fail(format!("delegate {name} exists; reap it first")));
+        }
+    }
+
+    // Every workspace on the server before the delegate creates anything, so a
+    // failed start can put the list back exactly.
+    let before = workspace_ids();
+    let placement = match place(&flags, mode) {
+        Ok(placement) => placement,
+        Err(code) => return Ok(code),
+    };
+    let started = start_the_agent(name, &placement, harness, flags.model.as_deref());
+    let agent = match started {
+        Ok(agent) => agent,
+        Err(reason) => {
+            rollback(name, &placement, &before);
+            return Ok(fail(reason));
+        }
+    };
+
+    // The workspace the delegate created came with a shell in it. Leaving that
+    // shell there would mean the operator's "where is my agent" question has two
+    // panes in the answer, and an idle wake or a manual type would land in a pane
+    // nobody is watching.
+    if let Err(err) = request(Method::PaneClose(PaneTarget {
+        pane_id: placement.root_pane.clone(),
+    })) {
+        rollback(name, &placement, &before);
+        return Ok(fail(format!(
+            "could not close the workspace's root pane: {err}"
+        )));
+    }
+
+    let ready_timeout = flags
+        .ready_timeout_ms
+        .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
+    let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
+    if let Err(reason) = await_ready(name, &agent, ready_deadline) {
+        rollback(name, &placement, &before);
+        return Ok(fail(reason));
+    }
+
+    let terminal_id = field(&agent, "terminal_id").unwrap_or_default().to_string();
+    let pane_id = field(&agent, "pane_id").unwrap_or_default().to_string();
+    let cursor = match cursor_of(&agent) {
+        Ok(cursor) => cursor,
+        Err(reason) => {
+            rollback(name, &placement, &before);
+            return Ok(fail(reason));
+        }
+    };
+    let submitted_at_ms = now_ms();
+
+    let entry = Entry {
+        name: name.to_string(),
+        terminal_id: terminal_id.clone(),
+        pane_id: pane_id.clone(),
+        workspace_id: placement.workspace_id.clone(),
+        mode: mode.as_str().to_string(),
+        worktree: placement.worktree.clone(),
+        branch: placement.branch.clone(),
+        harness: harness.to_string(),
+        model: flags.model.clone(),
+        round: 1,
+        brief: brief.clone(),
+        submitted_at_ms,
+        cursor: cursor.clone(),
+        created_at_ms: now_ms(),
+    };
+    if let Err(err) = write_entry(&entry) {
+        rollback(name, &placement, &before);
+        return Ok(fail(format!(
+            "could not write the delegate registry entry: {err}"
+        )));
+    }
+
+    match super::pane::submit_sequence(&pane_id, &sentence) {
+        Ok(0) => {}
+        Ok(_) | Err(_) => {
+            // The sentence did not land, so this start did not happen. Undo it
+            // rather than leave a workspace, a checkout and a registry entry
+            // describing a round nobody is running.
+            let _ = std::fs::remove_file(entry_path(name));
+            rollback(name, &placement, &before);
+            return Ok(fail(format!(
+                "delegate {name}: the brief was not submitted"
+            )));
+        }
+    }
+
+    if !flags.await_result {
+        emit_submit(&entry, flags.json);
+        return Ok(exit::OK);
+    }
+
+    let deadline = flags
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    Await {
+        entry: &entry,
+        after: Some(cursor),
+        submitted_at_ms,
+        deadline,
+        settle_ms: flags.settle_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+    .run()
+}
+
+fn start_the_agent(
+    name: &str,
+    placement: &Placement,
+    harness: &str,
+    model: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut argv = vec![harness.to_string()];
+    if let Some(model) = model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    let response = request(Method::AgentStart(AgentStartParams {
+        name: name.to_string(),
+        cwd: Some(placement.cwd.clone()),
+        workspace_id: Some(placement.workspace_id.clone()),
+        tab_id: None,
+        split: None,
+        active: false,
+        here: false,
+        // The delegate's whole premise is that it lands BESIDE the operator.
+        focus: false,
+        argv,
+    }))
+    .map_err(|err| format!("delegate {name}: could not start the agent: {err}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("delegate {name}: {}", server_error(error)));
+    }
+    response
+        .pointer("/result/agent")
+        .filter(|record| record.is_object())
+        .cloned()
+        .ok_or_else(|| format!("delegate {name}: the start answered with no agent record"))
+}
+
+/// Block until the agent is up AND at its prompt, under one deadline.
+///
+/// Two questions, one budget. A pane that has painted nothing yet is `unknown`
+/// and must not be typed into; a pane sitting on a permission prompt is `blocked`
+/// and must not be typed into either — a brief typed at a dialog is a brief that
+/// answers the dialog. Readiness is `unknown`-clear, the prompt is
+/// `idle`/`done`, and both are waited for here so no caller has to know that
+/// they are different questions.
+fn await_ready(name: &str, agent: &serde_json::Value, deadline: Instant) -> Result<(), String> {
+    let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
+    let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
+    let ready_ms = u64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+
+    match super::ready::wait_for_ready(name, &pane_id, ready_ms) {
+        Ok(super::ready::ReadyOutcome::Ready(_)) => {}
+        Ok(super::ready::ReadyOutcome::Refused { code, message }) => {
+            return Err(format!(
+                "delegate {name} never became ready: {code}: {message}"
+            ));
+        }
+        Ok(super::ready::ReadyOutcome::SubscribeRefused(body)) => {
+            return Err(format!("delegate {name}: {body}"));
+        }
+        Err(err) => {
+            return Err(format!(
+                "delegate {name}: readiness could not be watched: {err}"
+            ))
+        }
+    }
+
+    loop {
+        let Some(record) = agent_record(&terminal_id) else {
+            return Err(format!("delegate {name}: the agent no longer resolves"));
+        };
+        let status = field(&record, "agent_status")
+            .unwrap_or("unknown")
+            .to_string();
+        if matches!(status.as_str(), "idle" | "done") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("delegate {name} is {status}"));
+        }
+        sleep_bounded(deadline, READY_POLL);
+    }
+}
+
+fn sleep_bounded(deadline: Instant, interval: Duration) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    std::thread::sleep(left.min(interval));
+}
+
+// ------------------------------------------------------------------- send
+
+fn delegate_send(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", SEND_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Send, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let flags = as_send(&flags);
+    let Some(brief_path) = flags.brief.clone() else {
+        return Ok(usage(format!("--brief is required\nusage: {}", SEND_USAGE)));
+    };
+    let (brief, sentence) = match prepare_brief(&brief_path) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(usage(reason)),
+    };
+
+    let mut entry = match require_delegate(name) {
+        Ok(entry) => entry,
+        Err(code) => return Ok(code),
+    };
+    let _lock = match take_lock(name) {
+        Ok(lock) => lock,
+        Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
+        Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
+    };
+
+    let ready_timeout = flags
+        .ready_timeout_ms
+        .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
+    let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
+    let Some(record) = agent_record(&entry.terminal_id) else {
+        return Ok(fail(format!(
+            "delegate {name}: the agent no longer resolves"
+        )));
+    };
+    if let Err(reason) = await_prompt(name, &record, ready_deadline) {
+        return Ok(fail(reason));
+    }
+
+    let cursor = match cursor_of(&record) {
+        Ok(cursor) => cursor,
+        Err(reason) => return Ok(fail(reason)),
+    };
+    let submitted_at_ms = now_ms();
+    entry.round += 1;
+    entry.brief = brief;
+    entry.submitted_at_ms = submitted_at_ms;
+    entry.cursor = cursor.clone();
+    if let Err(err) = write_entry(&entry) {
+        return Ok(fail(format!(
+            "could not write the delegate registry entry: {err}"
+        )));
+    }
+
+    match super::pane::submit_sequence(&entry.pane_id, &sentence) {
+        Ok(0) => {}
+        Ok(_) | Err(_) => {
+            // This round did not start, so it is not counted. The entry goes back
+            // to the round that did.
+            entry.round -= 1;
+            let _ = write_entry(&entry);
+            return Ok(fail(format!(
+                "delegate {name}: the brief was not submitted"
+            )));
+        }
+    }
+
+    if !flags.await_result {
+        emit_submit(&entry, flags.json);
+        return Ok(exit::OK);
+    }
+
+    let deadline = flags
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    Await {
+        entry: &entry,
+        after: Some(cursor),
+        submitted_at_ms,
+        deadline,
+        settle_ms: flags.settle_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+    .run()
+}
+
+/// Wait for the agent to be at its prompt, which is where a brief may be typed.
+///
+/// Not the readiness wait: the agent is already up, and what is being asked here
+/// is narrower — it is not sitting on a dialog.
+fn await_prompt(name: &str, agent: &serde_json::Value, deadline: Instant) -> Result<(), String> {
+    let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
+    let mut record = agent.clone();
+    loop {
+        let status = field(&record, "agent_status")
+            .unwrap_or("unknown")
+            .to_string();
+        if matches!(status.as_str(), "idle" | "done") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("delegate {name} is {status}"));
+        }
+        sleep_bounded(deadline, READY_POLL);
+        record = agent_record(&terminal_id)
+            .ok_or_else(|| format!("delegate {name}: the agent no longer resolves"))?;
+    }
+}
+
+fn cursor_of(record: &serde_json::Value) -> Result<String, String> {
+    record
+        .get("turn_cursor")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the server's record carried no turn cursor".to_string())
+}
+
+// ------------------------------------------------------------ wait/result
+
+fn delegate_wait(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", WAIT_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Wait, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let flags = as_wait(&flags);
+
+    let entry = match require_delegate(name) {
+        Ok(entry) => entry,
+        Err(code) => return Ok(code),
+    };
+    // A caller resuming after a timeout needs to wait for the SAME round, and
+    // freshness is judged against when that round was submitted — so both come
+    // from the entry, and `--after` only replaces the cursor.
+    let after = flags.after.clone().or_else(|| Some(entry.cursor.clone()));
+    let deadline = flags
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    Await {
+        entry: &entry,
+        after,
+        submitted_at_ms: entry.submitted_at_ms,
+        deadline,
+        settle_ms: flags.settle_ms,
+        max_chars: flags.max_chars,
+        json: flags.json,
+    }
+    .run()
+}
+
+fn delegate_result(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", RESULT_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Result, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let entry = match require_delegate(name) {
+        Ok(entry) => entry,
+        Err(code) => return Ok(code),
+    };
+
+    let response = match request(Method::AgentResult(AgentResultParams {
+        target: entry.terminal_id.clone(),
+        max_chars: flags.max_chars,
+        offset: None,
+    })) {
+        Ok(response) => response,
+        Err(err) => return Ok(fail(err)),
+    };
+    if let Some(error) = response.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // `no_result` is the store saying there is no reply yet, which is a
+        // statement about the TURN rather than an error: the live status is what
+        // says whether that turn is still running.
+        if code == "no_result" {
+            let status = agent_record(&entry.terminal_id)
+                .and_then(|record| field(&record, "agent_status").map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            let running = matches!(status.as_str(), "working" | "blocked" | "unknown");
+            let outcome = if running { "running" } else { "no_result" };
+            emit_outcome(&entry, outcome, None, flags.json, &entry.cursor);
+            return Ok(exit::OK);
+        }
+        return Ok(fail(server_error(error)));
+    }
+    let Some(info) = response.pointer("/result/result") else {
+        return Ok(fail("the server answered with no result"));
+    };
+    let finished = info
+        .get("finished")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let outcome = if !finished {
+        "running"
+    } else {
+        match info.get("status").and_then(serde_json::Value::as_str) {
+            Some("done") => "done",
+            Some("verdict") => "verdict",
+            Some("blocked") => "blocked",
+            _ => "no_sentinel",
+        }
+    };
+    // An unfinished turn's `text` is an EARLIER turn's reply, so it is nulled
+    // rather than shown: reporting it as this round's answer is the exact
+    // confusion `agent result` documents for its own callers.
+    let info = if outcome == "running" {
+        None
+    } else {
+        Some(info)
+    };
+    emit_outcome(&entry, outcome, info, flags.json, &entry.cursor);
+    Ok(exit::OK)
+}
+
+fn delegate_status(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", STATUS_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Status, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    let entry = match require_delegate(name) {
+        Ok(entry) => entry,
+        Err(code) => return Ok(code),
+    };
+    let status = agent_record(&entry.terminal_id)
+        .and_then(|record| field(&record, "agent_status").map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    if flags.json {
+        // `goal` is reserved for #573 and is always present and null: a field
+        // that appears with its first value is not a field a caller can test for.
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": entry.name,
+                "agent_status": status,
+                "pane_id": entry.pane_id,
+                "workspace_id": entry.workspace_id,
+                "mode": entry.mode,
+                "worktree": entry.worktree,
+                "branch": entry.branch,
+                "harness": entry.harness,
+                "model": entry.model,
+                "round": entry.round,
+                "turn_cursor": entry.cursor,
+                "goal": serde_json::Value::Null,
+            })
+        );
+    } else {
+        println!("delegate {name}: {status}");
+        println!("  round {} · {}", entry.round, entry.mode);
+        if let Some(worktree) = &entry.worktree {
+            println!("  worktree {worktree}");
+        }
+    }
+    Ok(exit::OK)
+}
+
+/// The name resolves to a live delegate: an entry, and an agent of that name
+/// still on the terminal the entry recorded.
+///
+/// The terminal check is what makes a rename visible. An agent renamed away from
+/// its delegate name is no longer addressable as that delegate, and a `send`
+/// that still worked would type into whatever inherited the name.
+fn require_delegate(name: &str) -> Result<Entry, i32> {
+    if let Err(reason) = validate_name(name) {
+        return Err(usage(reason));
+    }
+    let refuse = || usage(format!("not a delegate: {name}"));
+    let Some(entry) = read_entry(name) else {
+        return Err(refuse());
+    };
+    let Some(record) = agent_record(name) else {
+        return Err(refuse());
+    };
+    if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
+        return Err(refuse());
+    }
+    Ok(entry)
+}
+
+// ------------------------------------------------------------------- reap
+
+fn delegate_reap(args: &[String]) -> io::Result<i32> {
+    let Some(name) = args.first() else {
+        return Ok(usage(format!("usage: {}", REAP_USAGE)));
+    };
+    let flags = match parse_flags(Verb::Reap, args) {
+        Ok(flags) => flags,
+        Err(reason) => return Ok(usage(reason)),
+    };
+    // Reap reads only the registry, so it still works for a delegate whose agent
+    // is gone, whose pane was closed by hand, or which was renamed — all of
+    // which `require_delegate` would refuse.
+    if let Err(reason) = validate_name(name) {
+        return Ok(usage(reason));
+    }
+    let Some(entry) = read_entry(name) else {
+        return Ok(usage(format!("not a delegate: {name}")));
+    };
+    // The lock is still taken unless forced: a reap that ran under a start
+    // would remove the workspace the start is about to submit into.
+    let _lock = match take_lock(name) {
+        Ok(lock) => lock,
+        Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
+        Err("busy") => match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path(name))
+        {
+            Ok(file) => Lock { _file: file },
+            Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
+        },
+        Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
+    };
+
+    let placement = Placement {
+        workspace_id: entry.workspace_id.clone(),
+        cwd: entry.worktree.clone().unwrap_or_default(),
+        worktree: entry.worktree.clone(),
+        branch: entry.branch.clone(),
+        root_pane: String::new(),
+    };
+
+    if let Some(worktree) = &entry.worktree {
+        let kill = |workspace_id: Option<&str>, path: Option<&str>| {
+            request(Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: workspace_id.map(str::to_string),
+                path: path.map(str::to_string),
+                force: flags.force,
+                caller_pid: Some(std::process::id()),
+                ..WorktreeKillParams::default()
+            }))
+        };
+        let response = kill(Some(&entry.workspace_id), None)?;
+        let response = if is_error_code(&response, "workspace_not_found") {
+            // The workspace is gone but the checkout may not be. The recorded
+            // path is what a reap is allowed to touch, so it is what it uses.
+            match kill(None, Some(worktree)) {
+                Ok(second) => second,
+                Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
+            }
+        } else {
+            response
+        };
+        if let Some(error) = response.get("error") {
+            // A path that is already gone, or no longer a linked worktree, means
+            // the checkout is not there to remove — which is what reap wanted.
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let gone = matches!(code, "not_linked_worktree" | "workspace_not_found")
+                || !Path::new(worktree).exists();
+            if !gone {
+                return Ok(super::worktree::kill_error_exit_code(error));
+            }
+        }
+    } else {
+        let response = request(Method::WorkspaceClose(WorkspaceTarget {
+            workspace_id: entry.workspace_id.clone(),
+        }));
+        if let Ok(response) = &response {
+            if let Some(error) = response.get("error") {
+                if !is_error_code(response, "workspace_not_found") {
+                    return Ok(fail(server_error(error)));
+                }
+            }
+        }
+    }
+
+    // The entry goes only once the thing it described is gone. A reap that
+    // refused must be retryable, and an entry removed on a refusal is a checkout
+    // nobody has an address for any more.
+    if let Err(err) = std::fs::remove_file(entry_path(name)) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Ok(fail(format!(
+                "could not remove the delegate registry entry: {err}"
+            )));
+        }
+    }
+    if flags.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": entry.name,
+                "workspace_id": entry.workspace_id,
+                "worktree": entry.worktree,
+                "removed": true,
+            })
+        );
+    } else {
+        println!("delegate {name}: reaped");
+    }
+    let _ = &placement;
+    Ok(exit::OK)
+}
+
+// ------------------------------------------------------------------ await
+
+/// What a delegate's await concluded.
+///
+/// Named rather than reused as a string everywhere, because the exit code is a
+/// property of the outcome and a script reads it — the two must not be two
+/// tables that drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    Verdict,
+    Blocked,
+    Gone,
+    NoSentinel,
+    NoResult,
+    AgentBlocked,
+    Timeout,
+    Failed,
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Verdict => "verdict",
+            Self::Blocked => "blocked",
+            Self::Gone => "gone",
+            Self::NoSentinel => "no_sentinel",
+            Self::NoResult => "no_result",
+            Self::AgentBlocked => "agent_blocked",
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Done | Self::Verdict => exit::OK,
+            Self::Blocked => super::settled::exit::BLOCKED,
+            Self::Gone => super::settled::exit::GONE,
+            Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
+            Self::AgentBlocked => exit::AGENT_BLOCKED,
+            Self::Timeout => super::settled::exit::TIMEOUT,
+            Self::Failed => 1,
+        }
+    }
+}
+
+/// What one poll of the result store said.
+enum ResultPoll {
+    /// A reply from THIS round, with its sentinel read.
+    Fresh(serde_json::Value),
+    /// The store has no reply yet, no session to read one from, or a reply from
+    /// an earlier turn. All three mean the same thing to a caller: not now.
+    NotYet,
+    /// The agent is gone.
+    Gone,
+    /// The server refused for a reason that is not "not yet".
+    Failed,
+}
+
+/// What the reply grace concluded.
+enum Grace {
+    /// A reply from this round, mapped to its outcome.
+    Reply(Outcome),
+    Gone,
+    Failed,
+    /// The agent started another turn, so the round has to settle again.
+    NewTurn,
+    /// The grace ran out with no reply. The caller decides timeout vs no_result.
+    Exhausted,
+}
+
+/// What a settled outcome means for the delegate.
+enum SettledDecision {
+    /// Report this outcome and exit with its code.
+    Report(Outcome),
+    /// A refused cursor: exit 2, with the reason on stderr and no object.
+    Usage(String),
+    /// A fatal failure: exit 1, with the server's own words.
+    Failed(String),
+    /// Settle again from the cursor that just settled.
+    WaitAgain,
+}
+
+struct Await<'a> {
+    entry: &'a Entry,
+    /// The cursor this await started from. Reported as `turn_cursor` in every
+    /// outcome so a caller that timed out can resume with `--after` on exactly
+    /// the cursor this one was waiting past.
+    after: Option<String>,
+    submitted_at_ms: u64,
+    deadline: Option<Instant>,
+    settle_ms: Option<u64>,
+    max_chars: Option<u32>,
+    json: bool,
+}
+
+impl Await<'_> {
+    /// Settle, then wait for the reply, and report the round.
+    ///
+    /// The outer loop exists for one case: the agent takes ANOTHER turn while
+    /// the reply grace is running. The reply that answers the round the caller
+    /// asked about is then not the reply that arrives next, so rather than
+    /// report somebody else's turn the await settles again from the cursor it
+    /// just settled on. Every other outcome ends it.
+    fn run(self) -> io::Result<i32> {
+        // The cursor this await STARTED from, reported in every outcome. A caller
+        // that timed out resumes with `--after <turn_cursor>` and gets the same
+        // turn rather than starting the search again.
+        let reported_cursor = self.after.clone().unwrap_or_default();
+        let mut after = self.after.clone();
+
+        loop {
+            let remaining = self.remaining_timeout_ms();
+            let settled = super::settled::settled_wait(
+                "delegate",
+                SettleTarget::Pinned(PinnedTarget {
+                    terminal_id: self.entry.terminal_id.clone(),
+                    pane_id: self.entry.pane_id.clone(),
+                }),
+                after.as_deref(),
+                self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
+                remaining,
+            )?;
+
+            let settled_cursor = settled.turn_cursor().unwrap_or_default().to_string();
+            match self.after_settle(settled, &settled_cursor)? {
+                SettledDecision::Report(outcome) => {
+                    let code = outcome.exit_code();
+                    let info = self.reported_info(outcome);
+                    emit_outcome(
+                        self.entry,
+                        outcome.as_str(),
+                        info.as_ref(),
+                        self.json,
+                        &reported_cursor,
+                    );
+                    return Ok(code);
+                }
+                SettledDecision::Usage(reason) => {
+                    eprintln!("delegate: {reason}");
+                    return Ok(exit::USAGE);
+                }
+                SettledDecision::Failed(reason) => {
+                    eprintln!("delegate: {reason}");
+                    return Ok(1);
+                }
+                SettledDecision::WaitAgain => {
+                    // Resume from the cursor that settled, not from the one this
+                    // await started at: the new turn is what the round now means,
+                    // and re-waiting from the original would accept its reply.
+                    after = Some(settled_cursor);
+                }
+            }
+        }
+    }
+
+    /// How much of `--timeout` is left, for a core that takes its own budget.
+    ///
+    /// `None` means wait forever, which is what an absent `--timeout` means; a
+    /// deadline already passed becomes a zero budget, so a core handed it times
+    /// out on its first sample rather than waiting for a wait that already ended.
+    fn remaining_timeout_ms(&self) -> Option<u64> {
+        let deadline = self.deadline?;
+        Some(
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(0),
+        )
+    }
+
+    /// What a settled outcome means for the delegate, once the grace is over.
+    fn after_settle(
+        &self,
+        settled: super::settled::SettledOutcome,
+        settled_cursor: &str,
+    ) -> io::Result<SettledDecision> {
+        use super::settled::SettledOutcome;
+        match settled {
+            // A held `blocked` is a human question, not a turn that finished.
+            SettledOutcome::Blocked { .. } => Ok(SettledDecision::Report(Outcome::AgentBlocked)),
+            SettledOutcome::Gone { .. } => Ok(SettledDecision::Report(Outcome::Gone)),
+            SettledOutcome::TimedOut => Ok(SettledDecision::Report(Outcome::Timeout)),
+            // A refused cursor is the caller's mistake rather than an outcome:
+            // exit 2 and no object, so nothing downstream can read it as a turn
+            // that ran.
+            SettledOutcome::Refused(reason) => Ok(SettledDecision::Usage(reason)),
+            SettledOutcome::Error(reason) => Ok(SettledDecision::Failed(reason)),
+            SettledOutcome::Settled { .. } => match self.await_reply(settled_cursor)? {
+                Grace::Reply(outcome) => Ok(SettledDecision::Report(outcome)),
+                Grace::Gone => Ok(SettledDecision::Report(Outcome::Gone)),
+                Grace::Failed => Ok(SettledDecision::Report(Outcome::Failed)),
+                Grace::NewTurn => Ok(SettledDecision::WaitAgain),
+                Grace::Exhausted => Ok(SettledDecision::Report(
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        // The deadline wins inside the grace too: a caller whose
+                        // clock ran out does not get a late answer reinterpreted.
+                        Outcome::Timeout
+                    } else {
+                        Outcome::NoResult
+                    },
+                )),
+            },
+        }
+    }
+
+    /// The grace: a settle is not a reply, so keep asking until one is written.
+    ///
+    /// The gap between the TUI going quiet and the plugin committing the
+    /// transcript is ordinary — opencode clears its spinner first — so a grace
+    /// that reported `no_result` the instant the agent went idle would call every
+    /// normal turn a failure.
+    fn await_reply(&self, settled_cursor: &str) -> io::Result<Grace> {
+        let grace_end = match self.deadline {
+            Some(deadline) => deadline.min(Instant::now() + RESULT_GRACE),
+            None => Instant::now() + RESULT_GRACE,
+        };
+        loop {
+            if Instant::now() >= grace_end {
+                return Ok(Grace::Exhausted);
+            }
+            match self.poll_result() {
+                ResultPoll::Fresh(info) => return Ok(Grace::Reply(self.sentinelled(&info))),
+                ResultPoll::Gone => return Ok(Grace::Gone),
+                ResultPoll::Failed => return Ok(Grace::Failed),
+                ResultPoll::NotYet => {}
+            }
+            // The agent took another turn, so the reply that answers THIS round
+            // is not the next one to land. Settle again instead.
+            if self.started_another_turn(settled_cursor) {
+                return Ok(Grace::NewTurn);
+            }
+            sleep_bounded(grace_end, RESULT_POLL);
+        }
+    }
+
+    /// A cursor from a turn that started after the one that settled.
+    ///
+    /// Compared the way the settle core compares `--after`, because it is the
+    /// same question: has a new turn started since the cursor I waited past? A
+    /// higher `working_entries` says yes, and so does a cursor that settled
+    /// mid-turn whose `state_seq` has moved since.
+    fn started_another_turn(&self, settled_cursor: &str) -> bool {
+        if settled_cursor.is_empty() {
+            return false;
+        }
+        let Some(record) = agent_record(&self.entry.terminal_id) else {
+            return false;
+        };
+        let Some(raw) = record
+            .get("turn_cursor")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        let (Ok(now), Ok(before)) = (Cursor::parse(raw), Cursor::parse(settled_cursor)) else {
+            return false;
+        };
+        if now.epoch != before.epoch {
+            return now.epoch > before.epoch;
+        }
+        now.entries > before.entries || (before.working && now.seq > before.seq)
+    }
+
+    /// Is the newest reply this round's?
+    ///
+    /// Three conditions, and the third is the one that matters: a reply written
+    /// BEFORE this round's submit belongs to an earlier turn no matter how
+    /// finished it is. A reply with no recorded time is never fresh — an
+    /// unattributable reply cannot be shown to have come from this turn.
+    fn is_fresh(&self, info: &serde_json::Value) -> bool {
+        let finished = info
+            .get("finished")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let at_ms = info.get("at_ms").and_then(serde_json::Value::as_u64);
+        finished && at_ms.is_some_and(|at_ms| at_ms >= self.submitted_at_ms)
+    }
+
+    /// Ask the store for the newest reply, and say whether it is this round's.
+    fn poll_result(&self) -> ResultPoll {
+        let response = match request(Method::AgentResult(AgentResultParams {
+            target: self.entry.terminal_id.clone(),
+            max_chars: self.max_chars,
+            offset: None,
+        })) {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("delegate: {err}");
+                return ResultPoll::Failed;
+            }
+        };
+        if let Some(error) = response.get("error") {
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            // `agent_not_found` is the one error here that is not about the
+            // store: the agent itself is gone, which is an outcome.
+            if code == "agent_not_found" || code == "pane_not_found" {
+                return ResultPoll::Gone;
+            }
+            if NOT_YET_CODES.contains(&code) {
+                return ResultPoll::NotYet;
+            }
+            eprintln!("delegate: {}", server_error(error));
+            return ResultPoll::Failed;
+        }
+        match response.pointer("/result/result") {
+            Some(info) if self.is_fresh(info) => ResultPoll::Fresh(info.clone()),
+            // A finished reply from an EARLIER turn is "not yet" rather than an
+            // answer: reporting it would attribute the last round's work to this
+            // one, which is the confusion `agent result` documents for its own
+            // callers.
+            Some(_) | None => ResultPoll::NotYet,
+        }
+    }
+
+    fn sentinelled(&self, info: &serde_json::Value) -> Outcome {
+        match info.get("status").and_then(serde_json::Value::as_str) {
+            Some("done") => Outcome::Done,
+            Some("verdict") => Outcome::Verdict,
+            Some("blocked") => Outcome::Blocked,
+            _ => Outcome::NoSentinel,
+        }
+    }
+
+    /// The reply an outcome reports, for the cases that carry one.
+    ///
+    /// Re-read at print time so the text on stdout is the reply the outcome was
+    /// decided from, and `None` for the outcomes that have no result to report —
+    /// which is most of them.
+    fn reported_info(&self, outcome: Outcome) -> Option<serde_json::Value> {
+        if !matches!(
+            outcome,
+            Outcome::Done | Outcome::Verdict | Outcome::Blocked | Outcome::NoSentinel
+        ) {
+            return None;
+        }
+        let response = request(Method::AgentResult(AgentResultParams {
+            target: self.entry.terminal_id.clone(),
+            max_chars: self.max_chars,
+            offset: None,
+        }))
+        .ok()?;
+        let info = response.pointer("/result/result")?.clone();
+        self.is_fresh(&info).then_some(info)
+    }
+}
+
+// ----------------------------------------------------------------- output
+
+fn emit_submit(entry: &Entry, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": entry.name,
+                "pane_id": entry.pane_id,
+                "workspace_id": entry.workspace_id,
+                "worktree": entry.worktree,
+                "branch": entry.branch,
+                "round": entry.round,
+                "turn_cursor": entry.cursor,
+            })
+        );
+    } else {
+        println!("delegate {}: submitted round {}", entry.name, entry.round);
+    }
+}
+
+/// The one object every outcome prints under `--json`.
+///
+/// The same shape for every exit, including the failures: a caller polling in a
+/// loop reads the same three fields whatever happened, and a missing key is a
+/// shape change rather than an absence.
+fn emit_outcome(
+    entry: &Entry,
+    outcome: &str,
+    info: Option<&serde_json::Value>,
+    json: bool,
+    turn_cursor: &str,
+) {
+    let text = |key: &str| {
+        info.and_then(|info| info.get(key))
+            .filter(|value| !value.is_null())
+            .cloned()
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": entry.name,
+                "outcome": outcome,
+                "status": text("status"),
+                "status_text": text("status_text"),
+                "text": text("text"),
+                "total_chars": text("total_chars"),
+                "next_offset": text("next_offset"),
+                "pane_id": entry.pane_id,
+                "workspace_id": entry.workspace_id,
+                "worktree": entry.worktree,
+                "branch": entry.branch,
+                "round": entry.round,
+                "turn_cursor": turn_cursor,
+                "session_id": text("session_id"),
+            })
+        );
+    } else {
+        if let Some(text) = info
+            .and_then(|info| info.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            println!("{text}");
+        }
+        let status_text = info
+            .and_then(|info| info.get("status_text"))
+            .and_then(|t| t.as_str());
+        match status_text {
+            Some(status_text) => eprintln!("delegate {}: {outcome}: {status_text}", entry.name),
+            None => eprintln!("delegate {}: {outcome}", entry.name),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The double-quote byte, named once so the check below does not have to
+    /// write a lone quote character literal — which is the very thing it counts.
+    const QUOTE: u8 = 0x22;
+
+    #[test]
+    fn names_are_safe_as_file_names() {
+        for name in ["d1", "a", "A9", "a.b_c-d", "n".repeat(64).as_str()] {
+            assert!(validate_name(name).is_ok(), "{name} should be accepted");
+        }
+        for name in [
+            "",
+            "../x",
+            "a/b",
+            ".hidden",
+            "-dash",
+            "sp ace",
+            "n".repeat(65).as_str(),
+            "a/b",
+        ] {
+            assert!(validate_name(name).is_err(), "{name:?} should be refused");
+        }
+    }
+
+    /// A name is going to be typed into a terminal as part of a sentence, so the
+    /// whole unsafe set is refused rather than most of it.
+    #[test]
+    fn a_brief_path_is_refused_before_it_is_typed() {
+        let dir = std::env::temp_dir().join(format!("flk-578-brief-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for unsafe_char in UNSAFE_PATH_CHARS {
+            let path = dir.join(format!("b{}.md", unsafe_char));
+            std::fs::write(&path, "x\n").unwrap();
+            let err = prepare_brief(&path.display().to_string())
+                .expect_err("a path that needs escaping is refused");
+            assert!(
+                err.contains("unsafe to type"),
+                "{unsafe_char:?} should be refused as unsafe: {err}"
+            );
+        }
+        let spaced = dir.join("two words");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let spaced = spaced.join("b.md");
+        std::fs::write(&spaced, "x\n").unwrap();
+        assert!(prepare_brief(&spaced.display().to_string())
+            .expect_err("whitespace is unsafe too")
+            .contains("unsafe to type"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of the brief: the typed text is the sentence, and the
+    /// sentence names the ABSOLUTE path rather than whatever the caller wrote.
+    #[test]
+    fn the_typed_sentence_names_the_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("flk-578-sentence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("task.md");
+        std::fs::write(&path, "x\n").unwrap();
+        let (absolute, sentence) = prepare_brief(&path.display().to_string()).expect("readable");
+        assert!(absolute.starts_with('/'), "{absolute} should be absolute");
+        assert_eq!(sentence, format!("Read {absolute} and execute it exactly."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_brief_must_be_a_readable_regular_file() {
+        let dir = std::env::temp_dir().join(format!("flk-578-notfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(prepare_brief(&dir.display().to_string())
+            .expect_err("a directory is not a brief")
+            .contains("not a regular file"));
+        assert!(prepare_brief(&dir.join("missing.md").display().to_string()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reason `--repo` is refused with `--cwd`: there is no checkout to
+    /// branch, so accepting the flag would be accepting one that cannot be
+    /// honoured.
+    #[test]
+    fn worktree_flags_need_worktree_mode() {
+        let mut flags = StartFlags {
+            cwd: Some("/tmp".into()),
+            branch: Some("b".into()),
+            ..StartFlags::default()
+        };
+        assert!(validate_worktree_flags(&flags).is_err());
+        flags.cwd = None;
+        flags.worktree = true;
+        assert!(validate_worktree_flags(&flags).is_ok());
+    }
+
+    #[test]
+    fn placement_is_exactly_one_of_cwd_or_worktree() {
+        assert!(validate_placement(&StartFlags::default()).is_err());
+        assert!(validate_placement(&StartFlags {
+            cwd: Some("/tmp".into()),
+            ..StartFlags::default()
+        })
+        .is_ok());
+        assert!(validate_placement(&StartFlags {
+            worktree: true,
+            ..StartFlags::default()
+        })
+        .is_ok());
+        assert!(validate_placement(&StartFlags {
+            cwd: Some("/tmp".into()),
+            worktree: true,
+            ..StartFlags::default()
+        })
+        .is_err());
+    }
+
+    /// The refusals a caller would hit by typing a flag from the wrong verb.
+    #[test]
+    fn a_flag_from_another_verb_is_a_usage_error() {
+        let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["start", "d1", "--after", "x"], &["start"]),
+            (&["wait", "d1", "--await"], &["wait"]),
+            (&["send", "d1", "--force"], &["send"]),
+            (&["status", "d1", "--timeout", "1"], &["status"]),
+            (&["reap", "d1", "--settle", "1"], &["reap"]),
+            (&["start", "d1", "--brief"], &["start"]),
+        ];
+        for (words, expected_in) in cases {
+            let err = parse_flags(
+                match expected_in[0] {
+                    "start" => Verb::Start,
+                    "send" => Verb::Send,
+                    "wait" => Verb::Wait,
+                    "status" => Verb::Status,
+                    "reap" => Verb::Reap,
+                    other => panic!("no verb {other}"),
+                },
+                &args(words),
+            )
+            .expect_err("a flag from another verb is not accepted");
+            assert!(
+                err.contains("unknown option") || err.contains("missing value"),
+                "{words:?}: {err}"
+            );
+        }
+    }
+
+    /// Every flag a usage row documents must be a flag that verb accepts. The
+    /// same obligation `cli::help`'s table test enforces, pinned here so a flag
+    /// cannot be documented on the delegate's own help and then dropped from its
+    /// parser.
+    #[test]
+    fn every_documented_flag_is_accepted() {
+        for (verb, usage) in [
+            (Verb::Start, START_USAGE),
+            (Verb::Send, SEND_USAGE),
+            (Verb::Wait, WAIT_USAGE),
+            (Verb::Result, RESULT_USAGE),
+            (Verb::Status, STATUS_USAGE),
+            (Verb::Reap, REAP_USAGE),
+        ] {
+            assert!(
+                usage.starts_with(&format!("flk delegate {}", verb_word(verb))),
+                "{usage}"
+            );
+            for token in usage.split_whitespace() {
+                // The prose after a flag in a usage row ends it with a comma or
+                // a full stop, so trim punctuation as well as brackets: the flag
+                // is the `--name`, not the sentence around it.
+                let flag = token.trim_matches(|c: char| {
+                    matches!(c, '[' | ']' | '(' | ')' | ',' | '.' | ':' | ';')
+                });
+                if !flag.starts_with("--") || flag == "--" {
+                    continue;
+                }
+                assert!(verb.accepts(flag), "{usage} documents {flag}, dropped");
+            }
+        }
+    }
+
+    /// The one harness this build drives, named in the refusal rather than a
+    /// list of the ones it does not.
+    #[test]
+    fn only_opencode_is_supported_yet() {
+        assert_eq!(validate_harness(None), Ok("opencode"));
+        assert_eq!(validate_harness(Some("opencode")), Ok("opencode"));
+        assert!(validate_harness(Some("claude"))
+            .expect_err("claude is not wired")
+            .contains("not supported"));
+    }
+
+    /// A quoted character in the file would break the help table's flag scan,
+    /// which pairs up double-quote bytes across the module. The rule is a plain
+    /// byte count, so it is checked the same way.
+    #[test]
+    fn the_module_holds_an_even_number_of_quote_bytes() {
+        let source = include_str!("delegate.rs");
+        assert_eq!(
+            source.bytes().filter(|byte| *byte == QUOTE).count() % 2,
+            0,
+            "delegate.rs must hold an even number of double-quote bytes"
+        );
+    }
+}

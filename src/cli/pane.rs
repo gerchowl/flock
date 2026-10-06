@@ -606,7 +606,25 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::normalize_pane_id(&args[0]);
     let text = args[1..].join(" ");
-    for step in pane_run_steps(&pane_id, &text) {
+    submit_sequence(&pane_id, &text)
+}
+
+/// Type `text` into `pane_id` and press Enter, as the same two separate writes
+/// `flk pane run` has always made, and report what the server said (#578 P18).
+///
+/// The executor beside the existing value: `pane_run_steps` is the ordering
+/// contract and stays a value a test can assert on, while this walks it and
+/// issues the requests. The delegate has to type into an agent's input box
+/// rather than run a shell command, and re-implementing the gap and the Enter
+/// beside [`PANE_RUN_SUBMIT_GAP`] would give the two callers different answers
+/// to the pasted-bracket problem #362 is about.
+///
+/// The exit code is what [`super::send_ok_request`] returns — 0, or 1 after
+/// printing the server's refusal to stderr as it does — so `pane run`'s
+/// observable behaviour is unchanged, and a caller that only wants to know
+/// whether the submit landed reads it as non-zero.
+pub(super) fn submit_sequence(pane_id: &str, text: &str) -> std::io::Result<i32> {
+    for step in pane_run_steps(pane_id, text) {
         let method = match step {
             PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
                 pane_id,

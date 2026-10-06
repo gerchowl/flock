@@ -86,6 +86,12 @@ const VERBS: &[(&str, &str, &str)] = &[
         "flk workspace rename <workspace_id> <label>",
     ),
     ("workspace", "close", "flk workspace close <workspace_id>"),
+    ("delegate", "start", super::delegate::START_USAGE),
+    ("delegate", "send", super::delegate::SEND_USAGE),
+    ("delegate", "wait", super::delegate::WAIT_USAGE),
+    ("delegate", "result", super::delegate::RESULT_USAGE),
+    ("delegate", "status", super::delegate::STATUS_USAGE),
+    ("delegate", "reap", super::delegate::REAP_USAGE),
     (
         "worktree",
         "list",
@@ -581,6 +587,7 @@ mod tests {
             "worktree" => include_str!("worktree.rs"),
             "tab" => include_str!("tab.rs"),
             "notification" => include_str!("notification.rs"),
+            "delegate" => include_str!("delegate.rs"),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
             "mcp" => include_str!("mcp.rs"),
@@ -755,6 +762,9 @@ mod tests {
             "pane send-keys",
             "pane arm-self-compact",
             "session delete",
+            "delegate start",
+            "delegate send",
+            "delegate reap",
         ] {
             let (group, verb) = invocation.split_once(' ').expect("group verb");
             assert!(
@@ -784,6 +794,9 @@ mod tests {
             ("agent", "start"),
             ("pane", "split"),
             ("workspace", "create"),
+            ("delegate", "start"),
+            ("delegate", "send"),
+            ("delegate", "reap"),
         ] {
             let words = [invocation.0, invocation.1, "--help"];
             assert_eq!(
