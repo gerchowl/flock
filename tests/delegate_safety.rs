@@ -1022,8 +1022,12 @@ fn r18_flk_help_lists_delegate() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let stdout = stdout(&out);
     assert!(
-        stdout.contains("flk delegate"),
-        "flk --help must list the delegate command: {stdout}"
+        stdout.contains("flk delegate <subcommand> ..."),
+        "the Usage block must list the delegate command: {stdout}"
+    );
+    assert!(
+        stdout.contains("flk delegate <subcommand>        "),
+        "the command list must list the delegate command: {stdout}"
     );
     // The short description should appear on the same line or adjacent.
     assert!(

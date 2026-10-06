@@ -508,6 +508,7 @@ fn main() -> io::Result<()> {
         println!("       flk tab <subcommand> ...");
         println!("       flk notification <subcommand> ...");
         println!("       flk agent <subcommand> ...");
+        println!("       flk delegate <subcommand> ...");
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
         println!("       flk session <subcommand> ...");
