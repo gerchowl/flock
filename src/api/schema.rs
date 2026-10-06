@@ -130,6 +130,11 @@ pub enum Method {
     MsgRead(MsgReadParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
+    /// #576: block until a message is answered, deferred or expires.
+    /// Held on the socket thread like `pane.wait_for_output`, but woken by the
+    /// event hub rather than a poll — see [`MsgWaitReplyParams`].
+    #[serde(rename = "msg.wait_reply")]
+    MsgWaitReply(MsgWaitReplyParams),
     /// #410: a spoke's held relay collecting the messages this server hands up
     /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
     #[serde(rename = "msg.uplink_take")]
@@ -1163,6 +1168,49 @@ pub struct MsgReadParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgStatusParams {
     pub correlation_id: String,
+}
+
+/// `msg.wait_reply` — the sender's half of a `needs_reply` round trip (#576).
+///
+/// `msg.status` answers "what became of it" once; this one waits for the
+/// answer. Keyed by the correlation id alone, so a waiter needs no inbox:
+/// a sender with no pane (an ssh shell, a script) can still be told.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgWaitReplyParams {
+    pub correlation_id: String,
+    /// How long to hold the request. Absent means
+    /// [`MSG_WAIT_REPLY_MAX_MS`], the age at which an unread message is
+    /// dropped anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The longest a `msg.wait_reply` is held: an unread message is dropped
+/// after a day (`UNDELIVERED_TTL_MS`), so a longer wait waits for nothing.
+pub const MSG_WAIT_REPLY_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The answer to a message, as `msg.status` and `msg.wait_reply` report it
+/// (#576). Read from the event log: the reply's own `MessageQueued` when it
+/// was delivered to an inbox here, or the `MessageReplied` that holds it when
+/// the original sender had no inbox to deliver to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgReplyInfo {
+    /// The reply's own correlation id.
+    pub correlation_id: String,
+    /// `reply`, or `deferral` for a muted recipient's automatic answer
+    /// (ADR-0018 §3).
+    pub kind: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_host: Option<String>,
+    /// True when the original sender had no inbox, so the reply is held here
+    /// for whoever waits on the correlation id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 /// `msg.wake` — may this pane be interrupted about its mail, and about how
@@ -2199,6 +2247,23 @@ pub enum ResponseResult {
         path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// #576: the answer, once there is one. `state` keeps describing the
+        /// message's own delivery; this is what came back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<MsgReplyInfo>,
+    },
+    /// #576: how a `msg.wait_reply` ended.
+    MsgReplyAwaited {
+        correlation_id: String,
+        /// `replied`, `deferred` (a muted recipient's automatic answer),
+        /// `expired` (dropped unread), or `timeout`.
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<MsgReplyInfo>,
+        /// On `timeout`: the message's last known delivery state (`queued`,
+        /// `read`, `relayed`), so "read but unanswered" is visible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
     },
     MsgRead {
         /// The messages just consumed, oldest first. Each is marked delivered
@@ -2959,6 +3024,19 @@ pub enum EventData {
         reply_correlation_id: String,
         reply_latency_ms: u64,
         round_trips: u32,
+        /// #576: the reply itself, recorded ONLY when it is held — the
+        /// original sender had no inbox (an ssh shell, a script), so this
+        /// event is the one place the answer lives, for `msg.wait_reply` and
+        /// `msg.status` to hand back. A reply delivered to an inbox already
+        /// has its body in that delivery's `MessageQueued`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_pane: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_agent: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        held: bool,
     },
     /// #175 phase 4 check-runner: one script check completed.
     /// `outcome` is one of `"fire"`, `"pass"`, or `"error"`.
@@ -4241,6 +4319,54 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let restored: ErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    /// #576: the wire shapes of the wait, its answer, and a held reply event
+    /// written by a build from before the reply carried a body.
+    #[test]
+    fn msg_wait_reply_round_trips() {
+        let request: Request = serde_json::from_str(
+            r#"{"id":"r","method":"msg.wait_reply","params":{"correlation_id":"c-1","timeout_ms":500}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.method,
+            Method::MsgWaitReply(MsgWaitReplyParams {
+                correlation_id: "c-1".into(),
+                timeout_ms: Some(500),
+            })
+        );
+        let bare: Request = serde_json::from_str(
+            r#"{"id":"r","method":"msg.wait_reply","params":{"correlation_id":"c-1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            bare.method,
+            Method::MsgWaitReply(MsgWaitReplyParams {
+                timeout_ms: None,
+                ..
+            })
+        ));
+
+        let result = ResponseResult::MsgReplyAwaited {
+            correlation_id: "c-1".into(),
+            outcome: "timeout".into(),
+            reply: None,
+            state: Some("read".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["type"], "msg_reply_awaited");
+        assert_eq!(value["state"], "read");
+        assert!(value.get("reply").is_none());
+
+        let old: EventData = serde_json::from_str(
+            r#"{"type":"message_replied","correlation_id":"c","reply_correlation_id":"r","reply_latency_ms":1,"round_trips":1}"#,
+        )
+        .expect("a MessageReplied from the durable log of an older build still reads");
+        let EventData::MessageReplied { body, held, .. } = old else {
+            panic!("expected MessageReplied");
+        };
+        assert_eq!((body, held), (None, false));
     }
 
     #[test]

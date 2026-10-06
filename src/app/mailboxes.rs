@@ -244,7 +244,15 @@ impl MailboxRegistry {
                         );
                     }
                 }
-                EventData::MessageReplied { correlation_id, .. } => {
+                // A held deferral (#576) is recorded as a `MessageReplied`
+                // so its body survives, but a mute's automatic answer is not a
+                // round trip: live, it never bumps the count, so replay must
+                // not either.
+                EventData::MessageReplied {
+                    correlation_id,
+                    reply_correlation_id,
+                    ..
+                } if !is_deferral(reply_correlation_id) => {
                     if let Some(meta) = self.history.get_mut(correlation_id) {
                         meta.round_trips += 1;
                     }

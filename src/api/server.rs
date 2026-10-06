@@ -10,6 +10,7 @@ use tracing::debug;
 #[cfg(test)]
 use std::fs;
 
+use crate::api::reply_wait::wait_for_reply;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
@@ -181,6 +182,32 @@ fn handle_connection(
                     &request_id,
                     method,
                     "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::MsgWaitReply(params) => {
+            let Some(response) =
+                wait_for_reply(request_id.clone(), params, &mut stream, event_hub, running)?
+            else {
+                crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "client_disconnected",
+                    changes_ui,
+                );
+                return Ok(());
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
                     changes_ui,
                 ),
                 Err(err) => {
@@ -386,6 +413,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgList(_) => "msg.list",
         Method::MsgRead(_) => "msg.read",
         Method::MsgStatus(_) => "msg.status",
+        Method::MsgWaitReply(_) => "msg.wait_reply",
         Method::MsgWake(_) => "msg.wake",
         Method::MsgMute(_) => "msg.mute",
         Method::MsgUplinkTake(_) => "msg.uplink_take",

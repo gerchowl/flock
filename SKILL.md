@@ -160,6 +160,19 @@ flk wait agent-status 1-1 --status done --timeout 60000
 
 use this when you want the same `done` / `idle` distinction the UI shows.
 
+## wait for the answer to a message you sent
+
+ask another agent something and block until it answers:
+
+```bash
+flk msg send 1-1 "which branch should I base on?" --intent needs-reply --await --timeout 600000
+# or, holding the id yourself:
+id=$(flk msg send 1-1 "which branch?" --intent needs-reply | jq -r .result.correlation_id)
+flk wait reply "$id" --timeout 600000
+```
+
+stdout is the reply body alone. Exit `0` replied, `3` the recipient is muted (its deferral is printed) or the message was dropped unread, `124` timed out (`--json` shows whether it was at least read). Run it as a background task to be woken by the answer instead of polling `flk msg status`. It works from outside any pane too (an ssh shell): the reply is held for you under the correlation id.
+
 ## send text or keys to a pane
 
 send text without pressing Enter:

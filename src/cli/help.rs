@@ -165,7 +165,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "msg",
         "send",
-        "flk msg send (<target> | --agent ID) <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] [-- <text starting with dashes>]",
+        "flk msg send (<target> | --agent ID) <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] [--await [--timeout MS]] [-- <text starting with dashes>]",
     ),
     (
         "msg",
@@ -272,6 +272,11 @@ const VERBS: &[(&str, &str, &str)] = &[
         "wait",
         "agent-status",
         "flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]",
+    ),
+    (
+        "wait",
+        "reply",
+        "flk wait reply <correlation_id> [--timeout MS] [--json]",
     ),
     (
         "integration",

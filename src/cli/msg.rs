@@ -52,6 +52,8 @@ const SEND_OPTIONS: &[&str] = &[
     "--reply-to",
     "--intent",
     "--json",
+    "--await",
+    "--timeout",
 ];
 
 const REPLY_OPTIONS: &[&str] = &["--intent", "--json"];
@@ -90,6 +92,11 @@ struct SendArgs {
     agent: Option<String>,
     from_agent: Option<String>,
     from_host: Option<String>,
+    /// #576: after sending, wait for the answer (`flk wait reply`).
+    await_reply: bool,
+    /// How long `--await` waits, in ms.
+    timeout_ms: Option<u64>,
+    json: bool,
     positional: Vec<String>,
 }
 
@@ -110,6 +117,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
         agent: None,
         from_agent: None,
         from_host: None,
+        await_reply: false,
+        timeout_ms: None,
+        json: false,
         positional: Vec::new(),
     };
     let mut index = 0;
@@ -156,7 +166,22 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
                 parsed.unknown_intent = unknown.then_some(raw);
                 index += 2;
             }
-            "--json" => index += 1,
+            "--json" => {
+                parsed.json = true;
+                index += 1;
+            }
+            "--await" => {
+                parsed.await_reply = true;
+                index += 1;
+            }
+            "--timeout" => {
+                let raw = value()?;
+                parsed.timeout_ms = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("--timeout takes milliseconds, got {raw:?}"))?,
+                );
+                index += 2;
+            }
             "--" => {
                 parsed.positional.extend(args[index + 1..].iter().cloned());
                 break;
@@ -193,6 +218,16 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             ));
         }
     }
+    // #576. Waiting on an `fyi` would wait for an answer nobody was asked
+    // for, and `--timeout` without `--await` would be silently ignored.
+    if parsed.await_reply && parsed.intent == MsgIntent::Fyi {
+        return Err(
+            "--await waits for an answer: send it with --intent needs-reply or blocking".into(),
+        );
+    }
+    if parsed.timeout_ms.is_some() && !parsed.await_reply {
+        return Err("--timeout only applies with --await".into());
+    }
     Ok(parsed)
 }
 
@@ -208,7 +243,7 @@ fn intent_spellings() -> String {
 fn msg_send(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk msg send (<target> | --agent ID) <text...> [--repo NAME] \
          [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] \
-         [-- <text starting with dashes>]";
+         [--await [--timeout MS]] [-- <text starting with dashes>]";
     let parsed = match parse_send_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -225,6 +260,9 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         agent,
         from_agent,
         from_host,
+        await_reply,
+        timeout_ms,
+        json,
         positional,
     } = parsed;
     // With --agent the identity IS the target, so only the body is positional.
@@ -247,7 +285,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         };
         (to, body)
     };
-    super::print_response(&super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: "cli:msg:send".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent,
@@ -259,7 +297,136 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
             intent,
             intent_unrecognised: unknown_intent,
         }),
-    })?)
+    })?;
+    if !await_reply {
+        return super::print_response(&response);
+    }
+    // #576 `--await`: the send's own result goes to stderr, so stdout is the
+    // answer alone — what a harness hands back when this ran as a background
+    // task.
+    eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
+    if response.get("error").is_some() {
+        return Ok(1);
+    }
+    let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
+        eprintln!("flk msg send --await: the send returned no correlation id to wait on");
+        return Ok(1);
+    };
+    await_reply_for(sent_id, timeout_ms, json)
+}
+
+/// `flk wait reply` exit status (#576): an answer arrived.
+const EXIT_REPLIED: i32 = 0;
+/// No answer is coming: the recipient is muted (its deferral is printed), or
+/// the message was dropped unread.
+const EXIT_NO_ANSWER: i32 = 3;
+/// The wait ran out first. The coreutils `timeout` convention.
+const EXIT_TIMEOUT: i32 = 124;
+
+fn exit_for(outcome: &str) -> i32 {
+    match outcome {
+        "replied" => EXIT_REPLIED,
+        "deferred" | "expired" => EXIT_NO_ANSWER,
+        "timeout" => EXIT_TIMEOUT,
+        _ => 1,
+    }
+}
+
+/// `flk wait reply <correlation_id> [--timeout MS] [--json]` (#576).
+pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: flk wait reply <correlation_id> [--timeout MS] [--json]";
+    let mut correlation_id = None;
+    let mut timeout_ms = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--timeout" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other if looks_like_option(other) => {
+                eprintln!(
+                    "{}",
+                    unknown_option("flk wait reply", other, &["--timeout", "--json"])
+                );
+                return Ok(2);
+            }
+            other if correlation_id.is_none() => {
+                correlation_id = Some(other.to_string());
+                index += 1;
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+    let Some(correlation_id) = correlation_id else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    await_reply_for(&correlation_id, timeout_ms, json)
+}
+
+/// Hold `msg.wait_reply` and report how it ended: the answer's body on
+/// stdout (its metadata on stderr), or the whole result with `--json`.
+fn await_reply_for(
+    correlation_id: &str,
+    timeout_ms: Option<u64>,
+    json: bool,
+) -> std::io::Result<i32> {
+    let response = super::send_request(&Request {
+        id: "cli:wait:reply".into(),
+        method: Method::MsgWaitReply(crate::api::schema::MsgWaitReplyParams {
+            correlation_id: correlation_id.to_string(),
+            timeout_ms,
+        }),
+    })?;
+    if response.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
+        return Ok(1);
+    }
+    let result = &response["result"];
+    let outcome = result["outcome"].as_str().unwrap_or_default();
+    if json {
+        println!("{}", serde_json::to_string(&response).unwrap_or_default());
+        return Ok(exit_for(outcome));
+    }
+    let reply = &result["reply"];
+    match outcome {
+        "replied" | "deferred" => {
+            let from = reply["from_agent"]
+                .as_str()
+                .or_else(|| reply["from_pane"].as_str())
+                .unwrap_or("an unattested sender");
+            eprintln!(
+                "{outcome}: {} from {from}{}",
+                reply["correlation_id"].as_str().unwrap_or_default(),
+                if reply["held"].as_bool() == Some(true) {
+                    " (held for this waiter)"
+                } else {
+                    ""
+                }
+            );
+            println!("{}", reply["body"].as_str().unwrap_or_default());
+        }
+        "expired" => eprintln!("{correlation_id} was dropped unread; no answer is coming"),
+        "timeout" => eprintln!(
+            "no answer to {correlation_id} yet (last state: {})",
+            result["state"].as_str().unwrap_or("unknown")
+        ),
+        other => eprintln!("unexpected outcome {other:?}"),
+    }
+    Ok(exit_for(outcome))
 }
 
 /// ADR-0006 shorthand: split `<repo>:<pane>` only when the left side names
@@ -514,7 +681,13 @@ fn print_msg_help() {
     );
     eprintln!("  flk msg list [--pane TARGET]");
     eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
-    eprintln!("  flk msg status <correlation_id>  what became of a message you sent");
+    eprintln!(
+        "  flk msg status <correlation_id>  what became of a message you sent, and its reply"
+    );
+    eprintln!(
+        "  --await [--timeout MS] on a needs-reply/blocking send waits for the answer, like \
+         `flk wait reply`: exit 0 replied, 3 deferred or expired, 124 timed out"
+    );
     eprintln!(
         "  flk msg mute <seconds> [--pane TARGET] [--reason TEXT]  stop waking a recipient; \
          0 clears, mail still arrives, and each needs-reply sender is told once when it lifts"
@@ -592,6 +765,48 @@ mod tests {
     }
 
     #[test]
+    fn await_needs_an_answer_to_wait_for_and_timeout_needs_await() {
+        // #576. Waiting on an `fyi` would wait for an answer nobody was asked
+        // for; a `--timeout` without `--await` would be silently ignored.
+        let refused = |args: &[&str]| parse_send_args(&argv(args)).expect_err("refused");
+        assert!(refused(&["w1:p1", "hi", "--await"]).contains("--intent needs-reply"));
+        assert!(refused(&["w1:p1", "hi", "--timeout", "5"]).contains("only applies with --await"));
+        assert!(refused(&[
+            "w1:p1",
+            "hi",
+            "--intent",
+            "needs-reply",
+            "--await",
+            "--timeout",
+            "soon"
+        ])
+        .contains("milliseconds"));
+        let parsed = parse_send_args(&argv(&[
+            "w1:p1",
+            "hi",
+            "--intent",
+            "blocking",
+            "--await",
+            "--timeout",
+            "250",
+            "--json",
+        ]))
+        .expect("a blocking send can await");
+        assert!(parsed.await_reply && parsed.json);
+        assert_eq!(parsed.timeout_ms, Some(250));
+        assert_eq!(parsed.positional, vec!["w1:p1", "hi"]);
+    }
+
+    #[test]
+    fn wait_reply_exit_codes_follow_the_outcome() {
+        assert_eq!(super::exit_for("replied"), 0);
+        assert_eq!(super::exit_for("deferred"), 3);
+        assert_eq!(super::exit_for("expired"), 3);
+        assert_eq!(super::exit_for("timeout"), 124);
+        assert_eq!(super::exit_for("anything else"), 1);
+    }
+
+    #[test]
     fn every_advertised_option_is_actually_accepted() {
         // The refusal message lists `SEND_OPTIONS`, so a flag that drifts out
         // of the match arms would be advertised and then refused — the same
@@ -599,7 +814,16 @@ mod tests {
         // down. Each option is fed with a value; the arms that take none
         // ignore the extra word as body text, which is what makes this cheap.
         for option in SEND_OPTIONS {
-            let args = argv(&["--agent", "agent_atlas_1", option, "fyi", "body"]);
+            // #576's two need a context to be valid in: `--await` waits for an
+            // answer, so not on an `fyi`; `--timeout` is `--await`'s, in ms.
+            let (value, context): (&str, &[&str]) = match *option {
+                "--await" => ("fyi", &["--intent", "needs-reply"]),
+                "--timeout" => ("1000", &["--intent", "needs-reply", "--await"]),
+                _ => ("fyi", &[]),
+            };
+            let mut args = argv(&["--agent", "agent_atlas_1", option, value]);
+            args.extend(argv(context));
+            args.push("body".into());
             assert!(
                 parse_send_args(&args).is_ok(),
                 "{option} is advertised but refused"
